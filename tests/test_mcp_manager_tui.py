@@ -32,15 +32,12 @@ def service(tmp_path, mount=None):
 @pytest.mark.asyncio
 async def test_slash_mcp_opens_primary_tui_manager(tmp_path):
     loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions"),
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
     app = TUIApp(
-        loop,
-        provider="codex",
-        model="offline",
+        loop, provider="codex", model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
     )
@@ -77,45 +74,22 @@ def test_manager_renders_every_status_glyph_and_redacts(tmp_path):
 
 def test_status_glyph_mapping_is_complete():
     base = {"name": "x", "scope": "user", "config": {"transport": "stdio"}}
-    assert (
-        MCPManager.glyph(
-            ManagedServer(**base, enabled=True, trusted=True, status="connected")
-        )
-        == "●"
-    )
-    assert (
-        MCPManager.glyph(
-            ManagedServer(**base, enabled=False, trusted=True, status="disabled")
-        )
-        == "○"
-    )
-    assert (
-        MCPManager.glyph(
-            ManagedServer(**base, enabled=True, trusted=True, auth="unauthorized")
-        )
-        == "!"
-    )
+    assert MCPManager.glyph(ManagedServer(**base, enabled=True, trusted=True, status="connected")) == "●"
+    assert MCPManager.glyph(ManagedServer(**base, enabled=False, trusted=True, status="disabled")) == "○"
+    assert MCPManager.glyph(ManagedServer(**base, enabled=True, trusted=True, auth="unauthorized")) == "!"
     assert MCPManager.glyph(ManagedServer(**base, enabled=True, trusted=False)) == "◌"
-    assert (
-        MCPManager.glyph(
-            ManagedServer(**base, enabled=True, trusted=True, status="degraded")
-        )
-        == "×"
-    )
+    assert MCPManager.glyph(ManagedServer(**base, enabled=True, trusted=True, status="degraded")) == "×"
 
 
 @pytest.mark.asyncio
 async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
     loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions"),
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
     app = TUIApp(
-        loop,
-        provider="codex",
-        model="offline",
+        loop, provider="codex", model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
     )
@@ -137,17 +111,14 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
         return StubDialog("" if input_calls == 2 else sys.executable)
 
     radio_values = iter(("user", "stdio"))
-    monkeypatch.setattr(
-        "zeta.tui.slash_handlers.mcp_manager.input_dialog", input_factory
-    )
+    monkeypatch.setattr("zeta.tui.slash_handlers.mcp_manager.input_dialog", input_factory)
     monkeypatch.setattr(
         "zeta.tui.slash_handlers.mcp_manager.radiolist_dialog",
         lambda **_kwargs: StubDialog(next(radio_values)),
     )
 
-    with (
-        create_pipe_input() as pipe,
-        create_app_session(input=pipe, output=DummyOutput()),
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
     ):
         session = app._make_session()
         app._active_session = session
@@ -168,10 +139,9 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
         async with asyncio.timeout(5):
             while not app._mcp_manager.service.path("user").exists():
                 await asyncio.sleep(0.01)
-        assert (
-            app._mcp_manager.service.show("draft-from-key-path", scope="user").name
-            == "draft-from-key-path"
-        )
+        assert app._mcp_manager.service.show(
+            "draft-from-key-path", scope="user"
+        ).name == "draft-from-key-path"
         assert "RuntimeError" not in str(app._mcp_manager.last_result)
         assert not prompt.done()
         assert app._mcp_manager_open
@@ -195,15 +165,12 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monkeypatch):
     loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions"),
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
     app = TUIApp(
-        loop,
-        provider="codex",
-        model="offline",
+        loop, provider="codex", model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
     )
@@ -234,9 +201,8 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
     )
     monkeypatch.setattr(app, "_collect_mcp_add_draft", cancelled_collect)
 
-    with (
-        create_pipe_input() as pipe,
-        create_app_session(input=pipe, output=DummyOutput()),
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
     ):
         session = app._make_session()
         app._active_session = session
@@ -284,8 +250,7 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
 @pytest.mark.asyncio
 async def test_wizard_cancelled_before_first_run_resets_state(tmp_path, monkeypatch):
     loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions"),
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
@@ -311,8 +276,7 @@ async def test_wizard_cancelled_before_first_run_resets_state(tmp_path, monkeypa
 @pytest.mark.asyncio
 async def test_wizard_exception_resets_state(tmp_path, monkeypatch):
     loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions"),
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
@@ -335,8 +299,7 @@ async def test_wizard_exception_resets_state(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_second_add_key_ignored_while_wizard_active(tmp_path, monkeypatch):
     loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions"),
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
@@ -365,8 +328,7 @@ async def test_second_add_key_ignored_while_wizard_active(tmp_path, monkeypatch)
 @pytest.mark.asyncio
 async def test_app_close_cancels_running_wizard(tmp_path, monkeypatch):
     loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions"),
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
@@ -416,39 +378,24 @@ async def test_add_wizard_escape_cancels_each_dialog_stage(monkeypatch, stage):
             current, value = "url", "https://example.test"
         else:
             current, value = "headers", ""
-        return (
-            real_input_dialog(title=title, text=text)
-            if stage == current
-            else StubDialog(value)
-        )
+        return real_input_dialog(title=title, text=text) if stage == current else StubDialog(value)
 
     def radio_factory(**kwargs):
         current = "scope" if kwargs["text"] == "Configuration scope:" else "transport"
-        value = (
-            "user"
-            if current == "scope"
-            else ("streamable-http" if http_path else "stdio")
+        value = "user" if current == "scope" else (
+            "streamable-http" if http_path else "stdio"
         )
-        return (
-            real_radiolist_dialog(**kwargs) if stage == current else StubDialog(value)
-        )
+        return real_radiolist_dialog(**kwargs) if stage == current else StubDialog(value)
 
     def yes_no_factory(**kwargs):
         return real_yes_no_dialog(**kwargs) if stage == "oauth" else StubDialog(False)
 
-    monkeypatch.setattr(
-        "zeta.tui.slash_handlers.mcp_manager.input_dialog", input_factory
-    )
-    monkeypatch.setattr(
-        "zeta.tui.slash_handlers.mcp_manager.radiolist_dialog", radio_factory
-    )
-    monkeypatch.setattr(
-        "zeta.tui.slash_handlers.mcp_manager.yes_no_dialog", yes_no_factory
-    )
+    monkeypatch.setattr("zeta.tui.slash_handlers.mcp_manager.input_dialog", input_factory)
+    monkeypatch.setattr("zeta.tui.slash_handlers.mcp_manager.radiolist_dialog", radio_factory)
+    monkeypatch.setattr("zeta.tui.slash_handlers.mcp_manager.yes_no_dialog", yes_no_factory)
 
-    with (
-        create_pipe_input() as pipe,
-        create_app_session(input=pipe, output=DummyOutput()),
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
     ):
         task = asyncio.create_task(MCPManagerMixin._collect_mcp_add_draft())
         async with asyncio.timeout(5):
@@ -493,9 +440,7 @@ async def test_remove_warns_before_unshadowing_user_definition(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_manager_dispatches_enable_remove_test_trust_and_navigation(
-    tmp_path, monkeypatch
-):
+async def test_manager_dispatches_enable_remove_test_trust_and_navigation(tmp_path, monkeypatch):
     manager = service(tmp_path)
     manager.add("one", scope="project", command=sys.executable)
     manager.add("two", scope="user", url="https://example.test", enabled=False)
@@ -558,9 +503,8 @@ async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_pat
         "Move this file aside, then run '/mcp auth live'."
     )
 
-    with (
-        create_pipe_input() as pipe,
-        create_app_session(input=pipe, output=DummyOutput()),
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
     ):
         session = app._make_session()
         app._active_session = session
@@ -587,7 +531,8 @@ async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_pat
             "text": expected_text,
         }
         rendered = "\n".join(
-            "".join(text for _style, text in line) for line in app._status_card._lines
+            "".join(text for _style, text in line)
+            for line in app._status_card._lines
         )
         assert expected_text in rendered
         assert credential_file.read_text() == "{broken"
