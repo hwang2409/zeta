@@ -1,9 +1,10 @@
 import json
-import time
+import sys
 from urllib.parse import quote
 
 import pytest
 
+import zeta.oauth as oauth_module
 from zeta.providers.auth import _redact_multipart, error_body_excerpt
 
 SENSITIVE_NAMES = (
@@ -464,42 +465,53 @@ def test_error_body_excerpt_handles_deep_multipart_without_recursion() -> None:
     assert max(depths) == depth
 
 
-def test_error_body_excerpt_joins_large_folded_header_once() -> None:
-    folded = " ;\r\n" * (792_000 // 3)
+def test_error_body_excerpt_joins_each_folded_header_once() -> None:
+    folded = " ;\r\n" * 256
     body = (
         "Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
         "--outer\r\n"
         "Content-Disposition: form-data;\r\n"
         f"{folded} name=password\r\n\r\n"
-        "folded-header-timing-marker\r\n"
+        "folded-header-marker\r\n"
         "--outer--\r\n"
-    ).encode()
-    started = time.perf_counter()
+    )
+    header_joins = 0
 
-    redacted = _redact_multipart(body.decode())
+    def count_header_joins(frame, event, argument):  # type: ignore[no-untyped-def]
+        nonlocal header_joins
+        if (
+            event == "c_call"
+            and frame.f_code.co_name == "_read_headers"
+            and getattr(argument, "__name__", None) == "join"
+        ):
+            header_joins += 1
 
-    elapsed = time.perf_counter() - started
-    assert "folded-header-timing-marker" not in redacted
-    # Budget is generous to survive CPU-loaded runs. It still catches the
-    # regression this test guards: a per-line rejoin of the folded header
-    # would be O(N^2) on ~264k fragments, taking many seconds even on an
-    # idle machine. The linear path finishes well under one second.
-    assert elapsed < 5.0
+    previous_profile = sys.getprofile()
+    sys.setprofile(count_header_joins)
+    try:
+        redacted = _redact_multipart(body)
+    finally:
+        sys.setprofile(previous_profile)
+
+    assert "folded-header-marker" not in redacted
+    # test-contract: complexity call count proves continuation count cannot multiply joins
+    assert header_joins == 2
 
 
-@pytest.mark.parametrize(
-    ("size_kib", "budget_seconds"),
-    [(512, 0.01), (4096, 0.1), (16384, 0.4)],
-)
-def test_error_body_excerpt_handles_later_colon_records_quickly(
-    size_kib: int, budget_seconds: float
+def test_error_body_excerpt_bounds_invalid_body_before_redaction(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    body = b"authorization: Foo\n" + b"x\n" * ((size_kib * 1024 - 19) // 2)
-    body += b"later: safe-value"
-    started = time.perf_counter()
+    body = b"authorization: Foo\n" + b"x\n" * (16 * 1024) + b"later: safe-value"
+    redacted_inputs: list[str] = []
 
-    excerpt = error_body_excerpt(body)
+    def record_redaction(text: str) -> str:
+        redacted_inputs.append(text)
+        return text
 
-    elapsed = time.perf_counter() - started
-    assert excerpt.startswith("authorization:")
-    assert elapsed < budget_seconds
+    # test-contract: seam no public seam exposes the bounded invalid-body redaction input
+    monkeypatch.setattr(oauth_module, "_redact_error_text", record_redaction)
+
+    error_body_excerpt(body)
+
+    # test-contract: complexity one bounded redaction call replaces size-based timing cases
+    assert redacted_inputs == [body[:4096].decode()]

@@ -19,8 +19,18 @@ from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
 from zeta.tools.inbox import _inbox, _model_visible, _validate_action
 from zeta.tools.registry import ToolRegistry
+
+
+@pytest.fixture(autouse=True)
+def _retain_async_test_writer(tmp_path: Path, request: pytest.FixtureRequest):
+    if request.node.get_closest_marker("asyncio") is None:
+        yield
+        return
+    with open_writer(tmp_path / ".zeta"):
+        yield
 
 
 def _registry(tmp_path: Path, *, enabled: bool = True, deny: tuple[str, ...] = ()):

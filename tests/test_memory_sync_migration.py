@@ -56,7 +56,18 @@ from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
 from zeta.tui.slash_handlers import SlashHandlerMixin
+
+
+@pytest.fixture
+def retained_test_writers(tmp_path: Path):
+    leases = [open_writer(tmp_path / name) for name in ("home", "second", "remote")]
+    try:
+        yield
+    finally:
+        for lease in reversed(leases):
+            lease.close()
 
 
 def _source(seq: int = 1) -> tuple[MemorySource, ...]:
@@ -314,7 +325,9 @@ def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> None:
+async def test_public_migration_end_to_end_with_real_content(
+    tmp_path: Path, retained_test_writers: None
+) -> None:
     first = tmp_path / "home"
     second = tmp_path / "second"
     workspace = tmp_path / "workspace"
@@ -425,9 +438,13 @@ async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> 
         features=frozenset({"projects-memory-v2"}),
     )
     assert shown["memory"]["profile"] == "zeta"
-    assert push_project_memory(
-        first, LocalTransport(second), project_id=project_id
-    ).conflicts == ()
+    pushed = await asyncio.to_thread(
+        push_project_memory,
+        first,
+        LocalTransport(second),
+        project_id=project_id,
+    )
+    assert pushed.conflicts == ()
     assert ProjectRegistry(second / "projects").memory_format(project_id) == 2
 
     registry.rollback_memory_migration(project_id)
@@ -568,7 +585,7 @@ def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str
 
 @pytest.mark.asyncio
 async def test_inflight_format_one_reconciliation_during_migration(
-    tmp_path: Path,
+    tmp_path: Path, retained_test_writers: None
 ) -> None:
     registry, project_id, _ = _legacy_fixture(tmp_path)
     home = tmp_path / "home"
@@ -887,6 +904,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     entry_point: str,
+    retained_test_writers: None,
 ) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
@@ -969,13 +987,28 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             1, "project_show", {"project_id": project_id}
         )
     elif entry_point == "sync-push":
-        push_project_memory(home, LocalTransport(remote), project_id=project_id)
+        await asyncio.to_thread(
+            push_project_memory,
+            home,
+            LocalTransport(remote),
+            project_id=project_id,
+        )
     elif entry_point == "sync-pull":
-        push_project_memory(home, LocalTransport(remote), project_id=project_id)
+        await asyncio.to_thread(
+            push_project_memory,
+            home,
+            LocalTransport(remote),
+            project_id=project_id,
+        )
         ProjectRegistry(remote / "projects").update_memory(
             project_id, {"state.md": "# Current state\n\nremote\n"}
         )
-        pull_project_memory(home, LocalTransport(remote), project_id=project_id)
+        await asyncio.to_thread(
+            pull_project_memory,
+            home,
+            LocalTransport(remote),
+            project_id=project_id,
+        )
     elif entry_point == "project-create":
         args = _cli_args(
             "unused",

@@ -519,8 +519,11 @@ async def test_child_lineage_two_roots_each_with_child_and_grandchild(
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
+    project = await asyncio.to_thread(
+        ProjectRegistry(home / "projects").create_project,
+        "demo",
+        "scope",
+        repository,
     )
 
     manager = SessionManager(home)
@@ -550,8 +553,11 @@ async def test_child_lineage_reconciled_after_registry_failure(
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
+    project = await asyncio.to_thread(
+        ProjectRegistry(home / "projects").create_project,
+        "demo",
+        "scope",
+        repository,
     )
 
     manager = SessionManager(home)
@@ -1474,8 +1480,12 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
     root_repository.mkdir()
     child_repository.mkdir()
     registry = ProjectRegistry(home / "projects")
-    root_project = registry.create_project("root", "root scope", root_repository)
-    child_project = registry.create_project("child", "child scope", child_repository)
+    root_project = await asyncio.to_thread(
+        registry.create_project, "root", "root scope", root_repository
+    )
+    child_project = await asyncio.to_thread(
+        registry.create_project, "child", "child scope", child_repository
+    )
 
     manager = SessionManager(home)
     opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=root_repository))

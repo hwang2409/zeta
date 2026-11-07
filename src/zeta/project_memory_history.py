@@ -722,7 +722,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             retained, lambda version: self._manifest(versions_fd, version)
         )
         dropped_blobs: set[str] = set()
-        for version in dropped:
+        for version in dropped - retained_plan.versions:
             manifest = self._manifest(versions_fd, version)
             for key in ("snapshot", "before_snapshot"):
                 payloads = manifest.get(key)

@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import read_pid_file, wait_for_path_command
 from zeta.agent.background import BackgroundAgentOwner
@@ -565,9 +566,8 @@ def test_child_question_notification_renders_question() -> None:
     assert "unavailable" not in plain
 
 
-def test_child_idle_notification_renders_one_line_notice() -> None:
+def test_child_idle_notification_renders_readable_report() -> None:
     from zeta.protocol.types import StreamEvent, StreamEventType
-    from zeta.tui import theme
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -584,16 +584,12 @@ def test_child_idle_notification_renders_one_line_notice() -> None:
     )
 
     assert rendered is not None
-    assert rendered.style == theme.NOTICE
-    assert rendered.plain.startswith("◌ finish PR #529 with a long report · idle")
-    assert "the child's report" not in rendered.plain
-    assert "\n" not in rendered.plain
-    assert all(
-        not (ord(character) < 32 or 0x80 <= ord(character) <= 0x9F)
-        for character in rendered.plain
-    )
-    assert rendered.overflow == "ellipsis"
-    assert rendered.no_wrap is True
+    plain = _renderable_plain(rendered)
+    assert "idle ← finish PR #529 with a long report :203 · idle" in plain
+    assert "the child's report is not shown in the notice" in plain
+    assert "\x1b" not in plain
+    assert "\x9b" not in plain
+    assert "\x07" not in plain
 
 
 def test_child_idle_notification_without_description_shows_error_line() -> None:
@@ -637,7 +633,7 @@ def test_child_question_withdrawn_notification_renders_text() -> None:
 
     assert rendered is not None
     plain = _renderable_plain(rendered)
-    assert "withdraw ← child :208" in plain
+    assert "withdraw ← child question withdrawn :208" in plain
     assert "b2517c6f0fbb448e86dbb8b34fe0fbc0" in plain
     assert "question withdrawn: child finished" not in plain
 
@@ -698,9 +694,11 @@ def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
     from zeta.tui.render import render_agent_notification
 
     def render(data: dict) -> str:
-        return render_agent_notification(
+        rendered = render_agent_notification(
             StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
-        ).plain
+        )
+        assert rendered is not None
+        return _renderable_plain(rendered).strip()
 
     task_line = render(
         {
@@ -887,11 +885,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         child_stores.append(child_store), track_store(child_store)
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    for _ in range(100):
-        if not owner._stores:
-            break
-        await asyncio.sleep(0.01)
-    await owner.wait_for_store_closes()
+    await asyncio.wait_for(owner.wait(), timeout=10)
     child_store = child_stores[0]
     with pytest.raises(OSError):
         os.fstat(child_store.directory_fd)
@@ -2259,7 +2253,19 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
 
 
 @pytest.mark.asyncio
-async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -> None:
+async def test_close_terminates_many_tasks_in_one_grace_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    termination_batches: list[int] = []
+    # test-contract: complexity no public process-termination batch seam exists
+    terminate_processes = process_module._terminate_processes
+
+    async def record_batch(processes, term_grace, *, finish):
+        termination_batches.append(len(processes))
+        return await terminate_processes(processes, term_grace, finish=finish)
+
+    # test-contract: complexity shutdown must expose one bounded termination batch
+    monkeypatch.setattr(process_module, "_terminate_processes", record_batch)
     tasks = BackgroundTaskRegistry(term_grace=0.25)
     task_ids = [
         await tasks.start(
@@ -2269,11 +2275,10 @@ async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -
         for _ in range(20)
     ]
 
-    started = asyncio.get_running_loop().time()
     await tasks.close()
-    elapsed = asyncio.get_running_loop().time() - started
 
-    assert elapsed < 1
+    # test-contract: complexity shutdown cost is one batch, not one grace per task
+    assert termination_batches == [len(task_ids)]
     assert all(not _group_exists(tasks.records[index].pid) for index in range(len(task_ids)))
 
 

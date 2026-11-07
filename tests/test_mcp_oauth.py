@@ -6,6 +6,7 @@ import asyncio
 import json
 import socket
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -200,7 +201,14 @@ def _write_token(name: str, home: Path, **overrides: object) -> MCPOAuthToken:
         resource=overrides.get("resource", "https://mcp.test/resource"),
         refresh_error=overrides.get("refresh_error"),
     )
-    save_token(name, token, home=str(home))
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        save_token(name, token, home=str(home))
+    else:
+        # test-contract: seam synchronous setup must cross the writer's off-loop seam
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(save_token, name, token, home=str(home)).result()
     return token
 
 

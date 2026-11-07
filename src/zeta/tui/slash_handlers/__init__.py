@@ -19,7 +19,7 @@ from ...accounts import (
     AccountUsage,
     account_provider,
 )
-from ...accounts.login import login_named_account
+from ...accounts.login import login_failure_message, login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import project_command_view
@@ -213,8 +213,8 @@ class SlashHandlerMixin:
             await asyncio.to_thread(
                 login_named_account, context.home, requested[1], requested[2]
             )
-        except (AccountError, OSError, RuntimeError, ValueError):
-            return "account login failed"
+        except Exception as exc:
+            return login_failure_message(exc)
         return f"logged in as {requested[1]}:{requested[2].lower()}"
 
     async def slash_accounts(self, args: str) -> str:

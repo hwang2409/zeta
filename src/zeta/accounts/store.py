@@ -51,6 +51,9 @@ from .files import (
 from .files import (
     file_mtime_ns as _file_mtime_ns,
 )
+from .files import fsync_directory as _fsync_directory
+from .files import mkdir_child_durable as _mkdir_child_durable
+from .files import owned_fd as _owned_fd
 from .files import (
     read_optional as _read_optional,
 )
@@ -1135,26 +1138,6 @@ def _open_account_directory(home_fd: int, account: AccountId) -> Iterator[int]:
         yield account_fd
 
 
-@contextmanager
-def _owned_fd(fd: int) -> Iterator[int]:
-    try:
-        yield fd
-    finally:
-        os.close(fd)
-
-
-def _mkdir_child_durable(parent_fd: int, name: str) -> int:
-    try:
-        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-    except FileExistsError:
-        pass
-    else:
-        _fsync_directory(parent_fd)
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-    os.fchmod(fd, 0o700)
-    return fd
-
-
 def _token_bytes(tokens: OAuthTokens) -> bytes:
     return (json.dumps(tokens.to_dict(), separators=(",", ":")) + "\n").encode()
 
@@ -1262,7 +1245,3 @@ def _unlink_legacy(home_fd: int, name: str) -> None:
 
 def _unlink_legacy_file(home_fd: int, name: str) -> None:
     os.unlink(name, dir_fd=home_fd)
-
-
-def _fsync_directory(directory_fd: int) -> None:
-    os.fsync(directory_fd)
