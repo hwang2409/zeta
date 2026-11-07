@@ -2510,10 +2510,10 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
     monkeypatch.setattr(spawn_module, "_signal_group", signal_group)
     try:
         closing = asyncio.create_task(tasks.close())
-        await term_sent.wait()
+        await asyncio.wait_for(term_sent.wait(), 10)
         closing.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await closing
+            await asyncio.wait_for(closing, 10)
 
         assert all(not _group_exists(record.pid) for record in tasks.records)
         assert await tasks.close() == ()
