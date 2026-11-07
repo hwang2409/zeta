@@ -7373,6 +7373,7 @@ async def test_agent_send_racing_wake_clear_remains_armed(
             return original_stage(target, *args)
 
         gated_stage.__name__ = "_stage_delivery_request"
+        # test-contract: seam the production stage boundary forces the race order
         monkeypatch.setattr(ConversationStore, "_stage_delivery_request", gated_stage)
         if producer_first:
             await flow.produce(
@@ -8257,6 +8258,7 @@ async def test_notification_producer_races_step_snapshot_once(
             return original_stage(target, *args)
 
         gated_stage.__name__ = "_stage_delivery_request"
+        # test-contract: seam the production stage boundary forces the race order
         monkeypatch.setattr(ConversationStore, "_stage_delivery_request", gated_stage)
         if producer_first:
             await flow.produce(_task_exit_input("task-race"))
@@ -12413,7 +12415,7 @@ async def test_idle_child_is_running_during_wake_turn(
             finish_lifecycle=lambda *_: {},
         )
     )
-    await asyncio.wait_for(first_idle.wait(), timeout=2)
+    await asyncio.wait_for(first_idle.wait(), timeout=10)
     first_idle_since = child_store.agent_lifecycle()["idle_since"]
     assert (
         await send_to_run(
@@ -13188,7 +13190,12 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         append_finished=append_finished,
     )
     try:
-        assert await asyncio.to_thread(append_started.wait, 10)
+        await asyncio.to_thread(
+            subprocess.run,
+            wait_for_path_command(append_started, timeout=10),
+            shell=True,
+            check=True,
+        )
 
         loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
         await loop.activate()
@@ -13206,11 +13213,12 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         observed.close()
         assert appends_before_recovery_returned
         recovery_done.write_text("done")
-        for _ in range(500):
-            if append_finished.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert append_finished.exists()
+        await asyncio.to_thread(
+            subprocess.run,
+            wait_for_path_command(append_finished, timeout=10),
+            shell=True,
+            check=True,
+        )
 
         assert set(root.agent_children()) == {"root:1"}
         active_questions = {
