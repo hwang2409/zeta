@@ -167,6 +167,8 @@ async def _create_session_in(tmp_path: Path, cwd: Path) -> str:
         created = await _request(reader, writer, 2, "new_session", {})
         return created[-1]["result"]["session"]["session_id"]
     finally:
+        # Drain the session owner before tearing down the client transport.
+        await server.runtime.close()
         await _close(server, writer)
 
 
@@ -226,6 +228,7 @@ async def test_resume_rejects_a_session_whose_cwd_was_removed(tmp_path: Path) ->
     original.mkdir()
     session_id = await _create_session_in(tmp_path, original)
     shutil.rmtree(original)
+    assert not original.exists()
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
