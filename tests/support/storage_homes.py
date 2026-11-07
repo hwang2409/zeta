@@ -62,8 +62,16 @@ def initialize_storage_home(home: Path) -> Path:
 def prepared_storage_home(home: Path, shape: StorageHomeShape) -> Iterator[None]:
     home.mkdir(parents=True)
     lock_path = home / ".storage-format.lock"
-    lock_path.touch()
     lock_fd: int | None = None
+
+    if shape == "realistic-old":
+        shutil.copytree(
+            Path(__file__).parents[1] / "fixtures" / "fresh_old_home",
+            home,
+            dirs_exist_ok=True,
+        )
+    else:
+        lock_path.touch()
 
     if shape == "gated":
         (home / "sessions" / "existing").mkdir(parents=True)
@@ -81,16 +89,6 @@ def prepared_storage_home(home: Path, shape: StorageHomeShape) -> Iterator[None]
     elif shape == "locked":
         lock_fd = os.open(lock_path, os.O_RDWR)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    elif shape == "realistic-old":
-        session = home / "sessions" / "legacy-session"
-        session.mkdir(parents=True)
-        shutil.copy2(
-            Path(__file__).parents[1]
-            / "fixtures"
-            / "legacy-summary-conversation.jsonl",
-            session / "conversation.jsonl",
-        )
-
     try:
         yield
     finally:
