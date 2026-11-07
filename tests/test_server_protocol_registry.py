@@ -172,50 +172,85 @@ def test_no_code_bypasses_the_typed_frame_codec() -> None:
 
 
 STRUCTURED_ERROR_FIXTURES = (
-    (ErrorDescriptor.HISTORY_SNAPSHOT_STALE, "session history changed", None),
-    (ErrorDescriptor.CONTENT_NOT_FOUND, "content not found", None),
-    (ErrorDescriptor.ACTIVE_SESSION, "select another session", None),
-    (ErrorDescriptor.ACCOUNT_LOCK_TIMEOUT, "account lock timeout", {"retryable": True}),
-    (ErrorDescriptor.APPROVAL_PERSISTENCE_FAILED, "approval persistence failed", None),
-    (ErrorDescriptor.HOST_BINDING_REQUIRED, "session is not attached", None),
-    (ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read", None),
-    (ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending", None),
-    (ErrorDescriptor.OBSERVER_READ_ONLY, "method is unavailable", {"method": "send"}),
-    (ErrorDescriptor.PROJECT_NOT_FOUND, "project missing", {"project_id": "p1"}),
+    (
+        ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+        "session history changed",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"session history changed","data":{"code":"stale_history_snapshot"}}}\n',
+    ),
+    (
+        ErrorDescriptor.CONTENT_NOT_FOUND,
+        "content not found",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32012,"message":"content not found","data":{"code":"content_not_found"}}}\n',
+    ),
+    (
+        ErrorDescriptor.ACTIVE_SESSION,
+        "select another session",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"select another session","data":{"code":"active_session"}}}\n',
+    ),
+    (
+        ErrorDescriptor.ACCOUNT_LOCK_TIMEOUT,
+        "account lock timeout",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32008,"message":"account lock timeout","data":{"code":"account_lock_timeout","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.APPROVAL_PERSISTENCE_FAILED,
+        "approval persistence failed",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"approval persistence failed","data":{"code":"approval_persistence_failed"}}}\n',
+    ),
+    (
+        ErrorDescriptor.HOST_BINDING_REQUIRED,
+        "session is not attached",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32003,"message":"session is not attached","data":{"code":"host_binding_required"}}}\n',
+    ),
+    (
+        ErrorDescriptor.INVALID_CONTENT_READ,
+        "invalid content read",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid content read","data":{"code":"invalid_content_read"}}}\n',
+    ),
+    (
+        ErrorDescriptor.LOGIN_IN_PROGRESS,
+        "login is already pending",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"login is already pending","data":{"code":"login_in_progress"}}}\n',
+    ),
+    (
+        ErrorDescriptor.OBSERVER_READ_ONLY,
+        "method is unavailable",
+        {"method": "send"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32008,"message":"method is unavailable","data":{"code":"observer_read_only","method":"send"}}}\n',
+    ),
+    (
+        ErrorDescriptor.PROJECT_NOT_FOUND,
+        "project missing",
+        {"project_id": "p1"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"project missing","data":{"code":"project_not_found","project_id":"p1"}}}\n',
+    ),
     (
         ErrorDescriptor.PROJECT_REGISTRY_BUSY,
         "project registry busy",
         {"retryable": False},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"project registry busy","data":{"code":"project_registry_busy","retryable":false}}}\n',
     ),
-    (ErrorDescriptor.SESSION_NOT_FOUND, "session missing", {"session_id": "s1"}),
+    (
+        ErrorDescriptor.SESSION_NOT_FOUND,
+        "session missing",
+        {"session_id": "s1"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session missing","data":{"code":"session_not_found","session_id":"s1"}}}\n',
+    ),
 )
-
-
-def _origin_main_structured_error_fixture(
-    descriptor: ErrorDescriptor, message: str, fields: dict[str, object] | None
-) -> bytes:
-    data = {"code": descriptor.data_code, **(fields or {})}
-    import json
-
-    return (
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 7,
-                "error": {"code": descriptor.code, "message": message, "data": data},
-            },
-            separators=(",", ":"),
-        )
-        + "\n"
-    ).encode()
 
 
 def test_structured_error_frames_match_origin_main_bytes() -> None:
     codec = FrameCodec()
-    assert {descriptor for descriptor, _, _ in STRUCTURED_ERROR_FIXTURES} == {
+    assert {descriptor for descriptor, _, _, _ in STRUCTURED_ERROR_FIXTURES} == {
         descriptor for descriptor in ErrorDescriptor if descriptor.data_code is not None
     }
-    for descriptor, message, fields in STRUCTURED_ERROR_FIXTURES:
-        assert codec.error_response(7, descriptor, message, fields) == (
-            _origin_main_structured_error_fixture(descriptor, message, fields)
-        )
+    for descriptor, message, fields, origin_main_frame in STRUCTURED_ERROR_FIXTURES:
+        assert codec.error_response(7, descriptor, message, fields) == origin_main_frame
