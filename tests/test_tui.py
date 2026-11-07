@@ -419,7 +419,7 @@ async def _background_event_transcript_count(
 
         app._run_full_screen = run_full_screen_after_ready  # type: ignore[method-assign]
         running = asyncio.create_task(app.run(session))
-        await input_ready.wait()
+        await asyncio.wait_for(input_ready.wait(), 10)
         if owner == "run_background":
             app._handle_tool_event(
                 StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=launch)
@@ -463,9 +463,11 @@ async def _background_event_transcript_count(
 
         if event.startswith("natural_exit"):
             assert task_id is not None
-            await app.loop.tool_registry.background_tasks.wait(task_id)
+            await asyncio.wait_for(
+                app.loop.tool_registry.background_tasks.wait(task_id), 10
+            )
             if owner == "background_macro":
-                await app.loop._background_owner.wait()
+                await asyncio.wait_for(app.loop._background_owner.wait(), 10)
             await wait_until(lambda: not store.agent_notifications())
         elif event == "task_kill":
             assert task_id is not None
@@ -483,7 +485,7 @@ async def _background_event_transcript_count(
                 )
             )
             if owner == "background_macro":
-                await app.loop._background_owner.wait()
+                await asyncio.wait_for(app.loop._background_owner.wait(), 10)
                 await wait_until(lambda: not store.agent_notifications())
         elif event == "failed_process_creation" and owner == "background_macro":
             await wait_until(lambda: not store.agent_notifications())
@@ -494,7 +496,7 @@ async def _background_event_transcript_count(
             app._print = fail_output
             app._print_unit = fail_output
         app.request_exit()
-        await running
+        await asyncio.wait_for(running, 10)
 
     resumed = ""
     if event == "session_shutdown":

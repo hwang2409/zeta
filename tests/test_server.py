@@ -4817,7 +4817,9 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
-        await asyncio.gather(first_turn, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(first_turn, return_exceptions=True), 10
+        )
         assert [
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]

@@ -96,7 +96,7 @@ async def test_terminal_state_and_notice_follow_off_loop_durable_record(
         tuple(notices),
     )
     release.set()
-    await killing
+    await asyncio.wait_for(killing, 10)
 
     assert before_commit == (True, 1, True, ())
     assert not registry.snapshot()[0].running
@@ -251,9 +251,9 @@ async def test_cancelled_terminal_commit_notifies_exit_once(
     monkeypatch.setattr(registry, "_persist", gated_terminal_persist)
     monkeypatch.setattr(process_module.asyncio, "wait", force_monitor_cutoff)
     killing = asyncio.create_task(registry.kill(task_id, cause="test requested task stop"))
-    await cutoff.wait()
+    await asyncio.wait_for(cutoff.wait(), 10)
     release.set()
-    await killing
+    await asyncio.wait_for(killing, 10)
 
     rows = json.loads((tmp_path / "background_tasks.json").read_text())
     assert len(rows) == 1

@@ -283,7 +283,7 @@ async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
 
     async def wait_for_task() -> None:
         wait_started.set()
-        await registry.wait(task_id)
+        await asyncio.wait_for(registry.wait(task_id), 10)
 
     waiter = asyncio.create_task(wait_for_task())
     try:
@@ -2351,12 +2351,14 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         killing.cancel()
         release_second_snapshot.set()
         with pytest.raises(asyncio.CancelledError):
-            await killing
+            await asyncio.wait_for(killing, 10)
         await wait_pid_exited(child_pid)
     finally:
         release_second_snapshot.set()
         if killing is not None:
-            await asyncio.gather(killing, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(killing, return_exceptions=True), 10
+            )
         if child_pid is not None and _group_exists(child_pid):
             os.killpg(child_pid, signal.SIGKILL)
         await tasks.close()

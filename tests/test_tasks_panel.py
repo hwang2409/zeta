@@ -399,8 +399,8 @@ async def test_panel_refresh_owns_output_cursor(
         output_appended.set()
 
     monkeypatch.setattr(registry, "_append", append_output)
-    await registry.input(task_id, "first\n")
-    await output_appended.wait()
+    await asyncio.wait_for(registry.input(task_id, "first\n"), 10)
+    await asyncio.wait_for(output_appended.wait(), 10)
     output_appended.clear()
 
     first_read = asyncio.Event()
@@ -412,11 +412,13 @@ async def test_panel_refresh_owns_output_cursor(
         selected_task_id: str, since: int | None = None, *, max_chars: int | None = None
     ) -> dict[str, object]:
         nonlocal read_count
-        result = await original_output(selected_task_id, since, max_chars=max_chars)
+        result = await asyncio.wait_for(
+            original_output(selected_task_id, since, max_chars=max_chars), 10
+        )
         read_count += 1
         if read_count == 1:
             first_read.set()
-            await release_first_read.wait()
+            await asyncio.wait_for(release_first_read.wait(), 10)
         return result
 
     monkeypatch.setattr(registry, "output", controlled_output)
@@ -426,19 +428,19 @@ async def test_panel_refresh_owns_output_cursor(
 
     refresh = asyncio.create_task(app._tasks_tick())
     try:
-        await first_read.wait()
-        await registry.input(task_id, "second\n")
-        await output_appended.wait()
+        await asyncio.wait_for(first_read.wait(), 10)
+        await asyncio.wait_for(registry.input(task_id, "second\n"), 10)
+        await asyncio.wait_for(output_appended.wait(), 10)
 
         # Paint from the current immutable snapshot while the only output read
         # is paused. Painting must not start another read or move its cursor.
         app._refresh_tasks_panel(keep_offset=True)
         release_first_read.set()
-        await refresh
+        await asyncio.wait_for(refresh, 10)
         settled = asyncio.Event()
         asyncio.get_running_loop().call_soon(settled.set)
-        await settled.wait()
-        await app._tasks_tick()
+        await asyncio.wait_for(settled.wait(), 10)
+        await asyncio.wait_for(app._tasks_tick(), 10)
 
         rendered = "\n".join(_text(app._tasks_panel))
         assert rendered.count("first") == 1
@@ -448,10 +450,14 @@ async def test_panel_refresh_owns_output_cursor(
         release_first_read.set()
         if not refresh.done():
             refresh.cancel()
-            await asyncio.gather(refresh, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), 10
+            )
         app.close_tasks_panel()
         registry.set_notice_sink(None)
-        await registry.kill(task_id, cause="test requested task stop")
+        await asyncio.wait_for(
+            registry.kill(task_id, cause="test requested task stop"), 10
+        )
         await registry.close()
 
 
@@ -461,7 +467,7 @@ async def test_snapshot_runtime_and_terminal_phase(tmp_path: Path) -> None:
     running_id, _ = await registry.start("sleep 30", tmp_path)
     exit_id, _ = await registry.start("true", tmp_path)
     try:
-        await registry.wait(exit_id, timeout=10)
+        await asyncio.wait_for(registry.wait(exit_id, timeout=10), 10)
         snap = {task.task_id: task for task in registry.snapshot()}
         assert snap[running_id].running is True
         assert snap[running_id].started_at is not None
