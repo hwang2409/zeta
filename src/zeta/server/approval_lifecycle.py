@@ -660,25 +660,29 @@ class ApprovalLifecycle:
         record = await self._record_for_decision(core_key, policy)
         if record is None or record.phase != "pending" or record.request is None:
             raise ProtocolError(
-                ErrorDescriptor.APPROVAL_UNAVAILABLE, f"approval request not found or already resolved: {request_id}"
+                ErrorDescriptor.APPROVAL_UNAVAILABLE,
+                f"approval request not found or already resolved: {request_id}",
             )
         pending = record.request
         if scope == "always_tool" and pending.child_instance_id is not None:
             raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS, "scope 'always_tool' is unavailable for delegated approvals"
+                ErrorDescriptor.INVALID_PARAMS,
+                "scope 'always_tool' is unavailable for delegated approvals",
             )
         if scope == "always_tool":
             try:
                 pending.always_allow_rule()
             except ValueError as exc:
                 raise ProtocolError(
-                    ErrorDescriptor.INVALID_PARAMS, f"cannot always allow approval request: {exc}"
+                    ErrorDescriptor.INVALID_PARAMS,
+                    f"cannot always allow approval request: {exc}",
                 ) from exc
         decision = "allow" if method == "approve" else "deny"
         record = self._reserve(record, decision)
         if record is None:
             raise ProtocolError(
-                ErrorDescriptor.APPROVAL_UNAVAILABLE, f"approval request not found or already resolved: {request_id}"
+                ErrorDescriptor.APPROVAL_UNAVAILABLE,
+                f"approval request not found or already resolved: {request_id}",
             )
         settlement = asyncio.create_task(
             self._settle_record(
@@ -691,7 +695,9 @@ class ApprovalLifecycle:
         try:
             resolution = await settlement
         except OSError as exc:
-            raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, f"approval persistence failed: {exc}") from exc
+            raise ProtocolError(
+                ErrorDescriptor.INTERNAL_ERROR, f"approval persistence failed: {exc}"
+            ) from exc
         confirmed = resolution["decision"]
         result: dict[str, object] = {
             "accepted": True,

@@ -306,14 +306,14 @@ async def test_ready_output_overflow_uses_shared_bound_and_reserved_control(
         decoded = json.loads(payload)
         if decoded.get("params", {}).get("delta") == "head":
             head_started.set()
-            await release_head.wait()
+            await asyncio.wait_for(release_head.wait(), 10)
         return await original_write(client, payload)
 
     # test-contract: seam stalls the real transport at a deterministic write
     monkeypatch.setattr(_Client, "_write_physical", gated_write)
     try:
         head = asyncio.create_task(_offer(server, state, role, "head"))
-        await head_started.wait()
+        await asyncio.wait_for(head_started.wait(), 10)
         tail_started = asyncio.Event()
 
         async def offer_tail() -> bool:
@@ -321,7 +321,7 @@ async def test_ready_output_overflow_uses_shared_bound_and_reserved_control(
             return await _offer(server, state, role, "tail")
 
         tail = asyncio.create_task(offer_tail())
-        await tail_started.wait()
+        await asyncio.wait_for(tail_started.wait(), 10)
         assert _retained(output)[0] == 2
         trigger_started = asyncio.Event()
 
@@ -330,7 +330,7 @@ async def test_ready_output_overflow_uses_shared_bound_and_reserved_control(
             return await _offer(server, state, role, "trigger")
 
         trigger = asyncio.create_task(offer_trigger())
-        await trigger_started.wait()
+        await asyncio.wait_for(trigger_started.wait(), 10)
         later_started = asyncio.Event()
 
         async def offer_later() -> bool:
@@ -338,10 +338,10 @@ async def test_ready_output_overflow_uses_shared_bound_and_reserved_control(
             return await _offer(server, state, role, "later")
 
         later = asyncio.create_task(offer_later())
-        await later_started.wait()
+        await asyncio.wait_for(later_started.wait(), 10)
         release_head.set()
-        results = await asyncio.gather(
-            head, tail, trigger, later, return_exceptions=True
+        results = await asyncio.wait_for(
+            asyncio.gather(head, tail, trigger, later, return_exceptions=True), 10
         )
 
         first = await _read_json(reader, transport)
@@ -402,7 +402,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
         frame = json.loads(payload)
         if frame.get("params", {}).get("delta") == "head":
             head_started.set()
-            await release_head.wait()
+            await asyncio.wait_for(release_head.wait(), 10)
         return await original_write(client, payload)
 
     def release(connection: Any) -> None:
@@ -480,8 +480,8 @@ async def test_controller_overflow_does_not_cancel_active_turn(
             )
 
         trigger = asyncio.create_task(trigger_overflow())
-        await trigger_started.wait()
-        assert trigger.done() and await trigger is False
+        await asyncio.wait_for(trigger_started.wait(), 10)
+        assert trigger.done() and await asyncio.wait_for(trigger, 10) is False
         release_head.set()
         frames = await _read_until_close(reader, transport)
         assert frames == [
@@ -503,7 +503,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
                 },
             },
         ]
-        assert await head is True
+        assert await asyncio.wait_for(head, 10) is True
         await asyncio.wait_for(turn_finalized.wait(), TIMEOUT)
         assert outcomes == ["disconnected"]
         await asyncio.wait_for(controller_released.wait(), TIMEOUT)
@@ -607,7 +607,7 @@ async def test_active_flush_overflow_sends_control_then_closes(
     async def gated_write(client: _Client, payload: bytes) -> bool:
         if json.loads(payload).get("id") == 1:
             hello_started.set()
-            await release_hello.wait()
+            await asyncio.wait_for(release_hello.wait(), 10)
         return await original_write(client, payload)
 
     # test-contract: seam stalls the real transport during the hello flush
@@ -623,7 +623,7 @@ async def test_active_flush_overflow_sends_control_then_closes(
                 "params": {"protocol_version": "1.2"},
             },
         )
-        await hello_started.wait()
+        await asyncio.wait_for(hello_started.wait(), 10)
         state = next(iter(server.connections._connections.values()))
         output = state.output
         assert output is not None
@@ -709,7 +709,7 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
         decoded = json.loads(payload)
         if decoded.get("params", {}).get("delta") == "head":
             head_started.set()
-            await release_head.wait()
+            await asyncio.wait_for(release_head.wait(), 10)
         return await original_write(client, payload)
 
     # test-contract: seam stalls the real transport until the deadline fires
@@ -718,7 +718,7 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
     try:
         head = asyncio.create_task(_offer(server, state, "controller", "head"))
         tasks.append(head)
-        await head_started.wait()
+        await asyncio.wait_for(head_started.wait(), 10)
 
         async def started_offer(label: str, started: asyncio.Event) -> bool:
             started.set()
@@ -727,11 +727,11 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
         trigger_started = asyncio.Event()
         trigger = asyncio.create_task(started_offer("trigger", trigger_started))
         tasks.append(trigger)
-        await trigger_started.wait()
+        await asyncio.wait_for(trigger_started.wait(), 10)
         later_started = asyncio.Event()
         later = asyncio.create_task(started_offer("later", later_started))
         tasks.append(later)
-        await later_started.wait()
+        await asyncio.wait_for(later_started.wait(), 10)
 
         if trigger.done():
             await deadline_armed.wait()
@@ -748,7 +748,7 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
             f"peer received output after overflow: {peer_result}"
         )
         assert deadline_calls == 1
-        assert trigger.done() and await trigger is False
+        assert trigger.done() and await asyncio.wait_for(trigger, 10) is False
         assert later.done() and await later is False
         await asyncio.gather(head, return_exceptions=True)
         assert _retained(output) == (0, 0)
@@ -759,9 +759,7 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
         await server.close()
         for task in tasks:
             task.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True), 10
-        )
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
@@ -1143,16 +1141,12 @@ async def test_observer_status_rejects_session_swap_snapshot(
         except TimeoutError:
             release_projection.set()
             stale.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(stale, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(stale, return_exceptions=True), 10)
             raise
         if not projection_ready:
             release_projection.set()
             stale.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(stale, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(stale, return_exceptions=True), 10)
             pytest.fail("status projection did not start")
         session_b = (
             await _rpc(
@@ -1177,9 +1171,7 @@ async def test_observer_status_rejects_session_swap_snapshot(
         release_projection.set()
         if stale is not None:
             stale.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(stale, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(stale, return_exceptions=True), 10)
         controller_writer.close()
         if observer_writer is not None:
             observer_writer.close()

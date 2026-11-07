@@ -186,7 +186,9 @@ class ServeControl:
 
     async def require_idle(self) -> None:
         if self.turn_busy():
-            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
 
     @contextmanager
     def reserve_session_swap(self) -> Iterator[None]:

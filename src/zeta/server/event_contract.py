@@ -83,6 +83,7 @@ def project_tool_value(value: object) -> tuple[object, bool]:
         return result, truncated
     return value, False
 
+
 LEGACY_NOTIFICATION_WIRE_EVENT = EventDescriptor.SUB_AGENT_RECEIPT
 NOTIFICATION_WIRE_EVENTS = {
     "agent_completion": LEGACY_NOTIFICATION_WIRE_EVENT,

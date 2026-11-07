@@ -21,9 +21,7 @@ class TurnContextDelivery(TypedDict, total=False):
 
 
 class _EventSink(Protocol):
-    def __call__(
-        self, event: StreamEvent, *, session_id: str
-    ) -> Awaitable[None]: ...
+    def __call__(self, event: StreamEvent, *, session_id: str) -> Awaitable[None]: ...
 
 
 @dataclass(frozen=True)
@@ -49,7 +47,8 @@ class PendingTurnContexts:
         """Validate negotiation and set context for the active session."""
         if "turn_context" not in features:
             raise ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND, "set_turn_context requires negotiated turn_context feature"
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "set_turn_context requires negotiated turn_context feature",
             )
         session_id = runtime.session_id if runtime.opened is not None else None
         return self.set(session_id, params)
@@ -90,7 +89,9 @@ class PendingTurnContexts:
         if "text" not in params or (
             params["text"] is not None and not isinstance(params["text"], str)
         ):
-            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must be a string or null")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS, "text must be a string or null"
+            )
         text = params["text"]
         if text is not None and len(text.encode("utf-8")) > MAX_BYTES:
             raise ProtocolError(

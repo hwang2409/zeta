@@ -22,7 +22,9 @@ from .runtime import ServerRuntime
 
 def validate(model: str, mode: str) -> None:
     if model not in known_model_names() or mode not in {"ask", "allow", "deny"}:
-        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid model or approval mode")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "invalid model or approval mode"
+        )
 
 
 async def apply(
@@ -57,10 +59,14 @@ async def apply(
                 metadata.model,
                 loop.context_assembler.token_budget,
             )
-        if selected_fallback is not None and (
-            provider,
-            selected_model,
-        ) == selected_fallback[:2]:
+        if (
+            selected_fallback is not None
+            and (
+                provider,
+                selected_model,
+            )
+            == selected_fallback[:2]
+        ):
             selected_fallback = None
         account_provider_name = account_provider(provider)
         if (
@@ -84,7 +90,9 @@ async def apply(
 
     def build_backend(metadata: SessionMetadata):
         account = None
-        selected = metadata.selected_accounts.get(account_provider(metadata.provider) or "")
+        selected = metadata.selected_accounts.get(
+            account_provider(metadata.provider) or ""
+        )
         if selected is not None:
             account = AccountId(*selected.split(":", 1))
         return runtime.backend_for_model(
@@ -110,6 +118,7 @@ async def apply(
         raise OSError("session settings were not persisted")
     approval_mode = authoritative.approval_mode or mode
     runtime.policy.default = ApprovalDecision(approval_mode)
+
 
 async def apply_rpc(runtime: ServerRuntime, model: str, mode: str) -> None:
     try:

@@ -418,9 +418,7 @@ async def run_command(
     raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "unexpected slash result type")
 
 
-async def _run_mcp_command(
-    runtime: ServerRuntime, tail: str
-) -> dict[str, object]:
+async def _run_mcp_command(runtime: ServerRuntime, tail: str) -> dict[str, object]:
     stripped = tail.strip()
     verb = stripped.partition(" ")[0]
     if verb not in {"status", "auth", "logout"}:

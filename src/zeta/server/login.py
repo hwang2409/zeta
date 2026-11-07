@@ -80,11 +80,15 @@ class Logins:
             return await asyncio.to_thread(self.providers)
         provider = params.get("provider")
         if provider not in ("claude", "codex"):
-            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "unsupported login provider")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS, "unsupported login provider"
+            )
         task = self.tasks.get(provider)
         if method == "login_start":
             if task is not None and not task.done():
-                raise ProtocolError(ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending")
+                raise ProtocolError(
+                    ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending"
+                )
             url = asyncio.get_running_loop().create_future()
             operation = _LoginOperation()
             task = asyncio.create_task(self._run(provider, url, operation))
@@ -141,11 +145,16 @@ class Logins:
                 f"Close any other {provider_label} login and retry.",
             )
         except LoginError:
-            return failure("login_callback_error", "Sign-in was rejected or the browser callback was invalid. Please try again.")
+            return failure(
+                "login_callback_error",
+                "Sign-in was rejected or the browser callback was invalid. Please try again.",
+            )
         except (OSError, RuntimeError, ValueError, httpx.HTTPError):
             # Provider responses can contain tokens or callback codes. Do not
             # forward exception text to the wire or transcript.
-            return failure("login_failed", "Could not complete sign-in. Please try again.")
+            return failure(
+                "login_failed", "Could not complete sign-in. Please try again."
+            )
 
     async def _run(
         self,

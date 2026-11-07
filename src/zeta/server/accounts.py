@@ -14,7 +14,12 @@ from ..providers.factory import build_backend
 from .protocol import ErrorDescriptor, ProtocolError
 from .runtime import ServerRuntime
 
-REQUEST_METHODS = {"account_list", "account_logout", "account_refresh", "account_switch"}
+REQUEST_METHODS = {
+    "account_list",
+    "account_logout",
+    "account_refresh",
+    "account_switch",
+}
 
 
 async def run_owned_switch(owner: Any, operation: Awaitable[object]) -> object:
@@ -44,7 +49,9 @@ async def list_accounts(
 ) -> dict[str, object]:
     context = getattr(runtime.loop, "account_context", None)
     if context is None:
-        raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, "accounts unavailable for this session")
+        raise ProtocolError(
+            ErrorDescriptor.STATE_UNAVAILABLE, "accounts unavailable for this session"
+        )
     snapshot = await context.list_snapshot()
     return {
         "accounts": [
@@ -76,7 +83,9 @@ async def request(
         return await refresh_accounts(runtime)
     raw = params.get("account")
     if not isinstance(raw, str) or ":" not in raw:
-        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "account must be provider:name")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "account must be provider:name"
+        )
     account = AccountId(*raw.split(":", 1))
     loop = runtime.loop
     if method == "account_logout":

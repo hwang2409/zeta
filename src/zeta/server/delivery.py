@@ -59,7 +59,9 @@ class DeliveryRequests:
         control.reject_client_turn_if_detached()
         control._reject_if_unhealthy()
         if control.turn_busy():
-            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         value = control._model_inputs.resolve(
             runtime.session_id,
             params,
@@ -130,7 +132,9 @@ class DeliveryRequests:
         control.reject_client_turn_if_detached()
         control._reject_if_unhealthy()
         if control.turn_busy():
-            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         ergonomics.require_mutable(runtime, control.has_pending_approvals())
         worker = asyncio.create_task(
             asyncio.to_thread(ergonomics.prepare_image_delivery, runtime, params)
@@ -460,13 +464,18 @@ async def _deliver_after_commit(
 
 def _require_feature(features: frozenset[str], feature: str, param: str) -> None:
     if feature not in features:
-        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{param} requires negotiated feature '{feature}'")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            f"{param} requires negotiated feature '{feature}'",
+        )
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:
     value = params.get(name)
     if not isinstance(value, str) or not value:
-        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string"
+        )
     return value
 
 

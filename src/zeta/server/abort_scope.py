@@ -34,9 +34,14 @@ def parse_abort_scope(params: dict[str, object], features: set[str]) -> AbortSco
 
     scope = params.get("scope", "session")
     if "scope" in params and "abort_scope" not in features:
-        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "scope requires the negotiated abort_scope feature")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            "scope requires the negotiated abort_scope feature",
+        )
     if not isinstance(scope, str) or scope not in {"session", "foreground"}:
-        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "scope must be 'session' or 'foreground'")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "scope must be 'session' or 'foreground'"
+        )
     return scope
 
 
