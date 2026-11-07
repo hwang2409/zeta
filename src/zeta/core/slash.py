@@ -1364,7 +1364,7 @@ def create_slash_registry(
         SlashCommand(
             "accounts",
             _run_accounts,
-            "list or label accounts",
+            "list, switch, or label accounts",
             ServeSlash(mutates=_has_args),
         )
     )

@@ -123,6 +123,7 @@ async def test_bare_overlay_commands_dispatch_and_render_through_registry(
         await await_submission_pipeline(app)
         rendered_help = "\n".join(app._transcript.lines(100))
         assert "/status — show session status" in rendered_help
+        assert "/accounts — list, switch, or label accounts" in rendered_help
         assert dispatched == ["help"]
 
         app._submit_input(f"/{command}")

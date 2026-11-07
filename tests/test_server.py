@@ -7833,6 +7833,9 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             and complete_by_name[name]["client_only"] is True
             for name in unavailable
         )
+        assert complete_by_name["accounts"]["description"] == (
+            "list, switch, or label accounts"
+        )
         assert runnable_by_name["review"]["source"] == "project"
         assert runnable_by_name["greet"]["kind"] == "skill"
 

@@ -1394,7 +1394,7 @@ The shared slash registry has this order and surface availability:
 | `approve` | no | `/approve [key]` |
 | `always` | no | `/always [key]` — allow this tool/action for the running session |
 | `deny` | no | `/deny [key]` |
-| `accounts` | yes | list or label accounts |
+| `accounts` | yes | list, switch, or label accounts |
 | `restart` | no | restart this session from the local checkout (reinstall after `pyproject` changes) |
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
 
