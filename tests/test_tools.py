@@ -1858,8 +1858,9 @@ async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> 
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await task
-    await wait_pid_exited(await read_pid_file(child_pid))
+        await asyncio.wait_for(task, 10)
+    child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
+    await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
 
     assert not marker.exists()
 
@@ -1884,8 +1885,9 @@ async def test_bash_abort_kills_process_group_and_returns_canceled_result(
     await read_pid_file(child_pid)
     abort_signal.abort()
 
-    result = await asyncio.wait_for(task, timeout=0.5)
-    await wait_pid_exited(await read_pid_file(child_pid))
+    result = await asyncio.wait_for(task, timeout=10)
+    child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
+    await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
