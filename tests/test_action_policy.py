@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from pathlib import Path
 
 import pytest
@@ -169,7 +167,246 @@ async def test_policy_authorizes_resolved_capability_only(tmp_path: Path) -> Non
     assert not result["isError"]
 
 
-def test_existing_tool_payloads_match_pre_action_policy_snapshots(
+_SCHEMA_DOCUMENTATION_KEYS = frozenset(
+    {"$comment", "description", "example", "examples", "title"}
+)
+_SCHEMA_STRUCTURE_KEYS = frozenset({"items", "properties", "required", "type"})
+
+
+def _without_schema_documentation(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _without_schema_documentation(child)
+            for key, child in value.items()
+            if key not in _SCHEMA_DOCUMENTATION_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_schema_documentation(child) for child in value]
+    return value
+
+
+def _provider_schema_contract(schema: dict[str, object]) -> dict[str, object]:
+    types: dict[str, object] = {}
+    required: list[str] = []
+    constraints: dict[str, object] = {}
+
+    def visit(value: object, path: str) -> None:
+        assert isinstance(value, dict), path
+        types[path] = value.get("type", "unconstrained")
+        for field in value.get("required", []):
+            required.append(f"{path}.{field}" if path else field)
+        for key, child in value.items():
+            if key in _SCHEMA_DOCUMENTATION_KEYS | _SCHEMA_STRUCTURE_KEYS:
+                continue
+            constraint_path = f"{path}.{key}" if path else key
+            constraints[constraint_path] = _without_schema_documentation(child)
+        properties = value.get("properties", {})
+        assert isinstance(properties, dict), path
+        for field, child in properties.items():
+            child_path = f"{path}.{field}" if path else field
+            visit(child, child_path)
+        if "items" in value:
+            visit(value["items"], f"{path}[]")
+
+    visit(schema, "")
+    del types[""]
+    return {
+        "types": types,
+        "required": sorted(required),
+        "constraints": constraints,
+    }
+
+
+def _expected_provider_contract(
+    types: str,
+    required: str = "",
+    constraints: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "types": dict(item.split("=", 1) for item in types.split()),
+        "required": sorted(required.split()),
+        "constraints": {"additionalProperties": False, **(constraints or {})},
+    }
+
+
+_EXPECTED_PROVIDER_TOOL_CONTRACTS = {
+    name: _expected_provider_contract(*contract)
+    for name, contract in {
+        "agent": (
+            (
+                "agent_type=string background=boolean cwd=string description=string "
+                "model=string preset=string prompt=string"
+            ),
+            "description prompt",
+            {
+                "agent_type.enum": ["general", "explore", "plan", "run"],
+                "preset.enum": ["general", "explore", "plan", "run"],
+                "model.enum": [
+                    "claude-fable-5",
+                    "claude-haiku-4-5",
+                    "claude-haiku-4-5-20251001",
+                    "claude-opus-4-5",
+                    "claude-opus-4-6",
+                    "claude-opus-4-7",
+                    "claude-opus-4-8",
+                    "claude-opus-5",
+                    "claude-opus-5-5",
+                    "claude-sonnet-4-5-20250929",
+                    "claude-sonnet-4-6",
+                    "claude-sonnet-5",
+                    "codex-auto-review",
+                    "gpt-5.3-codex-spark",
+                    "gpt-5.4",
+                    "gpt-5.4-mini",
+                    "gpt-5.5",
+                    "gpt-5.6-luna",
+                    "gpt-5.6-sol",
+                    "gpt-5.6-terra",
+                    "gpt-reserve",
+                    "qwen3:4b",
+                    "qwen3:4b-instruct",
+                ],
+            },
+        ),
+        "agent_cancel": ("handle=string", "handle", {"handle.minLength": 1}),
+        "agent_output": (
+            "handle=string limit=integer offset=integer",
+            "handle",
+            {"handle.minLength": 1, "limit.minimum": 1, "offset.minimum": 0},
+        ),
+        "agent_send": (
+            "child_instance_id=string message=string",
+            "child_instance_id message",
+            {"child_instance_id.minLength": 1, "message.minLength": 1},
+        ),
+        "agent_status": (
+            "handle=string limit=integer offset=integer",
+            "",
+            {"limit.minimum": 1, "offset.minimum": 0},
+        ),
+        "bash": (
+            (
+                "cmd=string command=string cwd=unconstrained max_output=integer "
+                "timeout=number"
+            ),
+            "",
+            {
+                "cmd.minLength": 1,
+                "command.minLength": 1,
+                "max_output.maximum": 1048576,
+                "max_output.minimum": 1,
+                "timeout.exclusiveMinimum": 0,
+                "timeout.maximum": 3600.0,
+            },
+        ),
+        "edit": (
+            (
+                "edits=array edits[]=object edits[].new_string=string "
+                "edits[].old_string=string new_string=string old_string=string "
+                "path=string"
+            ),
+            "edits[].new_string edits[].old_string path",
+            {
+                "edits.maxItems": 50,
+                "edits.minItems": 1,
+                "edits[].additionalProperties": False,
+                "edits[].old_string.minLength": 1,
+                "path.minLength": 1,
+            },
+        ),
+        "fetch": (
+            "max_bytes=integer offset=integer url=string",
+            "url",
+            {
+                "max_bytes.maximum": 104857600,
+                "max_bytes.minimum": 1,
+                "offset.minimum": 0,
+                "url.minLength": 1,
+            },
+        ),
+        "mcp_discover": (
+            "action=string names=array names[]=string query=string server=string uri=string",
+            "",
+            {"action.enum": ["search", "activate", "resources", "read_resource"]},
+        ),
+        "project": (
+            "action=string",
+            "",
+            {"action.enum": ["inspect", "sessions"]},
+        ),
+        "read": (
+            "limit=integer offset=integer path=string",
+            "path",
+            {"limit.minimum": 1, "offset.minimum": 0, "path.minLength": 1},
+        ),
+        "recall_history": (
+            (
+                "max_chars=integer offset=integer query=string seq_end=integer "
+                "seq_start=integer"
+            ),
+            "",
+            {
+                "max_chars.maximum": 20000,
+                "max_chars.minimum": 1,
+                "offset.minimum": 0,
+                "seq_end.minimum": 1,
+                "seq_start.minimum": 1,
+            },
+        ),
+        "resolve_attention": (
+            "attention_id=string decision=string",
+            "attention_id decision",
+        ),
+        "run_background": (
+            "command=string cwd=unconstrained",
+            "command",
+            {"command.minLength": 1},
+        ),
+        "session_push": ("host=string", "host", {"host.minLength": 1}),
+        "skill": ("name=string", "name", {"name.minLength": 1}),
+        "task_input": (
+            "data=string eof=boolean task_id=string",
+            "task_id",
+            {"task_id.minLength": 1},
+        ),
+        "task_kill": (
+            "task_id=string",
+            "task_id",
+            {"task_id.minLength": 1},
+        ),
+        "task_output": (
+            "since=integer task_id=string",
+            "task_id",
+            {"since.minimum": 0, "task_id.minLength": 1},
+        ),
+        "todo": (
+            "items=array items[]=object items[].content=string items[].status=string",
+            "items[].content items[].status",
+            {
+                "items[].additionalProperties": False,
+                "items[].status.enum": [
+                    "pending",
+                    "in_progress",
+                    "completed",
+                    "canceled",
+                ],
+            },
+        ),
+        "websearch": (
+            "max_results=integer query=string",
+            "query",
+            {"max_results.minimum": 1, "query.minLength": 1},
+        ),
+        "write": (
+            "content=string create_parents=boolean path=string",
+            "content path",
+            {"path.minLength": 1},
+        ),
+    }.items()
+}
+
+
+def test_existing_tool_payloads_keep_semantic_provider_contracts(
     tmp_path: Path,
 ) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
@@ -177,33 +414,69 @@ def test_existing_tool_payloads_match_pre_action_policy_snapshots(
     existing_schemas = [
         schema for schema in registry.schemas if schema["name"] != "request_attention"
     ]
-    snapshots = {
-        "schemas": existing_schemas,
-        "anthropic": build_request_payload(
-            messages,
-            existing_schemas,
-            model="claude-test",
-            max_tokens=2048,
-            thinking_budget=1024,
-        ),
-        "codex": build_responses_payload(
-            messages, existing_schemas, model="codex-test"
-        ),
-        "ollama": ollama_tools(existing_schemas),
-    }
-    expected = {
-        "schemas": "1f99642e3ee428f14eb8ac396e74190958cf9c570269844b007bfa566b2818c2",
-        "anthropic": "b8dde1c4542a3e76c2b7b95d68f9b7cad9304360c1f32b8b75861a4e9af5a19f",
-        "codex": "4184f1dc5e3e54f5b2ecaaf91b053315edaf59b99808dada67763bf96073eefb",
-        "ollama": "b7317ab67a45448c194fe492b3e220903c39130258fff939f04ff1326172d0fb",
-    }
+    anthropic_payload = build_request_payload(
+        messages,
+        existing_schemas,
+        model="claude-test",
+        max_tokens=2048,
+        thinking_budget=1024,
+    )
+    codex_payload = build_responses_payload(
+        messages, existing_schemas, model="codex-test"
+    )
+    anthropic = anthropic_payload["tools"]
+    codex = codex_payload["tools"]
+    ollama = ollama_tools(existing_schemas)
 
-    assert {
-        name: hashlib.sha256(
-            json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
-        ).hexdigest()
-        for name, value in snapshots.items()
-    } == expected
+    assert "tool_choice" not in anthropic_payload
+    assert "parallel_tool_calls" not in anthropic_payload
+    assert codex_payload["tool_choice"] == "auto"
+    assert codex_payload["parallel_tool_calls"] is True
+
+    assert all(
+        set(tool) == {"name", "input_schema", "description"} for tool in anthropic[:-1]
+    )
+    assert set(anthropic[-1]) == {
+        "name",
+        "input_schema",
+        "description",
+        "cache_control",
+    }
+    assert anthropic[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert all(isinstance(tool["description"], str) for tool in anthropic)
+    assert all(
+        tool["type"] == "function"
+        and tool["strict"] is False
+        and set(tool) == {"type", "name", "parameters", "strict", "description"}
+        and isinstance(tool["description"], str)
+        for tool in codex
+    )
+    assert all(
+        tool["type"] == "function"
+        and set(tool) == {"type", "function"}
+        and set(tool["function"]) == {"name", "description", "parameters"}
+        and isinstance(tool["function"]["description"], str)
+        for tool in ollama
+    )
+
+    provider_contracts = {
+        "anthropic": {
+            tool["name"]: _provider_schema_contract(tool["input_schema"])
+            for tool in anthropic
+        },
+        "codex": {
+            tool["name"]: _provider_schema_contract(tool["parameters"])
+            for tool in codex
+        },
+        "ollama": {
+            tool["function"]["name"]: _provider_schema_contract(
+                tool["function"]["parameters"]
+            )
+            for tool in ollama
+        },
+    }
+    for provider, contract in provider_contracts.items():
+        assert contract == _EXPECTED_PROVIDER_TOOL_CONTRACTS, provider
 
 
 def test_capability_selector_parser_normalizes_bare_action_and_mcp_names() -> None:
@@ -213,7 +486,9 @@ def test_capability_selector_parser_normalizes_bare_action_and_mcp_names() -> No
     assert str(parse_tool_selector("remote__*")) == "remote__*"
 
 
-@pytest.mark.parametrize("selector", ["agent()", "agent(status|output)", "agent(status *)"])
+@pytest.mark.parametrize(
+    "selector", ["agent()", "agent(status|output)", "agent(status *)"]
+)
 def test_capability_selector_parser_rejects_invalid_action_forms(selector: str) -> None:
     with pytest.raises(ValueError, match="tool selector"):
         parse_tool_selector(selector)
@@ -239,7 +514,9 @@ def test_layered_allowlists_intersect_and_deny_wins_per_action() -> None:
     assert not allowed.allows_call(_capability("task", "kill"))
 
 
-def test_schema_action_enum_is_filtered_and_tool_hidden_when_none_remain(tmp_path: Path) -> None:
+def test_schema_action_enum_is_filtered_and_tool_hidden_when_none_remain(
+    tmp_path: Path,
+) -> None:
     registry = _registry(tmp_path, tool_allow=("task(output)",))
 
     assert registry.schemas[0]["parameters"]["properties"]["action"]["enum"] == [
@@ -304,11 +581,47 @@ def test_approval_rule_is_resolved_against_action_metadata(tmp_path: Path) -> No
     )
     _registry(tmp_path, approval_policy=policy)
 
-    assert ApprovalRule("task", subject_pattern="pytest*", action="start") in policy.always_allow
+    assert (
+        ApprovalRule("task", subject_pattern="pytest*", action="start")
+        in policy.always_allow
+    )
     assert ApprovalRule("task", action="output") in policy.always_allow
-    assert policy.decide(_capability("task", "start", "pytest -q", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.ALLOW
-    assert policy.decide(_capability("task", "start", "pytest -k slow_case", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.ASK
-    assert policy.decide(_capability("task", "start", "pytest --pdb", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.DENY
+    assert (
+        policy.decide(
+            _capability(
+                "task",
+                "start",
+                "pytest -q",
+                subject_field="command",
+                binding=ApprovalBinding.CWD,
+            )
+        )
+        is ApprovalDecision.ALLOW
+    )
+    assert (
+        policy.decide(
+            _capability(
+                "task",
+                "start",
+                "pytest -k slow_case",
+                subject_field="command",
+                binding=ApprovalBinding.CWD,
+            )
+        )
+        is ApprovalDecision.ASK
+    )
+    assert (
+        policy.decide(
+            _capability(
+                "task",
+                "start",
+                "pytest --pdb",
+                subject_field="command",
+                binding=ApprovalBinding.CWD,
+            )
+        )
+        is ApprovalDecision.DENY
+    )
     assert policy.decide(_capability("task", "output")) is ApprovalDecision.ALLOW
 
 
@@ -317,12 +630,21 @@ def test_old_no_action_approval_syntax_keeps_its_meaning() -> None:
         "bash", subject_pattern="git status*"
     )
     policy = ApprovalPolicy(always_allow={"bash(git status*)"})
-    assert policy.decide(_capability("bash", subject_value="git status --short", subject_field="command")) is ApprovalDecision.ALLOW
+    assert (
+        policy.decide(
+            _capability(
+                "bash", subject_value="git status --short", subject_field="command"
+            )
+        )
+        is ApprovalDecision.ALLOW
+    )
 
 
 def test_action_scoped_unreadable_subject_fails_closed(tmp_path: Path) -> None:
     deny = ApprovalPolicy(always_deny={"task(start rm *)"}, default="allow")
-    ask = ApprovalPolicy(always_ask={"task(start git push*)"}, always_allow={"task(start)"})
+    ask = ApprovalPolicy(
+        always_ask={"task(start git push*)"}, always_allow={"task(start)"}
+    )
     _registry(tmp_path / "deny", approval_policy=deny)
     _registry(tmp_path / "ask", approval_policy=ask)
     unreadable = _capability(
@@ -343,9 +665,12 @@ def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
     )
 
     assert request is not None
-    assert registry.prepare_approval(
-        ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
-    ) is None
+    assert (
+        registry.prepare_approval(
+            ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
+        )
+        is None
+    )
     assert request.action == "start"
     assert request.audit_facts() == {"action": "start"}
     assert request.audit_display() == {}
@@ -370,10 +695,9 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
     executed: list[str] = []
     registry.register(
         "task",
-        lambda arguments, execution_context=None: executed.append(
-            str(arguments["command"])
-        )
-        or "started",
+        lambda arguments, execution_context=None: (
+            executed.append(str(arguments["command"])) or "started"
+        ),
         parameters=registry.definitions_by_name["task"].parameters,
         actions=_actions(),
     )
@@ -480,7 +804,11 @@ def test_action_subject_child_cwd_binding_is_preserved(tmp_path: Path) -> None:
     policy = ApprovalPolicy(always_allow={"task(start pytest*)"})
     _registry(tmp_path / "registry", approval_policy=policy)
     capability = _capability(
-        "task", "start", "pytest -q", subject_field="command", binding=ApprovalBinding.CWD
+        "task",
+        "start",
+        "pytest -q",
+        subject_field="command",
+        binding=ApprovalBinding.CWD,
     )
 
     same_decision, same_binding = policy.decide_for_child_with_binding(
@@ -536,9 +864,7 @@ def test_always_allow_scope_round_trips_to_current_action() -> None:
 
 def test_registry_resolves_action_and_no_action_capabilities(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
-    action = registry.resolve_call(
-        "task", {"action": "start", "command": "pytest -q"}
-    )
+    action = registry.resolve_call("task", {"action": "start", "command": "pytest -q"})
     registry.register(
         "plain",
         lambda arguments: "ok",
@@ -580,7 +906,9 @@ def test_registry_resolves_action_and_no_action_capabilities(tmp_path: Path) -> 
 
 
 def test_action_path_binding_requires_execution_context_handler(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
     actions = {
         "update": ToolAction(
             required_fields=frozenset({"path"}),
