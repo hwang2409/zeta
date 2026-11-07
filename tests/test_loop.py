@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import json
-import time
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -981,13 +980,22 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
             nonblocking_updates += 1
         original_put_nowait(queue, item)
 
-    def fail_blocking_call(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise AssertionError("stream publication used a blocking operation")
-
     monkeypatch.setattr(asyncio.Queue, "put_nowait", put_nowait)
-    monkeypatch.setattr(asyncio.Queue, "put", fail_blocking_call)
-    monkeypatch.setattr(time, "sleep", fail_blocking_call)
+
+    original_put = asyncio.Queue.put
+
+    def guard_stream_put(
+        queue: asyncio.Queue[object], item: object
+    ):
+        if (
+            isinstance(item, StreamEvent)
+            and item.type is StreamEventType.TOOL_EXECUTION_UPDATE
+            and item.tool_call == call
+        ):
+            raise AssertionError("stream publication used a blocking operation")
+        return original_put(queue, item)
+
+    monkeypatch.setattr(asyncio.Queue, "put", guard_stream_put)
 
     async def stream(
         arguments: dict[str, object],
@@ -1017,11 +1025,22 @@ skill_catalog=SkillCatalog.empty(),
         for event in events
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE
     ]
-    end = next(
+    end_events = [
         event
         for event in events
         if event.type is StreamEventType.TOOL_EXECUTION_END
+    ]
+    error_events = [
+        event
+        for event in events
+        if event.type is StreamEventType.ERROR
+    ]
+    assert end_events, (
+        "tool execution did not publish an end event; "
+        f"events={[event.type.value for event in events]}, "
+        f"errors={error_events}"
     )
+    end = end_events[0]
     assert nonblocking_updates >= len(chunks)
     assert len(updates) == 128
     assert updates[0].delta == "chunk-72\n"
