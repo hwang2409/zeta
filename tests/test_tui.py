@@ -153,6 +153,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    harness_notice,
     with_message_origin,
 )
 from zeta.tui import theme
@@ -1602,10 +1603,7 @@ async def test_task_safety_notice_and_kill_render_through_real_paths(
     )
     store = ConversationStore(tmp_path, session_id="child")
     store.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent(notice)]),
-            MessageOrigin.AGENT_PROMPT,
-        )
+        harness_notice("task safety", notice, event="agent_task_safety")
     )
     control = AgentTranscriptControl()
     await control.load(store.session_dir)

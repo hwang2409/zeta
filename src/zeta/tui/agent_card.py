@@ -23,7 +23,13 @@ from ..core.agent_progress import live_agent_lifecycle
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
-from ..protocol.types import Message, ToolCall, is_passive_harness_message
+from ..protocol.types import (
+    Message,
+    TextContent,
+    ToolCall,
+    is_passive_harness_message,
+    is_visible_harness_notice,
+)
 from . import theme
 from .cards.agent import (
     AgentCard,
@@ -483,7 +489,9 @@ def _read_bounded_messages(
                 data = row.get("data")
                 message = data.get("message") if isinstance(data, dict) else None
                 if isinstance(message, dict):
-                    if is_passive_harness_message(message):
+                    if is_passive_harness_message(
+                        message
+                    ) and not is_visible_harness_notice(message):
                         continue
                     append_message(message)
                     content = message.get("content")
@@ -683,17 +691,25 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         except (TypeError, ValueError):
             return
         unit_start = len(self.transcript._units)
-        render_replayed_message(
-            message,
-            presenter=self.presenter,
-            print_user=self._print_user,
-            print_unit=self.presenter.print_unit,
-            tool_calls=self._tool_calls,
-            include_thoughts=True,
-            replay_tool_results=True,
-            replay_tool_starts=True,
-            session_path=path,
-        )
+        if is_visible_harness_notice(message):
+            text = "\n".join(
+                block.text
+                for block in message.content
+                if isinstance(block, TextContent)
+            )
+            self.presenter.print_unit(Text(f"system · {text}", style=theme.CHROME))
+        else:
+            render_replayed_message(
+                message,
+                presenter=self.presenter,
+                print_user=self._print_user,
+                print_unit=self.presenter.print_unit,
+                tool_calls=self._tool_calls,
+                include_thoughts=True,
+                replay_tool_results=True,
+                replay_tool_starts=True,
+                session_path=path,
+            )
         units = self.transcript._units[unit_start:]
         self._entry_units.setdefault(entry_id, []).extend(units)
         self._unit_entries.update((unit, entry_id) for unit in units)

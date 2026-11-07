@@ -2555,6 +2555,8 @@ class _ControlledTaskSafetyRegistry:
     def __init__(self) -> None:
         self.tasks: list[SimpleNamespace] = []
         self.kills: list[tuple[str, str]] = []
+        self.task_change_generation = 0
+        self.closed = False
 
     def snapshot(self) -> tuple[SimpleNamespace, ...]:
         return tuple(self.tasks)
@@ -2562,6 +2564,10 @@ class _ControlledTaskSafetyRegistry:
     async def kill(self, task_id: str, *, cause: str) -> None:
         self.kills.append((task_id, cause))
         next(task for task in self.tasks if task.task_id == task_id).running = False
+
+    async def wait_for_task_change(self, generation: int) -> None:
+        assert generation == self.task_change_generation
+        await asyncio.Future()
 
 
 class _ControlledTaskSafetyWait:
@@ -2575,8 +2581,48 @@ class _ControlledTaskSafetyWait:
 
 
 class _TaskSafetyNotices(list[str]):
-    async def publish(self, text: str) -> None:
+    async def publish(self, text: str) -> str:
         self.append(text)
+        return f"warning-{len(self)}"
+
+
+@pytest.mark.asyncio
+async def test_task_start_and_exit_wake_task_safety_supervisor(tmp_path: Path) -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    timeouts: asyncio.Queue[float | None] = asyncio.Queue()
+
+    async def observe_registry_wake(wake, timeout: float | None) -> bool:
+        await timeouts.put(timeout)
+        await wake()
+        return True
+
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    lifecycle = TaskSafetyLifecycle(3600, wait=observe_registry_wake)
+    notices = _TaskSafetyNotices()
+    supervisor = asyncio.create_task(lifecycle.run(registry.background_tasks, notices.publish))
+    task_id: str | None = None
+    try:
+        assert await timeouts.get() is None
+        started = await registry.execute(
+            ToolCall(
+                "start",
+                "run_background",
+                {"command": _python("import time; time.sleep(30)")},
+            )
+        )
+        task_id = started["structuredContent"]["task_id"]
+        assert await timeouts.get() == pytest.approx(3600, abs=1)
+
+        await registry.background_tasks.kill(task_id)
+        task_id = None
+        assert await timeouts.get() is None
+        assert notices == []
+    finally:
+        if task_id is not None:
+            await registry.background_tasks.kill(task_id)
+        await registry.close()
+        await asyncio.wait_for(supervisor, timeout=10)
 
 
 @pytest.mark.asyncio
@@ -2587,101 +2633,125 @@ async def test_task_safety_clock_starts_when_a_late_task_starts() -> None:
     wait = _ControlledTaskSafetyWait()
     registry = _ControlledTaskSafetyRegistry()
     notices = _TaskSafetyNotices()
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait)
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
     supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
-    assert await wait.timeouts.get() is None
-
-    registry.tasks.append(
-        SimpleNamespace(
-            task_id="late-task",
-            headline="watch ci",
-            running=True,
-            started_at=now[0],
+    try:
+        assert await wait.timeouts.get() is None
+        registry.tasks.append(
+            SimpleNamespace(
+                task_id="late-task", headline="watch ci", running=True, started_at=now[0]
+            )
         )
-    )
-    lifecycle.owner_acted()
-    await wait.releases.put(True)
-    assert await wait.timeouts.get() == 3600
-    assert registry.kills == []
+        registry.task_change_generation += 1
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() == 3600
+        assert registry.kills == []
 
-    now[0] += 3600
-    await wait.releases.put(False)
-    assert await wait.timeouts.get() == 3600
-    assert notices == [
-        "task late-task (watch ci) has run 1h; kill it with task_kill or leave it running"
-    ]
-    assert registry.kills == []
-    supervisor.cancel()
-    await asyncio.gather(supervisor, return_exceptions=True)
+        now[0] += 3600
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert notices == [
+            "task late-task (watch ci) has run 1h; kill it with task_kill or leave it running"
+        ]
+        assert registry.kills == []
+    finally:
+        supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
 
 
 @pytest.mark.asyncio
-async def test_task_safety_owner_turn_resets_window_and_warns_again() -> None:
+async def test_task_safety_coalesces_deadlines_within_one_second() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.extend(
+        [
+            SimpleNamespace(task_id="task-1", headline="first", running=True, started_at=0.0),
+            SimpleNamespace(task_id="task-2", headline="second", running=True, started_at=0.5),
+            SimpleNamespace(task_id="task-3", headline="boundary", running=True, started_at=1.0),
+            SimpleNamespace(task_id="task-4", headline="next cohort", running=True, started_at=1.001),
+        ]
+    )
+    notices = _TaskSafetyNotices()
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait)
+    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+    try:
+        assert await wait.timeouts.get() == 3601
+        now[0] = 3601
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() == pytest.approx(1.001)
+        assert len(notices) == 1
+        assert "task task-1 (first)" in notices[0]
+        assert "task task-2 (second)" in notices[0]
+        assert "task task-3 (boundary)" in notices[0]
+        assert "task task-4 (next cohort)" not in notices[0]
+    finally:
+        supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_task_safety_rereads_terminal_state_at_deadline() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    task = SimpleNamespace(task_id="task-1", headline="done", running=True, started_at=0.0)
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.append(task)
+    notices = _TaskSafetyNotices()
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+    try:
+        assert await wait.timeouts.get() == 3600
+        task.running = False
+        registry.task_change_generation += 1
+        now[0] = 3600
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert notices == []
+        assert registry.kills == []
+    finally:
+        supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_task_safety_kills_after_delivered_warning_window() -> None:
     from zeta.agent.explicit_finish import TaskSafetyLifecycle
 
     now = [0.0]
     wait = _ControlledTaskSafetyWait()
     registry = _ControlledTaskSafetyRegistry()
     registry.tasks.append(
-        SimpleNamespace(
-            task_id="task-1", headline="watch ci", running=True, started_at=0.0
-        )
+        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
     )
     notices = _TaskSafetyNotices()
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait)
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
     supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
-    assert await wait.timeouts.get() == 3600
+    try:
+        assert await wait.timeouts.get() == 3600
+        now[0] = 3600
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() == 3600
 
-    now[0] = 3600
-    await wait.releases.put(False)
-    assert await wait.timeouts.get() == 3600
-    assert len(notices) == 1
-    lifecycle.owner_acted()
-    await wait.releases.put(True)
-    assert await wait.timeouts.get() == 3600
-
-    now[0] = 7200
-    await wait.releases.put(False)
-    assert await wait.timeouts.get() == 3600
-    assert len(notices) == 2
-    assert registry.kills == []
-    supervisor.cancel()
-    await asyncio.gather(supervisor, return_exceptions=True)
-
-
-@pytest.mark.asyncio
-async def test_task_safety_kills_after_unanswered_window_with_age() -> None:
-    from zeta.agent.explicit_finish import TaskSafetyLifecycle
-
-    now = [0.0]
-    wait = _ControlledTaskSafetyWait()
-    registry = _ControlledTaskSafetyRegistry()
-    registry.tasks.append(
-        SimpleNamespace(
-            task_id="task-1", headline="watch ci", running=True, started_at=0.0
-        )
-    )
-    notices = _TaskSafetyNotices()
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait)
-    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
-    assert await wait.timeouts.get() == 3600
-
-    now[0] = 3600
-    await wait.releases.put(False)
-    assert await wait.timeouts.get() == 3600
-    assert len(notices) == 1
-    now[0] = 7200
-    await wait.releases.put(False)
-    assert await wait.timeouts.get() is None
-    assert len(notices) == 1
-    assert registry.kills == [
-        (
-            "task-1",
-            "explicit-finish task safety limit expired at task age 7200 seconds after no owner turn for 3600 seconds",
-        )
-    ]
-    supervisor.cancel()
-    await asyncio.gather(supervisor, return_exceptions=True)
+        now[0] = 7200
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert registry.kills == [
+            (
+                "task-1",
+                "explicit-finish task safety limit expired at task age 7200 seconds after no owner turn for 3600 seconds",
+            )
+        ]
+    finally:
+        supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
 
 
 @pytest.mark.asyncio

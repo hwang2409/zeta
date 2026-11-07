@@ -42,7 +42,13 @@ from .background_task_types import (
     BackgroundTaskShutdownNotice,
     TaskExitInput,
 )
-from .process_output import command_headline, output_tail, utf8_char_chunk, utf8_chunk
+from .process_output import (
+    command_headline,
+    output_tail,
+    task_exit_headline,
+    utf8_char_chunk,
+    utf8_chunk,
+)
 from .tool_spawn import create_tool_subprocess_shell
 
 logger = logging.getLogger(__name__)
@@ -141,9 +147,11 @@ class BackgroundTaskRegistry:
             str, tuple[_BackgroundRecord, BackgroundTaskNotice]
         ] = {}
         self._task_start_generation = 0
+        self._task_change_generation = 0
+        self._task_changed = asyncio.Event()
         self._start_cleanup_error: BackgroundSpawnCleanupError | None = None
         self._shutdown_killed: tuple[str, ...] = ()
-        self._closing_for_shutdown = False
+        self._shutdown_cause: str | None = None
         if session_dir is not None:
             if directory_fd is None:
                 raise ValueError("session directory descriptor is required")
@@ -168,6 +176,25 @@ class BackgroundTaskRegistry:
         """Return the monotonic count of tasks that reached running state."""
 
         return self._task_start_generation
+
+    @property
+    def task_change_generation(self) -> int:
+        """Return the monotonic count of committed task start and exit changes."""
+
+        return self._task_change_generation
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def wait_for_task_change(self, generation: int) -> None:
+        """Wait until a task starts or reaches terminal state after generation."""
+
+        while self._task_change_generation == generation:
+            self._task_changed.clear()
+            if self._task_change_generation != generation:
+                return
+            await self._task_changed.wait()
 
     def close_failure_generation(self) -> int:
         return self._close_failure_generation
@@ -429,6 +456,8 @@ class BackgroundTaskRegistry:
                 self._records[record.task_id] = record
                 record.monitor = asyncio.create_task(self._monitor(record, log_handle))
                 self._task_start_generation += 1
+                self._task_change_generation += 1
+                self._task_changed.set()
 
             await self._commit_transition(
                 rows,
@@ -559,22 +588,20 @@ class BackgroundTaskRegistry:
                 "retry": False,
             }
 
-    def begin_shutdown(self) -> None:
+    def begin_shutdown(self, cause: str = "session shutdown") -> None:
         """Mark cancellations caused by session teardown as shutdown kills."""
 
-        self._closing_for_shutdown = True
+        self._shutdown_cause = self._shutdown_cause or cause
 
-    async def kill(self, task_id: str) -> dict[str, Any]:
+    async def kill(self, task_id: str, *, cause: str = "task killed") -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
             phase: Literal["task_kill", "session_shutdown"] = (
-                "session_shutdown" if self._closing_for_shutdown else "task_kill"
+                "session_shutdown" if self._shutdown_cause else "task_kill"
             )
             await self._terminate(
                 record,
-                reason="task killed on session exit"
-                if phase == "session_shutdown"
-                else "task killed",
+                reason="session shutdown" if phase == "session_shutdown" else cause,
                 phase=phase,
             )
         return self._status(record)
@@ -656,7 +683,7 @@ class BackgroundTaskRegistry:
             for record in records:
                 record.notify_on_exit = False
                 record.terminal_phase = "session_shutdown"
-                record.note = "task killed on session exit"
+                record.note = self._shutdown_cause or "background task registry closed"
             await finish(
                 asyncio.gather(*(self._close_stdin(record) for record in records))
             )
@@ -732,6 +759,8 @@ class BackgroundTaskRegistry:
                 raise self._start_cleanup_error
             self._closing = False
             self._closed = True
+            self._task_change_generation += 1
+            self._task_changed.set()
             self._shutdown_killed = tuple(killed)
             shutdown_result = tuple(killed)
         finally:
@@ -902,8 +931,12 @@ class BackgroundTaskRegistry:
                 )
             )
             notice = BackgroundTaskNotice(
-                f"background task {record.task_id} exited ({candidate.exit_code}): "
-                f"{command_headline(record.command)}",
+                task_exit_headline(
+                    record.task_id,
+                    candidate.exit_code,
+                    record.command,
+                    candidate.note,
+                ),
                 record.task_id,
                 candidate.terminal_phase,
                 record.owner,
@@ -921,15 +954,16 @@ class BackgroundTaskRegistry:
         await self._notify_terminal_exit(candidate)
         return True
 
-    @staticmethod
     def _publish_terminal(
-        record: _BackgroundRecord, candidate: _BackgroundRecord
+        self, record: _BackgroundRecord, candidate: _BackgroundRecord
     ) -> None:
         record.running = candidate.running
         record.exit_code = candidate.exit_code
         record.ended_at = candidate.ended_at
         record.process = candidate.process
         record.terminal_phase = candidate.terminal_phase
+        self._task_change_generation += 1
+        self._task_changed.set()
 
     async def _retry_pending_terminals(self) -> None:
         pending = tuple(self._pending_terminals.items())

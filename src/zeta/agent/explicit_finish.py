@@ -171,11 +171,15 @@ def register_handoff(child_loop: object) -> None:
     _register_handoff(child_loop, handoff)
 
 
+TASK_SAFETY_COHORT_SECONDS = 1.0
+
+
 @dataclass(slots=True)
 class _TaskSafetyWindow:
     task: BackgroundTaskInfo
     deadline: float
     warned: bool = False
+    warning_prompt_id: str | None = None
 
 
 class TaskSafetyLifecycle:
@@ -190,84 +194,149 @@ class TaskSafetyLifecycle:
             [Callable[[], Awaitable[None]], float | None], Awaitable[bool]
         ]
         | None = None,
+        cohort_seconds: float = TASK_SAFETY_COHORT_SECONDS,
     ) -> None:
         self._limit = limit
         self._clock = clock
         self._wait = wait or _wait_for_idle_wake
+        self._cohort_seconds = cohort_seconds
         self._changed = asyncio.Event()
         self._windows: dict[str, _TaskSafetyWindow] = {}
 
-    def owner_acted(self) -> None:
-        """Start a fresh window for every task whose warning got an owner turn."""
+    def delivery_completed(self, live_pending_ids: set[str]) -> None:
+        """Start a fresh window only for a warning cohort whose turn completed."""
 
         now = self._clock()
+        changed = False
         for window in self._windows.values():
-            if window.warned:
+            prompt_id = window.warning_prompt_id
+            if prompt_id is not None and prompt_id not in live_pending_ids:
+                window.warning_prompt_id = None
                 window.deadline = now + self._limit
-                window.warned = False
-        self._changed.set()
+                changed = True
+        if changed:
+            self._changed.set()
+
+    def _reconcile_running(
+        self, running: dict[str, BackgroundTaskInfo], now: float
+    ) -> None:
+        self._windows = {
+            task_id: window
+            for task_id, window in self._windows.items()
+            if task_id in running
+        }
+        for task_id, task in running.items():
+            window = self._windows.get(task_id)
+            if window is None:
+                started = task.started_at if task.started_at is not None else now
+                self._windows[task_id] = _TaskSafetyWindow(
+                    task, started + self._limit
+                )
+            else:
+                window.task = task
+
+    async def _wait_for_change(
+        self, registry: BackgroundTaskRegistry, generation: int
+    ) -> None:
+        owner_change = asyncio.create_task(self._changed.wait())
+        task_change = asyncio.create_task(registry.wait_for_task_change(generation))
+        try:
+            await asyncio.wait(
+                (owner_change, task_change),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (owner_change, task_change):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(owner_change, task_change, return_exceptions=True)
+
+    def _next_action_at(self) -> float | None:
+        deadlines = [
+            window.deadline
+            for window in self._windows.values()
+            if window.warning_prompt_id is None
+        ]
+        if not deadlines:
+            return None
+        return min(deadlines) + self._cohort_seconds
+
+    async def _expire_due(
+        self,
+        registry: BackgroundTaskRegistry,
+        publish_notice: Callable[[str], Awaitable[str]],
+        now: float,
+    ) -> None:
+        due = [
+            window
+            for window in self._windows.values()
+            if window.warning_prompt_id is None and window.deadline <= now
+        ]
+        warning_cohort = [window for window in due if not window.warned]
+        if warning_cohort:
+            text = "\n".join(
+                f"task {window.task.task_id} ({window.task.headline}) has run "
+                f"{_format_duration(_task_age(window.task, now, self._limit))}; "
+                "kill it with task_kill or leave it running"
+                for window in warning_cohort
+            )
+            prompt_id = await publish_notice(text)
+            for window in warning_cohort:
+                window.warned = True
+                window.warning_prompt_id = prompt_id
+
+        for window in due:
+            if not window.warned or window.warning_prompt_id is not None:
+                continue
+            age = _task_age(window.task, now, self._limit)
+            await registry.kill(
+                window.task.task_id,
+                cause=(
+                    "explicit-finish task safety limit expired at task age "
+                    f"{age:g} seconds after no owner turn for "
+                    f"{self._limit:g} seconds"
+                ),
+            )
 
     async def run(
         self,
         registry: BackgroundTaskRegistry,
-        publish_notice: Callable[[str], Awaitable[None]],
+        publish_notice: Callable[[str], Awaitable[str]],
     ) -> None:
-        while True:
-            running = {task.task_id: task for task in registry.snapshot() if task.running}
-            self._windows = {
-                task_id: window
-                for task_id, window in self._windows.items()
-                if task_id in running
-            }
+        while not registry.closed:
+            generation = registry.task_change_generation
             now = self._clock()
-            for task_id, task in running.items():
-                if task_id not in self._windows:
-                    started = task.started_at if task.started_at is not None else now
-                    self._windows[task_id] = _TaskSafetyWindow(
-                        task, started + self._limit
-                    )
-
-            deadline = min(
-                (window.deadline for window in self._windows.values()),
-                default=None,
+            self._reconcile_running(
+                {task.task_id: task for task in registry.snapshot() if task.running},
+                now,
             )
             self._changed.clear()
-            timeout = None if deadline is None else max(0.0, deadline - now)
-            if await self._wait(self._changed.wait, timeout):
+            action_at = self._next_action_at()
+            timeout = None if action_at is None else max(0.0, action_at - now)
+            if await self._wait(
+                lambda generation=generation: self._wait_for_change(
+                    registry, generation
+                ),
+                timeout,
+            ):
                 continue
 
+            # The deadline and a terminal transition can become ready together.
+            # Re-read committed task state before warning or killing anything.
             now = self._clock()
-            for window in tuple(self._windows.values()):
-                if window.deadline > now:
-                    continue
-                age = max(
-                    0.0,
-                    now
-                    - (
-                        window.task.started_at
-                        if window.task.started_at is not None
-                        else now - self._limit
-                    ),
-                )
-                if window.warned:
-                    await registry.kill(
-                        window.task.task_id,
-                        cause=(
-                            "explicit-finish task safety limit expired at task age "
-                            f"{age:g} seconds after no owner turn for "
-                            f"{self._limit:g} seconds"
-                        ),
-                    )
-                    continue
-                window.warned = True
-                window.deadline += self._limit
-                await publish_notice(
-                    f"task {window.task.task_id} ({window.task.headline}) has run "
-                    f"{_format_duration(age)}; kill it with task_kill or leave it running"
-                )
+            self._reconcile_running(
+                {task.task_id: task for task in registry.snapshot() if task.running},
+                now,
+            )
+            await self._expire_due(registry, publish_notice, now)
+
+
+def _task_age(task: BackgroundTaskInfo, now: float, limit: float) -> float:
+    started = task.started_at if task.started_at is not None else now - limit
+    return max(0.0, now - started)
 
 
 def _format_duration(seconds: float) -> str:
-    if seconds >= 3600 and seconds % 3600 == 0:
-        return f"{seconds / 3600:g}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600:g}h"
     return f"{seconds:g}s"

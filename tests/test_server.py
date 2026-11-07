@@ -70,6 +70,7 @@ from zeta.protocol.types import (
     ThinkingContent,
     ToolCall,
     ToolUseContent,
+    harness_notice,
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
@@ -4646,10 +4647,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
         "kill it with task_kill or leave it running"
     )
     store.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent(task_notice)]),
-            MessageOrigin.AGENT_PROMPT,
-        )
+        harness_notice("task safety", task_notice, event="agent_task_safety")
     )
     task_cause = (
         "explicit-finish task safety limit expired at task age 7200 seconds "
@@ -4694,7 +4692,9 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
         }
         assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
         assert any(
-            row.get("content", [{}])[0].get("text") == task_notice for row in history
+            row.get("content", [{}])[0].get("text")
+            == f"[zeta] task safety: {task_notice}"
+            for row in history
         )
         assert task_cause in by_kind["task_exited"]["content"][0]["text"]
         assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"

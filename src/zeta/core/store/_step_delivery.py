@@ -7,7 +7,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from ...protocol.types import Message, MessageOrigin, MessageRole, TextContent
+from ...protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    harness_notice,
+)
 from ..checkpoints import ConversationEntry
 from ._pending_prompts import PENDING_PROMPT_ID_METADATA
 from ._validation import validate_notification_data
@@ -286,6 +292,17 @@ def _select_prompt_delivery(
         trailing, str(prompt_entry.data["text"]), origin
     ):
         return prompt_entry, trailing, True
+    if origin is MessageOrigin.HARNESS_NUDGE:
+        return (
+            prompt_entry,
+            harness_notice(
+                "task safety",
+                str(prompt_entry.data["text"]),
+                event="agent_task_safety",
+                metadata={PENDING_PROMPT_ID_METADATA: prompt_entry.id},
+            ),
+            False,
+        )
     return (
         prompt_entry,
         Message(
