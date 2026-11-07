@@ -719,7 +719,7 @@ class AgentLoop(
         notification_turn: bool,
         recovery_state: EmptyTurnRecoveryState,
         turn_number: int,
-    ) -> tuple[_ToollessTransition, tuple[StreamEvent, ...]]:
+    ) -> tuple[_ToollessTransition, tuple[StreamEvent, ...], bool]:
         transition = await self._toolless_transition(
             step_delivery,
             assistant_message,
@@ -733,14 +733,24 @@ class AgentLoop(
             return transition, (
                 StreamEvent(StreamEventType.ERROR, error=transition.error),
                 StreamEvent(StreamEventType.AGENT_END),
-            )
+            ), True
+        if transition.continue_turn:
+            return transition, (
+                StreamEvent(
+                    StreamEventType.TURN_END,
+                    message=assistant_message,
+                    data={"turn": turn_number, "tool_calls": 0},
+                ),
+            ), False
+        self._schedule_transcript_index()
         return transition, (
             StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,
                 data={"turn": turn_number, "tool_calls": 0},
             ),
-        )
+            StreamEvent(StreamEventType.AGENT_END),
+        ), True
 
     async def _run_turn_impl(
         self,
@@ -1206,7 +1216,7 @@ class AgentLoop(
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             if not calls:
-                transition, events = await self._handle_toolless_turn(
+                transition, events, done = await self._handle_toolless_turn(
                     step_delivery,
                     assistant_message,
                     iteration_consuming_notifications=(
@@ -1220,14 +1230,10 @@ class AgentLoop(
                 nudge_turn_pending = transition.nudge_turn_pending
                 for event in events:
                     yield event
-                if transition.error is not None:
-                    return
                 consuming_notifications = transition.consuming_notifications
-                if transition.continue_turn:
-                    continue
-                self._schedule_transcript_index()
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
+                if done:
+                    return
+                continue
             dispatch = dispatch_tool_calls(
                 self,
                 calls,
