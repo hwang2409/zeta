@@ -848,12 +848,9 @@ async def test_stdio_connect_clears_reader_error_for_reconnect(
 
 
 @pytest.mark.asyncio
-async def test_stdio_rejects_unterminated_line_beyond_named_limit(
+async def test_stdio_rejects_malformed_unterminated_initialize_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.mcp.stdio as stdio_module
-
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = """
 import json
@@ -866,9 +863,11 @@ sys.stdout.flush()
     client = StdioMCPClient(
         MCPServerConfig("unterminated", "stdio", sys.executable, ("-u", "-c", source))
     )
-    with pytest.raises(MCPProtocolError, match="invalid MCP JSON"):
-        await client.connect()
-    await client.close()
+    try:
+        with pytest.raises(MCPProtocolError, match="invalid MCP JSON"):
+            await client.connect()
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -974,23 +973,28 @@ async def test_stdio_abort_returns_canceled_result(
     release = tmp_path / "receive-call"
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     client = StdioMCPClient(_gated_stdio_config("abort", release))
-    await client.connect()
-    await client.list_tools()
-    request_written, request_received = _capture_stdio_call(client, monkeypatch)
-    signal = AbortSignal()
-    task = asyncio.create_task(client.call_tool("echo", {"value": "wait"}, signal))
+    try:
+        await client.connect()
+        await client.list_tools()
+        request_written, request_received = _capture_stdio_call(client, monkeypatch)
+        signal = AbortSignal()
+        task = asyncio.create_task(client.call_tool("echo", {"value": "wait"}, signal))
 
-    await asyncio.wait_for(request_written.wait(), timeout=10)
-    assert not task.done()
-    assert not request_received.is_set()
-    assert client._invalidation is None
-    release.touch()
-    await asyncio.wait_for(request_received.wait(), timeout=10)
-    signal.abort()
-    result = await task
+        await asyncio.wait_for(request_written.wait(), timeout=10)
+        assert not task.done()
+        assert not request_received.is_set()
+        assert client._invalidation is None
+        release.touch()
+        await asyncio.wait_for(request_received.wait(), timeout=10)
+        signal.abort()
+        result = await task
 
-    assert result["content"][0]["text"] == "tool execution canceled"
-    await client.close()
+        assert result["content"][0]["text"] == "tool execution canceled"
+    finally:
+        try:
+            release.touch()
+        finally:
+            await client.close()
 
 
 @pytest.mark.asyncio
@@ -1007,40 +1011,45 @@ async def test_stdio_abort_marks_mount_failed(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"abort": config}),
     )
-    client = mount._clients["abort"]
-    request_written, request_received = _capture_stdio_call(client, monkeypatch)
-    signal = AbortSignal()
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall("call", "abort__echo", {"value": "wait"}),
-            abort_signal=signal,
+    try:
+        client = mount._clients["abort"]
+        request_written, request_received = _capture_stdio_call(client, monkeypatch)
+        signal = AbortSignal()
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall("call", "abort__echo", {"value": "wait"}),
+                abort_signal=signal,
+            )
         )
-    )
 
-    await asyncio.wait_for(request_written.wait(), timeout=10)
-    assert not task.done()
-    assert not request_received.is_set()
-    assert client._invalidation is None
-    release.touch()
-    await asyncio.wait_for(request_received.wait(), timeout=10)
-    signal.abort()
-    result = await task
-    degraded = asyncio.Event()
+        await asyncio.wait_for(request_written.wait(), timeout=10)
+        assert not task.done()
+        assert not request_received.is_set()
+        assert client._invalidation is None
+        release.touch()
+        await asyncio.wait_for(request_received.wait(), timeout=10)
+        signal.abort()
+        result = await task
+        degraded = asyncio.Event()
 
-    def schema_refresh(current: MCPMount) -> None:
-        if current.statuses["abort"].state == "degraded":
-            degraded.set()
+        def schema_refresh(current: MCPMount) -> None:
+            if current.statuses["abort"].state == "degraded":
+                degraded.set()
 
-    mount.set_schema_refresh(schema_refresh)
-    await asyncio.wait_for(degraded.wait(), timeout=10)
+        mount.set_schema_refresh(schema_refresh)
+        await asyncio.wait_for(degraded.wait(), timeout=10)
 
-    assert result["isError"] is True
-    assert mount.statuses["abort"].state == "degraded"
-    assert mount.statuses["abort"].tool_count == 1
-    assert mount.clients == ()
-    assert "abort__echo" not in {schema["name"] for schema in registry.schemas}
-    assert "abort: degraded" in mount.render()
-    await mount.close()
+        assert result["isError"] is True
+        assert mount.statuses["abort"].state == "degraded"
+        assert mount.statuses["abort"].tool_count == 1
+        assert mount.clients == ()
+        assert "abort__echo" not in {schema["name"] for schema in registry.schemas}
+        assert "abort: degraded" in mount.render()
+    finally:
+        try:
+            release.touch()
+        finally:
+            await mount.close()
 
 
 @pytest.mark.asyncio
@@ -1051,9 +1060,14 @@ async def test_stdio_abort_kills_descendant_process(
     descendant_connected: asyncio.Future[
         tuple[asyncio.StreamReader, asyncio.StreamWriter]
     ] = asyncio.get_running_loop().create_future()
+    writer: asyncio.StreamWriter | None = None
 
-    def connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        descendant_connected.set_result((reader, writer))
+    def connected(
+        reader: asyncio.StreamReader, accepted_writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal writer
+        writer = accepted_writer
+        descendant_connected.set_result((reader, accepted_writer))
 
     server = await asyncio.start_server(connected, host="127.0.0.1", port=0)
     address = server.sockets[0].getsockname()[:2]
@@ -1080,12 +1094,20 @@ async def test_stdio_abort_kills_descendant_process(
 
         assert result["content"][0]["text"] == "tool execution canceled"
         assert await asyncio.wait_for(reader.read(), timeout=10) == b""
-        writer.close()
-        await writer.wait_closed()
     finally:
-        await client.close()
-        server.close()
-        await server.wait_closed()
+        try:
+            try:
+                release.touch()
+            finally:
+                await client.close()
+        finally:
+            try:
+                if writer is not None:
+                    writer.close()
+                    await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
 
 
 @pytest.mark.asyncio
@@ -2582,23 +2604,25 @@ async def test_stdio_exit_updates_mount_status(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"dead": _stdio_config("dead")}),
     )
-    degraded = asyncio.Event()
+    try:
+        degraded = asyncio.Event()
 
-    def schema_refresh(current: MCPMount) -> None:
-        if current.statuses["dead"].state == "degraded":
-            degraded.set()
+        def schema_refresh(current: MCPMount) -> None:
+            if current.statuses["dead"].state == "degraded":
+                degraded.set()
 
-    mount.set_schema_refresh(schema_refresh)
-    client = mount._clients["dead"]
-    process = client._process
-    assert process is not None
-    process.terminate()
-    await process.wait()
-    await asyncio.wait_for(degraded.wait(), timeout=10)
+        mount.set_schema_refresh(schema_refresh)
+        client = mount._clients["dead"]
+        process = client._process
+        assert process is not None
+        process.terminate()
+        await process.wait()
+        await asyncio.wait_for(degraded.wait(), timeout=10)
 
-    assert mount.statuses["dead"].state == "degraded"
-    assert "dead__echo" not in {schema["name"] for schema in registry.schemas}
-    await mount.close()
+        assert mount.statuses["dead"].state == "degraded"
+        assert "dead__echo" not in {schema["name"] for schema in registry.schemas}
+    finally:
+        await mount.close()
 
 
 @pytest.mark.asyncio
