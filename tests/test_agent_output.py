@@ -4,7 +4,7 @@ import json
 import multiprocessing
 import os
 import threading
-from multiprocessing.connection import Connection, wait
+from multiprocessing.connection import Connection
 from pathlib import Path
 
 import pytest
@@ -1440,7 +1440,7 @@ async def test_resident_root_discovers_descendant_created_by_second_process(
         assert status["structuredContent"]["children"][0]["handle"] == "root:1:1"
         assert "cross-process answer" in output["content"][0]["text"]
         parent_pipe.send("close")
-        await asyncio.to_thread(wait, [process.sentinel], 10)
+        await asyncio.to_thread(process.join, 10)
         process_exitcode = process.exitcode
         assert process_exitcode == 0
 
