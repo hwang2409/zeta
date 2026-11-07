@@ -1051,7 +1051,20 @@ class ApprovalLifecycle:
             if record.disposition == "active":
                 self._externalize(record)
             return
-        if record.phase != "pending":
+        if record.phase == "settling":
+            settlement = record.settlement
+            if settlement is not None and settlement is not asyncio.current_task():
+                try:
+                    await asyncio.shield(settlement)
+                except asyncio.CancelledError:
+                    if not settlement.cancelled():
+                        raise
+                except Exception:  # noqa: BLE001 - settlement owns its failure path
+                    pass  # noqa: S110 - the settlement already handled the failure
+            record = self._state.records.get(key)
+            if record is None:
+                return
+        if record.phase != "pending" and record.phase != "settling":
             return
         resolution = record.target.store.approval_resolution_data(
             record.target.store_request_id
