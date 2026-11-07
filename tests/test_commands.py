@@ -84,9 +84,16 @@ def _approval_presentation_event(
     return approval_presented
 
 
+# test-contract: seam no public event reports submission-consumer completion.
 async def _drain_submission_consumer(app: TUIApp) -> None:
     while (consumer := app._submissions._consumer) is not None:
         await asyncio.wait_for(asyncio.shield(consumer), timeout=10)
+
+
+# test-contract: seam no public event reports active provider-turn completion.
+async def _wait_for_active_task(app: TUIApp) -> None:
+    assert app._active_task is not None
+    await asyncio.wait_for(asyncio.shield(app._active_task), timeout=10)
 
 
 def test_loads_home_and_project_commands_with_project_precedence(tmp_path: Path) -> None:
@@ -694,8 +701,7 @@ async def test_handler_failure_acknowledges_entry_and_advances_pipeline(
     )
 
     await _drain_submission_consumer(app)
-    assert app._active_task is not None
-    await asyncio.wait_for(asyncio.shield(app._active_task), timeout=10)
+    await _wait_for_active_task(app)
     # test-contract: durability the next queued submission dispatches exactly once.
     assert len(backend.calls) == 1, "pipeline did not advance after handler failure"
     assert "submission failed: forced handler failure" in app.console.file.getvalue()
@@ -737,8 +743,7 @@ async def test_provider_start_failure_rolls_back_and_advances_pipeline(
     await app._handle_prompt_value("later")
 
     await _drain_submission_consumer(app)
-    assert app._active_task is not None
-    await asyncio.wait_for(asyncio.shield(app._active_task), timeout=10)
+    await _wait_for_active_task(app)
     # test-contract: durability the next queued submission dispatches exactly once.
     assert len(backend.calls) == 1, "pipeline did not advance after provider failure"
     assert attempts == 2
@@ -786,8 +791,7 @@ async def test_same_tick_provider_failure_dispatches_the_next_submission(
     )
 
     await _drain_submission_consumer(app)
-    assert app._active_task is not None
-    await asyncio.wait_for(asyncio.shield(app._active_task), timeout=10)
+    await _wait_for_active_task(app)
     # test-contract: durability the second queued submission dispatches exactly once.
     assert len(backend.calls) == 1, "second submission was not dispatched"
     assert attempts == 2
@@ -1201,6 +1205,7 @@ async def test_unmapped_durable_approval_is_finalized(
     verb = "approve" if decision is ApprovalDecision.ALLOW else "deny"
     await app._handle_prompt_value(f"/{verb} {old_call.id}")
     await _drain_submission_consumer(app)
+    # test-contract: seam no public event reports durable approval-finalization completion.
     durable_task = app._submissions._durable_tasks.get(old_call.id)
     if durable_task is not None:
         await asyncio.wait_for(asyncio.shield(durable_task), timeout=10)
@@ -1272,6 +1277,7 @@ skill_catalog=SkillCatalog.empty(),
     )
     await asyncio.wait_for(started.wait(), timeout=10)
     assert app._submissions.active
+    # test-contract: seam no public event reports durable approval-finalization completion.
     durable_task = app._submissions._durable_tasks[old_call.id]
     app.abort_active()
     await asyncio.wait_for(asyncio.shield(durable_task), timeout=10)
@@ -1331,6 +1337,7 @@ skill_catalog=SkillCatalog.empty(),
         ApprovalDecision.ALLOW, old_call.id
     )
     await asyncio.wait_for(started.wait(), timeout=10)
+    # test-contract: seam no public event reports durable approval-finalization completion.
     durable_task = app._submissions._durable_tasks[old_call.id]
     await app._submissions.submit_text("later")
     assert backend.calls == []
@@ -1339,8 +1346,7 @@ skill_catalog=SkillCatalog.empty(),
     release.set()
     await asyncio.wait_for(asyncio.shield(durable_task), timeout=10)
     await _drain_submission_consumer(app)
-    assert app._active_task is not None
-    await asyncio.wait_for(asyncio.shield(app._active_task), timeout=10)
+    await _wait_for_active_task(app)
     # test-contract: durability durable finalization releases one provider dispatch.
     assert len(backend.calls) == 1, "submission was not dispatched after durable result"
 
@@ -1424,6 +1430,7 @@ async def test_inline_approval_queues_unrelated_submission(
     await app._handle_prompt_value("second")
     assert len(app._approval_queue) == 1
     key = app.pending_approvals[0].key
+    # test-contract: seam no public event reports command-preprocessing completion.
     preprocessing_task = next(iter(app._preprocessing_tasks.values()))
     await app._handle_prompt_value(f"/{decision} {key}")
     await first_task
@@ -1491,6 +1498,7 @@ async def test_undo_second_inline_submission_keeps_first_alive(
     first_id, second_id = app._inline_abort_signals
     first_signal = app._inline_abort_signals[first_id]
     second_signal = app._inline_abort_signals[second_id]
+    # test-contract: seam no public event reports command-preprocessing completion.
     second_preprocessing = app._preprocessing_tasks[second_id]
     app.undo_sent_turn()
     await _drain_submission_consumer(app)
@@ -1549,6 +1557,7 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
     first_id, second_id = app._inline_abort_signals
     first_signal = app._inline_abort_signals[first_id]
     second_signal = app._inline_abort_signals[second_id]
+    # test-contract: seam no public event reports command-preprocessing completion.
     first_preprocessing = app._preprocessing_tasks[first_id]
     app.abort_active(first_id)
     await _drain_submission_consumer(app)
@@ -2080,6 +2089,7 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
     app._submit_input("/wait")
     await _drain_submission_consumer(app)
     assert app.active
+    # test-contract: seam no public event reports active provider-turn completion.
     task = app._active_task
     assert task is not None
     app.abort_active()
@@ -2154,7 +2164,7 @@ async def test_macro_input_loop_keeps_processing_approval_input(
     await asyncio.wait_for(approval_presented.wait(), timeout=10)
     key = app.pending_approvals[0].key
     await app._handle_prompt_value(f"/approve {key}")
-    await asyncio.wait_for(app._active_task, timeout=10)
+    await _wait_for_active_task(app)
     await app.close()
 
 
@@ -2175,7 +2185,7 @@ async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path)
     await app._handle_prompt_value("/first")
     await app._handle_prompt_value("/second")
     await app._handle_prompt_value("continue")
-    await asyncio.wait_for(app._active_task, timeout=10)
+    await _wait_for_active_task(app)
 
     user_message = next(message for message in backend.calls[0][0] if message.role.value == "user")
     assert user_message.content[0].text.startswith(
@@ -2205,6 +2215,7 @@ async def test_macro_receipts_commit_in_submission_order_when_completion_reverse
         app._handle_prompt_value("/second"),
     )
     await _drain_submission_consumer(app)
+    # test-contract: seam no public event reports all command-preprocessing completions.
     command_tasks = tuple(app._submissions.preprocessing_tasks.values())
     await asyncio.wait_for(asyncio.gather(*command_tasks), timeout=10)
     await _drain_submission_consumer(app)
@@ -2216,8 +2227,7 @@ async def test_macro_receipts_commit_in_submission_order_when_completion_reverse
 
     await app._handle_prompt_value("continue")
     await _drain_submission_consumer(app)
-    assert app._active_task is not None
-    await asyncio.wait_for(asyncio.shield(app._active_task), timeout=10)
+    await _wait_for_active_task(app)
     # test-contract: durability the queued prompt dispatches exactly once.
     assert len(backend.calls) == 1, "provider turn did not start"
     user_message = next(
@@ -2290,7 +2300,7 @@ async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
 
     await app._handle_prompt_value("/first")
     if app._active_task is not None:
-        await asyncio.wait_for(app._active_task, timeout=10)
+        await _wait_for_active_task(app)
         app._active_task = None
     assert list(app._macro_receipts) == ["ran /first, exit 0"]
 
@@ -2331,10 +2341,11 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
         console=Console(file=StringIO(), force_terminal=False),
     )
     canceled = asyncio.Event()
+    background_release = asyncio.Event()
 
     async def background() -> None:
         try:
-            await asyncio.sleep(30)
+            await background_release.wait()
         except asyncio.CancelledError:
             canceled.set()
             raise
@@ -2344,6 +2355,7 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
     app._submit_input("/wait")
     await _drain_submission_consumer(app)
     assert app.active
+    # test-contract: seam no public event reports active provider-turn completion.
     macro_task = app._active_task
     assert macro_task is not None
 

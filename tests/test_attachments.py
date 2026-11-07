@@ -767,6 +767,7 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
         ),
         multiline=True,
     )
+    # test-contract: seam no public event reports prompt-session readiness for /paste.
     app._active_session = session
 
     await app._handle_prompt_value("/paste")
