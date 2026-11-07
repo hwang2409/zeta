@@ -14,12 +14,7 @@ import pytest
 
 from zeta.cli.main import main
 from zeta.core import session as session_module
-from zeta.core.session import (
-    SessionError,
-    SessionInUseError,
-    SessionManager,
-    SessionOwnedError,
-)
+from zeta.core.session import SessionError, SessionInUseError, SessionManager, SessionOwnedError
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -53,18 +48,10 @@ def test_rename_refuses_symlinks_without_external_writes(tmp_path, location):
         (directory / location).unlink()
         # The review probe: opening .meta.lock must not create this target.
         (directory / location).symlink_to(outside / "must-not-create")
-    before = {
-        p.relative_to(outside): p.read_bytes()
-        for p in outside.rglob("*")
-        if p.is_file()
-    }
+    before = {p.relative_to(outside): p.read_bytes() for p in outside.rglob("*") if p.is_file()}
     with pytest.raises(SessionError):
         manager.rename(sid, "changed")
-    after = {
-        p.relative_to(outside): p.read_bytes()
-        for p in outside.rglob("*")
-        if p.is_file()
-    }
+    after = {p.relative_to(outside): p.read_bytes() for p in outside.rglob("*") if p.is_file()}
     assert after == before
     assert not (outside / "must-not-create").exists()
 
@@ -98,12 +85,7 @@ def test_delete_refuses_open_store_until_owner_closes(tmp_path, monkeypatch):
         with pytest.raises(SessionInUseError):
             manager.delete(sid)
         assert main(["session", "delete", sid, "--force"]) == 1
-        first.append_message(
-            with_message_origin(
-                Message(MessageRole.USER, [TextContent("still writable")]),
-                MessageOrigin.USER,
-            )
-        )
+        first.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("still writable")]), MessageOrigin.USER))
     finally:
         first.close()
     assert main(["session", "delete", sid, "--force"]) == 0
@@ -121,9 +103,7 @@ sys.stdin.read()
 """
     with subprocess.Popen(
         [sys.executable, "-c", script, str(manager.home), sid],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
     ) as process:
         try:
             assert process.stdout.readline() == "ready\n"
@@ -178,9 +158,7 @@ def test_delete_refuses_metadata_mutation_until_it_finishes(tmp_path, monkeypatc
     assert not (manager.sessions_dir / sid).exists()
 
 
-def test_directory_deleted_before_lease_acquisition_stays_deleted(
-    tmp_path, monkeypatch
-):
+def test_directory_deleted_before_lease_acquisition_stays_deleted(tmp_path, monkeypatch):
     manager, sid = closed_session(tmp_path)
     flock = fcntl.flock
     deleted = False
@@ -241,10 +219,7 @@ def test_discarded_store_releases_lease(tmp_path):
     assert not (manager.sessions_dir / sid).exists()
 
 
-@pytest.mark.parametrize(
-    "name",
-    [".lock", "conversation.jsonl", "session_state.json", "agent_lifecycle.json"],
-)
+@pytest.mark.parametrize("name", [".lock", "conversation.jsonl", "session_state.json", "agent_lifecycle.json"])
 def test_store_open_refuses_symlinks_without_creating_external_targets(tmp_path, name):
     manager, sid = closed_session(tmp_path)
     outside = tmp_path / "outside"
@@ -272,9 +247,7 @@ def test_export_refuses_external_conversation_symlink(tmp_path):
     assert sentinel.read_bytes() == b'{"secret":"outside"}\n'
 
 
-@pytest.mark.parametrize(
-    "operation", ["append", "repair", "state", "lifecycle", "agents"]
-)
+@pytest.mark.parametrize("operation", ["append", "repair", "state", "lifecycle", "agents"])
 def test_store_uses_lifetime_descriptor_after_directory_swap(tmp_path, operation):
     manager, sid = closed_session(tmp_path)
     store = manager.open(sid).store
@@ -286,23 +259,13 @@ def test_store_uses_lifetime_descriptor_after_directory_swap(tmp_path, operation
     original.symlink_to(outside, target_is_directory=True)
     try:
         if operation == "append":
-            store.append_message(
-                with_message_origin(
-                    Message(MessageRole.USER, [TextContent("saved")]),
-                    MessageOrigin.USER,
-                )
-            )
+            store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("saved")]), MessageOrigin.USER))
             assert b"saved" in (pinned / "conversation.jsonl").read_bytes()
         elif operation == "repair":
             with (pinned / "conversation.jsonl").open("ab") as handle:
                 handle.write(b'{"torn')
             with pytest.warns(RuntimeWarning, match="torn"):
-                store.append_message(
-                    with_message_origin(
-                        Message(MessageRole.USER, [TextContent("saved")]),
-                        MessageOrigin.USER,
-                    )
-                )
+                store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("saved")]), MessageOrigin.USER))
             assert b'"torn' not in (pinned / "conversation.jsonl").read_bytes()
         elif operation == "state":
             store.set_bash_cwd("/saved")
@@ -325,9 +288,7 @@ def test_child_store_rejects_symlink_in_nested_sessions_root(tmp_path):
     manager, sid = closed_session(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (manager.sessions_dir / sid / "agents").symlink_to(
-        outside, target_is_directory=True
-    )
+    (manager.sessions_dir / sid / "agents").symlink_to(outside, target_is_directory=True)
     with pytest.raises((SessionError, OSError)):
         ConversationStore(manager.sessions_dir / sid / "agents", session_id="1")
     with manager.open(sid).store as store, pytest.raises((SessionError, OSError)):
@@ -372,16 +333,9 @@ asyncio.run(main(ZetaServer(home=sys.argv[1], port=0, provider='codex')))
 """
     env = {**os.environ, "ZETA_HOME": str(manager.home)}
     server = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-u",
-        "-c",
-        script,
-        str(manager.home),
-        order,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
+        sys.executable, "-u", "-c", script, str(manager.home), order,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env=env,
     )
     writer = None
     try:
@@ -389,23 +343,9 @@ asyncio.run(main(ZetaServer(home=sys.argv[1], port=0, provider='codex')))
         assert port_line, (await server.stderr.read()).decode()
         port = int(port_line)
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-
         async def request(request_id, method, params):
-            writer.write(
-                (
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "method": method,
-                            "params": params,
-                        }
-                    )
-                    + "\n"
-                ).encode()
-            )
+            writer.write((json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n").encode())
             await writer.drain()
-
         await request(1, "hello", {"protocol_version": "1.1"})
         assert "result" in json.loads(await asyncio.wait_for(reader.readline(), 10))
         await request(2, "rename_session", {"session_id": sid, "name": "saved"})
@@ -413,16 +353,8 @@ asyncio.run(main(ZetaServer(home=sys.argv[1], port=0, provider='codex')))
 
         async def delete_cli():
             cli = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-c",
-                "from zeta.cli.main import main; raise SystemExit(main())",
-                "session",
-                "delete",
-                sid,
-                "--force",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
+                sys.executable, "-c", "from zeta.cli.main import main; raise SystemExit(main())", "session", "delete", sid, "--force",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
             )
             stdout, stderr = await asyncio.wait_for(cli.communicate(), 10)
             return cli.returncode, stdout + stderr
@@ -465,37 +397,18 @@ def test_storage_operations_never_pass_full_session_paths_to_os(tmp_path, monkey
             for argument in args[:2]:
                 if isinstance(argument, (str, bytes, os.PathLike)):
                     value = os.fsdecode(argument)
-                    assert value != root and not value.startswith(root + "/"), (
-                        function.__name__,
-                        value,
-                    )
+                    assert value != root and not value.startswith(root + "/"), (function.__name__, value)
             return function(*args, **kwargs)
-
         return call
 
     with monkeypatch.context() as patch:
-        for name in (
-            "open",
-            "replace",
-            "rename",
-            "unlink",
-            "stat",
-            "lstat",
-            "mkdir",
-            "rmdir",
-            "scandir",
-            "listdir",
-        ):
+        for name in ("open", "replace", "rename", "unlink", "stat", "lstat", "mkdir", "rmdir", "scandir", "listdir"):
             patch.setattr(os, name, checked(getattr(os, name)))
         patch.setattr(io, "open", checked(io.open))
         opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
         sid = opened.metadata.session_id
         store = opened.store
-        store.append_message(
-            with_message_origin(
-                Message(MessageRole.USER, [TextContent("saved")]), MessageOrigin.USER
-            )
-        )
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("saved")]), MessageOrigin.USER))
         store.set_bash_cwd(str(tmp_path))
         store.allocate_agent_index()
         store._agent_lifecycle = {"state": "completed"}
@@ -597,9 +510,7 @@ async def test_background_shutdown_stays_in_pinned_directory(tmp_path, replaceme
         pinned = directory
         (directory / "background_tasks.tmp").symlink_to(outside / "must-not-create")
     try:
-        task_id, _ = await tasks.start(
-            "printf contained", tmp_path, log_path=directory / "macro.log"
-        )
+        task_id, _ = await tasks.start("printf contained", tmp_path, log_path=directory / "macro.log")
         await tasks.wait(task_id)
     finally:
         await runtime.close()
@@ -616,9 +527,7 @@ async def test_background_shutdown_stays_in_pinned_directory(tmp_path, replaceme
     assert tasks._directory_fd is None
 
 
-async def test_session_lifecycle_has_no_absolute_session_file_operations(
-    tmp_path, monkeypatch
-):
+async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_path, monkeypatch):
     """Audit the real runtime, including tool and TUI persistence boundaries."""
     from pathlib import Path
 
@@ -637,15 +546,9 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(
     # No absolute open of a session child belongs in this allowlist.
     root_pinning_opens = {(str(home), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)}
     path_arguments = {
-        "open": (0,),
-        "os.rename": (0, 1),
-        "os.remove": (0,),
-        "os.mkdir": (0,),
-        "os.rmdir": (0,),
-        "os.scandir": (0,),
-        "os.listdir": (0,),
-        "os.stat": (0,),
-        "os.lstat": (0,),
+        "open": (0,), "os.rename": (0, 1), "os.remove": (0,), "os.mkdir": (0,),
+        "os.rmdir": (0,), "os.scandir": (0,), "os.listdir": (0,),
+        "os.stat": (0,), "os.lstat": (0,),
     }
 
     def audit(event, args):
@@ -658,7 +561,6 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(
         def call(path, *args, **kwargs):
             audit("os." + function.__name__, (path,))
             return function(path, *args, **kwargs)
-
         return call
 
     for name in ("stat", "lstat"):
@@ -684,15 +586,10 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(
         await runtime.create_session()
         store = runtime.opened.store
         sid = store.session_id
-        turn = [
-            event
-            async for event in runtime.loop.run_turn("hello", origin=MessageOrigin.USER)
-        ]
+        turn = [event async for event in runtime.loop.run_turn("hello", origin=MessageOrigin.USER)]
         assert any(event.type == StreamEventType.MESSAGE_UPDATE for event in turn)
         tasks = runtime.loop.tool_registry.background_tasks
-        task_id, _ = await tasks.start(
-            "printf background", tmp_path, log_path=store.session_dir / "background.log"
-        )
+        task_id, _ = await tasks.start("printf background", tmp_path, log_path=store.session_dir / "background.log")
         await tasks.wait(task_id)
         runtime.policy.always_allow = ("bash(printf foreground)",)
         result = await run_shell_macro(
@@ -712,12 +609,7 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(
         await draft.flush_pending()
         assert draft.load() == "draft text"
         draft.clear()
-        message = build_user_message(
-            "log",
-            tmp_path,
-            (store.session_dir / "background.log",),
-            session_store=store,
-        )
+        message = build_user_message("log", tmp_path, (store.session_dir / "background.log",), session_store=store)
         assert "background" in message.content[1].text
         renamed = await asyncio.to_thread(
             runtime.manager.rename, sid, "renamed", store.execution_lease
@@ -733,13 +625,8 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(
         if runtime is not None:
             await runtime.close()
         recording = False
-    assert {"open", "os.rename", "os.remove", "os.mkdir"} <= {
-        event for event, _ in events
-    }
-    assert any(
-        event == "open" and (args[0], args[2]) in root_pinning_opens
-        for event, args in events
-    )
+    assert {"open", "os.rename", "os.remove", "os.mkdir"} <= {event for event, _ in events}
+    assert any(event == "open" and (args[0], args[2]) in root_pinning_opens for event, args in events)
     assert not violations()
 
     # Each negative control uses the same listener and predicate as the runtime.
@@ -774,13 +661,9 @@ async def test_background_descriptor_keeps_lease_until_registry_close(tmp_path):
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
     manager = SessionManager(tmp_path / "home")
-    opened = await asyncio.to_thread(
-        lambda: manager.create(provider="codex", model="offline", cwd=tmp_path)
-    )
+    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="offline", cwd=tmp_path))
     store = opened.store
-    tasks = BackgroundTaskRegistry(
-        session_dir=store.session_dir, directory_fd=store.directory_fd
-    )
+    tasks = BackgroundTaskRegistry(session_dir=store.session_dir, directory_fd=store.directory_fd)
     store.close()
     try:
         with pytest.raises(SessionInUseError):
@@ -829,9 +712,7 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
         assert not (pinned / "draft").exists()
         path = composer.paste_image(store.session_dir, directory_fd=store.directory_fd)
         assert (pinned / path.name).read_bytes() == png
-        message = composer.build_user_message(
-            "image", tmp_path, (path,), session_store=store
-        )
+        message = composer.build_user_message("image", tmp_path, (path,), session_store=store)
         assert message.content[1].mime_type == "image/png"
         app = SimpleNamespace(loop=SimpleNamespace(store=store))
         composer.ComposerAttachmentMixin._delete_staged_attachment(app, path)
@@ -847,9 +728,7 @@ def test_child_transcript_reads_use_parent_descriptor(tmp_path):
 
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     store.allocate_agent_index()
-    child = ConversationStore(
-        store.session_dir / "agents", session_id="1", cwd=tmp_path
-    )
+    child = ConversationStore(store.session_dir / "agents", session_id="1", cwd=tmp_path)
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("pinned child")]))
     child.close()
     pinned = tmp_path / "pinned"
@@ -858,9 +737,7 @@ def test_child_transcript_reads_use_parent_descriptor(tmp_path):
     store.session_dir.rename(pinned)
     store.session_dir.symlink_to(outside, target_is_directory=True)
     try:
-        assert b"pinned child" in _read_child_file(
-            store, child.session_dir, "conversation.jsonl"
-        )
+        assert b"pinned child" in _read_child_file(store, child.session_dir, "conversation.jsonl")
         with pytest.raises((OSError, SessionError, ValueError)):
             AgentTranscriptSource(child.session_dir).refresh(recursive=True)
         assert list(outside.iterdir()) == []
