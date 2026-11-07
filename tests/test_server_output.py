@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, Literal
@@ -13,7 +14,8 @@ import pytest
 from tests import test_server_websocket as websocket
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import TIMEOUT, _socket_path
-from zeta.protocol.types import TextContent
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
 from zeta.server import connections as connections_module
 from zeta.server import server as server_module
@@ -68,6 +70,40 @@ async def _read_json(
         opcode, payload = await websocket._read_frame(reader)
         assert opcode == 1
     return json.loads(payload)
+
+
+async def _rpc(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    transport: Transport,
+    request_id: int,
+    method: str,
+    params: dict[str, object] | None = None,
+) -> dict[str, Any]:
+    await _send_json(
+        writer,
+        transport,
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params or {},
+        },
+    )
+    while True:
+        frame = await _read_json(reader, transport)
+        if frame.get("id") == request_id:
+            return frame
+
+
+async def _event(
+    reader: asyncio.StreamReader, transport: Transport, name: str
+) -> dict[str, Any]:
+    while True:
+        frame = await _read_json(reader, transport)
+        params = frame.get("params", {})
+        if params.get("event") == name:
+            return params
 
 
 async def _read_or_close(
@@ -504,6 +540,22 @@ async def test_controller_overflow_does_not_cancel_active_turn(
             status = (await _read_json(reconnect_reader, transport))["result"]
             assert status["session"]["session_id"] == session_id
             assert status["state"] == "idle"
+            assert status["last_turn_outcome"] == {
+                "turn_id": finalized_turn_ids[0],
+                "reason": "disconnect",
+            }
+            await _send_json(
+                reconnect_writer,
+                transport,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 51,
+                    "method": "status",
+                    "params": {},
+                },
+            )
+            repeated_status = (await _read_json(reconnect_reader, transport))["result"]
+            assert repeated_status["last_turn_outcome"] == status["last_turn_outcome"]
             await _send_json(
                 reconnect_writer,
                 transport,
@@ -707,4 +759,428 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
         await server.close()
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 10
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_status_outcome_follows_active_branch_and_connection_feature(
+    tmp_path: Path,
+    transport: Transport,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first result")]),
+            ScriptedTurn([TextContent("fork result")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        port=None,
+        ws_port=0 if transport == "websocket" else None,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    controller_reader, controller_writer = await _connect(
+        server, transport, "controller"
+    )
+    observer_writer: asyncio.StreamWriter | None = None
+    legacy_writer: asyncio.StreamWriter | None = None
+    try:
+        await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["served_turn_end"],
+            },
+        )
+        created = await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            2,
+            "new_session",
+            {"provider": "codex"},
+        )
+        session_id = created["result"]["session"]["session_id"]
+
+        observer_reader, observer_writer = await _connect(
+            server, transport, "observer", start=False
+        )
+        await _rpc(
+            observer_reader,
+            observer_writer,
+            transport,
+            3,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers", "served_turn_end"],
+            },
+        )
+        legacy_reader, legacy_writer = await _connect(
+            server, transport, "observer", start=False
+        )
+        await _rpc(
+            legacy_reader,
+            legacy_writer,
+            transport,
+            4,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers"],
+            },
+        )
+
+        empty = await _rpc(controller_reader, controller_writer, transport, 5, "status")
+        assert "last_turn_outcome" in empty["result"]
+        assert empty["result"]["last_turn_outcome"] is None
+        legacy_empty = await _rpc(legacy_reader, legacy_writer, transport, 6, "status")
+        assert "last_turn_outcome" not in legacy_empty["result"]
+
+        await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            7,
+            "send",
+            {"text": "first"},
+        )
+        started = await _event(controller_reader, transport, "turn_start")
+        first_turn_id = started["data"]["turn_id"]
+        await _event(controller_reader, transport, "agent_end")
+        first_status = (
+            await _rpc(controller_reader, controller_writer, transport, 8, "status")
+        )["result"]
+        first_outcome = {"turn_id": first_turn_id, "reason": "completed"}
+        assert first_status["last_turn_outcome"] == first_outcome
+        observer_status = (
+            await _rpc(observer_reader, observer_writer, transport, 9, "status")
+        )["result"]
+        assert observer_status["last_turn_outcome"] == first_outcome
+        legacy_status = (
+            await _rpc(legacy_reader, legacy_writer, transport, 10, "status")
+        )["result"]
+        assert "last_turn_outcome" not in legacy_status
+
+        history = await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            11,
+            "session_history",
+            {"session_id": session_id},
+        )
+        user_id = next(
+            row["id"]
+            for row in history["result"]["messages"]
+            if row.get("role") == "user"
+        )
+        tree = await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            12,
+            "session_tree",
+            {"session_id": session_id},
+        )
+        original_leaf = tree["result"]["branches"][0]["id"]
+        forked = await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            13,
+            "fork_message",
+            {"session_id": session_id, "message_id": user_id},
+        )
+        fork_leaf = next(
+            branch["id"] for branch in forked["result"]["branches"] if branch["current"]
+        )
+        fork_status = (
+            await _rpc(controller_reader, controller_writer, transport, 14, "status")
+        )["result"]
+        assert fork_status["last_turn_outcome"] is None
+
+        await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            15,
+            "switch_branch",
+            {"session_id": session_id, "head_id": original_leaf},
+        )
+        restored = (
+            await _rpc(controller_reader, controller_writer, transport, 16, "status")
+        )["result"]
+        assert restored["last_turn_outcome"] == first_outcome
+        await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            17,
+            "switch_branch",
+            {"session_id": session_id, "head_id": fork_leaf},
+        )
+        selected_fork = (
+            await _rpc(controller_reader, controller_writer, transport, 18, "status")
+        )["result"]
+        assert selected_fork["last_turn_outcome"] is None
+
+        await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            19,
+            "send",
+            {"text": "fork"},
+        )
+        fork_started = await _event(controller_reader, transport, "turn_start")
+        await _event(controller_reader, transport, "agent_end")
+        fork_outcome = (
+            await _rpc(controller_reader, controller_writer, transport, 20, "status")
+        )["result"]["last_turn_outcome"]
+        assert fork_outcome == {
+            "turn_id": fork_started["data"]["turn_id"],
+            "reason": "completed",
+        }
+        assert fork_outcome != first_outcome
+
+        observer_writer.close()
+        await observer_writer.wait_closed()
+        observer_reader, observer_writer = await _connect(
+            server, transport, "observer", start=False
+        )
+        await _rpc(
+            observer_reader,
+            observer_writer,
+            transport,
+            21,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers", "served_turn_end"],
+            },
+        )
+        reconnected = (
+            await _rpc(observer_reader, observer_writer, transport, 22, "status")
+        )["result"]
+        assert reconnected["last_turn_outcome"] == fork_outcome
+    finally:
+        controller_writer.close()
+        if observer_writer is not None:
+            observer_writer.close()
+        if legacy_writer is not None:
+            legacy_writer.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_status_projects_foreign_turn_end_after_resident_append(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        port=None,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server, "unix", "controller")
+    foreign: ConversationStore | None = None
+    try:
+        await _rpc(
+            reader,
+            writer,
+            "unix",
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["served_turn_end"],
+            },
+        )
+        created = await _rpc(
+            reader,
+            writer,
+            "unix",
+            2,
+            "new_session",
+            {"provider": "codex"},
+        )
+        session_id = created["result"]["session"]["session_id"]
+        assert server.runtime.opened is not None
+        resident = server.runtime.opened.store
+        foreign = ConversationStore(resident.root_dir, session_id=session_id)
+        await foreign.append_turn_end_async("1" * 32, "error")
+
+        resident.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("resident append")])
+        )
+
+        status = (await _rpc(reader, writer, "unix", 3, "status"))["result"]
+        assert status["last_turn_outcome"] == {
+            "turn_id": "1" * 32,
+            "reason": "error",
+        }
+    finally:
+        if foreign is not None:
+            foreign.close()
+        writer.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_observer_status_rejects_session_swap_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: Transport,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        port=None,
+        ws_port=0 if transport == "websocket" else None,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    controller_reader, controller_writer = await _connect(
+        server, transport, "controller"
+    )
+    observer_writer: asyncio.StreamWriter | None = None
+    stale: asyncio.Task[dict[str, Any]] | None = None
+    release_projection = threading.Event()
+    try:
+        await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["served_turn_end"],
+            },
+        )
+        session_a = (
+            await _rpc(
+                controller_reader,
+                controller_writer,
+                transport,
+                2,
+                "new_session",
+                {"provider": "codex"},
+            )
+        )["result"]["session"]["session_id"]
+        await _rpc(
+            controller_reader,
+            controller_writer,
+            transport,
+            3,
+            "send",
+            {"text": "finish"},
+        )
+        await _event(controller_reader, transport, "agent_end")
+
+        observer_reader, observer_writer = await _connect(
+            server, transport, "observer", start=False
+        )
+        await _rpc(
+            observer_reader,
+            observer_writer,
+            transport,
+            4,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers", "served_turn_end"],
+            },
+        )
+        observed_a = (
+            await _rpc(observer_reader, observer_writer, transport, 5, "status")
+        )["result"]
+        assert observed_a["session"]["session_id"] == session_a
+        assert observed_a["last_turn_outcome"]["reason"] == "completed"
+
+        projection_started = threading.Event()
+        original_project_status = connections_module.project_status
+
+        def gated_project_status(target: object, **kwargs: object) -> dict[str, Any]:
+            projection_started.set()
+            assert release_projection.wait(timeout=10), (
+                "status projection was not released"
+            )
+            return original_project_status(target, **kwargs)
+
+        # test-contract: seam pauses the off-loop projection after capture
+        monkeypatch.setattr(connections_module, "project_status", gated_project_status)
+        stale = asyncio.create_task(
+            _rpc(observer_reader, observer_writer, transport, 6, "status")
+        )
+        try:
+            projection_ready = await asyncio.wait_for(
+                asyncio.to_thread(projection_started.wait, 10), TIMEOUT
+            )
+        except TimeoutError:
+            release_projection.set()
+            stale.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(stale, return_exceptions=True), 10
+            )
+            raise
+        if not projection_ready:
+            release_projection.set()
+            stale.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(stale, return_exceptions=True), 10
+            )
+            pytest.fail("status projection did not start")
+        session_b = (
+            await _rpc(
+                controller_reader,
+                controller_writer,
+                transport,
+                7,
+                "new_session",
+                {"provider": "codex"},
+            )
+        )["result"]["session"]["session_id"]
+        release_projection.set()
+        stale_result = await asyncio.wait_for(stale, 10)
+        assert stale_result["error"]["code"] == -32003
+
+        fresh = (await _rpc(observer_reader, observer_writer, transport, 8, "status"))[
+            "result"
+        ]
+        assert fresh["session"]["session_id"] == session_b
+        assert fresh["last_turn_outcome"] is None
+    finally:
+        release_projection.set()
+        if stale is not None:
+            stale.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(stale, return_exceptions=True), 10
+            )
+        controller_writer.close()
+        if observer_writer is not None:
+            observer_writer.close()
+        await server.close()
