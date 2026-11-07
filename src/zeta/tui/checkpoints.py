@@ -780,7 +780,7 @@ def render_replayed_message(
 ) -> None:
     """Render one persisted message through the live transcript pipeline."""
 
-    message = _sanitize_replayed_message(message)
+    message = _sanitize_replayed_message(message, include_thoughts=include_thoughts)
     provider = replay_provider(
         message,
         session_path=session_path,
@@ -828,12 +828,15 @@ def render_replayed_message(
             print_unit(render_event(event))
 
 
-def _sanitize_replayed_message(message: Message) -> Message:
+def _sanitize_replayed_message(message: Message, *, include_thoughts: bool) -> Message:
     """Remove terminal controls before rendering persisted message text."""
 
+    # Thinking is only displayed when ``include_thoughts`` is set; hidden
+    # thinking stays raw because nothing reads it from this copy.
+    shown = (TextContent, ThinkingContent) if include_thoughts else TextContent
     content = [
         replace(block, text=strip_terminal_controls(block.text))
-        if isinstance(block, (TextContent, ThinkingContent))
+        if isinstance(block, shown)
         else block
         for block in message.content
     ]
