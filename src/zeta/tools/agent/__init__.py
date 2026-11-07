@@ -1048,6 +1048,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "agent_status",
         _agent_status,
+        binding="shared",
         description=(
             "Inspect child agents from this session. Pass a child handle for "
             "one child, or omit it to list unfinished children. Finished children "
@@ -1081,6 +1082,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "agent_output",
         _agent_output,
+        binding="shared",
         description=(
             "Read a child agent transcript by handle. Output is bounded and "
             "paginated by character offset. This is read-only."
