@@ -31,6 +31,7 @@ from ...protocol.types import (
     require_new_message_origin,
 )
 from ...storage_format import WriterLease, open_writer
+from .. import session_execution
 from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
@@ -38,12 +39,6 @@ from ..checkpoints import (
     ConversationIntegrityError,
     active_branch,
     load_session_json,
-)
-from ..session_execution import (
-    OwnerSurface,
-    SessionExecutionLease,
-    StoreRuntimeLeaseMixin,
-    close_store_leases,
 )
 from ..session_files import (
     child_directory,
@@ -100,7 +95,7 @@ class ConversationStore(
     ConversationLogMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
-    StoreRuntimeLeaseMixin,
+    session_execution.StoreRuntimeLeaseMixin,
     AgentStateMixin,
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
@@ -122,8 +117,8 @@ class ConversationStore(
         _collect_persisted_appends: bool = False,
         _validated_log_state: _DetachedLogState | None = None,
         _storage_lease: WriterLease | None = None,
-        _execution_lease: SessionExecutionLease | None = None,
-        _owner_surface: OwnerSurface = "tui",
+        _execution_lease: session_execution.SessionExecutionLease | None = None,
+        _owner_surface: session_execution.OwnerSurface = "tui",
         _recovery_owner: bool = False,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
@@ -155,7 +150,7 @@ class ConversationStore(
             self.session_dir = self.root_dir / self.session_id
             self._read_only = _read_only
             self._must_exist = _must_exist
-            self._runtime_lease: SessionExecutionLease | None = None
+            self._runtime_lease: session_execution.SessionExecutionLease | None = None
             self._closed = False
             self._closing = False
             self._owner_thread_id: int | None = None
@@ -227,7 +222,7 @@ class ConversationStore(
                     self._strict_snapshot_sync = False
                 self._release_lease = weakref.finalize(
                     self,
-                    close_store_leases,
+                    session_execution.close_store_leases,
                     self._runtime_lease,
                     lease.pop_all(),
                     self._storage_lease,

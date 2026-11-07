@@ -466,7 +466,13 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 logger.warning(
                     "Empty session preview for %s: %s", metadata.session_id, exc
                 )
-            in_use, owner_pid = self.session_owner_status(metadata.session_id)
+            try:
+                in_use, owner_pid = self.session_owner_status(metadata.session_id)
+            except SessionError as exc:
+                in_use, owner_pid = False, None
+                logger.warning(
+                    "Missing owner hint for %s: %s", metadata.session_id, exc
+                )
             previews.append(
                 SessionPreview(
                     session_id=metadata.session_id,

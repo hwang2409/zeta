@@ -3140,7 +3140,12 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
         retained_tail=8,
         compaction_budget=200_000,
     )
-    base_size = len(codec.response(0, {"sessions": [probe.to_dict()]}))
+    probe_wire = {
+        **probe.to_catalog_dict(),
+        "first_message_preview": "",
+        "in_use": False,
+    }
+    base_size = len(codec.response(0, {"sessions": [probe_wire]}))
     huge = SessionMetadata.new(
         session_id=probe.session_id,
         provider="codex",
@@ -5917,6 +5922,7 @@ async def test_list_sessions_page_touches_only_page_rows(
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", counted_open)
+    # test-contract: seam count catalog reconciliation without changing production
     monkeypatch.setattr(
         server.runtime.manager, "_reconcile_project_link", reconciliations.append
     )
@@ -6645,6 +6651,8 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
         expected.pop("name")
         # The only gated field is name; all original metadata and preview remain.
         row.pop("first_message_preview")
+        assert row.pop("in_use") is True
+        assert row.pop("owner_pid") == os.getpid()
         expected["updated_at"] = row["updated_at"]
         expected["system_prompt"] = expected["system_prompt"][:512]
         assert row == expected
