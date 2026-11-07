@@ -340,6 +340,27 @@ def make_merge(
     return merge, parents[1], parents[2]
 
 
+def _make_conflict_merge(r: Path) -> str:
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "b"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def branch(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def main(): pass\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "b"], cwd=r, check=False)
+    (r / "src/a.py").write_text(
+        "def main(): pass\n<<<<<<< HEAD\ndef branch(): pass\n>>>>>>> b\n"
+    )
+    commit(r, "unresolved")
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+
+
 def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
@@ -369,6 +390,92 @@ def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     assert "merge does not parse:" in result.stderr
     assert "src/a.py:" in result.stderr
     assert "main:" not in result.stdout
+
+
+def test_moved_definition_is_info_against_final_head(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def kept(): pass\ndef branch(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def kept(): pass\ndef moved(): pass\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "merge")
+    merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    (r / "src/b.py").write_text("def moved(): pass\n")
+    commit(r, "move later")
+    final = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    result = run(r, merge, "--final", final)
+    assert result.returncode == 0
+    assert "moved/restored later: src/b.py:" in result.stdout
+
+
+def test_definition_absent_from_final_head_still_fails(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def kept(): pass\ndef branch(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def kept(): pass\ndef lost(): pass\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "merge")
+    merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    result = run(r, merge, "--final", merge)
+    assert result.returncode == 1
+    assert "lost" in result.stdout
+
+
+def test_historical_conflict_fixed_later_is_info(tmp_path: Path):
+    r = repo(tmp_path)
+    merge = _make_conflict_merge(r)
+    (r / "src/a.py").write_text("def main(): pass\ndef branch(): pass\n")
+    commit(r, "fix conflict")
+    final = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    result = run(r, merge, "--final", final)
+    assert result.returncode == 0
+    assert "fixed later" in result.stdout
+
+
+def test_final_conflict_marker_still_fails(tmp_path: Path):
+    r = repo(tmp_path)
+    merge = _make_conflict_merge(r)
+    result = run(r, merge, "--final", merge)
+    assert result.returncode == 2
+    assert "merge does not parse:" in result.stderr
+
+
+def test_parse_diagnostic_can_be_allowed(tmp_path: Path):
+    r = repo(tmp_path)
+    merge = _make_conflict_merge(r)
+    body = r / "body.txt"
+    body.write_text("merge-resolution: src/a.py parse -> intentional\n")
+    result = run(r, merge, "--pr-body-file", str(body))
+    assert result.returncode == 0
+    assert "allowed merge parse diagnostic" in result.stdout
 
 
 def test_parent_selection_reports_pr_merge(tmp_path: Path):

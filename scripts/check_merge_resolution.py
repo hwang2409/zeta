@@ -354,6 +354,99 @@ def resolve_parent(
     return main, branch, reason
 
 
+def _final_paths(revision: str) -> set[str]:
+    return {
+        path
+        for path in git(
+            "ls-tree", "-r", "--name-only", revision, "--", *ROOTS
+        ).splitlines()
+        if path.endswith(".py")
+    }
+
+
+def _final_index(
+    revision: str,
+) -> tuple[
+    dict[tuple[str, str, str, str], Item], dict[tuple[str, str], str | None], str | None
+]:
+    paths = _final_paths(revision)
+    sources = load_sources([revision], paths)
+    parsed, _unresolved, error = parse_revisions([revision], paths, sources)
+    error_path = error[1] if error else None
+    return parsed[revision], sources, error_path
+
+
+def _parse_error_status(
+    error: tuple[str, str, SyntaxError],
+    text: str,
+    commit: str,
+    final_revision: str | None,
+    final_sources: dict[tuple[str, str], str | None],
+    final_error_path: str | None,
+) -> int:
+    revision, path, syntax = error
+    lines = text.splitlines()
+    if any(line.startswith(f"merge-resolution: {path} parse ->") for line in lines):
+        print(f"allowed merge parse diagnostic: {revision}:{path}")
+        return 0
+    final_text = final_sources.get((final_revision, path)) if final_revision else None
+    fixed_later = (
+        final_revision
+        and commit != final_revision
+        and final_error_path is None
+        and final_text is not None
+        and not any(
+            line.startswith(("<<<<<<<", "=======", ">>>>>>>"))
+            for line in final_text.splitlines()
+        )
+    )
+    if fixed_later:
+        print(
+            f"info: merge does not parse: {revision}:{path}:{syntax.lineno} "
+            f"(conflict marker?); fixed later in {final_revision}:{path}"
+        )
+        return 0
+    print(
+        f"merge does not parse: {revision}:{path}:{syntax.lineno} (conflict marker?)",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _final_match(finding: Item, item: Item) -> bool:
+    if finding.kind != item.kind:
+        return False
+    if finding.kind in {"collection element", "membership element"}:
+        return finding.value == item.value
+    if finding.kind == "constant":
+        return finding.name == item.name
+    if finding.kind in {"def", "async def", "class"}:
+        return finding.name.lstrip("_") == item.name.lstrip("_")
+    return finding.name == item.name and finding.value == item.value
+
+
+def _report_final_moves(
+    findings: list[Item], final_items: dict[tuple[str, str, str, str], Item]
+) -> list[Item]:
+    remaining: list[Item] = []
+    reported: set[tuple[str, str, str, str]] = set()
+    for finding in findings:
+        if item_key(finding) in reported:
+            continue
+        reported.add(item_key(finding))
+        match = next(
+            (item for item in final_items.values() if _final_match(finding, item)), None
+        )
+        if match is None:
+            remaining.append(finding)
+        else:
+            print(
+                f"info: {finding.path}: {finding.kind} {finding.name}: "
+                f"moved/restored later: {match.path}:{match.line}"
+            )
+    return remaining
+
+
 def _module_name(path: str) -> str:
     return path.removeprefix("src/").removesuffix(".py").replace("/", ".")
 
@@ -468,6 +561,9 @@ def main() -> int:
     )
     parser.add_argument("--allow", type=argparse.FileType("r"))
     parser.add_argument("--pr-body-file", type=argparse.FileType("r"))
+    parser.add_argument(
+        "--final", help="revision whose final tree contains later fixes and moves"
+    )
     args = parser.parse_args()
     commit = args.commit
     parents = git("rev-list", "--parents", "-n", "1", commit).split()[1:]
@@ -492,13 +588,22 @@ def main() -> int:
     revisions = [base, main, branch, commit]
     sources = load_sources(revisions, all_paths)
     parsed, unresolved, error = parse_revisions(revisions, all_paths, sources)
+    final_revision = args.final
+    if final_revision:
+        final_items, final_sources, final_error_path = _final_index(final_revision)
+    else:
+        final_items = {}
+        final_sources = {}
+        final_error_path = None
     if error:
-        revision, path, syntax = error
-        print(
-            f"merge does not parse: {revision}:{path}:{syntax.lineno} (conflict marker?)",
-            file=sys.stderr,
+        return _parse_error_status(
+            error,
+            text,
+            commit,
+            final_revision,
+            final_sources,
+            final_error_path,
         )
-        return 2
     old_items, main_items, branch_items, merge_items = (
         parsed[revision] for revision in revisions
     )
@@ -547,6 +652,8 @@ def main() -> int:
         for i, f in enumerate(findings)
         if f not in findings[:i] and not any(marker(line, f) for line in lines)
     ]
+    if final_revision:
+        findings = _report_final_moves(findings, final_items)
     if findings:
         for finding in findings:
             key = item_key(finding)
