@@ -156,6 +156,7 @@ async def test_tool_spawn_paths_preserve_process_contract(
         spawned_pids.append(pid)
         return pid
 
+    # test-contract: seam reset the process-wide capability decision between rows
     monkeypatch.setattr(
         tool_spawn, "_POSIX_SPAWN_SETSID_SUPPORTED", None, raising=False
     )
@@ -217,6 +218,7 @@ async def test_tool_spawn_paths_preserve_process_contract(
             os.close(inherited_read)
             os.close(inherited_write)
     elif scenario == "launcher_failure":
+        # test-contract: seam force failure before the private readiness byte
         monkeypatch.setattr(tool_spawn, "_LAUNCHER", "raise SystemExit(1)")
         spawn_error: BaseException | None = None
         try:
@@ -233,6 +235,7 @@ async def test_tool_spawn_paths_preserve_process_contract(
         marker_read, marker_write = os.pipe()
         operation: asyncio.Task[asyncio.subprocess.Process] | None = None
         marker: asyncio.Task[bytes] | None = None
+        # test-contract: seam hold the private launcher at its readiness boundary
         monkeypatch.setattr(
             tool_spawn,
             "_LAUNCHER",
