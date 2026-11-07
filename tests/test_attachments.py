@@ -493,7 +493,7 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
 
     cleanup_started = asyncio.Event()
     cleanup_canceled = app._paste_runtime._cleanup_canceled
-    deleted = asyncio.Event()
+    deleted = threading.Event()
     delete_staged = app._paste_runtime._delete_staged
 
     async def record_cleanup(*args: object) -> None:
@@ -529,7 +529,7 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
         assert await asyncio.to_thread(returned[2].wait, 10)
         # The middle paste deleted its file, so its cleanup reached the point
         # where only the predecessor barrier keeps it from finishing.
-        await asyncio.wait_for(deleted.wait(), timeout=10)
+        assert await asyncio.to_thread(deleted.wait, 10)
         if second_cancel == "barrier":
             tasks[1].cancel()
         assert not tasks[1].done()
@@ -539,7 +539,8 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
         # Never leave a staging thread blocked, even when an assertion fails.
         for gate in gates:
             gate.set()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        await app.close()
 
     assert isinstance(results[1], asyncio.CancelledError)
     assert buffer.text == "[Image #1][Image #2]"
@@ -547,7 +548,6 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
     assert paths[0].exists()
     assert not paths[1].exists()
     assert paths[2].exists()
-    await app.close()
 
 
 @pytest.mark.asyncio
@@ -770,13 +770,16 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
     # test-contract: seam no public event reports prompt-session readiness for /paste.
     app._active_session = session
 
-    await app._handle_prompt_value("/paste")
+    try:
+        await app._handle_prompt_value("/paste")
 
-    assert session.app.current_buffer.text == "[Image #1]"
-    await app.close()
-
-    assert app._pending_attachment_tokens == {"[Image #1]": app._pending_attachments[0]}
-    assert helper_threads and helper_threads != [loop_thread]
+        assert session.app.current_buffer.text == "[Image #1]"
+        assert app._pending_attachment_tokens == {
+            "[Image #1]": app._pending_attachments[0]
+        }
+        assert helper_threads and helper_threads != [loop_thread]
+    finally:
+        await app.close()
     assert notices == []
 
 
