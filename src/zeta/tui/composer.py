@@ -39,13 +39,13 @@ from ..submission.notification_retry import NotificationFailure, NotificationOut
 from . import theme
 from ._attachments import (
     ATTACHMENT_MAX_TEXT_BYTES,  # noqa: F401 - preserve the composer import
-    ATTACHMENT_TOKEN_RE,  # noqa: F401 - preserve the composer import
+    ATTACHMENT_TOKEN_RE,
     AttachmentRef,  # noqa: F401 - preserve the composer import
     _attachment_path,
     _image_media_type,  # noqa: F401 - preserve the composer import
     _read_attachment,  # noqa: F401 - preserve the composer import
     attachment_refs,  # noqa: F401 - preserve the composer import
-    build_user_message,  # noqa: F401 - preserve the composer import
+    build_user_message,
     paste_image,  # noqa: F401 - preserve the composer import
     prepare_attachments,
 )
@@ -585,6 +585,14 @@ class ComposerAttachmentMixin:
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_attachment_tokens,
         )
+        if (
+            not pending_paths
+            and not discarded_paths
+            and ATTACHMENT_TOKEN_RE.search(source) is None
+        ):
+            return build_user_message(
+                value, self.loop.store.cwd, attachment_value=source
+            )
         store = self.loop.store
         prepared_paths = self._paste_runtime.prepared_for(pending_paths)
         for path in discarded_paths:
