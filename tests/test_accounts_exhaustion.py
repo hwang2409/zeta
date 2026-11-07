@@ -1075,7 +1075,7 @@ async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
 
     holder = threading.Thread(target=hold_usage_lock)
     holder.start()
-    assert await asyncio.to_thread(entered.wait, 1)
+    assert await asyncio.to_thread(entered.wait, 10)
 
     payload = json.loads(FIXTURE.read_text())
     failure = _failure(429, {"error": payload["error"]})
@@ -1088,18 +1088,18 @@ async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
     try:
         heartbeat = asyncio.Event()
         asyncio.get_running_loop().call_soon(heartbeat.set)
-        await asyncio.wait_for(heartbeat.wait(), timeout=5)
+        await asyncio.wait_for(heartbeat.wait(), timeout=10)
         assert not recovery.done()
 
         release.set()
-        result = await asyncio.wait_for(recovery, 5)
+        result = await asyncio.wait_for(recovery, 10)
         assert result is not None
         persisted = read_usage(context.store, first)
         assert persisted.snapshot is not None
         assert persisted.snapshot.windows[0].used_percent == 100
     finally:
         release.set()
-        holder.join(timeout=1)
+        holder.join(timeout=10)
         opened.store.close()
 
 

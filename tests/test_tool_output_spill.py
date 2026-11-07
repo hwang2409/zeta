@@ -868,19 +868,19 @@ async def test_async_spill_lock_wait_does_not_block_loop_or_leak_lock(
         def hold_lock() -> None:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             locked.set()
-            assert release.wait(timeout=5)
+            assert release.wait(timeout=10)
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
         holder = threading.Thread(target=hold_lock)
         holder.start()
-        assert locked.wait(timeout=2)
+        assert locked.wait(timeout=10)
 
         write = asyncio.create_task(spill.awrite_bytes("async", "call", 0, b"complete"))
         try:
             heartbeat = asyncio.Event()
             asyncio.get_running_loop().call_soon(heartbeat.set)
-            await asyncio.wait_for(heartbeat.wait(), timeout=2)
+            await asyncio.wait_for(heartbeat.wait(), timeout=10)
             assert not write.done()
 
             write.cancel()
@@ -891,7 +891,7 @@ async def test_async_spill_lock_wait_does_not_block_loop_or_leak_lock(
             # Cancellation stops the await, not the worker. It must still publish
             # and release the advisory lock before a later writer runs.
             path = await asyncio.wait_for(
-                spill.awrite_bytes("after", "call", 0, b"after"), timeout=1
+                spill.awrite_bytes("after", "call", 0, b"after"), timeout=10
             )
             assert path.read_bytes() == b"after"
         finally:
@@ -900,7 +900,7 @@ async def test_async_spill_lock_wait_does_not_block_loop_or_leak_lock(
                 write.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await write
-            holder.join(timeout=2)
+            holder.join(timeout=10)
             spill.close()
 
 

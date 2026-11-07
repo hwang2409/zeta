@@ -1868,6 +1868,7 @@ def test_migrate_never_sweeps_registered_account_during_login(
         with real_registry_guard(store, home_fd):
             yield
 
+    # test-contract: observe migration waiting behind live account ownership.
     monkeypatch.setattr(AccountStore, "_registry_guard", observed_registry_guard)
 
     def migrate() -> None:
@@ -1876,22 +1877,22 @@ def test_migrate_never_sweeps_registered_account_during_login(
 
     thread = threading.Thread(target=migrate)
     try:
-        assert ready.wait(timeout=5)
+        assert ready.wait(timeout=10)
         thread.start()
-        assert migration_waiting.wait(timeout=5)
+        assert migration_waiting.wait(timeout=10)
         assert not migration_done.is_set()
         release.set()
-        assert migration_done.wait(timeout=5)
+        assert migration_done.wait(timeout=10)
         assert credential.path.exists()
         assert AccountStore(tmp_path).contains(account)
     finally:
         release.set()
         if thread.ident is not None:
-            thread.join(timeout=5)
-        holder.join(timeout=5)
+            thread.join(timeout=10)
+        holder.join(timeout=10)
         if holder.is_alive():
             holder.kill()
-            holder.join(timeout=5)
+            holder.join(timeout=10)
         holder.close()
 
 

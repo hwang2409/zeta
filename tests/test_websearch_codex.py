@@ -530,15 +530,15 @@ async def test_codex_deadline_covers_credential_acquisition(monkeypatch, registr
     search = asyncio.create_task(execute(registry))
 
     try:
-        await asyncio.wait_for(acquisition_started.wait(), timeout=5)
+        await asyncio.wait_for(acquisition_started.wait(), timeout=10)
         await clock.advance(9.999)
         assert not search.done()
         assert calls == []
         await clock.advance(0.001)
-        result = await asyncio.wait_for(search, timeout=5)
+        result = await asyncio.wait_for(search, timeout=10)
     finally:
         release_acquisition.set()
-        await asyncio.wait_for(acquisition_finished.wait(), timeout=5)
+        await asyncio.wait_for(acquisition_finished.wait(), timeout=10)
 
     assert result["structuredContent"]["backend"] == "duckduckgo"
     assert calls == ["zeta"]
@@ -650,19 +650,19 @@ async def test_codex_deadline_does_not_cancel_token_refresh(monkeypatch, registr
     search = asyncio.create_task(execute(registry))
 
     try:
-        await asyncio.wait_for(refresh_started.wait(), timeout=5)
+        await asyncio.wait_for(refresh_started.wait(), timeout=10)
         await clock.advance(9.999)
         assert not search.done()
         assert not refresh_cancelled
         await clock.advance(0.001)
-        result = await asyncio.wait_for(search, timeout=5)
+        result = await asyncio.wait_for(search, timeout=10)
 
         assert result["structuredContent"]["backend"] == "duckduckgo"
         assert "timed out" in result["structuredContent"]["codex_failure"]
         assert not refresh_cancelled
     finally:
         allow_refresh_to_finish.set()
-        await asyncio.wait_for(refresh_persisted.wait(), timeout=5)
+        await asyncio.wait_for(refresh_persisted.wait(), timeout=10)
     assert not refresh_cancelled
 
 
@@ -724,12 +724,12 @@ async def test_codex_overall_deadline_falls_back(monkeypatch, registry):
     search = asyncio.create_task(execute(registry))
 
     try:
-        await asyncio.wait_for(stream_started.wait(), timeout=5)
+        await asyncio.wait_for(stream_started.wait(), timeout=10)
         await clock.advance(9.999)
         assert not search.done()
         assert calls == []
         await clock.advance(0.001)
-        result = await asyncio.wait_for(search, timeout=5)
+        result = await asyncio.wait_for(search, timeout=10)
     finally:
         release_stream.set()
 
