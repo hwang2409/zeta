@@ -381,22 +381,18 @@ async def _build_child_loop(
         if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
             excluded_names.add("agent")
         staged_names = {"ask_parent"} if follow_up_loop else set()
-        resolvable_names = (
-            set(loop.tool_registry.policy_allowed_registered_names) - excluded_names
-        )
-        resolvable_names.update(
-            name
-            for name in staged_names
-            if name not in excluded_names
-            and loop.tool_registry.tool_is_allowed_by_policy(name)
-        )
+        resolvable_names = set(loop.tool_registry.policy_allowed_registered_names)
+        resolvable_names.difference_update(excluded_names)
+        for name in staged_names - excluded_names:
+            if loop.tool_registry.tool_is_allowed_by_policy(name):
+                resolvable_names.add(name)
         profile_tool_allow = preset.tool_names
         if profile_tool_allow is not None:
             unresolved_names = profile_tool_allow - resolvable_names
             if unresolved_names:
-                unresolved = ", ".join(sorted(unresolved_names))
                 raise ValueError(
-                    f"profile {preset.name!r} requests unavailable tools: {unresolved}"
+                    f"profile {preset.name!r} requests unavailable tools: "
+                    + ", ".join(sorted(unresolved_names))
                 )
             allowed_names = set(profile_tool_allow)
             if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
