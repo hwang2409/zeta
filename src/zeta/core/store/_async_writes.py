@@ -174,6 +174,10 @@ class AsyncDurableWritesMixin:
                 writer = self._new_persistent_durable_writer()
                 self._durable_writer = writer
             self._before_committed_mutation()
+            if cancelled_before_write.is_set() and not isinstance(
+                command, _MethodMutation
+            ):
+                raise asyncio.CancelledError
             cancelled_before_write.write_started.set()
             delta = execute_mutation(writer, command, expected_generation)
             return delta, writer.take_persisted_appends()
