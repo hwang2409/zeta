@@ -1055,7 +1055,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         settlement = self._request_serve_abort(request_id)
         if settlement is None:
             return self.abort_or_winner(request_id, capability=capability)
-        resolution = await settlement
+        resolution = await asyncio.shield(settlement)
         return _resolved_decision(
             resolution["decision"] if resolution is not None else None
         )
