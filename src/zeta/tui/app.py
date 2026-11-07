@@ -34,7 +34,6 @@ from ..core.project_context import (
 )
 from ..core.session import SessionMetadata, env_home
 from ..core.slash import (
-    SlashCommand,
     SlashStatus,
     UsageTracker,
     _format_status,
@@ -124,32 +123,6 @@ def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
         overlay.rule(),
         overlay.hint("↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"),
     ]
-
-def _tui_slash_commands() -> tuple[SlashCommand, ...]:
-    """Commands that require the full-screen terminal UI."""
-
-    return (
-        SlashCommand(
-            "approve", lambda app, args: app.slash_approve(args), "/approve [key]"
-        ),
-        SlashCommand(
-            "always",
-            lambda app, args: app.slash_always(args),
-            "/always [key] — allow this tool/action for the running session",
-        ),
-        SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
-        SlashCommand("accounts", lambda app, args: app.slash_accounts(args), "switch account"),
-        SlashCommand(
-            "restart",
-            lambda app, args: app.slash_restart(args),
-            "restart this session from the local checkout (reinstall after pyproject changes)",
-        ),
-        SlashCommand(
-            "permissions",
-            lambda app, args: app.slash_permissions(args),
-            "show rules; revoke a session grant: /permissions revoke <grant>; clear all: /permissions clear",
-        ),
-    )
 
 def _prompt_style_with_background(
     foreground: str, background: str, *, background_first: bool = False
@@ -308,7 +281,6 @@ class TUIApp(
             project_dir=repo_root,
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
-            extra_commands=_tui_slash_commands(),
         )
         self.loop.add_skill_catalog_listener(self._slash_commands.register_skills)
         self.loop.set_mcp_prompt_refresh(
@@ -670,8 +642,6 @@ class TUIApp(
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
-        if self._open_overlay_from_submit(value):
-            return True
         if self._agent_navigation.child_view_active and not value.lstrip().startswith("/"):
             return self._send_to_child(value)
         self._paste_runtime.advance_buffer_generation()
@@ -681,21 +651,23 @@ class TUIApp(
     def _status_toolbar(self) -> list[tuple[str, str]]:
         return status_toolbar(self, get_app().output.get_size().columns)
 
+    def _consume_overlay_submission(self) -> None:
+        session = self._active_session
+        if isinstance(session, FullScreenPromptSession):
+            session.default_buffer.reset()
+            self._draft.clear()
+
     @property
     def status_card_active(self) -> bool:
         return self._status_card_open and self._full_screen_active()
 
-    def open_status_card(self, *, restore_composer: bool = True) -> None:
+    def open_status_card(self) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
-        if restore_composer:
-            self._status_restore_text = buffer.text
-            self._status_restore_cursor = buffer.cursor_position
-        else:
-            self._status_restore_text = ""
-            self._status_restore_cursor = 0
+        self._status_restore_text = buffer.text
+        self._status_restore_cursor = buffer.cursor_position
         self._status_card.set_lines(_status_card_lines(self.slash_status()))
         self._status_card_open = True
         session.layout.focus(self._status_card_window)

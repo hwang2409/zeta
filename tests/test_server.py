@@ -9,6 +9,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import re
 import shlex
 import signal
 import socket
@@ -54,6 +55,7 @@ from tests.support.server_client import (
 from tests.support.server_client import (
     request as _buffered_request,
 )
+from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -100,9 +102,10 @@ from zeta.server.protocol import (
     MAX_REQUEST_ID_BYTES,
     EventDescriptor,
     FrameCodec,
+    SlashResultKindDescriptor,
 )
 from zeta.server.server import _Client
-from zeta.server.slash_commands import ServerSlashSession
+from zeta.server.slash_commands import _SERVE_MCP_VERBS, ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tui.render import render_event
@@ -1776,7 +1779,10 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             agent_ended.set()
         return published
 
-    monkeypatch.setattr(server.control._approvals, "_publish", delay_delegated_approval_end)
+    # test-contract: seam forces approval-end publication ordering
+    monkeypatch.setattr(
+        server.control._approvals, "_publish", delay_delegated_approval_end
+    )
     monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
@@ -2090,9 +2096,7 @@ async def test_status_surfaces_transcript_index_failure(
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
         )
-        assert status["connection_setup_counts"] == list(
-            loop.connection_setup_counts()
-        )
+        assert status["connection_setup_counts"] == list(loop.connection_setup_counts())
         assert status["max_agent_depth"] == 3
     finally:
         await _close(server, writer)
@@ -3262,7 +3266,12 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
         retained_tail=8,
         compaction_budget=200_000,
     )
-    base_size = len(codec.response(0, {"sessions": [probe.to_dict()]}))
+    probe_wire = {
+        **probe.to_catalog_dict(),
+        "first_message_preview": "",
+        "in_use": False,
+    }
+    base_size = len(codec.response(0, {"sessions": [probe_wire]}))
     huge = SessionMetadata.new(
         session_id=probe.session_id,
         provider="codex",
@@ -5031,9 +5040,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
-        await asyncio.wait_for(
-            asyncio.gather(first_turn, return_exceptions=True), 10
-        )
+        await asyncio.wait_for(asyncio.gather(first_turn, return_exceptions=True), 10)
         assert [
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
@@ -5244,8 +5251,7 @@ async def test_close_kill_cause_reaches_live_serve_event(
 
         task_frames = history_frames
         if not any(
-            frame.get("params", {}).get("event") == "turn_end"
-            for frame in task_frames
+            frame.get("params", {}).get("event") == "turn_end" for frame in task_frames
         ):
             task_frames += await _frames_until_event(reader, "turn_end")
         events = [
@@ -5260,9 +5266,9 @@ async def test_close_kill_cause_reaches_live_serve_event(
         assert task_events[0]["data"]["task_id"] == task_id
         assert task_events[0]["data"]["kind"] == "task_exited"
         assert task_events[0]["data"]["note"] == task_cause
-        assert {
-            e["data"].get("kind", "agent_completion") for e in receipt_events
-        } == {"agent_completion"}
+        assert {e["data"].get("kind", "agent_completion") for e in receipt_events} == {
+            "agent_completion"
+        }
         assert len(backend.calls) == 1
     finally:
         await _close(server, writer)
@@ -5861,7 +5867,9 @@ async def test_attachment_failure_removes_entire_batch(
             patch.setattr(image_delivery.os, "replace", failing_replace)
             with pytest.raises(OSError):
                 await asyncio.to_thread(
-                    image_delivery.prepare_image_delivery, runtime, {"images": [item, item]}
+                    image_delivery.prepare_image_delivery,
+                    runtime,
+                    {"images": [item, item]},
                 )
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
@@ -6310,6 +6318,8 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
         await _event(reader, "turn_end")
         result = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]
         assert result["sessions"][0]["first_message_preview"] == "first message preview"
+        assert result["sessions"][0]["in_use"] is True
+        assert result["sessions"][0]["owner_pid"] == os.getpid()
         assert "name" not in result["sessions"][0]
     finally:
         await _close(server, writer)
@@ -6325,9 +6335,9 @@ async def test_list_sessions_page_touches_only_page_rows(
         opened = await asyncio.to_thread(
             manager.create, provider="codex", model="offline", cwd=tmp_path
         )
-        opened.store.close()
         opened.metadata.updated_at = f"2030-01-01T00:00:0{index}+00:00"
         await asyncio.to_thread(manager._write, opened.metadata)
+        opened.store.close()
         sessions.append(opened.metadata.session_id)
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
@@ -6341,6 +6351,7 @@ async def test_list_sessions_page_touches_only_page_rows(
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", counted_open)
+    # test-contract: seam count catalog reconciliation without changing production
     monkeypatch.setattr(
         server.runtime.manager, "_reconcile_project_link", reconciliations.append
     )
@@ -6365,7 +6376,7 @@ async def test_list_sessions_page_touches_only_page_rows(
         result = frame["result"]
         assert [row["session_id"] for row in result["sessions"]] == [sessions[-1]]
         assert len(preview_reads) == 1
-        assert reconciliations == [sessions[-1]]
+        assert reconciliations == []
     finally:
         await _close(server, writer)
 
@@ -6481,9 +6492,9 @@ async def test_catalog_row_bounds_system_prompt(tmp_path: Path) -> None:
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="offline", cwd=tmp_path
     )
-    opened.store.close()
     opened.metadata.system_prompt = "x" * 100_000
     await asyncio.to_thread(manager._write, opened.metadata)
+    opened.store.close()
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
@@ -7344,6 +7355,8 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
         expected.pop("name")
         # The only gated field is name; all original metadata and preview remain.
         row.pop("first_message_preview")
+        assert row.pop("in_use") is True
+        assert row.pop("owner_pid") == os.getpid()
         expected["updated_at"] = row["updated_at"]
         expected["system_prompt"] = expected["system_prompt"][:512]
         assert row == expected
@@ -7672,11 +7685,195 @@ def _seed_slash_fixtures(tmp_path: Path) -> Path:
     return project
 
 
+async def _raw_response_line(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request_id: str,
+    method: str,
+    params: dict[str, Any],
+) -> str:
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+    )
+    await writer.drain()
+    while True:
+        line = await asyncio.wait_for(reader.readline(), timeout=TIMEOUT)
+        frame = json.loads(line)
+        if frame.get("id") == request_id:
+            return line.decode().removesuffix("\n")
+
+
+async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
+    server = ZetaServer(home=home, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        return await _raw_response_line(reader, writer, "hello", "hello", params)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> None:
+    observed = [
+        await _hello_wire_line(
+            tmp_path / "hello-1.0", {"protocol_version": "1.0"}
+        ),
+        await _hello_wire_line(
+            tmp_path / "hello-1.1",
+            {
+                "protocol_version": "1.1",
+                "features": ["model_input_ids"],
+            },
+        ),
+    ]
+    observer_home = tmp_path / "hello-observer"
+    observer_server = ZetaServer(
+        home=observer_home,
+        port=0,
+        provider="codex",
+    )
+    controller_reader, controller_writer = await _connect(observer_server)
+    await _request(
+        controller_reader,
+        controller_writer,
+        "controller",
+        "hello",
+        {"protocol_version": "1.2", "features": ["serve_observers"]},
+    )
+    assert observer_server.port is not None
+    observer_reader, observer_writer = await asyncio.open_connection(
+        "127.0.0.1", observer_server.port
+    )
+    try:
+        observed.append(
+            await _raw_response_line(
+                observer_reader,
+                observer_writer,
+                "observer",
+                "hello",
+                {
+                    "protocol_version": "1.2",
+                    "role": "observer",
+                    "features": ["serve_observers"],
+                },
+            )
+        )
+    finally:
+        observer_writer.close()
+        await observer_writer.wait_closed()
+        await _close(observer_server, controller_writer)
+
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        observed.extend(
+            [
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "list-default",
+                    "slash_list",
+                    {"session_id": sid},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "list-complete",
+                    "slash_list",
+                    {"session_id": sid, "include_unavailable": True},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "mcp-bare",
+                    "slash_run",
+                    {"session_id": sid, "text": "/mcp"},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "mcp-status",
+                    "slash_run",
+                    {"session_id": sid, "text": "/mcp status"},
+                ),
+            ]
+        )
+    finally:
+        await _close(server, writer)
+
+    help_project = tmp_path / "help-project"
+    help_project.mkdir()
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "init", "--quiet", str(help_project)],
+        check=True,
+        capture_output=True,
+    )
+    help_server = ZetaServer(
+        home=tmp_path / "help-home",
+        cwd=help_project,
+        port=0,
+        provider="codex",
+    )
+    help_reader, help_writer, help_sid = await _ready_extensions(help_server)
+    try:
+        observed.append(
+            await _raw_response_line(
+                help_reader,
+                help_writer,
+                "help",
+                "slash_run",
+                {"session_id": help_sid, "text": "/help"},
+            )
+        )
+    finally:
+        await _close(help_server, help_writer)
+
+    fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
+    rows = fixture.read_text().splitlines()
+    assert rows[0] == (
+        "# baseline origin/main 66c084d8; accepted deltas: "
+        "W1, W2, W3, W5, text->output"
+    )
+    assert observed == rows[1:]
+
+
 @pytest.mark.asyncio
 async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
     tmp_path: Path,
 ) -> None:
     project = _seed_slash_fixtures(tmp_path)
+    (project / ".zeta" / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "live": {
+                        "transport": "stdio",
+                        "command": "missing-command",
+                        "enabled": False,
+                    },
+                    "oauth": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.test",
+                        "enabled": False,
+                        "auth": {"type": "oauth"},
+                    },
+                }
+            }
+        )
+    )
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -7708,16 +7905,38 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "review",
             "greet",
         } <= set(runnable_by_name)
-        assert {"keys", "plan", "fork", "theme", "local", "shell"} <= unavailable
+        assert {
+            "always",
+            "approve",
+            "deny",
+            "fork",
+            "keys",
+            "local",
+            "permissions",
+            "plan",
+            "restart",
+            "shell",
+            "theme",
+        } <= unavailable
         assert all(entry["unavailable"] is None for entry in runnable_by_name.values())
         assert all(
             complete_by_name[name]["unavailable"] == "requires_tui"
             and complete_by_name[name]["client_only"] is True
             for name in unavailable
         )
+        assert complete_by_name["accounts"]["description"] == (
+            "list, switch, or label accounts"
+        )
         assert runnable_by_name["review"]["source"] == "project"
         assert runnable_by_name["greet"]["kind"] == "skill"
 
+        documented_kinds = set(
+            re.findall(
+                r"^  - `([a-z_]+)`: ",
+                (Path(__file__).parents[1] / "docs" / "serve-protocol.md").read_text(),
+                re.MULTILINE,
+            )
+        )
         for number, name in enumerate(runnable_by_name, 10):
             response = (
                 await _request(
@@ -7727,17 +7946,43 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
                     "slash_run",
                     {
                         "session_id": sid,
-                        "text": "/mcp status" if name == "mcp" else f"/{name}",
+                        "text": f"/{name}",
                     },
                 )
             )[-1]
             assert "result" in response, (name, response)
             result = response["result"]
+            assert result["kind"] in documented_kinds, (name, result)
             assert result["kind"] not in {"client_only", "error", "unknown"}, (
                 name,
                 result,
             )
             assert "unsupported" not in str(result).lower()
+
+        for number, name in enumerate(unavailable, 100):
+            result = (
+                await _request(
+                    reader,
+                    writer,
+                    number,
+                    "slash_run",
+                    {"session_id": sid, "text": f"/{name}"},
+                )
+            )[-1]["result"]
+            assert result["kind"] in documented_kinds, (name, result)
+            assert result == {"kind": "client_only", "name": name}
+
+        help_result = (
+            await _request(
+                reader,
+                writer,
+                "help",
+                "slash_run",
+                {"session_id": sid, "text": "/help"},
+            )
+        )[-1]["result"]
+        assert "/status" in help_result["text"]
+        assert "/keys" not in help_result["text"]
 
         model_with_name = (
             await _request(
@@ -7751,16 +7996,53 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         assert model_with_name["kind"] == "output"
         assert "unsupported" not in str(model_with_name).lower()
 
-        mcp_status = (
+        mcp_arguments = {
+            "status": "",
+            "auth": "live",
+            "logout": "live",
+            "add": "added --stdio missing-command",
+            "remove": "added",
+            "enable": "live",
+            "disable": "live",
+            "trust": "live",
+            "untrust": "live",
+        }
+        assert set(mcp_arguments) == set(_SERVE_MCP_VERBS)
+        registered_kinds = {kind.value for kind in SlashResultKindDescriptor}
+        for number, verb in enumerate(_SERVE_MCP_VERBS, 200):
+            result = (
+                await _request(
+                    reader,
+                    writer,
+                    number,
+                    "slash_run",
+                    {
+                        "session_id": sid,
+                        "text": f"/mcp {verb} {mcp_arguments[verb]}".rstrip(),
+                    },
+                )
+            )[-1]["result"]
+            assert result["kind"] in registered_kinds, (verb, result)
+            assert result["kind"] in documented_kinds, (verb, result)
+            assert result["kind"] == "output", (verb, result)
+
+        credential_file = token_store_path("oauth", tmp_path / "home")
+        credential_file.parent.mkdir(parents=True, exist_ok=True)
+        credential_file.write_text("{broken")
+        credential_error = (
             await _request(
                 reader,
                 writer,
-                "mcp-status",
+                "mcp-structured-error",
                 "slash_run",
-                {"session_id": sid, "text": "/mcp status"},
+                {"session_id": sid, "text": "/mcp logout oauth"},
             )
         )[-1]["result"]
-        assert mcp_status["kind"] == "text"
+        assert credential_error["kind"] in registered_kinds
+        assert credential_error["kind"] in documented_kinds
+        assert credential_error["credential_store_error"]["code"] == (
+            "mcp_credential_store"
+        )
 
         invalid = (
             await _request(
@@ -7803,7 +8085,7 @@ async def test_serve_does_not_advertise_or_run_tui_approval_commands(
             await _request(reader, writer, "list", "slash_list", {"session_id": sid})
         )[-1]["result"]
 
-        assert run_result == {"kind": "unknown", "name": "approve"}
+        assert run_result == {"kind": "client_only", "name": "approve"}
         assert {entry["name"] for entry in list_result["commands"]}.isdisjoint(
             {"approve", "deny"}
         )
@@ -8164,6 +8446,7 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
     worker_errors: list[BaseException] = []
     shutdown_started = asyncio.Event()
     closing: asyncio.Task[None] | None = None
+    request_task: asyncio.Task[None] | None = None
     loop_closed = False
     status_worker: threading.Thread | None = None
 
@@ -8218,6 +8501,15 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         await close_control()
 
     monkeypatch.setattr(server.control, "close", track_shutdown)
+    writer_wait_closed = writer.wait_closed
+
+    async def wait_closed_after_server_shutdown() -> None:
+        assert shutdown_started.is_set(), (
+            "server shutdown must start before the test waits for the peer close"
+        )
+        await asyncio.wait_for(writer_wait_closed(), 10)
+
+    monkeypatch.setattr(writer, "wait_closed", wait_closed_after_server_shutdown)
     try:
         writer.write(
             json.dumps(
@@ -8231,10 +8523,21 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
             + b"\n"
         )
         await writer.drain()
-        assert await asyncio.to_thread(entered.wait, 10)
+        assert await asyncio.to_thread(entered.wait, 10), (
+            "status transcript worker did not start"
+        )
+        client = server._client
+        assert client is not None
+        request_task = next(
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and any(
+                frame.f_locals.get("client") is client for frame in task.get_stack()
+            )
+        )
 
         writer.close()
-        await writer.wait_closed()
         closing = asyncio.create_task(server.close())
         await asyncio.wait_for(shutdown_started.wait(), 10)
         loop_closed = True
@@ -8242,18 +8545,24 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         await asyncio.wait_for(worker_completed.wait(), 10)
         assert not worker_errors
         loop_closed = False
-        await asyncio.wait_for(closing, 10)
+        await asyncio.wait_for(asyncio.shield(closing), 10)
+        request_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(request_task), 10)
+        assert request_task.done(), "serve request task remained after cancellation"
     finally:
         loop_closed = False
         release.set()
-        if closing is not None and not closing.done():
-            closing.cancel()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
             with suppress(asyncio.CancelledError):
-                await closing
+                await asyncio.wait_for(asyncio.shield(request_task), 10)
+        if closing is None:
+            closing = asyncio.create_task(server.close())
+        await asyncio.wait_for(asyncio.shield(closing), 10)
         writer.close()
         with suppress(Exception):
-            await writer.wait_closed()
-        await server.close()
+            await asyncio.wait_for(writer.wait_closed(), 10)
 
 
 @pytest.mark.parametrize("with_fact_floor", [False, True])
@@ -8869,6 +9178,8 @@ async def test_slash_run_guards_mutations_while_approvals_pending(
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
+        # MCP config commands mutate shared config — must reject.
+        assert (await run("mcp-disable", "/mcp disable example"))["error"]["code"] == -32004
         # `/project init` mutates the session association — must reject.
         assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only and bypasses the mutation guard.
@@ -10381,6 +10692,7 @@ async def test_slash_run_mcp_credential_evidence_recovery(
     project = tmp_path / "project"
     home.mkdir()
     project.mkdir()
+    initialize_storage_home(home)
     (home / "mcp.json").write_text(
         json.dumps(
             {
@@ -10463,7 +10775,7 @@ async def test_slash_run_mcp_credential_evidence_recovery(
             "Move this file aside, then run '/mcp auth live'."
         )
         assert response == {
-            "kind": "text",
+            "kind": "output",
             "text": expected_text,
             "credential_store_error": {
                 "code": "mcp_credential_store",
