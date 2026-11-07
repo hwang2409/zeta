@@ -5,12 +5,15 @@ import os
 import select
 import selectors
 import shlex
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+from zeta.tools._shared.background_spawn import _group_exists
 
 _READY_TOKEN = b"ZETA_TEST_READY\n"
 
@@ -126,6 +129,15 @@ def reap_process(process: subprocess.Popen[object], *, timeout: float = 30) -> i
     except subprocess.TimeoutExpired:
         process.kill()
         return process.wait()
+
+
+def kill_group_if_present(pgid: int) -> None:
+    if not _group_exists(pgid):
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 async def wait_pid_exited(pid: int, timeout: float = 10) -> None:

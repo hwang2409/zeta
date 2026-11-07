@@ -25,6 +25,7 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import (
+    kill_group_if_present,
     read_pid_file,
     wait_for_path_command,
     wait_pid_exited,
@@ -2222,8 +2223,8 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         release_second_snapshot.set()
         if killing is not None:
             await asyncio.gather(killing, return_exceptions=True)
-        if child_pid is not None and _group_exists(child_pid):
-            os.killpg(child_pid, signal.SIGKILL)
+        if child_pid is not None:
+            kill_group_if_present(child_pid)
         await tasks.close()
 
 
@@ -2264,8 +2265,7 @@ async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
         release_shutdown.set()
         await asyncio.gather(closing, return_exceptions=True)
         for record in tasks.records:
-            if _group_exists(record.pid):
-                os.killpg(record.pid, signal.SIGKILL)
+            kill_group_if_present(record.pid)
 
 
 def test_asyncio_run_teardown_right_after_close_starts_terminates_all_groups(
@@ -2286,6 +2286,7 @@ import threading
 import time
 
 from zeta.tools._shared import background_spawn as spawn_module
+from tests.support.processes import kill_group_if_present
 from zeta.tools._shared import process as process_module
 from zeta.tools._shared.process import BackgroundTaskRegistry
 
@@ -2331,8 +2332,7 @@ async def main():
 tasks, pid = asyncio.run(main())
 alive = process_module._group_exists(pid)
 closed = tasks._closed
-if original_group_exists(pid):
-    os.killpg(pid, signal.SIGKILL)
+kill_group_if_present(pid)
 print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
 raise SystemExit(1 if alive or not closed else 0)
 """,
@@ -2381,8 +2381,7 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
         assert len(task_ids) == 3
     finally:
         for record in tasks.records:
-            if _group_exists(record.pid):
-                os.killpg(record.pid, signal.SIGKILL)
+            kill_group_if_present(record.pid)
 
 
 @pytest.mark.asyncio

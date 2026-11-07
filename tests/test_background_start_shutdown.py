@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.processes import kill_group_if_present
 from zeta.tools._shared import background_spawn
 from zeta.tools._shared import process as process_module
 from zeta.tools._shared.process import (
@@ -429,8 +430,7 @@ async def test_shutdown_joins_inflight_start(
         release_spawn.set()
         release_wait.set()
         for process in spawned:
-            if _group_exists(process.pid):
-                os.killpg(process.pid, signal.SIGKILL)
+            kill_group_if_present(process.pid)
         starting.cancel()
         await asyncio.gather(starting, return_exceptions=True)
         if closing is not None:
