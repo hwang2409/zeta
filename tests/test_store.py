@@ -1733,16 +1733,19 @@ async def test_async_writes_reuse_one_detached_store_open(
 
     monkeypatch.setattr(ConversationStore, "__init__", count_open)
 
-    await asyncio.gather(
-        store._to_thread_durable(store.append_pending_prompt, "follow up"),
-        store._to_thread_durable(
-            store.append_agent_notification,
-            "root:1",
-            child_session_path="/child",
-            description="child",
-            status="completed",
-            text="done",
+    await asyncio.wait_for(
+        asyncio.gather(
+            store._to_thread_durable(store.append_pending_prompt, "follow up"),
+            store._to_thread_durable(
+                store.append_agent_notification,
+                "root:1",
+                child_session_path="/child",
+                description="child",
+                status="completed",
+                text="done",
+            ),
         ),
+        10,
     )
 
     assert open_count == 1
@@ -1816,7 +1819,7 @@ async def test_async_write_cancelled_before_worker_start_writes_nothing(
     )
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
     assert not started.is_set()
     assert store._entries == []
 
@@ -1841,7 +1844,7 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
         task.cancel()
         release_fsync.set()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, 10)
 
     assert store._entries
 
@@ -2477,7 +2480,7 @@ async def test_async_append_defers_repeated_cancellation_until_fsync(
         assert not append.done()
         release_fsync.set()
         with pytest.raises(asyncio.CancelledError):
-            await append
+            await asyncio.wait_for(append, 10)
 
     assert [item.content[0].text for item in store.messages()] == ["durable"]
 
@@ -2511,7 +2514,7 @@ async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
         try:
             assert not close_finished.wait(timeout=0.1)
             release_fsync.set()
-            await append
+            await asyncio.wait_for(append, 10)
         finally:
             release_fsync.set()
             close_thread.join(timeout=2)
@@ -2544,7 +2547,7 @@ async def test_close_on_event_loop_drains_worker_without_deadlock(
         release.start()
         try:
             store.close()
-            await append
+            await asyncio.wait_for(append, 10)
         finally:
             release_fsync.set()
             release.join(timeout=2)

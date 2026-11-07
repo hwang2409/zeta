@@ -463,7 +463,7 @@ async def test_bash_abort_kills_process_group_and_reaps_descendants(
 
     await asyncio.sleep(0.05)
     abort_signal.abort()
-    result = await task
+    result = await asyncio.wait_for(task, 10)
     await asyncio.sleep(0.5)
 
     assert result["isError"] is True
@@ -1000,7 +1000,7 @@ async def test_write_race_reports_overwrite(
         if destination == "raced.txt" and dst_dir_fd is not None:
             creator = threading.Thread(target=lambda: target.write_bytes(b"concurrent"))
             creator.start()
-            creator.join()
+            creator.join(timeout=10)
         original_link(
             source,
             destination,
@@ -1063,7 +1063,7 @@ async def test_write_overwrite_symlink_race_stays_in_sandbox(tmp_path: Path) -> 
             assert outside.read_bytes() == b"outside"
     finally:
         stop.set()
-        swapper.join()
+        swapper.join(timeout=10)
         if target.is_symlink():
             target.unlink()
         if not target.exists():
@@ -1161,7 +1161,7 @@ async def test_write_create_parents_symlink_race_stays_in_sandbox(
             assert outside_target.read_bytes() == b"outside"
     finally:
         stop.set()
-        swapper.join()
+        swapper.join(timeout=10)
 
 
 @pytest.mark.asyncio
@@ -1618,7 +1618,7 @@ async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) ->
     result = await registry.execute(
         ToolCall("read-abort", "read", {"path": "large.txt"})
     )
-    await abort_task
+    await asyncio.wait_for(abort_task, 10)
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
@@ -2076,7 +2076,7 @@ async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> N
     ) -> str:
         del arguments
         started.set()
-        await abort_signal.wait()
+        await asyncio.wait_for(abort_signal.wait(), 10)
         observed.append(abort_signal.is_set())
         await asyncio.sleep(0)
         observed.append(abort_signal.is_set())
@@ -2336,10 +2336,10 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
             )
         )
     )
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 10)
     await asyncio.sleep(0.05)
     registry.abort()
-    await task
+    await asyncio.wait_for(task, 10)
 
     results = [
         message.tool_result for message in store.messages() if message.tool_result

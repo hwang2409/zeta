@@ -727,16 +727,19 @@ async def test_refreshes_coalesce_per_project(
 
     # test-contract: seam inject the refresh worker boundary
     monkeypatch.setattr(refresh_module, "_refresh_sources", observe)
-    await asyncio.gather(
-        *(
-            refresh_transcript_index(
-                tmp_path / "projects",
-                PROJECT_A,
-                source.session_id,
-                source.session_dir,
+    await asyncio.wait_for(
+        asyncio.gather(
+            *(
+                refresh_transcript_index(
+                    tmp_path / "projects",
+                    PROJECT_A,
+                    source.session_id,
+                    source.session_dir,
+                )
+                for _ in range(10)
             )
-            for _ in range(10)
-        )
+        ),
+        10,
     )
 
     assert batches == [(source.session_id,)]
