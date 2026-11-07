@@ -28,6 +28,7 @@ from rich.console import Console
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
+_ORIGINAL_ASYNCIO_WAIT = asyncio.wait
 os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
 os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
 
@@ -768,6 +769,7 @@ async def close_direct_test_runtime_owners(
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
     tracked: list[dict[str, object]] = []
+    original_asyncio_wait = _ORIGINAL_ASYNCIO_WAIT
     composed_stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
     test_home_leases: dict[Path, object] = {}
 
@@ -881,7 +883,7 @@ async def close_direct_test_runtime_owners(
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
         if _is_repository_test_path(caller):
             add(background, "BackgroundTaskRegistry", "owned_resources().async_resource(background, what=...)",
-                lambda: not background._closed, lambda: background_close(background))
+                lambda: not background._closed and not background._closing, lambda: background_close(background))
 
     # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
@@ -895,6 +897,14 @@ async def close_direct_test_runtime_owners(
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
+    async def bounded(awaitable, *, what: str):
+        patched_wait = asyncio.wait
+        asyncio.wait = original_asyncio_wait
+        try:
+            return await await_or_fail(awaitable, what=what)
+        finally:
+            asyncio.wait = patched_wait
+
     yield
 
     first_error: BaseException | None = None
@@ -906,11 +916,11 @@ async def close_direct_test_runtime_owners(
             continue
         leaked.append(record)
         try:
-            result = await await_or_fail(
+            result = await bounded(
                 asyncio.to_thread(record["close"]), what=f"closing {record['kind']}"
             )
             if inspect.isawaitable(result):
-                await await_or_fail(result, what=f"closing {record['kind']}")
+                await bounded(result, what=f"closing {record['kind']}")
         except BaseException as exc:  # noqa: BLE001
             if first_error is None:
                 first_error = exc
