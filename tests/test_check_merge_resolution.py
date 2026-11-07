@@ -28,6 +28,39 @@ def commit(r: Path, message: str) -> None:
     subprocess.run(["git", "commit", "-qm", message], cwd=r, check=True)
 
 
+def test_dropped_collection_element_flagged(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/render.py").write_text(
+        'BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = {"CONFIG_CHANGED"}\n'
+    )
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/render.py").write_text(
+        'BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = {"CONFIG_CHANGED", "BRANCH"}\n'
+    )
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/render.py").write_text(
+        'BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = {"CONFIG_CHANGED", "MAIN"}\n'
+    )
+    commit(r, "main")
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/render.py").write_text(
+        'BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = {"MAIN", "BRANCH"}\n'
+    )
+    commit(r, "bad merge")
+    result = run(r)
+    assert result.returncode == 1
+    assert "CONFIG_CHANGED" in result.stdout
+    assert "main parent line 1" in result.stdout
+
+
 def test_dropped_main_function_flagged(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
