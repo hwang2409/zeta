@@ -72,6 +72,7 @@ async def agent_cancel(
 def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "agent_cancel", agent_cancel,
+        binding="shared",
         description=("Cancel one running child agent owned by this agent tree. "
                      "The request is idempotent and never affects another session; "
                      "completion remains announced normally. A finished child returns "

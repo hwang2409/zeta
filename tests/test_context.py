@@ -23,7 +23,7 @@ from zeta.context_accounting import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.providers.anthropic import build_messages_payload
-from zeta.providers.codex_errors import CodexStreamError
+from zeta.codex import CodexStreamError
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import OllamaBackend, _messages as build_ollama_messages
 from zeta.protocol.types import (

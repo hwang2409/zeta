@@ -88,9 +88,8 @@ class BackgroundAgentOwner:
         self.notification_store = notification_store
         self.finish_gate_max_turns = finish_gate_max_turns
         self.finish_gate_timeout = float(finish_gate_timeout)
-        # Tasks may outlive the short model-turn safety bound. This internal
-        # bound is not a user setting; it only prevents an abandoned task from
-        # living forever when it never exits.
+        # This internal bound lets tasks outlive a turn but stops abandoned tasks
+        # that never exit; it is not a user setting.
         self.finish_gate_task_timeout = float(finish_gate_task_timeout)
         # Receipts and adopted descendants can outlive their immediate loop.
         # The tree owns child leases until root shutdown joins all watchers.
@@ -107,6 +106,7 @@ class BackgroundAgentOwner:
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
         self._active_stores: dict[str, tuple[ConversationStore, ...]] = {}
+        self.project_context_loops: dict[str, Any] = {}
         self._descriptions: dict[str, str] = {}
         self._canceling = False
         self._cancel_requested: set[str] = set()
@@ -1181,6 +1181,7 @@ async def finish_background_child(
             for key in ("head_sha", "verdict"):
                 if key in payload_structured:
                     notification_report[key] = payload_structured[key]
+
         async def commit_adopt_publish() -> ConversationEntry:
             transferred = await child_store.finalize_background_agent(
                 parent_store=effective_parent_store,
@@ -1244,7 +1245,6 @@ async def finish_background_child(
             raise asyncio.CancelledError
     finally:
         try:
-            close_cause = f"background child {'cancellation' if status == 'canceled' else 'completion'} cleanup"
             await close_child(close_cause)
             # Let the parent finalize the running/terminal tool result before
             # releasing the child store descriptor.

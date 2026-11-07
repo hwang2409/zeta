@@ -117,6 +117,17 @@ class _ToolSubprocessTransport(unix_events._UnixSubprocessTransport):  # type: i
         self._proc = _posix_spawn(args, stdin, stdout, stderr, **kwargs)
 
 
+def current_child_watcher(loop: asyncio.AbstractEventLoop) -> Any:
+    watcher = getattr(loop, "_watcher", None)
+    if watcher is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            watcher = events.get_child_watcher()
+        if not watcher.is_active():
+            raise RuntimeError("asyncio child watcher is not active")
+    return watcher
+
+
 async def create_tool_subprocess_shell(
     command: str,
     *,
@@ -143,13 +154,7 @@ async def create_tool_subprocess_shell(
             asyncio.streams._DEFAULT_LIMIT, loop
         )
         waiter = loop.create_future()
-        watcher = getattr(loop, "_watcher", None)
-        if watcher is None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                watcher = events.get_child_watcher()
-            if not watcher.is_active():
-                raise RuntimeError("asyncio child watcher is not active")
+        watcher = current_child_watcher(loop)
         transport = _ToolSubprocessTransport(
             loop,
             protocol,

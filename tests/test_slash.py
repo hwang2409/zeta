@@ -27,6 +27,7 @@ from zeta.core.slash import (
     UNPRICED_MODEL_IDS,
     UsageTracker,
     UsageSnapshot,
+    _format_status,
     compaction_history,
     context_fill_percent,
     create_slash_registry,
@@ -63,6 +64,10 @@ from zeta.protocol.types import (
 @dataclass(frozen=True, slots=True)
 class FakeSlashSession:
     status: SlashStatus
+
+    def slash_status_command(self, args: str) -> str:
+        del args
+        return _format_status(self.status)
 
     def slash_status(self) -> SlashStatus:
         return self.status
