@@ -328,6 +328,28 @@ async def test_new_tui_keeps_healthy_project_context(
         await app.close()
 
 
+def test_new_tui_ignores_crash_leftover_and_auto_creates_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = initialize_storage_home(tmp_path / "home")
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    projects = home / "projects"
+    projects.mkdir(mode=0o700)
+    leftover = projects / ("p_" + "0" * 32)
+    leftover.mkdir(mode=0o700)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(repository)
+
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    try:
+        assert app.loop.session_metadata.project_id is not None
+        assert app.loop.project_context_health is None
+    finally:
+        asyncio.run(app.close())
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("_case", "corrupt"),
