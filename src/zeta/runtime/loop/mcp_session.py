@@ -68,7 +68,8 @@ class MCPSession:
 
     async def _mount_mcp_servers(self) -> None:
         try:
-            service = MCPManagementService(
+            service = await asyncio.to_thread(
+                MCPManagementService,
                 home=self._mcp_home_hint,
                 project_dir=self._mcp_project_dir_value,
             )
@@ -184,7 +185,8 @@ class MCPSession:
             return f"mcp error: {self._mcp_config_error}"
         if mount is None:
             return "mcp: no configured servers"
-        service = MCPManagementService(
+        service = await asyncio.to_thread(
+            MCPManagementService,
             home=self._mcp_home_hint,
             project_dir=self._mcp_project_dir_value,
             mount=mount,

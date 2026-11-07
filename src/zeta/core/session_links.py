@@ -23,12 +23,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..storage_format import WriterLease, mapping_mutations
 from .session_files import (
     SessionError,
     child_directory,
     open_session_file,
     session_directory,
-    write_session_json,
+    write_session_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,7 @@ def persist_pending_root_link(
     project_id: str,
     role: str,
     parent_session_id: str | None,
+    lease: WriterLease,
 ) -> None:
     """Durably publish a root-session linkage intent before registry mutation."""
 
@@ -129,11 +131,20 @@ def persist_pending_root_link(
         "transcript_path": str(Path(sessions_dir) / session_id),
     }
     with session_directory(sessions_dir, session_id) as (_, directory_fd):
-        write_session_json(directory_fd, "project_link_pending.json", link)
+        lease.publish_json(
+            directory_fd,
+            "project_link_pending.json",
+            mapping_mutations(link),
+            write_session_file,
+        )
         os.fsync(directory_fd)
 
 
-def persist_pending_child_link(root_session_dir: os.PathLike[str], link: dict[str, object]) -> None:
+def persist_pending_child_link(
+    root_session_dir: os.PathLike[str],
+    link: dict[str, object],
+    lease: WriterLease,
+) -> None:
     """Durably record a child-lineage intent in the ROOT's pending index.
 
     Written and directory-fsynced BEFORE the registry append (in place of any
@@ -151,12 +162,14 @@ def persist_pending_child_link(root_session_dir: os.PathLike[str], link: dict[st
         # Ensuring the index directory added its entry to the root session dir;
         # fsync root_fd so that directory entry is durable before the registry
         # append.  Otherwise a crash after this returns but before the append
-        # could lose the whole index -- write_session_json below fsyncs the
+        # could lose the whole index -- the JSON publisher below fsyncs the
         # intent file and the index dir, but never the parent that names it.
         os.fsync(root_fd)
-        write_session_json(pending_fd, name, link)
+        lease.publish_json(
+            pending_fd, name, mapping_mutations(link), write_session_file
+        )
         # Durably land the new directory entry before the registry append;
-        # write_session_json fsyncs the file and its rename, not the dir.
+        # the JSON publisher fsyncs the file and its rename, not the dir.
         os.fsync(pending_fd)
 
 

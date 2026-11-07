@@ -1678,6 +1678,62 @@ async def test_tokens_do_not_appear_in_conversation_store(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["status", "auth live", "logout live"])
+async def test_slash_mcp_constructs_management_service_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    home = _monkey_home(monkeypatch, tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    (home / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "live": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.example",
+                        "auth": {"type": "oauth"},
+                    }
+                }
+            }
+        )
+    )
+    token = _write_token("live", home, expires_at=1e12)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    from zeta.mcp import mount as mount_module
+    from zeta.mcp import oauth as oauth_module
+
+    async def fake_connect_and_list(client: Any) -> list:
+        return []
+
+    async def fake_authorize(**kwargs: object) -> MCPOAuthToken:
+        return token
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
+    monkeypatch.setattr(oauth_module, "authorize", fake_authorize)
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty()
+    )
+    loop.set_mcp_scope(home=home, project_dir=project)
+    loop_thread_id = threading.get_ident()
+    resolve_threads: list[int] = []
+    original_resolve = Path.resolve
+
+    def checked_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == project:
+            resolve_threads.append(threading.get_ident())
+            assert threading.get_ident() != loop_thread_id
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", checked_resolve)
+    try:
+        await loop.slash_mcp(command)
+        assert resolve_threads
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_slash_mcp_status_shows_oauth_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

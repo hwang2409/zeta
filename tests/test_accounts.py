@@ -11,7 +11,7 @@ import signal
 import socket
 import stat
 import threading
-import time
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -1926,7 +1926,9 @@ def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> Non
     assert AccountStore(tmp_path).contains(account)
 
 
-def test_migrate_never_sweeps_registered_account_during_login(tmp_path: Path) -> None:
+def test_migrate_never_sweeps_registered_account_during_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     account = AccountId("codex", "work")
     credential = named_account_credentials(tmp_path, account.provider, account.name)
     credential.save(tokens())
@@ -1940,27 +1942,40 @@ def test_migrate_never_sweeps_registered_account_during_login(tmp_path: Path) ->
     )
     holder.start()
     migration_done = threading.Event()
+    migration_waiting = threading.Event()
+    real_registry_guard = AccountStore._registry_guard
+
+    @contextmanager
+    def observed_registry_guard(store, home_fd):  # type: ignore[no-untyped-def]
+        migration_waiting.set()
+        with real_registry_guard(store, home_fd):
+            yield
+
+    # test-contract: seam observe migration waiting behind live account ownership.
+    monkeypatch.setattr(AccountStore, "_registry_guard", observed_registry_guard)
 
     def migrate() -> None:
         AccountStore(tmp_path).migrate()
         migration_done.set()
 
     thread = threading.Thread(target=migrate)
-    thread.start()
     try:
-        assert ready.wait(timeout=5)
-        time.sleep(0.05)
+        assert ready.wait(timeout=10)
+        thread.start()
+        assert migration_waiting.wait(timeout=10)
+        assert not migration_done.is_set()
         release.set()
-        assert migration_done.wait(timeout=5)
+        assert migration_done.wait(timeout=10)
         assert credential.path.exists()
         assert AccountStore(tmp_path).contains(account)
     finally:
         release.set()
-        thread.join(timeout=5)
-        holder.join(timeout=5)
+        if thread.ident is not None:
+            thread.join(timeout=10)
+        holder.join(timeout=10)
         if holder.is_alive():
             holder.kill()
-            holder.join(timeout=5)
+            holder.join(timeout=10)
         holder.close()
 
 

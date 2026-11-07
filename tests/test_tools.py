@@ -958,24 +958,31 @@ async def test_write_race_reports_overwrite(
 ) -> None:
     target = tmp_path / "raced.txt"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    original_open = write_module.os.open
+    original_link = write_module.os.link
 
-    def racing_open(
-        path: object,
-        flags: int,
-        mode: int = 0o777,
+    def racing_link(
+        source: object,
+        destination: object,
         *,
-        dir_fd: int | None = None,
-    ) -> int:
-        if path == "raced.txt" and dir_fd is not None and flags & write_module.os.O_EXCL:
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if destination == "raced.txt" and dst_dir_fd is not None:
             creator = threading.Thread(
                 target=lambda: target.write_bytes(b"concurrent")
             )
             creator.start()
             creator.join()
-        return original_open(path, flags, mode, dir_fd=dir_fd)
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
 
-    monkeypatch.setattr(write_module.os, "open", racing_open)
+    monkeypatch.setattr(write_module.os, "link", racing_link)
     result = await registry.execute(
         ToolCall("write-race", "write", {"path": "raced.txt", "content": "x"})
     )
@@ -1159,7 +1166,7 @@ async def test_file_tools_leave_target_descriptor_owned_by_open_target(
         ):
             result = await registry.execute(call)
             assert not result["isError"], result
-        assert observed == ["wb", "rb", "r+b"]
+        assert observed == ["wb", "rb", "rb", "wb", "rb"]
         assert (tmp_path / "note.txt").read_text() == "after"
     finally:
         await registry.close()
