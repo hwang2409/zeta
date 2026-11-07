@@ -6,14 +6,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-EXPECTED = {
-    "context.json": "8eeebf7a00e96a1ade54bcc1225ca26718244cc788520a1c09f4a7e12bd5ff93",
-    "wire.json": "366f874c7fd1626c5087a8c04fa4908fca9008c1d92da941d1601a55cd796cda",
-    "appends.json": "9b3b346a2b2cfe5a307a7c9259b684921a6fbb64fdd807e3f8031e5a944e4b09",
-    "readback.json": "8eeebf7a00e96a1ade54bcc1225ca26718244cc788520a1c09f4a7e12bd5ff93",
-}
-
-
 def test_fixture_replay_uses_production_path_and_golden_digests(tmp_path: Path) -> None:
     result = subprocess.run(
         [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--artifact-dir", str(tmp_path / "artifacts")],
@@ -78,7 +70,7 @@ def test_fixture_compare_rejects_receipt_mutation_without_values(tmp_path: Path)
     head = _mutated_ref(tmp_path, [("fixture result ", "mutated result ")])
     result = _compare(ROOT, head, tmp_path)
     assert result.returncode != 0
-    assert "FAIL fixture invocation 1: appends.json at /" in result.stderr
+    assert "FAIL fixture: invocation 1: appends.json at /" in result.stderr
     assert "mutated result" not in result.stderr
     assert "fixture result" not in result.stderr
 
@@ -94,3 +86,12 @@ def test_fixture_compare_rejects_retained_floor_bound_mutation(tmp_path: Path) -
     assert result.returncode != 0
     assert "retained-floor bound check failed" in result.stderr
     assert "digest" not in result.stderr.lower()
+
+
+def test_fixture_compare_rejects_retained_floor_limit_change(tmp_path: Path) -> None:
+    head = _mutated_ref(tmp_path, [])
+    fact_floor = head / "src/zeta/context_eviction/_fact_floor.py"
+    fact_floor.write_text(fact_floor.read_text().replace("_NEWEST_LIMIT = 16", "_NEWEST_LIMIT = 17"))
+    result = _compare(ROOT, head, tmp_path)
+    assert result.returncode != 0
+    assert "limit change" in result.stderr

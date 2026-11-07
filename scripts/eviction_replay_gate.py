@@ -134,6 +134,45 @@ def _wire(messages: list[Any], provider: str) -> dict[str, Any]:
     return build_messages_payload(messages, [], model="fixture", max_tokens=16_384)
 
 
+def _production_limits() -> dict[str, int]:
+    from zeta.context_eviction import _fact_floor
+
+    return {
+        "oldest": _fact_floor._OLDEST_LIMIT,
+        "newest": _fact_floor._NEWEST_LIMIT,
+        "chars": _fact_floor.FACT_FLOOR_CHAR_CAP,
+        "tokens": _fact_floor.FACT_FLOOR_TOKEN_CAP,
+    }
+
+
+def _floor_metrics(normalized: list[dict[str, Any]], limits: dict[str, int]) -> list[dict[str, int]]:
+    from zeta.context_accounting import message_token_count
+    from zeta.context_eviction._fact_floor import render_fact_floor, validate_fact_floor
+
+    metrics: list[dict[str, int]] = []
+    for row in normalized:
+        floor = row.get("data", {}).get("fact_floor")
+        if floor is None:
+            continue
+        if not validate_fact_floor(floor):
+            raise RuntimeError("retained-floor bound check failed: invalid floor")
+        assert isinstance(floor, dict)
+        oldest = floor["oldest"]
+        newest = floor["newest"]
+        rendered = render_fact_floor(floor)
+        chars = len(rendered.content[0].text) if rendered else 0
+        tokens = message_token_count(rendered) if rendered else 0
+        metric = {"oldest": len(oldest), "newest": len(newest), "chars": chars, "tokens": tokens}
+        if any(metric[key] > limits[key] for key in metric):
+            raise RuntimeError(
+                "retained-floor bound check failed: "
+                f"oldest={metric['oldest']} newest={metric['newest']} "
+                f"chars={metric['chars']} tokens={metric['tokens']}"
+            )
+        metrics.append(metric)
+    return metrics
+
+
 async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int, provider: str) -> list[dict[str, Any]]:
     from zeta.core.context import ContextAssembler
     from zeta.core.store import ConversationStore
@@ -146,6 +185,7 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
         async def forbidden(*args: Any, **kwargs: Any) -> str:
             raise RuntimeError("eviction replay reached model-summary fallback")
         assembler.compaction_policy.summarize_chunked = forbidden  # type: ignore[method-assign]
+        limits = _production_limits()
         records: list[dict[str, Any]] = []
         previous_count = len(store.replay())
         stable = 0
@@ -168,31 +208,7 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
                 readback_store.close()
             context_data = [message.to_dict() for message in context.messages]
             readback_data = [message.to_dict() for message in readback.messages]
-            floor_metrics: list[dict[str, int]] = []
-            from zeta.context_eviction._fact_floor import (
-                FACT_FLOOR_CHAR_CAP,
-                FACT_FLOOR_TOKEN_CAP,
-                render_fact_floor,
-                validate_fact_floor,
-            )
-            for row in normalized:
-                floor = row.get("data", {}).get("fact_floor")
-                if floor is None:
-                    continue
-                if not validate_fact_floor(floor):
-                    raise RuntimeError("retained-floor bound check failed: invalid floor")
-                assert isinstance(floor, dict)
-                oldest = floor["oldest"]
-                newest = floor["newest"]
-                rendered = render_fact_floor(floor)
-                chars = len(rendered.content[0].text) if rendered else 0
-                tokens = 0 if rendered is None else __import__("zeta.context_accounting", fromlist=["message_token_count"]).message_token_count(rendered)
-                if len(oldest) > 8 or len(newest) > 16 or chars > FACT_FLOOR_CHAR_CAP or tokens > FACT_FLOOR_TOKEN_CAP:
-                    raise RuntimeError(
-                        "retained-floor bound check failed: "
-                        f"oldest={len(oldest)} newest={len(newest)} chars={chars} tokens={tokens}"
-                    )
-                floor_metrics.append({"oldest": len(oldest), "newest": len(newest), "chars": chars, "tokens": tokens})
+            floor_metrics = _floor_metrics(normalized, limits)
             trace = {"invocation": invocation, "appended": len(normalized), "token_count": context.token_count, "compacted": context.compacted, "marker_count": store.compaction_marker_count(), "retained_floor": (assembler.last_compaction_telemetry or {}).get("retained_floor"), "floor_metrics": floor_metrics}
             artifacts = {"context.json": context_data, "wire.json": _wire(list(context.messages), provider), "appends.json": normalized, "readback.json": readback_data, "scalar.json": trace}
             invocation_dir = artifact_dir / str(invocation)
@@ -234,11 +250,52 @@ def run(args: argparse.Namespace) -> int:
     try:
         records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider), 600))
         import zeta
-        record = {"git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "zeta_file": str(Path(zeta.__file__).resolve()), "session": args.session or "fixture", "records": records, "elapsed_seconds": round(time.monotonic() - started, 3), "artifact_dir": str(artifact_dir)}
+        record = {"git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "zeta_file": str(Path(zeta.__file__).resolve()), "limits": _production_limits(), "session": args.session or "fixture", "records": records, "elapsed_seconds": round(time.monotonic() - started, 3), "artifact_dir": str(artifact_dir)}
         print(json.dumps(record, sort_keys=True, separators=(",", ":")))
         return 0
     finally:
         temporary.cleanup()
+
+
+def _run_side(session: str, label: str, worktree: str, fixture: bool) -> dict[str, Any] | None:
+    artifact_dir = Path(tempfile.mkdtemp(prefix=f"eviction-{label}-"))
+    runner = Path(worktree) / "scripts/eviction_replay_gate.py"
+    if not runner.exists():
+        runner = Path(__file__).resolve()
+    command = [sys.executable, str(runner), "run", "--artifact-dir", str(artifact_dir)]
+    environment = {**__import__("os").environ, "PYTHONPATH": str(Path(worktree) / "src"), "UV_CACHE_DIR": str(Path(worktree) / ".uv-cache")}
+    if fixture:
+        command.append("--fixture")
+    else:
+        command.extend(["--session", str(Path.home() / ".zeta" / "sessions" / session)])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=620, check=False, env=environment)
+    if result.returncode:
+        detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "runner failed"
+        print(f"FAIL {session} {label}: {detail}", file=sys.stderr)
+        return None
+    record = json.loads(result.stdout.strip().splitlines()[-1])
+    if not Path(record["zeta_file"]).resolve().is_relative_to(Path(worktree).resolve()):
+        print(f"FAIL {session} {label}: zeta.__file__ outside expected worktree", file=sys.stderr)
+        return None
+    return {"label": label, "record": record, "artifacts": artifact_dir}
+
+
+def _compare_artifacts(session: str, base: dict[str, Any], head: dict[str, Any]) -> str | None:
+    base_record, head_record = base["record"], head["record"]
+    if base_record["limits"] != head_record["limits"]:
+        return f"limit change: base={base_record['limits']} head={head_record['limits']}"
+    if len(base_record["records"]) != len(head_record["records"]):
+        return "scalar trace invocation count differs"
+    for index, (left, right) in enumerate(zip(base_record["records"], head_record["records"]), 1):
+        for name in left["digests"]:
+            if left["digests"][name] != right["digests"][name]:
+                a = json.loads((base["artifacts"] / str(index) / name).read_text())
+                b = json.loads((head["artifacts"] / str(index) / name).read_text())
+                return f"invocation {index}: {name} at {_pointer_diff(a, b)}"
+        for metric in right["trace"]["floor_metrics"]:
+            if any(metric[key] > base_record["limits"][key] for key in metric):
+                return f"retained-floor bound check failed: {metric} limits={base_record['limits']}"
+    return None
 
 
 def compare(args: argparse.Namespace) -> int:
@@ -247,40 +304,14 @@ def compare(args: argparse.Namespace) -> int:
     manifest: dict[str, Any] = {"phase": "compare", "sessions": []}
     sessions = ["fixture"] if args.fixture else args.session
     for session in sessions:
-        rows: list[dict[str, Any]] = []
-        for label, worktree in (("base", args.base), ("head", args.head)):
-            artifact_dir = Path(tempfile.mkdtemp(prefix=f"eviction-{label}-"))
-            runner = Path(worktree) / "scripts/eviction_replay_gate.py"
-            if not runner.exists():
-                runner = Path(__file__).resolve()
-            command = [sys.executable, str(runner), "run", "--artifact-dir", str(artifact_dir)]
-            environment = {**__import__("os").environ, "PYTHONPATH": str(Path(worktree) / "src"), "UV_CACHE_DIR": str(Path(worktree) / ".uv-cache")}
-            if session == "fixture":
-                command.append("--fixture")
-            else:
-                command.extend(["--session", str(Path.home() / ".zeta" / "sessions" / session)])
-            result = subprocess.run(command, capture_output=True, text=True, timeout=620, check=False, env=environment)
-            if result.returncode:
-                detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "runner failed"
-                print(f"FAIL {session} {label}: {detail}", file=sys.stderr)
-                return 1
-            record = json.loads(result.stdout.strip().splitlines()[-1])
-            expected = str(Path(worktree).resolve())
-            if not Path(record["zeta_file"]).resolve().is_relative_to(Path(expected)):
-                print(f"FAIL {session} {label}: zeta.__file__ outside expected worktree", file=sys.stderr)
-                return 1
-            rows.append({"label": label, "record": record, "artifacts": artifact_dir})
-        base, head = rows
-        if len(base["record"]["records"]) != len(head["record"]["records"]):
-            print(f"FAIL {session}: scalar trace invocation count differs", file=sys.stderr)
+        base = _run_side(session, "base", args.base, args.fixture)
+        head = _run_side(session, "head", args.head, args.fixture)
+        if base is None or head is None:
             return 1
-        for index, (left, right) in enumerate(zip(base["record"]["records"], head["record"]["records"]), 1):
-            for name in left["digests"]:
-                if left["digests"][name] != right["digests"][name]:
-                    a = json.loads((base["artifacts"] / str(index) / name).read_text())
-                    b = json.loads((head["artifacts"] / str(index) / name).read_text())
-                    print(f"FAIL {session} invocation {index}: {name} at {_pointer_diff(a, b)}", file=sys.stderr)
-                    return 1
+        failure = _compare_artifacts(session, base, head)
+        if failure:
+            print(f"FAIL {session}: {failure}", file=sys.stderr)
+            return 1
         manifest["sessions"].append({"session": session, "base": base["record"], "head": head["record"], "status": "PASS"})
         print(f"PASS {session} {base['record']['elapsed_seconds']}s/{head['record']['elapsed_seconds']}s")
     out.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
