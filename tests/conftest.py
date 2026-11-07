@@ -543,9 +543,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         )
     yield
     after = _open_file_descriptors()
-    previous_count = (
-        _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
-    )
+    previous_count = _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
     if previous_count is not None and len(after) > previous_count:
         gc.collect()
         after = _open_file_descriptors()
@@ -764,9 +762,12 @@ async def close_direct_test_runtime_owners(
 ):
     """Track direct runtime owners and report leaks after every test."""
     from tests.support.owned import await_or_fail
+    from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
+    from zeta.memory.auto import AutoMemoryReconciler
+    from zeta.project_registry import ProjectRegistry
     from zeta.runtime.loop import AgentLoop
     from zeta.storage_format import open_writer
     from zeta.tools import ToolRegistry
@@ -790,6 +791,9 @@ async def close_direct_test_runtime_owners(
     loop_close = AgentLoop.close
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
+    project_registry_init = ProjectRegistry.__init__
+    account_store_init = AccountStore.__init__
+    memory_reconciler_init = AutoMemoryReconciler.__init__
     workspace_init = WorkspaceSnapshotStore.__init__
     registry_init = ToolRegistry.__init__
     registry_close = ToolRegistry.close
@@ -852,6 +856,39 @@ async def close_direct_test_runtime_owners(
             add(manager, "SessionManager", "owned_resources().release_with(manager._release_storage_lease)",
                 lambda: manager._release_storage_lease.alive, manager._release_storage_lease)
 
+    def on_event_loop() -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    @wraps(project_registry_init)
+    def tracked_project_registry_init(registry, *args, **kwargs):
+        if on_event_loop():
+            root = Path(args[0] if args else kwargs["root"])
+            ensure_format(root.parent)
+        project_registry_init(registry, *args, **kwargs)
+
+    @wraps(account_store_init)
+    def tracked_account_store_init(store, *args, **kwargs):
+        home = Path(args[0] if args else kwargs["home"])
+        ensure_format(home)
+        account_store_init(store, *args, **kwargs)
+
+    @wraps(memory_reconciler_init)
+    def tracked_memory_reconciler_init(reconciler, *args, **kwargs):
+        memory_reconciler_init(reconciler, *args, **kwargs)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            add(
+                reconciler,
+                "AutoMemoryReconciler",
+                "owned_resources().async_resource(reconciler, what=...)",
+                lambda: not reconciler._closing,
+                reconciler.close,
+            )
+
     @wraps(workspace_init)
     def tracked_workspace_init(workspace, *args, **kwargs):
         session_dir = Path(args[0])
@@ -892,9 +929,15 @@ async def close_direct_test_runtime_owners(
     # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
     # test-contract: seam constructor tracking has no public test hook
+    monkeypatch.setattr(AutoMemoryReconciler, "__init__", tracked_memory_reconciler_init)
+    # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam acquires the test home lease before direct registry setup
+    monkeypatch.setattr(ProjectRegistry, "__init__", tracked_project_registry_init)
+    # test-contract: seam acquires the test home lease before direct account setup
+    monkeypatch.setattr(AccountStore, "__init__", tracked_account_store_init)
     # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
     # test-contract: seam constructor tracking has no public test hook
@@ -933,14 +976,22 @@ async def close_direct_test_runtime_owners(
     for store in tuple(composed_stores):
         if not store._closed:
             try:
-                store.close()
+                await bounded(
+                    asyncio.to_thread(store.close), what="closing composed store"
+                )
             except BaseException as exc:  # noqa: BLE001
                 if first_error is None:
                     first_error = exc
                 else:
                     first_error.add_note(f"additional cleanup error: {type(exc).__name__}: {exc}")
     for lease in test_home_leases.values():
-        lease.close()
+        try:
+            await bounded(asyncio.to_thread(lease.close), what="closing storage lease")
+        except BaseException as exc:  # noqa: BLE001
+            if first_error is None:
+                first_error = exc
+            else:
+                first_error.add_note(f"additional cleanup error: {type(exc).__name__}: {exc}")
 
     report = getattr(request.node, "_zeta_call_report", None)
     ratchet = Path(__file__).with_name("test_cleanup_net_ratchet.txt")
