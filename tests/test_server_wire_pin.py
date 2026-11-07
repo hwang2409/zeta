@@ -54,63 +54,60 @@ async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
         assert len(rows) == len(methods), kind
         assert {pin["method"] for pin in rows} == set(methods), kind
 
-    contract = await ServeContract.start(tmp_path / "wire-pin", "unix")
-    try:
-        for index, pin in enumerate(pins):
-            if pin.get("kind") is None:
-                case = pin["case"]
-                role, _hello, version, raw_features = case.split(" ", 3)
-                features = ast.literal_eval(raw_features)
-                request_id = "o-hello" if role == "observer" else "c-hello"
-                client = await contract.connect(role)  # type: ignore[arg-type]
-                actual = await client.request_raw(
-                    request_id,
-                    "hello",
-                    {
-                        "protocol_version": version,
-                        "features": features,
-                        **({"role": "observer"} if role == "observer" else {}),
-                    },
-                )
-                assert actual == pin["response"]
-                await client.close()
-                continue
-            role = pin.get("role", "controller")
-            client = await contract.connect(role)  # type: ignore[arg-type]
-            hello = await client.request_raw(
-                f"hello-{index}",
+    for index, pin in enumerate(pin for pin in pins if pin.get("kind") is None):
+        case = pin["case"]
+        role, _hello, version, raw_features = case.split(" ", 3)
+        features = ast.literal_eval(raw_features)
+        hello_contract = await ServeContract.start(tmp_path / f"hello-{index}", "unix")
+        try:
+            client = await hello_contract.connect(role)  # type: ignore[arg-type]
+            actual = await client.request_raw(
+                "o-hello" if role == "observer" else "c-hello",
                 "hello",
                 {
-                    "protocol_version": pin.get("protocol_version", "1.2"),
-                    "features": pin.get("features", []),
+                    "protocol_version": version,
+                    "features": features,
                     **({"role": "observer"} if role == "observer" else {}),
                 },
             )
-            if pin.get("kind") == "direct" and pin["case"] in {
-                "not_a_method",
-                "clear_steering",
-                "delivery_status",
-                "observer unknown",
-            }:
+            assert actual == pin["response"]
+        finally:
+            await hello_contract.close()
+
+    groups: dict[tuple[str, str, tuple[str, ...]], list[dict[str, object]]] = {}
+    for pin in pins:
+        if pin.get("kind") is None:
+            continue
+        role = pin.get("role", "controller")
+        version = pin.get("protocol_version", "1.2")
+        features = tuple(pin.get("features", []))
+        groups.setdefault((role, version, features), []).append(pin)
+    for group_index, ((role, version, features), group) in enumerate(groups.items()):
+        contract = await ServeContract.start(
+            tmp_path / f"wire-pin-{group_index}", "unix"
+        )
+        try:
+            client = await contract.connect(role)  # type: ignore[arg-type]
+            hello = await client.request_raw(
+                f"hello-{group_index}",
+                "hello",
+                {
+                    "protocol_version": version,
+                    "features": list(features),
+                    **({"role": "observer"} if role == "observer" else {}),
+                },
+            )
+            assert json.loads(hello).get("error") is None
+            for pin in group:
                 actual = await client.request_raw(
                     pin["request_id"], pin["method"], pin["params"]
                 )
-                assert actual == _w4_delta(pin["response"], pin["method"])
-                await client.close()
-                continue
-            if pin.get("kind") is None:
-                assert hello == pin["response"]
-                continue
-            actual = await client.request_raw(
-                pin["request_id"], pin["method"], pin["params"]
-            )
-            if pin["method"] == "model_catalog":
-                result = json.loads(actual)["result"]
-                assert set(result) == {"models", "providers"}
-                assert isinstance(result["models"], list)
-                assert isinstance(result["providers"], dict)
-            else:
-                assert actual == _w4_delta(pin["response"], pin["method"])
-            await client.close()
-    finally:
-        await contract.close()
+                if pin["method"] == "model_catalog":
+                    result = json.loads(actual)["result"]
+                    assert set(result) == {"models", "providers"}
+                    assert isinstance(result["models"], list)
+                    assert isinstance(result["providers"], dict)
+                else:
+                    assert actual == _w4_delta(pin["response"], pin["method"])
+        finally:
+            await contract.close()
