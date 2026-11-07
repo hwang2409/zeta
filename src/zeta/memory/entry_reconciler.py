@@ -718,7 +718,12 @@ async def _invoke(
     invoke: EntryInvoke, prompt: str, budget: CompletionRetryBudget
 ) -> tuple[str, dict[str, int], bool]:
     with use_response_byte_limit(_MAX_RESPONSE_BYTES):
-        response = invoke(prompt, budget)
+        try:
+            inspect.signature(invoke).bind(prompt, budget)
+        except TypeError:
+            response = invoke(prompt)  # type: ignore[call-arg]
+        else:
+            response = invoke(prompt, budget)
         if inspect.isawaitable(response):
             response = await response
     if isinstance(response, ReconciliationResponse):

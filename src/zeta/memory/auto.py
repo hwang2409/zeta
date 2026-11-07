@@ -806,7 +806,12 @@ class AutoMemoryReconciler:
     ) -> tuple[str, dict[str, int]]:
         if self._closing:
             raise asyncio.CancelledError
-        raw = self.invoke(prompt, budget)
+        try:
+            inspect.signature(self.invoke).bind(prompt, budget)
+        except TypeError:
+            raw = self.invoke(prompt)  # type: ignore[call-arg]
+        else:
+            raw = self.invoke(prompt, budget)
         if inspect.isawaitable(raw):
             raw = await raw
         if isinstance(raw, ReconciliationResponse):

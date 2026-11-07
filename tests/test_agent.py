@@ -5378,6 +5378,7 @@ async def test_restricted_profile_keeps_eligible_child_runtime_tools(
         ],
         child_turns={"inspect the task": [child_turn]},
         parent_prompt="start",
+        gated_child_call=0,
     )
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
     registry = ToolRegistry(
@@ -7521,6 +7522,7 @@ async def test_failed_background_receipt_matches_error_flag(
             parent_turns=[ScriptedTurn(tool_calls=[call]), ScriptedTurn()],
             child_turns={"inspect the task": [ScriptedTurn()]},
             parent_prompt="start",
+            gated_child_call=0,
         ),
         store,
         max_turns=1,
