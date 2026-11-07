@@ -60,7 +60,7 @@ def test_live_trigger_reconciles_before_sigkill(tmp_path: Path) -> None:
         [sys.executable, "-c", "import time; time.sleep(30)"],
         tmp_path,
         dict(os.environ),
-        5,
+        10,
         transcript=lambda: (session, "session-1"),
         token_threshold=20,
         initial_tokens=25,

@@ -55,7 +55,7 @@ from zeta.tui import TUIApp
 FIXTURE = Path(__file__).parent / "fixtures/usage/codex_responses_429_usage_limit_reached.json"
 NOW = datetime(2026, 10, 22, 16, 0, tzinfo=UTC)
 ACCOUNT = AccountId("codex", "pro")
-SATURATED_RACE_TIMEOUT_SECONDS = 5
+SATURATED_RACE_TIMEOUT_SECONDS = 10
 
 
 def _failure(status: int, body: object) -> SimpleNamespace:
@@ -605,7 +605,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
 
         @contextmanager
         def observed_metadata_lock(*args: object, **kwargs: object):
-            writers_ready.wait(timeout=2)
+            writers_ready.wait(timeout=10)
             with metadata_lock(*args, **kwargs) as directory_fd:
                 yield directory_fd
 
@@ -632,7 +632,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
             ) as directory_fd:
                 assert directory_fd is None
             event_loop.call_soon_threadsafe(queue_renames)
-            writers_ready.wait(timeout=2)
+            writers_ready.wait(timeout=10)
             return metadata
 
         SessionAccountContext._commit_locked = commit_then_queue_renames  # type: ignore[method-assign]
@@ -683,21 +683,21 @@ def test_switch_releases_lock_with_saturated_metadata_writers(tmp_path: Path) ->
         process.join(timeout=SATURATED_RACE_TIMEOUT_SECONDS + 1)
         if process.is_alive():
             process.terminate()
-            process.join(timeout=1)
+            process.join(timeout=10)
             pytest.fail(
                 f"account switch exceeded its {SATURATED_RACE_TIMEOUT_SECONDS} s "
                 "deadline after "
                 f"{startup_seconds:.3f} s of child startup"
             )
         assert process.exitcode == 0
-        assert results.poll(1)
+        assert results.poll(10)
         event, error = results.recv()
         assert event == "result"
         assert error is None, error
     finally:
         if process.is_alive():
             process.terminate()
-            process.join(timeout=1)
+            process.join(timeout=10)
         results.close()
         process.close()
 

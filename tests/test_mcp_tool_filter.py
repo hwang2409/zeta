@@ -647,6 +647,7 @@ async def test_mcp_http_notification_listener_healthy_idle_resets_backoff(
         MCPServerConfig("http", "streamable-http", url="https://mcp.test"), handler
     )
 
+    # test-contract: latency ordered sleeps prove the healthy-stream backoff reset.
     assert delays == [0.1, 0.2, NOTIFICATION_RECONNECT_INITIAL_SECONDS]
 
 
