@@ -223,19 +223,24 @@ async def test_agent_status_reports_child_while_finish_is_being_published(
             "background": True,
         },
     )
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[run_call]),
-            ScriptedTurn(
-                tool_calls=[
-                    ToolCall(
-                        "finish-1",
-                        "finish",
-                        {"status": "done", "summary": "finished"},
-                    )
-                ]
-            ),
-        ]
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[run_call])],
+        {
+            "finish the task": [
+                ScriptedTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "finish-1",
+                            "finish",
+                            {"status": "done", "summary": "finished"},
+                        )
+                    ]
+                )
+            ]
+        },
+        parent_prompt="start",
+        gated_child_prompts=set(),
+        parent_waits_for_children=False,
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
