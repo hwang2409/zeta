@@ -1277,6 +1277,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     owner_thread = threading.get_ident()
     heavy_threads: dict[str, list[int]] = {
         "load": [],
+        "validate": [],
         "rebuild": [],
     }
     active_rows_by_thread: dict[int, int] = {}
@@ -1310,7 +1311,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
         original = getattr(ConversationStore, name)
 
         def observed(candidate: ConversationStore, *args: object, **kwargs: object):
-            heavy_threads[{"_load_full": "load", "_rebuild_incremental_validation_state": "rebuild"}[name]].append(
+            heavy_threads[{"_load_full": "load", "_validate_entries": "validate", "_rebuild_incremental_validation_state": "rebuild"}[name]].append(
                 threading.get_ident()
             )
             return original(candidate, *args, **kwargs)
@@ -1319,6 +1320,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
 
     for method_name in (
         "_load_full",
+        "_validate_entries",
         "_rebuild_incremental_validation_state",
     ):
         observe_heavy(method_name)

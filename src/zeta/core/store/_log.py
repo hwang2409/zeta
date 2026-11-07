@@ -724,6 +724,19 @@ class ConversationLogMixin:
             )
 
         self._entries = entries
+        try:
+            self._validate_entries()
+        except ConversationIntegrityError as exc:
+            raise self._transcript_error(
+                kind="broken_links",
+                row_number=None,
+                byte_offset=None,
+                valid_prefix_end=None,
+                reason_code="invalid_active_branch_links",
+                repairable=False,
+                raw=raw,
+                stat=stat,
+            ) from exc
         self._entry_prefix_digest = b""
         for entry in self._entries:
             self._record_entry_prefix(entry)
