@@ -11163,8 +11163,6 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     def record_enqueue(output, frame, *, wake=True):
         payload = json.loads(frame.payload)
         if payload.get("params", {}).get("event") == "tool_end":
-            for task in asyncio.all_tasks():
-                task.print_stack()
             tool_end_started.set()
         return original_enqueue(output, frame, wake=wake)
 
