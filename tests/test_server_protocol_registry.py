@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
 from zeta.server.protocol import (
     ErrorDescriptor,
@@ -85,6 +86,77 @@ def test_method_registry_matches_documented_table() -> None:
         (item.wire, item.since or "1.0", item.feature or "none", item.access.value)
         for item in MethodDescriptor
     ], "document every method in descriptor order"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_real_method_conformance_matrix(transport: str, tmp_path: Path) -> None:
+    document = PROTOCOL_DOC.read_text(encoding="utf-8")
+    section = _section(document, "## method table", "## common JSON-RPC shapes")
+    table = [
+        (name, since, feature, access)
+        for name, since, feature, access in re.findall(
+            r"^\| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \|$",
+            section,
+            re.MULTILINE,
+        )
+    ]
+    for version, features in (
+        ("1.0", []),
+        ("1.1", []),
+        ("1.1", ["abort_scope", "delivery_id", "ping"]),
+        ("1.2", ["abort_scope", "delivery_id", "ping", "serve_observers"]),
+    ):
+        contract = await ServeContract.start(
+            tmp_path / f"{version}-{len(features)}", transport
+        )  # type: ignore[arg-type]
+        controller = observer = None
+        try:
+            controller = await contract.connect("controller")
+            hello = await controller.request(
+                "controller-hello",
+                "hello",
+                {"protocol_version": version, "features": features},
+            )
+            advertised = hello["result"]["capabilities"]["requests"]
+            expected = [
+                name
+                for name, since, feature, _access in table
+                if (since == "1.0" or version != "1.0")
+                and (feature == "none" or feature in features)
+            ]
+            assert advertised == expected
+            observer = await contract.connect("observer")
+            observer_hello = await observer.request(
+                "observer-hello",
+                "hello",
+                {"protocol_version": version, "role": "observer", "features": features},
+            )
+            if "serve_observers" not in features:
+                assert observer_hello["error"]["code"] == -32602
+                continue
+            observer_expected = [
+                name
+                for name, since, feature, access in table
+                if access == "read"
+                and (since == "1.0" or version != "1.0")
+                and (feature == "none" or feature in features)
+            ]
+            assert observer_hello["result"]["capabilities"]["requests"] == sorted(
+                observer_expected
+            )
+            for method in ("send", "clear_steering"):
+                reply = await observer.request(f"observer-{method}", method)
+                assert reply["error"]["code"] == -32008
+            for method in ("clear_steering", "delivery_status"):
+                reply = await controller.request(f"w4-{method}", method)
+                if method == "clear_steering" and "abort_scope" in features:
+                    continue
+                if method == "delivery_status" and "delivery_id" in features:
+                    continue
+                assert reply["error"]["code"] == -32601
+        finally:
+            await contract.close()
 
 
 def test_protocol_registry_matches_documented_errors_and_events() -> None:
@@ -305,6 +377,27 @@ class _RawFrameBypassVisitor(ast.NodeVisitor):
         if _is_wire_error_or_notification(keys):
             self._add(target, "build error and notification frames through FrameCodec")
 
+    def visit_Compare(self, node: ast.Compare) -> None:
+        if (
+            self.path.name in {"server.py", "mutation.py"}
+            and isinstance(node.left, ast.Name)
+            and node.left.id == "method"
+        ):
+            literals = []
+            for item in node.comparators:
+                if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                    literals.append(item.value)
+                elif isinstance(item, ast.Set):
+                    literals.extend(
+                        value.value
+                        for value in item.elts
+                        if isinstance(value, ast.Constant)
+                        and isinstance(value.value, str)
+                    )
+            if any(value != "hello" for value in literals):
+                self._add(node, "dispatch method names must use MethodDescriptor")
+        self.generic_visit(node)
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in RAW_FRAME_BUILDERS:
             self._add(node, f"raw frame builder {node.attr} is private to protocol.py")
@@ -470,6 +563,17 @@ def test_no_serve_slash_allowlist_or_named_dispatch_bypasses_registry() -> None:
 )
 def test_slash_registry_gate_rejects_committed_bypass_mutations(source: str) -> None:
     assert _slash_registry_bypasses(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        'def dispatch(method):\n    if method == "ping":\n        return True\n',
+        'def dispatch(method):\n    if method in {"approve", "deny"}:\n        return True\n',
+    ),
+)
+def test_static_gate_rejects_raw_method_dispatch_mutations(source: str) -> None:
+    assert _source_bypasses(source)
 
 
 def test_no_code_bypasses_the_typed_frame_codec() -> None:
