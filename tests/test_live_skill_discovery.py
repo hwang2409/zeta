@@ -446,6 +446,32 @@ async def test_serve_discovers_new_skill_for_slash_list_then_run(
 
 
 @pytest.mark.asyncio
+async def test_serve_run_discovers_new_skill_without_list_refresh(
+    tmp_path: Path,
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    home = tmp_path / "home"
+    server = ZetaServer(home=home, cwd=project, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        _install_live_skill(home)
+        result = (
+            await _request(
+                reader,
+                writer,
+                "live-run-only",
+                "slash_run",
+                {"session_id": sid, "text": "/live request"},
+            )
+        )[-1]["result"]
+        assert result["kind"] == "model_input"
+        assert "live body" in result["text"]
+        assert "request" in result["text"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
     tmp_path: Path,
 ) -> None:
