@@ -309,8 +309,9 @@ class TUIApp(
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
             extra_commands=_tui_slash_commands(),
         )
+        slash_commands = self._slash_commands
         self.loop.add_live_config_listener(
-            lambda skills, _agents: self._slash_commands.register_skills(skills)
+            lambda skills, _agents: slash_commands.register_skills(skills)
         )
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
