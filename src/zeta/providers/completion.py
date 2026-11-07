@@ -779,6 +779,15 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             await attempt.aclose()
         except BaseException as cleanup_error:
             primary_error = primary if isinstance(primary, BaseException) else None
+            producer_error = getattr(attempt, "_producer_error", None)
+            if (
+                primary_error is not None
+                and is_control_exception(primary_error)
+                and isinstance(producer_error, BaseException)
+                and not is_control_exception(producer_error)
+            ):
+                primary_error.__cause__ = producer_error
+                primary_error.__context__ = producer_error
             if primary_error is not None and is_control_exception(cleanup_error):
                 raise cleanup_error from primary_error
             if primary is not None and primary_error is None:
@@ -787,6 +796,15 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     cleanup_error.__context__ = primary
                     raise
             else:
+                if (
+                    primary_error is not None
+                    and is_control_exception(primary_error)
+                    and is_control_exception(cleanup_error)
+                    and cleanup_error.__cause__ is not None
+                    and not is_control_exception(cleanup_error.__cause__)
+                ):
+                    primary_error.__cause__ = cleanup_error.__cause__
+                    primary_error.__context__ = cleanup_error.__cause__
                 selected = merge_exception(primary_error, cleanup_error)
                 if selected is cleanup_error:
                     if primary is None and not is_control_exception(cleanup_error):

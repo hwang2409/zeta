@@ -114,12 +114,6 @@ from .protocol.types import (
     ToolUseContent,
     flatten_tool_content,
 )
-from .providers.completion import (
-    CompletionCleanupError,
-    CompletionControl,
-    CompletionRetryBudget,
-    ResetPolicy,
-)
 
 SUMMARY_SOURCE_TOKEN_LIMIT = 64_000
 SUMMARY_RETRIES = 2
@@ -576,6 +570,13 @@ class CompactionPolicy:
         on_retry: Callable[[], None] | None,
         retry: bool,
     ) -> str:
+        from .providers.completion import (
+            CompletionCleanupError,
+            CompletionControl,
+            CompletionRetryBudget,
+            ResetPolicy,
+        )
+
         completion_backend = backend or self.backend
         if completion_backend is None:
             raise SummaryCompletionError("compaction requires a completion backend")

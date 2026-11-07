@@ -107,7 +107,7 @@ class _GatedBackend(FakeBackend):
     @owned_completion
     async def complete(self, messages: Any, tool_schemas: Any):
         if len(self.calls) == 1:
-            await self.release_next_call.wait()
+            await asyncio.wait_for(self.release_next_call.wait(), 10)
         async for event in FakeBackend.complete.__wrapped__(
             self, messages, tool_schemas
         ):

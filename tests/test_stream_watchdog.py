@@ -78,7 +78,7 @@ class _HangingByteStream(httpx.AsyncByteStream):
         if self._preface:
             yield self._preface
         self.entered.set()
-        await self._closed.wait()
+        await asyncio.wait_for(self._closed.wait(), 10)
 
     async def aclose(self) -> None:
         self._closed.set()
@@ -100,7 +100,7 @@ class _ClockedByteStream(httpx.AsyncByteStream):
         for elapsed, chunk in self._chunks:
             self._clock.advance(self._clock.now() + elapsed)
             yield chunk
-        await self._closed.wait()
+        await asyncio.wait_for(self._closed.wait(), 10)
 
     async def aclose(self) -> None:
         self._closed.set()
@@ -118,13 +118,13 @@ async def _collect_after_expirations(
     task = asyncio.create_task(_collect(completion))
     try:
         for gate in gates:
-            await gate.wait()
+            await asyncio.wait_for(gate.wait(), 10)
             await clock.expire_next()
         return await asyncio.wait_for(task, 10)
     finally:
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
 
 async def _collect(completion: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
@@ -424,7 +424,7 @@ async def test_provider_stalls_waiting_for_response_headers(
     async def no_headers(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         headers_waiting.set()
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         raise AssertionError("unreachable")
 
     client = _mock_client(no_headers)
@@ -472,7 +472,7 @@ async def test_oauth_refresh_network_wait_is_bounded(
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
 
     async def no_refresh_response(_request: httpx.Request) -> httpx.Response:
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         raise AssertionError("unreachable")
 
     async with _mock_client(no_refresh_response) as client:

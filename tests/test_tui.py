@@ -4430,7 +4430,7 @@ async def test_retry_reuses_user_message_and_keeps_partial_output(
     assert app.retry_available()
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     messages = store.messages()
     assert [message.role for message in messages] == [
@@ -4466,7 +4466,7 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
     await app._consume_turn("prompt")
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     rendered = Text.from_ansi(app.console.file.getvalue()).plain
     assert rendered.count("provider failure · timeout") == 2
@@ -4532,7 +4532,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
 
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert backend.calls == 3
     assert store.messages()[-1].content[0].text == "done"
@@ -4609,7 +4609,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
 
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert backend.calls == 3
     assert store.messages()[-1].content[0].text == "done"
@@ -4668,7 +4668,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
 
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     users = [
         message for message in store.messages() if message.role is MessageRole.USER
@@ -4799,7 +4799,7 @@ async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
 
     assert app._draft.load() == "new rapid draft"
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
     await app.loop.close()
 
 
@@ -4828,9 +4828,9 @@ async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
 
     await backend.started.wait()
     backend.release.set()
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     await wait_until(lambda: len(backend.calls) == 2)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert session.default_buffer.text == "third draft"
     assert app._draft.load() == "third draft"
@@ -4867,9 +4867,9 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
 
     await backend.started.wait()
     backend.release.set()
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     await wait_until(lambda: len(backend.calls) == 2)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert first_image.exists()
     assert second_image.exists()
@@ -10856,7 +10856,7 @@ async def test_control_command_does_not_reject_rapid_follow_up(
     app._submit_input(command)
     app._submit_input("probe")
     await wait_until(lambda: len(backend.calls) == 1)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     if expected == "checkpoint_count":
         assert store.checkpoint_count() == 1
@@ -10883,7 +10883,7 @@ async def test_plain_approve_word_is_sent_to_model_from_composer(
     app._submit_input(text)
     await asyncio.sleep(0.05)
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
 
     assert [
         block.text
@@ -10956,7 +10956,7 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
     app._submit_input("approve the plan")
     await asyncio.sleep(0.05)
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
 
     assert [request.key for request in app.pending_approvals] == [call.id]
     assert [
@@ -10985,9 +10985,9 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
     await backend.started.wait()
 
     backend.release.set()
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     await wait_until(lambda: len(backend.calls) == 2)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     user_texts = [
         block.text
@@ -11019,7 +11019,7 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(
     await asyncio.gather(app._active_task, return_exceptions=True)
     await asyncio.sleep(0)
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
 
     user_texts = [
         block.text
@@ -11053,7 +11053,7 @@ async def test_undo_restores_double_slash_source_text(tmp_path: Path) -> None:
 
     assert session.app.current_buffer.text == raw
     await app._handle_prompt_value(raw)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert len(backend.calls) == 2
     resent = [
@@ -13110,7 +13110,7 @@ async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
     monkeypatch.setattr(app.loop, "slash_mcp_prompt", resolve)
     await app._handle_prompt_value("/fake:review")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     message = store.messages()[0]
     assert message.content == [
@@ -13307,7 +13307,7 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
     assert app._pending_attachments == [staged]
     await app._handle_prompt_value("inspect [Image #1]")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     user_messages = [
         message for message in store.messages() if message.role is MessageRole.USER
@@ -13378,7 +13378,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
             self.max_active = max(self.max_active, self.active)
             try:
                 if self.calls == 1:
-                    await self.release_first.wait()
+                    await asyncio.wait_for(self.release_first.wait(), 10)
                 yield StreamEvent(StreamEventType.MESSAGE_START)
                 yield StreamEvent(
                     StreamEventType.MESSAGE_END,

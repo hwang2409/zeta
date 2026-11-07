@@ -896,7 +896,7 @@ class DelegatedApprovalBackend:
         if is_child:
             self.child_started.set()
         elif self.parent.calls:
-            await self.child_started.wait()
+            await asyncio.wait_for(self.child_started.wait(), 10)
         async for event in backend.complete(messages, tool_schemas, control=completion_control()):
             yield event
 
@@ -7549,7 +7549,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
-                    await release.wait()
+                    await asyncio.wait_for(release.wait(), 10)
 
     server = ZetaServer(
         home=tmp_path,
@@ -9214,7 +9214,7 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
-                    await release.wait()
+                    await asyncio.wait_for(release.wait(), 10)
 
     server = ZetaServer(
         home=tmp_path,
@@ -10525,7 +10525,7 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue_serve(
             self.calls.append(list(messages))
             if len(self.calls) == 1:
                 self.started.set()
-                await self.release.wait()
+                await asyncio.wait_for(self.release.wait(), 10)
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
