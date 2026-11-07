@@ -324,11 +324,7 @@ class ToolRegistry:
             storage_lease=(
                 session_store._storage_lease if session_store is not None else None
             ),
-            notification_exists=(
-                session_store.has_task_exit_notification
-                if session_store is not None
-                else None
-            ),
+            notification_exists=(session_store.has_task_exit_notification if session_store else None),
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)

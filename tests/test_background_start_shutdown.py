@@ -17,12 +17,9 @@ import pytest
 from tests.support.processes import kill_group_if_present
 from zeta.tools._shared import background_spawn
 from zeta.tools._shared import process as process_module
-from zeta.tools._shared.process import (
-    BackgroundTaskNotice,
-    BackgroundTaskRegistry,
-    TaskExitInput,
-    _group_exists,
-)
+from zeta.tools._shared.background_spawn import _group_exists
+from zeta.tools._shared.background_task_types import BackgroundTaskNotice, TaskExitInput
+from zeta.tools._shared.process import BackgroundTaskRegistry
 
 
 @pytest.mark.asyncio

@@ -54,15 +54,11 @@ from zeta.server import event_contract
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared import background_spawn as spawn_module
+from zeta.tools._shared.background_log_writer import _OrderedLogWriter
 from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
-from zeta.tools._shared.background_spawn import _terminate_process
-from zeta.tools._shared.process import (
-    BackgroundTaskRegistry,
-    TaskExitInput,
-    _BackgroundRecord,
-    _group_exists,
-    _OrderedLogWriter,
-)
+from zeta.tools._shared.background_spawn import _group_exists, _terminate_process
+from zeta.tools._shared.background_task_types import TaskExitInput, _BackgroundRecord
+from zeta.tools._shared.process import BackgroundTaskRegistry
 from zeta.tui.render import format_status, render_event
 
 
@@ -305,13 +301,17 @@ async def test_registry_close_persists_specific_kill_cause(
     task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
     terminate_processes = process_module._terminate_processes
 
-    async def assert_cause_before_signal(processes, term_grace, *, finish):
+    async def assert_cause_before_signal(
+        processes, term_grace, *, finish, after_signal=None
+    ):
         rows = json.loads((store.session_dir / "background_tasks.json").read_text())
         row = next(row for row in rows if row["task_id"] == task_id)
         assert row["running"] is True
         assert row["terminal_phase"] == "session_shutdown"
         assert row["note"] == "tool registry closed"
-        return await terminate_processes(processes, term_grace, finish=finish)
+        return await terminate_processes(
+            processes, term_grace, finish=finish, after_signal=after_signal
+        )
 
     # test-contract: seam inspect the durable record immediately before signaling
     monkeypatch.setattr(
@@ -2594,9 +2594,11 @@ async def test_close_terminates_many_tasks_in_one_grace_period(
     # test-contract: complexity no public process-termination batch seam exists
     terminate_processes = process_module._terminate_processes
 
-    async def record_batch(processes, term_grace, *, finish):
+    async def record_batch(processes, term_grace, *, finish, after_signal=None):
         termination_batches.append(len(processes))
-        return await terminate_processes(processes, term_grace, finish=finish)
+        return await terminate_processes(
+            processes, term_grace, finish=finish, after_signal=after_signal
+        )
 
     # test-contract: complexity shutdown must expose one bounded termination batch
     monkeypatch.setattr(process_module, "_terminate_processes", record_batch)
