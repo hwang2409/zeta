@@ -329,7 +329,9 @@ def test_recovery_uses_point_notification_queries_for_many_children(
     ):
         recover_agent_children(loop)
 
+    # test-contract: complexity recovery uses point queries, not full scans
     assert full_scan.call_count == 0
+    # test-contract: complexity one point query per child keeps work linear
     assert point_query.call_count == 8
     assert store.agent_children() == {}
 
