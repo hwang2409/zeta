@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -195,6 +196,43 @@ async def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
     assert offset == target.stat().st_size
 
 
+@pytest.mark.asyncio
+async def test_reconciliation_cursor_survives_short_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, registry, project_id, notices = _runner(tmp_path, transcript_count=1)
+    real_write = os.write
+
+    def short_write(fd: int, payload: bytes) -> int:
+        return real_write(fd, payload[:1])
+
+    monkeypatch.setattr(os, "write", short_write)
+    runner.state.record_success(
+        seq_start=1,
+        seq_end=1,
+        reason="test",
+        end_offset=17,
+        end_tokens=3,
+    )
+    await runner.close()
+
+    reopened = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id=SESSION,
+        session_dir=runner.session_dir,
+        invoke=_proposal,
+        notice=notices.append,
+    )
+    try:
+        assert reopened.last_reconciled_seq == 1, (
+            f"reopened cursor was {reopened.last_reconciled_seq}, not the published value"
+        )
+        assert json.loads(reopened.position_path.read_text(encoding="utf-8"))["seq"] == 1
+    finally:
+        await reopened.close()
+
+
 def test_transcript_scanner_stops_at_corrupt_rows(tmp_path: Path) -> None:
     runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
     rows = [
@@ -232,6 +270,29 @@ async def test_corrupt_transcript_stays_blocked_after_scheduled_retries(tmp_path
     assert runner.terminal_receipts() == ()
     assert len(notices) == 1
     assert len(runner.failure_log_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_memory_failure_log_survives_short_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
+    runner.session_dir.joinpath("conversation.jsonl").write_bytes(b"{not json}\n")
+    real_write = os.write
+
+    def short_write(fd: int, payload: bytes) -> int:
+        return real_write(fd, payload[:1])
+
+    monkeypatch.setattr(os, "write", short_write)
+    runner.activity(1)
+    try:
+        await runner.drain()
+        payload = runner.failure_log_path.read_bytes()
+        assert payload.endswith(b"\n"), f"failure log was cut off: {payload!r}"
+        record = json.loads(payload)
+        assert record["message"] == "malformed conversation row"
+    finally:
+        await runner.close()
 
 
 @pytest.mark.asyncio
