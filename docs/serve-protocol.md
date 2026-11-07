@@ -146,11 +146,11 @@ feature. Observer connections receive only methods with `read` access.
 | `resume` | `1.0` | `none` | `controller_write` |
 | `send` | `1.0` | `none` | `delivery` |
 | `steer` | `1.0` | `none` | `delivery` |
-| `approve` | `1.0` | `none` | `controller_write` |
-| `deny` | `1.0` | `none` | `controller_write` |
+| `approve` | `1.0` | `none` | `session_mutation` |
+| `deny` | `1.0` | `none` | `session_mutation` |
 | `abort` | `1.0` | `none` | `session_mutation` |
 | `status` | `1.0` | `none` | `read` |
-| `rename_session` | `1.1` | `none` | `controller_write` |
+| `rename_session` | `1.1` | `none` | `session_mutation` |
 | `delete_session` | `1.1` | `none` | `controller_write` |
 | `session_tree` | `1.1` | `none` | `read` |
 | `session_history` | `1.1` | `none` | `read` |

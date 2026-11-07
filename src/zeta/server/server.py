@@ -566,6 +566,8 @@ class _Client:
             raise ProtocolError(
                 ErrorDescriptor.METHOD_NOT_FOUND, f"{method} requires protocol 1.1"
             )
+        if descriptor.access is Access.SESSION_MUTATION:
+            self.server.control._reject_if_unhealthy()
         if descriptor.feature is not None and descriptor.feature not in self.features:
             feature_message = (
                 "session grants require the negotiated session_grants feature"
@@ -573,8 +575,6 @@ class _Client:
                 else f"{method} requires the negotiated {descriptor.feature} feature"
             )
             raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, feature_message)
-        if descriptor.access is Access.SESSION_MUTATION:
-            self.server.control._reject_if_unhealthy()
         return await HANDLERS[descriptor](self, request_id, params)
 
     async def _dispatch_descriptor(
