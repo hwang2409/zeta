@@ -101,7 +101,7 @@ def _publish_shape_field(
                 if entered is not None:
                     entered.set()
                 if release is not None:
-                    release.wait()
+                    assert release.wait(timeout=10)
                 atomic_publish_file(fd, name, payload, sync_directory=True)
 
             lease.publish_json(
@@ -340,7 +340,7 @@ def test_mcp_oauth_logout_during_refresh_leaves_no_token(
     def paused_replace(source: object, target: object, **kwargs: object) -> None:
         if str(target).endswith("server.json"):
             entered.set()
-            release.wait()
+            assert release.wait(timeout=10)
         original_replace(source, target, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(oauth_store.os, "replace", paused_replace)
@@ -348,7 +348,7 @@ def test_mcp_oauth_logout_during_refresh_leaves_no_token(
         target=asyncio.run, args=(store.save_login("server", token),)
     )
     refresh.start()
-    entered.wait()
+    assert entered.wait(timeout=10)
     logout_started = threading.Event()
 
     def logout() -> None:
@@ -357,13 +357,15 @@ def test_mcp_oauth_logout_during_refresh_leaves_no_token(
 
     logout_thread = threading.Thread(target=logout)
     logout_thread.start()
-    logout_started.wait()
+    assert logout_started.wait(timeout=10)
     token_directory = token_store_path("server", tmp_path).parent
     if not _shape_flock_is_held(tmp_path, token_directory, "server.json"):
-        logout_thread.join()
+        logout_thread.join(timeout=10)
     release.set()
-    refresh.join()
-    logout_thread.join()
+    refresh.join(timeout=10)
+    logout_thread.join(timeout=10)
+    assert not refresh.is_alive()
+    assert not logout_thread.is_alive()
 
     assert asyncio.run(store.load("server")).token is None
 
@@ -456,17 +458,19 @@ def test_shape_lock_serializes_two_thread_publishers(tmp_path: Path) -> None:
         args=(str(home), str(directory), "known", 2, entered, release),
     )
     writer_a.start()
-    entered.wait()
+    assert entered.wait(timeout=10)
     writer_b = threading.Thread(
         target=_publish_shape_field,
         args=(str(home), str(directory), "future-field", True),
     )
     writer_b.start()
     if not _shape_flock_is_held(home, directory, "state.json"):
-        writer_b.join()
+        writer_b.join(timeout=10)
     release.set()
-    writer_a.join()
-    writer_b.join()
+    writer_a.join(timeout=10)
+    writer_b.join(timeout=10)
+    assert not writer_a.is_alive()
+    assert not writer_b.is_alive()
 
     assert _read(directory / "state.json") == {"known": 2, "future-field": True}
 
@@ -486,17 +490,19 @@ def test_shape_lock_serializes_two_process_publishers(tmp_path: Path) -> None:
         args=(str(home), str(directory), "known", 2, entered, release),
     )
     writer_a.start()
-    entered.wait()
+    assert entered.wait(timeout=10)
     writer_b = context.Process(
         target=_publish_shape_field,
         args=(str(home), str(directory), "future-field", True),
     )
     writer_b.start()
     if not _shape_process_lock_is_held(home, directory, "state.json"):
-        writer_b.join()
+        writer_b.join(timeout=10)
     release.set()
-    writer_a.join()
-    writer_b.join()
+    writer_a.join(timeout=10)
+    writer_b.join(timeout=10)
+    assert not writer_a.is_alive()
+    assert not writer_b.is_alive()
     assert writer_a.exitcode == 0
     assert writer_b.exitcode == 0
     writer_a.close()
