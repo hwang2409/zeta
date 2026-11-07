@@ -254,6 +254,75 @@ os.environ["ZETA_HOME"] = "/tmp/home"
         assert [finding.code for finding in findings] == ["TQ005"]
 
 
+def test_marker_inline_comment_does_not_suppress_next_statement(tmp_path: Path) -> None:
+    source = """async def test_wait():
+    await asyncio.sleep(0.1)  # test-contract: latency real retry delay
+    await asyncio.sleep(0.2)
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 3)]
+
+
+def test_marker_comment_line_applies_only_to_next_statement(tmp_path: Path) -> None:
+    source = """async def test_wait():
+    # test-contract: latency real retry delay
+    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 4)]
+
+
+def test_marker_on_multiline_statement_closing_line_applies_to_that_line() -> None:
+    lines = [
+        "call(",
+        "    value,",
+        "    option,",
+        ")  # test-contract: seam real public seam is unavailable",
+    ]
+
+    assert quality._has_marker(lines, 4, {"seam"})
+
+
+def test_tq005_inline_marker_does_not_suppress_next_statement(tmp_path: Path) -> None:
+    source = """import os
+os.environ["ZETA_HOME"] = "/tmp/home"  # test-contract: bootstrap session home
+os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
+"""
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ005", 3)]
+
+
+def test_tq005_comment_marker_applies_only_to_next_statement(tmp_path: Path) -> None:
+    source = """import os
+# test-contract: bootstrap session home
+os.environ["ZETA_HOME"] = "/tmp/home"
+os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
+"""
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ005", 4)]
+
+
+def test_tq005_marker_on_multiline_statement_first_line_suppresses(
+    tmp_path: Path,
+) -> None:
+    source = """import os
+os.environ[  # test-contract: bootstrap session home
+    "ZETA_HOME"
+] = "/tmp/home"
+"""
+
+    assert _lint(tmp_path, source, path="tests/conftest.py") == []
+
+
 def test_tq005_rejects_global_zeta_bootstraps_in_conftest(tmp_path: Path) -> None:
     source = 'import os\nos.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"\n'
 

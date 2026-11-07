@@ -150,9 +150,12 @@ def _marker(lines: list[str], line: int) -> tuple[str, str] | None:
     for candidate in (line, line - 1):
         if candidate < 1 or candidate > len(lines):
             continue
+        marker_line = lines[candidate - 1]
+        if candidate == line - 1 and not marker_line.lstrip().startswith("#"):
+            continue
         match = re.search(
             r"#\s*test-contract:\s*([a-z-]+)(?:\s+([^#\s].*?))?\s*$",
-            lines[candidate - 1],
+            marker_line,
         )
         if match and match.group(1) in CONTRACT_KINDS and match.group(2):
             return match.group(1), match.group(2).strip()
