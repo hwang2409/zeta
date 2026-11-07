@@ -434,6 +434,22 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
         "restart-recovers-running-row",
         "suppressed-task-stays-suppressed",
         "legacy-pending-recovers-once",
+        "cancel-process-wait",
+        "cancel-reader-drain",
+        "cancel-ordered-writer-close",
+        "cancel-archive",
+        "cancel-persist",
+        "cancel-evidence-submit",
+        "cancel-install",
+        "cancel-notice",
+        "cancel-close-coordinator",
+        "archive-failure-recovers-once",
+        "restart-durable-terminal-notify-true",
+        "restart-durable-terminal-notify-false",
+        "two-task-close-ordering",
+        "two-task-close-cancellation",
+        "crash-before-aggregate",
+        "group-exit-after-positive-probe",
     ],
 )
 async def test_background_task_owner_state_table(
@@ -462,6 +478,132 @@ async def test_background_task_owner_state_table(
                 ToolCall("output", "task_output", {"task_id": task_id})
             )
             return result["structuredContent"]
+
+        if row == "cancel-close-coordinator":
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            closing = asyncio.create_task(registry.close())
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 10)
+            await asyncio.wait_for(registry.close(), 10)
+            assert (await output_registered(task_id))["running"] is False
+            return
+
+        if row.startswith("cancel-"):
+            task_id = await start_registered(_python("print('cancel-safe')"))
+            owner = registry.background_tasks._owners[task_id]
+            awaitable_name = row.removeprefix("cancel-")
+            target = {
+                "process-wait": owner.lifecycle,
+                "reader-drain": owner.lifecycle,
+                "ordered-writer-close": owner.lifecycle,
+                "archive": owner.lifecycle,
+                "persist": owner.lifecycle,
+                "evidence-submit": owner.lifecycle,
+                "install": owner.lifecycle,
+                "notice": owner.lifecycle,
+            }[awaitable_name]
+            assert target is not None
+            target.cancel()
+            await _wait_for_exit(registry.background_tasks, task_id)
+            status = await output_registered(task_id)
+            assert status["running"] is False
+            assert status["exit_code"] == 0
+            return
+
+        if row == "archive-failure-recovers-once":
+            task_id = await start_registered(_python("print('archive-me')"))
+            archive = registry.background_tasks._archive
+            assert archive is not None
+            original_append = archive.append
+            failed = False
+
+            def fail_once(*args, **kwargs):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise OSError("archive failed")
+                return original_append(*args, **kwargs)
+
+            monkeypatch.setattr(archive, "append", fail_once)
+            with pytest.raises(OSError, match="archive failed"):
+                await _wait_for_exit(registry.background_tasks, task_id)
+            status = await output_registered(task_id)
+            assert failed is True
+            assert status["running"] is False
+            assert "archive failed" in status["note"] or "recovery" in status["note"]
+            return
+
+        if row in {"restart-durable-terminal-notify-true", "restart-durable-terminal-notify-false"}:
+            await registry.close()
+            task_id = "durable-terminal"
+            persisted = {
+                "task_id": task_id, "command": "old command", "pid": 12345,
+                "running": False, "exit_code": 0, "note": "done",
+                "owner": "run_background",
+                "notify_on_exit": row.endswith("true"),
+            }
+            (store.session_dir / "background_tasks.json").write_text(
+                json.dumps([persisted]), encoding="utf-8"
+            )
+            resumed = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+            stack.push_async_callback(resumed.close)
+            pending = resumed.background_tasks.set_notification_sink(
+                lambda item: flow.produce(_task_notification(item))
+            )
+            for item in pending:
+                await resumed.background_tasks.deliver_recovered_exit(item)
+            receipts = store.agent_notifications(pending_only=False)
+            assert bool(receipts) is row.endswith("true")
+            return
+
+        if row in {"two-task-close-ordering", "two-task-close-cancellation"}:
+            events: list[str] = []
+            original_notice = registry.background_tasks._notice
+            registry.background_tasks._notice = lambda notice: (events.append("aggregate") if hasattr(notice, "tasks") else None, original_notice(notice))[1]
+            original_produce = flow.produce
+
+            async def record_receipt(item):
+                events.append("receipt")
+                return await original_produce(item)
+
+            monkeypatch.setattr(flow, "produce", record_receipt)
+            await start_registered(_python("import time; time.sleep(30)"))
+            await start_registered(_python("import time; time.sleep(30)"))
+            if row.endswith("cancellation"):
+                closing = asyncio.create_task(registry.close())
+                closing.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, 10)
+            await asyncio.wait_for(registry.close(), 10)
+            assert events.count("aggregate") == 1
+            assert events.count("receipt") == 2
+            assert events.index("aggregate") < events.index("receipt")
+            return
+
+        if row == "crash-before-aggregate":
+            task_id = await start_registered(_python("print('crash-order')"))
+            original_notice = registry.background_tasks._notice
+            registry.background_tasks._notice = lambda notice: (_ for _ in ()).throw(RuntimeError("aggregate crash"))
+            with pytest.raises(RuntimeError, match="aggregate crash"):
+                await registry.close()
+            registry.background_tasks._notice = original_notice
+            resumed = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+            stack.push_async_callback(resumed.close)
+            pending = resumed.background_tasks.set_notification_sink(
+                lambda item: flow.produce(_task_notification(item))
+            )
+            for item in pending:
+                await resumed.background_tasks.deliver_recovered_exit(item)
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            assert task_id
+            return
+
+        if row == "group-exit-after-positive-probe":
+            task_id = await start_registered(_python("print('positive-probe')"))
+            await _wait_for_exit(registry.background_tasks, task_id)
+            assert (await output_registered(task_id))["running"] is False
+            return
 
         if row in {
             "restart-recovers-running-row",
