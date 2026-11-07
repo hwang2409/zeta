@@ -13,6 +13,8 @@ import os
 import re
 from pathlib import Path
 
+from .storage_format import reject_unknown_keys
+
 # Memory kind keys (entry_store) and their mirror temporaries (project_publish)
 # share this grammar; it lives here because this module ships to remote peers.
 KIND_KEY_PATTERN = r"[a-z][a-z0-9_-]{0,31}"
@@ -44,6 +46,7 @@ def validate_project_record(
 ) -> tuple[str, str, str, str, str, str | None, str]:
     """Validate one complete registry record using only the standard library."""
 
+    reject_unknown_keys(value, "project_registry_record")
     if (
         not _PROJECT_FIELDS.issubset(value)
         or not set(value).issubset(_PROJECT_FIELDS | _OPTIONAL_PROJECT_FIELDS)

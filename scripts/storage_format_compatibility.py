@@ -13,13 +13,20 @@ from pathlib import Path
 from zeta.storage_format import StorageFormatError, compare_registry_dumps
 
 PROBE_PATHS = ("src/zeta/storage_format.py", "tests/compatibility/storage_probe.py")
+CLASSIFIER_PREFIXES = ("src/zeta/", "tests/compatibility/", ".github/workflows/", "scripts/")
+CLASSIFIER_FILES = {"pyproject.toml", "uv.lock"}
 
 def _git(*args: str, check: bool = True) -> str:
     return subprocess.check_output(("git", *args), text=True, stderr=subprocess.STDOUT).strip()
 
 def qualifying(commit: str) -> bool:
-    changed = _git("diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit).splitlines()
-    return any(path == "pyproject.toml" or path == "uv.lock" or path.startswith("src/zeta/") for path in changed)
+    """Classify first-parent changes, including merge commits."""
+    parents = _git("rev-list", "--parents", "-n", "1", commit).split()
+    if len(parents) == 1:
+        changed = _git("diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit).splitlines()
+    else:
+        changed = _git("diff", "--name-only", f"{commit}^1", commit).splitlines()
+    return any(path in CLASSIFIER_FILES or path.startswith(CLASSIFIER_PREFIXES) for path in changed)
 
 def has_probe(commit: str) -> bool:
     return all(subprocess.run(("git", "cat-file", "-e", f"{commit}:{path}"), capture_output=True, check=False).returncode == 0 for path in PROBE_PATHS)

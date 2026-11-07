@@ -19,6 +19,7 @@ from ...protocol.types import (
     TextContent,
     require_new_message_origin,
 )
+from ...storage_format import reject_unknown_keys
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
@@ -79,6 +80,18 @@ def validate_client_delivery_data(
 ) -> None:
     """Validate one acceptance or terminal transition record."""
 
+    shape = (
+        "client_delivery_queued_steer_acceptance_message"
+        if "accepted_message" in data
+        else "client_delivery_send_acceptance"
+        if data.get("method") == "send" and "outcome" in data
+        else "client_delivery_steer_acceptance"
+        if "outcome" in data
+        else "client_delivery_delivered_transition"
+        if data.get("status") == "delivered"
+        else "client_delivery_dropped_transition"
+    )
+    reject_unknown_keys(data, shape)
     delivery_id = data.get("delivery_id")
     method = data.get("method")
     status = data.get("status")

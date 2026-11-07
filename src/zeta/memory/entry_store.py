@@ -21,6 +21,7 @@ from zeta.memory.safety import contains_secret
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_schema import KIND_KEY_PATTERN, MAX_MEMORY_FILE_SIZE
 from zeta.protocol.types import MessageOrigin
+from zeta.storage_format import reject_unknown_keys
 
 MAX_ENTRIES = 1_000
 MAX_ENTRY_TEXT_BYTES = 4 * 1024
@@ -519,7 +520,21 @@ def state_digest(state: MemoryState) -> str:
     return hashlib.sha256(canonical_state_bytes(state)).hexdigest()
 
 
+_FORMAT_SHAPES = {
+    "format-2 memory state": "memory_state_root",
+    "memory schema": "memory_schema",
+    "memory kind": "memory_kind",
+    "memory entry": "memory_entry",
+    "missing memory entry": "memory_missing_entry",
+    "memory entry source": "memory_source",
+    "memory entry migration source": "memory_migration_source",
+    "memory operation receipt": "memory_operation_receipt",
+}
+
+
 def _exact_dict(value: object, fields: set[str], label: str) -> dict[str, Any]:
+    if isinstance(value, dict) and label in _FORMAT_SHAPES:
+        reject_unknown_keys(value, _FORMAT_SHAPES[label])
     if not isinstance(value, dict) or set(value) != fields:
         _fail(f"invalid {label}")
     return value

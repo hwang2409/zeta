@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 4
+WRITER_EPOCH: Final = 3
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -54,7 +54,7 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
         {"origin", "kind", "child_instance_id", "child_session_path", "description", "status", "text", "ask_parent_question_id", "display_only"}
     ),
     "project_registry_update": frozenset({"description", "repo", "repo_agents"}),
-    "project_registry_record": frozenset({"id", "name", "description", "repo", "repo_agents"}),
+    "project_registry_record": frozenset({"schema_version", "project_id", "name", "scope", "created_at", "updated_at", "canonical_integration_root", "lanes", "repo_agents"}),
     "memory_sync_digest": frozenset({"kind", "digests"}),
     "memory_sync_entry": frozenset({"kind", "entry_ids", "digests"}),
     "memory_reconciliation": frozenset({"changes"}),
@@ -63,7 +63,7 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "memory_operations": frozenset({"operations"}),
     "account_credential": frozenset({"provider", "name", "sha256"}),
     "account_publication_marker": frozenset({"provider", "name", "sha256"}),
-    "project_session_reference": frozenset({"session_id", "role", "created_at"}),
+    "project_session_reference": frozenset({"session_id", "transcript_path", "role", "parent_session_id", "recorded_at"}),
     "memory_state_root": frozenset({"format", "project_id", "generation", "schema", "entries", "compacted_through_version"}),
     "memory_schema": frozenset({"version", "profile", "kinds"}),
     "memory_kind": frozenset({"key", "name", "description", "prompt_mode", "prompt_priority", "prompt_max_entries", "default_expiry_days"}),
@@ -72,14 +72,14 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "memory_source": frozenset({"session_id", "seq_start", "seq_end", "origins", "observed_at", "evidence_rank"}),
     "memory_migration_source": frozenset({"source_digest", "source_version"}),
     "memory_operation_receipt": frozenset({"operation_id", "type", "target_ids", "result_ids", "reason", "reconciliation_key", "automatic"}),
-    "remote_memory_sync_state": frozenset({"schema", "project_id", "generation", "entries", "conflicts"}),
+    "remote_memory_sync_state": frozenset({"schema", "project_id", "files", "conflicts"}),
     "remote_memory_sync_conflict": frozenset({"id", "local", "remote"}),
     "entry_sync_state": frozenset({"version", "entries", "conflicts", "transitions"}),
     "entry_sync_schema": frozenset({"version", "kind", "fields"}),
     "entry_sync_conflict": frozenset({"id", "local", "remote", "resolution"}),
     "entry_sync_transition": frozenset({"id", "from", "to", "at"}),
     "entry_sync_resolution_candidate": frozenset({"id", "value", "source"}),
-    "background_output_journal_commit": frozenset({"task_id", "offset", "digest", "committed_at"}),
+    "background_output_journal_commit": frozenset({"task_id", "offset", "length"}),
     "client_delivery_send_acceptance": frozenset(
         {"delivery_id", "method", "status", "outcome"}
     ),
@@ -105,13 +105,13 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "fact_pr_head": frozenset({"type", "pr", "sha"}),
     "fact_child_status": frozenset({"type", "handle", "status"}),
     "fact_child_head": frozenset({"type", "handle", "sha"}),
-    "tool_result_text": frozenset({"type", "text"}),
-    "tool_result_image": frozenset({"type", "source"}),
-    "tool_result_resource": frozenset({"type", "resource"}),
+    "tool_result_text": frozenset({"type", "text", "truncated", "full_size", "full_size_chars", "next_offset", "spill_path", "annotations"}),
+    "tool_result_image": frozenset({"type", "data", "mimeType", "annotations", "caption", "width", "height", "path", "size"}),
+    "tool_result_resource": frozenset({"type", "resource", "annotations"}),
     "tool_result_resource_contents": frozenset({"uri", "mimeType", "text", "blob"}),
     "tool_result_annotations": frozenset({"audience", "priority", "lastModified"}),
-    "attention_record": frozenset({"id", "kind", "title", "body", "created_at", "read_at"}),
-    "attention_fork_meta": frozenset({"source_id", "fork_id", "created_at", "reason"}),
+    "attention_record": frozenset({"id", "created_at", "session_id", "project_id", "entry_id", "entry_seq", "lane", "title", "why", "options", "recommendation", "status", "resolved_at", "fork_session_id", "decision"}),
+    "attention_fork_meta": frozenset({"forked_from_session", "forked_at_entry", "attention_id"}),
     "storage_manifest": frozenset({"writer_epoch"}),
 }
 
@@ -162,6 +162,19 @@ _LOCK = ".storage-format.lock"
 
 class StorageFormatError(ValueError):
     """Raised when a home cannot be accessed by this stored-format version."""
+
+
+def reject_unknown_keys(payload: Mapping[str, object], shape: str) -> None:
+    """Enforce the one authoritative accepted-key declaration for a payload."""
+
+    accepted = ACCEPTED_KEY_SETS.get(shape)
+    if accepted is None:
+        raise StorageFormatError(f"stored key shape is not registered: {shape}")
+    unknown = set(payload) - accepted
+    if unknown:
+        raise StorageFormatError(
+            f"unknown keys for {shape}: {sorted(unknown)!r}"
+        )
 
 
 def require_closed_variant(shape: str, value: object) -> object:
