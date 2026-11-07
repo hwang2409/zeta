@@ -1724,7 +1724,8 @@ async def test_server_shutdown_emits_approval_end_once(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_matched_ends(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw_id = "shared-call"
     target = tmp_path / "input.txt"
@@ -1757,22 +1758,31 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     agent_ended = asyncio.Event()
-    original_admit = server.control._admit_controller
-    original_notify = server.control._notify
+    append_history = server.control._approvals._append_delegated_history
+    notify = server.control._notify
 
-    def record_admit(event: str, *args: object, **fields: object) -> Admission:
-        return original_admit(event, *args, **fields)
+    async def delay_delegated_approval_end(
+        record: object, payload: dict[str, object] | None
+    ) -> object:
+        if isinstance(record.target.key, tuple):
+            async with asyncio.timeout(10):
+                await agent_ended.wait()
+        return await append_history(record, payload)
 
     async def record_agent_end(
         event: str, session_id: str | None = None, **fields: object
     ) -> bool:
-        published = await original_notify(event, session_id, **fields)
+        published = await notify(event, session_id, **fields)
         if event == "agent_end":
             agent_ended.set()
         return published
 
-    # test-contract: seam observe approval admission through the single publication route
-    monkeypatch.setattr(server.control, "_admit_controller", record_admit)
+    # test-contract: seam holds the delegated approval-end admission until agent_end
+    monkeypatch.setattr(
+        server.control._approvals,
+        "_append_delegated_history",
+        delay_delegated_approval_end,
+    )
     monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
@@ -1799,8 +1809,12 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         assert {
             event["request_id"] for event in _named_events(frames, "approval_end")
         } == expected_end_ids
-        async with asyncio.timeout(10):
-            await agent_ended.wait()
+        assert server.runtime.opened is not None
+        assert any(
+            isinstance(block, TextContent) and block.text == "parent done"
+            for message in server.runtime.opened.store.messages()
+            for block in message.content
+        )
         child_store = ConversationStore(
             server.runtime.opened.store.session_dir / "agents", session_id="1"
         )
@@ -2686,22 +2700,32 @@ async def test_abort_captures_turn_before_approval_end_write(
         await _event(reader, "approval_request")
 
         assert server._client is not None
-        original_enqueue = server.connections._enqueue
+        turn_task = server.control._turn_task
+        assert turn_task is not None
+        original_write_physical = server.connections._write_physical
         approval_end_started = asyncio.Event()
+        allow_approval_end = asyncio.Event()
 
-        def observe_approval_end(output, frame, *, wake=True):
-            payload = json.loads(frame.payload)
-            if payload.get("params", {}).get("event") == "approval_end":
+        async def pause_approval_end(connection: object, payload: object) -> object:
+            frame = json.loads(payload)
+            if frame.get("params", {}).get("event") == "approval_end":
                 approval_end_started.set()
-            return original_enqueue(output, frame, wake=wake)
+                async with asyncio.timeout(TIMEOUT):
+                    await allow_approval_end.wait()
+            return await original_write_physical(connection, payload)
 
-        server.connections._enqueue = observe_approval_end  # type: ignore[method-assign]
+        # test-contract: seam hold the physical approval-end write until turn capture
+        server.connections._write_physical = pause_approval_end  # type: ignore[method-assign]
         abort = asyncio.create_task(
             _request(reader, writer, 4, "abort", {"scope": scope})
         )
         await asyncio.wait_for(approval_end_started.wait(), TIMEOUT)
-        while server.control._turn_task is not None:
-            await asyncio.sleep(0)
+        # The abort captured this turn before the approval_end frame reached the
+        # wire: it marked the cancellation outcome, so the turn cannot finish yet
+        # because its post-gate output is queued behind the held approval_end write.
+        assert server.control._turn_task is turn_task
+        assert server.control._turn_cancel_outcome is not None
+        allow_approval_end.set()
 
         frames = await asyncio.wait_for(abort, TIMEOUT)
         assert frames[-1]["result"] == {"aborted": True}

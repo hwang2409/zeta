@@ -15,7 +15,7 @@ from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from . import event_contract
-from .approval_admission import admit_end_then_terminal, reset_cancelled_settlement
+from .approval_settlement import persist_durably
 from .connections import Admission
 from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 
@@ -23,6 +23,7 @@ Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
 
 logger = logging.getLogger(__name__)
+
 
 ApprovalKey = str | tuple[str, str]
 
@@ -226,6 +227,33 @@ class ApprovalLifecycle:
         records[record.target.key] = record
         self._swap(records)
         return record
+
+    def _next_token(self) -> int:
+        return max((item.token for item in self._state.records.values()), default=0) + 1
+
+    def _reset_for_retry(
+        self, key: ApprovalKey, token: int, generation: int
+    ) -> None:
+        """Return an owned record whose durable write never committed to pending."""
+        current = self._state.records.get(key)
+        if (
+            current is None
+            or current.token != token
+            or generation != self._state.generation
+        ):
+            return
+        self._release_gate(current, error=asyncio.CancelledError())
+        self._put(
+            replace(
+                current,
+                admitted=asyncio.get_running_loop().create_future(),
+                token=self._next_token(),
+                phase="pending",
+                disposition="active",
+                settlement=None,
+                publication_owner=None,
+            )
+        )
 
     def _remove(self, key: ApprovalKey) -> None:
         records = dict(self._state.records)
@@ -551,9 +579,7 @@ class ApprovalLifecycle:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _new_record(self, target: _ApprovalTarget) -> ApprovalRecord:
-        token = (
-            max((item.token for item in self._state.records.values()), default=0) + 1
-        )
+        token = self._next_token()
         return self._put(
             ApprovalRecord(
                 target=target,
@@ -641,10 +667,7 @@ class ApprovalLifecycle:
             return self._reserve_record(record, decision, keep_starting=True)
         if record.phase != "pending":
             return None
-        token = (
-            max((item.token for item in self._state.records.values()), default=0) + 1
-        )
-        record = self._change(record, token=token)
+        record = self._change(record, token=self._next_token())
         return self._reserve_record(record, decision)
 
     async def resolve_approval(
@@ -760,45 +783,13 @@ class ApprovalLifecycle:
         generation = record.generation
         target = record.target
 
-        async def persist() -> dict[str, str] | None:
-            write_failed = False
-            try:
-                await target.store._to_thread_durable(
-                    target.store.resolve_approval,
-                    target.store_request_id,
-                    decision,
-                    **({"reason": reason} if decision == "abort" and reason else {}),
-                )
-            except OSError:
-                write_failed = True
-            resolution = target.store.approval_resolution_data(target.store_request_id)
-            if resolution is not None:
-                return resolution
-            if not write_failed:
-                return None
-            try:
-                await target.store._to_thread_durable(
-                    target.store.resolve_approval,
-                    target.store_request_id,
-                    "abort",
-                    reason=reason or "turn_canceled",
-                )
-                return target.store.approval_resolution_data(target.store_request_id)
-            except OSError:
-                return None
-
-        try:
-            resolution = await persist()
-        except asyncio.CancelledError:
-            current = self._state.records.get(target.key)
-            if (
-                current is not None
-                and current.token == token
-                and generation == self._state.generation
-            ):
-                reset_cancelled_settlement(current, self._release_gate, self._put,
-                                            max((item.token for item in self._state.records.values()), default=0))
-            raise
+        result = await persist_durably(
+            target.store, target.store_request_id, decision, reason
+        )
+        if result.should_retry:
+            self._reset_for_retry(target.key, token, generation)
+            raise asyncio.CancelledError
+        resolution = result.resolution
         current = self._state.records.get(target.key)
         owns_record = (
             current is not None
@@ -840,6 +831,8 @@ class ApprovalLifecycle:
         except BaseException as exc:
             self._release_gate(record, error=exc)
             raise
+        if result.cancelled:
+            raise asyncio.CancelledError
         return resolution
 
     def request_approval_abort(
@@ -1012,16 +1005,21 @@ class ApprovalLifecycle:
             if payload is not None and record.published:
                 if isinstance(record.target.key, tuple):
                     terminal = record.terminal
-                    end_result, terminal_result = admit_end_then_terminal(
-                        self._admit,
-                        self._session_id(),
-                        ("approval_end", payload),
-                        ("tool_end", terminal[2]) if terminal is not None else None,
+                    session_id = self._session_id()
+                    end_result = self._admit(
+                        EventDescriptor.APPROVAL_END, session_id, **payload
+                    )
+                    terminal_result = (
+                        self._admit(EventDescriptor.TOOL_END, session_id, **terminal[2])
+                        if terminal is not None
+                        else None
                     )
                     record = self._change(record, live_end=end_result)
                     self._release_gate(record, resolution=resolution)
                     if terminal is not None:
-                        record = self._change(record, terminal_result=terminal_result, terminal=None)
+                        record = self._change(
+                            record, terminal_result=terminal_result, terminal=None
+                        )
                 else:
                     admission = self._admit(
                         event_contract.STREAM_EVENT_WIRE_EVENTS[
