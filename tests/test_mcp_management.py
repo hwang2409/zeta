@@ -913,7 +913,7 @@ async def test_contended_config_lock_fails_off_loop_with_nonblocking_flock(
             assert calls and all(thread != loop_thread for thread, _operation in calls)
         else:
             with pytest.raises(MCPManagementError, match="mcp busy"):
-                await result
+                await asyncio.wait_for(result, 10)
     finally:
         for lock in locks:
             original(lock.fileno(), fcntl.LOCK_UN)
@@ -951,15 +951,20 @@ async def test_cancelled_mutation_releases_lock_and_refresh_adopts_commit(
     task = asyncio.create_task(
         manager.add("committed", scope="user", command=sys.executable)
     )
-    await asyncio.to_thread(started.wait)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    release.set()
-    await asyncio.to_thread(finished.wait)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(started.wait), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await asyncio.wait_for(asyncio.to_thread(started.wait), 10)
+        await asyncio.wait_for(asyncio.to_thread(finished.wait), 10)
 
     assert manager.snapshot.generation == 0
-    await manager.refresh()
+    await asyncio.wait_for(manager.refresh(), 10)
     assert manager.show("committed", scope="user").name == "committed"
 
 

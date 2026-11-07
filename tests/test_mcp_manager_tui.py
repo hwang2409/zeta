@@ -331,7 +331,7 @@ async def test_real_prompt_lock_contention_stays_responsive_and_renders_busy(
         if prompt is not None:
             prompt.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await prompt
+                await asyncio.wait_for(prompt, 10)
         await loop.close()
 
 
