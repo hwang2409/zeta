@@ -236,6 +236,7 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
             raise
         await original_archive_record(record, log_handle)
 
+    # test-contract: seam force the archive-pending monitor cancellation order
     monkeypatch.setattr(registry, "_archive_record", gated_archive_record)
     monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
     waiter = asyncio.create_task(registry.wait(task_id))
