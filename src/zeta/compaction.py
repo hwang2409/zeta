@@ -122,7 +122,6 @@ from .providers.completion import (
 
 SUMMARY_SOURCE_TOKEN_LIMIT = 64_000
 SUMMARY_RETRIES = 2
-RETRYABLE_SUMMARY_STREAM_ERRORS = {"Codex output item completed with open blocks"}
 _logger = logging.getLogger(__name__)
 
 
@@ -560,10 +559,7 @@ class CompactionPolicy:
                             else min(max_chars, fallback_max_chars)
                         ),
                     )
-                if not empty and not (
-                    getattr(exc, "code", None) == "stream_error"
-                    and str(exc) in RETRYABLE_SUMMARY_STREAM_ERRORS
-                ):
+                if not empty:
                     raise
                 if on_retry is not None:
                     on_retry()

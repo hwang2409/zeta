@@ -78,6 +78,41 @@ class MonotonicDeadlineClock:
             timer.cancel()
 
 
+def is_control_exception(value: BaseException) -> bool:
+    return isinstance(value, (asyncio.CancelledError, GeneratorExit))
+
+
+def _control_priority(value: BaseException) -> int:
+    if isinstance(value, asyncio.CancelledError):
+        return 2
+    if isinstance(value, GeneratorExit):
+        return 1
+    return 0
+
+
+def merge_exception(
+    primary: BaseException | None,
+    cleanup: BaseException,
+) -> BaseException:
+    if primary is None:
+        return cleanup
+    primary_is_control = is_control_exception(primary)
+    cleanup_is_control = is_control_exception(cleanup)
+    if cleanup_is_control and not primary_is_control:
+        cleanup.__cause__ = primary
+        cleanup.__context__ = primary
+        return cleanup
+    if (
+        cleanup_is_control
+        and primary_is_control
+        and _control_priority(cleanup) > _control_priority(primary)
+    ):
+        return cleanup
+    if primary_is_control and not cleanup_is_control:
+        primary.__context__ = cleanup
+    return primary
+
+
 @dataclass(frozen=True, slots=True)
 class RetryPlan:
     attempt: int
@@ -435,6 +470,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._model_deadline = 0.0
         self._last_model_progress: float | None = None
         self._maximum_progress_gap = 0.0
+        self._retry_usage: dict[str, Any] | None = None
 
     def __aiter__(self) -> CompletionRun:
         return self
@@ -475,10 +511,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 raise error
             except BaseException as error:
                 if isinstance(error, asyncio.CancelledError):
-                    try:
-                        await self._finish_attempt(error)
-                    except BaseException as cleanup_error:  # noqa: BLE001
-                        error.__context__ = cleanup_error
+                    await self._finish_attempt(error)
                     self._closed = True
                     raise
                 context = getattr(error, "diagnostic_context", None)
@@ -506,13 +539,18 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             if event is None:
                 continue
             if event.type is StreamEventType.MESSAGE_END:
-                self._attempt_completed = True
+                self._attempt_completed = event.data.get("truncated") is not True
+                usage = event.data.get("usage")
+                if isinstance(usage, Mapping):
+                    self._retry_usage = dict(usage)
             if event.type is StreamEventType.ERROR and event.error is not None:
                 retry = await self._retry(event.error, event.data)
                 await self._finish_attempt(event.error)
                 if retry:
                     continue
             self._observe(event)
+            if self._attempt_completed:
+                self._closed = True
             return event
 
     async def _open_attempt(self) -> None:
@@ -617,7 +655,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                         max(0, self._control.budget.attempts - 1),
                     )
             return False
-        self._pending.append(self._retry_notice(plan, error))
+        notice = self._retry_notice(plan, error)
+        if self._retry_usage is not None:
+            notice.data["usage"] = self._retry_usage
+            self._retry_usage = None
+        self._pending.append(notice)
         if self._emitted:
             if self._control.reset is ResetPolicy.NO_RESET:
                 return False
@@ -708,20 +750,23 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             return
         try:
             await attempt.aclose()
-        except BaseException as cleanup_error:  # noqa: BLE001 - diagnostic only
-            if (
-                isinstance(primary, asyncio.CancelledError)
-                and isinstance(cleanup_error, asyncio.CancelledError)
-                and cleanup_error.__cause__ is not None
-            ):
-                primary.__cause__ = cleanup_error.__cause__
-            asyncio.get_running_loop().call_exception_handler(
-                {
-                    "message": "provider completion cleanup failed",
-                    "exception": cleanup_error,
-                    "provider": self._adapter.provider,
-                }
-            )
+        except BaseException as cleanup_error:
+            primary_error = primary if isinstance(primary, BaseException) else None
+            if primary is not None and primary_error is None:
+                if is_control_exception(cleanup_error):
+                    raise
+            else:
+                selected = merge_exception(primary_error, cleanup_error)
+                if selected is cleanup_error:
+                    raise selected
+            if not is_control_exception(cleanup_error):
+                asyncio.get_running_loop().call_exception_handler(
+                    {
+                        "message": "provider completion cleanup failed",
+                        "exception": cleanup_error,
+                        "provider": self._adapter.provider,
+                    }
+                )
 
     async def aclose(self) -> None:
         if self._closed and self._attempt is None:
@@ -744,7 +789,12 @@ def complete(
     wait: Callable[[float], Awaitable[None]] | None = None,
 ) -> CompletionRun:
     return CompletionRun(
-        adapter, messages, tool_schemas, control, clock=clock, wait=wait
+        adapter,
+        messages,
+        tool_schemas,
+        control,
+        clock=clock or getattr(adapter, "_completion_clock", None),
+        wait=wait or getattr(adapter, "_completion_wait", None),
     )
 
 

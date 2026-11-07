@@ -1567,7 +1567,7 @@ async def test_summary_stream_error_is_retried() -> None:
         async def complete(self, messages, tool_schemas):
             self.calls += 1
             if self.calls == 1:
-                raise CodexStreamError("Codex output item completed with open blocks")
+                raise CodexStreamError("Codex output item completed with open blocks", retryable=True)
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=text(MessageRole.ASSISTANT, "summary"),
@@ -1859,20 +1859,45 @@ async def test_chunked_compaction_counts_retry_events_in_telemetry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compaction_discards_partial_output_before_provider_retry() -> None:
-    class RetryBackend(CompletionBackend):
+async def test_compaction_retries_only_before_no_reset_output() -> None:
+    class RetryBeforeOutputBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
         @owned_completion
         async def complete(self, messages, tool_schemas):
-            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="stale")
-            yield StreamEvent(StreamEventType.RETRY)
-            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
-            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fresh")
+            self.calls += 1
+            if self.calls == 1:
+                raise CodexStreamError("Codex output item completed with open blocks", retryable=True)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "fresh"),
+            )
 
-    summary = await CompactionPolicy(RetryBackend()).summarize_chunked(
+    retry_backend = RetryBeforeOutputBackend()
+    summary = await CompactionPolicy(retry_backend).summarize_chunked(
         [text(MessageRole.USER, "source")]
     )
 
     assert summary == "fresh"
+    assert retry_backend.calls == 2
+
+    class FailAfterOutputBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="stale")
+            raise CodexStreamError("Codex output item completed with open blocks", retryable=True)
+
+    committed_backend = FailAfterOutputBackend()
+    with pytest.raises(SummaryCompletionError, match="open blocks"):
+        await CompactionPolicy(committed_backend).summarize_chunked(
+            [text(MessageRole.USER, "source")]
+        )
+    assert committed_backend.calls == 1
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ from typing import Any, ClassVar, TypeVar
 
 import httpx
 
-from .completion import report_transport_activity
+from .completion import is_control_exception, merge_exception, report_transport_activity
 from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
@@ -420,47 +420,12 @@ def task_is_cancelling() -> bool:
     return task is not None and task.cancelling() > 0
 
 
-def is_control_exception(value: BaseException) -> bool:
-    return isinstance(value, (asyncio.CancelledError, GeneratorExit))
-
-
-def control_priority(value: BaseException) -> int:
-    if isinstance(value, asyncio.CancelledError):
-        return 2
-    if isinstance(value, GeneratorExit):
-        return 1
-    return 0
-
-
 def request_error[ErrorT: RuntimeError](
     cause: httpx.HTTPError, error_type: type[ErrorT]
 ) -> ErrorT:
     error = error_type("request failed")
     error.__cause__ = cause
     return error
-
-
-def merge_exception(
-    primary: BaseException | None,
-    cleanup: BaseException,
-) -> BaseException:
-    if primary is None:
-        return cleanup
-    primary_is_control = is_control_exception(primary)
-    cleanup_is_control = is_control_exception(cleanup)
-    if cleanup_is_control and not primary_is_control:
-        cleanup.__cause__ = primary
-        cleanup.__context__ = primary
-        return cleanup
-    if (
-        cleanup_is_control
-        and primary_is_control
-        and control_priority(cleanup) > control_priority(primary)
-    ):
-        return cleanup
-    if primary_is_control and not cleanup_is_control:
-        primary.__context__ = cleanup
-    return primary
 
 
 async def close_transport_resources(

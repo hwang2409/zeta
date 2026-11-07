@@ -18,10 +18,7 @@ import httpx
 import pytest
 
 import zeta.accounts.store as account_store
-import zeta.providers.anthropic as anthropic_module
-import zeta.providers.codex as codex_module
-import zeta.providers.transport as transport_module
-from tests.support.completion import completion_control
+from tests.support.completion import ManualDeadlineClock, completion_control
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountCredentials
@@ -42,8 +39,7 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex import CodexBackend
-from zeta.providers.codex_errors import CodexStreamError
-from zeta.providers.completion import owned_completion
+from zeta.providers.completion import ProviderStallError, owned_completion
 from zeta.runtime.headless import drive_turn
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -76,10 +72,12 @@ class _HangingByteStream(httpx.AsyncByteStream):
     def __init__(self, preface: bytes) -> None:
         self._preface = preface
         self._closed = asyncio.Event()
+        self.entered = asyncio.Event()
 
     async def __aiter__(self):
         if self._preface:
             yield self._preface
+        self.entered.set()
         await self._closed.wait()
 
     async def aclose(self) -> None:
@@ -87,20 +85,50 @@ class _HangingByteStream(httpx.AsyncByteStream):
 
 
 class _ClockedByteStream(httpx.AsyncByteStream):
-    """Emit controlled chunks while advancing a fake monotonic clock."""
+    """Emit controlled chunks while advancing a manual deadline clock."""
 
-    def __init__(self, clock: list[float], chunks: list[tuple[float, bytes]]) -> None:
+    def __init__(
+        self,
+        clock: ManualDeadlineClock,
+        chunks: list[tuple[float, bytes]],
+    ) -> None:
         self._clock = clock
         self._chunks = chunks
+        self._closed = asyncio.Event()
 
     async def __aiter__(self):
         for elapsed, chunk in self._chunks:
-            self._clock[0] += elapsed
+            self._clock.advance(self._clock.now() + elapsed)
             yield chunk
+        await self._closed.wait()
+
+    async def aclose(self) -> None:
+        self._closed.set()
 
 
 def _mock_client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def _collect_after_expirations(
+    completion: AsyncIterator[StreamEvent],
+    clock: ManualDeadlineClock,
+    gates: list[asyncio.Event],
+) -> list[StreamEvent]:
+    task = asyncio.create_task(_collect(completion))
+    try:
+        for gate in gates:
+            await gate.wait()
+            await clock.expire_next()
+        return await asyncio.wait_for(task, 10)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def _collect(completion: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
+    return [event async for event in completion]
 
 
 def _anthropic_store(path: Path) -> AccountCredentials:
@@ -158,8 +186,6 @@ def _notice_unreachable(*_args, **_kwargs) -> StreamEvent:
 async def test_anthropic_backend_stalls_and_retries_mid_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(anthropic_module.asyncio, "sleep", _no_op_sleep)
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
     requests: list[httpx.Request] = []
     partial = (
         b'event: message_start\n'
@@ -167,13 +193,15 @@ async def test_anthropic_backend_stalls_and_retries_mid_stream(
         b'"model":"claude-test","role":"assistant","usage":{"input_tokens":1}}}\n\n'
     )
 
+    hanging = _HangingByteStream(partial)
+
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if len(requests) == 1:
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
-                stream=_HangingByteStream(partial),
+                stream=hanging,
                 request=request,
             )
         return httpx.Response(
@@ -190,10 +218,15 @@ async def test_anthropic_backend_stalls_and_retries_mid_stream(
         stall_seconds=0.05,
         stall_retries=2,
     )
+    clock = ManualDeadlineClock()
+    backend._completion_clock = clock
+    backend._completion_wait = _no_op_sleep
     loop = AgentLoop(
         backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
     )
-    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
+    events = await _collect_after_expirations(
+        loop.run_turn("hello", origin=MessageOrigin.USER), clock, [hanging.entered]
+    )
     retries = [event for event in events if event.type is StreamEventType.RETRY]
 
     assert len(requests) == 2
@@ -206,7 +239,6 @@ async def test_anthropic_backend_stalls_and_retries_mid_stream(
 async def test_anthropic_retry_suppresses_truncated_salvage_and_keeps_usage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
     requests: list[httpx.Request] = []
     partial = (
         b'event: message_start\n'
@@ -249,6 +281,7 @@ async def test_anthropic_retry_suppresses_truncated_salvage_and_keeps_usage(
         client=client,
         token_store=_anthropic_store(tmp_path / "zeta.json"),
     )
+    backend._completion_wait = _no_op_sleep
     loop = AgentLoop(
         backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
     )
@@ -269,16 +302,16 @@ async def test_anthropic_retry_suppresses_truncated_salvage_and_keeps_usage(
 async def test_anthropic_backend_stall_budget_exhausts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(anthropic_module.asyncio, "sleep", _no_op_sleep)
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
     requests: list[httpx.Request] = []
+
+    streams = [_HangingByteStream(b"") for _ in range(3)]
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            stream=_HangingByteStream(b""),
+            stream=streams[len(requests) - 1],
             request=request,
         )
 
@@ -289,8 +322,15 @@ async def test_anthropic_backend_stall_budget_exhausts(
         stall_seconds=0.05,
         stall_retries=2,
     )
-    with pytest.raises(AnthropicStreamError) as excinfo:
-        [event async for event in backend.complete([], [], control=completion_control())]
+    clock = ManualDeadlineClock()
+    backend._completion_clock = clock
+    backend._completion_wait = _no_op_sleep
+    with pytest.raises(ProviderStallError) as excinfo:
+        await _collect_after_expirations(
+            backend.complete([], [], control=completion_control()),
+            clock,
+            [stream.entered for stream in streams],
+        )
 
     assert excinfo.value.is_stall is True
     assert len(requests) == 3
@@ -312,8 +352,6 @@ async def test_anthropic_backend_ignores_stall_after_message_end(
     already has a finished message, so the socket hanging open is a clean EOF
     from our perspective, not a stall that costs another billed attempt."""
 
-    monkeypatch.setattr(anthropic_module.asyncio, "sleep", _no_op_sleep)
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -381,8 +419,11 @@ async def test_provider_stalls_waiting_for_response_headers(
 ) -> None:
     requests: list[httpx.Request] = []
 
+    headers_waiting = asyncio.Event()
+
     async def no_headers(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        headers_waiting.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
@@ -394,7 +435,6 @@ async def test_provider_stalls_waiting_for_response_headers(
             stall_seconds=0.05,
             stall_retries=0,
         )
-        error_type = AnthropicStreamError
     else:
         backend = CodexBackend(
             client=client,
@@ -403,11 +443,15 @@ async def test_provider_stalls_waiting_for_response_headers(
             stall_seconds=0.05,
             stall_retries=0,
         )
-        error_type = CodexStreamError
     try:
-        with pytest.raises(error_type, match="response headers stalled") as caught:
-            await asyncio.wait_for(
-                anext(backend.complete([], [], control=completion_control())), timeout=10
+        clock = ManualDeadlineClock()
+        backend._completion_clock = clock
+        backend._completion_wait = _no_op_sleep
+        control = completion_control()
+        control.budget.max_stall_retries = 0
+        with pytest.raises(ProviderStallError, match="transport stalled for 90s") as caught:
+            await _collect_after_expirations(
+                backend.complete([], [], control=control), clock, [headers_waiting]
             )
         assert caught.value.is_stall is True
         assert len(requests) == 1
@@ -466,9 +510,7 @@ async def test_oauth_credential_lock_wait_is_bounded(
 async def test_codex_keepalives_do_not_reset_progress_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(transport_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
+    clock = ManualDeadlineClock()
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -492,8 +534,12 @@ async def test_codex_keepalives_do_not_reset_progress_deadline(
         stall_seconds=90.0,
         stall_retries=0,
     )
-    with pytest.raises(CodexStreamError, match="model progress stalled for 900s") as excinfo:
-        [event async for event in backend.complete([], [], control=completion_control())]
+    backend._completion_clock = clock
+    backend._completion_wait = _no_op_sleep
+    control = completion_control()
+    control.budget.max_stall_retries = 0
+    with pytest.raises(ProviderStallError, match="model progress stalled for 900s") as excinfo:
+        await asyncio.wait_for(_collect(backend.complete([], [], control=control)), 10)
 
     assert excinfo.value.is_stall is True
     await client.aclose()
@@ -502,8 +548,6 @@ async def test_codex_keepalives_do_not_reset_progress_deadline(
 async def test_codex_backend_stalls_and_retries_mid_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(codex_module.asyncio, "sleep", _no_op_sleep)
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
     partial = (
         b'event: response.created\n'
         b'data: {"type":"response.created","response":{"id":"r-partial",'
@@ -511,13 +555,15 @@ async def test_codex_backend_stalls_and_retries_mid_stream(
     )
     requests: list[httpx.Request] = []
 
+    hanging = _HangingByteStream(partial)
+
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if len(requests) == 1:
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
-                stream=_HangingByteStream(partial),
+                stream=hanging,
                 request=request,
             )
         return httpx.Response(
@@ -535,10 +581,15 @@ async def test_codex_backend_stalls_and_retries_mid_stream(
         stall_seconds=0.05,
         stall_retries=2,
     )
+    clock = ManualDeadlineClock()
+    backend._completion_clock = clock
+    backend._completion_wait = _no_op_sleep
     loop = AgentLoop(
         backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
     )
-    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
+    events = await _collect_after_expirations(
+        loop.run_turn("hello", origin=MessageOrigin.USER), clock, [hanging.entered]
+    )
     retries = [event for event in events if event.type is StreamEventType.RETRY]
 
     # The third request is the loop's normal empty-turn nudge after retry success.
@@ -552,16 +603,16 @@ async def test_codex_backend_stalls_and_retries_mid_stream(
 async def test_codex_backend_stall_budget_exhausts_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(codex_module.asyncio, "sleep", _no_op_sleep)
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
     requests: list[httpx.Request] = []
+
+    streams = [_HangingByteStream(b"") for _ in range(2)]
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            stream=_HangingByteStream(b""),
+            stream=streams[len(requests) - 1],
             request=request,
         )
 
@@ -573,8 +624,17 @@ async def test_codex_backend_stall_budget_exhausts_raises(
         stall_seconds=0.05,
         stall_retries=1,
     )
-    with pytest.raises(CodexStreamError) as excinfo:
-        [event async for event in backend.complete([], [], control=completion_control())]
+    clock = ManualDeadlineClock()
+    backend._completion_clock = clock
+    backend._completion_wait = _no_op_sleep
+    control = completion_control()
+    control.budget.max_stall_retries = 1
+    with pytest.raises(ProviderStallError) as excinfo:
+        await _collect_after_expirations(
+            backend.complete([], [], control=control),
+            clock,
+            [stream.entered for stream in streams],
+        )
 
     assert excinfo.value.is_stall is True
     assert len(requests) == 2
@@ -586,8 +646,6 @@ async def test_codex_backend_ignores_stall_after_message_end(
 ) -> None:
     """Codex mirror of the Anthropic post-completion guard."""
 
-    monkeypatch.setattr(codex_module.asyncio, "sleep", _no_op_sleep)
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
