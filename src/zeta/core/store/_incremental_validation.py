@@ -20,6 +20,15 @@ APPROVAL_RESOLUTION_REASONS = frozenset(
 )
 
 
+def validate_approval_reason(decision: str, reason: str | None) -> None:
+    if reason is not None and (
+        type(reason) is not str
+        or decision != "abort"
+        or reason not in APPROVAL_RESOLUTION_REASONS
+    ):
+        raise ValueError("invalid approval resolution reason")
+
+
 class IncrementalValidationMixin:
     """Validate linear appended entries without rescanning the full log."""
 

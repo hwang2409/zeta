@@ -17,6 +17,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager
 from zeta.project_errors import ProjectRegistryBusyError
@@ -60,14 +61,19 @@ _CORRUPTIONS: tuple[tuple[str, Callable[[Path, Path, Path], None]], ...] = (
 _CASE_IDS = [case for case, _corrupt in _CORRUPTIONS]
 
 
-def test_registry_lock_wait_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registry_lock_wait_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "projects"
     registry = ProjectRegistry(root)
     registry.create_project("one", "repo")
     lock = root / ".lock"
     fd = os.open(lock, os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
-    monkeypatch.setattr("zeta.project_registry._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05)
+    # test-contract: seam lowers lock timeout without changing lock behavior
+    monkeypatch.setattr(
+        "zeta.project_registry._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05
+    )
     finished = threading.Event()
     outcome: list[BaseException] = []
 
@@ -94,15 +100,11 @@ def test_registry_lock_wait_is_bounded(tmp_path: Path, monkeypatch: pytest.Monke
 def _make_registry(home: Path) -> tuple[Path, Path]:
     linked = home / "linked-project"
     linked.mkdir(parents=True)
-    project = ProjectRegistry(home / "projects").create_project(
-        "linked", "git", linked
-    )
+    project = ProjectRegistry(home / "projects").create_project("linked", "git", linked)
     return linked, home / "projects" / project.project_id / "project.json"
 
 
-def _corrupt_registry(
-    home: Path, corrupt: Callable[[Path, Path, Path], None]
-) -> Path:
+def _corrupt_registry(home: Path, corrupt: Callable[[Path, Path, Path], None]) -> Path:
     linked, record = _make_registry(home)
     corrupt(home, linked, record)
     return record
@@ -207,7 +209,9 @@ def test_broken_registry_tui_start_and_resume_without_repair(
             apps.append(app)
             rendered = _render_startup(app)
             warning = next(
-                item for item in app._startup_warnings if item.startswith(_WARNING_PREFIX)
+                item
+                for item in app._startup_warnings
+                if item.startswith(_WARNING_PREFIX)
             )
             assert warning.startswith(f"{_WARNING_PREFIX}{projects}: ")
             assert warning.endswith("; project features are disabled")
@@ -215,7 +219,9 @@ def test_broken_registry_tui_start_and_resume_without_repair(
             assert "project" not in app.loop.tool_registry.registered_names
             assert "inbox" not in app.loop.tool_registry.registered_names
             assert app.loop.project_registry is None
-            assert memory not in app.loop.context_assembler.system_prompt.content[0].text
+            assert (
+                memory not in app.loop.context_assembler.system_prompt.content[0].text
+            )
         assert _registry_snapshot(projects) == before
     finally:
         if record.exists():
@@ -277,7 +283,8 @@ def test_stale_project_roots_do_not_disable_registry(tmp_path: Path) -> None:
 def test_session_manager_construction_does_not_open_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry_root = tmp_path / "home" / "projects"
+    home = initialize_storage_home(tmp_path / "home")
+    registry_root = home / "projects"
     registry_root.mkdir(parents=True)
     opened: list[object] = []
     original_open = os.open
@@ -303,7 +310,7 @@ async def test_resolve_attention_does_not_open_registry(
     from zeta.runtime.project_registry_state import available_project_registry
     from zeta.tools import resolve_attention
 
-    home = tmp_path / "home"
+    home = initialize_storage_home(tmp_path / "home")
     session_dir = home / "sessions" / ("a" * 32)
     session_dir.mkdir(parents=True)
     state = available_project_registry(home / "projects")
