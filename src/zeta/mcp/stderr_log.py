@@ -5,14 +5,24 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
+import logging
 import os
 import stat
+import time
 from pathlib import Path
 
 MCP_STDERR_LOG_FILE_BYTES = 2 * 1024 * 1024
 MCP_STDERR_LOG_FILE_COUNT = 3
 _READ_BYTES = 64 * 1024
 _WRITE_QUEUE_BYTES = 8 * 1024 * 1024
+_LOCK_TIMEOUT_SECONDS = 1.0
+_LOCK_RETRY_SECONDS = 0.01
+
+logger = logging.getLogger(__name__)
+
+
+class _FileLockTimeout(TimeoutError):
+    pass
 
 
 class RotatingStderrLog:
@@ -54,12 +64,50 @@ class RotatingStderrLog:
     async def drain(self, stream: asyncio.StreamReader) -> None:
         queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         queued_bytes = 0
+        dropped_bytes = 0
+        drop_episode = False
+
+        def record_drop(byte_count: int) -> None:
+            nonlocal dropped_bytes, drop_episode
+            dropped_bytes += byte_count
+            if not drop_episode:
+                drop_episode = True
+                logger.warning(
+                    "dropping stderr bytes from MCP server log %s", self.path
+                )
+
+        async def append(chunk: bytes) -> bool:
+            nonlocal dropped_bytes, drop_episode
+            marker_bytes = dropped_bytes
+            if not await asyncio.to_thread(self._append, chunk, marker_bytes):
+                return False
+            dropped_bytes -= marker_bytes
+            if dropped_bytes == 0:
+                drop_episode = False
+            return True
 
         async def write_queued() -> None:
             nonlocal queued_bytes
             while (chunk := await queue.get()) is not None:
                 queued_bytes -= len(chunk)
-                await asyncio.to_thread(self._append, chunk)
+                if await append(chunk):
+                    continue
+                record_drop(len(chunk))
+                closing = False
+                while True:
+                    try:
+                        pending = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if pending is None:
+                        closing = True
+                        continue
+                    queued_bytes -= len(pending)
+                    record_drop(len(pending))
+                if closing:
+                    return
+            if dropped_bytes:
+                await append(b"")
 
         writer = asyncio.create_task(write_queued())
         try:
@@ -69,6 +117,8 @@ class RotatingStderrLog:
                 if queued_bytes + len(chunk) <= _WRITE_QUEUE_BYTES:
                     queue.put_nowait(chunk)
                     queued_bytes += len(chunk)
+                else:
+                    record_drop(len(chunk))
         finally:
             if not writer.done():
                 queue.put_nowait(None)
@@ -83,22 +133,32 @@ class RotatingStderrLog:
         if directory_fd >= 0 or lock_fd >= 0:
             await asyncio.to_thread(_close_fds, directory_fd, lock_fd)
 
-    def _append(self, data: bytes) -> None:
-        with self._locked():
-            fd = self._open_log(0, create=True)
-            try:
-                if os.fstat(fd).st_size + len(data) > MCP_STDERR_LOG_FILE_BYTES:
-                    os.close(fd)
-                    fd = -1
-                    self._rotate()
-                    fd = self._open_log(0, create=True)
-                view = memoryview(data)
-                while view:
-                    written = os.write(fd, view)
-                    view = view[written:]
-            finally:
-                if fd >= 0:
-                    os.close(fd)
+    def _append(self, data: bytes, dropped_bytes: int = 0) -> bool:
+        try:
+            with self._locked():
+                marker = (
+                    f"[zeta: dropped {dropped_bytes} bytes of stderr]\n".encode()
+                    if dropped_bytes
+                    else b""
+                )
+                payload = marker + data
+                fd = self._open_log(0, create=True)
+                try:
+                    if os.fstat(fd).st_size + len(payload) > MCP_STDERR_LOG_FILE_BYTES:
+                        os.close(fd)
+                        fd = -1
+                        self._rotate()
+                        fd = self._open_log(0, create=True)
+                    view = memoryview(payload)
+                    while view:
+                        written = os.write(fd, view)
+                        view = view[written:]
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+        except _FileLockTimeout:
+            return False
+        return True
 
     def _normalize_existing(self) -> None:
         for index in range(MCP_STDERR_LOG_FILE_COUNT):
@@ -160,7 +220,16 @@ class _FileLock:
         self._fd = fd
 
     def __enter__(self) -> None:
-        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _FileLockTimeout("timed out locking MCP stderr log") from exc
+                time.sleep(min(_LOCK_RETRY_SECONDS, remaining))
 
     def __exit__(self, *_args: object) -> None:
         fcntl.flock(self._fd, fcntl.LOCK_UN)

@@ -1,11 +1,13 @@
 import ast
 import asyncio
+import fcntl
 import importlib
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,6 +56,10 @@ from zeta.tools._spill import SpillStore
 mount_module = importlib.import_module("zeta.mcp.mount")
 server_actor_module = importlib.import_module("zeta.mcp.server_actor")
 connection_module = importlib.import_module("zeta.mcp.connection")
+try:
+    stderr_log_module = importlib.import_module("zeta.mcp.stderr_log")
+except ModuleNotFoundError:
+    stderr_log_module = None
 
 
 def test_mcp_client_construction_has_one_policy_checked_choke_point() -> None:
@@ -275,6 +281,32 @@ while remaining:
     remaining -= written
 os.close(2)
 """ + _stdio_source()
+    return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
+
+
+def _controllable_stderr_stdio_config(name: str) -> MCPServerConfig:
+    source = """
+import json
+import os
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized":
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}
+    elif method == "tools/call":
+        remaining = request["params"]["arguments"]["bytes"]
+        chunk = b"x" * 65536
+        while remaining:
+            written = os.write(2, chunk[:remaining])
+            remaining -= written
+        result = {"content": [], "isError": False}
+    else:
+        result = {"tools": []}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"""
     return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
 
 
@@ -920,6 +952,152 @@ async def test_stdio_stderr_log_rotates_while_child_is_running(
     assert 2 <= len(logs) <= 3
     assert all(path.stat().st_size <= 2 * 1024 * 1024 for path in logs)
     assert sum(path.stat().st_size for path in logs) <= 6 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_lock_timeout_drops_output_and_close_joins_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    clock = SimpleNamespace(now=0.0)
+    lock_waiting = threading.Event()
+    finish_wait = threading.Event()
+    warned = asyncio.Event()
+    warnings: list[tuple[object, ...]] = []
+
+    def wait_for_deadline(_seconds: float) -> None:
+        lock_waiting.set()
+        finish_wait.wait()
+
+    def record_warning(_message: str, *args: object) -> None:
+        warnings.append(args)
+        warned.set()
+
+    if stderr_log_module is not None:
+        monkeypatch.setattr(
+            stderr_log_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock.now, sleep=wait_for_deadline),
+        )
+        monkeypatch.setattr(stderr_log_module.logger, "warning", record_warning)
+    client = StdioMCPClient(_controllable_stderr_stdio_config("locked"))
+    await client.connect()
+    stderr_task = getattr(client, "_stderr_task", None)
+    lock_path = tmp_path / "mcp-logs" / ".locked.log.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        emitted = asyncio.create_task(
+            client.call_tool("emit", {"bytes": 65536}, AbortSignal())
+        )
+        if stderr_log_module is not None:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(lock_waiting.wait), timeout=10
+            )
+        await asyncio.wait_for(emitted, timeout=10)
+        if stderr_log_module is not None:
+            clock.now = 2.0
+            finish_wait.set()
+            await asyncio.wait_for(warned.wait(), timeout=10)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    await client.call_tool("emit", {"bytes": 1}, AbortSignal())
+    await asyncio.wait_for(client.close(), timeout=10)
+    log_path = tmp_path / "mcp-logs" / "locked.log"
+    if stderr_log_module is None:
+        assert "[zeta: dropped " in log_path.read_text()
+    assert stderr_task is not None and stderr_task.done()
+
+    client = StdioMCPClient(_controllable_stderr_stdio_config("locked"))
+    await client.connect()
+    stderr_task = client._stderr_task
+    assert stderr_task is not None
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if stderr_log_module is not None:
+        monkeypatch.setattr(stderr_log_module, "_LOCK_TIMEOUT_SECONDS", 0)
+    try:
+        await client.call_tool("emit", {"bytes": 1}, AbortSignal())
+        await asyncio.wait_for(client.close(), timeout=10)
+        assert stderr_task.done()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    markers = re.findall(
+        r"\[zeta: dropped (\d+) bytes of stderr\]", log_path.read_text()
+    )
+    assert len(markers) == 1
+    assert 0 < int(markers[0]) <= 65536
+    assert len(warnings) == 2
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_queue_overload_writes_one_bounded_loss_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    clock = SimpleNamespace(now=0.0)
+    lock_waiting = threading.Event()
+    finish_wait = threading.Event()
+    warned = asyncio.Event()
+    warning_count = 0
+
+    def wait_for_deadline(_seconds: float) -> None:
+        lock_waiting.set()
+        finish_wait.wait()
+
+    def record_warning(_message: str, *_args: object) -> None:
+        nonlocal warning_count
+        warning_count += 1
+        warned.set()
+
+    if stderr_log_module is not None:
+        monkeypatch.setattr(
+            stderr_log_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock.now, sleep=wait_for_deadline),
+        )
+        monkeypatch.setattr(stderr_log_module.logger, "warning", record_warning)
+        monkeypatch.setattr(
+            stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", 16 * 1024 * 1024
+        )
+    client = StdioMCPClient(_controllable_stderr_stdio_config("overload"))
+    await client.connect()
+    lock_path = tmp_path / "mcp-logs" / ".overload.log.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    emitted_bytes = 10 * 1024 * 1024
+    try:
+        emitted = asyncio.create_task(
+            client.call_tool("emit", {"bytes": emitted_bytes}, AbortSignal())
+        )
+        if stderr_log_module is not None:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(lock_waiting.wait), timeout=10
+            )
+        await asyncio.wait_for(emitted, timeout=10)
+        if stderr_log_module is not None:
+            await asyncio.wait_for(warned.wait(), timeout=10)
+            clock.now = 2.0
+            finish_wait.set()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    await client.call_tool("emit", {"bytes": 1}, AbortSignal())
+    await asyncio.wait_for(client.close(), timeout=10)
+
+    logs = b"".join(
+        path.read_bytes()
+        for path in sorted((tmp_path / "mcp-logs").glob("overload.log*"))
+    )
+    markers = re.findall(rb"\[zeta: dropped (\d+) bytes of stderr\]", logs)
+    assert len(markers) == 1
+    assert 0 < int(markers[0]) <= emitted_bytes
+    assert warning_count == 1
 
 
 @pytest.mark.asyncio
