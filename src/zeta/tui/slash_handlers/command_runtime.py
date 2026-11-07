@@ -9,7 +9,19 @@ from uuid import uuid4
 from ...agent.pending_delivery import NotificationInput
 from ...core.abort import AbortSignal
 from ...core.commands.custom_commands import CustomCommand
-from ...protocol.types import StreamEvent, StreamEventType, ToolCall, ToolResult
+from ...protocol.types import (
+    ASSISTANT_RESPONSE_STATE,
+    ASSISTANT_RESPONSE_SYNTHETIC,
+    MESSAGE_ORIGIN_METADATA,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolResult,
+)
 from ...submission.model import Submission
 from ...tools._shared.shell import (
     forget_macro_display,
@@ -198,6 +210,8 @@ class CommandRuntimeMixin:
         )
         register_macro_display(call.id, command=target, argv=())
         abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
+        previous_abort_signal = getattr(self, "_standalone_abort_signal", None)
+        self._standalone_abort_signal = abort_signal
         log_path = self.loop.store.session_dir / f"passthrough-{call.id[12:]}.log"
 
         def lifecycle_sink(kind: str) -> None:
@@ -241,6 +255,8 @@ class CommandRuntimeMixin:
             if self._approval_policy is not None:
                 self._approval_policy.forget_ephemeral(call.id)
             forget_macro_display(call.id)
+            if self._standalone_abort_signal is abort_signal:
+                self._standalone_abort_signal = previous_abort_signal
         self._handle_tool_event(
             StreamEvent(
                 StreamEventType.TOOL_EXECUTION_END,
@@ -259,9 +275,21 @@ class CommandRuntimeMixin:
         else:
             exit_code = structured.get("exit_code")
             status = f"exit {exit_code}" if exit_code is not None else "failed"
-        self._record_macro_receipt(f"ran !{target}, {status}")
+        receipt = f"ran !{target}, {status}"
+        self._record_macro_receipt(receipt)
+        self.loop.store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent(receipt)],
+                metadata={
+                    ASSISTANT_RESPONSE_STATE: ASSISTANT_RESPONSE_SYNTHETIC,
+                    MESSAGE_ORIGIN_METADATA: MessageOrigin.AUTOMATION_RECEIPT.value,
+                },
+            )
+        )
         self._loop_state = "idle"
         self._streaming = False
+        self._invalidate_prompt()
 
     def _watch_background_macro(
         self,

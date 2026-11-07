@@ -1255,6 +1255,95 @@ async def test_passthrough_runs_shell_without_provider_call(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_passthrough_ctrl_c_aborts_process_group(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), max_turns=1, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    started = asyncio.Event()
+    original_handle = app._handle_tool_event
+
+    def handle(event: Any) -> Any:
+        result = original_handle(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_START:
+            started.set()
+        return result
+
+    app._handle_tool_event = handle  # type: ignore[method-assign]
+    try:
+        app._submit_input("!sleep 30")
+        task = app._active_task
+        assert task is not None
+        await asyncio.wait_for(started.wait(), timeout=10)
+        app.abort_active()
+        await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        assert app._loop_state == "idle"
+        assert list(app._macro_receipts) == ["ran !sleep 30, canceled"]
+    finally:
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_end_repaints_terminal_card(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), max_turns=1, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    invalidations = 0
+    end_invalidations: int | None = None
+    original_handle = app._handle_tool_event
+
+    def invalidate() -> None:
+        nonlocal invalidations
+        invalidations += 1
+
+    def handle(event: Any) -> Any:
+        nonlocal end_invalidations
+        result = original_handle(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_END:
+            end_invalidations = invalidations
+        return result
+
+    app._invalidate_prompt = invalidate  # type: ignore[method-assign]
+    app._handle_tool_event = handle  # type: ignore[method-assign]
+    try:
+        app._submit_input("!printf done")
+        task = app._active_task
+        assert task is not None
+        await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        assert end_invalidations is not None
+        assert invalidations > end_invalidations
+    finally:
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_receipt_is_durable_without_a_model_turn(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    try:
+        app._submit_input("!printf durable")
+        task = app._active_task
+        assert task is not None
+        await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        receipt = next(message for message in store.messages() if message.role is MessageRole.ASSISTANT)
+        assert receipt.content[0].text == "ran !printf durable, exit 0"
+        assert receipt.metadata["response_state"] == "synthetic"
+        assert "ran !printf durable, exit 0" in (store.session_dir / "conversation.jsonl").read_text()
+    finally:
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_passthrough_repeat_uses_last_command(tmp_path: Path) -> None:
     backend = FakeBackend([])
     store = ConversationStore(tmp_path / "sessions")
