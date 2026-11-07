@@ -22,15 +22,18 @@ from zeta.server import accounts as accounts_module
 from zeta.server import connections as connections_module
 from zeta.server import control as control_module
 from zeta.server import server as server_module
-from zeta.server.control import CONTROLLER_HANDOFF_DEADLINE_SECONDS
 from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
 
 Transport = Literal["unix", "websocket"]
 Role = Literal["controller", "observer"]
 
-# Keep the order: server bound < read guard < release-gate guard.
-HELLO_READ_GUARD_SECONDS = CONTROLLER_HANDOFF_DEADLINE_SECONDS + 5
+# The past-bound test owns the handoff bound: it applies this value as the
+# server bound and derives the guards from it, so a run that never bounds the
+# handoff (the pre-fix base) times out at the read guard instead of replying.
+# Keep the order: handoff bound < read guard < release-gate guard, 5s margins.
+HANDOFF_BOUND_SECONDS = 0.0
+HELLO_READ_GUARD_SECONDS = HANDOFF_BOUND_SECONDS + 5
 RELEASE_GATE_GUARD_SECONDS = HELLO_READ_GUARD_SECONDS + 5
 
 
@@ -447,7 +450,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         monkeypatch.setattr(
             control_module,
             "CONTROLLER_HANDOFF_DEADLINE_SECONDS",
-            0.0,
+            HANDOFF_BOUND_SECONDS,
             raising=False,
         )
         rejected = await _rpc_within_test_bound(
@@ -478,11 +481,6 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         assert await _read_or_close(old_reader, transport) is None
         assert old_frames_after_fence == []
 
-        monkeypatch.setattr(
-            control_module,
-            "CONTROLLER_HANDOFF_DEADLINE_SECONDS",
-            CONTROLLER_HANDOFF_DEADLINE_SECONDS,
-        )
         release_gate.set()
         release = server.control._controller_release_task
         assert release is not None
