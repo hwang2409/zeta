@@ -73,7 +73,6 @@ from zeta.protocol.types import (
     ThinkingContent,
     ToolCall,
     ToolUseContent,
-    harness_notice,
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
@@ -5129,17 +5128,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
-    task_notice = (
-        "task task-1 (printf hi) has run 1h; "
-        "kill it with task_kill or leave it running"
-    )
-    store.append_message(
-        harness_notice("task safety", task_notice, event="agent_task_safety")
-    )
-    task_cause = (
-        "explicit-finish task safety limit expired at task age 7200 seconds "
-        "after no owner turn for 3600 seconds"
-    )
+    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     store.append_task_notification(
         task_id="task-1",
         command="printf hi",
@@ -5178,11 +5167,6 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
             row["notification"].get("kind", "agent_completion"): row for row in rows
         }
         assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
-        assert any(
-            row.get("content", [{}])[0].get("text")
-            == f"[zeta] task safety: {task_notice}"
-            for row in history
-        )
         assert task_cause in by_kind["task_exited"]["content"][0]["text"]
         assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
         assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
@@ -10486,20 +10470,33 @@ async def test_slash_run_mcp_credential_evidence_recovery(
     reader, writer, sid = await _ready_extensions(server)
     try:
         project_config = project / ".zeta" / "mcp.json"
-        add_response = (
-            await _request(
-                reader,
-                writer,
-                "mcp-add-client-only",
-                "slash_run",
-                {
-                    "session_id": sid,
-                    "text": "/mcp add surprise --http https://mcp.test",
-                },
-            )
-        )[-1]["result"]
-        assert add_response == {"kind": "client_only", "name": "mcp"}
-        assert not project_config.exists()
+
+        async def run_mcp(request_id: str, command: str) -> dict[str, object]:
+            return (
+                await _request(
+                    reader,
+                    writer,
+                    request_id,
+                    "slash_run",
+                    {"session_id": sid, "text": f"/mcp {command}"},
+                )
+            )[-1]["result"]
+
+        commands = (
+            "add surprise --stdio missing-command",
+            "disable surprise",
+            "trust surprise",
+            "untrust surprise",
+            "enable surprise",
+        )
+        for index, command in enumerate(commands):
+            result = await run_mcp(f"mcp-mutation-{index}", command)
+            assert result["kind"] == "output"
+        assert project_config.exists()
+        assert "surprise" in json.loads(project_config.read_text())["servers"]
+        removed = await run_mcp("mcp-mutation-remove", "remove surprise")
+        assert removed["kind"] == "output"
+        assert "surprise" not in json.loads(project_config.read_text())["servers"]
 
         response = (
             await _request(

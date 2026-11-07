@@ -236,6 +236,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "read",
         _read,
+        binding="shared",
         approval_subject="path",
         description=(
             "Read a UTF-8 text file or a PNG, JPEG, GIF, or WebP image. "

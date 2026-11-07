@@ -143,6 +143,34 @@ def test_allowed_drop_passes(tmp_path: Path):
     assert run(r).returncode == 0
 
 
+def test_pr_body_explains_dropped_symbol(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def lost(): pass\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def branch(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def lost(): pass\ndef added(): pass\n")
+    commit(r, "main")
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    subprocess.run(["git", "checkout", "branch", "--", "src/a.py"], cwd=r, check=True)
+    commit(r, "merge")
+    body = tmp_path / "pr-body"
+    body.write_text("merge-resolution: src/a.py def added -> intentional\n")
+
+    assert run(r).returncode == 1
+    explained = run(r, "--pr-body-file", str(body))
+    assert explained.returncode == 0
+    assert "clean merge" in explained.stdout
+
+
 def test_new_constant_value_flagged(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
