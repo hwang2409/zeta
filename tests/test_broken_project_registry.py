@@ -461,6 +461,12 @@ async def _drain(task: asyncio.Task[Any], timeout: float) -> None:
             raise AssertionError(
                 f"{task.get_name()} hung after test cleanup cancellation"
             ) from cancel_exc
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception as task_exc:
+                raise task_exc from exc
+            return
         raise AssertionError(f"{task.get_name()} hung during test cleanup") from exc
 
 
