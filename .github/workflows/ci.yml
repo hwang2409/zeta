@@ -109,19 +109,19 @@ jobs:
           enable-cache: false
       - name: Start installed zeta on old home
         run: python scripts/smoke_old_home.py
-      - name: Select stored-format predecessor
+      - name: Compare stored-format predecessor
         env:
           GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python scripts/storage_format_compatibility.py
-      - name: Emit candidate stored-format registry
-        run: uv run --frozen python tests/compatibility/storage_probe.py > storage-format-candidate.json
-      - name: Archive candidate registry and lock
+        run: uv run --frozen python scripts/storage_format_compatibility.py --output-dir storage-format-artifacts
+      - name: Archive stored-format selection and probes
         uses: actions/upload-artifact@v4
         with:
           name: storage-format-${{ matrix.os }}-${{ github.sha }}
           path: |
-            storage-format-candidate.json
-            uv.lock
+            storage-format-artifacts/storage-format-predecessor-sha
+            storage-format-artifacts/storage-format-predecessor.json
+            storage-format-artifacts/storage-format-candidate.json
+            storage-format-artifacts/uv.lock
 
   merge-resolution:
     name: merge resolution

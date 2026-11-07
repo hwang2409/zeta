@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 3
+WRITER_EPOCH: Final = 4
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -39,6 +39,7 @@ GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
 # Python type names, so a conditional variant can be compared independently.
 ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "hook_config": frozenset({"hook"}),
+    "hook_record": frozenset({"event", "command", "timeout_seconds", "tools", "on_error"}),
     "todo_item": frozenset({"content", "status"}),
     "notification_marker": frozenset({"notification_id"}),
     "turn_history": frozenset({"turn_id", "reason"}),
@@ -60,16 +61,18 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "memory_reconciliation_change": frozenset({"path", "content", "action"}),
     "memory_reconciliation_source": frozenset({"project_id", "session_id", "entry_id"}),
     "memory_operations": frozenset({"operations"}),
-    "memory_entry": frozenset({"id", "kind", "content", "created_at", "updated_at"}),
     "account_credential": frozenset({"provider", "name", "sha256"}),
     "account_publication_marker": frozenset({"provider", "name", "sha256"}),
     "project_session_reference": frozenset({"session_id", "role", "created_at"}),
-    "memory_state_root": frozenset({"format", "entries", "sources"}),
+    "memory_state_root": frozenset({"format", "project_id", "generation", "schema", "entries", "compacted_through_version"}),
+    "memory_schema": frozenset({"version", "profile", "kinds"}),
+    "memory_kind": frozenset({"key", "name", "description", "prompt_mode", "prompt_priority", "prompt_max_entries", "default_expiry_days"}),
+    "memory_entry": frozenset({"id", "project_id", "kind", "text", "representation", "status", "created_at", "updated_at", "seen_at", "expires_at", "expiry_is_default", "valid_from", "valid_until", "supersedes", "superseded_by", "sources", "automatic", "accepted_at", "accepted_by", "last_operation_id", "section", "migration_order", "migration_source"}),
     "memory_missing_entry": frozenset({"id", "missing"}),
-    "memory_source": frozenset({"id", "kind", "uri", "digest"}),
-    "memory_migration_source": frozenset({"path", "digest", "format"}),
-    "memory_operation_receipt": frozenset({"operation_id", "status", "error"}),
-    "remote_memory_sync_state": frozenset({"version", "entries", "conflicts"}),
+    "memory_source": frozenset({"session_id", "seq_start", "seq_end", "origins", "observed_at", "evidence_rank"}),
+    "memory_migration_source": frozenset({"source_digest", "source_version"}),
+    "memory_operation_receipt": frozenset({"operation_id", "type", "target_ids", "result_ids", "reason", "reconciliation_key", "automatic"}),
+    "remote_memory_sync_state": frozenset({"schema", "project_id", "generation", "entries", "conflicts"}),
     "remote_memory_sync_conflict": frozenset({"id", "local", "remote"}),
     "entry_sync_state": frozenset({"version", "entries", "conflicts", "transitions"}),
     "entry_sync_schema": frozenset({"version", "kind", "fields"}),
@@ -95,9 +98,13 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "client_delivery_accepted_outcome": frozenset({"accepted", "session_id"}),
     "client_delivery_steer_accepted_outcome": frozenset({"accepted"}),
     "pending_queue_closed": frozenset(),
-    "fact_floor_root": frozenset({"version", "facts"}),
-    "fact_floor_aggregate": frozenset({"kind", "count", "first_seq", "last_seq"}),
-    "fact_floor_record": frozenset({"kind", "value"}),
+    "fact_floor_root": frozenset({"version", "oldest", "newest"}),
+    "fact_floor_aggregate": frozenset({"fact", "first_seq", "last_seq", "value_rank"}),
+    "fact_pr": frozenset({"type", "pr"}),
+    "fact_pr_verdict": frozenset({"type", "pr", "verdict"}),
+    "fact_pr_head": frozenset({"type", "pr", "sha"}),
+    "fact_child_status": frozenset({"type", "handle", "status"}),
+    "fact_child_head": frozenset({"type", "handle", "sha"}),
     "tool_result_text": frozenset({"type", "text"}),
     "tool_result_image": frozenset({"type", "source"}),
     "tool_result_resource": frozenset({"type", "resource"}),
