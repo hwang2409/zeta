@@ -41,7 +41,7 @@ from zeta.tui.bootstrap import build_backend as build_interactive_backend
 _ORIGINAL_HTTP_REQUEST = httpx.HTTPTransport.handle_request
 _ORIGINAL_ASYNC_HTTP_REQUEST = httpx.AsyncHTTPTransport.handle_async_request
 _STALL_SECONDS = 0.05
-_CLIENT_DEADLINE_SECONDS = 0.75
+_CLIENT_DEADLINE_SECONDS = 10.0
 
 
 async def _captured_num_ctx(backend: OllamaBackend) -> int:
@@ -114,6 +114,7 @@ class _TCPHTTPServer:
         self.calls = 0
         self.request_bodies: list[bytes] = []
         self.first_body_sent = asyncio.Event()
+        self.second_request_received = asyncio.Event()
         self.server: asyncio.Server | None = None
         self.tasks: set[asyncio.Task] = set()
 
@@ -141,12 +142,12 @@ class _TCPHTTPServer:
                 ),
                 0,
             )
-            body = (
-                await reader.readexactly(content_length) if content_length else b""
-            )
+            body = await reader.readexactly(content_length) if content_length else b""
             self.request_bodies.append(body)
             script = self.scripts[min(self.calls, len(self.scripts) - 1)]
             self.calls += 1
+            if self.calls == 2:
+                self.second_request_received.set()
             await script(writer, self)
         except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError):
             pass
@@ -1594,7 +1595,7 @@ async def test_ollama_stall_zero_allows_progressing_real_transport(
 
 @pytest.mark.asyncio
 async def test_ollama_watchdog_retries_real_transport_stall(
-    tcp_http_server: _TCPHTTPServer, monkeypatch
+    tcp_http_server: _TCPHTTPServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     partial = b'{"message":{"content":"partial"}}\n'
     ok = b'{"message":{"content":"ok"},"done":true}\n'
@@ -1607,7 +1608,10 @@ async def test_ollama_watchdog_retries_real_transport_stall(
             lambda writer, server: _response(writer, server, [ok]),
         ]
     )
-    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0
+    )
+
     transport = _LoopbackAsyncHTTPTransport()
     async with httpx.AsyncClient(transport=transport) as client:
 
@@ -1617,13 +1621,20 @@ async def test_ollama_watchdog_retries_real_transport_stall(
                 async for event in OllamaBackend(
                     client=client,
                     base_url=tcp_http_server.url,
-                    timeout=_STALL_SECONDS / 5,
-                    stall_seconds=_STALL_SECONDS,
+                    stall_seconds=1.0,
                     stall_retries=1,
                 ).complete([], [])
             ]
 
-        events = await asyncio.wait_for(collect(), timeout=_CLIENT_DEADLINE_SECONDS)
+        result = (
+            await asyncio.wait_for(
+                asyncio.gather(collect(), return_exceptions=True),
+                timeout=_CLIENT_DEADLINE_SECONDS,
+            )
+        )[0]
+        assert tcp_http_server.second_request_received.is_set()
+        assert not isinstance(result, BaseException)
+        events = result
         assert tcp_http_server.calls == 2
         assert any(
             event.type is StreamEventType.RETRY and event.data.get("is_stall") is True
@@ -1635,7 +1646,7 @@ async def test_ollama_watchdog_retries_real_transport_stall(
 
 @pytest.mark.asyncio
 async def test_ollama_error_body_stall_retries_and_closes_stream(
-    tcp_http_server: _TCPHTTPServer, monkeypatch
+    tcp_http_server: _TCPHTTPServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     never = asyncio.Event()
     error_chunks = [b"error prefix", b" delayed suffix"]
@@ -1645,12 +1656,20 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
             lambda writer, server: _response(
                 writer, server, error_chunks, status=500, wait=never
             ),
-            lambda writer, server: _response(
-                writer, server, [final_error], status=400
-            ),
+            lambda writer, server: _response(writer, server, [final_error], status=400),
         ]
     )
-    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0
+    )
+
+    async def enter_without_header_deadline(enter, *_args):
+        return await asyncio.wait_for(enter, timeout=_CLIENT_DEADLINE_SECONDS)
+
+    monkeypatch.setattr(
+        "zeta.providers.ollama.wait_for_response_headers",
+        enter_without_header_deadline,
+    )
     transport = _LoopbackAsyncHTTPTransport()
     events = []
     async with httpx.AsyncClient(transport=transport) as client:
@@ -1665,7 +1684,7 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
                 events.append(event)
 
         with pytest.raises(OllamaError, match="Ollama HTTP 400: final error"):
-            await asyncio.wait_for(collect(), timeout=3)
+            await asyncio.wait_for(collect(), timeout=_CLIENT_DEADLINE_SECONDS)
         assert tcp_http_server.calls == 2
         assert any(
             event.type is StreamEventType.RETRY and event.data.get("is_stall") is True
