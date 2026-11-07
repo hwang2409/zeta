@@ -849,10 +849,10 @@ Error descriptors are:
 | `state_unavailable` | `-32005` | none | requested turn or account state is unavailable |
 | `approval_unavailable` | `-32006` | none | approval request is missing, resolved, or reserved |
 | `frame_too_large` | `-32007` | none | outbound frame exceeds the size limit |
-| `request_forbidden` | `-32008` | none | request is not allowed for this connection or account state |
 | `history_snapshot_stale` | `-32009` | `stale_history_snapshot` | session history snapshot is stale |
 | `delivery_id_evicted` | `-32010` | none | delivery ID details were evicted |
-| `output_overflow` | `-32011` | none | connection output queue overflowed |
+| `controller_output_overflow` | `-32011` | none | controller output overflow |
+| `observer_output_overflow` | `-32011` | none | observer output overflow |
 | `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
 | `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
 | `account_lock_timeout` | `-32008` | `account_lock_timeout` | another process holds the selected account lock |

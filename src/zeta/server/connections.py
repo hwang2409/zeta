@@ -179,7 +179,7 @@ class ConnectionRegistry:
         ):
             return False
         if (
-            event == "approval_end"
+            event is EventDescriptor.APPROVAL_END
             and "approval_reconnect" not in state.features
             and isinstance(fields.get("data"), dict)
             and fields["data"].get("reason") == "grace_expired"
@@ -447,9 +447,12 @@ class ConnectionRegistry:
 
     @staticmethod
     def _overflow_frame(role: str) -> bytes:
-        return FrameCodec().error_response(
-            None, ErrorDescriptor.OUTPUT_OVERFLOW, f"{role} output overflow"
+        descriptor = (
+            ErrorDescriptor.CONTROLLER_OUTPUT_OVERFLOW
+            if role == "controller"
+            else ErrorDescriptor.OBSERVER_OUTPUT_OVERFLOW
         )
+        return FrameCodec().error_response(None, descriptor, descriptor.meaning)
 
     @staticmethod
     async def _write_physical(

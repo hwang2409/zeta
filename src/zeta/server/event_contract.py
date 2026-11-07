@@ -5,8 +5,7 @@ from enum import Enum, auto
 
 from ..core.checkpoints import ConversationEntry
 from ..protocol.types import StreamEvent, StreamEventType
-from .protocol import TOOL_OUTPUT_MAX_BYTES, bounded
-from .protocol_registry import EventDescriptor
+from .protocol import TOOL_OUTPUT_MAX_BYTES, EventDescriptor, bounded
 
 
 def delivery_status_row(entry: ConversationEntry) -> dict[str, object]:
