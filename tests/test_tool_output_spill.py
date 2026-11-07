@@ -20,7 +20,8 @@ import httpx
 import pytest
 
 from zeta.core.store import ConversationStore
-from zeta.mcp.client import translate_call_result
+from zeta.mcp.client import MCPResourceContent, translate_call_result
+from zeta.mcp.resources import fetch_resource
 from zeta.protocol.types import StructuredToolResult, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -766,7 +767,7 @@ async def test_bash_large_output_spills(tmp_path: Path) -> None:
 async def test_closed_child_spills_are_reclaimed_for_a_sibling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    shared_cap = 150
+    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE
     monkeypatch.setattr(
         spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
     )
@@ -793,8 +794,8 @@ async def test_closed_child_spills_are_reclaimed_for_a_sibling(
         )
         first = root.clone_for_session(first_store)
         second = first.clone_for_session(second_store)
-        first.spills.max_bytes = 100
-        second.spills.max_bytes = 100
+        first.spills.max_bytes = shared_cap
+        second.spills.max_bytes = shared_cap
         try:
             old_path = first.spills.write_bytes("tool", "first", 0, b"a" * 100)
             await first.close()
@@ -818,11 +819,79 @@ async def test_closed_child_spills_are_reclaimed_for_a_sibling(
 
 
 @pytest.mark.asyncio
-async def test_child_spills_share_one_root_byte_cap(
+async def test_tiny_mcp_resources_have_a_bounded_shared_artifact_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    minimum = getattr(spill_module, "SPILL_MIN_ARTIFACT_CHARGE", 4 * 1024)
+    tree_cap = minimum * 4
     monkeypatch.setattr(
-        spill_module, "SPILL_SESSION_MAX_BYTES", 150, raising=False
+        spill_module, "SPILL_SESSION_MAX_BYTES", tree_cap, raising=False
+    )
+
+    class TinyResourceClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def read_resource(
+            self, uri: str
+        ) -> tuple[MCPResourceContent, ...]:
+            del uri
+            self.calls += 1
+            return (MCPResourceContent(b"x" if self.calls % 2 else b""),)
+
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        client = TinyResourceClient()
+        paths: list[Path] = []
+        try:
+            for index in range(12):
+                attachment = await fetch_resource(
+                    client,  # type: ignore[arg-type]
+                    server="tiny",
+                    uri=f"mcp://tiny/{index}",
+                    spill_store=(first if index % 2 else second).spills,
+                )
+                paths.extend(attachment.spill_paths)
+
+            assert all(not path.exists() for path in paths[:-4])
+            assert all(path.exists() for path in paths[-4:])
+            retained = first.spills.retained_paths() + second.spills.retained_paths()
+            assert len(retained) <= tree_cap // minimum
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_store_reclaim_removes_owner_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    minimum = getattr(spill_module, "SPILL_MIN_ARTIFACT_CHARGE", None)
+    tree_cap = minimum or 1
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", tree_cap, raising=False
     )
     with (
         _store(tmp_path, "parent") as parent_store,
@@ -847,8 +916,60 @@ async def test_child_spills_share_one_root_byte_cap(
         )
         first = root.clone_for_session(first_store)
         second = root.clone_for_session(second_store)
-        first.spills.max_bytes = 100
-        second.spills.max_bytes = 100
+        try:
+            old_path = first.spills.write_bytes("tool", "old", 0, b"x")
+            sibling_path = second.spills.write_bytes("tool", "sibling", 0, b"y")
+            retained_paths = getattr(first.spills, "retained_paths", None)
+            if retained_paths is None:
+                retained_paths = lambda: tuple(
+                    first.spills.root / name for name in first.spills._retained
+                )
+
+            assert not old_path.exists()
+            assert retained_paths() == ()
+
+            newest_path = first.spills.write_bytes("tool", "new", 0, b"z")
+            assert not sibling_path.exists()
+            assert retained_paths() == (newest_path,)
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
+async def test_child_spills_share_one_root_byte_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE + 50
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        first.spills.max_bytes = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+        second.spills.max_bytes = spill_module.SPILL_MIN_ARTIFACT_CHARGE
         try:
             old_path = first.spills.write_bytes("tool", "first", 0, b"a" * 100)
             sibling_path = second.spills.write_bytes(
@@ -881,8 +1002,8 @@ async def test_child_spills_share_one_root_byte_cap(
 async def test_concurrent_call_limit_reservations_reclaim_retained_spills(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    shared_cap = 140
     call_limit = 64
+    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE + call_limit
     monkeypatch.setattr(
         spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
     )
@@ -1009,8 +1130,9 @@ async def test_transient_bytes_alone_raise_typed_shared_spill_error(
 async def test_missing_reclaimed_file_returns_its_charge_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE
     monkeypatch.setattr(
-        spill_module, "SPILL_SESSION_MAX_BYTES", 100, raising=False
+        spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
     )
     with (
         _store(tmp_path, "parent") as parent_store,
@@ -1035,17 +1157,17 @@ async def test_missing_reclaimed_file_returns_its_charge_once(
         )
         first = root.clone_for_session(first_store)
         second = root.clone_for_session(second_store)
-        first.spills.max_bytes = 100
-        second.spills.max_bytes = 100
+        first.spills.max_bytes = shared_cap
+        second.spills.max_bytes = shared_cap
         try:
             missing = first.spills.write_bytes("tool", "missing", 0, b"a" * 100)
             missing.unlink()
             live = second.spills.write_bytes("tool", "live", 0, b"b" * 100)
 
-            first.spills.configure_transient_limit(100)
-            first.spills.reserve_transient(100)
+            first.spills.configure_transient_limit(shared_cap)
+            first.spills.reserve_transient(shared_cap)
             assert not live.exists()
-            first.spills.release_transient(100)
+            first.spills.release_transient(shared_cap)
             assert second.spills.write_bytes(
                 "tool", "after", 0, b"c" * 100
             ).read_bytes() == b"c" * 100

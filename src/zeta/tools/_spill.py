@@ -22,6 +22,7 @@ from ..core.session_files import SessionError, child_directory, open_session_fil
 SPILL_DIRECTORY = "spill"
 SPILL_MAX_BYTES = 100 * 1024 * 1024
 SPILL_SESSION_MAX_BYTES = 256 * 1024 * 1024
+SPILL_MIN_ARTIFACT_CHARGE = 4 * 1024
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 _LOCK_FILE = ".spill.lock"
 
@@ -47,7 +48,7 @@ class _SpillDirectory:
 class _RetainedArtifact:
     directory: _SpillDirectory
     name: str
-    byte_size: int
+    charged_size: int
     group: object | None
 
 
@@ -94,12 +95,12 @@ class SpillByteBudget:
         with self._lock:
             if group is not None:
                 self._protected_groups.add(group)
-            for name, byte_size in artifacts.items():
+            for name, charged_size in artifacts.items():
                 key = (directory, name)
                 if key in self._retained:
                     raise ValueError("spill artifact is already retained")
                 self._retained[key] = _RetainedArtifact(
-                    directory, name, byte_size, group
+                    directory, name, charged_size, group
                 )
 
     def unprotect(self, group: object) -> None:
@@ -112,8 +113,25 @@ class SpillByteBudget:
             artifact = self._retained.pop(key, None)
             self._reclaiming.discard(key)
             if artifact is not None:
-                self._used_bytes -= artifact.byte_size
+                self._used_bytes -= artifact.charged_size
             self._condition.notify_all()
+
+    def forget_directory(self, directory: _SpillDirectory) -> None:
+        with self._lock:
+            keys = [key for key in self._retained if key[0] == directory]
+            for key in keys:
+                artifact = self._retained.pop(key)
+                self._reclaiming.discard(key)
+                self._used_bytes -= artifact.charged_size
+            self._condition.notify_all()
+
+    def retained_names(self, directory: _SpillDirectory) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(
+                artifact.name
+                for artifact in self._retained.values()
+                if artifact.directory == directory
+            )
 
     def _reserve_or_select_oldest(
         self, byte_count: int, *, directory: _SpillDirectory | None
@@ -218,7 +236,6 @@ class SpillStore:
             self._parent_fd = directory_fd
             self.root = Path(session_dir).absolute() / SPILL_DIRECTORY
         self._closed = False
-        self._retained: dict[str, int] = {}
         self._transient_bytes = 0
         self._transient_max_bytes = 64 * 1024 * 1024
 
@@ -383,7 +400,6 @@ class SpillStore:
                     }
                     self._byte_budget.retain(directory, retained, group=group)
                     protected = True
-                    self._retained.update(retained)
                 except BaseException:
                     self._rollback_group(
                         directory_fd, directory, publications, published, reserved
@@ -414,20 +430,32 @@ class SpillStore:
             )
             reserved[temporary] = 0
             with os.fdopen(fd, "wb") as destination:
+                self._byte_budget.reserve(
+                    SPILL_MIN_ARTIFACT_CHARGE,
+                    directory=directory,
+                    directory_fd=directory_fd,
+                )
+                reserved[temporary] = SPILL_MIN_ARTIFACT_CHARGE
+                written = 0
                 for part in parts:
                     chunks = self._chunks(part)
                     for chunk in chunks:
+                        charged_size = max(
+                            SPILL_MIN_ARTIFACT_CHARGE, written + len(chunk)
+                        )
+                        additional_charge = charged_size - reserved[temporary]
                         self._byte_budget.reserve(
-                            len(chunk),
+                            additional_charge,
                             directory=directory,
                             directory_fd=directory_fd,
                         )
                         try:
                             destination.write(chunk)
                         except BaseException:
-                            self._byte_budget.release(len(chunk))
+                            self._byte_budget.release(additional_charge)
                             raise
-                        reserved[temporary] += len(chunk)
+                        written += len(chunk)
+                        reserved[temporary] = charged_size
                 destination.flush()
                 os.fsync(destination.fileno())
 
@@ -475,7 +503,6 @@ class SpillStore:
                 retained[temporary] = reserved.get(temporary, 0)
         if retained:
             self._byte_budget.retain(directory, retained)
-            self._retained.update(retained)
         self._byte_budget.release(sum(reserved.values()) - sum(retained.values()))
 
     @staticmethod
@@ -538,18 +565,20 @@ class SpillStore:
             self._parent_fd = None
             if self._temporary_root is not None:
                 shutil.rmtree(self._temporary_root, ignore_errors=True)
-                self._forget_missing_retained()
+                if self._directory_identity is not None and not self.root.exists():
+                    self._byte_budget.forget_directory(self._directory_identity)
         with self._transient_lock:
             self._byte_budget.release(self._transient_bytes)
             self._transient_bytes = 0
 
-    def _forget_missing_retained(self) -> None:
-        if self._directory_identity is None:
-            return
-        for name in list(self._retained):
-            if not (self.root / name).exists():
-                self._byte_budget.forget(self._directory_identity, name)
-                self._retained.pop(name, None)
+    def retained_paths(self) -> tuple[Path, ...]:
+        """List retained artifacts from the shared root ledger."""
+
+        with self._lock:
+            if self._directory_identity is None:
+                return ()
+            names = self._byte_budget.retained_names(self._directory_identity)
+            return tuple(self.root / name for name in names)
 
     def _ensure_directory(self) -> int:
         if self._closed:
@@ -600,8 +629,9 @@ class SpillStore:
                     continue
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     continue
-                total += info.st_size
-                entries.append((info.st_mtime_ns, name, info.st_size))
+                charged_size = max(info.st_size, SPILL_MIN_ARTIFACT_CHARGE)
+                total += charged_size
+                entries.append((info.st_mtime_ns, name, charged_size))
             for _mtime, name, size in sorted(entries):
                 if total <= self.max_bytes or name in newest:
                     continue
@@ -610,8 +640,7 @@ class SpillStore:
                 except OSError:
                     continue
                 total -= size
-                if self._retained.pop(name, None) is not None:
-                    self._byte_budget.forget(self._directory(), name)
+                self._byte_budget.forget(self._directory(), name)
         except OSError:
             return
 
