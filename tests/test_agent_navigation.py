@@ -1483,7 +1483,7 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     release.set()
     await asyncio.wait_for(queued.wait(), timeout=2)
     assert session.default_buffer.text == ""
-    await asyncio.gather(*tuple(app._child_send_tasks))
+    await asyncio.wait_for(asyncio.gather(*tuple(app._child_send_tasks)), timeout=10)
     target = app.loop._background_owner.conversation_channel._delivery_targets[
         "root:worker"
     ]

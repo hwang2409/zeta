@@ -5,17 +5,107 @@ import fcntl
 import functools
 import multiprocessing
 import os
+import select
 import shlex
 import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from zeta.core.session import SessionManager
+
+_WAIT_TIMEOUT_SECONDS = 10.0
+
+
+def _recv(connection: Any) -> Any:
+    assert connection.poll(_WAIT_TIMEOUT_SECONDS), (
+        "timed out waiting for process result"
+    )
+    return connection.recv()
+
+
+def _join(process: multiprocessing.Process) -> None:
+    process.join(_WAIT_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.kill()
+        process.join(_WAIT_TIMEOUT_SECONDS)
+        pytest.fail(f"process {process.pid} did not exit before the deadline")
+    assert not process.is_alive(), f"process {process.pid} could not be reaped"
+
+
+def _cleanup_process(process: multiprocessing.Process | None) -> None:
+    if process is None:
+        return
+    if process.is_alive():
+        process.kill()
+    _join(process)
+    process.close()
+
+
+def _read_fifo(path: Path) -> bytes:
+    fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        readable, _, _ = select.select([fd], [], [], _WAIT_TIMEOUT_SECONDS)
+        assert readable, f"timed out reading {path}"
+        data = os.read(fd, 4096)
+        assert data, f"{path} closed without data"
+        return data
+    finally:
+        os.close(fd)
+
+
+def _write_fifo(path: Path, data: bytes) -> None:
+    deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError as exc:
+            if exc.errno != getattr(os, "ENXIO", 6) or time.monotonic() >= deadline:
+                pytest.fail(f"timed out opening {path} for writing: {exc}")
+            threading.Event().wait(0.01)
+    try:
+        assert os.write(fd, data) == len(data)
+    finally:
+        os.close(fd)
+
+
+def _wait_for_stopped(pid: int) -> int:
+    deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        waited_pid, status = os.waitpid(pid, os.WUNTRACED | os.WNOHANG)
+        if waited_pid == pid:
+            return status
+        threading.Event().wait(0.01)
+    pytest.fail(f"process {pid} did not stop before the deadline")
+
+
+def _wait_for_pid_exit(pid: int) -> None:
+    deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        threading.Event().wait(0.01)
+
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    cleanup_deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    while time.monotonic() < cleanup_deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pytest.fail(f"tool process {pid} required SIGKILL after the exit deadline")
+        threading.Event().wait(0.01)
+    pytest.fail(f"tool process {pid} remained after SIGKILL")
 
 
 def _epoch(store: Any) -> str | None:
@@ -26,6 +116,7 @@ def _hold_session(home: str, session_id: str, ready: Any, release: Any) -> None:
     manager = SessionManager(home)
     with manager.open(session_id).store as store:
         ready.send(("owned", _epoch(store)))
+        assert release.poll(_WAIT_TIMEOUT_SECONDS)
         release.recv()
 
 
@@ -91,6 +182,7 @@ def _production_spawn_owner(
     with SessionManager(home).open(session_id).store as store:
         child_pid = asyncio.run(start())
         ready.send((child_pid, _epoch(store)))
+        assert release.poll(_WAIT_TIMEOUT_SECONDS)
         release.recv()
 
 
@@ -123,38 +215,68 @@ def test_second_process_cannot_open_owned_session(tmp_path: Path) -> None:
     owner_ready, owner_send = multiprocessing.Pipe(duplex=False)
     release_recv, release_send = multiprocessing.Pipe(duplex=False)
     owner = _spawn(_hold_session, str(home), session_id, owner_send, release_recv)
-    assert owner_ready.recv()[0] == "owned"
+    contender: multiprocessing.Process | None = None
+    result_recv = result_send = None
+    try:
+        assert _recv(owner_ready)[0] == "owned"
+        result_recv, result_send = multiprocessing.Pipe(duplex=False)
+        contender = _spawn(_try_open, str(home), session_id, result_send)
+        result = _recv(result_recv)
+        _join(contender)
+        release_send.send(None)
+        _join(owner)
 
-    result_recv, result_send = multiprocessing.Pipe(duplex=False)
-    contender = _spawn(_try_open, str(home), session_id, result_send)
-    result = result_recv.recv()
-    contender.join()
-    release_send.send(None)
-    owner.join()
-
-    assert result[0:2] == ("error", "SessionOwnedError")
-    assert owner.exitcode == contender.exitcode == 0
+        assert result[0:2] == ("error", "SessionOwnedError")
+        assert owner.exitcode == contender.exitcode == 0
+    finally:
+        _cleanup_process(contender)
+        _cleanup_process(owner)
+        for connection in (
+            owner_ready,
+            owner_send,
+            release_recv,
+            release_send,
+            result_recv,
+            result_send,
+        ):
+            if connection is not None:
+                connection.close()
 
 
 def test_owner_death_allows_immediate_new_epoch(tmp_path: Path) -> None:
     home = tmp_path / "home"
     session_id = _created_session(home, tmp_path)
     ready, ready_send = multiprocessing.Pipe(duplex=False)
-    release_recv, _release_send = multiprocessing.Pipe(duplex=False)
+    release_recv, release_send = multiprocessing.Pipe(duplex=False)
     owner = _spawn(_hold_session, str(home), session_id, ready_send, release_recv)
-    first_epoch = ready.recv()[1]
+    successor: multiprocessing.Process | None = None
+    result_recv = result_send = None
+    try:
+        first_epoch = _recv(ready)[1]
+        os.kill(owner.pid, signal.SIGKILL)
+        _join(owner)
+        assert owner.exitcode == -signal.SIGKILL
 
-    os.kill(owner.pid, signal.SIGKILL)
-    owner.join()
-    assert owner.exitcode == -signal.SIGKILL
-
-    result_recv, result_send = multiprocessing.Pipe(duplex=False)
-    successor = _spawn(_try_open, str(home), session_id, result_send)
-    result = result_recv.recv()
-    successor.join()
-    assert result[0] == "opened"
-    assert first_epoch is not None and result[1] != first_epoch
-    assert successor.exitcode == 0
+        result_recv, result_send = multiprocessing.Pipe(duplex=False)
+        successor = _spawn(_try_open, str(home), session_id, result_send)
+        result = _recv(result_recv)
+        _join(successor)
+        assert result[0] == "opened"
+        assert first_epoch is not None and result[1] != first_epoch
+        assert successor.exitcode == 0
+    finally:
+        _cleanup_process(successor)
+        _cleanup_process(owner)
+        for connection in (
+            ready,
+            ready_send,
+            release_recv,
+            release_send,
+            result_recv,
+            result_send,
+        ):
+            if connection is not None:
+                connection.close()
 
 
 def test_suspend_does_not_release_owner(tmp_path: Path) -> None:
@@ -163,21 +285,41 @@ def test_suspend_does_not_release_owner(tmp_path: Path) -> None:
     ready, ready_send = multiprocessing.Pipe(duplex=False)
     release_recv, release_send = multiprocessing.Pipe(duplex=False)
     owner = _spawn(_hold_session, str(home), session_id, ready_send, release_recv)
-    ready.recv()
+    contender: multiprocessing.Process | None = None
+    result_recv = result_send = None
+    try:
+        _recv(ready)
+        os.kill(owner.pid, signal.SIGSTOP)
+        status = _wait_for_stopped(owner.pid)
+        assert os.WIFSTOPPED(status)
+        result_recv, result_send = multiprocessing.Pipe(duplex=False)
+        contender = _spawn(_try_open, str(home), session_id, result_send)
+        result = _recv(result_recv)
+        _join(contender)
 
-    os.kill(owner.pid, signal.SIGSTOP)
-    waited_pid, status = os.waitpid(owner.pid, os.WUNTRACED)
-    assert waited_pid == owner.pid and os.WIFSTOPPED(status)
-    result_recv, result_send = multiprocessing.Pipe(duplex=False)
-    contender = _spawn(_try_open, str(home), session_id, result_send)
-    result = result_recv.recv()
-    contender.join()
-
-    os.kill(owner.pid, signal.SIGCONT)
-    release_send.send(None)
-    owner.join()
-    assert result[0:2] == ("error", "SessionOwnedError")
-    assert owner.exitcode == contender.exitcode == 0
+        os.kill(owner.pid, signal.SIGCONT)
+        release_send.send(None)
+        _join(owner)
+        assert result[0:2] == ("error", "SessionOwnedError")
+        assert owner.exitcode == contender.exitcode == 0
+    finally:
+        if owner.is_alive():
+            try:
+                os.kill(owner.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        _cleanup_process(contender)
+        _cleanup_process(owner)
+        for connection in (
+            ready,
+            ready_send,
+            release_recv,
+            release_send,
+            result_recv,
+            result_send,
+        ):
+            if connection is not None:
+                connection.close()
 
 
 def test_read_only_store_is_lease_free(tmp_path: Path) -> None:
@@ -319,7 +461,7 @@ def test_production_spawn_does_not_inherit_execution_owner(tmp_path: Path) -> No
         os.mkfifo(fifo)
 
     owner_ready, owner_send = multiprocessing.Pipe(duplex=False)
-    owner_release_recv, _owner_release_send = multiprocessing.Pipe(duplex=False)
+    owner_release_recv, owner_release_send = multiprocessing.Pipe(duplex=False)
     owner = _spawn(
         _production_spawn_owner,
         str(home),
@@ -336,57 +478,55 @@ def test_production_spawn_does_not_inherit_execution_owner(tmp_path: Path) -> No
     contender: multiprocessing.Process | None = None
     contender_recv = contender_send = None
     try:
-        spawned_pid, first_epoch = owner_ready.recv()
-        with ready_fifo.open() as stream:
-            child_pid = int(stream.read())
+        spawned_pid, first_epoch = _recv(owner_ready)
+        child_pid = int(_read_fifo(ready_fifo))
         assert child_pid == spawned_pid
 
         contender_recv, contender_send = multiprocessing.Pipe(duplex=False)
         contender = _spawn(_try_open, str(home), session_id, contender_send)
-        refusal = contender_recv.recv()
-        contender.join()
+        refusal = _recv(contender_recv)
+        _join(contender)
 
         os.kill(owner.pid, signal.SIGKILL)
-        owner.join()
+        _join(owner)
         assert owner.exitcode == -signal.SIGKILL
         os.kill(child_pid, 0)
 
         with SessionManager(home).open(session_id).store as successor:
             successor_epoch = _epoch(successor)
-        with release_fifo.open("wb", buffering=0) as release:
-            release.write(b"1")
+        _write_fifo(release_fifo, b"1")
         child_released = True
-        with done_fifo.open() as done:
-            assert done.read() == "done"
+        assert _read_fifo(done_fifo) == b"done"
         assert first_epoch is not None and successor_epoch != first_epoch
         assert refusal[0:2] == ("error", "SessionOwnedError")
     finally:
         if owner.is_alive():
             owner.kill()
-        owner.join()
-        if child_pid is not None and not child_released:
-            try:
-                release_fd = os.open(release_fifo, os.O_WRONLY | os.O_NONBLOCK)
-            except OSError:
-                try:
-                    os.kill(child_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            else:
-                try:
-                    os.write(release_fd, b"1")
-                finally:
-                    os.close(release_fd)
+        _join(owner)
+        if contender is not None:
+            if contender.is_alive():
+                contender.kill()
+            _join(contender)
         if child_pid is not None:
-            try:
-                os.waitpid(child_pid, 0)
-            except ChildProcessError:
-                pass
+            if not child_released:
+                try:
+                    release_fd = os.open(release_fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError:
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    try:
+                        os.write(release_fd, b"1")
+                    finally:
+                        os.close(release_fd)
+            _wait_for_pid_exit(child_pid)
         for connection in (
             owner_ready,
             owner_send,
             owner_release_recv,
-            _owner_release_send,
+            owner_release_send,
             contender_recv,
             contender_send,
         ):
@@ -413,7 +553,8 @@ def test_takeover_waits_for_detached_write_to_drain(
     @functools.wraps(real_append)
     def blocked_append(self: Any, *args: Any, **kwargs: Any) -> Any:
         write_started.set()
-        release_write.wait()
+        if not release_write.wait(_WAIT_TIMEOUT_SECONDS):
+            raise TimeoutError("timed out waiting to release detached write")
         return real_append(self, *args, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "append_message", blocked_append)
@@ -424,33 +565,51 @@ def test_takeover_waits_for_detached_write_to_drain(
                 Message(MessageRole.ASSISTANT, [TextContent("persisted")])
             )
         )
-        await asyncio.to_thread(write_started.wait)
-        loop = asyncio.get_running_loop()
-        close_waiting = loop.create_future()
-        condition = store._durable_write_condition
-        real_wait = condition.wait
-
-        def report_close_wait(*args: Any, **kwargs: Any) -> Any:
-            if not close_waiting.done():
-                loop.call_soon_threadsafe(close_waiting.set_result, None)
-            return real_wait(*args, **kwargs)
-
-        condition.wait = report_close_wait
-        close = asyncio.create_task(asyncio.to_thread(store.close))
-        await close_waiting
-        assert store._closing
-
+        close: asyncio.Task[None] | None = None
         try:
+            started = await asyncio.wait_for(
+                asyncio.to_thread(write_started.wait, _WAIT_TIMEOUT_SECONDS),
+                _WAIT_TIMEOUT_SECONDS,
+            )
+            assert started
+            loop = asyncio.get_running_loop()
+            close_waiting = loop.create_future()
+            condition = store._durable_write_condition
+            real_wait = condition.wait
+
+            def report_close_wait(*args: Any, **kwargs: Any) -> Any:
+                if not close_waiting.done():
+                    loop.call_soon_threadsafe(close_waiting.set_result, None)
+                return real_wait(*args, **kwargs)
+
+            condition.wait = report_close_wait
+            close = asyncio.create_task(asyncio.to_thread(store.close))
+            await asyncio.wait_for(close_waiting, _WAIT_TIMEOUT_SECONDS)
+            assert store._closing
+
             result_recv, result_send = multiprocessing.Pipe(duplex=False)
             contender = _spawn(_try_open, str(home), session_id, result_send)
-            result = result_recv.recv()
-            contender.join()
-            assert result[0:2] == ("error", "SessionOwnedError")
-            assert contender.exitcode == 0
+            try:
+                result = _recv(result_recv)
+                _join(contender)
+                assert result[0:2] == ("error", "SessionOwnedError")
+                assert contender.exitcode == 0
+            finally:
+                if contender.is_alive():
+                    contender.kill()
+                _join(contender)
+                result_recv.close()
+                result_send.close()
+                contender.close()
         finally:
             release_write.set()
-            await write
-            await close
+            await asyncio.wait_for(write, _WAIT_TIMEOUT_SECONDS)
+            if close is None:
+                await asyncio.wait_for(
+                    asyncio.to_thread(store.close), _WAIT_TIMEOUT_SECONDS
+                )
+            else:
+                await asyncio.wait_for(close, _WAIT_TIMEOUT_SECONDS)
 
     asyncio.run(exercise())
     with SessionManager(home).open(session_id).store as successor:
@@ -463,101 +622,107 @@ def test_format_socket_and_execution_lock_order_across_processes(
     from zeta.server.server import ZetaServer
     from zeta.storage_format import StorageFormatError, advance, verify
 
+    connections: list[Any] = []
+    processes: list[multiprocessing.Process] = []
     home = tmp_path / "home"
     home.mkdir()
     (home / "storage-format.json").write_text('{"writer_epoch":2}\n')
     session_id = _created_session(home, tmp_path)
-    owner_ready, owner_send = multiprocessing.Pipe(duplex=False)
-    owner_release_recv, owner_release_send = multiprocessing.Pipe(duplex=False)
-    owner = _spawn(_hold_session, str(home), session_id, owner_send, owner_release_recv)
-    assert owner_ready.recv()[0] == "owned"
     try:
-        advance(home, expected_epoch=2, target_epoch=3)
-    except StorageFormatError as exc:
-        advance_error = str(exc)
-    else:
-        advance_error = ""
-    owner_release_send.send(None)
-    owner.join()
-    assert "active writers" in advance_error
-    assert owner.exitcode == 0
+        owner_ready, owner_send = multiprocessing.Pipe(duplex=False)
+        owner_release_recv, owner_release_send = multiprocessing.Pipe(duplex=False)
+        connections.extend(
+            (owner_ready, owner_send, owner_release_recv, owner_release_send)
+        )
+        owner = _spawn(
+            _hold_session, str(home), session_id, owner_send, owner_release_recv
+        )
+        processes.append(owner)
+        assert _recv(owner_ready)[0] == "owned"
+        try:
+            advance(home, expected_epoch=2, target_epoch=3)
+        except StorageFormatError as exc:
+            advance_error = str(exc)
+        else:
+            advance_error = ""
+        owner_release_send.send(None)
+        _join(owner)
+        assert "active writers" in advance_error
+        assert owner.exitcode == 0
 
-    advanced_home = tmp_path / "advanced-home"
-    advanced_home.mkdir()
-    (advanced_home / "storage-format.json").write_text('{"writer_epoch":3}\n')
-    session_recv, session_send = multiprocessing.Pipe(duplex=False)
-    creator = _spawn(
-        _create_session_process, str(advanced_home), str(tmp_path), session_send
-    )
-    advanced_session_id = session_recv.recv()
-    creator.join()
-    assert creator.exitcode == 0
-    format_fd = os.open(advanced_home / ".storage-format.lock", os.O_RDWR)
-    fcntl.flock(format_fd, fcntl.LOCK_EX)
-    try:
+        advanced_home = tmp_path / "advanced-home"
+        advanced_home.mkdir()
+        (advanced_home / "storage-format.json").write_text('{"writer_epoch":3}\n')
+        session_recv, session_send = multiprocessing.Pipe(duplex=False)
+        connections.extend((session_recv, session_send))
+        creator = _spawn(
+            _create_session_process, str(advanced_home), str(tmp_path), session_send
+        )
+        processes.append(creator)
+        advanced_session_id = _recv(session_recv)
+        _join(creator)
+        assert creator.exitcode == 0
+
+        format_fd = os.open(advanced_home / ".storage-format.lock", os.O_RDWR)
+        fcntl.flock(format_fd, fcntl.LOCK_EX)
         result_recv, result_send = multiprocessing.Pipe(duplex=False)
+        connections.extend((result_recv, result_send))
         contender = _spawn(
             _open_with_format_lock_probe,
             str(advanced_home),
             advanced_session_id,
             result_send,
         )
-        assert result_recv.recv() == "attempting"
-        assert contender.is_alive()
-    finally:
-        fcntl.flock(format_fd, fcntl.LOCK_UN)
-        os.close(format_fd)
-    assert result_recv.recv()[0] == "opened"
-    contender.join()
-    assert contender.exitcode == 0
-
-    socket_path = tmp_path / "serve.sock"
-    socket_lock_fd = os.open(
-        f"{socket_path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
-    )
-    fcntl.flock(socket_lock_fd, fcntl.LOCK_EX)
-    blocked_server = ZetaServer(
-        home=advanced_home, socket_path=socket_path, provider="codex"
-    )
-
-    async def fail_before_session_open() -> None:
+        processes.append(contender)
         try:
-            with pytest.raises(RuntimeError, match="already listening"):
-                await blocked_server.start()
+            assert _recv(result_recv) == "attempting"
+            assert contender.is_alive()
         finally:
-            await blocked_server.close()
+            fcntl.flock(format_fd, fcntl.LOCK_UN)
+            os.close(format_fd)
+        assert _recv(result_recv)[0] == "opened"
+        _join(contender)
+        assert contender.exitcode == 0
 
-    try:
-        asyncio.run(fail_before_session_open())
+        socket_path = tmp_path / "serve.sock"
+        socket_lock_fd = os.open(
+            f"{socket_path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
+        )
+        fcntl.flock(socket_lock_fd, fcntl.LOCK_EX)
+        blocked_server = ZetaServer(
+            home=advanced_home, socket_path=socket_path, provider="codex"
+        )
+
+        async def fail_before_session_open() -> None:
+            try:
+                with pytest.raises(RuntimeError, match="already listening"):
+                    await asyncio.wait_for(
+                        blocked_server.start(), _WAIT_TIMEOUT_SECONDS
+                    )
+            finally:
+                await asyncio.wait_for(blocked_server.close(), _WAIT_TIMEOUT_SECONDS)
+
+        try:
+            asyncio.run(fail_before_session_open())
+        finally:
+            fcntl.flock(socket_lock_fd, fcntl.LOCK_UN)
+            os.close(socket_lock_fd)
+
+        socket_result_recv, socket_result_send = multiprocessing.Pipe(duplex=False)
+        connections.extend((socket_result_recv, socket_result_send))
+        after_socket_failure = _spawn(
+            _try_open,
+            str(advanced_home),
+            advanced_session_id,
+            socket_result_send,
+        )
+        processes.append(after_socket_failure)
+        assert _recv(socket_result_recv)[0] == "opened"
+        _join(after_socket_failure)
+        assert after_socket_failure.exitcode == 0
+        assert verify(advanced_home).writer_epoch == 3
     finally:
-        fcntl.flock(socket_lock_fd, fcntl.LOCK_UN)
-        os.close(socket_lock_fd)
-
-    socket_result_recv, socket_result_send = multiprocessing.Pipe(duplex=False)
-    after_socket_failure = _spawn(
-        _try_open,
-        str(advanced_home),
-        advanced_session_id,
-        socket_result_send,
-    )
-    assert socket_result_recv.recv()[0] == "opened"
-    after_socket_failure.join()
-    assert after_socket_failure.exitcode == 0
-    assert verify(advanced_home).writer_epoch == 3
-    for connection in (
-        owner_ready,
-        owner_send,
-        owner_release_recv,
-        owner_release_send,
-        session_recv,
-        session_send,
-        result_recv,
-        result_send,
-        socket_result_recv,
-        socket_result_send,
-    ):
-        connection.close()
-    owner.close()
-    creator.close()
-    contender.close()
-    after_socket_failure.close()
+        for process in reversed(processes):
+            _cleanup_process(process)
+        for connection in connections:
+            connection.close()

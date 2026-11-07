@@ -13319,7 +13319,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
 async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
-    store = ConversationStore(tmp_path / "sessions")
+    store = await open_test_store(tmp_path / "sessions")
     store.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("do the thing")]),
