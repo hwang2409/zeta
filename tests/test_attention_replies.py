@@ -113,6 +113,30 @@ def _fail_once(kind: str) -> BaseException:
     return RuntimeError("injected crash")
 
 
+def test_popup_stage_syncs_contents_before_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = _fixture(tmp_path, count=1)
+    events: list[tuple[str, str]] = []
+    real_sync = AttentionReplies._sync_file
+    real_replace = os.replace
+
+    def sync(path: Path) -> None:
+        events.append(("sync", path.name))
+        real_sync(path)
+
+    def replace(source: object, destination: object, *args: object, **kwargs: object) -> None:
+        if Path(destination).parent.name == "staged":
+            events.append(("rename", Path(destination).name))
+        real_replace(source, destination, *args, **kwargs)
+
+    # test-contract: seam record the file barrier order around atomic staging
+    monkeypatch.setattr(AttentionReplies, "_sync_file", staticmethod(sync))
+    monkeypatch.setattr(os, "replace", replace)
+    fixture.replies.stage(fixture.records[0].id, "durable answer")
+    rename_index = next(index for index, event in enumerate(events) if event[0] == "rename")
+    # test-contract: durability verify the private file barrier precedes atomic staging rename
+    assert any(kind == "sync" for kind, _name in events[:rename_index])
+
+
 @pytest.mark.parametrize("case", ["batch", "same-id-conflict"])
 def test_attention_reply_behavior_on_pre_batch_surface(
     case: str, tmp_path: Path

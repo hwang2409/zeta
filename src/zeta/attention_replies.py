@@ -120,6 +120,7 @@ class AttentionReplies:
             tmp = self.staged_dir / f".{attention_id}.{secrets.token_hex(8)}"
             tmp.write_text(reply, encoding="utf-8")
             os.chmod(tmp, 0o600)
+            self._sync_file(tmp)
             os.replace(tmp, path)
             self._sync_directory(self.staged_dir)
 

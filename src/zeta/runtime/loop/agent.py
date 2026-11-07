@@ -588,7 +588,7 @@ class AgentLoop(
         # blocking filesystem and inbox work, so keep it off the event loop.
         from ...attention_replies import AttentionReplies
 
-        await asyncio.to_thread(
+        recovered = await asyncio.to_thread(
             AttentionReplies(
                 self.store.session_dir.parent.parent,
                 self.store.session_id,
@@ -596,6 +596,8 @@ class AgentLoop(
             ).recover
         )
         await self._ensure_step_delivery()
+        if recovered.published:
+            await self._check_project_inbox()
         for item in self._pending_task_recovery:
             await self.tool_registry.background_tasks._notify_exit(
                 item.task_id,

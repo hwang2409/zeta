@@ -122,9 +122,11 @@ class ServerSlashSession:
         if separator:
             parts.extend([remainder] if command == "batch" else remainder.split(maxsplit=1))
         registry_state = self._runtime.manager.project_registry_state
-        await asyncio.to_thread(
+        recovered = await asyncio.to_thread(
             AttentionReplies(self._runtime.home, opened.metadata.session_id, registry_state=registry_state).recover
         )
+        if recovered.published:
+            await loop._check_project_inbox()
         items = await asyncio.to_thread(
             open_decisions,
             self._runtime.home,

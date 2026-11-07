@@ -511,7 +511,7 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
             recommendation="Use the first option because it is safest.",
         )
         app._decisions_panel.set_items([item])
-        app.open_decisions_panel()
+        await app._open_decisions_panel()
 
         async def render() -> tuple[Screen, MouseHandlers]:
             session.app.output = _FixedSizeOutput(width, height)
