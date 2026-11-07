@@ -573,10 +573,20 @@ class MCPManagementService:
 
         self._closed.set()
         task = self._transaction_task
-        if task is None:
+        if task is None or task.get_loop().is_closed():
+            return
+        if task.done():
+            try:
+                task.result()
+            except BaseException:  # noqa: BLE001,S110 - consume the owned outcome
+                pass
             return
         try:
             await asyncio.shield(task)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if not task.cancelled() or (current is not None and current.cancelling()):
+                raise
         except MCPManagementClosedError:
             pass
 

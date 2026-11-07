@@ -95,6 +95,49 @@ async def test_management_service_close_owns_transaction_lifetime(
 
 
 @pytest.mark.asyncio
+async def test_management_close_ignores_cancelled_transaction_from_closed_loop(
+    tmp_path: Path,
+) -> None:
+    manager = service(tmp_path)
+    def make_cancelled_task_from_closed_loop() -> asyncio.Task[object]:
+        old_loop = asyncio.new_event_loop()
+        try:
+            transaction = old_loop.create_task(asyncio.sleep(0))
+            transaction.cancel()
+            old_loop.run_until_complete(
+                asyncio.gather(transaction, return_exceptions=True)
+            )
+            return transaction
+        finally:
+            old_loop.close()
+
+    manager._transaction_task = await asyncio.to_thread(
+        make_cancelled_task_from_closed_loop
+    )
+
+    await manager.aclose()
+    assert manager._closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_management_close_propagates_outer_cancellation(
+    tmp_path: Path,
+) -> None:
+    manager = service(tmp_path)
+    transaction = asyncio.create_task(asyncio.Event().wait())
+    manager._transaction_task = transaction
+    closing = asyncio.create_task(manager.aclose())
+    try:
+        assert await asyncio.to_thread(manager._closed.wait, 10)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(closing, 10)
+    finally:
+        transaction.cancel()
+        await asyncio.wait_for(asyncio.gather(transaction, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
 async def test_management_close_interrupts_lock_held_by_another_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
