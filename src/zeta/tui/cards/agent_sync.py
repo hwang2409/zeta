@@ -741,6 +741,6 @@ async def refresh_agent_cards(cards: Iterable[Any]) -> list[bool]:
         except Exception as error:  # noqa: BLE001 - keep later cards refreshing
             source = card.transcript_source
             if source is not None:
-                source._failed_snapshot(error)
+                await asyncio.to_thread(source._failed_snapshot, error)
             changes[id(card)] = False
     return [changes.get(id(card), False) for card in card_list]

@@ -147,6 +147,7 @@ class _FullLoadValidator:
         self.state._task_notification_ids = set()
         self.state._sent_message_receipts = []
         self.by_id: dict[str, ConversationEntry] = {}
+        self.rows_by_id: dict[str, _PhysicalRow] = {}
         self.header_seen = False
 
     def _error(
@@ -246,6 +247,7 @@ class _FullLoadValidator:
 
         self.state._entries.append(entry)
         self.by_id[entry.id] = entry
+        self.rows_by_id[entry.id] = row
         self.state._entry_ids.add(entry.id)
         self.state._record_entry_prefix(entry)
         self.state._sent_message_receipts.extend(sent_message_receipts(entry))
@@ -256,20 +258,6 @@ class _FullLoadValidator:
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self.state._task_notification_ids.add(task_id)
-        try:
-            if (
-                len(self.state._entries) == 1
-                or entry.parent_id == self.state._entries[-2].id
-            ):
-                self.state._record_active_entry(entry)
-            else:
-                self._select_branch(entry)
-        except ConversationIntegrityError as exc:
-            raise self._error(
-                row,
-                kind="broken_links",
-                reason_code=self._semantic_reason(exc),
-            ) from exc
         return entry
 
     def _select_branch(self, head: ConversationEntry) -> None:
@@ -282,7 +270,14 @@ class _FullLoadValidator:
             branch.append(current)
             current = self.by_id.get(current.parent_id) if current.parent_id else None
         for entry in reversed(branch):
-            self.state._record_active_entry(entry)
+            try:
+                self.state._record_active_entry(entry)
+            except ConversationIntegrityError as exc:
+                raise self._error(
+                    self.rows_by_id[entry.id],
+                    kind="broken_links",
+                    reason_code=self._semantic_reason(exc),
+                ) from exc
 
     @staticmethod
     def _semantic_reason(error: ConversationIntegrityError) -> str:
@@ -328,6 +323,8 @@ class _FullLoadValidator:
                 raw=self.raw,
                 stat=self.stat,
             )
+        if self.state._entries:
+            self._select_branch(self.state._entries[-1])
         self.state._rebuild_client_deliveries(self.state._entries)
         for attribute in self._STATE_ATTRIBUTES:
             setattr(self.store, attribute, getattr(self.state, attribute))

@@ -1683,6 +1683,61 @@ def test_agent_refresh_surfaces_symlinked_file_after_snapshot(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_apply_failure_diagnosis_stays_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sources = []
+    for index in range(3):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"child-{index}")])
+        )
+        child.close()
+        sources.append(agent_sync_module.AgentTranscriptSource(child.session_dir))
+
+    apply_failed = threading.Event()
+    diagnosis_threads: list[int] = []
+    real_store = agent_sync_module.ConversationStore
+
+    class ObservedStore(real_store):
+        def __init__(self, *args, **kwargs) -> None:
+            if apply_failed.is_set():
+                diagnosis_threads.append(threading.get_ident())
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(agent_sync_module, "ConversationStore", ObservedStore)
+
+    class Card:
+        refresh_eligible = True
+
+        def __init__(self, source, *, fail: bool = False) -> None:
+            self.transcript_source = source
+            self.fail = fail
+            self.applied = False
+
+        def apply_transcript_snapshot(self, snapshot) -> bool:
+            self.applied = True
+            if self.fail:
+                apply_failed.set()
+                raise RuntimeError("apply failed")
+            return True
+
+    cards = [Card(sources[0]), Card(sources[1], fail=True), Card(sources[2])]
+    event_loop_thread = threading.get_ident()
+    try:
+        changes = await agent_sync_module.refresh_agent_cards(cards)
+    finally:
+        for source in sources:
+            source.close()
+
+    assert apply_failed.is_set()
+    assert [card.applied for card in cards] == [True, True, True]
+    assert changes == [True, False, True]
+    assert diagnosis_threads
+    assert event_loop_thread not in diagnosis_threads
+
+
+@pytest.mark.asyncio
 async def test_failing_agent_source_does_not_stop_batch_or_spinner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

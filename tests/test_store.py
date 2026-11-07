@@ -2084,6 +2084,57 @@ def test_corrupt_transcript_diagnosis_localizes_first_bad_row(
     assert path.read_bytes() == damaged
 
 
+def test_abandoned_branch_semantic_failure_is_ignored(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="abandoned-semantic-failure")
+    root = store.append_message(message(MessageRole.USER, "root"))
+    store.append_message(message(MessageRole.ASSISTANT, "abandoned"))
+    active = store.append_message(
+        message(MessageRole.ASSISTANT, "active"), parent_id=root.id
+    )
+    rows = store.path.read_bytes().splitlines(keepends=True)
+    abandoned = json.loads(rows[2])
+    abandoned["type"] = "approval_resolution"
+    abandoned["data"] = {"request_id": "abandoned", "decision": "deny"}
+    rows[2] = json.dumps(abandoned).encode() + b"\n"
+    store.path.write_bytes(b"".join(rows))
+    store.close()
+
+    reopened = ConversationStore(
+        tmp_path, session_id="abandoned-semantic-failure", _read_only=True
+    )
+
+    assert [entry.id for entry in reopened.replay()] == [root.id, active.id]
+    reopened.close()
+
+
+def test_full_load_validates_the_final_branch_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="branch-rich")
+    root = store.append_message(message(MessageRole.USER, "root"))
+    for index in range(118):
+        store.append_message(
+            message(MessageRole.ASSISTANT, f"branch-{index}"), parent_id=root.id
+        )
+    store.close()
+    validations = 0
+    original = ConversationStore._record_active_entry
+
+    def count_validation(self: ConversationStore, entry: ConversationEntry) -> None:
+        nonlocal validations
+        validations += 1
+        original(self, entry)
+
+    monkeypatch.setattr(ConversationStore, "_record_active_entry", count_validation)
+
+    reopened = ConversationStore(tmp_path, session_id="branch-rich", _read_only=True)
+
+    assert len(reopened.entries) == 119
+    assert len(reopened.replay()) == 2
+    assert validations == 2
+    reopened.close()
+
+
 @pytest.mark.parametrize("damage", ["future_schema", "future_entry"])
 def test_transcript_compatibility_classification_precedes_corruption(
     tmp_path: Path, damage: str
