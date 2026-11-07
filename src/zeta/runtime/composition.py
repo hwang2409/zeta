@@ -30,7 +30,7 @@ from ..skills.agent_catalog import AgentCatalog
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
-from .loop.skill_refresh import RuntimePrompt
+from .prompt import RuntimePrompt
 
 BackendBuilder = Callable[..., tuple[CompletionBackend, str]]
 BackgroundEventSink = Callable[[StreamEvent], None]
@@ -290,6 +290,7 @@ def compose_runtime(
             root_project_id=metadata.project_id,
             parent_session_id=metadata.parent_session_id,
             project_registry=project_registry,
+            max_agent_depth=config.agents_max_depth,
             **loop_kwargs,
         )
         loop.explicit_finish = config.agents_explicit_finish

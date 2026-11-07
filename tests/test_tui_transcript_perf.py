@@ -138,15 +138,29 @@ def test_stream_invalidation_does_not_add_an_idle_trailing_paint(
         callbacks.append(callback) or Mock()
     )
     monkeypatch.setattr(composer_module.asyncio, "get_running_loop", lambda: loop)
-    app = TUIApp.__new__(TUIApp)
-    app._stream_invalidation_handle = None
-    app._stream_invalidation_pending = False
-    app._invalidate_prompt = Mock()
+    app, transcript = _streaming_app()
+    frames: list[str] = []
+    app._invalidate_prompt = lambda: frames.append(
+        _content_text(transcript, 80, 20).strip()
+    )
 
-    app._invalidate_stream_prompt()
+    def publish(chunk: str) -> None:
+        app._consume_text(StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=chunk))
+        app._invalidate_stream_prompt()
+
+    publish("first")
     callbacks.pop(0)()
+    assert frames == ["first"]
 
-    assert app._invalidate_prompt.call_count == 1
+    publish(" second")
+    publish(" third")
+    assert frames == ["first", "first second"]
+    callbacks.pop(0)()
+    assert frames == ["first", "first second", "first second third"]
+
+    publish(" final")
+    app._finish_stream_invalidation()
+    assert frames[-1] == "first second third final"
 
 
 def test_repaints_do_not_rescan_terminal_agent_sessions(
@@ -320,7 +334,7 @@ def _open_fds_under(path: Path) -> list[int]:
                 target = Path(os.path.realpath(f"/proc/self/fd/{fd}"))
         except (OSError, ValueError):
             continue
-        if target == root or root in target.parents:
+        if (target == root or root in target.parents) and target.name != ".storage-format.lock":
             open_fds.append(fd)
     return open_fds
 
@@ -1372,20 +1386,6 @@ def test_streaming_thinking_uses_the_incremental_unit() -> None:
     assert "reasoning delta" in _content_text(transcript, 80, 24)
 
 
-@pytest.mark.asyncio
-async def test_streaming_repaints_are_coalesced_and_final_paint_is_immediate() -> None:
-    consumer = TurnConsumerMixin()
-    paints = Mock()
-    consumer._invalidate_prompt = paints
-
-    for _ in range(1_000):
-        consumer._invalidate_stream_prompt()
-
-    assert paints.call_count == 1
-    consumer._finish_stream_invalidation()
-    assert paints.call_count == 2
-
-
 def test_lazy_tail_disabled_when_max_lines_set() -> None:
     marker = "[custom older output]"
 
@@ -1509,6 +1509,66 @@ async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_corrupt_child_transcript_renders_diagnosis_without_breaking_parent(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    root.append_message(Message(MessageRole.ASSISTANT, [TextContent("parent healthy")]))
+    corrupt = ConversationStore(root.session_dir / "agents", session_id="1")
+    corrupt.append_message(Message(MessageRole.ASSISTANT, [TextContent("corrupt child")]))
+    sibling = ConversationStore(root.session_dir / "agents", session_id="2")
+    sibling.append_message(Message(MessageRole.ASSISTANT, [TextContent("sibling healthy")]))
+    for call, child in (
+        (ToolCall("nested-corrupt", "agent", {"prompt": "corrupt"}), corrupt),
+        (ToolCall("nested-sibling", "agent", {"prompt": "sibling"}), sibling),
+    ):
+        root.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        root.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [],
+                tool_result=ToolResult(
+                    call.id,
+                    "running",
+                    structured_content={"child_session_path": str(child.session_dir)},
+                ),
+            )
+        )
+    corrupt.close()
+    sibling.close()
+    root.close()
+    child_path = root.session_dir / "agents" / "1" / "conversation.jsonl"
+    with child_path.open("ab") as stream:
+        stream.write(b'{"private":"must-not-leak"\n')
+    damaged = child_path.read_bytes()
+
+    transcript = TranscriptWidget()
+    transcript.append(Text("top-level parent usable"))
+    call = ToolCall("agent-parent", "agent", {"prompt": "inspect parent"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    transcript.start_tool(call.id, call, render_module.render_event(start), start)
+    transcript.update_tool(
+        call.id,
+        Text("turn 1"),
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(root.session_dir)},
+        ),
+    )
+
+    await transcript.refresh_agent_transcripts()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+
+    assert "top-level parent usable" in rendered
+    assert "parent healthy" in rendered
+    assert "sibling healthy" in rendered
+    assert "transcript terminated invalid conversation row at row 3 (session 1)" in rendered
+    assert "must-not-leak" not in rendered
+    assert child_path.read_bytes() == damaged
+
+
+@pytest.mark.asyncio
 async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -> None:
     from zeta.tui.cards.agent import AgentCard
 
@@ -1620,6 +1680,61 @@ def test_agent_refresh_surfaces_symlinked_file_after_snapshot(tmp_path: Path) ->
             source.refresh(recursive=True)
     finally:
         source.close()
+
+
+@pytest.mark.asyncio
+async def test_apply_failure_diagnosis_stays_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sources = []
+    for index in range(3):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"child-{index}")])
+        )
+        child.close()
+        sources.append(agent_sync_module.AgentTranscriptSource(child.session_dir))
+
+    apply_failed = threading.Event()
+    diagnosis_threads: list[int] = []
+    real_store = agent_sync_module.ConversationStore
+
+    class ObservedStore(real_store):
+        def __init__(self, *args, **kwargs) -> None:
+            if apply_failed.is_set():
+                diagnosis_threads.append(threading.get_ident())
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(agent_sync_module, "ConversationStore", ObservedStore)
+
+    class Card:
+        refresh_eligible = True
+
+        def __init__(self, source, *, fail: bool = False) -> None:
+            self.transcript_source = source
+            self.fail = fail
+            self.applied = False
+
+        def apply_transcript_snapshot(self, snapshot) -> bool:
+            self.applied = True
+            if self.fail:
+                apply_failed.set()
+                raise RuntimeError("apply failed")
+            return True
+
+    cards = [Card(sources[0]), Card(sources[1], fail=True), Card(sources[2])]
+    event_loop_thread = threading.get_ident()
+    try:
+        changes = await agent_sync_module.refresh_agent_cards(cards)
+    finally:
+        for source in sources:
+            source.close()
+
+    assert apply_failed.is_set()
+    assert [card.applied for card in cards] == [True, True, True]
+    assert changes == [True, False, True]
+    assert diagnosis_threads
+    assert event_loop_thread not in diagnosis_threads
 
 
 @pytest.mark.asyncio

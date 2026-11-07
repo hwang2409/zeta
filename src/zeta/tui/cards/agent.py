@@ -8,22 +8,16 @@ import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Self
 
 from rich import box
-from rich.console import Group, RenderableType
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.panel import Panel
 from rich.text import Text
 
 from ...agent.conversation_channel import has_follow_up_loop
 from ...agent.explicit_finish import format_idle_resource_usage, idle_resource_usage
-from ...agent.presets import GENERAL_PRESET, get_agent_preset
-from ...agent.receipt import (
-    agent_stats,
-    ensure_agent_receipt_text,
-    has_agent_receipt_suffix,
-    terminal_state,
-)
+from ...agent.receipt import has_agent_receipt_suffix, terminal_state
 from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import ConversationIntegrityError
 from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType, ToolCall
@@ -34,11 +28,66 @@ from .agent_sync import (
     AgentTranscriptTreeSnapshot,
 )
 from .base import compact_tool_card
+from .shared import wrap_by_cells
+
+if TYPE_CHECKING:
+    from .agent_message import AgentIdentityIndex
 
 AGENT_TOOL_NAME = "agent"
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
 MAX_TAIL_LINES = 20
+
+
+class _TailLine(str):
+    wrap: bool
+
+    def __new__(cls, text: str, wrap: bool = False) -> Self:
+        line = super().__new__(cls, text)
+        line.wrap = wrap
+        return line
+
+
+class _BoundedTail:
+    def __init__(self, lines: Sequence[_TailLine]) -> None:
+        self._lines = lines
+
+    @property
+    def plain(self) -> str:
+        return "\n".join(self._lines)
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        del console
+        projected: list[str] = []
+        for line in self._lines:
+            projected.extend(
+                wrap_by_cells(str(line), options.max_width) if line.wrap else (str(line),)
+            )
+        omitted = (
+            len(projected) - MAX_TAIL_LINES + 1
+            if len(projected) > MAX_TAIL_LINES
+            else 0
+        )
+        if omitted:
+            projected = [
+                f"… +{omitted} lines",
+                *projected[-(MAX_TAIL_LINES - 1) :],
+            ]
+        for line in projected:
+            yield Text(line, style=theme.BODY, overflow="ellipsis", no_wrap=True)
+
+
+def _trim_tail(lines: list[_TailLine], limit: int) -> list[_TailLine]:
+    if len(lines) <= limit:
+        return lines
+    previous = re.fullmatch(r"… \+(\d+) lines", lines[0])
+    omitted = len(lines) - limit + (0 if previous else 1)
+    if previous is not None:
+        omitted += int(previous.group(1))
+    retained = lines[-(limit - 1) :] if limit > 1 else []
+    return [_TailLine(f"… +{omitted} lines"), *retained]
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -74,6 +123,45 @@ def _read_lifecycle(path: str) -> dict[str, Any]:
     return resident if resident is not None else {}
 
 
+def _project_tool_result(
+    name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+    identities: AgentIdentityIndex,
+) -> tuple[tuple[_TailLine, ...], Path | None]:
+    """Project one paired tool result and return its recursive child path."""
+
+    from .agent_message import agent_send_tail_lines
+
+    result_data = result.get("structured_content")
+    if name.casefold() == AGENT_TOOL_NAME and isinstance(result_data, dict):
+        identity = dict(result_data)
+        identity.setdefault("description", arguments.get("description"))
+        identity.setdefault("agent_type", arguments.get("agent_type"))
+        identity.setdefault("model", arguments.get("model"))
+        identities.observe_item(identity)
+    if name.casefold() == "agent_send":
+        send_lines = agent_send_tail_lines(arguments, result, identities)
+        lines = tuple(_TailLine(line, wrap=True) for line in send_lines or ())
+    else:
+        exit_code = (
+            result_data.get("exit_code") if isinstance(result_data, dict) else None
+        )
+        if type(exit_code) is int:
+            status = f"exit {exit_code}"
+        elif result.get("is_error") is True:
+            status = "failed"
+        else:
+            status = "done"
+        lines = (_TailLine(f"{name}: {status}"),)
+    child_path = (
+        result_data.get("child_session_path")
+        if isinstance(result_data, dict)
+        else None
+    )
+    return lines, Path(child_path) if isinstance(child_path, str) and child_path else None
+
+
 class AgentCard:
     """Own one agent card's rendering state, including its bounded tail."""
 
@@ -90,7 +178,7 @@ class AgentCard:
         self._expanded = True
         self._receipt: RenderableType | None = None
         self._depth = 1
-        self._tail: tuple[str, ...] = ()
+        self._tail: tuple[_TailLine, ...] = ()
         self._tail_loaded = False
         self._transcript_source: AgentTranscriptSource | None = None
         self._final_tail_pending = False
@@ -111,10 +199,20 @@ class AgentCard:
 
     @classmethod
     def _agent_type(cls, call: ToolCall) -> str:
-        preset = get_agent_preset(call.arguments.get("agent_type"))
-        if preset is None or preset.name == GENERAL_PRESET.name:
+        value = call.arguments.get("agent_type")
+        return value if isinstance(value, str) and value else ""
+
+    @classmethod
+    def _model(cls, call: ToolCall) -> str:
+        value = call.arguments.get("model")
+        return value if isinstance(value, str) and value else ""
+
+    @staticmethod
+    def _short_handle(handle: object) -> str:
+        if not isinstance(handle, str):
             return ""
-        return preset.name
+        separator = handle.find(":")
+        return handle[separator:] if separator >= 0 else handle
 
     @classmethod
     def _turns_from_content(cls, content: str) -> int:
@@ -145,10 +243,18 @@ class AgentCard:
         depth: int = 1,
     ) -> Text:
         agent_type = cls._agent_type(call)
-        prefix = f"{agent_type} · " if agent_type else ""
+        fields = [cls._description(call)]
+        if agent_type:
+            fields.insert(0, agent_type)
+        fields.extend(
+            (f"{elapsed_seconds:.1f}s", f"{turns_used} turns", f"depth {depth}")
+        )
+        model = cls._model(call)
+        if model:
+            fields.append(model)
+        fields.append("running")
         return Text(
-            f"{prefix}{cls._description(call)} · {elapsed_seconds:.1f}s · "
-            f"{turns_used} turns · depth {depth}",
+            " · ".join(fields),
             style=theme.COMMAND,
             no_wrap=True,
             overflow="ellipsis",
@@ -192,10 +298,14 @@ class AgentCard:
         path: Path,
         limit: int,
         seen: set[Path] | None = None,
-    ) -> list[str]:
+        identities: AgentIdentityIndex | None = None,
+    ) -> list[_TailLine]:
         """Project a bounded recursive card tail from immutable snapshots."""
 
+        from .agent_message import AgentIdentityIndex, agent_send_tail_lines
+
         seen = set() if seen is None else seen
+        identities = identities or AgentIdentityIndex()
         if path in seen or limit < 1:
             return []
         seen.add(path)
@@ -203,13 +313,12 @@ class AgentCard:
         if snapshot is None:
             return []
         if snapshot.unavailable_reason is not None:
-            return [snapshot.unavailable_reason]
-        lines: list[str] = []
-        tool_names: dict[str, str] = {}
+            return [_TailLine(snapshot.unavailable_reason)]
+
+        lines: list[_TailLine] = []
+        tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
         for _entry_id, message in snapshot.messages:
             role = message.get("role", "message")
-            if role == "assistant":
-                tool_names.clear()
             content = message.get("content")
             if not isinstance(content, list):
                 continue
@@ -222,8 +331,10 @@ class AgentCard:
                     and role != "tool_result"
                     and isinstance(block.get("text"), str)
                 ):
-                    for text_line in block["text"].splitlines() or [""]:
-                        lines.append(f"{role}: {text_line}")
+                    lines.extend(
+                        _TailLine(f"{role}: {text_line}")
+                        for text_line in block["text"].splitlines() or [""]
+                    )
                 elif block_type == "tool_use" and isinstance(
                     block.get("tool_call"), dict
                 ):
@@ -233,48 +344,47 @@ class AgentCard:
                     if isinstance(name, str) and isinstance(arguments, dict):
                         call_id = tool_call.get("id")
                         if isinstance(call_id, str):
-                            tool_names[call_id] = name
-                        lines.append(f"tool: {name} {_arguments(arguments)}")
+                            tool_calls[call_id] = (name, arguments)
+                        if name.casefold() != "agent_send":
+                            lines.append(
+                                _TailLine(f"tool: {name} {_arguments(arguments)}")
+                            )
             tool_result = message.get("tool_result")
             if isinstance(tool_result, dict):
                 call_id = tool_result.get("tool_call_id")
-                name = (
-                    tool_names.get(call_id, "tool")
-                    if isinstance(call_id, str)
-                    else "tool"
+                call_details = (
+                    tool_calls.pop(call_id, None) if isinstance(call_id, str) else None
                 )
-                result_data = tool_result.get("structured_content")
-                exit_code = (
-                    result_data.get("exit_code")
-                    if isinstance(result_data, dict)
-                    else None
+                name, arguments = call_details or ("tool", {})
+                projected, nested_path = _project_tool_result(
+                    name, arguments, tool_result, identities
                 )
-                if type(exit_code) is int:
-                    status = f"exit {exit_code}"
-                elif tool_result.get("is_error") is True:
-                    status = "failed"
-                else:
-                    status = "done"
-                lines.append(f"{name}: {status}")
-                nested_path = (
-                    result_data.get("child_session_path")
-                    if isinstance(result_data, dict)
-                    else None
-                )
-                if isinstance(nested_path, str) and nested_path:
+                lines.extend(projected)
+                if nested_path is not None:
                     nested_tail = cls._tail_lines(
-                        tree, Path(nested_path), max(1, limit - len(lines)), seen
+                        tree,
+                        nested_path,
+                        max(1, limit - len(lines)),
+                        seen,
+                        identities,
                     )
-                    lines.extend(f"  {line}" for line in nested_tail)
-            if len(lines) > limit:
-                lines = lines[-limit:]
-        return lines[-limit:]
+                    lines.extend(
+                        _TailLine(f"  {line}", line.wrap) for line in nested_tail
+                    )
+            lines = _trim_tail(lines, limit)
+        for name, arguments in tool_calls.values():
+            if name.casefold() != "agent_send":
+                continue
+            send_lines = agent_send_tail_lines(arguments, None, identities)
+            if send_lines is not None:
+                lines.extend(_TailLine(line, wrap=True) for line in send_lines)
+        return _trim_tail(lines, limit)
 
     @classmethod
     def _expanded_panel(
         cls,
         call: ToolCall,
-        tail: Sequence[str],
+        tail: Sequence[_TailLine],
         *,
         elapsed_seconds: float,
         turns_used: int,
@@ -282,11 +392,10 @@ class AgentCard:
     ) -> Panel | None:
         if call.name.casefold() != "agent":
             return None
-        body = Text(
-            "\n".join(tail) if tail else "child transcript unavailable",
-            style=theme.BODY if tail else theme.DIM,
-            overflow="ellipsis",
-            no_wrap=True,
+        body: RenderableType = (
+            _BoundedTail(tail)
+            if tail
+            else Text("child transcript unavailable", style=theme.DIM)
         )
         return Panel(
             Group(
@@ -395,38 +504,42 @@ class AgentCard:
                 else None
             ),
         )
-        status = (
-            structured_status
-            if structured_status in {"completed", "error", "canceled"}
-            else "canceled"
-            if receipt_status == "canceled"
-            else "fail"
-            if receipt_status == "failed"
-            else "ok"
-        )
-        stats = agent_stats(
-            lifecycle,
-            status=receipt_status,
-            turns_used=turns,
-        )
-        receipt_text = ensure_agent_receipt_text(
-            result.content,
-            receipt_status,
-            stats,
-        )
-        if has_agent_receipt_suffix(result.content):
-            return Text(
-                receipt_text,
-                style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
-                no_wrap=True,
-                overflow="ellipsis",
+        canonical_receipt = has_agent_receipt_suffix(result.content)
+        receipt_parts = result.content.rsplit(" · ", 5) if canonical_receipt else []
+        receipt_answer = receipt_parts[0] if canonical_receipt else result.content
+        tool_calls = lifecycle.get("tool_calls") if lifecycle else None
+        if type(tool_calls) is not int or tool_calls < 0:
+            tool_calls_text = receipt_parts[3] if canonical_receipt else ""
+            tool_calls = (
+                int(tool_calls_text.removesuffix(" tool calls"))
+                if tool_calls_text.removesuffix(" tool calls").isdigit()
+                else None
             )
         agent_type = cls._agent_type(call)
-        prefix = f"{agent_type} · " if agent_type else ""
+        description = structured.get("description", cls._description(call))
+        fields = [str(description)]
+        if agent_type:
+            fields.insert(0, agent_type)
+        handle = cls._short_handle(structured.get("child_instance_id"))
+        if handle:
+            fields[1 if agent_type else 0] += f" {handle}"
+        fields.extend(
+            (
+                f"{turns} turns",
+                f"{max(0.0, elapsed or 0.0):.1f}s",
+                receipt_status,
+                f"depth {display_depth}",
+            )
+        )
+        if tool_calls is not None:
+            fields.append(f"{tool_calls} tool calls")
+        model = structured.get("model", cls._model(call))
+        if isinstance(model, str) and model:
+            fields.append(model)
+        if receipt_answer:
+            fields.append(receipt_answer)
         return Text(
-            f"{prefix}{cls._description(call)} · {turns} turns · "
-            f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "
-            f"depth {display_depth} · {receipt_text}",
+            " · ".join(fields),
             style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
             no_wrap=True,
             overflow="ellipsis",
@@ -514,9 +627,15 @@ class AgentCard:
 
         if Path(self._child_session_path) != snapshot.root:
             return False
-        tail = tuple(type(self)._tail_lines(snapshot, snapshot.root, MAX_TAIL_LINES))
+        tail = tuple(
+            type(self)._tail_lines(
+                snapshot,
+                snapshot.root,
+                MAX_TAIL_LINES,
+            )
+        )
         usage = idle_resource_usage(snapshot.lifecycles)
-        status_lines: list[str] = []
+        status_lines: list[_TailLine] = []
         root_lifecycle = snapshot.lifecycles[0] if snapshot.lifecycles else {}
         if root_lifecycle.get("state") == "idle":
             idle_since = root_lifecycle.get("idle_since")
@@ -527,9 +646,11 @@ class AgentCard:
                 )
             except ValueError:
                 idle_seconds = 0.0
-            status_lines.append(f"idle · waiting for follow-up · {idle_seconds:.1f}s")
+            status_lines.append(
+                _TailLine(f"idle · waiting for follow-up · {idle_seconds:.1f}s")
+            )
         if usage["idle_child_count"]:
-            status_lines.append(format_idle_resource_usage(usage))
+            status_lines.append(_TailLine(format_idle_resource_usage(usage)))
         if status_lines:
             tail = (*status_lines, *tail)
         changed = not self._tail_loaded or tail != self._tail
