@@ -79,7 +79,7 @@ _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
 
-class StorageFormatError(Exception):
+class StorageFormatError(ValueError):
     """Raised when a home cannot be accessed by this stored-format version."""
 
 
@@ -244,24 +244,32 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
 
 
 def _home_has_gated_state(home: Path) -> bool:
-    for pattern, _owner in GATED_HOME_PATHS:
-        path = home / pattern.removesuffix("/*")
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            continue
-        if not pattern.endswith("/*"):
-            return True
-        if not stat.S_ISDIR(info.st_mode):
-            return True
-        try:
-            next(path.iterdir())
-        except StopIteration:
-            continue
-        except OSError:
-            return True
-        return True
-    return False
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for pattern, _owner in GATED_HOME_PATHS:
+            name = pattern.removesuffix("/*")
+            try:
+                info = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not pattern.endswith("/*") or not stat.S_ISDIR(info.st_mode):
+                return True
+            try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=home_fd,
+                )
+            except OSError:
+                return True
+            try:
+                if os.listdir(child_fd):
+                    return True
+            finally:
+                os.close(child_fd)
+        return False
+    finally:
+        os.close(home_fd)
 
 
 def _bootstrap_empty_home(fd: int, home: Path) -> None:

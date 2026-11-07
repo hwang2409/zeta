@@ -25,6 +25,7 @@ from typing import Protocol
 from ..core.session import SessionManager
 from ..core.session_files import SessionError, SessionInUseError, session_directory
 from ..core.store.runtime_lease import RUNTIME_LEASE_NAME
+from ..storage_format import open_writer
 from .errors import RemoteSyncError
 from .memory import (
     MemoryTransferResult,
@@ -91,6 +92,10 @@ class LocalTransport:
         return _machine_id(self.home)
 
     def publish_session(self, snapshot: Path, *, force: bool) -> Path:
+        with open_writer(self.home):
+            return self._publish_session(snapshot, force=force)
+
+    def _publish_session(self, snapshot: Path, *, force: bool) -> Path:
         manifest = _read_manifest(snapshot)
         session_id = manifest["session_id"]
         sessions = self.home / "sessions"
@@ -137,19 +142,21 @@ class LocalTransport:
         return destination
 
     def fetch_project(self, project_id: str, destination: Path) -> str:
-        return fetch_local_project(
-            self.home, project_id, destination, peer=self.name
-        )
+        with open_writer(self.home):
+            return fetch_local_project(
+                self.home, project_id, destination, peer=self.name
+            )
 
     def publish_project(
         self, project_id: str, snapshot: Path, *, expected_digest: str
     ) -> None:
-        publish_local_project(
-            self.home,
-            project_id,
-            snapshot,
-            expected_digest=expected_digest,
-        )
+        with open_writer(self.home):
+            publish_local_project(
+                self.home,
+                project_id,
+                snapshot,
+                expected_digest=expected_digest,
+            )
 
 
 def resolve_transport(
@@ -238,6 +245,18 @@ def pull_session(
     """Pull one session atomically and map its cwd to an existing local path."""
 
     local_home = Path(home).expanduser().resolve()
+    with open_writer(local_home):
+        return _pull_session(local_home, transport, session_id, cwd=cwd, force=force)
+
+
+def _pull_session(
+    local_home: Path,
+    transport: Transport,
+    session_id: str,
+    *,
+    cwd: str | Path | None,
+    force: bool,
+) -> SessionTransferResult:
     safe_id = _safe_component(session_id, "session id")
     sessions = local_home / "sessions"
     sessions.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -451,15 +470,15 @@ def _tree_state(root: Path) -> tuple[int, str]:
         if relative == "transfer.json":
             continue
         digest.update(relative.encode("utf-8") + b"\0")
-        lines = _stream_file(path, digest, count_lines=path.name == "conversation.jsonl")
+        lines = _stream_file(
+            path, digest, count_lines=path.name == "conversation.jsonl"
+        )
         if path.name == "conversation.jsonl":
             last_seq += max(0, lines - 1)
     return last_seq, digest.hexdigest()
 
 
-def _stream_file(
-    path: Path, digest: _Digest, *, count_lines: bool = False
-) -> int:
+def _stream_file(path: Path, digest: _Digest, *, count_lines: bool = False) -> int:
     lines = 0
     last = b""
     with path.open("rb") as stream:
@@ -486,7 +505,9 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
                 first = source.readline(_MAX_CONVERSATION_HEADER_BYTES + 1)
                 if not first:
                     raise RemoteSyncError(f"empty conversation log: {log}")
-                if len(first) > _MAX_CONVERSATION_HEADER_BYTES or not first.endswith(b"\n"):
+                if len(first) > _MAX_CONVERSATION_HEADER_BYTES or not first.endswith(
+                    b"\n"
+                ):
                     raise RemoteSyncError(f"conversation header is too large: {log}")
                 header = json.loads(first)
                 header["data"]["cwd"] = cwd_text
@@ -539,7 +560,9 @@ def _map_missing_cwd(snapshot: Path, placeholder: Path) -> None:
 def _validate_snapshot(snapshot: Path, session_id: str) -> None:
     manifest = _read_manifest(snapshot)
     if manifest.get("session_id") != session_id:
-        raise RemoteSyncError("session manifest id does not match the requested session")
+        raise RemoteSyncError(
+            "session manifest id does not match the requested session"
+        )
     for path in snapshot.rglob("*"):
         if path.is_symlink():
             raise RemoteSyncError("remote session contains a symlink")

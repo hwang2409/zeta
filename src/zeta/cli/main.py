@@ -819,6 +819,8 @@ def _create_tui_app(
         return create_app(args)
     except SessionError as exc:
         parser.error(str(exc))
+    except StorageFormatError:
+        raise
     except ValueError as exc:
         print(f"zeta: {exc}", file=sys.stderr)
         return None
@@ -1089,6 +1091,8 @@ def _main(argv: list[str] | None = None) -> int:
                 approval_reconnect_grace=args.approval_reconnect_grace,
             )
             asyncio.run(run_server(server))
+        except StorageFormatError:
+            raise
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
             return 2

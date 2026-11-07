@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import os
 import shutil
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
-from zeta.storage_format import WRITER_EPOCH
+from zeta.storage_format import WRITER_EPOCH, StorageFormatError, open_writer
 
 StorageHomeShape = Literal[
     "empty",
@@ -28,6 +30,32 @@ STORAGE_HOME_SHAPES: tuple[StorageHomeShape, ...] = (
     "locked",
     "realistic-old",
 )
+
+
+def initialize_storage_home(home: Path) -> Path:
+    def initialize() -> None:
+        with open_writer(home):
+            pass
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        initialize()
+    else:
+        error: list[OSError | StorageFormatError] = []
+
+        def initialize_off_loop() -> None:
+            try:
+                initialize()
+            except (OSError, StorageFormatError) as exc:
+                error.append(exc)
+
+        thread = threading.Thread(target=initialize_off_loop)
+        thread.start()
+        thread.join()
+        if error:
+            raise error[0]
+    return home
 
 
 @contextmanager
