@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import _print_exit_hint, build_parser, main
 from zeta.core.session import (
     SESSION_NAME_MAX_LENGTH,
@@ -76,24 +77,24 @@ async def test_slash_name_persists_label_and_shows_current(
     app = await asyncio.to_thread(create_app, _args())
 
     assert (
-        await create_slash_registry(
-            skill_catalog=SkillCatalog.empty()
-        ).dispatch_async(app, "/name")
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/name"
+        )
         == "session name: (unnamed)"
     )
     assert (
-        await create_slash_registry(
-            skill_catalog=SkillCatalog.empty()
-        ).dispatch_async(app, "/name  planning  ")
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/name  planning  "
+        )
         == "session name: planning"
     )
     assert SessionManager(home).open(app.loop.store.session_id).metadata.name == (
         "planning"
     )
     assert (
-        await create_slash_registry(
-            skill_catalog=SkillCatalog.empty()
-        ).dispatch_async(app, "/name")
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/name"
+        )
         == "session name: planning"
     )
 
@@ -135,8 +136,8 @@ def test_slash_new_requests_restart_only_when_idle(
 def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
     async def rejected() -> None:
         from tests.support.fake_backend import FakeBackend
-        from zeta.core.loop import AgentLoop
         from zeta.core.store import ConversationStore
+        from zeta.runtime.loop import AgentLoop
         from zeta.tui.app import TUIApp
 
         app = TUIApp(
@@ -213,13 +214,11 @@ def test_session_list_shows_id_name_age_preview(
 
     first = create_app(_args())
     first.loop.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("first prompt")]), MessageOrigin.USER)
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("first prompt")]), MessageOrigin.USER
+        )
     )
-    manager = SessionManager(home)
-    manager.record_name(
-        SessionManager(home).open(first.loop.store.session_id).metadata,
-        name="planning",
-    )
+    SessionManager(home).rename(first.loop.store.session_id, "planning")
 
     exit_code = main(["session", "list"])
     output = capsys.readouterr().out
@@ -227,6 +226,7 @@ def test_session_list_shows_id_name_age_preview(
     assert "planning" in output
     assert first.loop.store.session_id[:8] in output
     assert "first prompt" in output
+    assert f"in use, pid {os.getpid()}" in output
 
 
 def test_session_list_shows_placeholder_for_empty_preview(
@@ -295,7 +295,11 @@ def test_session_export_writes_portable_jsonl(
 
     app = create_app(_args())
     session_id = app.loop.store.session_id
-    app.loop.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi world")]), MessageOrigin.USER))
+    app.loop.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("hi world")]), MessageOrigin.USER
+        )
+    )
 
     exit_code = main(["session", "export", session_id])
     output = capsys.readouterr().out
@@ -385,9 +389,7 @@ def test_resume_picker_shows_names(
     monkeypatch.chdir(tmp_path)
     first = create_app(_args())
     manager = SessionManager(home)
-    manager.record_name(
-        manager.open(first.loop.store.session_id).metadata, name="planning"
-    )
+    manager.rename(first.loop.store.session_id, "planning")
     monkeypatch.setattr(
         "zeta.tui.app.get_terminal_size",
         lambda fallback: SimpleNamespace(columns=200, lines=24),
@@ -398,6 +400,7 @@ def test_resume_picker_shows_names(
     output = capsys.readouterr().out
 
     assert "[planning]" in output
+    assert f"[in use, pid {os.getpid()}]" in output
 
 
 def test_session_metadata_rejects_bad_name_type(
@@ -542,7 +545,7 @@ def test_session_delete_rejects_ambiguous_prefix(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    home = tmp_path / "zeta-home"
+    home = initialize_storage_home(tmp_path / "zeta-home")
     sessions_dir = home / "sessions"
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "abc111").mkdir()

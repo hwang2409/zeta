@@ -91,6 +91,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "mcp_discover",
         _discover,
+        binding="shared",
         description=(
             "Search the mounted MCP catalog without exposing it, activate selected "
             "tools for the next turn, or list/read bounded MCP resources."

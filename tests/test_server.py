@@ -9,6 +9,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import re
 import shlex
 import signal
 import socket
@@ -16,7 +17,7 @@ import stat
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Collection
+from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
@@ -33,9 +34,15 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
 from tests.support.serve_contract import ServeClient
+from tests.support.server_client import (
+    assert_event_order,
+    event_owner,
+    frames_for_call,
+    read_until,
+)
 from tests.support.server_client import (
     event as _buffered_event,
 )
@@ -48,6 +55,7 @@ from tests.support.server_client import (
 from tests.support.server_client import (
     request as _buffered_request,
 )
+from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -73,7 +81,6 @@ from zeta.protocol.types import (
     ThinkingContent,
     ToolCall,
     ToolUseContent,
-    harness_notice,
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
@@ -95,9 +102,10 @@ from zeta.server.protocol import (
     MAX_REQUEST_ID_BYTES,
     EventDescriptor,
     FrameCodec,
+    SlashResultKindDescriptor,
 )
 from zeta.server.server import _Client
-from zeta.server.slash_commands import ServerSlashSession
+from zeta.server.slash_commands import _SERVE_MCP_VERBS, ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tui.render import render_event
@@ -842,86 +850,6 @@ class BlockingThenCaptureBackend:
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
         )
-
-
-def _public_input_prompt(messages, prompts: Collection[str]) -> str:
-    public_inputs = [
-        block.text
-        for message in messages
-        if message.role is MessageRole.USER
-        for block in message.content
-        if isinstance(block, TextContent)
-    ]
-    prompt = next((text for text in public_inputs if text in prompts), None)
-    if prompt is None:
-        raise AssertionError(f"no scripted backend for actor prompt {public_inputs!r}")
-    return prompt
-
-
-def test_public_input_prompt_rejects_unknown_actor() -> None:
-    messages = [Message(MessageRole.USER, [TextContent("unknown-child")])]
-
-    with pytest.raises(
-        AssertionError, match="no scripted backend for actor prompt.*unknown-child"
-    ):
-        _public_input_prompt(messages, {"parent", "known-child"})
-
-
-class PerActorFakeBackend:
-    def __init__(
-        self,
-        parent_turns: list[ScriptedTurn],
-        child_turns: dict[str, list[ScriptedTurn]],
-        *,
-        parent_prompt: str,
-        gated_child_call: int = 1,
-    ) -> None:
-        self.parent_prompt = parent_prompt
-        self.parent = FakeBackend(parent_turns)
-        self.children = {
-            prompt: FakeBackend(turns) for prompt, turns in child_turns.items()
-        }
-        self.child_started = {prompt: asyncio.Event() for prompt in self.children}
-        self.child_calls = dict.fromkeys(self.children, 0)
-        self.release_children = asyncio.Event()
-        self.gated_child_call = gated_child_call
-
-    async def complete(self, messages, tool_schemas):
-        actor_prompt = _public_input_prompt(
-            messages, {self.parent_prompt, *self.children}
-        )
-        child_prompt = actor_prompt if actor_prompt in self.children else None
-        backend = (
-            self.children[child_prompt] if child_prompt is not None else self.parent
-        )
-        if child_prompt is not None:
-            self.child_calls[child_prompt] += 1
-        if (
-            child_prompt is not None
-            and self.child_calls[child_prompt] == self.gated_child_call
-        ):
-            self.child_started[child_prompt].set()
-            try:
-                await asyncio.wait_for(self.release_children.wait(), TIMEOUT)
-            except TimeoutError as error:
-                raise AssertionError("children were not released") from error
-        stream = backend.complete(messages, tool_schemas)
-        if child_prompt is None and self.parent.calls:
-            try:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(
-                            *(started.wait() for started in self.child_started.values())
-                        ),
-                        TIMEOUT,
-                    )
-                except TimeoutError as error:
-                    raise AssertionError("child did not start") from error
-                yield await anext(stream)
-            finally:
-                self.release_children.set()
-        async for event in stream:
-            yield event
 
 
 class DelegatedApprovalBackend:
@@ -1851,7 +1779,10 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             agent_ended.set()
         return published
 
-    monkeypatch.setattr(server.control._approvals, "_publish", delay_delegated_approval_end)
+    # test-contract: seam forces approval-end publication ordering
+    monkeypatch.setattr(
+        server.control._approvals, "_publish", delay_delegated_approval_end
+    )
     monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
@@ -2165,9 +2096,7 @@ async def test_status_surfaces_transcript_index_failure(
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
         )
-        assert status["connection_setup_counts"] == list(
-            loop.connection_setup_counts()
-        )
+        assert status["connection_setup_counts"] == list(loop.connection_setup_counts())
         assert status["max_agent_depth"] == 3
     finally:
         await _close(server, writer)
@@ -3337,7 +3266,12 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
         retained_tail=8,
         compaction_budget=200_000,
     )
-    base_size = len(codec.response(0, {"sessions": [probe.to_dict()]}))
+    probe_wire = {
+        **probe.to_catalog_dict(),
+        "first_message_preview": "",
+        "in_use": False,
+    }
+    base_size = len(codec.response(0, {"sessions": [probe_wire]}))
     huge = SessionMetadata.new(
         session_id=probe.session_id,
         provider="codex",
@@ -3582,7 +3516,9 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
 
 
 @pytest.mark.asyncio
-async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) -> None:
+async def test_late_approval_after_disconnect_abort_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     server = ZetaServer(
@@ -3592,17 +3528,34 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
-    await _request(reader, writer, 3, "send", {"text": "read it"})
-    await _event(reader, "approval_request")
-    writer.close()
-    await writer.wait_closed()
-    await asyncio.sleep(0.05)
-    second_reader, second_writer = await asyncio.open_unix_connection(
-        str(server.socket_path)
-    )
+    assert server.connections is not None
+    controller = server.connections.controller_metadata()
+    assert controller is not None
+    first_client_released = asyncio.Event()
+    release = server.connections.release
+
+    def record_release(connection: object) -> None:
+        release(connection)
+        if connection is controller.connection:
+            first_client_released.set()
+
+    monkeypatch.setattr(server.connections, "release", record_release)
+    second_writer = None
     try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        await _event(reader, "approval_request")
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.wait_for(first_client_released.wait(), 10)
+        second_reader, second_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
         await _request(
-            second_reader, second_writer, 1, "hello", {"protocol_version": "1.0"}
+            second_reader,
+            second_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0"},
         )
         error = (
             await _request(
@@ -3615,7 +3568,12 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
         )[-1]
         assert error["error"]["code"] == -32006
     finally:
-        await _close(server, second_writer)
+        writer.close()
+        await writer.wait_closed()
+        if second_writer is None:
+            await server.close()
+        else:
+            await _close(server, second_writer)
 
 
 @pytest.mark.asyncio
@@ -5082,9 +5040,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
-        await asyncio.wait_for(
-            asyncio.gather(first_turn, return_exceptions=True), 10
-        )
+        await asyncio.wait_for(asyncio.gather(first_turn, return_exceptions=True), 10)
         assert [
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
@@ -5129,17 +5085,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
-    task_notice = (
-        "task task-1 (printf hi) has run 1h; "
-        "kill it with task_kill or leave it running"
-    )
-    store.append_message(
-        harness_notice("task safety", task_notice, event="agent_task_safety")
-    )
-    task_cause = (
-        "explicit-finish task safety limit expired at task age 7200 seconds "
-        "after no owner turn for 3600 seconds"
-    )
+    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     store.append_task_notification(
         task_id="task-1",
         command="printf hi",
@@ -5178,11 +5124,6 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
             row["notification"].get("kind", "agent_completion"): row for row in rows
         }
         assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
-        assert any(
-            row.get("content", [{}])[0].get("text")
-            == f"[zeta] task safety: {task_notice}"
-            for row in history
-        )
         assert task_cause in by_kind["task_exited"]["content"][0]["text"]
         assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
         assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
@@ -5310,8 +5251,7 @@ async def test_close_kill_cause_reaches_live_serve_event(
 
         task_frames = history_frames
         if not any(
-            frame.get("params", {}).get("event") == "turn_end"
-            for frame in task_frames
+            frame.get("params", {}).get("event") == "turn_end" for frame in task_frames
         ):
             task_frames += await _frames_until_event(reader, "turn_end")
         events = [
@@ -5326,9 +5266,9 @@ async def test_close_kill_cause_reaches_live_serve_event(
         assert task_events[0]["data"]["task_id"] == task_id
         assert task_events[0]["data"]["kind"] == "task_exited"
         assert task_events[0]["data"]["note"] == task_cause
-        assert {
-            e["data"].get("kind", "agent_completion") for e in receipt_events
-        } == {"agent_completion"}
+        assert {e["data"].get("kind", "agent_completion") for e in receipt_events} == {
+            "agent_completion"
+        }
         assert len(backend.calls) == 1
     finally:
         await _close(server, writer)
@@ -5927,7 +5867,9 @@ async def test_attachment_failure_removes_entire_batch(
             patch.setattr(image_delivery.os, "replace", failing_replace)
             with pytest.raises(OSError):
                 await asyncio.to_thread(
-                    image_delivery.prepare_image_delivery, runtime, {"images": [item, item]}
+                    image_delivery.prepare_image_delivery,
+                    runtime,
+                    {"images": [item, item]},
                 )
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
@@ -6108,8 +6050,8 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(
 ):
     from zeta.accounts import AccountCredentials
     from zeta.codex import CodexCredentialDriver
+    from zeta.oauth import OAuthTokens
     from zeta.providers.anthropic import AnthropicCredentialDriver
-    from zeta.providers.auth import OAuthTokens
     from zeta.providers.factory import credential_store
 
     monkeypatch.delenv("ZETA_ALLOW_API_KEY", raising=False)
@@ -6376,6 +6318,8 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
         await _event(reader, "turn_end")
         result = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]
         assert result["sessions"][0]["first_message_preview"] == "first message preview"
+        assert result["sessions"][0]["in_use"] is True
+        assert result["sessions"][0]["owner_pid"] == os.getpid()
         assert "name" not in result["sessions"][0]
     finally:
         await _close(server, writer)
@@ -6391,9 +6335,9 @@ async def test_list_sessions_page_touches_only_page_rows(
         opened = await asyncio.to_thread(
             manager.create, provider="codex", model="offline", cwd=tmp_path
         )
-        opened.store.close()
         opened.metadata.updated_at = f"2030-01-01T00:00:0{index}+00:00"
         await asyncio.to_thread(manager._write, opened.metadata)
+        opened.store.close()
         sessions.append(opened.metadata.session_id)
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
@@ -6407,6 +6351,7 @@ async def test_list_sessions_page_touches_only_page_rows(
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", counted_open)
+    # test-contract: seam count catalog reconciliation without changing production
     monkeypatch.setattr(
         server.runtime.manager, "_reconcile_project_link", reconciliations.append
     )
@@ -6431,7 +6376,7 @@ async def test_list_sessions_page_touches_only_page_rows(
         result = frame["result"]
         assert [row["session_id"] for row in result["sessions"]] == [sessions[-1]]
         assert len(preview_reads) == 1
-        assert reconciliations == [sessions[-1]]
+        assert reconciliations == []
     finally:
         await _close(server, writer)
 
@@ -6547,9 +6492,9 @@ async def test_catalog_row_bounds_system_prompt(tmp_path: Path) -> None:
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="offline", cwd=tmp_path
     )
-    opened.store.close()
     opened.metadata.system_prompt = "x" * 100_000
     await asyncio.to_thread(manager._write, opened.metadata)
+    opened.store.close()
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
@@ -6599,7 +6544,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
             completions.append(self.model)
             if self.model == "gpt-5.4-mini":
                 if raise_error:
-                    from zeta.providers.codex_errors import CodexHTTPError
+                    from zeta.codex import CodexHTTPError
 
                     raise CodexHTTPError(detail, status_code=status_code)
                 yield StreamEvent(
@@ -6922,7 +6867,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
 
 @pytest.mark.asyncio
 async def test_return_to_fallback_does_not_restore_itself(tmp_path):
-    from zeta.providers.codex_errors import CodexHTTPError
+    from zeta.codex import CodexHTTPError
 
     class DeniedBackend(FakeBackend):
         async def complete(self, messages, tool_schemas):
@@ -6967,7 +6912,7 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
 
 @pytest.mark.asyncio
 async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
-    from zeta.providers.codex_errors import CodexAuthError
+    from zeta.codex import CodexAuthError
     from zeta.server import model_selection
 
     server = ZetaServer(
@@ -7410,6 +7355,8 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
         expected.pop("name")
         # The only gated field is name; all original metadata and preview remain.
         row.pop("first_message_preview")
+        assert row.pop("in_use") is True
+        assert row.pop("owner_pid") == os.getpid()
         expected["updated_at"] = row["updated_at"]
         expected["system_prompt"] = expected["system_prompt"][:512]
         assert row == expected
@@ -7738,11 +7685,195 @@ def _seed_slash_fixtures(tmp_path: Path) -> Path:
     return project
 
 
+async def _raw_response_line(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request_id: str,
+    method: str,
+    params: dict[str, Any],
+) -> str:
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+    )
+    await writer.drain()
+    while True:
+        line = await asyncio.wait_for(reader.readline(), timeout=TIMEOUT)
+        frame = json.loads(line)
+        if frame.get("id") == request_id:
+            return line.decode().removesuffix("\n")
+
+
+async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
+    server = ZetaServer(home=home, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        return await _raw_response_line(reader, writer, "hello", "hello", params)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> None:
+    observed = [
+        await _hello_wire_line(
+            tmp_path / "hello-1.0", {"protocol_version": "1.0"}
+        ),
+        await _hello_wire_line(
+            tmp_path / "hello-1.1",
+            {
+                "protocol_version": "1.1",
+                "features": ["model_input_ids"],
+            },
+        ),
+    ]
+    observer_home = tmp_path / "hello-observer"
+    observer_server = ZetaServer(
+        home=observer_home,
+        port=0,
+        provider="codex",
+    )
+    controller_reader, controller_writer = await _connect(observer_server)
+    await _request(
+        controller_reader,
+        controller_writer,
+        "controller",
+        "hello",
+        {"protocol_version": "1.2", "features": ["serve_observers"]},
+    )
+    assert observer_server.port is not None
+    observer_reader, observer_writer = await asyncio.open_connection(
+        "127.0.0.1", observer_server.port
+    )
+    try:
+        observed.append(
+            await _raw_response_line(
+                observer_reader,
+                observer_writer,
+                "observer",
+                "hello",
+                {
+                    "protocol_version": "1.2",
+                    "role": "observer",
+                    "features": ["serve_observers"],
+                },
+            )
+        )
+    finally:
+        observer_writer.close()
+        await observer_writer.wait_closed()
+        await _close(observer_server, controller_writer)
+
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        observed.extend(
+            [
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "list-default",
+                    "slash_list",
+                    {"session_id": sid},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "list-complete",
+                    "slash_list",
+                    {"session_id": sid, "include_unavailable": True},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "mcp-bare",
+                    "slash_run",
+                    {"session_id": sid, "text": "/mcp"},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "mcp-status",
+                    "slash_run",
+                    {"session_id": sid, "text": "/mcp status"},
+                ),
+            ]
+        )
+    finally:
+        await _close(server, writer)
+
+    help_project = tmp_path / "help-project"
+    help_project.mkdir()
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "init", "--quiet", str(help_project)],
+        check=True,
+        capture_output=True,
+    )
+    help_server = ZetaServer(
+        home=tmp_path / "help-home",
+        cwd=help_project,
+        port=0,
+        provider="codex",
+    )
+    help_reader, help_writer, help_sid = await _ready_extensions(help_server)
+    try:
+        observed.append(
+            await _raw_response_line(
+                help_reader,
+                help_writer,
+                "help",
+                "slash_run",
+                {"session_id": help_sid, "text": "/help"},
+            )
+        )
+    finally:
+        await _close(help_server, help_writer)
+
+    fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
+    rows = fixture.read_text().splitlines()
+    assert rows[0] == (
+        "# baseline origin/main 66c084d8; accepted deltas: "
+        "W1, W2, W3, W5, text->output"
+    )
+    assert observed == rows[1:]
+
+
 @pytest.mark.asyncio
 async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
     tmp_path: Path,
 ) -> None:
     project = _seed_slash_fixtures(tmp_path)
+    (project / ".zeta" / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "live": {
+                        "transport": "stdio",
+                        "command": "missing-command",
+                        "enabled": False,
+                    },
+                    "oauth": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.test",
+                        "enabled": False,
+                        "auth": {"type": "oauth"},
+                    },
+                }
+            }
+        )
+    )
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -7774,16 +7905,38 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "review",
             "greet",
         } <= set(runnable_by_name)
-        assert {"keys", "plan", "fork", "theme", "local", "shell"} <= unavailable
+        assert {
+            "always",
+            "approve",
+            "deny",
+            "fork",
+            "keys",
+            "local",
+            "permissions",
+            "plan",
+            "restart",
+            "shell",
+            "theme",
+        } <= unavailable
         assert all(entry["unavailable"] is None for entry in runnable_by_name.values())
         assert all(
             complete_by_name[name]["unavailable"] == "requires_tui"
             and complete_by_name[name]["client_only"] is True
             for name in unavailable
         )
+        assert complete_by_name["accounts"]["description"] == (
+            "list, switch, or label accounts"
+        )
         assert runnable_by_name["review"]["source"] == "project"
         assert runnable_by_name["greet"]["kind"] == "skill"
 
+        documented_kinds = set(
+            re.findall(
+                r"^  - `([a-z_]+)`: ",
+                (Path(__file__).parents[1] / "docs" / "serve-protocol.md").read_text(),
+                re.MULTILINE,
+            )
+        )
         for number, name in enumerate(runnable_by_name, 10):
             response = (
                 await _request(
@@ -7793,17 +7946,43 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
                     "slash_run",
                     {
                         "session_id": sid,
-                        "text": "/mcp status" if name == "mcp" else f"/{name}",
+                        "text": f"/{name}",
                     },
                 )
             )[-1]
             assert "result" in response, (name, response)
             result = response["result"]
+            assert result["kind"] in documented_kinds, (name, result)
             assert result["kind"] not in {"client_only", "error", "unknown"}, (
                 name,
                 result,
             )
             assert "unsupported" not in str(result).lower()
+
+        for number, name in enumerate(unavailable, 100):
+            result = (
+                await _request(
+                    reader,
+                    writer,
+                    number,
+                    "slash_run",
+                    {"session_id": sid, "text": f"/{name}"},
+                )
+            )[-1]["result"]
+            assert result["kind"] in documented_kinds, (name, result)
+            assert result == {"kind": "client_only", "name": name}
+
+        help_result = (
+            await _request(
+                reader,
+                writer,
+                "help",
+                "slash_run",
+                {"session_id": sid, "text": "/help"},
+            )
+        )[-1]["result"]
+        assert "/status" in help_result["text"]
+        assert "/keys" not in help_result["text"]
 
         model_with_name = (
             await _request(
@@ -7817,16 +7996,53 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         assert model_with_name["kind"] == "output"
         assert "unsupported" not in str(model_with_name).lower()
 
-        mcp_status = (
+        mcp_arguments = {
+            "status": "",
+            "auth": "live",
+            "logout": "live",
+            "add": "added --stdio missing-command",
+            "remove": "added",
+            "enable": "live",
+            "disable": "live",
+            "trust": "live",
+            "untrust": "live",
+        }
+        assert set(mcp_arguments) == set(_SERVE_MCP_VERBS)
+        registered_kinds = {kind.value for kind in SlashResultKindDescriptor}
+        for number, verb in enumerate(_SERVE_MCP_VERBS, 200):
+            result = (
+                await _request(
+                    reader,
+                    writer,
+                    number,
+                    "slash_run",
+                    {
+                        "session_id": sid,
+                        "text": f"/mcp {verb} {mcp_arguments[verb]}".rstrip(),
+                    },
+                )
+            )[-1]["result"]
+            assert result["kind"] in registered_kinds, (verb, result)
+            assert result["kind"] in documented_kinds, (verb, result)
+            assert result["kind"] == "output", (verb, result)
+
+        credential_file = token_store_path("oauth", tmp_path / "home")
+        credential_file.parent.mkdir(parents=True, exist_ok=True)
+        credential_file.write_text("{broken")
+        credential_error = (
             await _request(
                 reader,
                 writer,
-                "mcp-status",
+                "mcp-structured-error",
                 "slash_run",
-                {"session_id": sid, "text": "/mcp status"},
+                {"session_id": sid, "text": "/mcp logout oauth"},
             )
         )[-1]["result"]
-        assert mcp_status["kind"] == "text"
+        assert credential_error["kind"] in registered_kinds
+        assert credential_error["kind"] in documented_kinds
+        assert credential_error["credential_store_error"]["code"] == (
+            "mcp_credential_store"
+        )
 
         invalid = (
             await _request(
@@ -7869,7 +8085,7 @@ async def test_serve_does_not_advertise_or_run_tui_approval_commands(
             await _request(reader, writer, "list", "slash_list", {"session_id": sid})
         )[-1]["result"]
 
-        assert run_result == {"kind": "unknown", "name": "approve"}
+        assert run_result == {"kind": "client_only", "name": "approve"}
         assert {entry["name"] for entry in list_result["commands"]}.isdisjoint(
             {"approve", "deny"}
         )
@@ -8230,6 +8446,7 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
     worker_errors: list[BaseException] = []
     shutdown_started = asyncio.Event()
     closing: asyncio.Task[None] | None = None
+    request_task: asyncio.Task[None] | None = None
     loop_closed = False
     status_worker: threading.Thread | None = None
 
@@ -8284,6 +8501,15 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         await close_control()
 
     monkeypatch.setattr(server.control, "close", track_shutdown)
+    writer_wait_closed = writer.wait_closed
+
+    async def wait_closed_after_server_shutdown() -> None:
+        assert shutdown_started.is_set(), (
+            "server shutdown must start before the test waits for the peer close"
+        )
+        await asyncio.wait_for(writer_wait_closed(), 10)
+
+    monkeypatch.setattr(writer, "wait_closed", wait_closed_after_server_shutdown)
     try:
         writer.write(
             json.dumps(
@@ -8297,10 +8523,21 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
             + b"\n"
         )
         await writer.drain()
-        assert await asyncio.to_thread(entered.wait, 10)
+        assert await asyncio.to_thread(entered.wait, 10), (
+            "status transcript worker did not start"
+        )
+        client = server._client
+        assert client is not None
+        request_task = next(
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and any(
+                frame.f_locals.get("client") is client for frame in task.get_stack()
+            )
+        )
 
         writer.close()
-        await writer.wait_closed()
         closing = asyncio.create_task(server.close())
         await asyncio.wait_for(shutdown_started.wait(), 10)
         loop_closed = True
@@ -8308,18 +8545,24 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         await asyncio.wait_for(worker_completed.wait(), 10)
         assert not worker_errors
         loop_closed = False
-        await asyncio.wait_for(closing, 10)
+        await asyncio.wait_for(asyncio.shield(closing), 10)
+        request_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(request_task), 10)
+        assert request_task.done(), "serve request task remained after cancellation"
     finally:
         loop_closed = False
         release.set()
-        if closing is not None and not closing.done():
-            closing.cancel()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
             with suppress(asyncio.CancelledError):
-                await closing
+                await asyncio.wait_for(asyncio.shield(request_task), 10)
+        if closing is None:
+            closing = asyncio.create_task(server.close())
+        await asyncio.wait_for(asyncio.shield(closing), 10)
         writer.close()
         with suppress(Exception):
-            await writer.wait_closed()
-        await server.close()
+            await asyncio.wait_for(writer.wait_closed(), 10)
 
 
 @pytest.mark.parametrize("with_fact_floor", [False, True])
@@ -8935,6 +9178,8 @@ async def test_slash_run_guards_mutations_while_approvals_pending(
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
+        # MCP config commands mutate shared config — must reject.
+        assert (await run("mcp-disable", "/mcp disable example"))["error"]["code"] == -32004
         # `/project init` mutates the session association — must reject.
         assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only and bypasses the mutation guard.
@@ -10447,6 +10692,7 @@ async def test_slash_run_mcp_credential_evidence_recovery(
     project = tmp_path / "project"
     home.mkdir()
     project.mkdir()
+    initialize_storage_home(home)
     (home / "mcp.json").write_text(
         json.dumps(
             {
@@ -10486,20 +10732,33 @@ async def test_slash_run_mcp_credential_evidence_recovery(
     reader, writer, sid = await _ready_extensions(server)
     try:
         project_config = project / ".zeta" / "mcp.json"
-        add_response = (
-            await _request(
-                reader,
-                writer,
-                "mcp-add-client-only",
-                "slash_run",
-                {
-                    "session_id": sid,
-                    "text": "/mcp add surprise --http https://mcp.test",
-                },
-            )
-        )[-1]["result"]
-        assert add_response == {"kind": "client_only", "name": "mcp"}
-        assert not project_config.exists()
+
+        async def run_mcp(request_id: str, command: str) -> dict[str, object]:
+            return (
+                await _request(
+                    reader,
+                    writer,
+                    request_id,
+                    "slash_run",
+                    {"session_id": sid, "text": f"/mcp {command}"},
+                )
+            )[-1]["result"]
+
+        commands = (
+            "add surprise --stdio missing-command",
+            "disable surprise",
+            "trust surprise",
+            "untrust surprise",
+            "enable surprise",
+        )
+        for index, command in enumerate(commands):
+            result = await run_mcp(f"mcp-mutation-{index}", command)
+            assert result["kind"] == "output"
+        assert project_config.exists()
+        assert "surprise" in json.loads(project_config.read_text())["servers"]
+        removed = await run_mcp("mcp-mutation-remove", "remove surprise")
+        assert removed["kind"] == "output"
+        assert "surprise" not in json.loads(project_config.read_text())["servers"]
 
         response = (
             await _request(
@@ -10516,7 +10775,7 @@ async def test_slash_run_mcp_credential_evidence_recovery(
             "Move this file aside, then run '/mcp auth live'."
         )
         assert response == {
-            "kind": "text",
+            "kind": "output",
             "text": expected_text,
             "credential_store_error": {
                 "code": "mcp_credential_store",
@@ -10635,7 +10894,21 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
+        frames += await read_until(
+            reader,
+            lambda frame: (
+                frame.get("params", {}).get("event") == "approval_request"
+                and frame["params"]["request_id"] == call.id
+            ),
+            what=f"approval_request for {call.id}",
+        )
+        approval = frames_for_call(frames, call.id)[-1]["params"]
+        turn_start_owner = next(
+            owner
+            for frame in frames
+            if (owner := event_owner(frame)) is not None and owner[0] == "turn_start"
+        )
+        turn_end_owner = ("turn_end", *turn_start_owner[1:])
         writer.write(
             (
                 json.dumps(
@@ -10654,15 +10927,18 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
         await asyncio.wait_for(runtime_end.wait(), timeout=10)
         await asyncio.wait_for(runtime_end_handled.wait(), timeout=10)
         release.set()
-        while not _named_events(frames, "turn_end"):
-            frames.append(await asyncio.wait_for(_read(reader), timeout=10))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert (
-            names.index("approval_end")
-            < names.index("tool_end")
-            < names.index("turn_end")
+        frames += await read_until(
+            reader,
+            lambda frame: event_owner(frame) == turn_end_owner,
+            what=f"turn_end for {turn_end_owner[2]}",
         )
+        approval_owner = (
+            "approval_end",
+            approval["session_id"],
+            approval["request_id"],
+        )
+        tool_owner = ("tool_end", approval["session_id"], call.id)
+        assert_event_order(frames, approval_owner, tool_owner, turn_end_owner)
     finally:
         release.set()
         await _close(server, writer)
@@ -10705,12 +10981,44 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
         ConversationStore, "append_approval_history_async", fail_terminal_history
     )
     reader, writer = await _ready(server)
+    assert server.connections is not None
+    parent_tool_ended = asyncio.Event()
+    release_parent_turn = asyncio.Event()
+    parent_session_id = server.runtime.session_id
+    publish_controller = server.connections.publish_controller
+
+    async def force_parent_tool_end_first(event, session_id, **fields):
+        if failure == "cancelled" and event == "approval_end":
+            await asyncio.wait_for(parent_tool_ended.wait(), timeout=10)
+        if (
+            failure == "cancelled"
+            and event == "turn_start"
+            and session_id == parent_session_id
+            and parent_tool_ended.is_set()
+        ):
+            await asyncio.wait_for(release_parent_turn.wait(), timeout=10)
+        published = await publish_controller(event, session_id, **fields)
+        tool_call = fields.get("tool_call") or {}
+        if event == "tool_end" and tool_call.get("id") == agent.id:
+            parent_tool_ended.set()
+        return published
+
+    # test-contract: seam no public event exposes controller admission order
+    monkeypatch.setattr(
+        server.connections, "publish_controller", force_parent_tool_end_first
+    )
     frames: list[dict[str, Any]] = []
     try:
         async with asyncio.timeout(10):
             await _request(reader, writer, 3, "send", {"text": "delegate"})
-            while not _named_events(frames, "approval_request"):
-                frames.append(await _read(reader))
+            frames += await read_until(
+                reader,
+                lambda frame: (
+                    frame.get("params", {}).get("event") == "approval_request"
+                    and frame["params"]["tool_call"]["id"] == child_call.id
+                ),
+                what=f"approval_request for {child_call.id}",
+            )
             approval = _named_events(frames, "approval_request")[0]
             assert approval["delegated"] is True
             writer.write(
@@ -10727,7 +11035,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 ).encode()
             )
             await writer.drain()
-            await history_write_started.wait()
+            await asyncio.wait_for(history_write_started.wait(), timeout=10)
             settlement = None
             if failure == "cancelled":
                 record = server.control._approvals.state.records[
@@ -10736,23 +11044,33 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 settlement = record.settlement
                 assert settlement is not None
                 settlement.cancel()
-            while not _named_events(frames, "approval_end"):
-                frames.append(await _read(reader))
-            names = [frame.get("params", {}).get("event") for frame in frames]
-            child_start = max(
-                index for index, name in enumerate(names) if name == "turn_start"
+            approval_owner = (
+                "approval_end",
+                approval["session_id"],
+                approval["request_id"],
             )
-            approval_end = names.index("approval_end")
-            assert len(_named_events(frames, "approval_end")) == 1
-            assert child_start < approval_end
+            frames += await read_until(
+                reader,
+                lambda frame: event_owner(frame) == approval_owner,
+                what=f"approval_end for {approval['request_id']}",
+            )
+            assert len(frames_for_call(frames, approval["request_id"])) == 2
             key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
                 with pytest.raises(asyncio.CancelledError):
-                    await settlement
+                    await asyncio.wait_for(settlement, timeout=10)
             else:
-                while not _named_events(frames, "error"):
-                    frames.append(await _read(reader))
+                frames += await read_until(
+                    reader,
+                    lambda frame: frame.get("params", {}).get("event") == "error",
+                    what="approval persistence error",
+                )
                 error = _named_events(frames, "error")[0]
+                approval_end = next(
+                    index
+                    for index, frame in enumerate(frames)
+                    if event_owner(frame) == approval_owner
+                )
                 names = [frame.get("params", {}).get("event") for frame in frames]
                 assert approval_end < names.index("error")
                 assert error["error"] == {
@@ -10766,16 +11084,25 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 health = server.control._approvals.state.health
                 assert health is not None
                 assert health.code == "approval_persistence_failed"
-            names = [frame.get("params", {}).get("event") for frame in frames]
-            child_terminals = [
-                index
-                for index, name in enumerate(names)
-                if index > child_start and name in {"tool_end", "turn_end"}
-            ]
-            assert all(approval_end < index for index in child_terminals)
+            child_tool_owner = (
+                "tool_end",
+                approval["session_id"],
+                child_call.id,
+            )
+            parent_tool_owner = (
+                "tool_end",
+                approval["session_id"],
+                agent.id,
+            )
+            # test-contract: seam exact lifecycle order is the protocol contract
+            assert_event_order(frames, parent_tool_owner, approval_owner)
+            if any(event_owner(frame) == child_tool_owner for frame in frames):
+                assert_event_order(frames, approval_owner, child_tool_owner)
             assert key not in server.control._approvals.state.records
+            release_parent_turn.set()
     finally:
         history_release.set()
+        release_parent_turn.set()
         await asyncio.wait_for(_close(server, writer), timeout=10)
 
 
@@ -10824,7 +11151,21 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
+        frames += await read_until(
+            reader,
+            lambda frame: (
+                frame.get("params", {}).get("event") == "approval_request"
+                and frame["params"]["request_id"] == call.id
+            ),
+            what=f"approval_request for {call.id}",
+        )
+        approval = frames_for_call(frames, call.id)[-1]["params"]
+        turn_start_owner = next(
+            owner
+            for frame in frames
+            if (owner := event_owner(frame)) is not None and owner[0] == "turn_start"
+        )
+        turn_end_owner = ("turn_end", *turn_start_owner[1:])
         writer.write(
             (
                 json.dumps(
@@ -10843,15 +11184,18 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             await write_started.wait()
             await tool_end_started.wait()
             release_write.set()
-            while not _named_events(frames, "turn_end"):
-                frames.append(await _read(reader))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert (
-            names.index("approval_end")
-            < names.index("tool_end")
-            < names.index("turn_end")
+            frames += await read_until(
+                reader,
+                lambda frame: event_owner(frame) == turn_end_owner,
+                what=f"turn_end for {turn_end_owner[2]}",
+            )
+        approval_owner = (
+            "approval_end",
+            approval["session_id"],
+            approval["request_id"],
         )
+        tool_owner = ("tool_end", approval["session_id"], call.id)
+        assert_event_order(frames, approval_owner, tool_owner, turn_end_owner)
     finally:
         release_write.set()
         await _close(server, writer)

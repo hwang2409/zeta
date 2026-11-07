@@ -1,6 +1,8 @@
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import lint_test_quality as quality
 from scripts.lint_test_quality import lint_diff
@@ -894,15 +896,109 @@ def test_select_base_uses_first_parent_for_push(monkeypatch) -> None:
     assert commands == [(["git", "rev-parse", "HEAD^"], True)]
 
 
-def test_select_base_uses_first_parent_for_workflow_dispatch(monkeypatch) -> None:
-    commands = []
-    monkeypatch.setattr(
-        "scripts.lint_test_quality.subprocess.check_output",
-        lambda command, text: commands.append((command, text)) or "parent\n",
+def _git(path: Path, *args: str) -> str:
+    return subprocess.check_output(["git", *args], cwd=path, text=True).strip()
+
+
+def test_workflow_dispatch_lints_all_commits_since_main(
+    tmp_path: Path, monkeypatch
+) -> None:
+    origin = tmp_path / "origin.git"
+    repo_path = tmp_path / "repo"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo_path)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@e"], cwd=repo_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo_path, check=True)
+    (repo_path / "baseline.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "main"], cwd=repo_path, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(origin)], cwd=repo_path, check=True
+    )
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=repo_path, check=True)
+    subprocess.run(["git", "checkout", "-qb", "feature"], cwd=repo_path, check=True)
+    (repo_path / "tests").mkdir()
+    (repo_path / "tests/test_bad.py").write_text("def test_bad():\n    time.sleep(1)\n")
+    (repo_path / "tests/test_second.py").write_text("def test_second(): pass\n")
+    subprocess.run(["git", "add", "."], cwd=repo_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "feature first"], cwd=repo_path, check=True)
+    (repo_path / "README").write_text("second commit\n")
+    subprocess.run(["git", "add", "."], cwd=repo_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "feature second"], cwd=repo_path, check=True
     )
 
-    assert quality.select_base("workflow_dispatch") == "parent"
-    assert commands == [(["git", "rev-parse", "HEAD^"], True)]
+    monkeypatch.chdir(repo_path)
+    base = quality.select_base("workflow_dispatch")
+    diff = subprocess.check_output(
+        ["git", "diff", "--unified=0", base, "HEAD", "--", "*.py"],
+        cwd=repo_path,
+        text=True,
+    )
+    findings = quality.lint_diff(diff, repo_path)
+    assert [(finding.code, finding.path) for finding in findings] == [
+        ("TQ001", Path("tests/test_bad.py"))
+    ]
+
+
+def test_workflow_dispatch_on_main_has_empty_diff(tmp_path: Path, monkeypatch) -> None:
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@e"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    (tmp_path / "empty.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "main"], cwd=tmp_path, check=True)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(origin)], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=tmp_path, check=True)
+    monkeypatch.chdir(tmp_path)
+    assert quality.select_base("workflow_dispatch") == _git(
+        tmp_path, "rev-parse", "HEAD"
+    )
+
+
+def test_ci_events_are_supported_by_quality_lint_base_selection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text())
+    events = workflow.get("on", workflow.get(True, {}))
+    assert events
+    results = []
+    for event in events:
+        repo_path = tmp_path / event
+        repo_path.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo_path)], check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@e"], cwd=repo_path, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo_path, check=True)
+        (repo_path / "file").write_text("x\n")
+        subprocess.run(["git", "add", "."], cwd=repo_path, check=True)
+        subprocess.run(["git", "commit", "-qm", "main"], cwd=repo_path, check=True)
+        (repo_path / "second").write_text("x\n")
+        subprocess.run(["git", "add", "."], cwd=repo_path, check=True)
+        subprocess.run(["git", "commit", "-qm", "second"], cwd=repo_path, check=True)
+        origin = repo_path.with_suffix(".git")
+        subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(origin)], cwd=repo_path, check=True
+        )
+        subprocess.run(
+            ["git", "push", "-q", "origin", "main"], cwd=repo_path, check=True
+        )
+        monkeypatch.chdir(repo_path)
+        try:
+            base = quality.select_base(event, "main")
+        except (ValueError, subprocess.CalledProcessError) as error:
+            base = f"error: {error}"
+        results.append((event, base))
+    failures = [
+        (event, base) for event, base in results if str(base).startswith("error:")
+    ]
+    assert failures == [], results
 
 
 def test_ci_runs_quality_lint_for_pull_requests_and_main_pushes() -> None:
@@ -913,6 +1009,17 @@ def test_ci_runs_quality_lint_for_pull_requests_and_main_pushes() -> None:
     assert "if: github.event_name == 'pull_request'" not in step
     assert "GITHUB_EVENT_NAME: ${{ github.event_name }}" in step
     assert '--base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF"' in step
+
+
+def test_merge_resolution_passes_pull_request_body() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text()
+    step = workflow.split("- name: Check merge resolutions", 1)[1]
+    step = step.split("\n  browser:", 1)[0]
+
+    assert "PR_BODY: ${{ github.event.pull_request.body }}" in step
+    assert 'printf \'%s\' "$PR_BODY" > "$body_file"' in step
+    assert 'args+=(--pr-body-file "$body_file")' in step
+    assert '"${args[@]}"' in step
 
 
 def test_non_test_python_files_are_ignored(tmp_path: Path) -> None:

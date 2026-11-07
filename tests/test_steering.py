@@ -21,7 +21,6 @@ import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import BudgetExceeded, ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
@@ -37,6 +36,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop._completion import _error_info
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
@@ -1252,6 +1252,71 @@ async def test_passthrough_runs_shell_without_provider_call(tmp_path: Path) -> N
     assert receipts[0].startswith("ran !printf hi")
     assert receipts[0].endswith("exit 0")
     await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_ctrl_c_aborts_process_group(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), max_turns=1, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    started = asyncio.Event()
+    original_handle = app._handle_tool_event
+
+    def handle(event: Any) -> Any:
+        result = original_handle(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_START:
+            started.set()
+        return result
+
+    app._handle_tool_event = handle  # type: ignore[method-assign]
+    try:
+        app._submit_input("!sleep 30")
+        task = app._active_task
+        assert task is not None
+        await asyncio.wait_for(started.wait(), timeout=10)
+        app.abort_active()
+        await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        assert app._loop_state == "idle"
+        assert list(app._macro_receipts) == ["ran !sleep 30, canceled"]
+    finally:
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_end_repaints_terminal_card(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), max_turns=1, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    with create_pipe_input() as pipe:
+        app._active_session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            multiline=True,
+        )
+        rendered_on_invalidate: list[str] = []
+        original_invalidate = app._invalidate_prompt
+
+        def invalidate() -> None:
+            original_invalidate()
+            rendered_on_invalidate.append(app._transcript.render(120))
+
+        app._invalidate_prompt = invalidate  # type: ignore[method-assign]
+        try:
+            app._submit_input("!printf done")
+            task = app._active_task
+            assert task is not None
+            await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            assert any("exit 0" in rendered for rendered in rendered_on_invalidate)
+            assert rendered_on_invalidate[-1].find("exit 0") >= 0
+            assert "running" not in rendered_on_invalidate[-1]
+        finally:
+            await app.loop.close()
 
 
 @pytest.mark.asyncio

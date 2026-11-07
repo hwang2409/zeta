@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-import fcntl
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
-from pathlib import Path
+from collections.abc import Mapping, Sequence
 
 from ..model_input import ModelInputEnvelope
 from ..protocol.types import MessageOrigin
-from .config import (
-    MCPConfigError,
-    MCPServerConfig,
-    read_mcp_config_file,
-    resolve_server_config,
-    server_to_json,
-    write_mcp_config,
-)
-from .mount import MCPMount, NoticeSink
+from .config import MCPServerConfig
+from .management import ManagedServer
+from .mount import MCPMount
 from .resources import (
     MCPResourceError,
     fetch_resource,
@@ -28,7 +19,8 @@ from .resources import (
 MCP_USAGE = (
     "mcp usage: /mcp [status] | /mcp reconnect <server> | /mcp add <name> --stdio <cmd...> "
     "| /mcp add <name> --http <url> [--oauth] "
-    "| /mcp remove <name> | /mcp auth <server> | /mcp logout <server> "
+    "| /mcp remove <name> | /mcp enable|disable <name> "
+    "| /mcp trust|untrust <name> | /mcp auth <server> | /mcp logout <server> "
     "| /mcp resources <server> [<uri>]"
 )
 
@@ -71,112 +63,11 @@ def parse_add_command(tokens: list[str]) -> MCPServerConfig:
     raise MCPCommandError(f"unknown add flag: {flag}")
 
 
-def rewrite_mcp_file(
-    path: Path,
-    edit: Callable[[dict[str, dict[str, object]]], dict[str, dict[str, object]]],
-) -> None:
-    """Read, edit, validate, and atomically write one config file."""
-
-    target = Path(path).expanduser()
-    with _config_transaction_lock(target):
-        try:
-            current = read_mcp_config_file(target)
-        except MCPConfigError as exc:
-            raise MCPCommandError(str(exc)) from exc
-        write_mcp_config(target, edit(current))
-
-
-@contextmanager
-def _config_transaction_lock(path: Path) -> Iterator[None]:
-    """Hold a stable cross-process lock for a complete config transaction."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f".{path.name}.lock")
-    with lock_path.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-async def add_and_mount(
-    mount: MCPMount,
-    server_config: MCPServerConfig,
-    *,
-    target: Path,
-    notice_sink: NoticeSink | None,
-) -> None:
-    """Write a new entry to the target file and live-mount it, rolling back on failure."""
-
-    name = server_config.name
-    entry = server_to_json(server_config)
-
-    def prepare() -> None:
-        def add_entry(
-            servers: dict[str, dict[str, object]],
-        ) -> dict[str, dict[str, object]]:
-            if name in servers:
-                raise MCPCommandError(f"MCP server already configured: {name}")
-            return {**servers, name: entry}
-
-        rewrite_mcp_file(target, add_entry)
-
-    def rollback() -> None:
-        def remove_created_entry(
-            servers: dict[str, dict[str, object]],
-        ) -> dict[str, dict[str, object]]:
-            if servers.get(name) != entry:
-                return servers
-            return {key: value for key, value in servers.items() if key != name}
-
-        rewrite_mcp_file(target, remove_created_entry)
-
-    await mount.add_server(
-        resolve_server_config(server_config),
-        source=target,
-        notice_sink=notice_sink,
-        prepare=prepare,
-        rollback=rollback,
-    )
-
-
-async def remove_and_unshadow(
-    mount: MCPMount,
-    name: str,
-    *,
-    home_path: Path | None,
-    load_home: Callable[[], dict[str, MCPServerConfig]],
-    notice_sink: NoticeSink | None,
-) -> None:
-    """Remove one entry from its owning file, unmount it, remount any home shadow."""
-
-    def persist(locked_source: Path) -> None:
-        rewrite_mcp_file(
-            locked_source,
-            lambda servers: {
-                key: entry for key, entry in servers.items() if key != name
-            },
-        )
-
-    def replacement(locked_source: Path) -> tuple[MCPServerConfig, Path] | None:
-        if home_path is None or home_path.resolve() == locked_source.resolve():
-            return None
-        entry = load_home().get(name)
-        if entry is None:
-            return None
-        return resolve_server_config(entry), home_path
-
-    await mount.replace_server(
-        name,
-        persist=persist,
-        replacement=replacement,
-        notice_sink=notice_sink,
-    )
-
-
 def render_mcp_status(
-    mount: MCPMount, *, credential_status: Mapping[str, str] | None = None
+    mount: MCPMount,
+    *,
+    credential_status: Mapping[str, str] | None = None,
+    configured_entries: Sequence[ManagedServer] = (),
 ) -> str:
     """Render `/mcp` output from resident, non-secret credential state."""
 
@@ -189,6 +80,11 @@ def render_mcp_status(
             if line.startswith(f"{name}: "):
                 output.append(_render_auth_suffix(name, config, statuses))
                 break
+    mounted = set(mount.configs)
+    effective = {item.name: item for item in configured_entries}
+    for name, item in effective.items():
+        if name not in mounted:
+            output.append(f"{name}: {item.status}")
     return "\n".join(output)
 
 
@@ -244,11 +140,8 @@ async def run_mcp_resource_attach(
 __all__ = [
     "MCP_USAGE",
     "MCPCommandError",
-    "add_and_mount",
     "parse_add_command",
-    "remove_and_unshadow",
     "render_mcp_status",
-    "rewrite_mcp_file",
     "run_mcp_resource_attach",
     "run_mcp_resources_list",
 ]
