@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -59,7 +61,11 @@ async def test_bind_shell_cwd_worker_failure_and_duplicate_call(
     import zeta.tools._shared.shell_cwd as module
 
     # test-contract: seam force the worker failure path through the public async binder.
-    monkeypatch.setattr(module, "_bind_shell_cwd", lambda *args: (_ for _ in ()).throw(ValueError("worker failure")))
+    monkeypatch.setattr(
+        module,
+        "_bind_shell_cwd",
+        lambda *args: (_ for _ in ()).throw(ValueError("worker failure")),
+    )
     with pytest.raises(ValueError, match="worker failure"):
         await bind_shell_cwd_async(registry, None)
     assert registry.take_cwd_recovery_notices() == ()
@@ -118,6 +124,8 @@ async def test_bind_shell_cwd_cancellation_drains_and_does_not_commit(
     import zeta.tools._shared.shell_cwd as module
 
     original = module._bind_shell_cwd
+    original_thread_call = module.run_owned_thread_call
+    close_done = threading.Event()
     returned_fds: list[int] = []
 
     def blocked(
@@ -130,14 +138,26 @@ async def test_bind_shell_cwd_cancellation_drains_and_does_not_commit(
         returned_fds.append(result[1])
         return result
 
+    async def observed_thread_call(
+        acquire: Callable[[], tuple[str, int, tuple[str, str] | None]],
+        close: Callable[[tuple[str, int, tuple[str, str] | None]], None],
+    ) -> tuple[str, int, tuple[str, str] | None]:
+        def observed_close(result: tuple[str, int, tuple[str, str] | None]) -> None:
+            close(result)
+            close_done.set()
+
+        return await original_thread_call(acquire, observed_close)
+
     # test-contract: seam hold the worker to prove cancellation drains its fd.
     monkeypatch.setattr(module, "_bind_shell_cwd", blocked)
+    monkeypatch.setattr(module, "run_owned_thread_call", observed_thread_call)
     task = asyncio.create_task(bind_shell_cwd_async(registry, None))
     await asyncio.wait_for(started.wait(), 10)
     task.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 10)
+    assert await asyncio.to_thread(close_done.wait, 10)
     assert registry.bash_cwd == str(session)
     assert registry.take_cwd_recovery_notices() == ()
     assert returned_fds
