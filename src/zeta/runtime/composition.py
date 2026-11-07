@@ -192,7 +192,11 @@ def compose_runtime(
                 tool_allow_layers=effective_policy.allow_layers,
             )
         completion_callback = on_completion_success or (
-            lambda: asyncio.to_thread(manager.refresh_recency, metadata.session_id)
+            lambda: asyncio.to_thread(
+                manager.refresh_recency,
+                metadata.session_id,
+                opened.store.execution_lease,
+            )
         )
         policy = ApprovalPolicy(
             store=opened.store,

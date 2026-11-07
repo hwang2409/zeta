@@ -16,7 +16,6 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta import project_registry as registry_module
 from zeta.core import session_files
 from zeta.core.abort import AbortGenerationRegistry
-from zeta.core.loop import AgentLoop
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.core.session import SessionManager
 from zeta.project_registry import (
@@ -26,6 +25,7 @@ from zeta.project_registry import (
     ProjectRegistryError,
 )
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
 from zeta.tools import ToolRegistry

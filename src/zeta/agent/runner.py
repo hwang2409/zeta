@@ -691,12 +691,13 @@ async def run_agent_tool(
     parent_identity = loop.agent_instance_id or loop.store.session_id
     child_instance_id = f"{parent_identity}:{child_number}"
     agents_root = loop.store.session_dir / "agents"
-    child_store = loop._background_owner.store_leases.enter_context(
-        ConversationStore(
+    child_store = await loop.store._to_thread_store(
+        lambda: ConversationStore(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
             _storage_lease=loop.store._storage_lease,
+            _owner_surface="child",
         )
     )
     try:
@@ -704,6 +705,7 @@ async def run_agent_tool(
     except BaseException:
         await child_store._to_thread_store(child_store.close)
         raise
+    loop._background_owner.store_leases.enter_context(child_store)
     loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)

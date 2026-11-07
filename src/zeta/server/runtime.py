@@ -204,7 +204,7 @@ class ServerRuntime:
         self._server_provider = self._config(None, None).provider
         self._test_scripted_provider = os.environ.get(TEST_SCRIPTED_PROVIDER_ENV) == "1"
         self.backend_factory = backend_factory
-        self.manager = SessionManager(self.home)
+        self.manager = SessionManager(self.home, owner_surface="serve")
         self._project_registry_probed = False
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None

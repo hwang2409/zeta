@@ -19,6 +19,7 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager
 from zeta.project_errors import ProjectRegistryBusyError
@@ -554,7 +555,8 @@ def test_stale_project_roots_do_not_disable_registry(tmp_path: Path) -> None:
 def test_session_manager_construction_does_not_open_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry_root = tmp_path / "home" / "projects"
+    home = initialize_storage_home(tmp_path / "home")
+    registry_root = home / "projects"
     registry_root.mkdir(parents=True)
     opened: list[object] = []
     original_open = os.open
@@ -580,7 +582,7 @@ async def test_resolve_attention_does_not_open_registry(
     from zeta.runtime.project_registry_state import available_project_registry
     from zeta.tools import resolve_attention
 
-    home = tmp_path / "home"
+    home = initialize_storage_home(tmp_path / "home")
     session_dir = home / "sessions" / ("a" * 32)
     session_dir.mkdir(parents=True)
     state = available_project_registry(home / "projects")

@@ -70,6 +70,7 @@ class _SessionRecency:
     ) -> None:
         self._manager = manager
         self._session_id = metadata.session_id
+        self._execution_lease = metadata._execution_lease
         self._dirty = False
         self._task: asyncio.Task[None] | None = None
 
@@ -123,7 +124,7 @@ class _SessionRecency:
         def run() -> None:
             try:
                 result: bool | BaseException = self._manager.refresh_recency(
-                    self._session_id
+                    self._session_id, self._execution_lease
                 )
             except BaseException as exc:  # noqa: BLE001 - return worker failure
                 result = exc
@@ -221,8 +222,13 @@ def format_picker_row(index: int, preview: SessionPreview) -> str:
 
     age = format_relative_age(preview.updated_at).rjust(8)
     label = f" [{preview.name}]" if preview.name else ""
+    usage = ""
+    if preview.in_use:
+        usage = (
+            f" [in use, pid {preview.owner_pid}]" if preview.owner_pid else " [in use]"
+        )
     text = preview.preview or "(no user message)"
-    return f"{index}. {age}  {preview.session_id[:8]}{label}  {text}"
+    return f"{index}. {age}  {preview.session_id[:8]}{label}{usage}  {text}"
 
 
 def create_app(args: argparse.Namespace) -> TUIApp:
@@ -264,7 +270,13 @@ def _create_app_with_root(
     runtime_home = ephemeral_root if ephemeral else home
     assert runtime_home is not None
     registry_state = load_project_registry(runtime_home / "projects")
-    manager = SessionManager(runtime_home, project_registry_state=registry_state)
+    manager = SessionManager(
+        runtime_home,
+        project_registry_state=registry_state,
+        owner_surface="headless"
+        if getattr(args, "prompt", None) is not None
+        else "tui",
+    )
     opened = None
     try:
         system_prompt_override = resolve_prompt_argument(
