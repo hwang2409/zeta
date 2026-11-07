@@ -222,8 +222,7 @@ async def consume_child(
                 "structuredContent": structured_content,
                 "explicitFinishReport": explicit_report,
             }
-        children = owned_children()
-        tasks = owned_tasks()
+        children, tasks = owned_children(), owned_tasks()
         if (
             not child_loop.explicit_finish
             and final_message is not None
@@ -272,8 +271,7 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
-        text = f"agent error: {failure_message}"
-        return terminal_result(state="failed", text=text)
+        return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
         return terminal_result(state="failed", text=text)
