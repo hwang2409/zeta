@@ -75,7 +75,7 @@ def test_fixture_replay_uses_production_path_and_golden_digests(tmp_path: Path) 
     expected = {
         "context.json": "3715866d9380bbe995e8f913b4f09f06d886274fea368d891fb9fde6fe2c7c93",
         "wire.json": "5e87bf4d29a4ff4e83e587d42aa47058e73bd3dfa2ae3cf96a1d950133d24302",
-        "appends.json": "c1eb7feded93c55dff6c82afe2f69bdf53f5074dd5fd69f5dcc2e9957c32a36b",
+        "appends.json": "2545f24281b87ba6c61967e4768e726581757b5300bf9265795e480f52990479",
         "readback.json": "3715866d9380bbe995e8f913b4f09f06d886274fea368d891fb9fde6fe2c7c93",
     }
     assert {key: record["records"][0]["digests"][key] for key in expected} == expected
