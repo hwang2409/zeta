@@ -59,7 +59,7 @@ from .presets import (
     compose_system_prompt,
     resolve_child_profile_tools,
 )
-from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
+from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
 from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
 
@@ -244,6 +244,8 @@ async def consume_child(
                 finish_gate_state,
                 delivering_prompt_id,
             )
+            if gate_result.outcome == "task_safety_expired":
+                child_loop.tool_registry.background_tasks.begin_shutdown(f"finish-gate task safety bound expired after {child_loop._background_owner.finish_gate_task_timeout:g} seconds")
             if finish_gate_state is not None:
                 finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
@@ -369,13 +371,13 @@ async def _build_child_loop(
     child_policy: ChildApprovalPolicy | None = None
     child_loop: AgentLoop | None = None
 
-    async def close_construction() -> None:
+    async def close_construction(*, background_task_cause: str) -> None:
         if child_loop is not None:
-            await child_loop.close()
+            await child_loop.close(background_task_cause=background_task_cause)
         elif is_owned_completion_backend(child_backend):
             await loop.close_backend(child_backend, stage="child_construction")
         if child_registry is not None:
-            await child_registry.close()
+            await child_registry.close(background_task_cause=background_task_cause)
 
     try:
         explicit_finish = explicit_finish_eligible(
@@ -490,14 +492,16 @@ async def _build_child_loop(
         child_loop.set_background_event_sink(loop._publish_background_event)
         return child_loop, child_policy
     except asyncio.CancelledError:
-        cleanup = asyncio.create_task(close_construction())
+        cleanup = asyncio.create_task(
+            close_construction(background_task_cause="child spawn setup canceled")
+        )
         while not cleanup.done():
             with suppress(asyncio.CancelledError):
                 await asyncio.shield(cleanup)
         cleanup.result()
         raise
     except BaseException:
-        await close_construction()
+        await close_construction(background_task_cause="child spawn setup failed")
         raise
 
 
@@ -1045,8 +1049,8 @@ async def run_agent_tool(
             loop._background_owner.mark_store_finished(child_store)
             loop._background_owner.release_unused_stores()
 
-        async def close_background_child() -> tuple[str, ...]:
-            return tuple(await child_loop.close(cancel_background=False))
+        async def close_background_child(cause: str) -> tuple[str, ...]:
+            return tuple(await child_loop.close(background_task_cause=cause, cancel_background=False))
 
         async def finish_background() -> None:
             await finish_background_child(
@@ -1136,8 +1140,7 @@ async def run_agent_tool(
             (child_task, abort_task),
             return_when=asyncio.FIRST_COMPLETED,
         )
-        # A completed child wins a same-turn abort race so its descendants can
-        # be adopted by receipt processing rather than canceled as unreachable.
+        # A completed child wins an abort race so descendants can be adopted by receipt processing.
         if child_task in done:
             result = child_task.result()
             if follow_up_loop:
@@ -1166,8 +1169,7 @@ async def run_agent_tool(
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
-        await child_loop.close(cancel_background=False)
-
+        await child_loop.close(cancel_background=False, background_task_cause=child_cleanup_details("foreground", child_task.cancelled())[0])
 
 def _child_base_system_prompt(
     loop: AgentLoop,

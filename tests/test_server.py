@@ -93,6 +93,7 @@ from zeta.server.server import _Client
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
+from zeta.tui.render import render_event
 
 # A hang guard for waits on real frames, not a speed limit: a loaded CI
 # runner can take more than a few seconds between frames.
@@ -4819,7 +4820,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         written = await original_write(target, payload)
         if b'"sub_agent_receipt"' in payload and not published.is_set():
             published.set()
-            await release_publication.wait()
+            await asyncio.wait_for(release_publication.wait(), TIMEOUT)
         return written
 
     monkeypatch.setattr(client.codec, "write", gate_after_receipt_bytes)
@@ -4837,7 +4838,9 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
-        await asyncio.gather(first_turn, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(first_turn, return_exceptions=True), 10
+        )
         assert [
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
@@ -4879,8 +4882,14 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
+    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     store.append_task_notification(
-        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+        task_id="task-1",
+        command="printf hi",
+        exit_code=0,
+        output_tail="hi",
+        note=task_cause,
+        background_metadata=("run_background", "task_kill"),
     )
     store._append_row(
         "notification",
@@ -4912,10 +4921,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
             row["notification"].get("kind", "agent_completion"): row for row in rows
         }
         assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
-        assert (
-            "background task task-1 exited"
-            in by_kind["task_exited"]["content"][0]["text"]
-        )
+        assert task_cause in by_kind["task_exited"]["content"][0]["text"]
         assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
         assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
     finally:
@@ -4923,8 +4929,15 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 
 
 @pytest.mark.asyncio
-async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None:
-    # Protocol 1.2 gives known notification kinds explicit events.
+@pytest.mark.parametrize(
+    "task_cause",
+    ["foreground child completion cleanup", "tool registry closed"],
+    ids=["child-cleanup", "registry-close"],
+)
+async def test_close_kill_cause_reaches_live_serve_event(
+    tmp_path: Path, task_cause: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Protocol 1.2 gives close-driven task exits an explicit event.
     backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
     server = ZetaServer(
         home=tmp_path,
@@ -4932,38 +4945,125 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
-    store.append_task_notification(
-        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
-    )
-    store.append_agent_notification(
-        "child-1",
-        child_session_path="/tmp/child-1",
-        description="child",
-        status="completed",
-        text="child done",
+    reader, writer, session_id = await _ready_extensions(server)
+    writer.close()
+    await asyncio.wait_for(writer.wait_closed(), TIMEOUT)
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection("127.0.0.1", server.port), TIMEOUT
     )
     try:
-        writer.close()
-        await writer.wait_closed()
-        await asyncio.sleep(0.05)
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        frames = await _request(
+        hello_frames = await _request(
             reader, writer, 4, "hello", {"protocol_version": "1.2"}
         )
-        frames += await _frames_until_event(reader, "turn_end")
+        store = server.runtime.opened.store
+        store.append_agent_notification(
+            "child-1",
+            child_session_path="/tmp/child-1",
+            description="child",
+            status="completed",
+            text="child done",
+        )
+        registry = server.runtime.loop.tool_registry.background_tasks
+        task_id, _pid = await registry.start("sleep 30", tmp_path)
+        admission_started = threading.Event()
+        admission_held_past_old_deadline = threading.Event()
+        release_admission = threading.Event()
+        hold_observer: threading.Thread | None = None
+        if task_cause == "tool registry closed":
+            flow = await server.runtime.loop._ensure_step_delivery()
+            original_produce = flow.produce
+
+            async def gated_produce(item):
+                if getattr(item, "kind", None) == "task_exit":
+                    admission_started.set()
+                    assert await asyncio.wait_for(
+                        asyncio.to_thread(release_admission.wait, 10), 10
+                    ), "task-exit admission was not released"
+                return await original_produce(item)
+
+            monkeypatch.setattr(flow, "produce", gated_produce)
+
+            def observe_old_deadline() -> None:
+                if admission_started.wait(10) and not release_admission.wait(1.1):
+                    admission_held_past_old_deadline.set()
+
+            hold_observer = threading.Thread(target=observe_old_deadline)
+            hold_observer.start()
+        registry.begin_shutdown(task_cause)
+        close_task = asyncio.create_task(registry.close())
+        try:
+            if hold_observer is not None:
+                assert await asyncio.wait_for(
+                    asyncio.to_thread(admission_held_past_old_deadline.wait, 10), 10
+                )
+                release_admission.set()
+            close_result = await asyncio.wait_for(
+                asyncio.gather(close_task, return_exceptions=True), 10
+            )
+            assert close_result == [(task_id,)]
+        finally:
+            release_admission.set()
+            if not close_task.done():
+                close_task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(close_task, return_exceptions=True), 10
+            )
+            if hold_observer is not None:
+                await asyncio.wait_for(asyncio.to_thread(hold_observer.join, 10), 10)
+
+        history_frames = await _request(
+            reader,
+            writer,
+            6,
+            "session_history",
+            {"session_id": session_id},
+        )
+        history = history_frames[-1]["result"]["messages"]
+        task_rows = [
+            row
+            for row in history
+            if row.get("notification", {}).get("kind") == "task_exited"
+        ]
+        assert len(task_rows) == 1
+        assert task_cause in task_rows[0]["content"][0]["text"]
+        notification = next(
+            entry
+            for entry in store.agent_notifications()
+            if entry.data.get("kind") == "task_exited"
+        )
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "notification_id": notification.id,
+                    **notification.data,
+                    "tui_presented": store.is_agent_notification_presented_to_tui(
+                        notification.id
+                    ),
+                },
+            )
+        )
+        assert rendered is not None
+        assert task_cause in rendered.plain
+
+        task_frames = history_frames
+        if not any(
+            frame.get("params", {}).get("event") == "turn_end"
+            for frame in task_frames
+        ):
+            task_frames += await _frames_until_event(reader, "turn_end")
         events = [
             frame["params"]
-            for frame in frames
+            for frame in task_frames + hello_frames
             if frame.get("params", {}).get("event")
             in {"task_exit_notification", "sub_agent_receipt"}
         ]
         task_events = [e for e in events if e["event"] == "task_exit_notification"]
         receipt_events = [e for e in events if e["event"] == "sub_agent_receipt"]
         assert len(task_events) == 1
-        assert task_events[0]["data"]["task_id"] == "task-1"
+        assert task_events[0]["data"]["task_id"] == task_id
         assert task_events[0]["data"]["kind"] == "task_exited"
+        assert task_events[0]["data"]["note"] == task_cause
         assert {
             e["data"].get("kind", "agent_completion") for e in receipt_events
         } == {"agent_completion"}
@@ -6978,7 +7078,8 @@ async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
-def test_memory_command_parity_tui_and_serve() -> None:
+@pytest.mark.asyncio
+async def test_memory_command_parity_tui_and_serve() -> None:
     from types import SimpleNamespace
 
     from zeta.tui.slash_handlers import SlashHandlerMixin
@@ -7017,8 +7118,14 @@ def test_memory_command_parity_tui_and_serve() -> None:
         metadata=SimpleNamespace(project_id="p"),
         manager=SimpleNamespace(project_registry=Registry()),
     )
-    tui_outputs = [SlashHandlerMixin.slash_memory(tui, command) for command in ("log", "undo", "accept state.md")]
-    serve_outputs = [ServerSlashSession(runtime).slash_memory(command) for command in ("log", "undo", "accept state.md")]
+    tui_outputs = [
+        await SlashHandlerMixin.slash_memory(tui, command)
+        for command in ("log", "undo", "accept state.md")
+    ]
+    serve_outputs = [
+        await ServerSlashSession(runtime).slash_memory(command)
+        for command in ("log", "undo", "accept state.md")
+    ]
     assert tui_outputs == serve_outputs
     assert tui_registry.calls == runtime.manager.project_registry.calls
 
@@ -7075,6 +7182,58 @@ async def test_slash_status_maps_compaction_with_or_without_fact_floor(
         assert result["kind"] == "output"
         assert "compaction_history:\n  turn 1: 1 entries" in result["text"]
         assert "retained typed facts" not in result["text"]
+    finally:
+        await _close(server, writer)
+
+
+async def test_serve_project_init_runs_discovery_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+
+    loop_thread = threading.get_ident()
+    discovery_threads: list[int] = []
+    run_discovery_git = project_context._run_discovery_git
+
+    def record_discovery(*args, **kwargs):
+        discovery_threads.append(threading.get_ident())
+        return run_discovery_git(*args, **kwargs)
+
+    # test-contract: seam observe the real Git subprocess seam through socket RPC
+    monkeypatch.setattr(project_context, "_run_discovery_git", record_discovery)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = ZetaServer(
+        home=tmp_path / "home",
+        cwd=workspace,
+        port=0,
+        provider="codex",
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    discovery_threads.clear()
+    try:
+        response = (
+            await _request(
+                reader,
+                writer,
+                "project-init",
+                "slash_run",
+                {"session_id": sid, "text": "/project init"},
+            )
+        )[-1]
+
+        project_id = server.runtime.metadata.project_id
+        assert project_id is not None
+        assert response["result"] == {
+            "kind": "output",
+            "text": (
+                f"project: workspace ({project_id})\n"
+                f"root: {workspace.resolve()}\n"
+                "memory: brief, decisions, state, backlog, changelog"
+            ),
+        }
+        assert discovery_threads
+        assert all(thread_id != loop_thread for thread_id in discovery_threads)
     finally:
         await _close(server, writer)
 
@@ -7573,6 +7732,8 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
+        # `/project init` mutates the session association — must reject.
+        assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only and bypasses the mutation guard.
         assert (await run(6, "/model"))["result"] == {
             "kind": "output",
@@ -8708,6 +8869,9 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
 
 def _serve_switch_rename_race(home_value: str, results: object) -> None:
     home = Path(home_value)
+    from zeta.storage_format import advance
+
+    advance(home, expected_epoch=0)
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
     for account in (first, second):
@@ -8715,9 +8879,6 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             OAuthTokens(account.name, "refresh", 9_999_999_999)
         )
     AccountStore(home).set_default(first)
-    from zeta.storage_format import advance
-
-    advance(home, expected_epoch=0)
     server = ZetaServer(home=home, cwd=home, port=0, provider="codex")
 
     async def run() -> None:

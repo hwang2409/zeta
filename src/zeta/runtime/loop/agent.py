@@ -472,9 +472,12 @@ class AgentLoop(
         self.tool_registry.start_batch()
         return True
 
-    async def _close_delivery_resources(self) -> tuple[str, ...]:
+    async def _close_delivery_resources(
+        self, *, background_task_cause: str
+    ) -> tuple[str, ...]:
         killed: tuple[str, ...] = ()
         try:
+            self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
             killed = await self.tool_registry.close()
             late_tasks = tuple(self._tracked_tasks)
             if late_tasks:
@@ -500,7 +503,12 @@ class AgentLoop(
                 )
         return killed
 
-    async def close(self, *, cancel_background: bool = True) -> tuple[str, ...]:
+    async def close(
+        self,
+        *,
+        cancel_background: bool = True,
+        background_task_cause: str = "session shutdown",
+    ) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
 
         Returns the ids of background tasks killed by this close so a completing
@@ -515,7 +523,9 @@ class AgentLoop(
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
-                self.tool_registry.background_tasks.begin_shutdown()
+                self.tool_registry.background_tasks.begin_shutdown(
+                    background_task_cause
+                )
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
@@ -545,7 +555,9 @@ class AgentLoop(
                 self._mcp_mount = None
         finally:
             await self.close_backend_owners(stage="runtime_close")
-            killed = await self._close_delivery_resources()
+            killed = await self._close_delivery_resources(
+                background_task_cause=background_task_cause
+            )
         return killed
 
     def session_start(self) -> None:
@@ -553,21 +565,14 @@ class AgentLoop(
             self.hooks.session_start()
 
     async def _produce_task_exit(self, item: TaskExitInput) -> ProducerResult:
-        data: dict[str, object] = {
-            "task_id": item.task_id,
-            "headline": item.command,
-            "exit_code": item.exit_code,
-            "output_tail": item.output_tail,
-            "background_owner": item.owner,
-            "background_phase": item.phase,
-        }
-        if item.log_path is not None:
-            data["log_path"] = item.log_path
-        if item.note is not None:
-            data["note"] = item.note
         step_delivery = await self._ensure_step_delivery()
         return await step_delivery.produce(
-            NotificationInput("task_exit", data, dedupe_key=item.task_id)
+            NotificationInput(
+                "task_exit",
+                item.notification_data(),
+                dedupe_key=item.task_id,
+                tui_presented=item.tui_presented,
+            )
         )
 
     async def activate(self) -> None:
@@ -579,7 +584,10 @@ class AgentLoop(
         self._activated = True
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
-            await self._produce_task_exit(item)
+            await self.tool_registry.background_tasks._notify_exit(
+                item.task_id, item.command, item.exit_code, item.output_tail, item.log_path, item.note,
+                owner=item.owner, phase=item.phase, tui_presented=item.tui_presented,
+            )
         self._pending_task_recovery = ()
         await recovery_lease.activate_agent_children(self)
         self.session_start()
