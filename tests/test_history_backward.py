@@ -10,6 +10,7 @@ import pytest
 
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -19,6 +20,8 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer, ergonomics, protocol
 from zeta.server.protocol import FrameCodec, ProtocolError
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 
 def _entry(number: int) -> SimpleNamespace:
@@ -50,7 +53,7 @@ def _backward_history(store: _HistoryStore, params: dict[str, object]) -> dict[s
 async def _real_history_server(tmp_path: Path, count: int = 220) -> AsyncIterator[tuple[object, object, str, ZetaServer]]:
     server = ZetaServer(
         home=tmp_path,
-        socket_path=Path("/tmp") / f"zeta-history-{tmp_path.name}.sock",
+        socket_path=_socket_path(tmp_path),
         provider="codex",
     )
     await server.start()

@@ -16,13 +16,13 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.serve_close import close_serve
+from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
+    _close,
     _connect,
     _read_raw,
     _request,
-    _socket_path,
 )
 from tests.test_server_observers import _controller_event_stream
 from zeta.protocol.types import (
@@ -39,6 +39,8 @@ from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 
 class _GatedBackend(CompletionBackend):

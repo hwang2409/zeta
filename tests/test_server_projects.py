@@ -104,7 +104,7 @@ def _filesystem_snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
 
 
 @pytest.mark.asyncio
-async def test_new_session_promotes_healthy_cwd_project_after_malformed_probe(
+async def test_new_session_promotes_healthy_cwd_project_after_malformed_finding(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -131,12 +131,18 @@ async def test_new_session_promotes_healthy_cwd_project_after_malformed_probe(
     )
     try:
         await server.start()
-        assert server.runtime.manager.project_registry_unavailable is not None
+        assert server.runtime.manager.project_registry_unavailable is None
 
         metadata = await server.runtime.create_session()
 
         assert metadata.project_id == healthy.project_id
         assert server.runtime.loop.root_project_id == healthy.project_id
+        assert server.runtime.loop.project_context_health is not None
+        assert server.runtime.loop.project_context_health.code == "malformed_project"
+        assert (
+            server.runtime.loop.project_context_health.project_id
+            == malformed.project_id
+        )
     finally:
         await server.close()
 

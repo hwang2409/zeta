@@ -16,12 +16,14 @@ from urllib.parse import urlencode
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.serve_close import close_serve
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.cli.main import build_parser
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
 from zeta.server.protocol import MAX_FRAME_BYTES
 from zeta.server.transport import _parse_subprotocol_auth
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 TIMEOUT = 3
 
@@ -140,6 +142,12 @@ async def _read_json(reader: asyncio.StreamReader) -> dict[str, object]:
     return json.loads(payload)
 
 
+async def close_serve(
+    server: ZetaServer, writer: asyncio.StreamWriter | None = None
+) -> None:
+    if writer is not None:
+        writer.close()
+    await asyncio.wait_for(server.close(), TIMEOUT)
 
 
 @pytest.mark.asyncio
@@ -386,7 +394,7 @@ async def test_websocket_valid_bearer_echoes_only_v1(tmp_path: Path) -> None:
 async def test_websocket_and_unix_socket_share_single_client_limit(
     tmp_path: Path,
 ) -> None:
-    socket_path = Path("/tmp") / f"zeta-ws-{secrets.token_hex(8)}.sock"
+    socket_path = _socket_path(tmp_path)
     server = ZetaServer(
         home=tmp_path, socket_path=socket_path, ws_port=0, provider="codex"
     )
@@ -616,7 +624,9 @@ async def test_observer_credential_cannot_claim_controller_before_or_after_disco
             "message"
         ] == "credential permits observer role only"
     finally:
-        await close_serve(server, observer[1])
+        observer[1].close()
+        await observer[1].wait_closed()
+        await close_serve(server)
 
 
 @pytest.mark.asyncio

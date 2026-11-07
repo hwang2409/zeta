@@ -12,6 +12,7 @@ import pytest
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.serve_close import close_serve
 from tests.support.server_client import event, request
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -28,6 +29,8 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer
 
+pytest_plugins = ("tests.support.socket_fixtures",)
+
 
 async def _open(
     tmp_path: Path,
@@ -38,7 +41,7 @@ async def _open(
     server = ZetaServer(
         provider="codex",
         home=tmp_path,
-        socket_path=Path("/tmp") / f"zeta-history-fidelity-{tmp_path.name}.sock",
+        socket_path=_socket_path(tmp_path),
         backend_factory=(
             (lambda provider, model, home: (backend, model or "offline"))
             if backend is not None

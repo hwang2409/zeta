@@ -16,15 +16,15 @@ import pytest
 from PIL import Image
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.serve_close import close_serve
+from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
+    _close,
     _connect,
     _event,
     _frames_until_event,
     _read,
     _request,
-    _socket_path,
 )
 from zeta.core.session import SessionMetadata
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
@@ -32,6 +32,8 @@ from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.server import ZetaServer, image_delivery
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 FEATURES = [
     "session_cwd",
@@ -192,7 +194,7 @@ async def test_resume_runs_tools_in_the_session_cwd(
 
         async def gated_send(connection: object, payload: bytes) -> bool:
             if connection is controller and json.loads(payload).get("id") == 4:
-                await asyncio.wait_for(tool_end_written.wait(), 10)
+                await tool_end_written.wait()
             return await original_send(connection, payload)
 
         async def record_write(payload: bytes) -> bool:
@@ -708,7 +710,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
 
     def record_decode(*args, **kwargs):
         if threading.get_ident() != threading.main_thread().ident:
-            heartbeat_reached_thread.wait(10)
+            heartbeat_reached_thread.wait()
         decoded_after_heartbeat.append(heartbeat.is_set())
         return original_decode(*args, **kwargs)
 
@@ -742,8 +744,8 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
         )
         asyncio.get_running_loop().call_soon(heartbeat.set)
         asyncio.get_running_loop().call_soon(heartbeat_reached_thread.set)
-        await asyncio.wait_for(heartbeat.wait(), 10)
-        assert await asyncio.wait_for(request, 10) == {"accepted": True, "session_id": session_id}
+        await heartbeat.wait()
+        assert await request == {"accepted": True, "session_id": session_id}
         assert decoded_after_heartbeat and all(decoded_after_heartbeat)
         await _event(reader, "agent_end")
     finally:
@@ -762,7 +764,7 @@ async def test_cancelled_send_images_publishes_nothing(
 
     async def gated_normalize(*args, **kwargs):
         worker_started.set()
-        release_worker.wait(10)
+        release_worker.wait()
         try:
             return await original_normalize(*args, **kwargs)
         finally:
@@ -796,7 +798,7 @@ async def test_cancelled_send_images_publishes_nothing(
         request.cancel()
         release_worker.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(request, 10)
+            await request
         await asyncio.to_thread(worker_finished.wait)
 
         assert server.runtime.opened.store.messages() == []
@@ -1305,9 +1307,7 @@ async def test_session_host_commands_negotiation_validation_and_redaction(
         assert not server.control._active_host_commands.commands
     finally:
         await close_serve(
-            server,
-            writer,
-            *([observer_writer] if observer_writer is not None else []),
+            server, writer, *([observer_writer] if observer_writer is not None else [])
         )
 
     unnegotiated = _server(tmp_path / "unnegotiated", None, _launch(tmp_path))
@@ -1644,9 +1644,7 @@ async def test_session_host_commands_reject_client_turn_before_resume(
         assert backend.calls == []
         assert tuple(server.runtime.opened.store.entries) == durable_rows
     finally:
-        await close_serve(
-            server, *([replay_writer] if replay_writer is not None else [])
-        )
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -1678,9 +1676,7 @@ async def test_legacy_session_still_accepts_send_after_reconnect(tmp_path: Path)
         await _event(replay_reader, "agent_end")
         assert len(backend.calls) == 1
     finally:
-        await close_serve(
-            server, *([replay_writer] if replay_writer is not None else [])
-        )
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -1737,9 +1733,7 @@ async def test_detached_session_returns_existing_duplicate_delivery(
         assert len(backend.calls) == 1
         assert tuple(server.runtime.opened.store.entries) == durable_rows
     finally:
-        await close_serve(
-            server, *([replay_writer] if replay_writer is not None else [])
-        )
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -1879,9 +1873,7 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             for block in message.content
         )
     finally:
-        await close_serve(
-            server, *([replay_writer] if replay_writer is not None else [])
-        )
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -1996,9 +1988,7 @@ async def test_session_host_commands_live_approval_before_resume_keeps_original_
             for block in message.content
         )
     finally:
-        await close_serve(
-            server, *([replay_writer] if replay_writer is not None else [])
-        )
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -2120,9 +2110,7 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
             == 1
         )
     finally:
-        await close_serve(
-            server, *([replay_writer] if replay_writer is not None else [])
-        )
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event as _event
 from tests.support.server_client import frames_until_event as _frames_until_event
 from tests.support.server_client import request as _request
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ErrorInfo,
@@ -40,11 +41,9 @@ from zeta.server.delivery import (
     _deliver_after_commit,
 )
 
+pytest_plugins = ("tests.support.socket_fixtures",)
+
 TIMEOUT = 3
-
-
-def _socket_path(tmp_path: Path, suffix: str = "") -> Path:
-    return Path("/tmp") / f"zeta-delivery-{tmp_path.name}{suffix}.sock"
 
 
 async def _connect(server: ZetaServer):
