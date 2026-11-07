@@ -87,6 +87,12 @@ def notification_wire_event(kind: object, protocol_version: str) -> str:
     return NOTIFICATION_WIRE_EVENTS.get(kind, LEGACY_NOTIFICATION_WIRE_EVENT)
 
 
+def notification_payload(notification: Mapping[str, object]) -> dict[str, object]:
+    """Preserve additive durable notification fields on the serve wire."""
+
+    return dict(notification)
+
+
 class AuxiliaryEvent(Enum):
     MEMORY_UPDATED = auto()
     TURN_ABORTED = auto()
