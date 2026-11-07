@@ -14359,7 +14359,6 @@ async def test_ask_parent_answer_does_not_block_finish(
     await loop.close()
 
 
-# test-contract: seam observe private append-lock ownership because no public seam exists.
 async def _assert_fence_operation_does_not_block_loop(
     store: ConversationStore,
     operation,
@@ -14376,6 +14375,7 @@ async def _assert_fence_operation_does_not_block_loop(
         return append_lock(candidate, *args, **kwargs)
 
     with monkeypatch.context() as patch:
+        # test-contract: seam observe lock ownership because no public seam exists.
         patch.setattr(ConversationStore, "_append_lock", observed_append_lock)
         result = await operation()
 

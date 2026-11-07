@@ -13106,7 +13106,6 @@ async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
 
 
 @pytest.mark.asyncio
-# test-contract: seam observe private metadata-lock ownership because no public seam exists.
 async def test_tui_model_command_does_no_lock_work_on_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -13154,6 +13153,7 @@ async def test_tui_model_command_does_no_lock_work_on_loop(
         lock_threads.append(threading.get_ident())
         return metadata_lock(*args, **kwargs)
 
+    # test-contract: seam observe lock ownership because no public seam exists.
     monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
     output = await app._slash_commands.dispatch_async(app, "/model gpt-5.4")
 
