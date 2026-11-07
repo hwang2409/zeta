@@ -928,7 +928,7 @@ def test_child_reconciliation_reads_registry_once(
 
 
 @pytest.mark.asyncio
-async def test_real_child_spawns_repeat_a_bounded_ready_set(
+async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.core import session_links
@@ -956,12 +956,11 @@ async def test_real_child_spawns_repeat_a_bounded_ready_set(
     monkeypatch.setattr(
         loop.store, "append_child_run_started_async", stop_after_publication
     )
-    # test-contract: seam reduce the production batch limit without 257 spawns
-    monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
     owner_before_collection = threading.Event()
     release_owner = threading.Event()
     real_session_directory = session_links.session_directory
     calls_by_thread: dict[int, int] = {}
+    event_loop_thread_id = threading.get_ident()
     owner_thread_id: int | None = None
     real_persist = session_links.persist_pending_child_link
 
@@ -970,11 +969,17 @@ async def test_real_child_spawns_repeat_a_bounded_ready_set(
         real_persist(*args, **kwargs)
         if owner_thread_id is None:
             owner_thread_id = threading.get_ident()
+            if owner_thread_id == event_loop_thread_id:
+                owner_before_collection.set()
 
     def gate_before_collection(*args: object, **kwargs: object):
         thread_id = threading.get_ident()
         calls_by_thread[thread_id] = calls_by_thread.get(thread_id, 0) + 1
-        if thread_id == owner_thread_id and calls_by_thread[thread_id] == 2:
+        if (
+            thread_id == owner_thread_id
+            and thread_id != event_loop_thread_id
+            and calls_by_thread[thread_id] == 2
+        ):
             owner_before_collection.set()
             release_owner.wait()
         return real_session_directory(*args, **kwargs)
@@ -994,7 +999,7 @@ async def test_real_child_spawns_repeat_a_bounded_ready_set(
     signals = AbortGenerationRegistry()
     calls = [
         ToolCall(
-            f"child-more-{index}",
+            f"child-stable-{index}",
             "agent",
             {
                 "prompt": f"work {index}",
@@ -1002,7 +1007,7 @@ async def test_real_child_spawns_repeat_a_bounded_ready_set(
                 "background": False,
             },
         )
-        for index in range(3)
+        for index in range(257)
     ]
     first = asyncio.create_task(
         loop._run_agent_tool(
@@ -1011,11 +1016,9 @@ async def test_real_child_spawns_repeat_a_bounded_ready_set(
     )
     await asyncio.to_thread(owner_before_collection.wait)
     tasks = [first]
-    for item in calls[1:]:
+    for call in calls[1:]:
         task = asyncio.create_task(
-            loop._run_agent_tool(
-                item, item.arguments, signals.new_generation(), None
-            )
+            loop._run_agent_tool(call, call.arguments, signals.new_generation(), None)
         )
         tasks.append(task)
         await asyncio.gather(task, return_exceptions=True)
@@ -1026,15 +1029,18 @@ async def test_real_child_spawns_repeat_a_bounded_ready_set(
 
     assert all(isinstance(result, RuntimeError) for result in results)
     assert registry_reads == 2
-    records = registry.list_session_links(project.project_id, limit=100)
+    records = registry.list_session_links(project.project_id, limit=10_000)
     child_ids = [
         record["session_id"] for record in records if ":" in str(record["session_id"])
     ]
-    assert len(child_ids) == 3
+    assert len(child_ids) == 257
+    assert len(set(child_ids)) == 257
+    pending = opened.store.session_dir / session_links.PENDING_CHILD_LINKS_DIRNAME
+    assert list(pending.iterdir()) == []
 
 
 @pytest.mark.asyncio
-async def test_real_child_spawns_drain_stable_overflow_in_bounded_batches(
+async def test_real_child_spawns_repeat_after_generation_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.core import session_links
@@ -1240,6 +1246,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         return real_read(*args, **kwargs)
 
     monkeypatch.setattr(registry, "record_sessions", gate_batches)
+    # test-contract: seam count registry scans behind real nested spawn calls
     monkeypatch.setattr(registry, "_read_session_records", count_registry_read)
     grand_calls = [call(f"grandchild-{index}") for index in range(4)]
     grand_tasks = [
