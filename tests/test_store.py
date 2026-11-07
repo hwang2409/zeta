@@ -2037,6 +2037,76 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
     assert store.bash_cwd == str(Path.cwd())
 
 
+@pytest.mark.parametrize(
+    ("damage", "kind", "reason_code"),
+    [
+        ("parse", "invalid_row", "invalid_json"),
+        ("payload", "invalid_row", "invalid_payload"),
+        ("links", "broken_links", "missing_parent"),
+    ],
+)
+def test_corrupt_transcript_diagnosis_localizes_first_bad_row(
+    tmp_path: Path, damage: str, kind: str, reason_code: str
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"diagnose-{damage}")
+    store.append_message(message(MessageRole.USER, "first"))
+    store.append_message(message(MessageRole.ASSISTANT, "second"))
+    path = store.path
+    lines = path.read_bytes().splitlines(keepends=True)
+    expected_offset = len(lines[0]) + len(lines[1])
+    row = json.loads(lines[2])
+    if damage == "parse":
+        lines[2] = b'{"private":"must-not-leak"\n'
+    elif damage == "payload":
+        row["data"] = {"private": "must-not-leak"}
+        lines[2] = json.dumps(row).encode() + b"\n"
+    else:
+        row["parent_id"] = "must-not-leak"
+        lines[2] = json.dumps(row).encode() + b"\n"
+    damaged = b"".join(lines)
+    path.write_bytes(damaged)
+
+    with pytest.raises(ConversationIntegrityError) as raised:
+        ConversationStore(tmp_path, session_id=store.session_id, _read_only=True)
+
+    error = raised.value
+    assert (error.kind, error.row_number, error.byte_offset) == (
+        kind,
+        3,
+        expected_offset,
+    )
+    assert error.valid_prefix_end == expected_offset
+    assert error.reason_code == reason_code
+    assert "must-not-leak" not in str(error)
+    assert str(path) not in str(error)
+    assert path.read_bytes() == damaged
+
+
+@pytest.mark.parametrize("damage", ["future_schema", "future_entry"])
+def test_transcript_compatibility_classification_precedes_corruption(
+    tmp_path: Path, damage: str
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"diagnose-{damage}")
+    store.append_message(message(MessageRole.USER, "first"))
+    lines = store.path.read_bytes().splitlines(keepends=True)
+    row_index = 0 if damage == "future_schema" else 1
+    row = json.loads(lines[row_index])
+    if damage == "future_schema":
+        row["data"]["schema"] = "zeta.conversation.v999"
+    else:
+        row["type"] = "future_entry"
+        row["data"] = {"message": "not validated for a future type"}
+    lines[row_index] = json.dumps(row).encode() + b"\n"
+    store.path.write_bytes(b"".join(lines))
+
+    with pytest.raises(ConversationIntegrityError) as raised:
+        ConversationStore(tmp_path, session_id=store.session_id, _read_only=True)
+
+    assert raised.value.kind == "unsupported_format"
+    assert raised.value.row_number == row_index + 1
+    assert raised.value.repairable is False
+
+
 def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
@@ -2068,7 +2138,9 @@ def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:
     with store.path.open("ab") as handle:
         handle.write(b'{"invalid": }\n')
 
-    with pytest.raises(ConversationIntegrityError, match="terminated"):
+    with pytest.raises(
+        ConversationIntegrityError, match="terminated invalid conversation row at row 2"
+    ):
         ConversationStore(tmp_path, session_id=store.session_id)
 
 

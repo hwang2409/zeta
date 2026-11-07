@@ -26,7 +26,7 @@ from ...core.session_files import (
     open_session_file,
     session_directory,
 )
-from ...core.store import ConversationStore
+from ...core.store import ConversationStore, TranscriptLoadError
 from ...protocol.types import is_passive_harness_message
 from ..todo import TodoSnapshot
 from .agent_shutdown import SHUTDOWN_BUDGET_SECONDS, finish_cleanup_or_handoff
@@ -549,17 +549,25 @@ class AgentTranscriptSource:
     def _log_refresh_error(self, error: Exception, *, traceback: bool) -> None:
         if self._refresh_error_logged:
             return
-        _LOGGER.warning(
-            "agent transcript refresh failed for %s: %s",
-            self.path,
-            error,
-            exc_info=error if traceback else None,
-        )
+        if isinstance(error, TranscriptLoadError):
+            _LOGGER.warning("agent transcript refresh failed: %s", error)
+        else:
+            _LOGGER.warning(
+                "agent transcript refresh failed for %s: %s",
+                self.path,
+                error,
+                exc_info=error if traceback else None,
+            )
         self._refresh_error_logged = True
 
     def _failed_snapshot(self, error: Exception) -> AgentTranscriptTreeSnapshot:
         self._log_refresh_error(error, traceback=True)
-        snapshot = AgentTranscriptSnapshot((), (), _REFRESH_UNAVAILABLE)
+        reason = (
+            str(error)
+            if isinstance(error, TranscriptLoadError)
+            else _REFRESH_UNAVAILABLE
+        )
+        snapshot = AgentTranscriptSnapshot((), (), reason)
         self._snapshots[self.path] = snapshot
         return AgentTranscriptTreeSnapshot(self.path, ((self.path, snapshot),))
 

@@ -359,6 +359,26 @@ data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
 recovery.
 
+If the transcript is corrupt or uses a newer conversation format, `resume`
+returns `-32000` with bounded data:
+
+```text
+{
+  code: "corrupt_transcript",
+  kind: "torn_tail" | "invalid_row" | "broken_links" | "unsupported_format" | "unrecoverable_header",
+  row: integer | null,
+  repairable: boolean,
+  session_id: string,
+  child_run_id?: string,
+  actions: []
+}
+```
+
+The diagnosis-only protocol has no repair request, so `actions` is always the
+empty array. The object has at most seven fields and contains no transcript
+bytes, payload text, file path, digest, source identity, or arbitrary exception
+text. `row` identifies the first bad physical row when it is known.
+
 A resumed session runs in its stored `cwd`, not in the server launch
 directory. If that directory no longer exists, `resume` returns `-32602` with
 the message `session working directory no longer exists: <cwd>`, and the active

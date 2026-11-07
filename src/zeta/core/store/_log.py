@@ -24,12 +24,14 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from ...agent.receipt import encode_json
 from ..checkpoints import (
+    CONVERSATION_ENTRY_TYPES,
     ConversationEntry,
     ConversationIntegrityError,
     _now,
     load_session_json,
 )
 from ..session_files import open_session_file, read_session_file
+from ._diagnosis import TranscriptFailureKind, TranscriptLoadError
 from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
@@ -454,9 +456,13 @@ class ConversationLogMixin:
             if fd >= 0:
                 os.close(fd)
 
-        entries, torn_at = self._parse_entry_lines(
-            raw, first_row=len(self._entries) + 2
-        )
+        try:
+            entries, torn_at = self._parse_entry_lines(
+                raw, first_row=len(self._entries) + 2
+            )
+        except ConversationIntegrityError:
+            self._load_full()
+            return
         if torn_at is not None:
             if getattr(self, "_strict_snapshot_sync", False):
                 self._strict_snapshot_sync = False
@@ -468,7 +474,12 @@ class ConversationLogMixin:
                 )
             self._repair_torn_tail(known_offset + torn_at)
             # Parse any complete rows before the torn suffix before recording the warning.
-            if not self._accept_incremental_entries(entries):
+            try:
+                accepted = self._accept_incremental_entries(entries)
+            except ConversationIntegrityError:
+                self._load_full()
+                return
+            if not accepted:
                 self._load_full()
                 return
             self._log_offset = known_offset + torn_at
@@ -476,7 +487,12 @@ class ConversationLogMixin:
             self._append_torn_warning()
             return
 
-        if not self._accept_incremental_entries(entries):
+        try:
+            accepted = self._accept_incremental_entries(entries)
+        except ConversationIntegrityError:
+            self._load_full()
+            return
+        if not accepted:
             self._load_full()
             return
         if not self._read_only and not raw.endswith(b"\n"):
@@ -487,12 +503,70 @@ class ConversationLogMixin:
             self._set_log_stat(stat)
         self._publish_entries_installed(tuple(entries))
 
+    def _transcript_error(
+        self: ConversationStore,
+        *,
+        kind: TranscriptFailureKind,
+        row_number: int | None,
+        byte_offset: int | None,
+        valid_prefix_end: int | None,
+        reason_code: str,
+        repairable: bool,
+        raw: bytes,
+        stat: os.stat_result,
+    ) -> TranscriptLoadError:
+        prefix_end = valid_prefix_end or 0
+        return TranscriptLoadError(
+            kind=kind,
+            session_id=self.session_id,
+            row_number=row_number,
+            byte_offset=byte_offset,
+            valid_prefix_end=valid_prefix_end,
+            reason_code=reason_code,
+            repairable=repairable,
+            source_device=stat.st_dev,
+            source_inode=stat.st_ino,
+            source_size=stat.st_size,
+            prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
+        )
+
+    def _first_invalid_link(self: ConversationStore) -> tuple[int, str]:
+        entries = self._entries
+        try:
+            for count in range(1, len(entries) + 1):
+                self._entries = entries[:count]
+                try:
+                    self._validate_entries()
+                except ConversationIntegrityError as exc:
+                    message = str(exc)
+                    reason_code = (
+                        "missing_parent"
+                        if "missing prior parent" in message
+                        else "duplicate_id"
+                        if "duplicate conversation id" in message
+                        else "orphaned_root"
+                        if "orphaned root" in message
+                        else "invalid_sequence"
+                        if "non-monotonic conversation sequence" in message
+                        else "invalid_links"
+                    )
+                    return count + 1, reason_code
+        finally:
+            self._entries = entries
+        return len(entries) + 1, "invalid_links"
+
     def _load_full(self: ConversationStore) -> None:
         self._full_reload_count += 1
         baseline = (len(self._entries), self._entry_prefix_digest)
+        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+        try:
+            stat = os.fstat(fd)
+        finally:
+            os.close(fd)
         raw = read_session_file(self.directory_fd, "conversation.jsonl")
         lines = raw.splitlines(keepends=True)
         valid_rows: list[dict[str, Any]] = []
+        row_offsets: list[int] = []
         torn_offset: int | None = None
         offset = 0
         for index, line in enumerate(lines):
@@ -501,43 +575,163 @@ class ConversationLogMixin:
             try:
                 row = load_session_json(line)
             except ConversationIntegrityError as exc:
-                if (
-                    self._read_only
-                    or index != len(lines) - 1
-                    or line.endswith(b"\n")
-                    or not isinstance(
-                        exc.__cause__, (json.JSONDecodeError, UnicodeError)
-                    )
-                ):
-                    kind = "terminated " if line.endswith(b"\n") else ""
-                    raise ConversationIntegrityError(
-                        f"invalid {kind}conversation row {index + 1}: {self.path}"
-                    ) from exc
-                torn_offset = offset
-                break
+                torn = (
+                    index == len(lines) - 1
+                    and not line.endswith(b"\n")
+                    and isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeError))
+                )
+                if torn and not self._read_only:
+                    torn_offset = offset
+                    break
+                kind: TranscriptFailureKind = (
+                    "unrecoverable_header"
+                    if index == 0
+                    else "torn_tail"
+                    if torn
+                    else "invalid_row"
+                )
+                raise self._transcript_error(
+                    kind=kind,
+                    row_number=index + 1,
+                    byte_offset=offset,
+                    valid_prefix_end=None if index == 0 else offset,
+                    reason_code="invalid_json",
+                    repairable=index > 0,
+                    raw=raw,
+                    stat=stat,
+                ) from exc
             if not isinstance(row, dict):
-                raise ConversationIntegrityError(
-                    f"conversation row {index + 1} is not an object: {self.path}"
+                kind = "unrecoverable_header" if index == 0 else "invalid_row"
+                raise self._transcript_error(
+                    kind=kind,
+                    row_number=index + 1,
+                    byte_offset=offset,
+                    valid_prefix_end=None if index == 0 else offset,
+                    reason_code="row_not_object",
+                    repairable=index > 0,
+                    raw=raw,
+                    stat=stat,
                 )
             valid_rows.append(row)
+            row_offsets.append(offset)
             offset += len(line)
 
         if not valid_rows:
-            raise ConversationIntegrityError(f"conversation file is empty: {self.path}")
-        self._validate_header(valid_rows[0])
+            raise self._transcript_error(
+                kind="unrecoverable_header",
+                row_number=1 if lines else None,
+                byte_offset=0 if lines else None,
+                valid_prefix_end=None,
+                reason_code="missing_header",
+                repairable=False,
+                raw=raw,
+                stat=stat,
+            )
         try:
-            self._entries = []
-            for index, row in enumerate(valid_rows[1:]):
-                if index and index % 64 == 0:
-                    time.sleep(0.0001)
-                self._entries.append(ConversationEntry.from_dict(row))
-        except ConversationIntegrityError:
-            raise
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ConversationIntegrityError(
-                f"invalid conversation entry: {self.path}"
+            self._validate_header(valid_rows[0])
+        except ConversationIntegrityError as exc:
+            header_data = valid_rows[0].get("data")
+            schema_is_unsupported = (
+                valid_rows[0].get("type") == "header"
+                and type(header_data) is dict
+                and type(header_data.get("schema")) is str
+                and header_data.get("schema") != SCHEMA
+            )
+            session_id_mismatch = (
+                type(header_data) is dict
+                and header_data.get("schema") == SCHEMA
+                and header_data.get("session_id") != self.session_id
+            )
+            raise self._transcript_error(
+                kind=(
+                    "unsupported_format"
+                    if schema_is_unsupported
+                    else "unrecoverable_header"
+                ),
+                row_number=1,
+                byte_offset=0,
+                valid_prefix_end=None,
+                reason_code=(
+                    "unsupported_schema"
+                    if schema_is_unsupported
+                    else "header_session_mismatch"
+                    if session_id_mismatch
+                    else "invalid_header"
+                ),
+                repairable=False,
+                raw=raw,
+                stat=stat,
             ) from exc
-        self._validate_entries()
+
+        self._entries = []
+        for index, row in enumerate(valid_rows[1:], start=1):
+            if index and index % 64 == 0:
+                time.sleep(0.0001)
+            row_number = index + 1
+            row_offset = row_offsets[index]
+            entry_type = row.get("type")
+            if type(entry_type) is str and entry_type not in CONVERSATION_ENTRY_TYPES:
+                try:
+                    ConversationEntry.from_dict({**row, "type": "warning"})
+                except ConversationIntegrityError:
+                    pass
+                else:
+                    raise self._transcript_error(
+                        kind="unsupported_format",
+                        row_number=row_number,
+                        byte_offset=row_offset,
+                        valid_prefix_end=row_offset,
+                        reason_code="unknown_entry_type",
+                        repairable=False,
+                        raw=raw,
+                        stat=stat,
+                    )
+            try:
+                entry = ConversationEntry.from_dict(row)
+            except (ConversationIntegrityError, KeyError, TypeError, ValueError) as exc:
+                raise self._transcript_error(
+                    kind="invalid_row",
+                    row_number=row_number,
+                    byte_offset=row_offset,
+                    valid_prefix_end=row_offset,
+                    reason_code="invalid_common_fields",
+                    repairable=True,
+                    raw=raw,
+                    stat=stat,
+                ) from exc
+            try:
+                self._validate_entry_payload(entry)
+                if entry.type == "fork":
+                    self._validate_fork_entry(entry)
+            except ConversationIntegrityError as exc:
+                raise self._transcript_error(
+                    kind="invalid_row",
+                    row_number=row_number,
+                    byte_offset=row_offset,
+                    valid_prefix_end=row_offset,
+                    reason_code="invalid_payload",
+                    repairable=True,
+                    raw=raw,
+                    stat=stat,
+                ) from (exc.__cause__ or exc)
+            self._entries.append(entry)
+
+        try:
+            self._validate_entries()
+        except ConversationIntegrityError as exc:
+            row_number, reason_code = self._first_invalid_link()
+            row_offset = row_offsets[row_number - 1]
+            raise self._transcript_error(
+                kind="broken_links",
+                row_number=row_number,
+                byte_offset=row_offset,
+                valid_prefix_end=row_offset,
+                reason_code=reason_code,
+                repairable=True,
+                raw=raw,
+                stat=stat,
+            ) from exc
+
         self._entry_prefix_digest = b""
         for entry in self._entries:
             self._record_entry_prefix(entry)
@@ -546,11 +740,11 @@ class ConversationLogMixin:
         for index, entry in enumerate(self._entries):
             if index and index % 64 == 0:
                 time.sleep(0.0001)
-            self._validate_entry_payload(entry)
-            if entry.type == "fork":
-                self._validate_fork_entry(entry)
             self._sent_message_receipts.extend(sent_message_receipts(entry))
-            if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
+            if (
+                entry.type == "notification"
+                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+            ):
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
@@ -571,11 +765,7 @@ class ConversationLogMixin:
             self._write_bytes(b"\n")
             self._publish_entries_installed(delta)
         else:
-            fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
-            try:
-                self._set_log_stat(os.fstat(fd))
-            finally:
-                os.close(fd)
+            self._set_log_stat(stat)
             self._publish_entries_installed(delta)
 
     def _validate_header(self: ConversationStore, header: dict[str, Any]) -> None:

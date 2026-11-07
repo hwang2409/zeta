@@ -1509,6 +1509,44 @@ async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_corrupt_child_transcript_renders_diagnosis_without_breaking_parent(
+    tmp_path: Path,
+) -> None:
+    from zeta.tui.cards.agent import AgentCard
+
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    root.append_message(Message(MessageRole.ASSISTANT, [TextContent("parent healthy")]))
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
+    child.close()
+    with (root.session_dir / "agents" / "1" / "conversation.jsonl").open(
+        "ab"
+    ) as stream:
+        stream.write(b'{"private":"must-not-leak"\n')
+
+    source = agent_sync_module.AgentTranscriptSource(root.session_dir / "agents" / "1")
+    with pytest.raises(Exception) as raised:
+        source.refresh()
+    snapshot = source._failed_snapshot(raised.value)
+    card = AgentCard(ToolCall("agent-corrupt", "agent", {"prompt": "inspect"}))
+    card.set_child_session_path(str(source.path))
+    card.apply_transcript_snapshot(snapshot)
+    console = Console(record=True, width=100)
+    console.print(card.current())
+    rendered = console.export_text()
+
+    assert (
+        "transcript terminated invalid conversation row at row 3 (session 1)"
+        in rendered
+    )
+    assert "must-not-leak" not in rendered
+    assert root.messages()[0].content[0].text == "parent healthy"
+    card.release_transcript_source()
+    source.close()
+    root.close()
+
+
+@pytest.mark.asyncio
 async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -> None:
     from zeta.tui.cards.agent import AgentCard
 
