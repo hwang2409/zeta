@@ -96,6 +96,7 @@ def test_render_failure_exits_without_input_and_restores_session(
     async def bounded_run(app, args) -> None:
         await asyncio.wait_for(original_run(app, args), timeout=5)
 
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
     monkeypatch.setattr(cli, "_create_tui_app", lambda *_args: app)
     monkeypatch.setattr(cli, "_run_tui", bounded_run)
     monkeypatch.setattr(app._status_card, "preferred_width", broken_width)
