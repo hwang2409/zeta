@@ -35,7 +35,6 @@ import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
-from tests.support.storage_homes import initialize_storage_home
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
     event as _buffered_event,
@@ -49,6 +48,7 @@ from tests.support.server_client import (
 from tests.support.server_client import (
     request as _buffered_request,
 )
+from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -1850,7 +1850,9 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             agent_ended.set()
         return published
 
-    monkeypatch.setattr(server.control._approvals, "_publish", delay_delegated_approval_end)
+    monkeypatch.setattr(
+        server.control._approvals, "_publish", delay_delegated_approval_end
+    )
     monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
@@ -2083,9 +2085,7 @@ async def test_status_surfaces_transcript_index_failure(
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
         )
-        assert status["connection_setup_counts"] == list(
-            loop.connection_setup_counts()
-        )
+        assert status["connection_setup_counts"] == list(loop.connection_setup_counts())
         assert status["max_agent_depth"] == 3
     finally:
         await _close(server, writer)
@@ -5000,9 +5000,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
-        await asyncio.wait_for(
-            asyncio.gather(first_turn, return_exceptions=True), 10
-        )
+        await asyncio.wait_for(asyncio.gather(first_turn, return_exceptions=True), 10)
         assert [
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
@@ -5213,8 +5211,7 @@ async def test_close_kill_cause_reaches_live_serve_event(
 
         task_frames = history_frames
         if not any(
-            frame.get("params", {}).get("event") == "turn_end"
-            for frame in task_frames
+            frame.get("params", {}).get("event") == "turn_end" for frame in task_frames
         ):
             task_frames += await _frames_until_event(reader, "turn_end")
         events = [
@@ -5229,9 +5226,9 @@ async def test_close_kill_cause_reaches_live_serve_event(
         assert task_events[0]["data"]["task_id"] == task_id
         assert task_events[0]["data"]["kind"] == "task_exited"
         assert task_events[0]["data"]["note"] == task_cause
-        assert {
-            e["data"].get("kind", "agent_completion") for e in receipt_events
-        } == {"agent_completion"}
+        assert {e["data"].get("kind", "agent_completion") for e in receipt_events} == {
+            "agent_completion"
+        }
         assert len(backend.calls) == 1
     finally:
         await _close(server, writer)
@@ -5830,7 +5827,9 @@ async def test_attachment_failure_removes_entire_batch(
             patch.setattr(image_delivery.os, "replace", failing_replace)
             with pytest.raises(OSError):
                 await asyncio.to_thread(
-                    image_delivery.prepare_image_delivery, runtime, {"images": [item, item]}
+                    image_delivery.prepare_image_delivery,
+                    runtime,
+                    {"images": [item, item]},
                 )
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
