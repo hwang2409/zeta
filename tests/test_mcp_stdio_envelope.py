@@ -487,7 +487,6 @@ async def test_cancel_during_stdio_invalidation_observes_pending_future_error(
     try:
         await cancel_during_cleanup()
         gc.collect()
-        await asyncio.sleep(0)
         assert [
             context.get("message")
             for context in unhandled
