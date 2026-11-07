@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -66,23 +67,11 @@ async def _owned_descendant(pid_file: Path):
     try:
         yield
     finally:
-        try:
-            if pid_file.exists():
-                pid = int(pid_file.read_text())
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    return
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
                 await wait_pid_exited(pid)
-        except BaseException as error:
-            active_error = sys.exc_info()[1]
-            if active_error is not None:
-                active_error.add_note(
-                    f"descendant cleanup error: {type(error).__name__}: {error}"
-                )
-            else:
-                raise
 
 
 async def _collect_loop(loop: AgentLoop) -> list[object]:
