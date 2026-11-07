@@ -357,7 +357,6 @@ async def test_address_commit_owner_refusal_writes_nothing(
         process.close()
         del process, child_control, parent_control
         gc.collect()
-
     recovered = await commit_conversation_async(
         ConversationAddress("project", "root", "root"),
         AppendConversationRows((_warning("recovered"),)),
