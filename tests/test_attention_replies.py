@@ -90,6 +90,21 @@ def _make_information_item(fixture: ReplyFixture, record: AttentionRecord) -> No
     path.write_text(value, encoding="utf-8")
 
 
+def _tui_wake_count(outcome: Any) -> int:
+    from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin
+
+    class WakeAdapter:
+        def __init__(self) -> None:
+            self.count = 0
+
+        def _schedule_background_wake(self) -> None:
+            self.count += 1
+
+    adapter = WakeAdapter()
+    DecisionsMixin._wake_for_attention_outcome(adapter, outcome)
+    return adapter.count
+
+
 def _stage_all(fixture: ReplyFixture, replies: list[str] | None = None) -> list[str]:
     values = replies or [f"answer {index}" for index in range(len(fixture.records))]
     for record, reply in zip(fixture.records, values, strict=True):
@@ -172,6 +187,11 @@ _OPERATIONS = (
     "resolve_local",
     "recover",
 )
+_OPERATION_ROWS = [
+    f"operation-{operation}-{scenario}"
+    for operation in _OPERATIONS
+    for scenario in ("success", "duplicate")
+]
 _CONCURRENT_ROWS = [
     f"concurrent-seal-{operation}-{selection}"
     for operation in _OPERATIONS
@@ -201,6 +221,7 @@ _FAULT_ROWS = [
     "case",
     [
         "success",
+        *_OPERATION_ROWS,
         *_CONCURRENT_ROWS,
         *_FAULT_ROWS,
         "publish-body",
@@ -218,6 +239,56 @@ def test_attention_replies_public_table(
     """Exercise durable reply outcomes only through the public AttentionReplies API."""
     fixture = _fixture(tmp_path, count=3)
     replies = fixture.replies
+
+    if case.startswith("operation-"):
+        operation, scenario = case.removeprefix("operation-").rsplit("-", 1)
+        target = fixture.records[1]
+        if operation == "flush":
+            replies.stage(target.id, "target")
+        elif operation == "dismiss":
+            _make_information_item(fixture, target)
+        elif operation == "recover":
+            sealer = AttentionReplies(fixture.home, fixture.session_id)
+
+            def stop_after_seal(_journal: Path) -> None:
+                raise RuntimeError("leave journal sealed")
+
+            sealer._send_journal = stop_after_seal  # type: ignore[method-assign]
+            with pytest.raises(RuntimeError, match="leave journal sealed"):
+                sealer.reply(target.id, "target", fixture.answerer_session_id)
+
+        def run_operation() -> Any:
+            if operation == "stage":
+                return replies.stage(target.id, "target")
+            if operation == "flush":
+                return replies.flush(fixture.answerer_session_id)
+            if operation == "reply":
+                return replies.reply(target.id, "target", fixture.answerer_session_id)
+            if operation == "dismiss":
+                return replies.dismiss(target.id)
+            if operation == "stage_and_flush":
+                return replies.stage_and_flush(
+                    [(target.id, "target")], fixture.answerer_session_id
+                )
+            if operation == "resolve_local":
+                return replies.resolve_local(target.id, "target")
+            assert operation == "recover"
+            return replies.recover()
+
+        outcome = run_operation()
+        publishes = operation in {"flush", "reply", "stage_and_flush", "recover"}
+        assert outcome.published is publishes
+        assert _tui_wake_count(outcome) == int(publishes)
+        if scenario == "duplicate":
+            duplicate = run_operation()
+            assert not duplicate.published
+            assert _tui_wake_count(duplicate) == 0
+            if duplicate.items:
+                assert all(
+                    item.status in {"duplicate", "already-resolved"}
+                    for item in duplicate.items
+                )
+        return
 
     if case.startswith("concurrent-seal-"):
         operation, selection = case.removeprefix("concurrent-seal-").rsplit("-", 1)
@@ -280,18 +351,7 @@ def test_attention_replies_public_table(
         )
         assert outcome.published, "terminal operation lost its recovery publication"
 
-        class WakeAdapter:
-            def __init__(self) -> None:
-                self.count = 0
-
-            def _schedule_background_wake(self) -> None:
-                self.count += 1
-
-        from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin
-
-        adapter = WakeAdapter()
-        DecisionsMixin._wake_for_attention_outcome(adapter, outcome)
-        assert adapter.count == 1
+        assert _tui_wake_count(outcome) == 1
         return
 
     if case == "success":
