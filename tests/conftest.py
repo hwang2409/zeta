@@ -759,8 +759,13 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     background_init = BackgroundTaskRegistry.__init__
     store_close = ConversationStore.close
     registry_close = ToolRegistry.close
+    format_lock = threading.Lock()
 
     def ensure_format(home: Path) -> None:
+        with format_lock:
+            ensure_format_locked(home)
+
+    def ensure_format_locked(home: Path) -> None:
         home.mkdir(parents=True, exist_ok=True)
         if not (home / "storage-format.json").exists():
             advance(home, expected_epoch=0)
