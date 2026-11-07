@@ -1608,7 +1608,7 @@ async def test_async_spill_double_cancel_joins_worker_before_close() -> None:
         release_read.set()
         if not write.done():
             write.cancel()
-        await asyncio.gather(write, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(write, return_exceptions=True), 10)
         spill.close()
 
 

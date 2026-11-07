@@ -15,6 +15,7 @@ import pytest
 
 import zeta.mcp.server_actor as server_actor_module
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from tests.support.serve_contract import ServeClient
 from tests.support.tui_render import render_full_screen
 from zeta.config.settings import load_settings
@@ -563,7 +564,7 @@ async def test_cancelled_spill_reservation_is_released(
         append.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await append
+            await await_or_fail(append, what="cancelled append")
         assert await asyncio.to_thread(completed.wait, 10)
         await envelope.close()
 
@@ -576,7 +577,7 @@ async def test_cancelled_spill_reservation_is_released(
         await envelope.close()
         if not append.done():
             append.cancel()
-        await asyncio.gather(append, return_exceptions=True)
+        await await_or_fail(asyncio.gather(append, return_exceptions=True), what="drain append")
         spill.close()
 
 
@@ -603,7 +604,7 @@ async def test_cancelled_failed_spill_reservation_reports_quota_error(
         append.cancel()
         release.set()
         with pytest.raises(MCPTransientQuotaError):
-            await append
+            await await_or_fail(append, what="failed-reservation append")
         await envelope.close()
         assert spill._transient_bytes == 0
         assert budget._used_bytes == 0
@@ -612,7 +613,7 @@ async def test_cancelled_failed_spill_reservation_reports_quota_error(
         await envelope.close()
         if not append.done():
             append.cancel()
-        await asyncio.gather(append, return_exceptions=True)
+        await await_or_fail(asyncio.gather(append, return_exceptions=True), what="drain append")
         spill.close()
 
 
@@ -664,7 +665,7 @@ async def test_cancelled_temporary_open_records_handle_before_returning(
 
         asyncio.get_running_loop().call_soon(observe_cancellation)
         with pytest.raises(asyncio.CancelledError):
-            await append
+            await await_or_fail(append, what="cancelled temporary-open append")
         assert await asyncio.to_thread(completed.wait, 10)
         await envelope.close()
 
@@ -680,7 +681,7 @@ async def test_cancelled_temporary_open_records_handle_before_returning(
         await envelope.close()
         if not append.done():
             append.cancel()
-        await asyncio.gather(append, return_exceptions=True)
+        await await_or_fail(asyncio.gather(append, return_exceptions=True), what="drain append")
         spill.close()
 
 
