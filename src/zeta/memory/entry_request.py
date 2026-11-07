@@ -15,7 +15,6 @@ from .entry_store import (
     MAX_ENTRY_TEXT_BYTES,
     MemoryEntry,
     MemoryState,
-    state_digest,
 )
 from .reconciler import (
     ReconciliationError,
@@ -196,10 +195,10 @@ def _entry_relevance_terms(entry: MemoryEntry) -> tuple[frozenset[str], frozense
 
 
 def _cached_entries(
-    state: MemoryState, *, snapshot_digest: str | None = None
+    state: MemoryState, *, snapshot_digest: str
 ) -> dict[str, _CachedEntry]:
     global _ENTRY_CACHE
-    key = (state.project_id, snapshot_digest or state_digest(state))
+    key = (state.project_id, snapshot_digest)
     if _ENTRY_CACHE is not None and _ENTRY_CACHE[0] == key:
         return _ENTRY_CACHE[1]
     cached: dict[str, _CachedEntry] = {}
@@ -223,10 +222,9 @@ def _active_entries_for_request(
     state: MemoryState,
     transcript: Transcript,
     *,
-    snapshot_digest: str | None = None,
+    cached: dict[str, _CachedEntry],
 ) -> list[MemoryEntry]:
     active = _active_entries_by_priority(state)
-    cached = _cached_entries(state, snapshot_digest=snapshot_digest)
     transcript_opaque, transcript_words = _relevance_terms(
         _transcript_relevance_text(transcript),
         max_chars=_MAX_RELEVANCE_TRANSCRIPT_CHARS,
@@ -396,21 +394,17 @@ def _prepare_request(
     state: MemoryState,
     *,
     as_of: date,
-    snapshot_digest: str | None = None,
+    snapshot_digest: str,
 ) -> _EntryPreparedRequest:
     empty = Transcript(transcript.session_id, ())
     priority = _active_entries_by_priority(state)
-    components = {
-        entry.id: _cached_entries(state, snapshot_digest=snapshot_digest)[entry.id].component
-        for entry in priority
-    }
+    cached = _cached_entries(state, snapshot_digest=snapshot_digest)
+    components = {entry.id: cached[entry.id].component for entry in priority}
     empty_size = len(_prompt(empty, state, as_of=as_of).encode())
 
     def entry_parts(rows: Sequence[dict[str, Any]]):
         candidate = Transcript(transcript.session_id, tuple(rows))
-        active = _active_entries_for_request(
-            state, candidate, snapshot_digest=snapshot_digest
-        )
+        active = _active_entries_for_request(state, candidate, cached=cached)
         return active, _entry_prompt_parts(active, components, base_size=empty_size)
 
     preliminary_size = entry_parts(())[1][4]
