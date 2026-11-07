@@ -58,7 +58,7 @@ async def _publish_task_safety_notice(
             child_loop.agent_instance_id,
             PromptInput(text, MessageOrigin.HARNESS_NUDGE, None),
         )
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         if prompt_id := await committed_prompt_id():
             return prompt_id
         raise

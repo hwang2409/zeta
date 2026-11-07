@@ -309,27 +309,29 @@ class TaskSafetyLifecycle:
             "kill it with task_kill or leave it running"
             for window in cohort
         )
-        publication = asyncio.create_task(
-            publish_notice(f"{text}\n[task-safety-cohort: {token}]")
-        )
-        try:
-            prompt_id = await asyncio.shield(publication)
-        except asyncio.CancelledError as cancelled:
+
+        async def publish() -> None:
             try:
-                prompt_id = await publication
-            except Exception as error:
-                raise cancelled from error
+                prompt_id = await publish_notice(
+                    f"{text}\n[task-safety-cohort: {token}]"
+                )
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                self._publish_retry_at = now + TASK_SAFETY_RETRY_SECONDS
+                return
+            self._publish_retry_at = None
             for window in cohort:
                 window.warned = True
                 window.warning_prompt_id = prompt_id
-            raise
-        except Exception:  # noqa: BLE001 - every publication failure is retryable
-            self._publish_retry_at = now + TASK_SAFETY_RETRY_SECONDS
-            return
-        self._publish_retry_at = None
-        for window in cohort:
-            window.warned = True
-            window.warning_prompt_id = prompt_id
+
+        publication = asyncio.create_task(publish())
+        cancelled: asyncio.CancelledError | None = None
+        while not publication.done():
+            try:
+                await asyncio.shield(publication)
+            except asyncio.CancelledError as error:
+                cancelled = error
+        if cancelled is not None:
+            raise cancelled
 
     async def _expire_due(
         self,

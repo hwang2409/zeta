@@ -2824,122 +2824,25 @@ async def test_task_completion_turn_rearms_full_safety_window() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "success",
+        "cancel-first-lookup",
+        "cancel-produce",
+        "cancel-second-lookup",
+        "double-cancel-produce",
+        "fail-first-lookup",
+        "fail-produce-before-append",
+        "fail-produce-after-append",
+        "fail-second-lookup",
+        "restart",
+        "duplicate-input",
+    ],
+)
 @pytest.mark.asyncio
-async def test_task_safety_retries_failed_warning_before_killing() -> None:
-    from zeta.agent.explicit_finish import TaskSafetyLifecycle
-
-    now = [0.0]
-    wait = _ControlledTaskSafetyWait()
-    registry = _ControlledTaskSafetyRegistry()
-    registry.tasks.append(
-        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
-    )
-    notices: list[str] = []
-    attempts = 0
-    first_attempted = asyncio.Event()
-
-    async def publish(text: str) -> str:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            first_attempted.set()
-            raise OSError("forced pre-commit failure")
-        notices.append(text)
-        return "warning-1"
-
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
-    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
-    try:
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
-        now[0] = 3600
-        await wait.releases.put(False)
-        await asyncio.wait_for(first_attempted.wait(), 10)
-        assert not supervisor.done()
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 1
-        assert notices == []
-        assert registry.kills == []
-        window = lifecycle._windows["task-1"]
-        assert not window.warned
-        assert window.warning_prompt_id is None
-
-        now[0] = 3601
-        await wait.releases.put(False)
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
-        assert len(notices) == 1
-        assert registry.kills == []
-
-        lifecycle.delivery_completed(set())
-        await wait.releases.put(True)
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
-        now[0] = 7201
-        await wait.releases.put(False)
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
-        assert len(notices) == 1
-        assert registry.kills[0][0] == "task-1"
-        assert "task safety limit expired" in registry.kills[0][1]
-    finally:
-        supervisor.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(supervisor, return_exceptions=True), timeout=10
-        )
-
-
-@pytest.mark.asyncio
-async def test_task_safety_retry_reuses_ambiguous_warning_token() -> None:
-    from zeta.agent.explicit_finish import TaskSafetyLifecycle
-
-    now = [0.0]
-    wait = _ControlledTaskSafetyWait()
-    registry = _ControlledTaskSafetyRegistry()
-    registry.tasks.append(
-        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
-    )
-    committed: dict[str, str] = {}
-    attempts = 0
-    first_attempted = asyncio.Event()
-
-    async def publish(text: str) -> str:
-        nonlocal attempts
-        attempts += 1
-        token = text.rpartition("\n")[2]
-        if prompt_id := committed.get(token):
-            return prompt_id
-        committed[token] = "warning-1"
-        first_attempted.set()
-        raise OSError("forced post-commit failure")
-
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
-    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
-    try:
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
-        now[0] = 3600
-        await wait.releases.put(False)
-        await asyncio.wait_for(first_attempted.wait(), 10)
-        assert not supervisor.done()
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 1
-        assert len(committed) == 1
-        assert registry.kills == []
-
-        now[0] = 3601
-        await wait.releases.put(False)
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
-        assert attempts == 2
-        assert len(committed) == 1
-
-        lifecycle.delivery_completed(set())
-        await wait.releases.put(True)
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
-        assert lifecycle._windows["task-1"].deadline == 7201
-    finally:
-        supervisor.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(supervisor, return_exceptions=True), timeout=10
-        )
-
-
-@pytest.mark.asyncio
-async def test_task_safety_publisher_adopts_ambiguously_committed_warning(
-    tmp_path: Path,
+async def test_task_safety_warning_publication_outcomes(
+    tmp_path: Path, scenario: str
 ) -> None:
     from zeta.agent.explicit_finish import TaskSafetyLifecycle
     from zeta.agent.run_consumer import _publish_task_safety_notice
@@ -2948,97 +2851,162 @@ async def test_task_safety_publisher_adopts_ambiguously_committed_warning(
     wait = _ControlledTaskSafetyWait()
     registry = _ControlledTaskSafetyRegistry()
     registry.tasks.append(
-        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
+        SimpleNamespace(
+            task_id="task-1", headline="watch ci", running=True, started_at=0.0
+        )
     )
-    store = ConversationStore(tmp_path / "session")
-    attempts = 0
+    durable_store = ConversationStore(tmp_path / "session")
+    lookup_calls = 0
+    produce_calls = 0
+    lookup_entered = threading.Event()
+    lookup_release = threading.Event()
+    produce_entered = asyncio.Event()
+    produce_release = asyncio.Event()
 
-    class CommitThenFailChannel:
-        async def produce_to(self, _target: str, item: object) -> None:
-            nonlocal attempts
-            attempts += 1
-            await asyncio.wait_for(
-                asyncio.to_thread(store.append_pending_prompt, item.text), 10
+    def pending_prompts():
+        nonlocal lookup_calls
+        lookup_calls += 1
+        if scenario == "fail-first-lookup" and lookup_calls == 1:
+            raise OSError("forced first lookup failure")
+        if scenario == "fail-second-lookup" and lookup_calls == 2:
+            raise OSError("forced second lookup failure")
+        if scenario in {"restart", "duplicate-input"} and lookup_calls == 2:
+            raise OSError("forced ambiguous lookup failure")
+        if (
+            scenario == "cancel-first-lookup"
+            and lookup_calls == 1
+            or scenario == "cancel-second-lookup"
+            and lookup_calls == 2
+        ):
+            lookup_entered.set()
+            assert lookup_release.wait(10), "timed out releasing pending-prompt lookup"
+        return durable_store.pending_prompts()
+
+    store = SimpleNamespace(pending_prompts=pending_prompts)
+
+    class Channel:
+        async def produce_to(self, _target: str, item: object) -> object:
+            nonlocal produce_calls
+            produce_calls += 1
+            if scenario in {"cancel-produce", "double-cancel-produce"}:
+                produce_entered.set()
+                await asyncio.wait_for(produce_release.wait(), 10)
+            if scenario in {"fail-produce-before-append", "fail-second-lookup"}:
+                raise OSError("forced pre-append failure")
+            entry = await asyncio.wait_for(
+                asyncio.to_thread(durable_store.append_pending_prompt, item.text), 10
             )
-            raise OSError("forced post-commit failure")
+            if scenario == "cancel-second-lookup" and produce_calls == 1:
+                raise asyncio.CancelledError
+            if (
+                scenario
+                in {"fail-produce-after-append", "restart", "duplicate-input"}
+                and produce_calls == 1
+            ):
+                raise OSError("forced post-append failure")
+            return SimpleNamespace(entries=[entry])
 
     loop = SimpleNamespace(
         agent_instance_id="root:1",
-        _background_owner=SimpleNamespace(
-            conversation_channel=CommitThenFailChannel()
-        ),
+        _background_owner=SimpleNamespace(conversation_channel=Channel()),
     )
 
     async def publish(text: str) -> str:
         return await _publish_task_safety_notice(loop, store, text)
 
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    def new_lifecycle() -> TaskSafetyLifecycle:
+        return TaskSafetyLifecycle(
+            3600, clock=lambda: now[0], wait=wait, cohort_seconds=0
+        )
+
+    lifecycle = new_lifecycle()
     supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+    supervisors = [supervisor]
     try:
         assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
         now[0] = 3600
         await wait.releases.put(False)
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
-        pending = await asyncio.wait_for(asyncio.to_thread(store.pending_prompts), 10)
-        assert len(pending) == 1
-        assert attempts == 1
-        assert registry.kills == []
 
-        lifecycle.delivery_completed(set())
-        await wait.releases.put(True)
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
-        assert lifecycle._windows["task-1"].deadline == 7200
-    finally:
-        supervisor.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(supervisor, return_exceptions=True), timeout=10
-        )
+        cancel_scenarios = {
+            "cancel-first-lookup",
+            "cancel-produce",
+            "cancel-second-lookup",
+            "double-cancel-produce",
+        }
+        if scenario in {"cancel-first-lookup", "cancel-second-lookup"}:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(lookup_entered.wait, 10), 10
+            )
+        elif scenario in {"cancel-produce", "double-cancel-produce"}:
+            await asyncio.wait_for(produce_entered.wait(), 10)
 
-
-@pytest.mark.asyncio
-async def test_task_safety_cancellation_finishes_warning_commit() -> None:
-    from zeta.agent.explicit_finish import TaskSafetyLifecycle
-
-    now = [0.0]
-    wait = _ControlledTaskSafetyWait()
-    registry = _ControlledTaskSafetyRegistry()
-    registry.tasks.append(
-        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
-    )
-    publishing = asyncio.Event()
-    release = asyncio.Event()
-    notices: list[str] = []
-
-    async def publish(text: str) -> str:
-        publishing.set()
-        await asyncio.wait_for(release.wait(), 10)
-        notices.append(text)
-        return "warning-1"
-
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
-    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
-    try:
-        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
-        now[0] = 3600
-        await wait.releases.put(False)
-        await asyncio.wait_for(publishing.wait(), 10)
-        supervisor.cancel()
-        release.set()
-        result = await asyncio.wait_for(
-            asyncio.gather(supervisor, return_exceptions=True), timeout=10
-        )
-        assert isinstance(result[0], asyncio.CancelledError)
-        assert len(notices) == 1
-        window = lifecycle._windows["task-1"]
-        assert window.warned
-        assert window.warning_prompt_id == "warning-1"
-    finally:
-        release.set()
-        if not supervisor.done():
+        if scenario in cancel_scenarios:
             supervisor.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+            if scenario == "double-cancel-produce":
+                yielded = asyncio.get_running_loop().create_future()
+                asyncio.get_running_loop().call_soon(yielded.set_result, None)
+                await asyncio.wait_for(yielded, 10)
+                supervisor.cancel()
+            lookup_release.set()
+            produce_release.set()
+            result = await asyncio.wait_for(
+                asyncio.gather(supervisor, return_exceptions=True), 10
+            )
+            assert isinstance(result[0], asyncio.CancelledError)
+        else:
+            next_timeout = await asyncio.wait_for(wait.timeouts.get(), 10)
+            if scenario in {
+                "fail-first-lookup",
+                "fail-produce-before-append",
+                "fail-second-lookup",
+                "restart",
+                "duplicate-input",
+            }:
+                assert next_timeout == 1
+            else:
+                assert next_timeout is None
+
+        if scenario == "duplicate-input":
+            now[0] = 3601
+            await wait.releases.put(False)
+            assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+        elif scenario == "restart":
+            supervisor.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(supervisor, return_exceptions=True), 10
+            )
+            lifecycle = new_lifecycle()
+            supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+            supervisors.append(supervisor)
+            assert await asyncio.wait_for(wait.timeouts.get(), 10) == 0
+            await wait.releases.put(False)
+            assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+
+        pending = await asyncio.wait_for(
+            asyncio.to_thread(durable_store.pending_prompts), 10
         )
+        window = lifecycle._windows["task-1"]
+        uncommitted_failures = {
+            "fail-first-lookup",
+            "fail-produce-before-append",
+            "fail-second-lookup",
+        }
+        if scenario in uncommitted_failures:
+            assert pending == []
+            assert not window.warned
+            assert window.warning_prompt_id is None
+        else:
+            expected_notices = 2 if scenario == "restart" else 1
+            assert window.warned
+            assert len(pending) == expected_notices
+            assert window.warning_prompt_id == pending[-1].id
+    finally:
+        lookup_release.set()
+        produce_release.set()
+        for task in supervisors:
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(asyncio.gather(*supervisors, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
