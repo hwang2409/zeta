@@ -37,7 +37,7 @@ from ...core.checkpoints import (
     load_session_json,
 )
 from ...core.child_lifecycle import select_legacy_child_lifecycle
-from ...core.session_files import child_directory, read_session_file
+from ...core.session_files import child_directory, read_session_file, session_root
 from ...core.store import ConversationStore
 from ...models.catalog import known_model_names
 from ...protocol.types import (
@@ -297,20 +297,18 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
         return read_session_file(directory_fd, name)
 
 
-def _read_agent_output(
-    store: object,
-    *,
-    requested_handle: str,
-    offset: int,
-    limit: int | None,
-    max_bytes: int,
-) -> dict[str, object]:
-    receipts = _active_agent_receipts(store)
-    child_path = receipts.get(requested_handle)
-    if child_path is None:
-        raise ValueError("unknown child handle")
+def _read_agent_transcript(
+    child_path: Path,
+    cached: tuple[tuple[int, int, int], str] | None,
+) -> tuple[tuple[int, int, int], str]:
     try:
-        raw = _read_child_file(store, child_path, "conversation.jsonl")
+        with session_root(child_path) as directory_fd:
+            transcript = child_path / "conversation.jsonl"
+            identity = os.stat(transcript, follow_symlinks=False)
+            key = (identity.st_ino, identity.st_size, identity.st_mtime_ns)
+            if cached is not None and cached[0] == key:
+                return cached
+            raw = read_session_file(directory_fd, "conversation.jsonl")
         rows = raw.splitlines(keepends=True)
         entries: list[ConversationEntry] = []
         for index, line in enumerate(rows):
@@ -355,8 +353,22 @@ def _read_agent_output(
             if entry.type == "message"
         ]
         output = _serialize_agent_transcript(messages)
+        identity = os.stat(transcript, follow_symlinks=False)
+        return (identity.st_ino, identity.st_size, identity.st_mtime_ns), output
     except (OSError, ValueError, ConversationIntegrityError) as exc:
         raise ValueError("could not read child transcript") from exc
+
+
+def _read_agent_output(
+    child_path: Path,
+    *,
+    requested_handle: str,
+    offset: int,
+    limit: int | None,
+    max_bytes: int,
+    cached: tuple[tuple[int, int, int], str] | None = None,
+) -> tuple[tuple[int, int, int], str, dict[str, object]]:
+    identity, output = _read_agent_transcript(child_path, cached)
     result = _agent_output_page(
         output,
         handle=requested_handle,
@@ -366,7 +378,7 @@ def _read_agent_output(
     )
     if result is None:
         raise ValueError("transcript page exceeds response limit")
-    return result
+    return identity, output, result
 
 
 def _unknown_agent_status(
@@ -862,16 +874,24 @@ async def _agent_output(
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
     try:
-        return _bounded_agent_result(
-            _read_agent_output(
-                registry.session_store,
-                requested_handle=handle,
-                offset=offset,
-                limit=limit,
-                max_bytes=max_bytes,
-            ),
-            max_bytes,
+        child_path = _active_agent_receipts(registry.session_store).get(handle)
+        if child_path is None:
+            raise ValueError("unknown child handle")
+        cached = registry._agent_output_cache.get(child_path)
+        identity, output, result = await asyncio.to_thread(
+            _read_agent_output,
+            child_path,
+            requested_handle=handle,
+            offset=offset,
+            limit=limit,
+            max_bytes=max_bytes,
+            cached=cached,
         )
+        registry._agent_output_cache[child_path] = (identity, output)
+        registry._agent_output_cache.move_to_end(child_path)
+        while len(registry._agent_output_cache) > 4:
+            registry._agent_output_cache.popitem(last=False)
+        return _bounded_agent_result(result, max_bytes)
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)
 

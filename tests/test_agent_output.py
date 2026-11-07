@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import threading
+from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -400,6 +402,112 @@ async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
     assert out_of_tree["isError"] is True
     assert "unknown child handle" in forged["content"][0]["text"]
     assert "unknown child handle" in out_of_tree["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_agent_output_read_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(
+        parent.session_dir / "agents", session_id="1", _storage_lease=parent._storage_lease
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
+    raw = (child.session_dir / "conversation.jsonl").read_bytes()
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_read(*args: object, **kwargs: object) -> bytes:
+        del args, kwargs
+        started.set()
+        assert release.wait(10)
+        return raw
+
+    monkeypatch.setattr(agent_tools, "read_session_file", blocked_read)
+    monkeypatch.setattr(
+        agent_tools,
+        "_active_agent_receipts",
+        lambda store: {"parent:1": child.session_dir},
+    )
+    registry = SimpleNamespace(
+        max_output_chars=10_000,
+        session_store=parent,
+        _agent_output_cache=OrderedDict(),
+    )
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while not release.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    output_task = asyncio.create_task(
+        agent_tools._agent_output(
+            registry,
+            {"handle": "parent:1"},
+            object(),
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        await asyncio.sleep(0)
+        assert ticks > 0
+        release.set()
+        result = await asyncio.wait_for(output_task, 10)
+        assert result["content"][0]["text"] == "assistant: answer\n"
+    finally:
+        release.set()
+        if not output_task.done():
+            output_task.cancel()
+        await asyncio.wait_for(asyncio.gather(output_task, return_exceptions=True), 10)
+        heartbeat_task.cancel()
+        await asyncio.wait_for(asyncio.gather(heartbeat_task, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
+async def test_agent_output_reuses_unchanged_transcript_and_refreshes_after_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("first")]))
+    monkeypatch.setattr(
+        agent_tools,
+        "_active_agent_receipts",
+        lambda store: {"parent:1": child.session_dir},
+    )
+    parsed = 0
+    load = agent_tools.load_session_json
+
+    def counting_load(row: bytes) -> object:
+        nonlocal parsed
+        parsed += 1
+        return load(row)
+
+    monkeypatch.setattr(agent_tools, "load_session_json", counting_load)
+    registry = SimpleNamespace(
+        max_output_chars=10_000,
+        session_store=object(),
+        _agent_output_cache=OrderedDict(),
+    )
+    first = await agent_tools._agent_output(
+        registry, {"handle": "parent:1", "limit": 1}, object()
+    )
+    next_offset = first["structuredContent"]["next_offset"]
+    before = parsed
+    second = await agent_tools._agent_output(
+        registry, {"handle": "parent:1", "offset": next_offset}, object()
+    )
+    assert parsed == before
+    assert second["structuredContent"]["truncated"] is False
+
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("new tail")]))
+    refreshed = await agent_tools._agent_output(
+        registry, {"handle": "parent:1", "offset": 0}, object()
+    )
+    assert "assistant: new tail" in refreshed["content"][0]["text"]
+    assert parsed > before
 
 
 @pytest.mark.asyncio
