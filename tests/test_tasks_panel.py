@@ -441,7 +441,7 @@ async def test_panel_refresh_owns_output_cursor(
             await asyncio.gather(refresh, return_exceptions=True)
         app.close_tasks_panel()
         registry.set_notice_sink(None)
-        await registry.kill(task_id)
+        await registry.kill(task_id, cause="test requested task stop")
         await registry.close()
 
 
