@@ -16,9 +16,14 @@ from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._results import _spill_preview
 from .._shared.background_spawn import _kill_and_reap
-from .._shared.process import spawn_background, tool_subprocess_env
-from .._shared.tool_spawn import create_tool_subprocess_shell
+from .._shared.log_open import open_log_off_loop
+from .._shared.process import (
+    create_subprocess_shell_in_fd,
+    spawn_background,
+    tool_subprocess_env,
+)
 from .._shared.shell_cwd import bind_shell_cwd_async
+from .._shared.tool_spawn import create_tool_subprocess_shell
 from ..registry import (
     ToolExecutionContext,
     ToolRegistry,
@@ -178,21 +183,32 @@ async def _bash(
         raise ValueError(f"max_output must be an integer from 1 to {MAX_OUTPUT_BYTES}")
     log_path = arguments.get("_log_path")
     shell_command = _extract_command(arguments)
+    log_handle = (
+        await open_log_off_loop(lambda: registry.background_tasks.open_log(log_path))
+        if log_path is not None
+        else None
+    )
     if arguments.get("_background") is True:
         # Background exec macros own their own completion receipt/notification,
         # so the registry must not also emit a task_exited notification.
-        start_cwd, cwd_fd = await bind_shell_cwd_async(
-            registry, arguments.get("cwd"), approved_cwd
-        )
-        task_id, pid = await registry.background_tasks.start(
-            shell_command,
-            start_cwd,
-            cwd_fd=cwd_fd,
-            log_path=log_path,
-            notify_on_exit=False,
-            owner="background_macro",
-            environment=_shell_environment(execution_context, start_cwd),
-        )
+        try:
+            start_cwd, cwd_fd = await bind_shell_cwd_async(
+                registry, arguments.get("cwd"), approved_cwd
+            )
+            owned_log, log_handle = log_handle, None
+            task_id, pid = await registry.background_tasks.start(
+                shell_command,
+                start_cwd,
+                cwd_fd=cwd_fd,
+                log_path=log_path,
+                log_handle=owned_log,
+                notify_on_exit=False,
+                owner="background_macro",
+                environment=_shell_environment(execution_context, start_cwd),
+            )
+        finally:
+            if log_handle is not None:
+                log_handle.close()
         message = f"background task {task_id} started (pid {pid})"
         return _success_result(
             text_block(message),
@@ -205,13 +221,20 @@ async def _bash(
             },
         )
 
-    start_cwd, cwd_fd = await bind_shell_cwd_async(
-        registry, arguments.get("cwd"), approved_cwd
-    )
+    try:
+        start_cwd, cwd_fd = await bind_shell_cwd_async(
+            registry, arguments.get("cwd"), approved_cwd
+        )
+    except BaseException:
+        if log_handle is not None:
+            log_handle.close()
+        raise
     try:
         read_fd, write_fd = os.pipe()
     except BaseException:
         os.close(cwd_fd)
+        if log_handle is not None:
+            log_handle.close()
         raise
     nonce = uuid.uuid4().hex
     bind_fd = "" if write_fd == 3 else f"exec 3>&{write_fd}; exec {write_fd}>&-; "
@@ -226,7 +249,6 @@ async def _bash(
         ["bash", "-c", script, "zeta-bash", start_cwd, shell_command]
     )
     process: asyncio.subprocess.Process | None = None
-    log_handle = None
     stdout_capture = _OutputCapture(output_limit)
     stderr_capture = _OutputCapture(output_limit)
     stdout_reader: asyncio.Task[None] | None = None
@@ -236,21 +258,23 @@ async def _bash(
     timeout_wait: asyncio.Task[None] | None = None
     timed_out = False
     try:
-        if log_path is not None:
-            log_handle = await asyncio.to_thread(
-                registry.background_tasks.open_log, log_path
-            )
         try:
-            spawn = create_tool_subprocess_shell(
-                command,
-                cwd_fd=cwd_fd,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                pass_fds=(write_fd,),
-                env=_shell_environment(execution_context, start_cwd),
-                niceness=registry.command_niceness,
-            )
+            spawn_kwargs = {
+                "stdin": asyncio.subprocess.DEVNULL,
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "pass_fds": (write_fd,),
+                "env": _shell_environment(execution_context, start_cwd),
+                "niceness": registry.command_niceness,
+            }
+            if approved_cwd is not None:
+                spawn = create_subprocess_shell_in_fd(
+                    command, cwd_fd, **spawn_kwargs
+                )
+            else:
+                spawn = create_tool_subprocess_shell(
+                    command, cwd_fd=cwd_fd, **spawn_kwargs
+                )
             process = await spawn_background(
                 spawn,
                 require_open=lambda: None,

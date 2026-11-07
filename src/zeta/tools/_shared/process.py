@@ -44,6 +44,7 @@ from .background_task_types import (
     TaskExitInput,
     _BackgroundRecord,
 )
+from .log_open import open_log_off_loop
 from .process_output import command_headline, output_tail, utf8_char_chunk, utf8_chunk
 from .tool_spawn import create_tool_subprocess_shell
 
@@ -254,14 +255,13 @@ class BackgroundTaskRegistry:
         command: str,
         cwd: str | Path,
         *,
-        cwd_fd: int | None = None,
-        log_path: str | Path | None = None,
+        cwd_fd: int | None = None, log_path: str | Path | None = None,
+        log_handle: IO[bytes] | None = None,
         notify_on_exit: bool = True,
         owner: str = "run_background",
         environment: Mapping[str, str] | None = None,
     ) -> tuple[str, int]:
-        """Start a task, taking ownership of ``cwd_fd`` when one is supplied."""
-
+        """Start a task, taking ownership of supplied cwd and log handles."""
         pending = asyncio.get_running_loop().create_future()
         try:
             self._require_open()
@@ -269,8 +269,7 @@ class BackgroundTaskRegistry:
             return await self._start(
                 command,
                 cwd,
-                cwd_fd=cwd_fd,
-                log_path=log_path,
+                cwd_fd=cwd_fd, log_path=log_path, log_handle=log_handle,
                 notify_on_exit=notify_on_exit,
                 owner=owner,
                 environment=environment,
@@ -289,24 +288,24 @@ class BackgroundTaskRegistry:
         command: str,
         cwd: str | Path,
         *,
-        cwd_fd: int | None,
-        log_path: str | Path | None,
+        cwd_fd: int | None, log_path: str | Path | None,
+        log_handle: IO[bytes] | None,
         notify_on_exit: bool,
         owner: str,
         environment: Mapping[str, str] | None,
     ) -> tuple[str, int]:
-        self._require_open()
         task_id = f"task-{uuid.uuid4().hex[:12]}"
         effective_log_path = (
             Path(log_path) if log_path is not None else self._default_log_path(task_id)
         )
         with ExitStack() as cleanup:
-            if log_path is None:
-                if self._archive is None:
-                    raise RuntimeError("background output storage is unavailable")
-                log_handle = cleanup.enter_context(self._open_task_log(task_id))
-            else:
-                log_handle = cleanup.enter_context(self.open_log(effective_log_path))
+            if log_handle is None:
+                opener = (lambda: self._open_task_log(task_id)) if log_path is None else (
+                    lambda: self.open_log(effective_log_path)
+                )
+                log_handle = await open_log_off_loop(opener)
+            log_handle = cleanup.enter_context(log_handle)
+            self._require_open()
             try:
                 spawn_kwargs = {
                     "stdin": asyncio.subprocess.PIPE,

@@ -528,6 +528,79 @@ async def test_bash_removed_start_cwd_falls_back_and_persists(
 
 
 @pytest.mark.asyncio
+async def test_bash_restart_recovers_persisted_removed_cwd(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session-cwd"
+    persisted_cwd = tmp_path / "persisted-cwd"
+    session_cwd.mkdir()
+    persisted_cwd.mkdir()
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, cwd=session_cwd)
+    registry = ToolRegistry(
+        session_cwd, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        changed = await registry.execute(
+            ToolCall(
+                "persist-cwd",
+                "bash",
+                {"command": f"cd {shlex.quote(str(persisted_cwd))}"},
+            )
+        )
+        assert changed["isError"] is False
+        session_id = store.session_id
+    finally:
+        await registry.close()
+        store.close()
+
+    persisted_cwd.rmdir()
+    reopened = ConversationStore(root, session_id=session_id)
+    restarted = ToolRegistry(
+        session_cwd,
+        session_store=reopened,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        result = await restarted.execute(
+            ToolCall("recover-persisted-cwd", "bash", {"command": "pwd"})
+        )
+
+        assert result["isError"] is False
+        assert result["structuredContent"]["stdout"].strip() == str(tmp_path)
+        assert restarted.bash_cwd == str(tmp_path)
+        assert reopened.bash_cwd == str(tmp_path)
+    finally:
+        await restarted.close()
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_bash_recovers_when_session_cwd_is_removed_during_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_cwd = tmp_path / "session-cwd"
+    session_cwd.mkdir()
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
+    registry.verify_cwd_identity()
+    original_open = registry._open_cwd
+
+    def remove_then_open() -> int:
+        session_cwd.rmdir()
+        return original_open()
+
+    monkeypatch.setattr(registry, "_open_cwd", remove_then_open)
+    try:
+        result = await registry.execute(
+            ToolCall("remove-during-bind", "bash", {"command": "pwd"})
+        )
+
+        assert result["isError"] is False, result
+        assert result["structuredContent"]["stdout"].strip() == str(tmp_path)
+        assert registry.bash_cwd == str(tmp_path)
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_bash_cwd_override_does_not_persist_without_cd(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()

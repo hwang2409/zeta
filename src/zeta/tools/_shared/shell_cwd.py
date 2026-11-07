@@ -30,25 +30,26 @@ def _bind_shell_cwd(
         else resolve_shell_cwd(registry.bash_cwd, requested_cwd)
     )
     recovery: tuple[str, str] | None = None
-    if approved_cwd is None and requested_cwd is None:
-        removed = False
-        if Path(start_cwd) == registry.cwd:
-            try:
-                registry.verify_cwd_identity()
-            except SessionCwdRemoved:
-                removed = True
-        else:
-            removed = not Path(start_cwd).is_dir()
-        if removed:
-            fallback = nearest_existing_directory(start_cwd)
-            recovery = (start_cwd, fallback)
-            start_cwd = fallback
-
     if approved_cwd is not None:
         fd = open_verified_directory(start_cwd, approved_cwd.identity)
     elif Path(start_cwd) == registry.cwd:
-        fd = registry._open_cwd()
+        try:
+            fd = registry._open_cwd()
+        except SessionCwdRemoved:
+            if requested_cwd is not None:
+                raise
+            fallback = nearest_existing_directory(start_cwd)
+            recovery = (start_cwd, fallback)
+            start_cwd = fallback
+            identity = os.lstat(fallback)
+            fd = open_verified_directory(
+                fallback, (identity.st_dev, identity.st_ino)
+            )
     else:
+        if requested_cwd is None and not Path(start_cwd).is_dir():
+            fallback = nearest_existing_directory(start_cwd)
+            recovery = (start_cwd, fallback)
+            start_cwd = fallback
         bound_cwd = os.path.realpath(start_cwd)
         try:
             identity = os.lstat(bound_cwd)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 from pathlib import Path
 
@@ -117,12 +118,17 @@ async def test_bind_shell_cwd_cancellation_drains_and_does_not_commit(
     import zeta.tools._shared.shell_cwd as module
 
     original = module._bind_shell_cwd
+    returned_fds: list[int] = []
 
-    def blocked(*args: object, **kwargs: object) -> tuple[str, int, tuple[str, str] | None]:
+    def blocked(
+        *args: object, **kwargs: object
+    ) -> tuple[str, int, tuple[str, str] | None]:
         started.set()
         while not release.is_set():
             pass
-        return original(*args, **kwargs)
+        result = original(*args, **kwargs)
+        returned_fds.append(result[1])
+        return result
 
     # test-contract: seam hold the worker to prove cancellation drains its fd.
     monkeypatch.setattr(module, "_bind_shell_cwd", blocked)
@@ -134,4 +140,8 @@ async def test_bind_shell_cwd_cancellation_drains_and_does_not_commit(
         await asyncio.wait_for(task, 10)
     assert registry.bash_cwd == str(session)
     assert registry.take_cwd_recovery_notices() == ()
+    assert returned_fds
+    with pytest.raises(OSError) as error:
+        os.fstat(returned_fds[0])
+    assert error.value.errno == errno.EBADF
     await registry.close()

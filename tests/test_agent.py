@@ -12220,6 +12220,34 @@ def _first_tool_result(store: ConversationStore) -> ToolResult:
 
 
 @pytest.mark.asyncio
+async def test_first_turn_mcp_setup_does_not_recreate_removed_shell_cwd(
+    tmp_path: Path,
+) -> None:
+    session_cwd = tmp_path / "removed-cwd"
+    session_cwd.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=session_cwd)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("removed-cwd", "bash", {"command": "pwd"})]
+            ),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    try:
+        session_cwd.rmdir()
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+        result = _first_tool_result(store)
+        assert result.is_error is False
+        assert result.structured_content["stdout"].strip() == str(tmp_path)
+        assert not session_cwd.exists()
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_child_cwd_replacement_fails_closed_for_all_tools(
     tmp_path: Path,
 ) -> None:

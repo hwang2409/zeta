@@ -1,6 +1,7 @@
 import asyncio
 import shlex
 import subprocess
+import threading
 from io import StringIO
 from pathlib import Path
 
@@ -2093,6 +2094,54 @@ async def test_exec_macro_deny_renders_denied_receipt(
         assert "/deploy · denied" in output.getvalue()
         assert "/deploy · failed" not in output.getvalue()
         assert store.messages() == []
+
+
+@pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
+async def test_canceled_macro_creates_log_before_shell_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    background: bool,
+) -> None:
+    import zeta.tools._shared.shell_cwd as shell_cwd_module
+
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    log_path = tmp_path / f"macro-{'background' if background else 'foreground'}.log"
+    entered = threading.Event()
+    release = threading.Event()
+    original = shell_cwd_module._bind_shell_cwd
+
+    def blocked(*args: object, **kwargs: object):
+        entered.set()
+        assert release.wait(10)
+        return original(*args, **kwargs)
+
+    # test-contract: seam hold cwd binding after the macro log has been created.
+    monkeypatch.setattr(shell_cwd_module, "_bind_shell_cwd", blocked)
+    task = asyncio.create_task(
+        run_shell_macro(
+            registry,
+            ToolCall("macro-cancel-before-start", "bash", {"command": "true"}),
+            log_path,
+            stream_sink=lambda _event: None,
+            lifecycle_sink=lambda _kind: None,
+            background=background,
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
+        task.cancel()
+        release.set()
+        result = await asyncio.wait_for(task, 10)
+
+        assert result.is_canceled is True
+        assert result.structured_content == {"log_path": str(log_path)}
+        assert log_path.is_file()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await registry.close()
 
 
 async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
