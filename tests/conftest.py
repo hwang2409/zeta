@@ -505,8 +505,13 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
             for descriptor, description in before.items()
         )
     yield
-    gc.collect()
     after = _open_file_descriptors()
+    previous_count = (
+        _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
+    )
+    if previous_count is not None and len(after) > previous_count:
+        gc.collect()
+        after = _open_file_descriptors()
     _update_fd_owners(after, item.nodeid)
     added = tuple(after[fd] for fd in sorted(after.keys() - before.keys()))
     grouped = _group_fds_by_path_prefix(added)

@@ -229,6 +229,43 @@ def test_fd_guard_counts_only_reachable_owners(tmp_path: Path, reachable: bool) 
         assert "fd-retained nodeid=test_probe.py" not in output
 
 
+def test_fd_guard_skips_collection_when_fd_count_is_stable(tmp_path: Path) -> None:
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    calls = tmp_path / "gc-calls"
+    for name in ("conftest.py", "sitecustomize.py"):
+        shutil.copyfile(Path(__file__).with_name(name), probe / name)
+    with (probe / "conftest.py").open("a", encoding="utf-8") as conftest:
+        conftest.write("\npytest_plugins = ['count_gc']\n")
+    (probe / "count_gc.py").write_text(
+        "import gc\n"
+        "from pathlib import Path\n"
+        "CALLS = 0\n"
+        "COLLECT = gc.collect\n"
+        "def count_gc():\n"
+        "    global CALLS\n"
+        "    CALLS += 1\n"
+        "    return COLLECT()\n"
+        "gc.collect = count_gc\n"
+        f"def pytest_unconfigure(): Path({str(calls)!r}).write_text(str(CALLS))\n",
+        encoding="utf-8",
+    )
+    (probe / "test_probe.py").write_text("def test_stable(): pass\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--confcutdir", str(probe)],
+        cwd=probe,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # test-contract: complexity prove the per-test fast path avoids a heap scan
+    assert calls.read_text() == "1"
+
+
 @pytest.mark.parametrize("close_fds", [False, True])
 def test_fd_guard_propagates_worker_breach_to_xdist_controller(
     tmp_path: Path, close_fds: bool
