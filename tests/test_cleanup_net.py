@@ -107,9 +107,13 @@ def test_cleanup_error_is_reported(tmp_path: Path) -> None:
 
 def test_ratchet_entry_suppresses_known_leak(tmp_path: Path) -> None:
     ratchet = Path(__file__).with_name("test_cleanup_net_ratchet.txt")
+    original = ratchet.read_text() if ratchet.exists() else None
     ratchet.write_text("tests/_cleanup_net_probe.py::test_case\n")
     try:
         result = _run_probe(tmp_path, "leak")
     finally:
-        ratchet.unlink(missing_ok=True)
+        if original is None:
+            ratchet.unlink(missing_ok=True)
+        else:
+            ratchet.write_text(original)
     assert result.returncode == 0, result.stdout + result.stderr
