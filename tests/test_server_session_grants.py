@@ -33,6 +33,7 @@ from tests.test_server_websocket import (
     _read_json,
     _send_json,
 )
+from zeta.core.approval import ApprovalRequest
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
 from zeta.server import ZetaServer
 from zeta.tui.app import TUIApp
@@ -247,6 +248,102 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
         await _frames_until_event(reader, "turn_end")
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_grant_approval_publishes_after_concurrent_install(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("call-1", "bash", {"command": "printf websocket"})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    await server.start()
+    reader, writer, status, _headers = await _connect_websocket(
+        server, token=None, protocol_token=server._websocket.token
+    )
+    assert status == 101
+    try:
+        persist_started = asyncio.Event()
+        release_persist = asyncio.Event()
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {"protocol_version": "1.2", "features": FEATURES},
+            },
+        )
+        while (await _read_json(reader)).get("id") != 1:
+            pass
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "new_session",
+                "params": {"provider": "codex"},
+            },
+        )
+        while True:
+            frame = await _read_json(reader)
+            if frame.get("id") == 2:
+                break
+        store = server.runtime.opened.store
+        original_durable = store._to_thread_durable
+
+        async def gated_durable(job: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(job, "__name__", "") == "resolve_approval":
+                persist_started.set()
+                await release_persist.wait()
+            return await original_durable(job, *args, **kwargs)
+
+        store._to_thread_durable = gated_durable  # type: ignore[method-assign]
+        await _send_json(
+            writer,
+            {"jsonrpc": "2.0", "id": 3, "method": "send", "params": {"text": "run"}},
+        )
+        while True:
+            frame = await _read_json(reader)
+            if frame.get("params", {}).get("event") == "approval_request":
+                break
+        approval_request = ApprovalRequest("call-1", call)
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "approve",
+                "params": {"request_id": "call-1", "scope": "always_tool"},
+            },
+        )
+        await asyncio.wait_for(persist_started.wait(), TIMEOUT)
+        server.runtime.policy.remember_allow(approval_request)
+        release_persist.set()
+        observed: list[dict[str, Any]] = []
+        while not any(frame.get("id") == 4 for frame in observed):
+            observed.append(await _read_json(reader))
+        grants = [
+            frame
+            for frame in observed
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+            and frame.get("params", {}).get("data", {}).get("change") == "grant"
+        ]
+        assert len(grants) == 1, observed
+        assert grants[0]["params"]["data"]["changed"] == ["bash"]
+        assert observed.index(grants[0]) < next(
+            index for index, frame in enumerate(observed) if frame.get("id") == 4
+        ), observed
+    finally:
+        await _close_websocket(server, writer)
 
 
 @pytest.mark.asyncio

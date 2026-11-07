@@ -381,16 +381,12 @@ class ServeControl:
         policy = self.server.runtime.policy
         if loop is None or policy is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
-        grants_before = policy.session_allow
-        result, core_key = await self._approvals.transition(
+        result, core_key, grant_change = await self._approvals.transition(
             Decide(method, request_id, scope)
         )
         assert isinstance(result, dict)
-        added = tuple(sorted(map(str, policy.session_allow - grants_before)))
-        if added:
-            await self.publish_session_grant_change(
-                session_grant_change(policy, "grant", added)
-            )
+        if grant_change is not None:
+            await self.publish_session_grant_change(grant_change)
         if (
             not self.turn_busy()
             and isinstance(core_key, str)

@@ -11,7 +11,12 @@ from types import MappingProxyType
 from typing import Literal
 from uuid import uuid4
 
-from ..core.approval import ApprovalPolicy, ApprovalRequest
+from ..core.approval import (
+    ApprovalPolicy,
+    ApprovalRequest,
+    SessionGrantChange,
+    session_grant_change,
+)
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from . import event_contract
@@ -651,7 +656,7 @@ class ApprovalLifecycle:
 
     async def resolve_approval(
         self, method: str, request_id: str, scope: str = "once"
-    ) -> tuple[dict[str, object], ApprovalKey]:
+    ) -> tuple[dict[str, object], ApprovalKey, SessionGrantChange | None]:
         policy = self._policy()
         if policy is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
@@ -689,15 +694,20 @@ class ApprovalLifecycle:
                 record,
                 decision,
                 grant=pending if scope == "always_tool" else None,
+                return_grant_change=scope == "always_tool",
             )
         )
         self._change(record, settlement=settlement)
         try:
-            resolution = await settlement
+            settled = await settlement
         except OSError as exc:
             raise ProtocolError(
                 ErrorDescriptor.INTERNAL_ERROR, f"approval persistence failed: {exc}"
             ) from exc
+        if isinstance(settled, tuple):
+            resolution, grant_change = settled
+        else:
+            resolution, grant_change = settled, None
         confirmed = resolution["decision"]
         result: dict[str, object] = {
             "accepted": True,
@@ -708,7 +718,7 @@ class ApprovalLifecycle:
             result["scope"] = scope
         if reason := resolution.get("reason"):
             result["reason"] = reason
-        return result, core_key
+        return result, core_key, grant_change
 
     def reject_if_unhealthy(self) -> None:
         health = self._state.health
@@ -757,10 +767,15 @@ class ApprovalLifecycle:
         reason: str | None = None,
         *,
         grant: ApprovalRequest | None = None,
-    ) -> dict[str, str]:
+        return_grant_change: bool = False,
+    ) -> dict[str, str] | tuple[dict[str, str], SessionGrantChange | None]:
         token = record.token
         generation = record.generation
         target = record.target
+        policy = self._policy()
+        grant_before = (
+            policy.session_allow if grant is not None and policy is not None else None
+        )
 
         async def persist() -> dict[str, str] | None:
             write_failed = False
@@ -804,7 +819,7 @@ class ApprovalLifecycle:
                     "reason": reason or "turn_canceled",
                 }
                 await self._finish_record(record, synthetic)
-                return synthetic
+                return (synthetic, None) if return_grant_change else synthetic
             if owns_record:
                 await self._report_persistence_failure(
                     record, "approval decision could not be persisted"
@@ -813,13 +828,15 @@ class ApprovalLifecycle:
                 self._change(record, settlement=None)
             raise OSError("approval decision could not be persisted")
         if not owns_record:
-            return resolution
+            return (resolution, None) if return_grant_change else resolution
+        grant_change: SessionGrantChange | None = None
         if grant is not None and resolution["decision"] == "allow":
-            policy = self._policy()
             if policy is not None:
-                policy.remember_allow(grant)
+                rule = policy.remember_allow(grant)
+                if grant_before is not None and rule not in grant_before:
+                    grant_change = session_grant_change(policy, "grant", (str(rule),))
         await self._finish_record(record, resolution)
-        return resolution
+        return (resolution, grant_change) if return_grant_change else resolution
 
     def request_approval_abort(
         self,
