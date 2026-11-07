@@ -12783,6 +12783,541 @@ def _reminder_loop(tmp_path: Path) -> tuple[ConversationStore, ToolRegistry, _Ex
     return store, registry, loop
 
 
+async def _idle_notice_fixture(
+    tmp_path: Path,
+) -> tuple[
+    ConversationStore,
+    ConversationStore,
+    ToolRegistry,
+    _ExplicitFinishLoop,
+    pending_delivery_module.StepDeliveryFlow,
+    list[str],
+]:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(tmp_path / "child")
+    registry_path = tmp_path / "registry"
+    registry_path.mkdir()
+    registry = ToolRegistry(registry_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(child)
+    owner = BackgroundAgentOwner(parent)
+    loop = _ExplicitFinishLoop(registry, owner)
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child.session_dir),
+        description="work",
+        agent_type="worker",
+        background=True,
+        child_instance_id="root:1",
+        accepts_follow_ups=True,
+        explicit_finish=True,
+    )
+    child.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    loop._terminal_transition_fence = TerminalTransitionFence(
+        child,
+        owned_work=lambda: loop.background_work_descriptions,
+        delivering_prompt_id=lambda: getattr(loop, "_delivering_prompt_id", None),
+    )
+    owner.conversation_channel.register_loop("root:1")
+    wakes: list[str] = []
+    parent_flow = pending_delivery_module.StepDeliveryFlow(
+        parent, wake_sink=lambda source: wakes.append(source)
+    )
+    owner.conversation_channel.register_delivery_flow(None, parent_flow)
+    await loop._ensure_step_delivery()
+    return parent, child, registry, loop, parent_flow, wakes
+
+
+async def _run_until_idle_wait(
+    loop: _ExplicitFinishLoop,
+    child: ConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    replies: list[str] | None = None,
+    wait_for_idle: bool = True,
+) -> tuple[asyncio.Task[dict[str, object]], asyncio.Event, list[str]]:
+    idle_waiting = asyncio.Event()
+    prompts: list[str] = []
+    reply_texts = iter(replies or ["last child message"])
+
+    async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(child, kwargs)
+        prompts.append(prompt)
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": next(reply_texts, "later child message"),
+                }
+            ],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(_wake, _timeout):
+        idle_waiting.set()
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=child,
+            child_turns=lambda: len(prompts),
+            child_path=str(child.session_dir),
+            explicit_finish_metadata={
+                "child_instance_id": "root:1",
+                "description": "work",
+            },
+            idle_wait=wait_idle,
+        )
+    )
+    if wait_for_idle:
+        await asyncio.wait_for(idle_waiting.wait(), 10)
+    return run, idle_waiting, prompts
+
+
+async def _cancel_idle_fixture(
+    run: asyncio.Task[dict[str, object]],
+    registry: ToolRegistry,
+    parent: ConversationStore,
+    child: ConversationStore,
+) -> None:
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    await registry.close()
+    parent.close()
+    child.close()
+
+
+@pytest.mark.parametrize("wake_source", ["task", "child", "question"])
+@pytest.mark.asyncio
+async def test_idle_with_open_work_does_not_notify_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wake_source: str,
+) -> None:
+    parent, child, registry, loop, parent_flow, wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    owned_child: asyncio.Task[None] | None = None
+    if wake_source == "task":
+        monkeypatch.setattr(
+            registry.background_tasks,
+            "snapshot",
+            lambda: (
+                SimpleNamespace(
+                    running=True, task_id="task-owned", headline="owned task"
+                ),
+            ),
+        )
+    elif wake_source == "child":
+        owned_child = asyncio.create_task(asyncio.Event().wait())
+        loop._background_owner.register(
+            "root:1:1",
+            owned_child.cancel,
+            owned_child,
+            parent_instance_id="root:1",
+            description="owned child",
+        )
+    else:
+        await loop._background_owner.conversation_channel.publish_question(
+            child_instance_id="root:1",
+            question_id="q-pending",
+            question="approve?",
+            options=None,
+        )
+        prepared = await parent_flow.prepare_request("idle_start", [], None)
+        assert prepared.notification_ids
+        await parent_flow.acknowledge_active()
+        wakes.clear()
+
+    run, _idle_waiting, prompts = await _run_until_idle_wait(loop, child, monkeypatch)
+    try:
+        assert prompts == (
+            ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
+            if wake_source == "question"
+            else ["work"]
+        )
+        assert not any(
+            entry.data.get("kind") == "child_idle"
+            for entry in parent.agent_notifications(pending_only=False)
+        )
+        assert wakes == []
+        lifecycle = child.agent_lifecycle()
+        assert lifecycle["state"] == "idle"
+        assert lifecycle["current_step"] == "idle, waiting for follow-up"
+    finally:
+        if owned_child is not None:
+            loop._background_owner.cancel_subtree("root:1:1")
+            await asyncio.gather(owned_child, return_exceptions=True)
+        await _cancel_idle_fixture(run, registry, parent, child)
+
+
+@pytest.mark.asyncio
+async def test_empty_idle_notifies_parent_once_with_last_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, child, registry, loop, _parent_flow, wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    run, _idle_waiting, prompts = await _run_until_idle_wait(
+        loop,
+        child,
+        monkeypatch,
+        replies=["final useful status", "reminder did no work"],
+    )
+    try:
+        notices = [
+            entry
+            for entry in parent.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "child_idle"
+        ]
+        assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
+        assert len(notices) == 1
+        assert notices[0].data["text"] == "final useful status"
+        assert wakes == ["notification"]
+    finally:
+        await _cancel_idle_fixture(run, registry, parent, child)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_commit_suppresses_racing_stalled_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, child, registry, loop, _parent_flow, _wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    task_running = True
+    monkeypatch.setattr(
+        registry.background_tasks,
+        "snapshot",
+        lambda: (
+            SimpleNamespace(
+                running=True, task_id="task-owned", headline="owned task"
+            ),
+        )
+        if task_running
+        else (),
+    )
+    commit_entered = asyncio.Event()
+    release_commit = asyncio.Event()
+    idle_waiting = asyncio.Event()
+    order: list[str] = []
+    original_durable = child._to_thread_durable
+    channel = loop._background_owner.conversation_channel
+    original_idle = channel.publish_idle
+
+    async def blocked_durable(function, /, *args, **kwargs):
+        if function.__name__ == "_commit_delivery_input" and isinstance(
+            args[0], pending_delivery_module.PromptInput
+        ):
+            commit_entered.set()
+            await release_commit.wait()
+            result = await original_durable(function, *args, **kwargs)
+            order.append("follow_up")
+            return result
+        return await original_durable(function, *args, **kwargs)
+
+    async def observed_idle(**kwargs):
+        order.append("idle")
+        return await original_idle(**kwargs)
+
+    async def consume(_loop, _prompt, **kwargs):
+        await _ack_fake_delivery(child, kwargs)
+        return {
+            "content": [{"type": "text", "text": "idle"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(wake, _timeout):
+        idle_waiting.set()
+        await wake()
+        asyncio.get_running_loop().call_soon(release_commit.set)
+        return True
+
+    monkeypatch.setattr(child, "_to_thread_durable", blocked_durable)
+    monkeypatch.setattr(channel, "publish_idle", observed_idle)
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=child,
+            child_turns=lambda: 1,
+            child_path=str(child.session_dir),
+            explicit_finish_metadata={
+                "child_instance_id": "root:1",
+                "description": "work",
+            },
+            idle_wait=wait_idle,
+        )
+    )
+    send: asyncio.Task[object] | None = None
+    try:
+        await asyncio.wait_for(idle_waiting.wait(), 10)
+        send = asyncio.create_task(
+            channel.produce_to(
+                "root:1",
+                pending_delivery_module.PromptInput(
+                    "new work", MessageOrigin.AGENT_SEND, None
+                ),
+            )
+        )
+        await commit_entered.wait()
+        task_running = False
+        channel.wake("root:1")
+        await send
+        assert order[0] == "follow_up"
+    finally:
+        release_commit.set()
+        if send is not None:
+            await asyncio.gather(send, return_exceptions=True)
+        await _cancel_idle_fixture(run, registry, parent, child)
+
+
+@pytest.mark.asyncio
+async def test_stalled_admission_commits_before_racing_follow_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, child, registry, loop, _parent_flow, _wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    channel = loop._background_owner.conversation_channel
+    child_flow = loop.step_delivery
+    idle_entered = asyncio.Event()
+    release_idle = asyncio.Event()
+    send_started = asyncio.Event()
+    order: list[str] = []
+    original_idle = channel.publish_idle
+    original_produce = child_flow.produce
+
+    async def blocked_idle(**kwargs):
+        idle_entered.set()
+        await release_idle.wait()
+        result = await original_idle(**kwargs)
+        order.append("idle")
+        return result
+
+    async def observed_produce(item):
+        send_started.set()
+        result = await original_produce(item)
+        order.append("follow_up")
+        return result
+
+    monkeypatch.setattr(channel, "publish_idle", blocked_idle)
+    monkeypatch.setattr(child_flow, "produce", observed_produce)
+    run, idle_waiting, _prompts = await _run_until_idle_wait(
+        loop, child, monkeypatch, wait_for_idle=False
+    )
+    send: asyncio.Task[object] | None = None
+    try:
+        try:
+            await idle_entered.wait()
+            send = asyncio.create_task(
+                channel.produce_to(
+                    "root:1",
+                    pending_delivery_module.PromptInput(
+                        "new work", MessageOrigin.AGENT_SEND, None
+                    ),
+                )
+            )
+            await send_started.wait()
+        finally:
+            release_idle.set()
+        assert send is not None
+        await send
+        await asyncio.wait_for(idle_waiting.wait(), 10)
+        assert order[:2] == ["idle", "follow_up"]
+        assert any(
+            entry.data.get("kind") == "child_idle"
+            for entry in parent.agent_notifications(pending_only=False)
+        )
+    finally:
+        release_idle.set()
+        if send is not None:
+            await asyncio.gather(send, return_exceptions=True)
+        await _cancel_idle_fixture(run, registry, parent, child)
+
+
+@pytest.mark.asyncio
+async def test_last_owned_source_exit_publishes_stall_without_polling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, child, registry, loop, _parent_flow, wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    task_running = True
+    monkeypatch.setattr(
+        registry.background_tasks,
+        "snapshot",
+        lambda: (
+            (
+                SimpleNamespace(
+                    running=True, task_id="task-owned", headline="owned task"
+                ),
+            )
+            if task_running
+            else ()
+        ),
+    )
+    idle_entries: asyncio.Queue[None] = asyncio.Queue()
+
+    async def consume(_loop, _prompt, **kwargs):
+        await _ack_fake_delivery(child, kwargs)
+        return {
+            "content": [{"type": "text", "text": "waiting for task"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(wake, _timeout):
+        idle_entries.put_nowait(None)
+        await wake()
+        return True
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=child,
+            child_turns=lambda: 1,
+            child_path=str(child.session_dir),
+            explicit_finish_metadata={
+                "child_instance_id": "root:1",
+                "description": "work",
+            },
+            idle_wait=wait_idle,
+        )
+    )
+    try:
+        await asyncio.wait_for(idle_entries.get(), 10)
+        assert parent.agent_notifications(pending_only=False) == []
+        task_running = False
+        loop._background_owner.conversation_channel.wake("root:1")
+        await asyncio.wait_for(idle_entries.get(), 10)
+        notices = [
+            entry
+            for entry in parent.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "child_idle"
+        ]
+        assert len(notices) == 1
+        assert notices[0].data["text"] == "waiting for task"
+        assert wakes == ["notification"]
+    finally:
+        await _cancel_idle_fixture(run, registry, parent, child)
+
+
+@pytest.mark.asyncio
+async def test_question_answer_then_later_stall_starts_new_notice_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, child, registry, loop, parent_flow, _wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    idle_entries: asyncio.Queue[None] = asyncio.Queue()
+    prompts: list[str] = []
+
+    async def consume(_loop, prompt, **kwargs):
+        await _ack_fake_delivery(child, kwargs)
+        if not prompt and loop.step_delivery.has_prompt_edge:
+            prepared = await loop.step_delivery.prepare_request(
+                "terminal_fallback", [], None
+            )
+            assert prepared.prompt_id is not None
+            prompt = prepared.messages[-1].content[0].text
+            await loop.step_delivery.acknowledge_active()
+        prompts.append(prompt)
+        if prompt == "ask now":
+            await loop._background_owner.conversation_channel.publish_question(
+                child_instance_id="root:1",
+                question_id="q-reset",
+                question="approve?",
+                options=None,
+            )
+        return {
+            "content": [{"type": "text", "text": f"after {prompt}"}],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(wake, _timeout):
+        idle_entries.put_nowait(None)
+        await wake()
+        return True
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=child,
+            child_turns=lambda: len(prompts),
+            child_path=str(child.session_dir),
+            explicit_finish_metadata={
+                "child_instance_id": "root:1",
+                "description": "work",
+            },
+            idle_wait=wait_idle,
+        )
+    )
+    try:
+        await asyncio.wait_for(idle_entries.get(), 10)
+        assert (
+            await send_to_run(
+                parent,
+                "root:1",
+                "ask now",
+                channel=loop._background_owner.conversation_channel,
+            )
+            is None
+        )
+        await asyncio.wait_for(idle_entries.get(), 10)
+        assert (
+            len(
+                [
+                    entry
+                    for entry in parent.agent_notifications(pending_only=False)
+                    if entry.data.get("kind") == "child_idle"
+                ]
+            )
+            == 1
+        )
+        prepared = await parent_flow.prepare_request("idle_start", [], None)
+        assert prepared.notification_ids
+        await parent_flow.acknowledge_active()
+        assert (
+            await send_to_run(
+                parent,
+                "root:1",
+                "Re q-reset: approved",
+                channel=loop._background_owner.conversation_channel,
+            )
+            is None
+        )
+        await asyncio.wait_for(idle_entries.get(), 10)
+        notices = [
+            entry
+            for entry in parent.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "child_idle"
+        ]
+        assert len(notices) == 2
+        assert notices[0].id != notices[1].id
+        assert notices[1].data["text"] == "after Re q-reset: approved"
+    finally:
+        await _cancel_idle_fixture(run, registry, parent, child)
+
+
 @pytest.mark.asyncio
 async def test_real_input_wins_over_immediate_reminder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -12821,7 +13356,7 @@ async def test_real_input_wins_over_immediate_reminder(
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
     await asyncio.wait_for(
-        agent_runner_module.consume_run(loop, "work", child_store=store), 2
+        agent_runner_module.consume_run(loop, "work", child_store=store), 10
     )
     assert calls == ["work", "real input"]
     assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in calls
@@ -12880,7 +13415,7 @@ async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child
             loop, "work", child_store=store, idle_wait=wait_idle
         )
     )
-    await asyncio.wait_for(idle_waiting.wait(), 2)
+    await asyncio.wait_for(idle_waiting.wait(), 10)
     assert prompts == ["work"]
     run.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -14831,7 +15366,7 @@ async def test_idle_notification_wakes_waiting_parent_without_polling(
     notice = parent.agent_notifications()[-1]
     assert notice.data["kind"] == "child_idle"
     assert notice.data["status"] == "child_idle"
-    assert notice.data["ask_parent_question_id"] == "q1"
+    assert "ask_parent_question_id" not in notice.data
     assert len(notice.data["text"]) <= 10_000
     assert woke == [True]
 
@@ -14912,6 +15447,10 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
     )
     await asyncio.wait_for(parent_wake, timeout=1)
     assert parent.agent_notifications()[0].data["kind"] == "child_idle"
+    assert not any(
+        entry.data.get("kind") == "child_idle"
+        for entry in root.agent_notifications(pending_only=False)
+    )
     owner.cancel_subtree("root:1")
     await asyncio.wait_for(owner.wait(), timeout=10)
 

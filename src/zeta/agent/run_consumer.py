@@ -156,7 +156,6 @@ async def consume_run(
     kwargs.setdefault("finish_gate_state", FinishGateState())
 
     safety_started: float | None = None
-    idle_published = False
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
     try:
         result = await consume_child(
@@ -174,6 +173,7 @@ async def consume_run(
             flow = await child_loop._ensure_step_delivery()
             if flow.has_pending_edge:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
+                flow.reset_stalled_episode()
                 idle_lifecycle.reset_idle_period()
                 _transition_running(child_loop, child_store)
                 result = await consume_child(
@@ -183,21 +183,51 @@ async def consume_run(
                     notification_turn=True,
                     **kwargs,
                 )
-                idle_published = False
                 continue
             if idle:
+                _transition_idle(child_store)
                 content = result.get("content")
+                text = "child is idle"
+                if (
+                    isinstance(content, list)
+                    and content
+                    and isinstance(content[0], dict)
+                    and isinstance(content[0].get("text"), str)
+                ):
+                    text = content[0]["text"] or text
+                metadata = kwargs.get("explicit_finish_metadata")
+                child_path = kwargs.get("child_path")
+                finish_gate_state = kwargs["finish_gate_state"]
+                if (
+                    isinstance(metadata, dict)
+                    and isinstance(child_path, str)
+                    and isinstance(finish_gate_state, FinishGateState)
+                ):
+
+                    async def publish_stalled(
+                        metadata=metadata, child_path=child_path, text=text
+                    ):
+                        return await child_loop._background_owner.conversation_channel.publish_idle(
+                            child_instance_id=str(metadata["child_instance_id"]),
+                            child_session_path=child_path,
+                            description=str(metadata["description"]),
+                            text=text,
+                        )
+
+                    await flow.publish_stalled(
+                        lambda finish_gate_state=finish_gate_state: (
+                            finish_gate_state.can_wake_again(child_loop)
+                        ),
+                        publish_stalled,
+                    )
                 ended_with_text = (
                     isinstance(content, list)
                     and bool(content)
                     and isinstance(content[0], dict)
                     and bool(str(content[0].get("text", "")).strip())
                 )
-                if (
-                    ended_with_text
-                    and await idle_lifecycle.reserve_immediate_reminder(
-                        child_loop._terminal_transition_fence
-                    )
+                if ended_with_text and await idle_lifecycle.reserve_immediate_reminder(
+                    child_loop._terminal_transition_fence
                 ):
                     _transition_running(child_loop, child_store)
                     result = await consume_child(
@@ -211,28 +241,7 @@ async def consume_run(
                         ),
                         **kwargs,
                     )
-                    idle_published = False
                     continue
-                if not idle_published:
-                    content = result.get("content")
-                    text = "child is idle"
-                    if (
-                        isinstance(content, list)
-                        and content
-                        and isinstance(content[0], dict)
-                        and isinstance(content[0].get("text"), str)
-                    ):
-                        text = content[0]["text"] or text
-                    metadata = kwargs.get("explicit_finish_metadata")
-                    child_path = kwargs.get("child_path")
-                    if isinstance(metadata, dict) and isinstance(child_path, str):
-                        await child_loop._background_owner.conversation_channel.publish_idle(
-                            child_instance_id=str(metadata["child_instance_id"]),
-                            child_session_path=child_path,
-                            description=str(metadata["description"]),
-                            text=text,
-                        )
-                    idle_published = True
                 running_tasks = any(
                     task.running
                     for task in child_loop.tool_registry.background_tasks.snapshot()
@@ -270,7 +279,6 @@ async def consume_run(
                     ),
                     **kwargs,
                 )
-                idle_published = False
                 continue
             terminal = await flow.admit_terminal("segment_end")
             if terminal.pending:
