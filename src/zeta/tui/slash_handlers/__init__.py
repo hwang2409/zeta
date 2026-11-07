@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
@@ -23,7 +22,7 @@ from ...accounts import (
 from ...accounts.login import login_failure_message, login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
-from ...core.project_context import discover_project_root
+from ...core.project_context import project_command_view
 from ...core.session import (
     SessionError,
     env_home,
@@ -231,7 +230,9 @@ class SlashHandlerMixin:
                 return "accounts unavailable for this session"
             return await asyncio.to_thread(rename_account_command, context.store, args)
         if self.active or self.pending_approvals:
-            return "accounts unavailable: cannot switch while a turn or approval is active"
+            return (
+                "accounts unavailable: cannot switch while a turn or approval is active"
+            )
         if context is None:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
@@ -764,54 +765,39 @@ class SlashHandlerMixin:
         registry = self.loop.project_registry
         if registry is None:
             return "project registry unavailable"
-        project = None
-        if args.strip() == "init":
-            root = (
-                discover_project_root(self.loop.store.cwd)
-                or Path(self.loop.store.cwd).resolve()
+        initialize = args.strip() == "init"
+        try:
+            view = await asyncio.to_thread(
+                project_command_view,
+                registry,
+                self.loop.store.cwd,
+                self.loop.session_metadata.project_id,
+                initialize=initialize,
             )
-            try:
-                project = registry.find_or_create_for_directory(root)
-                await persist_metadata_change(
-                    self.loop.manager,
-                    self.loop.session_metadata,
-                    lambda candidate: self.loop.manager.associate_project(
-                        candidate, project.project_id
-                    ),
-                )
-                self.loop._set_runtime_project(self.loop.session_metadata)
-            except (ProjectRegistryError, OSError, SessionError) as exc:
+        except (ProjectRegistryError, OSError, SessionError) as exc:
+            if initialize:
                 return f"could not initialize project: {exc}"
-        else:
-            if self.loop.session_metadata.project_id:
-                try:
-                    project = registry.show_project(
-                        self.loop.session_metadata.project_id
-                    )
-                except ProjectRegistryError:
-                    project = None
-            if project is None:
-                project = registry.find_for_directory(self.loop.store.cwd)
-        if project is None:
-            return "unassociated (run /project init to associate this directory)"
-        if registry.memory_format(project.project_id) == 2:
-            memory = (
-                ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
+            raise
+        if initialize:
+            assert view.project is not None
+            await persist_metadata_change(
+                self.loop.manager,
+                self.loop.session_metadata,
+                lambda candidate: self.loop.manager.associate_project(
+                    candidate, view.project.project_id
+                ),
             )
-        else:
-            memory = (
-                ", ".join(name for name, _ in registry.load_memory(project.project_id))
-                or "none"
-            )
-        return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
+            self.loop._set_runtime_project(self.loop.session_metadata)
+        return view.text
 
-    def slash_memory(self, args: str) -> str:
+    async def slash_memory(self, args: str) -> str:
         """Show, retry, or undo versioned automatic project-memory changes."""
         registry = self.loop.project_registry
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        return run_memory_command(
+        return await asyncio.to_thread(
+            run_memory_command,
             registry,
             project_id,
             args,
@@ -819,7 +805,7 @@ class SlashHandlerMixin:
             MemoryMutationAuthorization.direct_slash(),
         )
 
-    def slash_inbox(self, args: str) -> str:
+    async def slash_inbox(self, args: str) -> str:
         if args.strip():
             return "usage: /inbox"
         registry = self.loop.project_registry
@@ -827,9 +813,12 @@ class SlashHandlerMixin:
         if registry is None or project_id is None:
             return "project inbox unavailable: session is not associated with a project"
         try:
-            state = ProjectInbox(
-                registry, sessions_root=registry.root.parent / "sessions"
-            ).list(project_id)
+            state = await asyncio.to_thread(
+                ProjectInbox(
+                    registry, sessions_root=registry.root.parent / "sessions"
+                ).list,
+                project_id,
+            )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
         return json.dumps(state, indent=2, sort_keys=True)

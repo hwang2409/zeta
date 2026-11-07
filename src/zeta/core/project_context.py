@@ -330,6 +330,60 @@ def discover_project_root(cwd: str | Path | None = None) -> Path | None:
     return discovery.primary_root if discovery.eligible else None
 
 
+def initialize_project_for_directory(
+    registry: ProjectRegistry, cwd: str | Path
+) -> Project:
+    """Discover a project root and create or find its registry entry."""
+
+    root = discover_project_root(cwd) or Path(cwd).resolve()
+    return registry.find_or_create_for_directory(root)
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectCommandView:
+    project: Project | None
+    text: str
+
+
+def project_command_view(
+    registry: ProjectRegistry,
+    cwd: str | Path,
+    project_id: str | None,
+    *,
+    initialize: bool,
+) -> ProjectCommandView:
+    """Resolve and render one project command synchronously."""
+
+    if initialize:
+        project = initialize_project_for_directory(registry, cwd)
+    else:
+        project = None
+        if project_id:
+            try:
+                project = registry.show_project(project_id)
+            except ProjectRegistryError:
+                pass
+        if project is None:
+            project = registry.find_for_directory(cwd)
+    if project is None:
+        return ProjectCommandView(
+            None, "unassociated (run /project init to associate this directory)"
+        )
+    if registry.memory_format(project.project_id) == 2:
+        memory = ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
+    else:
+        memory = (
+            ", ".join(name for name, _ in registry.load_memory(project.project_id))
+            or "none"
+        )
+    return ProjectCommandView(
+        project,
+        f"project: {project.name} ({project.project_id})\n"
+        f"root: {project.canonical_integration_root}\n"
+        f"memory: {memory}",
+    )
+
+
 def discover_or_find_project(
     registry: ProjectRegistry, cwd: str | Path, user_home: Path
 ) -> Project | None:
@@ -1067,6 +1121,7 @@ __all__ = [
     "discover_project",
     "discover_project_root",
     "discover_repo_root",
+    "initialize_project_for_directory",
     "load_project_context",
     "resolve_project_context",
     "resolve_prompt_argument",
