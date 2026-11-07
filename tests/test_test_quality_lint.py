@@ -778,6 +778,43 @@ def test_private_patch_reflow_survives_zero_count_destination_hunks(
     assert _lint(tmp_path, after, diff=diff) == []
 
 
+def test_new_file_has_an_exactly_empty_base_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = 'def test_case(monkeypatch):\n    monkeypatch.setattr(target, "_private", replacement)\n'
+    seen_base_sources = []
+    real_lint_source = quality.lint_source
+
+    def capture_base_source(path, current, added, base_source=None):
+        seen_base_sources.append(base_source)
+        return real_lint_source(path, current, added, base_source)
+
+    # test-contract: seam lint_diff does not expose its reconstructed base source
+    monkeypatch.setattr(quality, "lint_source", capture_base_source)
+
+    diff = """diff --git a/tests/test_example.py b/tests/test_example.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_example.py
+@@ -0,0 +1,2 @@
++def test_case(monkeypatch):
++    monkeypatch.setattr(target, "_private", replacement)
+"""
+
+    findings = _lint(tmp_path, source, diff=diff)
+
+    assert findings == [
+        quality.Finding(
+            Path("tests/test_example.py"),
+            2,
+            5,
+            "TQ003",
+            quality.CONTRACT_ERROR,
+        )
+    ]
+    assert seen_base_sources == [""]
+
+
 def test_rule_checks_only_added_test_lines(tmp_path: Path) -> None:
     source = """def test_existing_and_new():
     time.sleep(0.1)
