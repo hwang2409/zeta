@@ -143,14 +143,18 @@ def _compare(base: Path, head: Path, tmp_path: Path, *, env: dict[str, str] | No
 
 
 def test_compare_records_exact_identity_for_each_worktree(tmp_path: Path) -> None:
+    identity_before = subprocess.run(
+        ["git", "-C", str(ROOT), "config", "--local", "--get", "user.name"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     base = tmp_path / "base"
     head = tmp_path / "head"
     subprocess.run(["git", "worktree", "add", "--detach", str(base), "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True)
     try:
         subprocess.run(["git", "worktree", "add", "--detach", str(head), "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True)
-        subprocess.run(["git", "-C", str(head), "config", "user.email", "test@example.invalid"], check=True, capture_output=True, text=True)
-        subprocess.run(["git", "-C", str(head), "config", "user.name", "test"], check=True, capture_output=True, text=True)
-        subprocess.run(["git", "-C", str(head), "commit", "--allow-empty", "-m", "identity test"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "-C", str(head), "commit", "--allow-empty", "-m", "identity test"], check=True, capture_output=True, text=True)
         result = _compare(base, head, tmp_path)
         assert result.returncode == 0, result.stderr
         manifest = json.loads((tmp_path / "manifest.json").read_text())["sessions"][0]
@@ -160,6 +164,13 @@ def test_compare_records_exact_identity_for_each_worktree(tmp_path: Path) -> Non
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(head)], cwd=ROOT, check=False, capture_output=True)
         subprocess.run(["git", "worktree", "remove", "--force", str(base)], cwd=ROOT, check=False, capture_output=True)
+    identity_after = subprocess.run(
+        ["git", "-C", str(ROOT), "config", "--local", "--get", "user.name"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert (identity_after.returncode, identity_after.stdout) == (identity_before.returncode, identity_before.stdout)
 
 
 def test_compare_rejects_import_outside_expected_worktree(tmp_path: Path) -> None:
