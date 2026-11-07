@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.support.server_client import event, request
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.protocol.types import (
@@ -67,10 +68,6 @@ async def _open(
     return server, reader, writer, session_id
 
 
-async def _close(server: ZetaServer, writer: asyncio.StreamWriter) -> None:
-    writer.close()
-    await writer.wait_closed()
-    await server.close()
 
 
 async def _history(reader, writer, session_id: str):
@@ -200,7 +197,7 @@ async def test_session_history_fidelity_projects_bounded_tool_data_over_socket(
         assert rows[3]["tool_result"]["structured_content_truncated"] is True
         assert rows[4]["tool_result"]["structured_content_truncated"] is None
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -259,7 +256,7 @@ async def test_session_history_fidelity_projects_tool_image_stubs_over_socket(
             },
         ]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -287,7 +284,7 @@ async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
             key: value for key, value in live.items() if key != "session_id"
         } == replayed
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -356,7 +353,7 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
         rows = await _history(reader, writer, session_id)
         assert not any(row.get("event") == "served_turn_end" for row in rows)
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -391,7 +388,7 @@ async def test_sequential_served_turns_have_distinct_correlated_ids(
         assert live[0][1] != live[1][1]
         assert history_ids == [turn_id for _, turn_id in live]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -408,7 +405,7 @@ async def test_legacy_turn_start_omits_turn_id(tmp_path: Path) -> None:
         after = (await request(reader, writer, 21, "status"))[-1]["result"]
         assert "last_turn_outcome" not in after
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.parametrize(
@@ -461,7 +458,7 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
         live_turn_id = started["data"].get("turn_id")
         assert isinstance(live_turn_id, str)
         if isinstance(backend, _BlockingBackend):
-            await backend.started.wait()
+            await asyncio.wait_for(backend.started.wait(), 10)
         if reason == "user_stop":
             await request(reader, writer, 12, "abort")
         elif reason == "disconnect":
@@ -469,7 +466,7 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
             await writer.wait_closed()
         if terminal is not None:
             await event(reader, terminal)
-        await finalized.wait()
+        await asyncio.wait_for(finalized.wait(), 10)
 
         if reason != "disconnect":
             writer.close()
@@ -492,7 +489,7 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
         assert [row["data"]["reason"] for row in served] == [reason]
         assert served[0]["data"].get("turn_id") == live_turn_id
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.parametrize("finalizer", ["notification", "resumed_tool"])
@@ -554,7 +551,7 @@ async def test_background_finalizers_persist_served_turn_end(
             started = await event(reader, "turn_start")
             live_turn_id = started["data"].get("turn_id")
             assert isinstance(live_turn_id, str)
-        await finalized.wait()
+        await asyncio.wait_for(finalized.wait(), 10)
 
         rows = await _history(reader, writer, session_id)
         served = [row for row in rows if row.get("event") == "served_turn_end"]
@@ -564,7 +561,7 @@ async def test_background_finalizers_persist_served_turn_end(
         if live_turn_id is not None:
             assert stored_turn_id == live_turn_id
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -633,7 +630,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
         assert not announcement.done()
 
         release.set()
-        await announcement
+        await asyncio.wait_for(announcement, 10)
         rows = await _history(reader, writer, session_id)
         assert [
             row["data"]["reason"]
@@ -644,7 +641,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
         release.set()
         if announcement is not None and not announcement.done():
             announcement.cancel()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -673,7 +670,7 @@ async def test_history_projects_all_closed_served_turn_end_reasons(
             if row.get("event") == "served_turn_end"
         ] == ["completed", "user_stop", "error", "disconnect"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -696,4 +693,4 @@ async def test_history_without_fidelity_keeps_legacy_empty_arguments(
         assert rows[0]["content"][0]["tool_call"]["arguments"] == {}
         assert "arguments_truncated" not in rows[0]["content"][0]["tool_call"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)

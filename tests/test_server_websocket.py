@@ -142,7 +142,7 @@ async def _read_json(reader: asyncio.StreamReader) -> dict[str, object]:
     return json.loads(payload)
 
 
-async def _close(
+async def close_serve(
     server: ZetaServer, writer: asyncio.StreamWriter | None = None
 ) -> None:
     if writer is not None:
@@ -180,7 +180,7 @@ async def test_websocket_round_trip_uses_real_serve_runtime(tmp_path: Path) -> N
             "result": {"sessions": []},
         }
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -302,7 +302,7 @@ async def test_websocket_upgrade_requires_token_and_allowed_origin(
             if status == 101:
                 await asyncio.sleep(0)
     finally:
-        await _close(server)
+        await close_serve(server)
 
 
 @pytest.mark.asyncio
@@ -334,7 +334,7 @@ async def test_websocket_subprotocol_auth_rejects_bad_tokens(
         writer.close()
         await writer.wait_closed()
     finally:
-        await _close(server)
+        await close_serve(server)
 
 
 @pytest.mark.asyncio
@@ -369,7 +369,7 @@ async def test_websocket_subprotocol_auth_shape(
         writer.close()
         await writer.wait_closed()
     finally:
-        await _close(server)
+        await close_serve(server)
 
 
 @pytest.mark.asyncio
@@ -388,7 +388,7 @@ async def test_websocket_valid_bearer_echoes_only_v1(tmp_path: Path) -> None:
         writer.close()
         await writer.wait_closed()
     finally:
-        await _close(server)
+        await close_serve(server)
 
 
 async def test_websocket_and_unix_socket_share_single_client_limit(
@@ -444,7 +444,7 @@ async def test_websocket_and_unix_socket_share_single_client_limit(
         writer.close()
         await writer.wait_closed()
     finally:
-        await _close(server, ws_writer)
+        await close_serve(server, ws_writer)
 
 
 @pytest.mark.asyncio
@@ -471,7 +471,7 @@ async def test_websocket_reassembles_fragmented_text(tmp_path: Path) -> None:
         await writer.drain()
         assert (await _read_json(reader))["result"]["server"] == "zeta"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -502,7 +502,7 @@ async def test_websocket_rejects_invalid_message_types(
         assert opcode == 8
         assert int.from_bytes(payload[:2], "big") == close_code
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -533,7 +533,7 @@ async def test_websocket_token_file_lifecycle_and_loopback_bind(tmp_path: Path) 
             "127.0.0.1"
         }
     finally:
-        await _close(server)
+        await close_serve(server)
     assert not token_path.exists()
 
 
@@ -547,7 +547,7 @@ async def test_websocket_prints_connect_url_once_without_logging_token(
         assert server._websocket is not None
         token = server._websocket.token
         port = server._websocket.port
-        await _close(server)
+        await close_serve(server)
     captured = capsys.readouterr()
     assert captured.out == ""
     assert token is not None
@@ -626,7 +626,7 @@ async def test_observer_credential_cannot_claim_controller_before_or_after_disco
     finally:
         observer[1].close()
         await observer[1].wait_closed()
-        await _close(server)
+        await close_serve(server)
 
 
 @pytest.mark.asyncio
@@ -646,8 +646,8 @@ async def test_websocket_discovery_file_has_one_owner(tmp_path: Path) -> None:
         assert second._websocket.server is None
         assert token_path.read_bytes() == first_value
     finally:
-        await _close(second)
-        await _close(first)
+        await close_serve(second)
+        await close_serve(first)
     assert not token_path.exists()
 
     replacement = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
@@ -656,7 +656,7 @@ async def test_websocket_discovery_file_has_one_owner(tmp_path: Path) -> None:
         assert token_path.exists()
         assert token_path.read_bytes() != first_value
     finally:
-        await _close(replacement)
+        await close_serve(replacement)
 
 
 @pytest.mark.asyncio
@@ -673,7 +673,7 @@ async def test_websocket_replaces_stale_discovery_file(tmp_path: Path) -> None:
         assert value["pid"] == os.getpid()
         assert (token_path.parent / "serve.ws.lock").read_text() == str(os.getpid())
     finally:
-        await _close(server)
+        await close_serve(server)
 
 
 def test_serve_websocket_cli_flags() -> None:
