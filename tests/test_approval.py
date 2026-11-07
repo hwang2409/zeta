@@ -16,7 +16,6 @@ from zeta.core.approval import (
     ApprovalRule,
     parse_approval_rule,
 )
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
@@ -31,6 +30,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry

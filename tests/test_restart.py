@@ -11,8 +11,8 @@ from prompt_toolkit.output import DummyOutput
 from tests.support.fake_backend import FakeBackend
 from zeta.cli import main as cli_main
 from zeta.cli.main import _exec_restart, _restart_argv
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import FullScreenPromptSession
