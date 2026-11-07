@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.support.server_client import event, request
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.memory.reconciler import (
@@ -411,9 +412,7 @@ async def test_dropped_steer_text_never_reaches_memory_reconciler(
 
         assert "private dropped steer" not in reconciliation.prompt
     finally:
-        writer.close()
-        await writer.wait_closed()
-        await server.close()
+        await close_serve(server, writer)
 
 
 def test_request_excludes_client_delivery_bookkeeping() -> None:
