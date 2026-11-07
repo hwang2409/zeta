@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Literal
-from weakref import WeakKeyDictionary
 
 from ..core.abort import AbortSignal
 from ..core.process_env import subprocess_env
@@ -102,7 +101,9 @@ async def _append_frame_part(
     return frame
 
 
-_Outcome = Literal["limit", "quota", "restart", "canceled", "transport", "closed"]
+_Outcome = Literal[
+    "limit", "quota", "deadline", "restart", "canceled", "transport", "closed"
+]
 
 
 @dataclass(slots=True)
@@ -161,9 +162,6 @@ class StdioMCPClient(MCPClient):
         self._generation = 0
         self._active_accumulator: MCPCallEnvelope | None = None
         self._invalidation: _Invalidation | None = None
-        self._invalidation_results: WeakKeyDictionary[
-            asyncio.Task[object], StructuredToolResult
-        ] = WeakKeyDictionary()
 
     def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
         self._failure_sink = sink
@@ -174,13 +172,6 @@ class StdioMCPClient(MCPClient):
     def _report_failure(self, error: BaseException) -> None:
         if self._failure_sink is not None:
             self._failure_sink(_error_text(error))
-
-    def take_invalidation_result(
-        self, task: asyncio.Task[object]
-    ) -> StructuredToolResult | None:
-        """Return the result fixed before shared transport cleanup began."""
-
-        return self._invalidation_results.pop(task, None)
 
     async def connect(self) -> None:
         if self._process is not None:
@@ -323,6 +314,20 @@ class StdioMCPClient(MCPClient):
             f"MCP stdio server {self.config.name} restarted after a call limit; "
             "retry the tool"
         )
+
+    def deadline_exceeded(self, owner: asyncio.Task[object]) -> None:
+        """Start or join invalidation before the timed-out call can resume."""
+
+        invalidation = self._start_invalidation(
+            MCPTransportError("MCP stdio server terminated after a call deadline"),
+            default_outcome="restart",
+        )
+        deadline_ids = {
+            request_id
+            for request_id, pending in invalidation.pending.items()
+            if pending.owner is owner
+        }
+        self._record_outcomes(invalidation, set(), set(), set(), deadline_ids)
 
     async def close(self) -> None:
         if self._closed:
@@ -534,6 +539,8 @@ class StdioMCPClient(MCPClient):
                 else None
             )
             return result, _StdioSpillQuota()
+        if outcome == "deadline":
+            return None, None
         if outcome == "canceled":
             return canceled_result() if tool_name is not None else None, MCPCanceled()
         if outcome == "restart":
@@ -547,6 +554,7 @@ class StdioMCPClient(MCPClient):
         limit_ids: set[int],
         quota_ids: set[int],
         cancel_ids: set[int],
+        deadline_ids: set[int] | None = None,
     ) -> None:
         for request_id in limit_ids:
             if request_id in invalidation.pending:
@@ -557,14 +565,9 @@ class StdioMCPClient(MCPClient):
         for request_id in cancel_ids:
             if request_id in invalidation.pending:
                 invalidation.outcomes[request_id] = "canceled"
-        for request_id, pending in invalidation.pending.items():
-            if pending.owner is None or pending.tool_name is None:
-                continue
-            result, _ = self._outcome_values(
-                invalidation.outcomes[request_id], pending.tool_name
-            )
-            if result is not None:
-                self._invalidation_results[pending.owner] = result
+        for request_id in deadline_ids or ():
+            if request_id in invalidation.pending:
+                invalidation.outcomes[request_id] = "deadline"
 
     async def _finish_invalidation(self, invalidation: _Invalidation) -> None:
         reader_tasks = [
@@ -590,9 +593,11 @@ class StdioMCPClient(MCPClient):
             for request_id, pending in invalidation.pending.items():
                 if pending.future.done():
                     continue
-                _, error = self._outcome_values(
-                    invalidation.outcomes[request_id], pending.tool_name
-                )
+                outcome = invalidation.outcomes[request_id]
+                if outcome == "deadline":
+                    pending.future.cancel()
+                    continue
+                _, error = self._outcome_values(outcome, pending.tool_name)
                 pending.future.set_exception(error or invalidation.reason)
             if self._reader_error is None:
                 self._reader_error = invalidation.reason
