@@ -6,10 +6,9 @@ import asyncio
 import re
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 from rich import box
 from rich.console import Group, RenderableType
@@ -39,10 +38,13 @@ MAX_RESULT = 180
 MAX_TAIL_LINES = 20
 
 
-@dataclass(frozen=True, slots=True)
-class _TailLine:
-    text: str
-    wrap: bool = False
+class _TailLine(str):
+    wrap: bool
+
+    def __new__(cls, text: str, wrap: bool = False) -> Self:
+        line = super().__new__(cls, text)
+        line.wrap = wrap
+        return line
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -317,7 +319,7 @@ class AgentCard:
                         identities,
                     )
                     lines.extend(
-                        _TailLine(f"  {line.text}", line.wrap) for line in nested_tail
+                        _TailLine(f"  {line}", line.wrap) for line in nested_tail
                     )
             if len(lines) > limit:
                 lines = lines[-limit:]
@@ -345,7 +347,7 @@ class AgentCard:
             Group(
                 *(
                     Text(
-                        line.text,
+                        line,
                         style=theme.BODY,
                         overflow="fold" if line.wrap else "ellipsis",
                         no_wrap=not line.wrap,
