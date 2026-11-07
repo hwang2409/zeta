@@ -214,7 +214,8 @@ def compare_registry_dumps(
     if changes and candidate_epoch <= previous_epoch:
         raise StorageFormatError(
             "; ".join(changes)
-            + "; candidate WRITER_EPOCH must be greater than the predecessor's; "
+            + "; registry delta requires WRITER_EPOCH = latest origin/main + 1 "
+            "(candidate must be greater than the predecessor's); "
             "bump the epoch in src/zeta/storage_format.py"
         )
 
