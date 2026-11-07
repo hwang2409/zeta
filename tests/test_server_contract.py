@@ -197,7 +197,11 @@ async def _hello(client: ServeClient, request_id: str = "hello") -> dict[str, ob
         "hello",
         {
             "protocol_version": "1.2",
-            "features": ["serve_observers", "not_a_server_feature"],
+            "features": [
+                "serve_observers",
+                "session_grants",
+                "not_a_server_feature",
+            ],
         },
     )
     return reply["result"]
@@ -213,8 +217,16 @@ async def test_hello_negotiates_the_same_features(
 
     assert hello["server"] == "zeta"
     assert hello["protocol_version"] == "1.2"
-    assert hello["capabilities"]["features"] == ["serve_observers"]
-    assert {"new_session", "send"} <= set(hello["capabilities"]["requests"])
+    assert hello["capabilities"]["features"] == [
+        "serve_observers",
+        "session_grants",
+    ]
+    assert {
+        "new_session",
+        "send",
+        "session_grants",
+        "revoke_session_grants",
+    } <= set(hello["capabilities"]["requests"])
 
 
 @pytest.mark.asyncio
@@ -288,7 +300,7 @@ async def test_controller_and_observer_roles_match(
         {
             "protocol_version": "1.2",
             "role": "observer",
-            "features": ["serve_observers"],
+            "features": ["serve_observers", "session_grants"],
         },
     )
 
@@ -318,7 +330,10 @@ async def test_controller_and_observer_roles_match(
     )
 
     assert "new_session" in controller_hello["capabilities"]["requests"]
-    assert "new_session" not in observer_hello["result"]["capabilities"]["requests"]
+    observer_requests = observer_hello["result"]["capabilities"]["requests"]
+    assert "new_session" not in observer_requests
+    assert "session_grants" in observer_requests
+    assert "revoke_session_grants" not in observer_requests
     assert observed["result"] == {"sessions": []}
     assert rejected["error"]["code"] == -32008
     assert rejected["error"]["data"] == {
