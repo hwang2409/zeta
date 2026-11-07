@@ -335,7 +335,6 @@ class DecisionsMixin:
             except (OSError, ValueError) as exc:
                 self._print_system(f"attention not dismissed: {exc}")
             await self._decisions_tick()
-            self._refresh_decisions_panel()
 
         asyncio.create_task(run())
 

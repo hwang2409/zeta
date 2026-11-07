@@ -10,6 +10,7 @@ from prompt_toolkit.application.current import set_app
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyPress
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.output import DummyOutput
@@ -179,7 +180,7 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
         entry_id=None,
         entry_seq=None,
         title="choose",
-        why="choose a value",
+        why="choose a value " + "with supporting context " * 20,
     )
     information = attention.request(
         session_id=store.session_id,
@@ -187,7 +188,7 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
         entry_id=None,
         entry_seq=None,
         title="answer",
-        why="the answer is ready",
+        why="the answer is ready " + "with supporting context " * 20,
     )
     information_path = attention.directory / f"{information.id}.json"
     information_value = json.loads(information_path.read_text())
@@ -249,6 +250,13 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
         assert foreground(decision_badge) != foreground(answer_badge)
         assert "d dismiss" in text
         assert app._decisions_panel.selected.record.kind == "answer"
+        await _render_status(session, 100, 24)
+        with set_app(session.app):
+            for _ in range(20):
+                session.app.key_processor.feed(KeyPress(Keys.PageDown))
+                session.app.key_processor.process_keys()
+        offset_before_dismiss = app._decisions_panel_control.offset
+        assert offset_before_dismiss > 0
 
         app._stop_decisions_refresh()
         tick_done = asyncio.Event()
@@ -283,6 +291,7 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
         dismissed = attention.get(information.id)
         assert dismissed.status == "resolved"
         assert dismissed.decision is None
+        assert app._decisions_panel_control.offset > 0
     finally:
         app.close_decisions_panel()
         await app.close()
