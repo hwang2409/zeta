@@ -98,6 +98,46 @@ def _filesystem_snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
 
 
 @pytest.mark.asyncio
+async def test_new_session_promotes_healthy_cwd_project_after_malformed_probe(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    cwd = tmp_path / "healthy"
+    unrelated = tmp_path / "unrelated"
+    cwd.mkdir()
+    unrelated.mkdir()
+    await asyncio.to_thread(
+        subprocess.run, ["git", "init", "-q"], cwd=cwd, check=True
+    )
+    registry = ProjectRegistry(home / "projects")
+    healthy = registry.create_project("healthy", "git", cwd)
+    malformed = registry.create_project("malformed", "git", unrelated)
+    (registry.root / malformed.project_id / "project.json").write_text(
+        "{", encoding="utf-8"
+    )
+    server = ZetaServer(
+        home=home,
+        cwd=cwd,
+        provider="codex",
+        port=0,
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    try:
+        await server.start()
+        assert server.runtime.manager.project_registry_unavailable is not None
+
+        metadata = await server.runtime.create_session()
+
+        assert metadata.project_id == healthy.project_id
+        assert server.runtime.loop.root_project_id == healthy.project_id
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["new_session", "resume"])
 async def test_session_project_preparation_does_not_block_ping(
     tmp_path: Path, method: str

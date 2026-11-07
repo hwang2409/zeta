@@ -6376,8 +6376,18 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
 
     monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
     app.loop.project_context_health = SimpleNamespace(
-        summary="malformed_memory (p_test/memory/state.md): project memory is malformed"
+        summary="malformed_memory (p_root/memory/state.md): project memory is malformed"
     )
+    vars(app.loop._background_owner)["project_context_loops"] = {
+        "child-session": SimpleNamespace(
+            project_context_health=SimpleNamespace(
+                summary=(
+                    "malformed_memory (p_child/memory/brief.md): "
+                    "project memory is malformed"
+                )
+            )
+        )
+    }
 
     lines = tui_app_module._status_card_lines(app.slash_status())
     rendered = "\n".join("".join(text for _style, text in line) for line in lines)
@@ -6386,14 +6396,17 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
     assert (
         "transcript_index_failure: disk full; pending changes will retry" in rendered
     )
-    assert "project_context_health: healthy" in rendered
+    assert (
+        "project_context_health: malformed_memory "
+        "(p_child/memory/brief.md): project memory is malformed" in rendered
+    )
 
     app._agent_navigation.current_path = app._agent_navigation.root_path
     lines = tui_app_module._status_card_lines(app.slash_status())
     rendered = "\n".join("".join(text for _style, text in line) for line in lines)
     assert (
         "project_context_health: malformed_memory "
-        "(p_test/memory/state.md): project memory is malformed" in rendered
+        "(p_root/memory/state.md): project memory is malformed" in rendered
     )
     await app.close()
 

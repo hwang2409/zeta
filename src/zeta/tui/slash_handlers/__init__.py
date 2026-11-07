@@ -116,6 +116,18 @@ class SlashHandlerMixin:
         compaction_history_data = compaction_history(
             self.loop.store.replay(), context_assembler.token_counter
         )
+        viewed_path = self._viewed_session_path()
+        if viewed_path == self.loop.store.session_dir:
+            viewed_health = self.loop.project_context_health
+        else:
+            viewed_loop = self.loop._background_owner.project_context_loops.get(
+                viewed_path.name
+            )
+            viewed_health = (
+                viewed_loop.project_context_health
+                if viewed_loop is not None
+                else None
+            )
         return SlashStatus(
             session_id=self.loop.store.session_id,
             provider=self.provider,
@@ -153,13 +165,10 @@ class SlashHandlerMixin:
                 else None
             ),
             transcript_index_failure=self.loop.transcript_index_failure(
-                self._viewed_session_path().name
+                viewed_path.name
             ),
             project_context_health=(
-                self.loop.project_context_health.summary
-                if self._viewed_session_path() == self.loop.store.session_dir
-                and self.loop.project_context_health is not None
-                else None
+                viewed_health.summary if viewed_health is not None else None
             ),
         )
 

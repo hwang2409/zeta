@@ -80,6 +80,88 @@ class ProjectContextProjectionMixin:
 
         return self._read(operation)
 
+    def _read_project_identities(
+        self, root_fd: int, names: list[str]
+    ) -> tuple[list[Project], list[ProjectContextHealth]]:
+        projects: list[Project] = []
+        malformed: list[ProjectContextHealth] = []
+        for name in names:
+            try:
+                directory_fd = self._project_dir(root_fd, name)
+                try:
+                    record = self._read_fd(directory_fd, "project.json")
+                    projects.append(self._decode(record, name))
+                finally:
+                    os.close(directory_fd)
+            except (OSError, ProjectRegistryError):
+                malformed.append(_health("malformed_project", name, "project.json"))
+        return projects, malformed
+
+    def _read_selected_memory(
+        self, root_fd: int, selected: Project | None
+    ) -> tuple[
+        list[MemoryContextEntry],
+        EntryMemorySnapshot | None,
+        ProjectContextHealth | None,
+    ]:
+        memory: list[MemoryContextEntry] = []
+        entry_memory: EntryMemorySnapshot | None = None
+        memory_health: ProjectContextHealth | None = None
+        if selected is None:
+            return memory, entry_memory, memory_health
+        directory_fd = self._project_dir(root_fd, selected.project_id)
+        try:
+            pointer: dict[str, object] | None = None
+            try:
+                pointer = self._pointer(directory_fd)
+                if pointer is None:
+                    memory_fd = self._memory_fd(directory_fd)
+                    try:
+                        for name in PROJECT_MEMORY_FILES:
+                            try:
+                                content = self._read_memory_file(memory_fd, name)
+                                if content.startswith("<!-- zeta-memory-mirror:v1"):
+                                    raise ProjectRegistryError(
+                                        "memory mirror is not authoritative"
+                                    )
+                            except FileNotFoundError:
+                                continue
+                            except (OSError, ProjectRegistryError):
+                                if memory_health is None:
+                                    memory_health = _health(
+                                        "malformed_memory",
+                                        selected.project_id,
+                                        f"memory/{name}",
+                                    )
+                                continue
+                            memory.append(MemoryContextEntry(name, content, False))
+                    finally:
+                        os.close(memory_fd)
+                else:
+                    try:
+                        snapshot = self._snapshot_locked(directory_fd)
+                    except UnsupportedMemoryFormatError:
+                        entry_memory = self._entry_snapshot_locked(directory_fd)
+                    else:
+                        automatic = self._automatic_files_from_records(
+                            self._records_locked(directory_fd)
+                        )
+                        memory.extend(
+                            MemoryContextEntry(name, content, name in automatic)
+                            for name, content in snapshot.contents.items()
+                        )
+            except (OSError, ProjectRegistryError, ValueError):
+                source = "memory-current.json"
+                if pointer is not None and isinstance(pointer.get("current"), str):
+                    source = f"memory-versions/versions/{pointer['current']}.json"
+                memory.clear()
+                memory_health = _health(
+                    "malformed_memory", selected.project_id, source
+                )
+        finally:
+            os.close(directory_fd)
+        return memory, entry_memory, memory_health
+
     def project_context_projection(
         self, session_project_id: str | None
     ) -> ProjectContextProjection:
@@ -91,87 +173,14 @@ class ProjectContextProjectionMixin:
             )
             if len(names) > MAX_PROJECTS:
                 raise ProjectRegistryError("project limit exceeded")
-            projects: list[Project] = []
-            malformed: list[ProjectContextHealth] = []
-            for name in names:
-                try:
-                    directory_fd = self._project_dir(root_fd, name)
-                    try:
-                        record = self._read_fd(directory_fd, "project.json")
-                        projects.append(self._decode(record, name))
-                    finally:
-                        os.close(directory_fd)
-                except (OSError, ProjectRegistryError):
-                    malformed.append(_health("malformed_project", name, "project.json"))
-
+            projects, malformed = self._read_project_identities(root_fd, names)
             selected = next(
                 (item for item in projects if item.project_id == session_project_id),
                 None,
             )
-            memory: list[MemoryContextEntry] = []
-            entry_memory: EntryMemorySnapshot | None = None
-            memory_health: ProjectContextHealth | None = None
-            if selected is not None:
-                directory_fd = self._project_dir(root_fd, selected.project_id)
-                try:
-                    pointer: dict[str, object] | None = None
-                    try:
-                        pointer = self._pointer(directory_fd)
-                        if pointer is None:
-                            memory_fd = self._memory_fd(directory_fd)
-                            try:
-                                for name in PROJECT_MEMORY_FILES:
-                                    try:
-                                        content = self._read_memory_file(memory_fd, name)
-                                        if content.startswith(
-                                            "<!-- zeta-memory-mirror:v1"
-                                        ):
-                                            raise ProjectRegistryError(
-                                                "memory mirror is not authoritative"
-                                            )
-                                    except FileNotFoundError:
-                                        continue
-                                    except (OSError, ProjectRegistryError):
-                                        if memory_health is None:
-                                            memory_health = _health(
-                                                "malformed_memory",
-                                                selected.project_id,
-                                                f"memory/{name}",
-                                            )
-                                        continue
-                                    memory.append(
-                                        MemoryContextEntry(name, content, False)
-                                    )
-                            finally:
-                                os.close(memory_fd)
-                        else:
-                            try:
-                                snapshot = self._snapshot_locked(directory_fd)
-                            except UnsupportedMemoryFormatError:
-                                entry_memory = self._entry_snapshot_locked(directory_fd)
-                            else:
-                                automatic = self._automatic_files_from_records(
-                                    self._records_locked(directory_fd)
-                                )
-                                memory.extend(
-                                    MemoryContextEntry(
-                                        name, content, name in automatic
-                                    )
-                                    for name, content in snapshot.contents.items()
-                                )
-                    except (OSError, ProjectRegistryError, ValueError):
-                        source = "memory-current.json"
-                        if pointer is not None and isinstance(pointer.get("current"), str):
-                            source = (
-                                "memory-versions/versions/"
-                                f"{pointer['current']}.json"
-                            )
-                        memory.clear()
-                        memory_health = _health(
-                            "malformed_memory", selected.project_id, source
-                        )
-                finally:
-                    os.close(directory_fd)
+            memory, entry_memory, memory_health = self._read_selected_memory(
+                root_fd, selected
+            )
 
             if session_project_id is not None and selected is None:
                 finding = next(

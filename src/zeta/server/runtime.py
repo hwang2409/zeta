@@ -390,6 +390,8 @@ class ServerRuntime:
             if projection is not None
             else None
         )
+        if session_project is None and cwd_project is not None:
+            session_project = cwd_project
         context = load_project_context(
             cwd=session_cwd,
             repo_root=repo_root,

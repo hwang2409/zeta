@@ -16,7 +16,12 @@ from ...project_context.projection import (
 from ...project_registry import ProjectRegistry
 from ..offload import await_joined_offload
 from ..project_registry_state import ProjectRegistryState
-from ..prompt import RuntimePrompt, replace_runtime_prompt
+from ..prompt import (
+    RuntimePrompt,
+    owned_fragment,
+    replace_owned_fragment,
+    replace_runtime_prompt,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,11 +42,13 @@ class ProjectContextRecoveryMixin:
         project_id: str | None,
         health: ProjectContextHealth | None,
         prepare: Callable[[ProjectContextProjection], ProjectContext] | None,
+        replace_component: str | None = None,
     ) -> None:
         self.project_context_health = health
         self._project_context_registry = registry
         self._project_context_project_id = project_id
         self._project_context_prepare = prepare
+        self._project_context_replace_component = replace_component
         self._project_context_read_task: asyncio.Task[ProjectContextProjection] | None = None
         self._project_context_prepare_task: asyncio.Task[_PreparedProjectContext] | None = None
         self._project_context_pending: ProjectContextProjection | None = None
@@ -60,16 +67,20 @@ class ProjectContextRecoveryMixin:
         generation = self._prompt_generation
         base = self._skill_prompt_base()
         context = await await_joined_offload(self._project_context_prepare, projection)
-        return _PreparedProjectContext(
-            generation,
-            base,
-            replace_runtime_prompt(
+        prepared = RuntimePrompt(context.system_prompt, context.prompt_components)
+        if self._project_context_replace_component is None:
+            prompt = replace_runtime_prompt(
                 base, context.system_prompt, context.prompt_components
-            ),
-            context,
-        )
+            )
+        else:
+            prompt = replace_owned_fragment(
+                base,
+                self._project_context_replace_component,
+                owned_fragment(prepared, self._project_context_replace_component),
+            )
+        return _PreparedProjectContext(generation, base, prompt, context)
 
-    def _advance_project_context_recovery(self) -> None:
+    def _consume_project_context_recovery(self) -> None:
         read = self._project_context_read_task
         if read is not None and read.done():
             self._project_context_read_task = None
@@ -113,6 +124,7 @@ class ProjectContextRecoveryMixin:
                             manager.project_registry_unavailable = None
                     self._project_context_pending = None
 
+    def _schedule_project_context_recovery(self) -> None:
         if (
             self._project_context_pending is not None
             and self._project_context_prepare_task is None
@@ -130,6 +142,10 @@ class ProjectContextRecoveryMixin:
             self._project_context_read_task = asyncio.create_task(
                 self._read_project_context_projection()
             )
+
+    def _advance_project_context_recovery(self) -> None:
+        self._consume_project_context_recovery()
+        self._schedule_project_context_recovery()
 
     async def _close_project_context_recovery(self) -> None:
         tasks = tuple(

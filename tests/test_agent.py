@@ -11504,6 +11504,9 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
     (home / "projects" / child_project.project_id / "AGENTS.md").write_text(
         "CHILD-PRIVATE-MARKER", encoding="utf-8"
     )
+    parent_memory = home / "projects" / parent_project.project_id / "memory"
+    (parent_memory / "brief.md").write_text("HEALTHY-PARENT-MEMORY", encoding="utf-8")
+    (parent_memory / "state.md").write_bytes(b"MALFORMED-\xff-MEMORY")
     (child_cwd / "AGENTS.md").write_text("CHILD-REPO-MARKER", encoding="utf-8")
     _ignore_repo_agents = ignored_project == "project-a"
     ignored_id = (
@@ -11533,22 +11536,32 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
         project_registry=registry,
         skill_catalog=SkillCatalog.empty(),
     )
-    backend = FakeBackend(
+    class RecordingBackgroundBackend(BackgroundBackend):
+        def __init__(self, calls: Sequence[ToolCall]) -> None:
+            super().__init__(calls)
+            self.recorded: list[list[Message]] = []
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            self.recorded.append(list(messages))
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+
+    backend = RecordingBackgroundBackend(
         [
-            ScriptedTurn(
-                tool_calls=[
-                    ToolCall(
-                        "child-1",
-                        "agent",
-                        {
-                            "prompt": "child-work",
-                            "description": "other project child",
-                            "cwd": str(child_cwd),
-                        },
-                    )
-                ]
-            ),
-            ScriptedTurn([TextContent("child done")]),
+            ToolCall(
+                "child-1",
+                "agent",
+                {
+                    "prompt": "inspect the task",
+                    "description": "other project child",
+                    "cwd": str(child_cwd),
+                    "background": True,
+                },
+            )
         ]
     )
     loop = AgentLoop(
@@ -11564,12 +11577,20 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
     loop.set_mcp_scope(home=home, project_dir=parent_cwd)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await backend.child_started.wait()
+    child_loops = getattr(loop._background_owner, "project_context_loops", {})
+    assert child_loops, "spawned child did not publish its project-context state"
+    child_loop = next(iter(child_loops.values()))
+    assert child_loop.project_context_health is not None
+    assert child_loop.project_context_health.code == "malformed_memory"
 
-    child_system = backend.calls[1][0][0]
+    child_system = backend.recorded[1][0]
     system_text = " ".join(
         block.text for block in child_system.content if isinstance(block, TextContent)
     )
     assert "CHILD-PRIVATE-MARKER" in system_text
+    assert "HEALTHY-PARENT-MEMORY" in system_text
+    assert "MALFORMED" not in system_text
     assert "PARENT-PRIVATE-MARKER" not in system_text
     from zeta.core.project_context import load_project_context
     context = load_project_context(
@@ -11582,6 +11603,7 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
         inbox_enabled=False,
     )
     assert any("repository AGENTS.md" in notice for notice in context.notices) is (ignored_project == "project-b")
+    backend.release_child.set()
     await loop.close()
 
 
@@ -11621,7 +11643,9 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
         project_registry=registry,
     )
 
-    prompt = _child_base_system_prompt(loop, str(child_cwd), child_tools)
+    prompt = _child_base_system_prompt(
+        loop, str(child_cwd), child_tools
+    ).system_prompt
 
     assert "PROJECT A MEMORY" in prompt
     assert "PROJECT B MEMORY" not in prompt

@@ -90,11 +90,19 @@ def _conservative_context(
     )
     if selected_memory_unavailable and owned and offset is not None and length is not None:
         prompt = prompt[:offset] + prompt[offset + length :]
-        components.pop("project_memory", None)
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        components["project_memory"] = {
+            "offset": offset,
+            "length": 0,
+            "digest": empty_digest,
+        }
         return ProjectContext(
             prompt,
             tuple(Path(path) for path in metadata.context_files),
+            memory_offset=offset,
+            memory_length=0,
             memory_project_id=metadata.project_id,
+            memory_digest=empty_digest,
             has_override=metadata.prompt_recipe == "custom",
             prompt_recipe=metadata.prompt_recipe,
             prompt_components=components,

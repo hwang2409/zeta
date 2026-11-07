@@ -12,15 +12,18 @@ import threading
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager
 from zeta.project_errors import ProjectRegistryBusyError
 from zeta.project_registry import ProjectRegistry
+from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.project_registry_state import (
     ProjectRegistryUnavailable,
     load_project_registry,
@@ -248,55 +251,189 @@ async def test_broken_registry_serve_hello_without_repair(
             record.chmod(0o600)
 
 
-def test_tui_keeps_healthy_legacy_memory_and_recovers_after_repair(
+@pytest.mark.asyncio
+async def test_custom_resume_recovers_through_real_turns_without_losing_skill_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.skills import SkillCatalog
+
     home = tmp_path / "home"
     repository = tmp_path / "repository"
     repository.mkdir()
-    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    await asyncio.to_thread(
+        subprocess.run, ["git", "init", "-q", str(repository)], check=True
+    )
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("healthy", "git", repository)
-    memory = registry.root / project.project_id / "memory"
-    (memory / "brief.md").write_text("HEALTHY-MEMORY", encoding="utf-8")
-    (memory / "state.md").write_bytes(b"\xff")
+    memory_dir = registry.root / project.project_id / "memory"
+    (memory_dir / "state.md").write_bytes(b"\xff")
+    skill_index = SkillCatalog.empty().index()
+    old_memory = "OLD-MEMORY"
+    prompt = f"CUSTOM-BEFORE\n{skill_index}\n{old_memory}\nCUSTOM-AFTER"
+    skill_offset = prompt.index(skill_index)
+    memory_offset = prompt.index(old_memory)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create,
+        provider="codex",
+        model="gpt-5.6-luna",
+        cwd=repository,
+        project_id=project.project_id,
+        auto_project=False,
+        system_prompt=prompt,
+        project_memory_offset=memory_offset,
+        project_memory_length=len(old_memory),
+        project_memory_digest=hashlib.sha256(old_memory.encode()).hexdigest(),
+        prompt_recipe="custom",
+        prompt_components={
+            "skill_index": {
+                "offset": skill_offset,
+                "length": len(skill_index),
+                "digest": hashlib.sha256(skill_index.encode()).hexdigest(),
+            },
+            "project_memory": {
+                "offset": memory_offset,
+                "length": len(old_memory),
+                "digest": hashlib.sha256(old_memory.encode()).hexdigest(),
+            },
+        },
+    )
+    session_id = opened.store.session_id
+    opened.store.close()
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(repository)
+    args = build_parser().parse_args(
+        ["--resume", session_id, "--provider", "codex", "--no-auto-memory"]
+    )
+    app = await asyncio.to_thread(create_app, args)
+    backend = FakeBackend(
+        [ScriptedTurn(content=[TextContent("ok")]) for _ in range(15)]
+    )
+    app.loop.backend = backend
+    projection_calls = 0
+    original_projection = app.loop.project_registry._read_context_projection
 
-    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    def count_projection(operation):
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_projection(operation)
+
+    # test-contract: seam Count projection reads without changing recovery flow.
+    monkeypatch.setattr(
+        app.loop.project_registry, "_read_context_projection", count_projection
+    )
+    prepare_entered = threading.Event()
+    prepare_release = threading.Event()
+    prepare_done = [threading.Event(), threading.Event()]
+    prepare_calls = 0
+    from zeta.runtime import composition as composition_module
+
+    original_load = composition_module.load_project_context
+
+    def gated_load(**kwargs):
+        nonlocal prepare_calls
+        index = prepare_calls
+        prepare_calls += 1
+        if index == 0:
+            prepare_entered.set()
+            prepare_release.wait()
+        try:
+            return original_load(**kwargs)
+        finally:
+            if index < 2:
+                prepare_done[index].set()
+
+    monkeypatch.setattr(composition_module, "load_project_context", gated_load)
+
+    async def turn(text: str) -> None:
+        await _collect_turn(app.loop, text)
+
+    closing_app = None
+    close_task = None
+    close_read_release = threading.Event()
     try:
-        prompt = app.loop.context_assembler.system_prompt.content[0].text
-        assert "HEALTHY-MEMORY" in prompt
-        assert "Check your inbox with inbox action list" in prompt
+        initial = app.loop.context_assembler.system_prompt.content[0].text
+        assert "CUSTOM-BEFORE" in initial and "CUSTOM-AFTER" in initial
+        assert old_memory not in initial
         assert app.loop.project_context_health is not None
-        assert app.loop.project_context_health.source == "memory/state.md"
 
-        (memory / "state.md").write_text("RECOVERED-MEMORY", encoding="utf-8")
+        (memory_dir / "state.md").write_text("RECOVERED-MEMORY", encoding="utf-8")
+        for index in range(4):
+            await turn(f"advance-{index}")
+            if prepare_entered.is_set():
+                break
+        assert prepare_entered.is_set()
+        skill = home / "skills" / "recovered" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(
+            "---\nname: recovered\ndescription: RECOVERED-SKILL\n---\nbody\n",
+            encoding="utf-8",
+        )
+        await turn("fourth")
+        fourth_prompt = backend.calls[-1][0][0].content[0].text
+        assert "RECOVERED-SKILL" in fourth_prompt
+        assert "RECOVERED-MEMORY" not in fourth_prompt
+        prepare_release.set()
+        await asyncio.to_thread(prepare_done[0].wait)
 
-        async def recover() -> None:
-            app.loop._advance_project_context_recovery()
-            assert app.loop._project_context_read_task is not None
-            await app.loop._project_context_read_task
-            app.loop._advance_project_context_recovery()
-            assert app.loop._project_context_prepare_task is not None
-            await app.loop._project_context_prepare_task
-            assert app.loop._commit_prepared_prompt(
-                app.loop._prompt_generation,
-                app.loop._runtime_prompt,
-                app.loop._runtime_prompt,
-            )
-            app.loop._advance_project_context_recovery()
-            assert app.loop.project_context_health is not None
-            assert app.loop._project_context_prepare_task is not None
-            await app.loop._project_context_prepare_task
-            app.loop._advance_project_context_recovery()
+        await turn("fifth")
+        for index in range(3):
+            if prepare_done[1].is_set():
+                break
+            await turn(f"retry-{index}")
+        assert prepare_done[1].is_set()
+        assert app.loop.project_context_health is not None
 
-        asyncio.run(recover())
-        prompt = app.loop.context_assembler.system_prompt.content[0].text
-        assert "RECOVERED-MEMORY" in prompt
+        await turn("sixth")
+        recovered = backend.calls[-1][0][0].content[0].text
+        assert "CUSTOM-BEFORE" in recovered and "CUSTOM-AFTER" in recovered
+        assert "RECOVERED-SKILL" in recovered
+        assert "RECOVERED-MEMORY" in recovered
         assert app.loop.project_context_health is None
+        calls_after_recovery = projection_calls
+
+        await turn("healthy")
+        assert projection_calls == calls_after_recovery
+
+        (memory_dir / "state.md").write_bytes(b"\xff")
+        closing_app = await asyncio.to_thread(create_app, args)
+        closing_app.loop.backend = FakeBackend(
+            [ScriptedTurn(content=[TextContent("ok")])]
+        )
+        close_read_entered = threading.Event()
+        original_close_projection = (
+            closing_app.loop.project_registry._read_context_projection
+        )
+
+        def held_close_projection(operation):
+            close_read_entered.set()
+            close_read_release.wait()
+            return original_close_projection(operation)
+
+        monkeypatch.setattr(
+            closing_app.loop.project_registry,
+            "_read_context_projection",
+            held_close_projection,
+        )
+        await _collect_turn(closing_app.loop, "close")
+        close_task = asyncio.create_task(closing_app.close())
+        await asyncio.to_thread(close_read_entered.wait)
+        assert not close_task.done()
+        close_read_release.set()
+        await close_task
     finally:
-        asyncio.run(app.close())
+        prepare_release.set()
+        close_read_release.set()
+        if close_task is not None:
+            await close_task
+        elif closing_app is not None:
+            await closing_app.close()
+        await app.close()
+
+
+async def _collect_turn(loop: Any, text: str) -> None:
+    async for _event in loop.run_turn(text, origin=MessageOrigin.USER):
+        pass
 
 
 @pytest.mark.parametrize("damage", ["pointer", "manifest"])

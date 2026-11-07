@@ -324,14 +324,22 @@ def compose_runtime(
                 project_projection=projection,
             )
 
+        conservative_recovery = (
+            resuming
+            and project_context.prompt_recipe != "default"
+            and "project_memory" in project_context.prompt_components
+        )
         loop._configure_project_context_recovery(
             registry=project_registry,
             project_id=metadata.project_id,
             health=project_context.health,
             prepare=(
                 prepare_project_context
-                if project_context.prompt_recipe == "default"
+                if project_context.prompt_recipe == "default" or conservative_recovery
                 else None
+            ),
+            replace_component=(
+                "project_memory" if conservative_recovery else None
             ),
         )
         if project_registry is not None and (
