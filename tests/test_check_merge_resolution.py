@@ -839,6 +839,37 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
     return merge, train_merge, pr_head, "main_only"
 
 
+@pytest.mark.parametrize("case", ["lost line", "renamed owner"])
+def test_pr_side_line_table(tmp_path: Path, case: str) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    return 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
+    commit(r, "branch addition")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        "def renamed():\n    return 1\n" if case == "renamed owner" else "def check():\n    return 3\n"
+    )
+    commit(r, "main edit")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(
+        "def renamed():\n    added = 2\n    return 1\n"
+        if case == "renamed owner"
+        else "def check():\n    return 3\n"
+    )
+    commit(r, "merge")
+    result = run(r)
+    assert (result.returncode == 0) is (case == "renamed owner")
+    if case == "lost line":
+        assert "pr-line" in result.stdout
+
+
+
 @pytest.mark.parametrize(
     ("shape", "expected", "refusal"),
     [

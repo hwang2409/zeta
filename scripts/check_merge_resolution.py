@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import difflib
+import hashlib
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -261,10 +263,129 @@ def _owner_was_removed(
     )
 
 
-def marker(line: str, finding: Item) -> bool:
-    return line.startswith(
-        f"merge-resolution: {finding.path} {finding.kind} {finding.name} ->"
-    )
+def _line_owner(tree: ast.Module, line: int) -> str:
+    owners: list[tuple[int, int, str]] = []
+
+    def visit(body: list[ast.stmt], scope: str = "") -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{scope}{node.name}"
+                end = getattr(node, "end_lineno", node.lineno)
+                owners.append((node.lineno, end, name))
+                visit(node.body, f"{name}.")
+
+    visit(tree.body)
+    matches = [(end - start, name) for start, end, name in owners if start <= line <= end]
+    return min(matches)[1] if matches else "<module>"
+
+
+def _owners_by_line(tree: ast.Module, count: int) -> list[str]:
+    owners = ["<module>"] * count
+    scopes: list[tuple[int, int, str]] = []
+
+    def visit(body: list[ast.stmt], scope: str = "") -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{scope}{node.name}"
+                scopes.append((node.lineno, getattr(node, "end_lineno", node.lineno), name))
+                visit(node.body, f"{name}.")
+
+    visit(tree.body)
+    for start, end, name in sorted(scopes, key=lambda item: item[1] - item[0], reverse=True):
+        for line in range(max(1, start), min(count, end) + 1):
+            owners[line - 1] = name
+    return owners
+
+
+def _diff_blocks(base: list[str], side: list[str]) -> list[tuple[int, int, int, int]]:
+    matcher = difflib.SequenceMatcher(None, base, side, autojunk=False)
+    return [
+        (old_start, old_end, new_start, new_end)
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes()
+        if tag != "equal"
+    ]
+
+
+def _pr_line_items(
+    path: str,
+    base_text: str,
+    branch_text: str,
+    main_text: str,
+    merge_text: str | None,
+    owner_map: dict[str, str] | None = None,
+) -> list[Item]:
+    try:
+        tree = ast.parse(branch_text, filename=path)
+    except SyntaxError:
+        return []
+    base = base_text.splitlines()
+    branch = branch_text.splitlines()
+    main = main_text.splitlines()
+    merged = (merge_text or "").splitlines()
+    branch_tree = tree
+    merge_tree = ast.parse(merge_text, filename=path) if merge_text is not None else None
+    owner_map = owner_map or {}
+    branch_owners = _owners_by_line(branch_tree, len(branch))
+    merge_owners = _owners_by_line(merge_tree, len(merged)) if merge_tree else []
+    pr_blocks = _diff_blocks(base, branch)
+    main_blocks = _diff_blocks(base, main)
+    candidates: list[tuple[Item, tuple[int, int]]] = []
+    for old_start, old_end, new_start, new_end in pr_blocks:
+        for line_no in range(new_start, new_end):
+            value = branch[line_no].strip()
+            if not value or value.startswith("#"):
+                continue
+            owner = owner_map.get(branch_owners[line_no], branch_owners[line_no])
+            digest = hashlib.sha256(f"{owner}\\0{value}".encode()).hexdigest()[:12]
+            candidates.append(
+                (
+                    Item(path, "pr-line", f"{owner}@{digest}", line_no + 1, value, owner=owner),
+                    (old_start, old_end),
+                )
+            )
+    kept: list[Item] = []
+    for item, (start, end) in candidates:
+        if any(
+            (start == end == other_start == other_end)
+            or (start != end and other_start <= start and other_end >= end)
+            for other_start, other_end, _new_start, _new_end in main_blocks
+        ):
+            continue
+        branch_count = sum(
+            line.strip() == item.value and owner_map.get(owner, owner) == item.owner
+            for line, owner in zip(branch, branch_owners)
+        )
+        merged_count = sum(
+            line.strip() == item.value and owner == item.owner
+            for line, owner in zip(merged, merge_owners)
+        )
+        if merged_count < branch_count:
+            already = sum(
+                candidate.value == item.value and candidate.owner == item.owner
+                for candidate in kept
+            )
+            if already < branch_count - merged_count:
+                kept.append(item)
+    return kept
+
+
+def _group_marker(line: str, findings: list[Item]) -> set[Item]:
+    prefix = "merge-resolution: "
+    if not line.startswith(prefix) or " pr-lines " not in line or " ->" not in line:
+        return set()
+    head = line[len(prefix) : line.index(" ->")]
+    path, rest = head.split(" pr-lines ", 1)
+    owner, digest = rest.rsplit("@", 1)
+    group = [item for item in findings if item.path == path and item.owner == owner]
+    values = sorted(f"{item.name}={item.value}" for item in group)
+    actual = hashlib.sha256("\\n".join(values).encode()).hexdigest()[:12]
+    return set(group) if actual == digest else set()
+
+
+def marker(line: str, finding: Item, findings: list[Item] | None = None) -> bool:
+    if line.startswith(f"merge-resolution: {finding.path} {finding.kind} {finding.name} ->"):
+        return True
+    return bool(findings and finding in _group_marker(line, findings))
 
 
 def _is_ancestor(ancestor: str, descendant: str) -> bool:
@@ -883,7 +1004,36 @@ def _parse_merge_data(commit: str, main: str, branch: str, args):
     revisions = [base, main, branch, commit]
     sources = load_sources(revisions, all_paths)
     parsed, unresolved, error = parse_revisions(revisions, all_paths, sources)
-    return text, changed, all_paths, parsed, unresolved, error, revisions
+    line_findings: list[Item] = []
+    if error:
+        return text, changed, all_paths, parsed, unresolved, error, revisions, line_findings
+    old_items, _main_items, branch_items, merge_items = (
+        parsed[revision] for revision in revisions
+    )
+    for path in all_paths:
+        base_text = sources.get((base, path))
+        branch_text = sources.get((branch, path))
+        main_text = sources.get((main, path))
+        merge_text = sources.get((commit, path))
+        if not base_text or not branch_text or not main_text or merge_text is None:
+            continue
+        owner_map: dict[str, str] = {}
+        for item in branch_items.values():
+            if item.path != path or item.kind not in {"def", "async def", "class"}:
+                continue
+            matches = [
+                candidate
+                for candidate in merge_items.values()
+                if candidate.path == path
+                and candidate.kind == item.kind
+                and candidate.fingerprint == item.fingerprint
+            ]
+            if len(matches) == 1:
+                owner_map[item.name] = matches[0].name
+        line_findings.extend(
+            _pr_line_items(path, base_text, branch_text, main_text, merge_text, owner_map)
+        )
+    return text, changed, all_paths, parsed, unresolved, error, revisions, line_findings
 
 
 def _filter_findings(findings: list[Item], text: str) -> list[Item]:
@@ -892,7 +1042,7 @@ def _filter_findings(findings: list[Item], text: str) -> list[Item]:
         finding
         for index, finding in enumerate(findings)
         if finding not in findings[:index]
-        and not any(marker(line, finding) for line in lines)
+        and not any(marker(line, finding, findings) for line in lines)
     ]
 
 
@@ -918,7 +1068,7 @@ def main() -> int:
     if resolved is None:
         return 2
     main, branch, _reason = resolved
-    text, changed, all_paths, parsed, unresolved, error, revisions = _parse_merge_data(
+    text, changed, all_paths, parsed, unresolved, error, revisions, line_findings = _parse_merge_data(
         commit, main, branch, args
     )
     final_revision = args.final
@@ -953,6 +1103,7 @@ def main() -> int:
     findings.extend(
         _element_findings(old_items, main_items, branch_items, merge_items, unresolved)
     )
+    findings.extend(line_findings)
     findings = _filter_findings(findings, text)
     if final_revision:
         findings = _report_final_moves(findings, final_items)
