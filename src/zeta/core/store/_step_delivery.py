@@ -7,7 +7,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from ...protocol.types import Message, MessageOrigin, MessageRole, TextContent
+from ...protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    harness_notice,
+)
 from ..checkpoints import ConversationEntry
 from ._pending_prompts import PENDING_PROMPT_ID_METADATA
 from ._validation import validate_notification_data
@@ -71,6 +77,7 @@ class NotificationInput:
     dedupe_key: str | None = None
     after_commit: Callable[[], bool] | None = None
     deadline: float | None = None
+    tui_presented: bool = False
 
 
 type DeliveryInput = PromptInput | NotificationInput
@@ -140,6 +147,10 @@ def _commit_delivery_input(
             return ProducerResult((), False)
         existing = _existing_notification(store, kind, data, item.dedupe_key)
         if existing is not None:
+            if item.tui_presented and not store.is_agent_notification_presented_to_tui(existing.id):
+                store._append_row_unlocked(
+                    "notification_tui_presented", {"notification_id": existing.id}
+                )
             changed = _run_after_commit(item, default=False)
             return ProducerResult((store._snapshot_entry(existing),), changed)
         if kind == "inbox":
@@ -162,6 +173,10 @@ def _commit_delivery_input(
                 claimed = _run_after_commit(item, default=True)
                 return ProducerResult((store._snapshot_entry(entry),), claimed, 1)
         entry = store._append_row_unlocked("notification", data)
+        if item.tui_presented:
+            store._append_row_unlocked(
+                "notification_tui_presented", {"notification_id": entry.id}
+            )
         snapshot = store._snapshot_entry(entry)
         claimed = _run_after_commit(item, default=True)
         return ProducerResult((snapshot,), claimed, 1)
@@ -286,6 +301,17 @@ def _select_prompt_delivery(
         trailing, str(prompt_entry.data["text"]), origin
     ):
         return prompt_entry, trailing, True
+    if origin is MessageOrigin.HARNESS_NUDGE:
+        return (
+            prompt_entry,
+            harness_notice(
+                "task safety",
+                str(prompt_entry.data["text"]),
+                event="agent_task_safety",
+                metadata={PENDING_PROMPT_ID_METADATA: prompt_entry.id},
+            ),
+            False,
+        )
     return (
         prompt_entry,
         Message(
@@ -486,6 +512,8 @@ def validate_delivery_input(item: DeliveryInput) -> DeliverySource:
         "macro_completion",
     }:
         raise ValueError("after_commit is not valid for this delivery kind")
+    if item.tui_presented and item.kind != "task_exit":
+        raise ValueError("tui_presented is only valid for task exits")
     return "notification"
 
 

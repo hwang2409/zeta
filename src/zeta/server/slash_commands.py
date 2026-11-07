@@ -17,25 +17,33 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
-from ..core.project_context import discover_repo_root
-from ..core.session import persist_metadata_change
+from ..core.project_context import discover_repo_root, project_command_view
+from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
-    MODEL_CONTEXT_WINDOWS,
     SlashCommand,
     SlashCommandRegistry,
     SlashStatus,
-    compaction_history,
     create_slash_registry,
 )
-from ..core.todo import todo_count_tuple
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
+from ..project_registry import ProjectRegistryError
+from ..runtime.status import (
+    SlashStatusSnapshot,
+    build_slash_status,
+    capture_slash_status,
+)
 from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
-from .protocol import ProtocolError
+from .protocol import (
+    ErrorDescriptor,
+    ProtocolError,
+    SlashErrorCodeDescriptor,
+    SlashResultKindDescriptor,
+)
 from .runtime import ServerRuntime
 
 _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
@@ -53,6 +61,7 @@ EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
         "memory",
         "mcp",
         "model",
+        "project",
         "project-instructions",
         "status",
         "vim",
@@ -98,71 +107,43 @@ class ServerSlashSession:
         self,
         runtime: ServerRuntime,
         approval_control: _ApprovalProjection | None = None,
+        status: SlashStatus | None = None,
     ) -> None:
         self._runtime = runtime
         self._approval_control = approval_control
+        self._status = status
 
     # --- runnable server-side ---
 
-    def slash_status(self) -> SlashStatus:
+    def status_snapshot(self) -> SlashStatusSnapshot:
         runtime = self._runtime
         loop = runtime.loop
         opened = runtime.opened
         if loop is None or opened is None:
-            raise ProtocolError(-32003, "no active session")
-        assembler = loop.context_assembler
-        child_usage = assembler.descendant_usage
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        state = runtime.state
+        if state is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         pending = (
             self._approval_control.pending_approval_labels()
             if self._approval_control is not None
             else ()
         )
-        items = loop.store.todo_items()
-        return SlashStatus(
+        return capture_slash_status(
+            loop,
             session_id=opened.metadata.session_id,
             provider=opened.metadata.provider,
             model=opened.metadata.model,
-            retained_tail=assembler.retained_tail,
-            tokens_used_this_session=assembler.tokens_used_this_session,
-            tokens_in_current_context=assembler.token_count,
-            compaction_marker_count=loop.store.compaction_marker_count(),
-            pending_approvals=pending,
-            checkpoint_count=loop.store.checkpoint_count(),
-            cache_read_input_tokens=assembler.cache_read_input_tokens_this_session,
-            cache_creation_input_tokens=assembler.cache_creation_input_tokens_this_session,
-            uncached_input_tokens=assembler.uncached_input_tokens_this_session,
-            output_tokens_this_session=assembler.output_tokens_this_session,
-            child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
-            child_cache_creation_input_tokens=child_usage[
-                "cache_creation_input_tokens"
-            ],
-            child_uncached_input_tokens=child_usage["input_tokens"],
-            child_output_tokens_this_session=child_usage["output_tokens"],
             context_files=tuple(opened.metadata.context_files),
             vim_mode=opened.metadata.vim_mode,
-            plan_mode=opened.metadata.plan_mode,
-            hooks=(),
-            todo_counts=todo_count_tuple(items) if items else None,
-            usage_history=(),
-            usage_cost_by_model=(),
-            compaction_history=compaction_history(
-                loop.store.replay(), assembler.token_counter
-            ),
-            model_window=MODEL_CONTEXT_WINDOWS.get(opened.metadata.provider, {}).get(
-                opened.metadata.model
-            ),
-            mcp_summary=loop.mcp_summary,
-            explicit_finish=loop.explicit_finish,
-            max_agent_depth=loop.max_agent_depth,
-            automatic_memory_failure=(
-                loop.memory_reconciler.automatic_memory_status
-                if loop.memory_reconciler is not None
-                else None
-            ),
-            transcript_index_failure=loop.transcript_index_failure(
-                opened.metadata.session_id
-            ),
+            pending_approvals=pending,
+            usage_tracker=state.usage_tracker,
         )
+
+    def slash_status(self) -> SlashStatus:
+        if self._status is not None:
+            return self._status
+        return build_slash_status(self.status_snapshot())
 
     async def slash_accounts(self, args: str) -> str:
         """List accounts or change one display label."""
@@ -210,6 +191,10 @@ class ServerSlashSession:
         except Exception as exc:  # noqa: BLE001 - context assembler surface is broad
             return f"compact failed: {exc}"
         after = loop.store.compaction_marker_count()
+        state = runtime.state
+        if state is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        state.usage_tracker.record_compaction(state.model)
         if after == before:
             return "compact: nothing to compact"
         marker = next(
@@ -242,7 +227,41 @@ class ServerSlashSession:
             )
         return f"vim mode: {'on' if enabled else 'off'}"
 
-    def slash_memory(self, args: str) -> str:
+    async def slash_project(self, args: str) -> str:
+        runtime = self._runtime
+        opened = runtime.opened
+        registry = runtime.manager.project_registry
+        if opened is None:
+            return "project registry unavailable: no active session"
+        if registry is None:
+            return "project registry unavailable"
+        initialize = args.strip() == "init"
+        try:
+            view = await asyncio.to_thread(
+                project_command_view,
+                registry,
+                opened.store.cwd,
+                runtime.metadata.project_id,
+                initialize=initialize,
+            )
+        except (ProjectRegistryError, OSError, SessionError) as exc:
+            if initialize:
+                return f"could not initialize project: {exc}"
+            raise
+        if initialize:
+            assert view.project is not None
+            await persist_metadata_change(
+                runtime.manager,
+                runtime.metadata,
+                lambda candidate: runtime.manager.associate_project(
+                    candidate, view.project.project_id
+                ),
+            )
+            if runtime.loop is not None:
+                runtime.loop._set_runtime_project(runtime.metadata)
+        return view.text
+
+    async def slash_memory(self, args: str) -> str:
         runtime = self._runtime
         project_id = runtime.metadata.project_id
         if project_id is None:
@@ -252,7 +271,8 @@ class ServerSlashSession:
             return "memory: project registry unavailable"
         loop = getattr(runtime, "loop", None)
         reconciler = loop.memory_reconciler if loop is not None else None
-        return run_memory_command(
+        return await asyncio.to_thread(
+            run_memory_command,
             registry,
             project_id,
             args,
@@ -265,7 +285,7 @@ class ServerSlashSession:
             raise RuntimeError(_UNAVAILABLE_NOTICE)
         return await self._runtime.loop.slash_mcp(args)
 
-    def slash_inbox(self, args: str) -> str:
+    async def slash_inbox(self, args: str) -> str:
         if args.strip():
             return "usage: /inbox"
         runtime = self._runtime
@@ -276,9 +296,12 @@ class ServerSlashSession:
         if registry is None or project_id is None:
             return "project inbox unavailable: session is not associated with a project"
         try:
-            state = ProjectInbox(
-                registry, sessions_root=registry.root.parent / "sessions"
-            ).list(project_id)
+            state = await asyncio.to_thread(
+                ProjectInbox(
+                    registry, sessions_root=registry.root.parent / "sessions"
+                ).list,
+                project_id,
+            )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
         return json.dumps(state, indent=2, sort_keys=True)
@@ -289,10 +312,10 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
 
     opened = runtime.opened
     if opened is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     loop = runtime.loop
     if loop is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     catalog = loop.tool_registry.skill_catalog
     project_dir = discover_repo_root(Path(opened.metadata.cwd or runtime.cwd))
     return create_slash_registry(
@@ -323,7 +346,10 @@ async def read_request(
     if method == "slash_list":
         include_unavailable = params.get("include_unavailable", False)
         if not isinstance(include_unavailable, bool):
-            raise ProtocolError(-32602, "include_unavailable must be a boolean")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "include_unavailable must be a boolean",
+            )
         return await list_commands(runtime, include_unavailable=include_unavailable)
     operation = accounts.request(method, runtime, require_idle, params)
     if method == "account_switch":
@@ -352,15 +378,16 @@ async def run_command(
     *,
     register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
     approval_control: _ApprovalProjection | None = None,
+    run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
     if not text.startswith("/") or text.startswith("//"):
-        raise ProtocolError(-32602, "text must start with '/'")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must start with '/'")
     first_line = text.split("\n", 1)[0]
     parts = first_line[1:].split(maxsplit=1)
     if not parts or not parts[0]:
-        raise ProtocolError(-32602, "text must name a command")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
     if (
@@ -368,6 +395,7 @@ async def run_command(
         or name == "compact"
         or (name == "model" and tail.strip())
         or (name == "accounts" and tail.strip())
+        or (name == "project" and tail.strip() == "init")
     ):
         # Guard mutation-capable dispatch on the same seam session-mutation
         # RPCs use. Without this, `/compact` or `/model <name>` could edit
@@ -383,7 +411,7 @@ async def run_command(
     registry = await asyncio.to_thread(build_registry, runtime)
     builtin_names = {command.name for command in registry.builtin_commands}
     if name in builtin_names and name not in EXECUTABLE_BUILTINS:
-        return {"kind": "client_only", "name": name}
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
     if name == "mcp":
         return await _run_mcp_command(runtime, tail)
     # Prompt macros expand to user input rather than dispatch through a handler.
@@ -392,22 +420,32 @@ async def run_command(
     custom = registry.custom_command_for(name)
     if custom is not None:
         if custom.kind != "prompt" or registry.needs_inline_shell_resolution(text):
-            return {"kind": "client_only", "name": name}
+            return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
         envelope = registry.input_for_model(text)
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
-        return {"kind": "client_only", "name": name}
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
     session = ServerSlashSession(runtime, approval_control)
+    if name == "status":
+        snapshot = session.status_snapshot()
+        status = await (
+            run_blocking(lambda: build_slash_status(snapshot))
+            if run_blocking is not None
+            else asyncio.to_thread(build_slash_status, snapshot)
+        )
+        if not isinstance(status, SlashStatus):
+            raise RuntimeError("status worker returned an invalid projection")
+        session = ServerSlashSession(runtime, approval_control, status)
     result = await registry.dispatch_async(session, text)
     if result is None:
-        return {"kind": "unknown", "name": name}
+        return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}
     if isinstance(result, SlashPromptError):
-        return {"kind": "error", "text": result.message}
+        return {"kind": SlashResultKindDescriptor.ERROR, "text": result.message}
     if isinstance(result, ModelInputEnvelope):
         return _model_input_result(result, register_model_input)
     if isinstance(result, str):
-        return {"kind": "output", "text": result}
-    raise ProtocolError(-32000, "unexpected slash result type")
+        return {"kind": SlashResultKindDescriptor.OUTPUT, "text": result}
+    raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "unexpected slash result type")
 
 
 async def _run_mcp_command(
@@ -416,17 +454,23 @@ async def _run_mcp_command(
     stripped = tail.strip()
     verb = stripped.partition(" ")[0]
     if verb not in {"status", "auth", "logout"}:
-        return {"kind": "client_only", "name": "mcp"}
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": "mcp"}
     if runtime.loop is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     result = await runtime.loop.slash_mcp(stripped)
     response: dict[str, object] = {
-        "kind": "text" if stripped == "status" else "output",
+        "kind": (
+            SlashResultKindDescriptor.TEXT
+            if stripped == "status"
+            else SlashResultKindDescriptor.OUTPUT
+        ),
         "text": result,
     }
     credential_error = getattr(result, "credential_store_error", None)
     if credential_error is not None:
-        response["credential_store_error"] = credential_error
+        public_error = dict(credential_error)
+        public_error["code"] = SlashErrorCodeDescriptor.MCP_CREDENTIAL_STORE
+        response["credential_store_error"] = public_error
     return response
 
 
@@ -436,13 +480,13 @@ def _model_input_result(
 ) -> dict[str, object]:
     if register is None:
         return {
-            "kind": "model_input",
+            "kind": SlashResultKindDescriptor.MODEL_INPUT,
             "text": envelope.text,
             "display_text": envelope.display_text,
             "origin": envelope.origin.value,
         }
     return {
-        "kind": "model_input",
+        "kind": SlashResultKindDescriptor.MODEL_INPUT,
         "input_id": register(envelope),
         "display_text": envelope.display_text,
     }
