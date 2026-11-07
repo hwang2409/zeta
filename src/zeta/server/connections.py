@@ -217,15 +217,12 @@ class ConnectionRegistry:
             for state in (self._controller, *self._observers)
             if state is not None and feature in state.features
         )
-        await asyncio.gather(
-            *(
-                self.send(
-                    state.connection,
-                    state.connection.codec.notification(event, session_id, data=data),
-                )
-                for state in states
-            )
-        )
+        for state in states:
+            frame = state.connection.codec.notification(event, session_id, data=data)
+            if state is self._controller:
+                await self.send(state.connection, frame)
+            else:
+                self._publish_observer(state, frame)
 
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)
@@ -405,18 +402,40 @@ class ConnectionRegistry:
         output.ready = self.loop.create_future()
         output.phase = "claimed_buffering"
 
+    def _publish_observer(self, state: _Connection, frame: bytes) -> None:
+        output = state.output
+        if (
+            state.connection not in self._connections
+            or output is None
+            or output.phase != "ready"
+        ):
+            return
+        if (
+            output.queued_bytes + len(frame) > 4 * 1024 * 1024
+            or len(output.queue) >= 256
+        ):
+            self._start_overflow(state)
+            return
+        self._enqueue(output, _OutputFrame(frame))
+
     async def _overflow(self, state: _Connection) -> bool:
+        overflow_done = self._start_overflow(state)
+        if overflow_done is None:
+            return False
+        return await overflow_done
+
+    def _start_overflow(self, state: _Connection) -> asyncio.Future[bool] | None:
         output = state.output
         assert output is not None
         if state.connection not in self._connections:
-            return False
+            return None
         output.phase = "overflowing"
         self._clear_output(output)
         if output.current_write is not None:
             output.current_write.cancel()
         output.overflow_done = self.loop.create_future()
         self._enqueue(output, _OutputFrame(self._overflow_frame("observer")))
-        return await output.overflow_done
+        return output.overflow_done
 
     @staticmethod
     def _overflow_frame(role: str) -> bytes:

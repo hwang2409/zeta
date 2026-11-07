@@ -510,6 +510,20 @@ class _Client:
             self, request_id, method, params
         )
 
+    async def _dispatch_session_grants(
+        self, method: str, params: dict[str, Any]
+    ) -> object:
+        session_grants.require_feature(self.features)
+        runtime = self.server.runtime
+        if method == session_grants.READ:
+            return session_grants.read(runtime.policy, runtime.session_id, params)
+        result, change = session_grants.revoke(
+            runtime.policy, runtime.session_id, params
+        )
+        if change.changed:
+            await self.server.control.publish_session_grant_change(change)
+        return result
+
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
@@ -640,16 +654,7 @@ class _Client:
                     self.server.control._host_binding_required = False
                 raise
         if method in {session_grants.READ, session_grants.REVOKE}:
-            session_grants.require_feature(self.features)
-            runtime = self.server.runtime
-            if method == session_grants.READ:
-                return session_grants.read(runtime.policy, runtime.session_id, params)
-            result, change = session_grants.revoke(
-                runtime.policy, runtime.session_id, params
-            )
-            if change.changed:
-                await self.server.control.publish_session_grant_change(change)
-            return result
+            return await self._dispatch_session_grants(method, params)
         if method == "send":
             return await self.server.control.deliveries.send(params, self.features)
         if method == "steer":

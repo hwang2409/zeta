@@ -117,6 +117,20 @@ async def _wait_idle(
             return request_id
 
 
+async def _assert_completes_in_ready_turns(
+    task: asyncio.Task[Any], *, turns: int = 20
+) -> Any:
+    loop = asyncio.get_running_loop()
+    for _ in range(turns):
+        if task.done():
+            break
+        turn = loop.create_future()
+        loop.call_soon(turn.set_result, None)
+        await turn
+    assert task.done(), "controller response waited for observer output"
+    return await task
+
+
 async def _hello_and_create(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -330,7 +344,7 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_observer_reads_events_cannot_revoke_and_reconnects_from_snapshot(
+async def test_slow_observer_does_not_delay_grant_or_revoke_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -359,47 +373,61 @@ async def test_observer_reads_events_cannot_revoke_and_reconnects_from_snapshot(
         await _event(reader, "approval_request")
         assert server.connections is not None
         observer_connection = server.connections._observers[0].connection
-        original_send = server.connections.send
+        original_write = observer_connection._write_physical
         observer_blocked = asyncio.Event()
         release_observer = asyncio.Event()
 
-        async def block_observer(connection: Any, payload: bytes) -> bool:
-            if (
-                connection is observer_connection
-                and b"session_grants_changed" in payload
-            ):
+        async def block_observer(payload: bytes) -> bool:
+            if b"session_grants_changed" in payload:
                 observer_blocked.set()
                 await release_observer.wait()
-            return await original_send(connection, payload)
+            return await original_write(payload)
 
-        monkeypatch.setattr(server.connections, "send", block_observer)
-        writer.write(
-            (
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 4,
-                        "method": "approve",
-                        "params": {
-                            "request_id": "call-1",
-                            "scope": "always_tool",
-                        },
-                    }
-                )
-                + "\n"
-            ).encode()
+        # test-contract: seam gate the real observer transport write
+        monkeypatch.setattr(observer_connection, "_write_physical", block_observer)
+        approve = asyncio.create_task(
+            _request(
+                reader,
+                writer,
+                4,
+                "approve",
+                {"request_id": "call-1", "scope": "always_tool"},
+            )
         )
-        await writer.drain()
         await observer_blocked.wait()
+        approve_frames = await _assert_completes_in_ready_turns(approve)
+        assert approve_frames[-1]["result"] == {
+            "accepted": True,
+            "decision": "approve",
+            "request_id": "call-1",
+            "scope": "always_tool",
+        }
         controller_event = await _event(reader, "session_grants_changed")
         release_observer.set()
-        while (await _read(reader)).get("id") != 4:
-            pass
         observer_event = await _event(observer_reader, "session_grants_changed")
         assert observer_event["data"] == controller_event["data"]
+        await _frames_until_event(reader, "turn_end")
+
+        observer_blocked.clear()
+        release_observer = asyncio.Event()
+        revoke = asyncio.create_task(
+            _request(
+                reader,
+                writer,
+                5,
+                "revoke_session_grants",
+                {"grant": "bash"},
+            )
+        )
+        await observer_blocked.wait()
+        revoke_frames = await _assert_completes_in_ready_turns(revoke)
+        assert revoke_frames[-1]["result"]["removed"] == ["bash"]
+        release_observer.set()
+        revoke_event = await _event(observer_reader, "session_grants_changed")
+        assert revoke_event["data"]["grants"]["session_grants"] == []
         assert (await _request(observer_reader, observer_writer, 11, "session_grants"))[
             -1
-        ]["result"] == observer_event["data"]["grants"]
+        ]["result"] == revoke_event["data"]["grants"]
 
         denied = (
             await _request(
@@ -419,9 +447,6 @@ async def test_observer_reads_events_cannot_revoke_and_reconnects_from_snapshot(
         observer_writer.close()
         await observer_writer.wait_closed()
         observer_writer = None
-        await _request(reader, writer, 5, "revoke_session_grants", {"grant": "bash"})
-        await _event(reader, "session_grants_changed")
-
         replacement_reader, replacement_writer = await _observer(
             server, 20, features=["serve_observers", "session_grants"]
         )
@@ -430,12 +455,151 @@ async def test_observer_reads_events_cannot_revoke_and_reconnects_from_snapshot(
         )[-1]["result"]
         assert snapshot["session_grants"] == []
     finally:
+        release_observer.set()
         if observer_writer is not None:
             observer_writer.close()
             await observer_writer.wait_closed()
         if replacement_writer is not None:
             replacement_writer.close()
             await replacement_writer.wait_closed()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_observer_write_failure_does_not_block_approved_tool_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCall("call-1", "bash", {"command": "printf approved"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    observer_writer: asyncio.StreamWriter | None = None
+    try:
+        await _hello_and_create(reader, writer)
+        _observer_reader, observer_writer = await _observer(
+            server, 10, features=["serve_observers", "session_grants"]
+        )
+        await _request(reader, writer, 3, "send", {"text": "run"})
+        await _event(reader, "approval_request")
+        assert server.connections is not None
+        observer_connection = server.connections._observers[0].connection
+        write_failed = asyncio.Event()
+
+        async def fail_grant_event(payload: bytes) -> bool:
+            if b"session_grants_changed" in payload:
+                write_failed.set()
+                raise ConnectionError("simulated observer write failure")
+            return True
+
+        # test-contract: seam fail the real observer transport write
+        monkeypatch.setattr(observer_connection, "_write_physical", fail_grant_event)
+        approve_response = (
+            await _request(
+                reader,
+                writer,
+                4,
+                "approve",
+                {"request_id": "call-1", "scope": "always_tool"},
+            )
+        )[-1]
+        assert "result" in approve_response, approve_response
+        assert approve_response["result"] == {
+            "accepted": True,
+            "decision": "approve",
+            "request_id": "call-1",
+            "scope": "always_tool",
+        }
+        await write_failed.wait()
+        await _frames_until_event(reader, "turn_end")
+        snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
+        assert snapshot["session_grants"] == ["bash"]
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_observer_write_failure_does_not_turn_revoke_into_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCall("call-1", "bash", {"command": "printf grant"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    observer_writer: asyncio.StreamWriter | None = None
+    try:
+        await _hello_and_create(reader, writer)
+        _observer_reader, observer_writer = await _observer(
+            server, 10, features=["serve_observers", "session_grants"]
+        )
+        await _request(reader, writer, 3, "send", {"text": "run"})
+        await _event(reader, "approval_request")
+        await _request(
+            reader,
+            writer,
+            4,
+            "approve",
+            {"request_id": "call-1", "scope": "always_tool"},
+        )
+        await _frames_until_event(reader, "turn_end")
+
+        assert server.connections is not None
+        observer_connection = server.connections._observers[0].connection
+        write_failed = asyncio.Event()
+
+        async def fail_grant_event(payload: bytes) -> bool:
+            if b"session_grants_changed" in payload:
+                write_failed.set()
+                raise ConnectionError("simulated observer write failure")
+            return True
+
+        # test-contract: seam fail the real observer transport write
+        monkeypatch.setattr(observer_connection, "_write_physical", fail_grant_event)
+        revoke_response = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "revoke_session_grants",
+                {"grant": "bash"},
+            )
+        )[-1]
+        assert "result" in revoke_response, revoke_response
+        revoked = revoke_response["result"]
+        assert revoked["removed"] == ["bash"]
+        assert revoked["grants"]["session_grants"] == []
+        await write_failed.wait()
+        assert (await _request(reader, writer, 6, "session_grants"))[-1]["result"] == (
+            revoked["grants"]
+        )
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
         await _close(server, writer)
 
 
