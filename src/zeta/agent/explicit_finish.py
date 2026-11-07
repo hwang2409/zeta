@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from ..tools._shared.process import BackgroundTaskInfo, BackgroundTaskRegistry
 from .presets import AgentPreset
 
 if TYPE_CHECKING:
-    from ..tools._shared.process import BackgroundTaskRegistry
     from .terminal_fence import TerminalTransitionFence
 
 
@@ -169,21 +171,103 @@ def register_handoff(child_loop: object) -> None:
     _register_handoff(child_loop, handoff)
 
 
-async def kill_tasks_after_deadline(
-    registry: BackgroundTaskRegistry,
-    timeout: float,
-    *,
-    safety_limit: float | None = None,
-) -> tuple[str, ...]:
-    """Kill tasks still running when the single idle safety deadline expires."""
+@dataclass(slots=True)
+class _TaskSafetyWindow:
+    task: BackgroundTaskInfo
+    deadline: float
+    warned: bool = False
 
-    await asyncio.sleep(timeout)
-    task_ids = tuple(task.task_id for task in registry.snapshot() if task.running)
-    configured_limit = timeout if safety_limit is None else safety_limit
-    cause = (
-        "explicit-finish child task safety deadline expired after "
-        f"{configured_limit:g} seconds"
-    )
-    for task_id in task_ids:
-        await registry.kill(task_id, cause=cause)
-    return task_ids
+
+class TaskSafetyLifecycle:
+    """Wake a task owner before enforcing one per-task safety window."""
+
+    def __init__(
+        self,
+        limit: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        wait: Callable[
+            [Callable[[], Awaitable[None]], float | None], Awaitable[bool]
+        ]
+        | None = None,
+    ) -> None:
+        self._limit = limit
+        self._clock = clock
+        self._wait = wait or _wait_for_idle_wake
+        self._changed = asyncio.Event()
+        self._windows: dict[str, _TaskSafetyWindow] = {}
+
+    def owner_acted(self) -> None:
+        """Start a fresh window for every task whose warning got an owner turn."""
+
+        now = self._clock()
+        for window in self._windows.values():
+            if window.warned:
+                window.deadline = now + self._limit
+                window.warned = False
+        self._changed.set()
+
+    async def run(
+        self,
+        registry: BackgroundTaskRegistry,
+        publish_notice: Callable[[str], Awaitable[None]],
+    ) -> None:
+        while True:
+            running = {task.task_id: task for task in registry.snapshot() if task.running}
+            self._windows = {
+                task_id: window
+                for task_id, window in self._windows.items()
+                if task_id in running
+            }
+            now = self._clock()
+            for task_id, task in running.items():
+                if task_id not in self._windows:
+                    started = task.started_at if task.started_at is not None else now
+                    self._windows[task_id] = _TaskSafetyWindow(
+                        task, started + self._limit
+                    )
+
+            deadline = min(
+                (window.deadline for window in self._windows.values()),
+                default=None,
+            )
+            self._changed.clear()
+            timeout = None if deadline is None else max(0.0, deadline - now)
+            if await self._wait(self._changed.wait, timeout):
+                continue
+
+            now = self._clock()
+            for window in tuple(self._windows.values()):
+                if window.deadline > now:
+                    continue
+                age = max(
+                    0.0,
+                    now
+                    - (
+                        window.task.started_at
+                        if window.task.started_at is not None
+                        else now - self._limit
+                    ),
+                )
+                if window.warned:
+                    await registry.kill(
+                        window.task.task_id,
+                        cause=(
+                            "explicit-finish task safety limit expired at task age "
+                            f"{age:g} seconds after no owner turn for "
+                            f"{self._limit:g} seconds"
+                        ),
+                    )
+                    continue
+                window.warned = True
+                window.deadline += self._limit
+                await publish_notice(
+                    f"task {window.task.task_id} ({window.task.headline}) has run "
+                    f"{_format_duration(age)}; kill it with task_kill or leave it running"
+                )
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds / 3600:g}h"
+    return f"{seconds:g}s"

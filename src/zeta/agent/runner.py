@@ -247,11 +247,6 @@ async def consume_child(
                 finish_gate_state,
                 delivering_prompt_id,
             )
-            if gate_result.outcome == "task_safety_expired":
-                background_task_kill_cause = (
-                    "finish-gate task safety bound expired after "
-                    f"{child_loop._background_owner.finish_gate_task_timeout:g} seconds"
-                )
             if gate_result.handoff is not None:
                 reason, outputs = gate_result.handoff
                 final_message = Message(

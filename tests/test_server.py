@@ -4416,7 +4416,20 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
-    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
+    task_notice = (
+        "task task-1 (printf hi) has run 1h; "
+        "kill it with task_kill or leave it running"
+    )
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent(task_notice)]),
+            MessageOrigin.AGENT_PROMPT,
+        )
+    )
+    task_cause = (
+        "explicit-finish task safety limit expired at task age 7200 seconds "
+        "after no owner turn for 3600 seconds"
+    )
     store.append_task_notification(
         task_id="task-1",
         command="printf hi",
@@ -4455,6 +4468,9 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
             row["notification"].get("kind", "agent_completion"): row for row in rows
         }
         assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
+        assert any(
+            row.get("content", [{}])[0].get("text") == task_notice for row in history
+        )
         assert task_cause in by_kind["task_exited"]["content"][0]["text"]
         assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
         assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
@@ -4474,7 +4490,10 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
     )
     reader, writer, _session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
-    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
+    task_cause = (
+        "explicit-finish task safety limit expired at task age 7200 seconds "
+        "after no owner turn for 3600 seconds"
+    )
     store.append_task_notification(
         task_id="task-1",
         command="printf hi",

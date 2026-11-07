@@ -1624,8 +1624,29 @@ def terminal_plain(renderable: object) -> str:
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
 
-def test_task_safety_kill_renders_cause() -> None:
-    cause = "explicit-finish child task safety deadline expired after 3600 seconds"
+@pytest.mark.asyncio
+async def test_task_safety_notice_and_kill_render_through_real_paths(
+    tmp_path: Path,
+) -> None:
+    notice = (
+        "task task-safety (watch ci) has run 1h; "
+        "kill it with task_kill or leave it running"
+    )
+    store = ConversationStore(tmp_path, session_id="child")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent(notice)]),
+            MessageOrigin.AGENT_PROMPT,
+        )
+    )
+    control = AgentTranscriptControl()
+    await control.load(store.session_dir)
+    assert notice in Text.from_ansi(control.transcript.render(120)).plain
+
+    cause = (
+        "explicit-finish task safety limit expired at task age 7200 seconds "
+        "after no owner turn for 3600 seconds"
+    )
     event = StreamEvent(
         StreamEventType.AGENT_NOTIFICATION,
         data={
@@ -1642,6 +1663,7 @@ def test_task_safety_kill_renders_cause() -> None:
 
     assert rendered is not None
     assert cause in renderable_plain(rendered)
+    store.close()
 
 
 def test_every_durable_notification_kind_has_non_error_rendering() -> None:
