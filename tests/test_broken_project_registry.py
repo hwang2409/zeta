@@ -299,8 +299,9 @@ def test_tui_keeps_healthy_legacy_memory_and_recovers_after_repair(
         asyncio.run(app.close())
 
 
+@pytest.mark.parametrize("damage", ["pointer", "manifest"])
 def test_tui_omits_malformed_version_authority_but_keeps_inbox_guidance(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
 ) -> None:
     home = tmp_path / "home"
     repository = tmp_path / "repository"
@@ -309,10 +310,25 @@ def test_tui_omits_malformed_version_authority_but_keeps_inbox_guidance(
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("healthy", "git", repository)
     project_root = registry.root / project.project_id
-    (project_root / "memory" / "brief.md").write_text(
-        "LEGACY-MUST-NOT-LEAK", encoding="utf-8"
-    )
-    (project_root / "memory-current.json").write_text("{", encoding="utf-8")
+    pointer_path = project_root / "memory-current.json"
+    if damage == "manifest":
+        registry.activate_entry_memory(project.project_id)
+        registry._replace_entry_kind(project.project_id, "state", "current")
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        (
+            project_root
+            / "memory-versions"
+            / "versions"
+            / f"{pointer['current']}.json"
+        ).write_text(
+            "{", encoding="utf-8"
+        )
+    else:
+        pointer_path.write_text("{", encoding="utf-8")
+    legacy_path = project_root / "memory" / "brief.md"
+    if legacy_path.exists():
+        legacy_path.chmod(0o600)
+    legacy_path.write_text("LEGACY-MUST-NOT-LEAK", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(repository)
 
@@ -322,7 +338,12 @@ def test_tui_omits_malformed_version_authority_but_keeps_inbox_guidance(
         assert "LEGACY-MUST-NOT-LEAK" not in prompt
         assert "Check your inbox with inbox action list" in prompt
         assert app.loop.project_context_health is not None
-        assert app.loop.project_context_health.source == "memory-current.json"
+        expected_source = (
+            "memory-current.json"
+            if damage == "pointer"
+            else f"memory-versions/versions/{pointer['current']}.json"
+        )
+        assert app.loop.project_context_health.source == expected_source
     finally:
         asyncio.run(app.close())
 

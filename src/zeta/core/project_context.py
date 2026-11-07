@@ -861,67 +861,85 @@ def load_project_context(
                         "omitted the memory block"
                     )
                 else:
-                    try:
-                        context_entries = (
-                            project_projection.memory
-                            if project_projection is not None
-                            else registry.load_memory_for_context(project.project_id)
-                        )
-                    except UnsupportedMemoryFormatError:
-                        # Format 2 remains reachable only through the private
-                        # fixture store until the activation PR. Its projection
-                        # is nevertheless complete and directly testable here.
-                        snapshot = registry._entry_memory_state_for_context(
-                            project.project_id
-                        )
-                        projection = render_entry_memory(
-                            snapshot.state,
+                    entry_snapshot = (
+                        project_projection.entry_memory
+                        if project_projection is not None
+                        else None
+                    )
+                    if entry_snapshot is not None:
+                        entry_projection = render_entry_memory(
+                            entry_snapshot.state,
                             now=utc_now(),
                             byte_cap=min(MEMORY_PROMPT_BYTE_CAP, budget_for_memory),
                         )
-                        if len(projection.block.encode("utf-8")) <= budget_for_memory:
-                            memory_block = projection.block
+                        if (
+                            len(entry_projection.block.encode("utf-8"))
+                            <= budget_for_memory
+                        ):
+                            memory_block = entry_projection.block
                         else:
                             notices.append(
                                 f"context · project memory exceeded {byte_cap} byte cap; "
                                 "omitted the memory block"
                             )
                     else:
-                        for entry in context_entries:
-                            path = (
-                                registry.root
-                                / project.project_id
-                                / "memory"
-                                / entry.name
+                        try:
+                            context_entries = (
+                                project_projection.memory
+                                if project_projection is not None
+                                else registry.load_memory_for_context(project.project_id)
                             )
-                            section = _format_section(path, entry.content)
-                            candidate_manual = list(manual_memory_sections)
-                            candidate_automatic = list(automatic_memory_sections)
-                            target = (
-                                candidate_automatic
-                                if entry.automatic
-                                else candidate_manual
+                        except UnsupportedMemoryFormatError:
+                            snapshot = registry._entry_memory_state_for_context(
+                                project.project_id
                             )
-                            target.append(section)
-                            candidate = _render_memory_block(
-                                project.project_id,
-                                candidate_manual,
-                                candidate_automatic,
+                            entry_projection = render_entry_memory(
+                                snapshot.state,
+                                now=utc_now(),
+                                byte_cap=min(
+                                    MEMORY_PROMPT_BYTE_CAP, budget_for_memory
+                                ),
                             )
-                            if len(candidate.encode("utf-8")) <= budget_for_memory:
-                                manual_memory_sections = candidate_manual
-                                automatic_memory_sections = candidate_automatic
-                                loaded.append(path)
-                            else:
-                                notices.append(
-                                    "context · project memory exceeded "
-                                    f"{byte_cap} byte cap; skipped {entry.name}"
+                            memory_block = entry_projection.block
+                        else:
+                            for entry in context_entries:
+                                path = (
+                                    registry.root
+                                    / project.project_id
+                                    / "memory"
+                                    / entry.name
                                 )
-                        memory_block = _render_memory_block(
-                            project.project_id,
-                            manual_memory_sections,
-                            automatic_memory_sections,
-                        )
+                                section = _format_section(path, entry.content)
+                                candidate_manual = list(manual_memory_sections)
+                                candidate_automatic = list(automatic_memory_sections)
+                                target = (
+                                    candidate_automatic
+                                    if entry.automatic
+                                    else candidate_manual
+                                )
+                                target.append(section)
+                                candidate = _render_memory_block(
+                                    project.project_id,
+                                    candidate_manual,
+                                    candidate_automatic,
+                                )
+                                if (
+                                    len(candidate.encode("utf-8"))
+                                    <= budget_for_memory
+                                ):
+                                    manual_memory_sections = candidate_manual
+                                    automatic_memory_sections = candidate_automatic
+                                    loaded.append(path)
+                                else:
+                                    notices.append(
+                                        "context · project memory exceeded "
+                                        f"{byte_cap} byte cap; skipped {entry.name}"
+                                    )
+                            memory_block = _render_memory_block(
+                                project.project_id,
+                                manual_memory_sections,
+                                automatic_memory_sections,
+                            )
                     if memory_block is not None:
                         memory_index = len(sections)
                         memory_project_id = project.project_id

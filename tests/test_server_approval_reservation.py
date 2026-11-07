@@ -715,7 +715,7 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
 
 
 @pytest.mark.asyncio
-async def test_observer_status_surfaces_transcript_index_failure_when_degraded(
+async def test_observer_status_surfaces_viewed_session_health_when_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _controller_reader, controller_writer, call = await _approval_server(

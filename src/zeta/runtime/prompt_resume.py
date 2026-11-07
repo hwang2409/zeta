@@ -264,7 +264,7 @@ def _resume_composition(
             current,
             home=home,
             project_features_enabled=project_features_enabled,
-            project_projection=projection,
+            projection=projection,
         )
         if current.prompt_recipe is not None:
             context = _replace_context_skill_index(context, skills)
@@ -308,7 +308,7 @@ def resume_prompt(
     context_loader: ContextLoader = load_project_context,
     project_features_enabled: bool = True,
     registry: ProjectRegistry | None = None,
-    projection: ProjectContextProjection | None = None,
+    project_projection: ProjectContextProjection | None = None,
 ) -> ResumedPrompt:
     """Classify, safely recompose, persist, and adopt one resumed prompt.
 
@@ -338,13 +338,15 @@ def resume_prompt(
         explicit_custom=explicit_custom,
         project_features_enabled=project_features_enabled,
         registry=registry,
-        project_projection=projection,
+        projection=project_projection,
     )
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
     context = replace(
         _adopted_context(metadata, composition.notices),
-        health=projection.health if projection is not None else None,
+        health=(
+            project_projection.health if project_projection is not None else None
+        ),
     )
     if owns_skill_index:
         context = _replace_context_skill_index(context, skills)

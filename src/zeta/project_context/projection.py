@@ -7,7 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypeVar
 
-from ..project_errors import ProjectRegistryError
+from ..memory.entry_store import EntryMemorySnapshot
+from ..project_errors import ProjectRegistryError, UnsupportedMemoryFormatError
 from ..project_memory_history import PROJECT_MEMORY_FILES, MemoryContextEntry
 from ..project_schema import MAX_PROJECTS, PROJECT_ID_PATTERN
 
@@ -42,6 +43,7 @@ class ProjectContextProjection:
     session_project: Project | None
     projects: tuple[Project, ...]
     memory: tuple[MemoryContextEntry, ...]
+    entry_memory: EntryMemorySnapshot | None
     health: ProjectContextHealth | None
 
 
@@ -107,6 +109,7 @@ class ProjectContextProjectionMixin:
                 None,
             )
             memory: list[MemoryContextEntry] = []
+            entry_memory: EntryMemorySnapshot | None = None
             memory_health: ProjectContextHealth | None = None
             if selected is not None:
                 directory_fd = self._project_dir(root_fd, selected.project_id)
@@ -142,18 +145,27 @@ class ProjectContextProjectionMixin:
                             finally:
                                 os.close(memory_fd)
                         else:
-                            snapshot = self._snapshot_locked(directory_fd)
-                            automatic = self._automatic_files_from_records(
-                                self._records_locked(directory_fd)
-                            )
-                            memory.extend(
-                                MemoryContextEntry(name, content, name in automatic)
-                                for name, content in snapshot.contents.items()
-                            )
+                            try:
+                                snapshot = self._snapshot_locked(directory_fd)
+                            except UnsupportedMemoryFormatError:
+                                entry_memory = self._entry_snapshot_locked(directory_fd)
+                            else:
+                                automatic = self._automatic_files_from_records(
+                                    self._records_locked(directory_fd)
+                                )
+                                memory.extend(
+                                    MemoryContextEntry(
+                                        name, content, name in automatic
+                                    )
+                                    for name, content in snapshot.contents.items()
+                                )
                     except (OSError, ProjectRegistryError, ValueError):
                         source = "memory-current.json"
                         if pointer is not None and isinstance(pointer.get("current"), str):
-                            source = f"memory-versions/{pointer['current']}.json"
+                            source = (
+                                "memory-versions/versions/"
+                                f"{pointer['current']}.json"
+                            )
                         memory.clear()
                         memory_health = _health(
                             "malformed_memory", selected.project_id, source
@@ -173,17 +185,24 @@ class ProjectContextProjectionMixin:
             else:
                 finding = memory_health or (malformed[0] if malformed else None)
             return ProjectContextProjection(
-                selected,
-                tuple(sorted(projects, key=lambda item: (item.name, item.project_id))),
-                tuple(memory),
-                finding,
+                session_project=selected,
+                projects=tuple(
+                    sorted(projects, key=lambda item: (item.name, item.project_id))
+                ),
+                memory=tuple(memory),
+                entry_memory=entry_memory,
+                health=finding,
             )
 
         try:
             return self._read_context_projection(read)
         except (OSError, ProjectRegistryError):
             return ProjectContextProjection(
-                None, (), (), _health("project_registry_unavailable")
+                session_project=None,
+                projects=(),
+                memory=(),
+                entry_memory=None,
+                health=_health("project_registry_unavailable"),
             )
 
 
