@@ -56,6 +56,7 @@ from .presets import (
     RUN_PRESET,
     AgentPreset,
     compose_system_prompt,
+    resolve_child_profile_tools,
 )
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
 from .run_consumer import consume_run as consume_follow_up_run
@@ -377,13 +378,26 @@ async def _build_child_loop(
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
     try:
-        excluded_names = {"inbox", "request_attention", "resolve_attention"}
-        if child_depth >= child_max_depth or not preset.allow_delegation:
-            excluded_names.add("agent")
-        if preset.tool_names is not None:
-            excluded_names.update(
-                set(loop.tool_registry.definitions_by_name) - preset.tool_names
-            )
+        explicit_finish = explicit_finish_eligible(
+            global_enabled=loop.explicit_finish,
+            preset=preset,
+            background=follow_up_loop,
+        )
+        runtime_tool_names = {"ask_parent"} if follow_up_loop else set()
+        if explicit_finish:
+            runtime_tool_names.update(("finish", "agent_handoff"))
+        policy_allowed_runtime_names = frozenset(
+            name
+            for name in runtime_tool_names
+            if loop.tool_registry.tool_is_allowed_by_policy(name)
+        )
+        excluded_names, profile_tool_allow = resolve_child_profile_tools(
+            child_depth=child_depth,
+            child_max_depth=child_max_depth,
+            preset=preset,
+            policy_allowed_names=loop.tool_registry.policy_allowed_registered_names,
+            runtime_tool_names=policy_allowed_runtime_names,
+        )
         child_provider = getattr(child_backend, "provider", None)
         child_image_policy = (
             image_policy_for_provider(child_provider)
@@ -393,6 +407,7 @@ async def _build_child_loop(
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
+            profile_tool_allow=profile_tool_allow,
             cwd=cwd_override,
             image_policy=child_image_policy,
         )
@@ -437,11 +452,6 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
-        explicit_finish = explicit_finish_eligible(
-            global_enabled=loop.explicit_finish,
-            preset=preset,
-            background=follow_up_loop,
-        )
         child_loop = AgentLoop(
             child_backend,
             child_store,

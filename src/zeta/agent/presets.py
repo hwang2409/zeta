@@ -42,6 +42,33 @@ class AgentPreset:
         return self.prompt_suffix
 
 
+def resolve_child_profile_tools(
+    *,
+    child_depth: int,
+    child_max_depth: int,
+    preset: AgentPreset,
+    policy_allowed_names: frozenset[str],
+    runtime_tool_names: frozenset[str],
+) -> tuple[set[str], frozenset[str] | None]:
+    """Resolve hard exclusions and one child's profile tool layer."""
+    excluded_names = {"inbox", "request_attention", "resolve_attention"}
+    if child_depth >= child_max_depth or not preset.allow_delegation:
+        excluded_names.add("agent")
+    resolvable_names = (
+        set(policy_allowed_names) | set(runtime_tool_names)
+    ) - excluded_names
+    if preset.tool_names is None:
+        return excluded_names, None
+    unresolved_names = preset.tool_names - resolvable_names
+    if unresolved_names:
+        raise ValueError(
+            f"profile {preset.name!r} requests unavailable tools: "
+            + ", ".join(sorted(unresolved_names))
+        )
+    allowed_names = set(preset.tool_names) | set(runtime_tool_names)
+    return excluded_names, frozenset(allowed_names - excluded_names)
+
+
 GENERAL_PRESET = AgentPreset(
     name="general",
     tool_names=None,
