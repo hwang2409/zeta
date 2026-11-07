@@ -786,21 +786,137 @@ async def test_background_task_owner_state_table(
             return
 
         if row == "crash-before-aggregate":
-            task_id = await start_registered(_python("print('crash-order')"))
+            eligible = [
+                await start_registered(_python("import time; time.sleep(30)"))
+                for _ in range(2)
+            ]
+            suppressed, _ = await registry.background_tasks.start(
+                _python("import time; time.sleep(30)"),
+                tmp_path,
+                notify_on_exit=False,
+                owner="background_macro",
+            )
             original_notice = registry.background_tasks._notice
-            registry.background_tasks._notice = lambda notice: (_ for _ in ()).throw(RuntimeError("aggregate crash"))
+
+            def crash_aggregate(notice):
+                if hasattr(notice, "tasks"):
+                    raise RuntimeError("aggregate crash")
+                original_notice(notice)
+
+            registry.background_tasks._notice = crash_aggregate
+            registry.background_tasks.begin_shutdown("session shutdown")
             with pytest.raises(RuntimeError, match="aggregate crash"):
                 await registry.close()
             registry.background_tasks._notice = original_notice
-            resumed = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
-            stack.push_async_callback(resumed.close)
-            pending = resumed.background_tasks.set_notification_sink(
-                lambda item: flow.produce(_task_notification(item))
+            persisted = json.loads(
+                (store.session_dir / "background_tasks.json").read_text()
             )
-            for item in pending:
-                await resumed.background_tasks.deliver_recovered_exit(item)
-            assert len(store.agent_notifications(pending_only=False)) == 1
-            assert task_id
+            by_id = {item["task_id"]: item for item in persisted}
+            assert all(by_id[task_id]["running"] is False for task_id in eligible)
+            assert all(
+                by_id[task_id]["terminal_phase"] == "session_shutdown"
+                and "session" in by_id[task_id]["note"]
+                for task_id in eligible
+            )
+            assert by_id[suppressed]["running"] is False
+            assert by_id[suppressed]["notify_on_exit"] is False
+            assert store.agent_notifications(pending_only=False) == []
+
+            store.close()
+            resumed_store = ConversationStore(
+                tmp_path / row, session_id=store.session_id
+            )
+            resumed_loop = AgentLoop(
+                FakeBackend([]),
+                resumed_store,
+                max_turns=1,
+                skill_catalog=SkillCatalog.empty(),
+            )
+            resumed_notices = []
+            resumed_loop.tool_registry.background_tasks.set_notice_sink(
+                resumed_notices.append
+            )
+            assert len(resumed_loop._pending_task_recovery) == 2
+            await resumed_loop.activate()
+            receipts = [
+                entry
+                for entry in resumed_store.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "task_exited"
+            ]
+            assert {entry.data["task_id"] for entry in receipts} == set(eligible)
+            assert all(
+                entry.data["background_phase"] == "session_shutdown"
+                and "session" in entry.data["note"]
+                for entry in receipts
+            )
+            assert not any(
+                getattr(notice, "phase", None) == "session_shutdown"
+                for notice in resumed_notices
+            )
+            flow = pending_delivery_module.StepDeliveryFlow(resumed_store)
+            await flow.prepare_request("terminal_fallback", [], None)
+            await flow.acknowledge_active()
+            for receipt in receipts:
+                resumed_store.append_compaction_marker(
+                    "task exit receipt evicted",
+                    receipt.seq,
+                    receipt.seq,
+                    kind="evict",
+                    view=[
+                        {
+                            "seq": receipt.seq,
+                            "message": Message(
+                                MessageRole.ASSISTANT,
+                                [TextContent("[task exit receipt evicted]")],
+                                metadata={
+                                    "context_evicted": True,
+                                    "eviction_receipt": "assistant",
+                                    "source_seq": receipt.seq,
+                                },
+                            ).to_dict(),
+                        }
+                    ],
+                )
+            assembler = ContextAssembler(
+                resumed_store,
+                token_budget=1000,
+                retained_tail=1,
+                token_counter=lambda _message: 1,
+            )
+            await assembler.assemble_context(
+                force=True, bypass_eviction_hysteresis=True
+            )
+            assert all(
+                any(
+                    entry.type == "compaction"
+                    and entry.data["source_seq_start"] <= receipt.seq
+                    <= entry.data["source_seq_end"]
+                    for entry in resumed_store.replay()
+                )
+                for receipt in receipts
+            )
+            await resumed_loop.close()
+            resumed_store.close()
+
+            second_store = ConversationStore(
+                tmp_path / row, session_id=store.session_id
+            )
+            second_loop = AgentLoop(
+                FakeBackend([]),
+                second_store,
+                max_turns=1,
+                skill_catalog=SkillCatalog.empty(),
+            )
+            await second_loop.activate()
+            assert len(
+                [
+                    entry
+                    for entry in second_store.agent_notifications(pending_only=False)
+                    if entry.data.get("kind") == "task_exited"
+                ]
+            ) == 2
+            await second_loop.close()
+            second_store.close()
             return
 
         if row == "group-exit-after-positive-probe":
