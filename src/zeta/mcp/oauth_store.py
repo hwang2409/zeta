@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict
 
+from .._fsio import write_all
 from ..core.session import env_home
 from ..storage_format import WriterLease, mapping_mutations, open_writer
 from .client import MCPError
@@ -431,10 +432,7 @@ class MCPCredentialStore:
             tmp_path = Path(tmp_name)
             os.fchmod(fd, 0o600)
             try:
-                view = memoryview(payload)
-                while view:
-                    written = os.write(fd, view)
-                    view = view[written:]
+                write_all(fd, payload)
                 try:
                     os.fsync(fd)
                 except OSError as exc:

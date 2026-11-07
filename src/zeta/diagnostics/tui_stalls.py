@@ -17,6 +17,8 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
+from .._fsio import write_all
+
 logger = logging.getLogger(__name__)
 
 PROBE_INTERVAL_SECONDS = 0.05
@@ -307,8 +309,7 @@ def _append_bounded_record(path: Path, encoded: bytes, max_bytes: int) -> None:
             if path.exists():
                 fd = os.open(path, os.O_APPEND | os.O_WRONLY, 0o600)
                 try:
-                    if os.write(fd, encoded) != len(encoded):
-                        raise OSError("incomplete TUI diagnostic write")
+                    write_all(fd, encoded)
                 finally:
                     os.close(fd)
             else:
@@ -317,8 +318,7 @@ def _append_bounded_record(path: Path, encoded: bytes, max_bytes: int) -> None:
                 )
                 fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 try:
-                    if os.write(fd, encoded) != len(encoded):
-                        raise OSError("incomplete TUI diagnostic write")
+                    write_all(fd, encoded)
                     os.chmod(temporary, 0o600)
                     os.replace(temporary, path)
                 finally:

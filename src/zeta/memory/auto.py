@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .._fsio import write_all
 from ..context_eviction import estimated_text_tokens
 from ..core.checkpoints import (
     CONVERSATION_ENTRY_TYPES,
@@ -887,7 +888,7 @@ class AutoMemoryReconciler:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
             os.close(fd)
             fd = -1

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .._fsio import write_all
 from ..providers.stream_diagnostics import write_stream_diagnostic
 from ..storage_format import PatchRecords, SetValue, WriterLease
 
@@ -613,7 +614,7 @@ class ReconciliationState:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -656,7 +657,7 @@ class ReconciliationState:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
             os.close(fd)
             fd = -1
@@ -725,7 +726,7 @@ class ReconciliationState:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
             os.close(fd)
             fd = -1
