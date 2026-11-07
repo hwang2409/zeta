@@ -31,6 +31,17 @@ def crash_logout(home: str, account: AccountId, point: str) -> None:
     store.logout(account, sessions_root=store.home / "sessions")
 
 
+def hold_provider_login_lock(
+    home: str,
+    provider: str,
+    ready: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+) -> None:
+    with AccountStore(home).provider_login_lock(provider):
+        ready.set()
+        release.wait()
+
+
 def hold_account_credential_lock(
     home: str,
     account: AccountId,
