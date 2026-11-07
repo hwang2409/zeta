@@ -463,8 +463,9 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
         process = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "zeta",
+                "-c",
+                # The `zeta` console script entry point (zeta.cli.main:main).
+                "import sys; from zeta.cli.main import main; sys.exit(main())",
                 "serve",
                 "--socket",
                 str(socket),
@@ -650,6 +651,13 @@ def probe_search(args: argparse.Namespace) -> dict[str, Any]:
             lambda: _prepare_request(transcript, snapshot.state, as_of=today), args.n
         )
         out["prompt_bytes"] = len(request.prompt.encode())
+        out["prepare_request_profile"] = profile(
+            f"memory-prepare-request-{args.session}",
+            lambda: _prepare_request(transcript, snapshot.state, as_of=today),
+        )
+        out["transcript_state_cold_profile"] = profile(
+            f"memory-transcript-state-cold-{args.session}", cold_state
+        )
     except Exception as exc:  # noqa: BLE001 - report the failure instead of hiding it
         out["memory_prep_error"] = repr(exc)[:400]
     return out
