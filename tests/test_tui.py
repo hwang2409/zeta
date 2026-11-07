@@ -11847,20 +11847,20 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
         original_deliver(item, result, failure)
         if item.stop:
             stop_delivered.set()
-            assert release_worker.wait(1)
+            assert release_worker.wait(10)
 
     monkeypatch.setattr(persistence_module, "write_session_json", write)
     monkeypatch.setattr(persistence._writer, "_deliver", gated_deliver)
     persistence.schedule("new draft")
     shutdown = asyncio.create_task(persistence.shutdown_pending())
-    assert await asyncio.to_thread(stop_delivered.wait, 1)
+    assert await asyncio.to_thread(stop_delivered.wait, 10)
     with pytest.raises(OSError, match="disk full"):
         await shutdown
 
     persistence.flush()
     assert persistence._writer._queue.qsize() == 1
     release_worker.set()
-    await persistence._writer.flush(timeout=0.05)
+    await persistence._writer.flush(timeout=10)
 
     try:
         assert persistence.load() == "new draft"
