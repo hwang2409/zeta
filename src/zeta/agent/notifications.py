@@ -167,6 +167,8 @@ class AgentNotificationMixin:
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
+        if self.wake_scheduler is not None:
+            self.wake_scheduler.begin_external_run()
         return self._run_turn(
             user_text,
             origin=origin,

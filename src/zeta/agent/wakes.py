@@ -109,15 +109,14 @@ class WakeScheduler:
     def admission_count(self) -> int:
         return self._admission_count
 
-    def begin_external_run(self) -> tuple[WakeRecord, ...]:
-        """Start one user-origin run and consume due passive reminders once."""
+    def begin_external_run(self) -> None:
+        """Start one user-origin run with a fresh top-level root allowance."""
 
         self._require_open()
         self._external_root_count = 0
         self._wake_chain_id = None
         self._wake_generation = None
         self._wake_successor_scheduled = False
-        return self.consume_due_passive()
 
     def begin_wake_run(self, admission: WakeAdmission) -> None:
         """Set the chain facts used by schedules made during an admitted run."""

@@ -6,13 +6,16 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from zeta.agent.wakes import (
     MAX_PARENT_ADMISSIONS_PER_PROCESS,
     MAX_PENDING_WAKES,
     WakeAdmission,
     WakeScheduler,
 )
-from zeta.protocol.types import ToolCall
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import MessageOrigin, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.wake import register_wake
@@ -36,6 +39,20 @@ class Ids:
     def __call__(self) -> str:
         self.value += 1
         return str(self.value)
+
+
+async def _execute(registry: ToolRegistry, call: ToolCall) -> dict[str, object]:
+    return await asyncio.wait_for(registry.execute(call), timeout=10)
+
+
+async def _close_scheduler(
+    scheduler: WakeScheduler, registry: ToolRegistry | None = None
+) -> None:
+    try:
+        await asyncio.wait_for(scheduler.close(), timeout=10)
+    finally:
+        if registry is not None:
+            await asyncio.wait_for(registry.close(), timeout=10)
 
 
 def _scheduler(
@@ -63,8 +80,8 @@ async def test_wake_tool_schedules_lists_cancels_and_enforces_pending_bound(
     )
     register_wake(registry, scheduler)
     try:
-        too_soon = await registry.execute(
-            ToolCall("soon", "wake", {"after_seconds": 9, "note": "too soon"})
+        too_soon = await _execute(
+            registry, ToolCall("soon", "wake", {"after_seconds": 9, "note": "too soon"})
         )
         assert too_soon["isError"] is True
         assert "between 10 and 604800" in too_soon["content"][0]["text"]
@@ -72,12 +89,13 @@ async def test_wake_tool_schedules_lists_cancels_and_enforces_pending_bound(
         due_times: list[str] = []
         wake_ids: list[str] = []
         for index in range(MAX_PENDING_WAKES):
-            result = await registry.execute(
+            result = await _execute(
+                registry,
                 ToolCall(
                     f"schedule-{index}",
                     "wake",
                     {"after_seconds": 20 - index, "note": f"note {index}"},
-                )
+                ),
             )
             assert result["isError"] is False
             assert result["structuredContent"]["durability"] == "process_local"
@@ -88,26 +106,28 @@ async def test_wake_tool_schedules_lists_cancels_and_enforces_pending_bound(
             due_times.append(result["structuredContent"]["due_at"])
             wake_ids.append(result["structuredContent"]["wake_id"])
 
-        overflow = await registry.execute(
+        overflow = await _execute(
+            registry,
             ToolCall(
                 "overflow",
                 "wake",
                 {"after_seconds": 30, "note": "one too many"},
-            )
+            ),
         )
         assert overflow["isError"] is True
         assert "at most 8 wakes" in overflow["content"][0]["text"]
 
-        listed = await registry.execute(ToolCall("list", "wake", {"action": "list"}))
+        listed = await _execute(registry, ToolCall("list", "wake", {"action": "list"}))
         listed_wakes = listed["structuredContent"]["wakes"]
         assert [item["due_at"] for item in listed_wakes] == sorted(due_times)
 
-        canceled = await registry.execute(
+        canceled = await _execute(
+            registry,
             ToolCall(
                 "cancel",
                 "wake",
                 {"action": "cancel", "wake_id": wake_ids[0]},
-            )
+            ),
         )
         assert canceled["structuredContent"] == {
             "action": "cancel",
@@ -115,8 +135,7 @@ async def test_wake_tool_schedules_lists_cancels_and_enforces_pending_bound(
             "canceled": True,
         }
     finally:
-        await scheduler.close()
-        await registry.close()
+        await _close_scheduler(scheduler, registry)
 
 
 @pytest.mark.asyncio
@@ -139,7 +158,7 @@ async def test_top_level_external_run_allows_only_eight_root_wakes() -> None:
         assert ninth.autonomous is False
         assert ninth.reason == "top_level_chain_limit"
     finally:
-        await scheduler.close()
+        await _close_scheduler(scheduler)
 
 
 @pytest.mark.asyncio
@@ -175,7 +194,7 @@ async def test_top_level_wakes_stop_after_three_generations() -> None:
         assert passive.admission is None
         assert passive.passive[0].generation == 4
     finally:
-        await scheduler.close()
+        await _close_scheduler(scheduler)
 
 
 @pytest.mark.asyncio
@@ -208,7 +227,7 @@ async def test_parent_owned_lifetime_admits_exactly_96_runs() -> None:
         assert activation.passive[0].passive_reason == "parent_lifetime_limit"
         assert scheduler.admission_count == 96
     finally:
-        await scheduler.close()
+        await _close_scheduler(scheduler)
 
 
 @pytest.mark.asyncio
@@ -240,7 +259,7 @@ async def test_due_wakes_coalesce_and_later_wake_stays_out_of_closed_cohort() ->
         ]
         assert scheduler.admission_count == 2
     finally:
-        await scheduler.close()
+        await _close_scheduler(scheduler)
 
 
 @pytest.mark.asyncio
@@ -278,7 +297,76 @@ async def test_timer_rechecks_utc_after_one_sixty_second_slice() -> None:
         assert scheduler.poll_due() is False
     finally:
         release_wait.set()
-        await scheduler.close()
+        await _close_scheduler(scheduler)
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_registers_wake_and_discards_it_on_close(
+    tmp_path: Path,
+) -> None:
+    """Mutation: omit the production scheduler close; the closed assertion fails."""
+
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    scheduler = loop.wake_scheduler
+    assert scheduler is not None
+    try:
+        result = await _execute(
+            loop.tool_registry,
+            ToolCall(
+                "schedule",
+                "wake",
+                {"after_seconds": 10, "note": "lost on loop close"},
+            ),
+        )
+        assert result["isError"] is False
+        assert scheduler.owned_work().pending_ids
+    finally:
+        try:
+            await asyncio.wait_for(loop.close(), timeout=10)
+        finally:
+            store.close()
+
+    assert scheduler.closed
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_starts_each_user_turn_with_fresh_root_allowance(
+    tmp_path: Path,
+) -> None:
+    """Mutation: omit begin_external_run in run_turn; the new root stays passive."""
+
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    scheduler = loop.wake_scheduler
+    assert scheduler is not None
+    stream = None
+    try:
+        roots = [
+            scheduler.schedule(after_seconds=10, note=f"root {index}")
+            for index in range(8)
+        ]
+        scheduler.cancel(roots[0].record.wake_id)
+        ninth = scheduler.schedule(after_seconds=10, note="root 9")
+        assert ninth.autonomous is False
+        scheduler.cancel(ninth.record.wake_id)
+
+        stream = loop.run_turn("ordinary user turn", origin=MessageOrigin.USER)
+        await asyncio.wait_for(stream.aclose(), timeout=10)
+        stream = None
+
+        new_root = scheduler.schedule(after_seconds=10, note="new root")
+        assert new_root.autonomous is True
+        assert new_root.record.generation == 1
+    finally:
+        try:
+            if stream is not None:
+                await asyncio.wait_for(stream.aclose(), timeout=10)
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), timeout=10)
+            finally:
+                store.close()
 
 
 @pytest.mark.asyncio
@@ -297,7 +385,7 @@ async def test_close_discards_process_local_state_and_stops_owner_checks() -> No
     scheduler.schedule(after_seconds=10, note="lost on restart")
     assert scheduler.owned_work().pending_ids
 
-    lost = await scheduler.close()
+    lost = await asyncio.wait_for(scheduler.close(), timeout=10)
 
     assert lost == 1
     assert len(owner_checks) == 1

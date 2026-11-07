@@ -40,6 +40,7 @@ from ...agent.plan_mode import (
 from ...agent.result_payload import ChildResultPayloadMixin
 from ...agent.runner import run_agent_tool
 from ...agent.tool_results import validated_tool_result as _validated_tool_result
+from ...agent.wakes import WakeScheduler
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import BudgetExceeded, ContextAssembler
@@ -83,6 +84,7 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
+from ...tools.wake import register_wake
 from ..backend_state import (
     PreparedBackendState,
     apply_backend_state,
@@ -262,6 +264,12 @@ class AgentLoop(
         self._mcp_config_error: str | None = None
         self._mcp_schema_names: set[str] = set()
         self._provided_tool_schemas = tool_schemas is not None
+        self.wake_scheduler: WakeScheduler | None = None
+        if self.agent_instance_id is None:
+            self.wake_scheduler = WakeScheduler(
+                "top_level", on_due=self._background_owner.notify_wake
+            )
+            register_wake(self.tool_registry, self.wake_scheduler)
         self.tool_registry._agent_owner = self._background_owner
         self.tool_registry.bind_session_store(store)
         # Route model-owned task exits into this loop's depth-aware wake so a
@@ -507,6 +515,8 @@ class AgentLoop(
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        if self.wake_scheduler is not None:
+            await self.wake_scheduler.close()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
         if self.agent_depth == 0:

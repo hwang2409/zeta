@@ -7,6 +7,7 @@ from typing import Any
 from ...agent.wakes import WakeError, WakeRecord, WakeScheduler
 from ..registry import ToolRegistry, text_block
 
+WAKE_TOOL_NAME = "wake"
 _RESTART_WARNING = "pending wakes are lost when this zeta session process restarts"
 
 
@@ -25,7 +26,7 @@ def register_wake(registry: ToolRegistry, scheduler: WakeScheduler) -> None:
             return _error(str(exc))
 
     registry.register_session_tool(
-        "wake",
+        WAKE_TOOL_NAME,
         wake,
         description=(
             "Schedule one process-local reminder for this session, list pending "
