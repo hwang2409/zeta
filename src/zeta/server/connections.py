@@ -57,7 +57,6 @@ class _OutputState:
     overflow_frame: bytes | None = None
     overflow_deadline_task: asyncio.Task[None] | None = None
     overflowed: bool = False
-    overflowed_before_flush: bool = False
     released: bool = False
 
 
@@ -233,7 +232,6 @@ class ConnectionRegistry:
         hello = _OutputFrame(frame)
         output.queue.appendleft(hello)
         self._charge(output, hello)
-        output.overflowed_before_flush = output.overflowed
         if output.overflowed:
             output.phase = "overflowing"
             self._enqueue_overflow_control(output)
@@ -357,7 +355,6 @@ class ConnectionRegistry:
         if output.phase == "flushing":
             output.phase = "ready"
             output.overflowed = False
-            output.overflowed_before_flush = False
             self._assert_retained_accounting(output)
             assert output.retained_bytes == 0
             assert output.retained_frames == 0
@@ -410,11 +407,7 @@ class ConnectionRegistry:
         if output.overflowed:
             return
         output.overflowed = True
-        output.overflowed_before_flush = output.phase in {
-            "claimed_buffering",
-            "flushing",
-        }
-        self._clear_output(output)
+        self._clear_output(output, result=False)
         if enqueue_control:
             output.phase = "overflowing"
             self._enqueue_overflow_control(output)
@@ -560,12 +553,16 @@ class ConnectionRegistry:
         output.overflow_deadline_task = None
 
     @staticmethod
-    def _clear_output(output: _OutputState) -> None:
+    def _clear_output(output: _OutputState, *, result: bool | None = None) -> None:
         while output.queue:
             item = output.queue.popleft()
             ConnectionRegistry._finish_frame_accounting(output, item)
-            if item.future is not None and not item.future.done():
+            if item.future is None or item.future.done():
+                continue
+            if result is None:
                 item.future.cancel()
+            else:
+                item.future.set_result(result)
 
     async def run_blocking(self, callable: Callable[[], Any]) -> Any:
         """Run one store or observer read away from the event loop."""

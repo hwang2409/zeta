@@ -11,7 +11,9 @@ from typing import Any, Literal
 import pytest
 
 from tests import test_server_websocket as websocket
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import TIMEOUT, _socket_path
+from zeta.protocol.types import TextContent
 from zeta.server import ZetaServer
 from zeta.server import connections as connections_module
 from zeta.server.server import _Client
@@ -21,9 +23,14 @@ Role = Literal["controller", "observer"]
 
 
 async def _connect(
-    server: ZetaServer, transport: Transport, role: Role
+    server: ZetaServer,
+    transport: Transport,
+    role: Role,
+    *,
+    start: bool = True,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    await server.start()
+    if start:
+        await server.start()
     if transport == "unix":
         return await asyncio.open_unix_connection(str(server.socket_path))
     assert server._websocket is not None
@@ -198,6 +205,7 @@ async def test_ready_output_overflow_uses_shared_bound_and_reserved_control(
             await release_head.wait()
         return await original_write(client, payload)
 
+    # test-contract: seam stalls the real transport at a deterministic write
     monkeypatch.setattr(_Client, "_write_physical", gated_write)
     try:
         head = asyncio.create_task(_offer(server, state, role, "head"))
@@ -240,12 +248,187 @@ async def test_ready_output_overflow_uses_shared_bound_and_reserved_control(
             "id": None,
             "error": {"code": -32011, "message": f"{role} output overflow"},
         }
-        assert results[2:] == [False, False]
+        assert results == [True, False, False, False]
         retained = _retained(output)
         assert retained[0] <= connections_module.OUTPUT_MAX_FRAMES
         assert retained[1] <= connections_module.OUTPUT_MAX_BYTES
         assert await _read_until_close(reader, transport) == []
         assert _retained(output) == (0, 0)
+    finally:
+        release_head.set()
+        writer.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_controller_overflow_does_not_cancel_active_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: Transport,
+) -> None:
+    monkeypatch.setattr(connections_module, "OUTPUT_MAX_FRAMES", 3, raising=False)
+    monkeypatch.setattr(connections_module, "OUTPUT_MAX_BYTES", 16_384, raising=False)
+    backend = FakeBackend([ScriptedTurn([TextContent("completed")])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        port=None,
+        ws_port=0 if transport == "websocket" else None,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server, transport, "controller")
+    head_started = asyncio.Event()
+    release_head = asyncio.Event()
+    controller_released = asyncio.Event()
+    turn_event_queued = asyncio.Event()
+    turn_finalized = asyncio.Event()
+    outcomes: list[str] = []
+    original_write = _Client._write_physical
+    original_release = server.connections.release
+    original_enqueue = server.connections._enqueue
+    original_finalize = server.control.deliveries.finalize_turn
+
+    async def gated_write(client: _Client, payload: bytes) -> bool:
+        frame = json.loads(payload)
+        if frame.get("params", {}).get("delta") == "head":
+            head_started.set()
+            await release_head.wait()
+        return await original_write(client, payload)
+
+    def release(connection: Any) -> None:
+        if server.connections.is_controller(connection):
+            controller_released.set()
+        original_release(connection)
+
+    def observe_enqueue(output: Any, frame: Any, *, wake: bool = True) -> None:
+        original_enqueue(output, frame, wake=wake)
+        value = json.loads(frame.payload)
+        if value.get("params", {}).get("event") == "agent_start":
+            turn_event_queued.set()
+
+    async def record_finalize(
+        session_id: str,
+        state: Any,
+        outcome: Any,
+        *,
+        schedule_wake: bool,
+    ) -> None:
+        outcomes.append(str(outcome))
+        await original_finalize(session_id, state, outcome, schedule_wake=schedule_wake)
+        turn_finalized.set()
+
+    # test-contract: seam stalls the real transport at a deterministic write
+    monkeypatch.setattr(_Client, "_write_physical", gated_write)
+    monkeypatch.setattr(server.connections, "release", release)
+    # test-contract: seam identifies when the active turn publication is queued
+    monkeypatch.setattr(server.connections, "_enqueue", observe_enqueue)
+    monkeypatch.setattr(server.control.deliveries, "finalize_turn", record_finalize)
+    try:
+        await _send_json(
+            writer,
+            transport,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {"protocol_version": "1.2", "role": "controller"},
+            },
+        )
+        assert (await _read_json(reader, transport))["id"] == 1
+        await _send_json(
+            writer,
+            transport,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "new_session",
+                "params": {"provider": "codex"},
+            },
+        )
+        created = await _read_json(reader, transport)
+        session_id = created["result"]["session"]["session_id"]
+
+        head = asyncio.create_task(
+            server.connections.publish_controller(
+                "assistant_delta", session_id, delta="head"
+            )
+        )
+        await asyncio.wait_for(head_started.wait(), TIMEOUT)
+        server.control.start_turn("finish despite output overload")
+        await asyncio.wait_for(turn_event_queued.wait(), TIMEOUT)
+
+        trigger_started = asyncio.Event()
+
+        async def trigger_overflow() -> bool:
+            trigger_started.set()
+            return await server.connections.publish_controller(
+                "assistant_delta", session_id, delta="trigger"
+            )
+
+        trigger = asyncio.create_task(trigger_overflow())
+        await trigger_started.wait()
+        assert trigger.done() and await trigger is False
+        release_head.set()
+        frames = await _read_until_close(reader, transport)
+        assert frames == [
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "event": "assistant_delta",
+                    "session_id": session_id,
+                    "delta": "head",
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {
+                    "code": -32011,
+                    "message": "controller output overflow",
+                },
+            },
+        ]
+        assert await head is True
+        await asyncio.wait_for(turn_finalized.wait(), TIMEOUT)
+        assert outcomes == ["disconnected"]
+        await asyncio.wait_for(controller_released.wait(), TIMEOUT)
+
+        reconnect_reader, reconnect_writer = await _connect(
+            server, transport, "controller", start=False
+        )
+        try:
+            await _send_json(
+                reconnect_writer,
+                transport,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "hello",
+                    "params": {"protocol_version": "1.2", "role": "controller"},
+                },
+            )
+            assert (await _read_json(reconnect_reader, transport))["id"] == 4
+            await _send_json(
+                reconnect_writer,
+                transport,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "status",
+                    "params": {},
+                },
+            )
+            status = (await _read_json(reconnect_reader, transport))["result"]
+            assert status["session"]["session_id"] == session_id
+            assert status["state"] == "idle"
+        finally:
+            reconnect_writer.close()
     finally:
         release_head.set()
         writer.close()
