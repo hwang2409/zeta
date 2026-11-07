@@ -1078,7 +1078,7 @@ async def finish_background_child(
         if (
             child_loop is not None
             and status != "canceled"
-            and not explicit_finish
+            and explicit_finish_report is None
             and not (
                 finish_gate_state is not None
                 and finish_gate_state.terminal_admitted

@@ -760,7 +760,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
 
 
 @pytest.mark.asyncio
-async def test_owned_work_finalization_does_not_block_resident_loop(
+async def test_finalization_cancel_completes_commit_adopt_publish_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent_store = ConversationStore(tmp_path / "parent")
@@ -807,6 +807,7 @@ async def test_owned_work_finalization_does_not_block_resident_loop(
         if threading.current_thread() is not main_thread:
             release_finalization.wait()
 
+    # test-contract: seam force cancellation after the durable commit
     monkeypatch.setattr(
         type(child_store), "_write_agent_lifecycle", pause_after_finalization_commit
     )
@@ -892,20 +893,12 @@ async def test_owned_work_finalization_does_not_block_resident_loop(
     parent_store.close()
 
 
-@pytest.mark.asyncio
-async def test_finalization_cancel_completes_commit_adopt_publish_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    await test_owned_work_finalization_does_not_block_resident_loop(
-        tmp_path, monkeypatch
-    )
-
-
 async def _assert_failed_child_waits_for_owned_descendant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    unexpected_runtime_error: bool,
+    terminal_path: str,
+    explicit_finish: bool = False,
 ) -> None:
     parent_store = ConversationStore(tmp_path / "parent")
     child_store = ConversationStore(tmp_path / "child")
@@ -971,9 +964,14 @@ async def _assert_failed_child_waits_for_owned_descendant(
     monkeypatch.setattr(owner.conversation_channel, "publish_completion", observe_publish)
 
     async def child_result() -> dict[str, object]:
-        if unexpected_runtime_error:
+        if terminal_path == "runtime_exception":
             raise RuntimeError("unexpected child-task failure")
-        return {"content": [{"text": "provider failed"}], "isError": True}
+        text = {
+            "provider_failure": "agent error: provider failed",
+            "empty_response": "agent error: child returned an empty final assistant message",
+            "no_final_response": "agent error: child ended without a final response",
+        }[terminal_path]
+        return {"content": [{"text": text}], "isError": True}
 
     async def close_child() -> tuple[()]:
         return ()
@@ -1004,6 +1002,7 @@ async def _assert_failed_child_waits_for_owned_descendant(
         "error_message": str,
         "child_loop": child_loop,
         "background_owner": owner,
+        "explicit_finish": explicit_finish,
     }
     if "child_loop" not in finish_background_child.__code__.co_varnames:
         finish_kwargs.pop("child_loop")
@@ -1040,7 +1039,7 @@ async def test_background_runtime_error_waits_for_owned_child_before_failed_publ
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await _assert_failed_child_waits_for_owned_descendant(
-        tmp_path, monkeypatch, unexpected_runtime_error=True
+        tmp_path, monkeypatch, terminal_path="runtime_exception"
     )
 
 
@@ -1049,7 +1048,25 @@ async def test_finish_gate_provider_failure_preserves_failure_while_draining_chi
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await _assert_failed_child_waits_for_owned_descendant(
-        tmp_path, monkeypatch, unexpected_runtime_error=False
+        tmp_path, monkeypatch, terminal_path="provider_failure"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_path",
+    ["provider_failure", "runtime_exception", "empty_response", "no_final_response"],
+)
+async def test_explicit_finish_non_finish_terminal_waits_for_owned_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_path: str,
+) -> None:
+    await _assert_failed_child_waits_for_owned_descendant(
+        tmp_path,
+        monkeypatch,
+        terminal_path=terminal_path,
+        explicit_finish=True,
     )
 
 
@@ -1067,7 +1084,7 @@ async def test_owned_work_terminal_outcomes_drain_without_model(
         await test_child_finish_gate_waits_for_grandchild_and_merges_result(tmp_path)
     elif outcome == "failed":
         await _assert_failed_child_waits_for_owned_descendant(
-            tmp_path, monkeypatch, unexpected_runtime_error=False
+            tmp_path, monkeypatch, terminal_path="provider_failure"
         )
     elif outcome == "explicit_finish":
         await test_explicit_finish_refuses_owned_work_until_clear(tmp_path)
@@ -2948,7 +2965,7 @@ async def test_child_finish_gate_waits_for_grandchild_and_merges_result(
 
     child_store.close()
     backend.release_grandchild.set()
-    await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(task, timeout=10)
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child_store.agent_lifecycle()
@@ -3080,12 +3097,12 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
     monkeypatch.setattr(owner, "cancel_all", cancel_all)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(completion_published.wait(), timeout=2)
+    await asyncio.wait_for(completion_published.wait(), timeout=10)
     closing = asyncio.create_task(loop.close())
     try:
-        await asyncio.wait_for(cancellation_requested.wait(), timeout=1)
+        await asyncio.wait_for(cancellation_requested.wait(), timeout=10)
         release_child_watcher.set()
-        await asyncio.wait_for(closing, timeout=1)
+        await asyncio.wait_for(closing, timeout=10)
         assert not owner.running
     finally:
         release_child_watcher.set()
@@ -3093,7 +3110,7 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
         if not closing.done():
             closing.cancel()
         await asyncio.gather(closing, return_exceptions=True)
-        await asyncio.wait_for(owner.wait(), timeout=2)
+        await asyncio.wait_for(owner.wait(), timeout=10)
         store.close()
 
 

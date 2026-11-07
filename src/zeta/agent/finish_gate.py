@@ -456,35 +456,12 @@ async def _wait_for_finish(
         if state.should_wait_without_model(bool(tasks)):
             result = await state.wait_transition(child_loop, tasks_running=True)
         elif pending_notification or delivery_pending:
-            episode = None
-            if state.automatic_turns_exhausted:
-                if flow is None:
-                    result = await state.wait_transition(
-                        child_loop, tasks_running=bool(tasks)
-                    )
-                    if result is not None:
-                        return result
-                    continue
-                staged_ids = flow.pending_ids()
-                episode, exhausted_ids = child_loop._background_owner.causal_episodes.claim(
-                    child_loop.agent_instance_id or "", staged_ids
-                )
-                if episode is None:
-                    flow.suppress_pending(exhausted_ids)
-                    child_loop._background_owner.conversation_channel.clear_wake(
-                        child_loop.agent_instance_id or ""
-                    )
-                    result = await state.wait_transition(
-                        child_loop, tasks_running=bool(tasks)
-                    )
-                    if result is not None:
-                        return result
-                    continue
-            result = await state.run_model_turn(
+            result = await _handle_pending_notification(
+                state,
                 child_loop,
-                child_loop.run_notification_turn(),
                 consume_events,
-                episode,
+                flow,
+                tasks_running=bool(tasks),
             )
         else:
             result = await state.wait_transition(
@@ -493,6 +470,37 @@ async def _wait_for_finish(
         if result is not None:
             return result
     return FinishGateResult("completed")
+
+
+async def _handle_pending_notification(
+    state: FinishGateState,
+    child_loop: AgentLoop,
+    consume_events: ConsumeEvents,
+    flow: Any | None,
+    *,
+    tasks_running: bool,
+) -> FinishGateResult | None:
+    episode = None
+    if state.automatic_turns_exhausted:
+        if flow is None:
+            return await state.wait_transition(child_loop, tasks_running=tasks_running)
+        episode, exhausted_ids = child_loop._background_owner.causal_episodes.claim(
+            child_loop.agent_instance_id or "", flow.pending_ids()
+        )
+        if episode is None:
+            flow.suppress_pending(exhausted_ids)
+            child_loop._background_owner.conversation_channel.clear_wake(
+                child_loop.agent_instance_id or ""
+            )
+            return await state.wait_transition(
+                child_loop, tasks_running=tasks_running
+            )
+    return await state.run_model_turn(
+        child_loop,
+        child_loop.run_notification_turn(),
+        consume_events,
+        episode,
+    )
 
 
 async def _terminal_transition(
