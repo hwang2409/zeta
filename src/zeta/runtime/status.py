@@ -37,6 +37,7 @@ def capture_slash_status(
     vim_mode: bool,
     pending_approvals: tuple[str, ...],
     usage_tracker: UsageTracker,
+    project_context_health: str | None,
     transcript_session_id: str | None = None,
 ) -> SlashStatusSnapshot:
     """Capture loop-owned status state without transcript-sized processing."""
@@ -89,6 +90,7 @@ def capture_slash_status(
             transcript_index_failure=loop.transcript_index_failure(
                 transcript_session_id or session_id
             ),
+            project_context_health=project_context_health,
         ),
         transcript_entries=loop.store.resident_entries_snapshot(),
         token_counter=context_assembler.token_counter,
