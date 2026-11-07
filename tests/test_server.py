@@ -8455,7 +8455,7 @@ async def test_slash_run_mcp_status_maps_malformed_credential_error(
             "Move this file aside, then run '/mcp auth live'."
         )
         assert response == {
-            "kind": "output",
+            "kind": "text",
             "text": expected_text,
             "credential_store_error": {
                 "code": "mcp_credential_store",
