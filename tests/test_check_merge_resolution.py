@@ -1015,7 +1015,11 @@ def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> N
             cwd=Path(__file__).parents[1], check=False,
         )
         if present.returncode:
-            pytest.skip(f"historical commit {revision} is absent from this checkout")
+            if os.environ.get("CI"):
+                raise AssertionError(
+                    f"historical commit {revision} is absent from the CI checkout"
+                )
+            pytest.skip(f"historical commit {revision} is absent from this local checkout")
     repo_root = Path(__file__).parents[1]
     first = run(repo_root, "628344f0")
     first_output = first.stdout + first.stderr
