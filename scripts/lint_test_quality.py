@@ -4,21 +4,28 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 TIME_ERROR = (
     "wait on a readiness event or inject a clock; timeouts are hang guards only "
-    "(use '# test-contract: latency' on this line or the line above only when real "
-    "product latency is the contract)"
+    "(use '# test-contract: latency <reason>' on this line or the line above only "
+    "when real product latency is the contract)"
+)
+SHORT_TIMEOUT_ERROR = (
+    "use a generous hang guard (>= 10 s) and wait on the event; use an injected "
+    "clock for timeout behavior"
 )
 DIGEST_ERROR = "assert semantic fields, not a hash"
 CONTRACT_ERROR = (
     "assert through <public interface> or mark the contract with "
-    "'# test-contract: complexity' or '# test-contract: durability' on this line "
-    "or the line above"
+    "'# test-contract: complexity <reason>', 'durability <reason>', or "
+    "'seam <reason>' on this line or the line above"
 )
+CONTRACT_KINDS = {"complexity", "durability", "latency", "seam"}
+MIN_HANG_GUARD_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -33,15 +40,21 @@ class Finding:
         return f"{self.path}:{self.line}:{self.column}: {self.code} {self.message}"
 
 
+def _normalized_diff_line(line: str) -> str:
+    return re.sub(r"\s+", "", line)
+
+
 def _added_lines(diff: str) -> dict[Path, set[int]]:
-    changed: dict[Path, set[int]] = {}
+    added_by_path: dict[Path, list[tuple[int, str]]] = {}
+    deleted_by_path: dict[Path, list[str]] = {}
     path: Path | None = None
     new_line = 0
     hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             path = Path(line[6:])
-            changed.setdefault(path, set())
+            added_by_path.setdefault(path, [])
+            deleted_by_path.setdefault(path, [])
             continue
         match = hunk.match(line)
         if match:
@@ -50,12 +63,22 @@ def _added_lines(diff: str) -> dict[Path, set[int]]:
         if path is None or line.startswith(("diff --git ", "--- ")):
             continue
         if line.startswith("+") and not line.startswith("+++"):
-            changed[path].add(new_line)
+            added_by_path[path].append((new_line, _normalized_diff_line(line[1:])))
             new_line += 1
         elif line.startswith("-") and not line.startswith("---"):
-            continue
+            deleted_by_path[path].append(_normalized_diff_line(line[1:]))
         elif line.startswith(" "):
             new_line += 1
+
+    changed: dict[Path, set[int]] = {}
+    for changed_path, additions in added_by_path.items():
+        unmatched_deletions = deleted_by_path[changed_path].copy()
+        changed[changed_path] = set()
+        for line_number, normalized in additions:
+            if normalized in unmatched_deletions:
+                unmatched_deletions.remove(normalized)
+            else:
+                changed[changed_path].add(line_number)
     return changed
 
 
@@ -88,14 +111,22 @@ def _literal_number(node: ast.AST) -> float | None:
     return None
 
 
-def _has_marker(lines: list[str], line: int, contracts: set[str]) -> bool:
+def _marker(lines: list[str], line: int) -> tuple[str, str] | None:
     for candidate in (line, line - 1):
         if candidate < 1 or candidate > len(lines):
             continue
-        match = re.search(r"#\s*test-contract:\s*([a-z-]+)\b", lines[candidate - 1])
-        if match and match.group(1) in contracts:
-            return True
-    return False
+        match = re.search(
+            r"#\s*test-contract:\s*([a-z-]+)(?:\s+([^#\s].*?))?\s*$",
+            lines[candidate - 1],
+        )
+        if match and match.group(1) in CONTRACT_KINDS and match.group(2):
+            return match.group(1), match.group(2).strip()
+    return None
+
+
+def _has_marker(lines: list[str], line: int, contracts: set[str]) -> bool:
+    marker = _marker(lines, line)
+    return marker is not None and marker[0] in contracts
 
 
 def _touches_added_line(node: ast.AST, added: set[int]) -> bool:
@@ -226,6 +257,87 @@ def _mock_contract_assertion(node: ast.AST) -> bool:
     return False
 
 
+def _wait_for_timeout(node: ast.Call) -> float | None:
+    if _name(node.func) not in {"asyncio.wait_for", "wait_for"}:
+        return None
+    if len(node.args) > 1:
+        return _literal_number(node.args[1])
+    for keyword in node.keywords:
+        if keyword.arg == "timeout":
+            return _literal_number(keyword.value)
+    return None
+
+
+def _timing_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Finding]:
+    if isinstance(node, ast.Call):
+        timeout = _wait_for_timeout(node)
+        if timeout is not None and 0 < timeout < MIN_HANG_GUARD_SECONDS:
+            return [
+                Finding(
+                    path, node.lineno, node.col_offset + 1, "TQ001", SHORT_TIMEOUT_ERROR
+                )
+            ]
+        if _name(node.func) in {"time.sleep", "asyncio.sleep"}:
+            delay = _literal_number(node.args[0]) if node.args else None
+            if (
+                delay is not None
+                and delay > 0
+                and not _has_marker(lines, node.lineno, {"latency"})
+            ):
+                return [
+                    Finding(path, node.lineno, node.col_offset + 1, "TQ001", TIME_ERROR)
+                ]
+    if (
+        isinstance(node, ast.Assert)
+        and any(isinstance(child, ast.Compare) for child in ast.walk(node.test))
+        and _contains_timing_reference(node.test)
+        and not _has_marker(lines, node.lineno, {"latency"})
+    ):
+        return [Finding(path, node.lineno, node.col_offset + 1, "TQ001", TIME_ERROR)]
+    return []
+
+
+def _digest_findings(
+    path: Path, node: ast.AST, literal_names: set[str], serialized_names: set[str]
+) -> list[Finding]:
+    if not isinstance(node, ast.Assert):
+        return []
+    comparisons = [
+        child for child in ast.walk(node.test) if isinstance(child, ast.Compare)
+    ]
+    violates = any(
+        (
+            _is_serialized_digest(compare.left, serialized_names)
+            and any(
+                _is_literal_reference(value, literal_names)
+                for value in compare.comparators
+            )
+        )
+        or (
+            any(
+                _is_serialized_digest(value, serialized_names)
+                for value in compare.comparators
+            )
+            and _is_literal_reference(compare.left, literal_names)
+        )
+        for compare in comparisons
+    )
+    if not violates:
+        return []
+    return [Finding(path, node.lineno, node.col_offset + 1, "TQ002", DIGEST_ERROR)]
+
+
+def _contract_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Finding]:
+    violates = (isinstance(node, ast.Call) and _private_patch(node)) or (
+        _mock_contract_assertion(node)
+    )
+    if not violates or _has_marker(
+        lines, node.lineno, {"complexity", "durability", "seam"}
+    ):
+        return []
+    return [Finding(path, node.lineno, node.col_offset + 1, "TQ003", CONTRACT_ERROR)]
+
+
 def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
@@ -241,60 +353,15 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
         ]
 
     lines = source.splitlines()
-    findings: list[Finding] = []
     literal_names = _literal_names(tree)
     serialized_names = _serialized_names(tree)
+    findings: list[Finding] = []
     for node in ast.walk(tree):
         if not hasattr(node, "lineno") or not _touches_added_line(node, added):
             continue
-        column = node.col_offset + 1
-        if isinstance(node, ast.Call) and _name(node.func) in {
-            "time.sleep",
-            "asyncio.sleep",
-        }:
-            delay = _literal_number(node.args[0]) if node.args else None
-            if (
-                delay is not None
-                and delay > 0
-                and not _has_marker(lines, node.lineno, {"latency"})
-            ):
-                findings.append(Finding(path, node.lineno, column, "TQ001", TIME_ERROR))
-        if (
-            isinstance(node, ast.Assert)
-            and any(isinstance(child, ast.Compare) for child in ast.walk(node.test))
-            and _contains_timing_reference(node.test)
-            and not _has_marker(lines, node.lineno, {"latency"})
-        ):
-            findings.append(Finding(path, node.lineno, column, "TQ001", TIME_ERROR))
-        if isinstance(node, ast.Assert):
-            comparisons = [
-                child for child in ast.walk(node.test) if isinstance(child, ast.Compare)
-            ]
-            if any(
-                (
-                    _is_serialized_digest(compare.left, serialized_names)
-                    and any(
-                        _is_literal_reference(value, literal_names)
-                        for value in compare.comparators
-                    )
-                )
-                or (
-                    any(
-                        _is_serialized_digest(value, serialized_names)
-                        for value in compare.comparators
-                    )
-                    and _is_literal_reference(compare.left, literal_names)
-                )
-                for compare in comparisons
-            ):
-                findings.append(
-                    Finding(path, node.lineno, column, "TQ002", DIGEST_ERROR)
-                )
-        if (
-            (isinstance(node, ast.Call) and _private_patch(node))
-            or _mock_contract_assertion(node)
-        ) and not _has_marker(lines, node.lineno, {"complexity", "durability"}):
-            findings.append(Finding(path, node.lineno, column, "TQ003", CONTRACT_ERROR))
+        findings.extend(_timing_findings(path, node, lines))
+        findings.extend(_digest_findings(path, node, literal_names, serialized_names))
+        findings.extend(_contract_findings(path, node, lines))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
 
@@ -314,10 +381,30 @@ def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
     )
 
 
+def select_base(event_name: str, base_ref: str = "") -> str:
+    if event_name == "pull_request":
+        if not base_ref:
+            raise ValueError("pull_request requires a base ref")
+        subprocess.run(["git", "fetch", "--no-tags", "origin", base_ref], check=True)
+        return subprocess.check_output(
+            ["git", "merge-base", "HEAD", "FETCH_HEAD"], text=True
+        ).strip()
+    if event_name == "push":
+        return subprocess.check_output(["git", "rev-parse", "HEAD^"], text=True).strip()
+    raise ValueError(f"unsupported github event: {event_name}")
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments[:1] == ["--base"] and len(arguments) in {2, 3}:
+        print(select_base(arguments[1], arguments[2] if len(arguments) == 3 else ""))
+        return 0
     if len(arguments) != 1:
-        print("usage: lint_test_quality.py <unified-diff-path|->", file=sys.stderr)
+        print(
+            "usage: lint_test_quality.py <unified-diff-path|-> | "
+            "--base <pull_request|push> [base-ref]",
+            file=sys.stderr,
+        )
         return 2
     diff = (
         sys.stdin.read()

@@ -85,13 +85,12 @@ jobs:
         run: uv run --frozen ruff check --output-format github
 
       - name: Reject new low-signal test patterns
-        if: github.event_name == 'pull_request'
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
-          git fetch --no-tags origin "$GITHUB_BASE_REF"
-          merge_base=$(git merge-base HEAD FETCH_HEAD)
-          git diff --unified=0 "$merge_base" HEAD -- ':(glob)**/*.py' | python scripts/lint_test_quality.py -
+          base=$(python scripts/lint_test_quality.py --base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF")
+          git diff --unified=0 "$base" HEAD -- ':(glob)**/*.py' | python scripts/lint_test_quality.py -
 
   browser:
     name: browser
