@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -172,6 +173,7 @@ def register_handoff(child_loop: object) -> None:
 
 
 TASK_SAFETY_COHORT_SECONDS = 1.0
+TASK_SAFETY_RETRY_SECONDS = 1.0
 
 
 @dataclass(slots=True)
@@ -180,6 +182,7 @@ class _TaskSafetyWindow:
     deadline: float
     warned: bool = False
     warning_prompt_id: str | None = None
+    warning_token: str | None = None
 
 
 class TaskSafetyLifecycle:
@@ -207,6 +210,7 @@ class TaskSafetyLifecycle:
         self._cohort_seconds = cohort_seconds
         self._changed = asyncio.Event()
         self._windows: dict[str, _TaskSafetyWindow] = {}
+        self._publish_retry_at: float | None = None
 
     def delivery_completed(self, live_pending_ids: set[str]) -> None:
         """Start a fresh window only for a warning cohort whose turn completed."""
@@ -264,7 +268,68 @@ class TaskSafetyLifecycle:
         ]
         if not deadlines:
             return None
-        return min(deadlines) + self._cohort_seconds
+        action_at = min(deadlines) + self._cohort_seconds
+        if self._publish_retry_at is not None:
+            action_at = max(action_at, self._publish_retry_at)
+        return action_at
+
+    def _warning_cohort(self, now: float) -> list[_TaskSafetyWindow]:
+        return [
+            window
+            for window in self._windows.values()
+            if not window.warned
+            and window.warning_prompt_id is None
+            and window.deadline <= now + self._cohort_seconds
+        ]
+
+    def _kill_candidates(self, now: float) -> list[_TaskSafetyWindow]:
+        return [
+            window
+            for window in self._windows.values()
+            if window.warned
+            and window.warning_prompt_id is None
+            and window.deadline <= now
+        ]
+
+    async def _publish_warning(
+        self,
+        publish_notice: Callable[[str], Awaitable[str]],
+        cohort: list[_TaskSafetyWindow],
+        now: float,
+    ) -> None:
+        token = next(
+            (window.warning_token for window in cohort if window.warning_token),
+            uuid.uuid4().hex,
+        )
+        for window in cohort:
+            window.warning_token = token
+        text = "\n".join(
+            f"task {window.task.task_id} ({window.task.headline}) has run "
+            f"{_format_duration(_task_age(window.task, now, self._limit))}; "
+            "kill it with task_kill or leave it running"
+            for window in cohort
+        )
+        publication = asyncio.create_task(
+            publish_notice(f"{text}\n[task-safety-cohort: {token}]")
+        )
+        try:
+            prompt_id = await asyncio.shield(publication)
+        except asyncio.CancelledError as cancelled:
+            try:
+                prompt_id = await publication
+            except Exception as error:
+                raise cancelled from error
+            for window in cohort:
+                window.warned = True
+                window.warning_prompt_id = prompt_id
+            raise
+        except Exception:  # noqa: BLE001 - every publication failure is retryable
+            self._publish_retry_at = now + TASK_SAFETY_RETRY_SECONDS
+            return
+        self._publish_retry_at = None
+        for window in cohort:
+            window.warned = True
+            window.warning_prompt_id = prompt_id
 
     async def _expire_due(
         self,
@@ -272,33 +337,13 @@ class TaskSafetyLifecycle:
         publish_notice: Callable[[str], Awaitable[str]],
         now: float,
     ) -> None:
-        actionable = [
-            window
-            for window in self._windows.values()
-            if window.warning_prompt_id is None and window.deadline <= now
-        ]
-        if any(not window.warned for window in actionable):
-            warning_cohort = [
-                window
-                for window in self._windows.values()
-                if not window.warned
-                and window.warning_prompt_id is None
-                and window.deadline <= now + self._cohort_seconds
-            ]
-            text = "\n".join(
-                f"task {window.task.task_id} ({window.task.headline}) has run "
-                f"{_format_duration(_task_age(window.task, now, self._limit))}; "
-                "kill it with task_kill or leave it running"
-                for window in warning_cohort
-            )
-            prompt_id = await publish_notice(text)
-            for window in warning_cohort:
-                window.warned = True
-                window.warning_prompt_id = prompt_id
+        if self._publish_retry_at is not None and now >= self._publish_retry_at:
+            self._publish_retry_at = None
+        warning_cohort = self._warning_cohort(now)
+        if warning_cohort and self._publish_retry_at is None:
+            await self._publish_warning(publish_notice, warning_cohort, now)
 
-        for window in actionable:
-            if not window.warned or window.warning_prompt_id is not None:
-                continue
+        for window in self._kill_candidates(now):
             age = _task_age(window.task, now, self._limit)
             await registry.kill(
                 window.task.task_id,

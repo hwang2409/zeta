@@ -35,6 +35,36 @@ _IDLE_NUDGE_PROMPT = (
 )
 
 
+async def _publish_task_safety_notice(
+    child_loop: AgentLoop, child_store: ConversationStore, text: str
+) -> str:
+    token_marker = text.rpartition("\n")[2]
+
+    async def committed_prompt_id() -> str | None:
+        prompts = await asyncio.to_thread(child_store.pending_prompts)
+        return next(
+            (
+                entry.id
+                for entry in prompts
+                if token_marker in str(entry.data.get("text", ""))
+            ),
+            None,
+        )
+
+    if prompt_id := await committed_prompt_id():
+        return prompt_id
+    try:
+        result = await child_loop._background_owner.conversation_channel.produce_to(
+            child_loop.agent_instance_id,
+            PromptInput(text, MessageOrigin.HARNESS_NUDGE, None),
+        )
+    except Exception:
+        if prompt_id := await committed_prompt_id():
+            return prompt_id
+        raise
+    return result.entries[0].id
+
+
 def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
     if getattr(child_loop, "explicit_finish", False):
         child_store.update_agent_lifecycle(
@@ -144,11 +174,7 @@ async def consume_run(
     )
 
     async def publish_task_safety_notice(text: str) -> str:
-        result = await child_loop._background_owner.conversation_channel.produce_to(
-            child_loop.agent_instance_id,
-            PromptInput(text, MessageOrigin.HARNESS_NUDGE, None),
-        )
-        return result.entries[0].id
+        return await _publish_task_safety_notice(child_loop, child_store, text)
 
     def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
         if not callable(child_turns):

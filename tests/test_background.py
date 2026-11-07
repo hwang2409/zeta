@@ -2825,6 +2825,223 @@ async def test_task_completion_turn_rearms_full_safety_window() -> None:
 
 
 @pytest.mark.asyncio
+async def test_task_safety_retries_failed_warning_before_killing() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.append(
+        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
+    )
+    notices: list[str] = []
+    attempts = 0
+    first_attempted = asyncio.Event()
+
+    async def publish(text: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            first_attempted.set()
+            raise OSError("forced pre-commit failure")
+        notices.append(text)
+        return "warning-1"
+
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+    try:
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
+        now[0] = 3600
+        await wait.releases.put(False)
+        await asyncio.wait_for(first_attempted.wait(), 10)
+        assert not supervisor.done()
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 1
+        assert notices == []
+        assert registry.kills == []
+        window = lifecycle._windows["task-1"]
+        assert not window.warned
+        assert window.warning_prompt_id is None
+
+        now[0] = 3601
+        await wait.releases.put(False)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+        assert len(notices) == 1
+        assert registry.kills == []
+
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
+        now[0] = 7201
+        await wait.releases.put(False)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+        assert len(notices) == 1
+        assert registry.kills[0][0] == "task-1"
+        assert "task safety limit expired" in registry.kills[0][1]
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_safety_retry_reuses_ambiguous_warning_token() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.append(
+        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
+    )
+    committed: dict[str, str] = {}
+    attempts = 0
+    first_attempted = asyncio.Event()
+
+    async def publish(text: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        token = text.rpartition("\n")[2]
+        if prompt_id := committed.get(token):
+            return prompt_id
+        committed[token] = "warning-1"
+        first_attempted.set()
+        raise OSError("forced post-commit failure")
+
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+    try:
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
+        now[0] = 3600
+        await wait.releases.put(False)
+        await asyncio.wait_for(first_attempted.wait(), 10)
+        assert not supervisor.done()
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 1
+        assert len(committed) == 1
+        assert registry.kills == []
+
+        now[0] = 3601
+        await wait.releases.put(False)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+        assert attempts == 2
+        assert len(committed) == 1
+
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
+        assert lifecycle._windows["task-1"].deadline == 7201
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_safety_publisher_adopts_ambiguously_committed_warning(
+    tmp_path: Path,
+) -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+    from zeta.agent.run_consumer import _publish_task_safety_notice
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.append(
+        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
+    )
+    store = ConversationStore(tmp_path / "session")
+    attempts = 0
+
+    class CommitThenFailChannel:
+        async def produce_to(self, _target: str, item: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            await asyncio.wait_for(
+                asyncio.to_thread(store.append_pending_prompt, item.text), 10
+            )
+            raise OSError("forced post-commit failure")
+
+    loop = SimpleNamespace(
+        agent_instance_id="root:1",
+        _background_owner=SimpleNamespace(
+            conversation_channel=CommitThenFailChannel()
+        ),
+    )
+
+    async def publish(text: str) -> str:
+        return await _publish_task_safety_notice(loop, store, text)
+
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+    try:
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
+        now[0] = 3600
+        await wait.releases.put(False)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+        pending = await asyncio.wait_for(asyncio.to_thread(store.pending_prompts), 10)
+        assert len(pending) == 1
+        assert attempts == 1
+        assert registry.kills == []
+
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
+        assert lifecycle._windows["task-1"].deadline == 7200
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_safety_cancellation_finishes_warning_commit() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.append(
+        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
+    )
+    publishing = asyncio.Event()
+    release = asyncio.Event()
+    notices: list[str] = []
+
+    async def publish(text: str) -> str:
+        publishing.set()
+        await release.wait()
+        notices.append(text)
+        return "warning-1"
+
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+    try:
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
+        now[0] = 3600
+        await wait.releases.put(False)
+        await asyncio.wait_for(publishing.wait(), 10)
+        supervisor.cancel()
+        release.set()
+        result = await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+        assert isinstance(result[0], asyncio.CancelledError)
+        assert len(notices) == 1
+        window = lifecycle._windows["task-1"]
+        assert window.warned
+        assert window.warning_prompt_id == "warning-1"
+    finally:
+        release.set()
+        if not supervisor.done():
+            supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
 async def test_close_without_running_tasks_runs_no_process_table_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
