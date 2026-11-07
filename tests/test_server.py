@@ -91,6 +91,7 @@ from zeta.server.server import _Client
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
+from zeta.tui.render import render_event
 
 # A hang guard for waits on real frames, not a speed limit: a loaded CI
 # runner can take more than a few seconds between frames.
@@ -4581,7 +4582,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         written = await original_write(target, payload)
         if b'"sub_agent_receipt"' in payload and not published.is_set():
             published.set()
-            await release_publication.wait()
+            await asyncio.wait_for(release_publication.wait(), TIMEOUT)
         return written
 
     monkeypatch.setattr(client.codec, "write", gate_after_receipt_bytes)
@@ -4694,7 +4695,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     ids=["child-cleanup", "registry-close"],
 )
 async def test_close_kill_cause_reaches_live_serve_event(
-    tmp_path: Path, task_cause: str
+    tmp_path: Path, task_cause: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Protocol 1.2 gives close-driven task exits an explicit event.
     backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
@@ -4706,9 +4707,10 @@ async def test_close_kill_cause_reaches_live_serve_event(
     )
     reader, writer, session_id = await _ready_extensions(server)
     writer.close()
-    await writer.wait_closed()
-    await asyncio.sleep(0.05)
-    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    await asyncio.wait_for(writer.wait_closed(), TIMEOUT)
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection("127.0.0.1", server.port), TIMEOUT
+    )
     try:
         hello_frames = await _request(
             reader, writer, 4, "hello", {"protocol_version": "1.2"}
@@ -4723,8 +4725,46 @@ async def test_close_kill_cause_reaches_live_serve_event(
         )
         registry = server.runtime.loop.tool_registry.background_tasks
         task_id, _pid = await registry.start("sleep 30", tmp_path)
+        admission_started = threading.Event()
+        admission_held_past_old_deadline = threading.Event()
+        release_admission = threading.Event()
+        hold_observer: threading.Thread | None = None
+        if task_cause == "tool registry closed":
+            flow = await server.runtime.loop._ensure_step_delivery()
+            original_produce = flow.produce
+
+            async def gated_produce(item):
+                if getattr(item, "kind", None) == "task_exit":
+                    admission_started.set()
+                    assert await asyncio.wait_for(
+                        asyncio.to_thread(release_admission.wait, 10), 10
+                    ), "task-exit admission was not released"
+                return await original_produce(item)
+
+            monkeypatch.setattr(flow, "produce", gated_produce)
+
+            def observe_old_deadline() -> None:
+                if admission_started.wait(10) and not release_admission.wait(1.1):
+                    admission_held_past_old_deadline.set()
+
+            hold_observer = threading.Thread(target=observe_old_deadline)
+            hold_observer.start()
         registry.begin_shutdown(task_cause)
-        await registry.close()
+        close_task = asyncio.create_task(registry.close())
+        try:
+            if hold_observer is not None:
+                assert await asyncio.wait_for(
+                    asyncio.to_thread(admission_held_past_old_deadline.wait, 10), 10
+                )
+                release_admission.set()
+            await asyncio.wait_for(close_task, 10)
+        finally:
+            release_admission.set()
+            if not close_task.done():
+                close_task.cancel()
+            await asyncio.gather(close_task, return_exceptions=True)
+            if hold_observer is not None:
+                await asyncio.wait_for(asyncio.to_thread(hold_observer.join, 10), 10)
 
         history_frames = await _request(
             reader,
@@ -4741,6 +4781,25 @@ async def test_close_kill_cause_reaches_live_serve_event(
         ]
         assert len(task_rows) == 1
         assert task_cause in task_rows[0]["content"][0]["text"]
+        notification = next(
+            entry
+            for entry in store.agent_notifications()
+            if entry.data.get("kind") == "task_exited"
+        )
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "notification_id": notification.id,
+                    **notification.data,
+                    "tui_presented": store.is_agent_notification_presented_to_tui(
+                        notification.id
+                    ),
+                },
+            )
+        )
+        assert rendered is not None
+        assert task_cause in rendered.plain
 
         task_frames = history_frames
         if not any(

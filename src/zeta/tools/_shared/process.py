@@ -42,7 +42,6 @@ from .background_task_types import (
     BackgroundTaskNoticeSinkValue,
     BackgroundTaskShutdownNotice,
     TaskExitInput,
-    deliver_shutdown_task_exit,
 )
 from .process_output import command_headline, output_tail, utf8_char_chunk, utf8_chunk
 from .tool_spawn import create_tool_subprocess_shell
@@ -82,6 +81,7 @@ class _BackgroundRecord:
     log_fd: int | None = None
     storage_lock: asyncio.Lock | None = None
     notify_on_exit: bool = True
+    tui_presented: bool = False
     owner: str = "run_background"
     terminal_phase: Literal["natural_exit", "task_kill", "session_shutdown"] | None = (
         None
@@ -566,9 +566,10 @@ class BackgroundTaskRegistry:
 
         self._shutdown_cause = self._shutdown_cause or cause
 
-    async def kill(self, task_id: str, *, cause: str) -> dict[str, Any]:
+    async def kill(self, task_id: str, *, cause: str, tui_presented: bool = False) -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
+            record.tui_presented = tui_presented
             phase: Literal["task_kill", "session_shutdown"] = (
                 "session_shutdown" if self._shutdown_cause else "task_kill"
             )
@@ -651,12 +652,12 @@ class BackgroundTaskRegistry:
             records = [record for record, _ in entries]
             killed = [record.task_id for record in records]
             notified_records = [record for record in records if record.notify_on_exit]
-            # Prepare every record before signaling so monitors cannot publish a
-            # terminal event until every shutdown kill has a durable cause.
-            for record in records:
-                record.notify_on_exit = False
-                record.terminal_phase = "task_kill"
-                record.note = self._shutdown_cause or "background task registry closed"
+            async with self._transition_lock:
+                for record in records:
+                    record.notify_on_exit = False
+                    record.terminal_phase = "task_kill"
+                    record.note = self._shutdown_cause or "background task registry closed"
+                await finish(self._commit_notice(None))
             await finish(
                 asyncio.gather(*(self._close_stdin(record) for record in records))
             )
@@ -730,13 +731,7 @@ class BackgroundTaskRegistry:
                 await self._commit_notice(shutdown_notice)
             for record in notified_records:
                 record.notify_on_exit = True
-                await finish(
-                    deliver_shutdown_task_exit(
-                        lambda deadline, record=record: self._notify_terminal_exit(
-                            record, delivery_deadline=deadline
-                        )
-                    )
-                )
+                await finish(self._notify_terminal_exit(record))
             if self._start_cleanup_error is not None:
                 raise self._start_cleanup_error
             self._closing = False
@@ -1018,13 +1013,13 @@ class BackgroundTaskRegistry:
         reason: str,
         phase: Literal["task_kill", "session_shutdown"],
     ) -> None:
-        process = record.process
-        if process is None:
-            return
-        # Set the phase before signaling: the monitor commonly wins the race to
-        # finalize the record and must preserve the initiating lifecycle event.
-        record.terminal_phase = phase
-        record.note = reason
+        async with self._transition_lock:
+            process = record.process
+            if process is None or not record.running:
+                return
+            record.terminal_phase = phase
+            record.note = reason
+            await self._commit_notice(None)
         await _terminate_process(
             process, self.term_grace, close_stdin=lambda: self._close_stdin(record)
         )
@@ -1105,7 +1100,7 @@ class BackgroundTaskRegistry:
         if self._notice_sink is not None:
             self._notice_sink(notice)
 
-    async def _notify_terminal_exit(self, record: _BackgroundRecord, delivery_deadline: float | None = None) -> None:
+    async def _notify_terminal_exit(self, record: _BackgroundRecord) -> None:
         if not record.notify_on_exit:
             return
         await self._notify_exit(
@@ -1117,7 +1112,7 @@ class BackgroundTaskRegistry:
             record.note,
             owner=record.owner,
             phase=record.terminal_phase or "natural_exit",
-            delivery_deadline=delivery_deadline,
+            tui_presented=record.tui_presented,
         )
 
     async def _notify_exit(
@@ -1131,23 +1126,27 @@ class BackgroundTaskRegistry:
         *,
         owner: str = "run_background",
         phase: str = "natural_exit",
-        delivery_deadline: float | None = None,
+        tui_presented: bool = False,
     ) -> None:
         if self._notification_sink is None:
             return
-        await self._notification_sink(
-            TaskExitInput(
-                task_id=task_id,
-                command=command_headline(command),
-                exit_code=exit_code,
-                output_tail=output_tail,
-                log_path=str(log_path) if log_path is not None else None,
-                note=note,
-                owner=owner,
-                phase=phase,
-                delivery_deadline=delivery_deadline,
+        try:
+            await self._notification_sink(
+                TaskExitInput(
+                    task_id=task_id,
+                    command=command_headline(command),
+                    exit_code=exit_code,
+                    output_tail=output_tail,
+                    log_path=str(log_path) if log_path is not None else None,
+                    note=note,
+                    owner=owner,
+                    phase=phase,
+                    tui_presented=tui_presented,
+                )
             )
-        )
+        except ValueError as exc:
+            if str(exc) != "session store is closed":
+                raise
 
     def _load_previous(self) -> None:
         if self._directory_fd is None:
@@ -1178,6 +1177,8 @@ class BackgroundTaskRegistry:
                 continue
             was_running = row.get("running") is True
             archived_length = self._archived_lengths.get(task_id, 0)
+            note = row.get("note")
+            phase = row.get("terminal_phase")
             self._records[task_id] = _BackgroundRecord(
                 task_id=task_id,
                 command=command,
@@ -1189,7 +1190,8 @@ class BackgroundTaskRegistry:
                 exit_code=row.get("exit_code")
                 if type(row.get("exit_code")) is int
                 else None,
-                note="task exited when the previous session ended",
+                note=note if type(note) is str else "task exited when the previous session ended",
+                terminal_phase=phase if phase in {"natural_exit", "task_kill", "session_shutdown"} else None,
                 storage_lock=asyncio.Lock(),
             )
             if was_running:
@@ -1225,13 +1227,11 @@ class BackgroundTaskRegistry:
     ) -> tuple[dict[str, object], ...]:
         return tuple(
             {
-                "task_id": record.task_id,
-                "command": record.command,
-                "pid": record.pid,
-                "running": record.running,
-                "exit_code": record.exit_code,
-                "started_at": record.started_at,
-                "ended_at": record.ended_at,
+                "task_id": record.task_id, "command": record.command,
+                "pid": record.pid, "running": record.running,
+                "exit_code": record.exit_code, "started_at": record.started_at,
+                "ended_at": record.ended_at, "note": record.note,
+                "terminal_phase": record.terminal_phase,
             }
             for record in (self._records.values() if records is None else records)
         )

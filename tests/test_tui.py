@@ -874,44 +874,6 @@ def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
     store.close()
 
 
-@pytest.mark.asyncio
-async def test_close_task_notification_admission_is_bounded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    loop = AgentLoop(
-        FakeBackend([]),
-        store,
-        registry=registry,
-        skill_catalog=SkillCatalog.empty(),
-    )
-    flow = await loop._ensure_step_delivery()
-    producer_started = asyncio.Event()
-    allow_producer = asyncio.Event()
-    original_produce = flow.produce
-
-    async def gated_produce(item):
-        producer_started.set()
-        await allow_producer.wait()
-        return await original_produce(item)
-
-    monkeypatch.setattr(flow, "produce", gated_produce)
-    await registry.background_tasks.start("sleep 30", tmp_path)
-    close_task = asyncio.create_task(loop.close())
-    try:
-        await asyncio.wait_for(producer_started.wait(), 10)
-        with pytest.raises(RuntimeError, match="shutdown delivery admission timed out"):
-            # test-contract: latency notification admission has a 1 second deadline.
-            await asyncio.wait_for(close_task, 2)
-        assert store.agent_notifications() == []
-    finally:
-        allow_producer.set()
-        await asyncio.gather(close_task, return_exceptions=True)
-        await registry.background_tasks.close()
-        store.close()
-
-
 def test_other_background_notices_remain_visible() -> None:
     rendered: list[Text] = []
     background_notice(

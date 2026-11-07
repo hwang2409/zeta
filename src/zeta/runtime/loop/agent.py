@@ -580,7 +580,7 @@ class AgentLoop(
                 "task_exit",
                 data,
                 dedupe_key=item.task_id,
-                deadline=item.delivery_deadline,
+                tui_presented=item.tui_presented,
             )
         )
 

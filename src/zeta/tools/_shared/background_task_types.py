@@ -2,38 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-import time
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
 from .process_output import command_headline
-
-_SHUTDOWN_DELIVERY_TIMEOUT_SECONDS = 1.0
-
-
-async def deliver_shutdown_task_exit[T](
-    deliver: Callable[[float], Awaitable[T]],
-) -> T:
-    """Admit a shutdown task exit without blocking close indefinitely."""
-
-    deadline = time.monotonic() + _SHUTDOWN_DELIVERY_TIMEOUT_SECONDS
-    try:
-        return await asyncio.wait_for(
-            deliver(deadline), timeout=_SHUTDOWN_DELIVERY_TIMEOUT_SECONDS
-        )
-    except TimeoutError as exc:
-        raise RuntimeError("shutdown delivery admission timed out") from exc
-
-
-TUI_PRESENTED_TASK_KILL_CAUSES = frozenset(
-    {
-        "task_kill tool requested by the agent",
-        "TUI tasks panel requested by the user",
-        "background macro canceled by the user",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +42,7 @@ class TaskExitInput:
     note: str | None = None
     owner: str = "run_background"
     phase: str = "natural_exit"
-    delivery_deadline: float | None = None
+    tui_presented: bool = False
 
 
 @dataclass(frozen=True, slots=True)
