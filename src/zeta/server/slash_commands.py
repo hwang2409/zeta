@@ -434,7 +434,11 @@ async def run_command(
     command = registry.command_for(name)
     if command is not None and not registry.available(command):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    if command is not None and command.serve is not None and command.serve.mutates(tail):
+    if (
+        command is not None
+        and command.serve is not None
+        and command.serve.mutates(tail)
+    ):
         ergonomics.require_mutable(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
@@ -450,9 +454,7 @@ async def run_command(
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(
-        runtime, approval_control, run_blocking=run_blocking
-    )
+    session = ServerSlashSession(runtime, approval_control, run_blocking=run_blocking)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}

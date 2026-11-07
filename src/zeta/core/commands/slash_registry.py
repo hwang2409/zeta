@@ -75,9 +75,7 @@ class SlashCommandRegistry:
         self._skills: dict[str, SkillMeta] = {}
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
-        self._mcp_prompts = MCPPromptCommands(
-            self._notices, self._warning_notices
-        )
+        self._mcp_prompts = MCPPromptCommands(self._notices, self._warning_notices)
 
     def register(self, command: SlashCommand) -> None:
         if not is_slash_safe_name(command.name):
@@ -90,7 +88,9 @@ class SlashCommandRegistry:
     def custom_commands(self) -> tuple[CustomCommand, ...]:
         """Return loaded custom commands in stable name order."""
 
-        return tuple(self._custom_commands[name] for name in sorted(self._custom_commands))
+        return tuple(
+            self._custom_commands[name] for name in sorted(self._custom_commands)
+        )
 
     @property
     def builtin_commands(self) -> tuple[SlashCommand, ...]:
@@ -152,9 +152,7 @@ class SlashCommandRegistry:
         prompts = self._mcp_prompts.completion_entries()
         return builtins + custom + skills + prompts
 
-    def set_mcp_prompts(
-        self, entries: Sequence[tuple[str, str, MCPPrompt]]
-    ) -> None:
+    def set_mcp_prompts(self, entries: Sequence[tuple[str, str, MCPPrompt]]) -> None:
         """Replace live MCP prompt commands from one mount snapshot."""
         self._mcp_prompts.replace(tuple(entries))
 
