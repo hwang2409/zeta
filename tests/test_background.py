@@ -595,30 +595,26 @@ async def test_background_task_owner_state_table(
             return
 
         if row == "persist-failure-retries-same-candidate":
-            task_id = await start_registered(_python("import time; time.sleep(30)"))
-            original_persist = registry.background_tasks._persist
+            task_id = await start_registered(_python("print('done')"))
+            original_commit = registry.background_tasks._commit_transition
             failed = False
 
-            def fail_terminal_once(rows=None):
+            async def fail_terminal_once(rows, publish, notice):
                 nonlocal failed
-                if not failed:
+                if not failed and any(item["task_id"] == task_id and not item["running"] for item in rows):
                     failed = True
-                    raise OSError("disk full")
-                return original_persist(rows)
+                    raise OSError("terminal write failed")
+                return await original_commit(rows, publish, notice)
 
-            # test-contract: seam inject one durable-row failure at the storage boundary
-            monkeypatch.setattr(registry.background_tasks, "_persist", fail_terminal_once)
-            call = ToolCall("kill-first", "task_kill", {"task_id": task_id})
-            failed_result = await registry.execute(call)
-            assert failed_result["isError"] is True
-            assert "disk full" in failed_result["content"][0]["text"]
-            assert (await output_registered(task_id))["running"] is True
-            assert store.agent_notifications(pending_only=False) == []
-            result = await registry.execute(
-                ToolCall("kill-retry", "task_kill", {"task_id": task_id})
+            # test-contract: seam fail the terminal persistence after process exit
+            monkeypatch.setattr(
+                registry.background_tasks, "_commit_transition", fail_terminal_once
             )
-            assert result["structuredContent"]["killed_by_this_call"] is True
-            assert (await output_registered(task_id))["running"] is False
+            await _wait_for_exit(registry.background_tasks, task_id)
+            status = await output_registered(task_id)
+            assert failed is True
+            assert status["running"] is False
+            assert status["exit_code"] == 0
             assert len(store.agent_notifications(pending_only=False)) == 1
             return
 

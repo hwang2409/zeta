@@ -205,9 +205,22 @@ class _BackgroundTaskOwner:
                     for item in self.registry._records.values()
                 )
             )
-            await self.registry._commit_transition(rows, lambda: None, None)
-            self.state = _OwnerState.DURABLE_TERMINAL
-            self.terminal_durable.set()
+            attempts = 0
+            while not self.terminal_durable.is_set():
+                try:
+                    await self.registry._commit_transition(rows, lambda: None, None)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    attempts += 1
+                    if attempts >= 3:
+                        raise
+                    # Keep the same terminal candidate. A failed write must not
+                    # end the owner while the live record still says running.
+                    await asyncio.sleep(0)
+                    continue
+                self.state = _OwnerState.DURABLE_TERMINAL
+                self.terminal_durable.set()
         if self.defer_receipt_for_close:
             self._receipt_release.clear()
             await self._receipt_release.wait()
@@ -350,7 +363,24 @@ class _BackgroundTaskOwner:
             transport.close()
 
     async def wait_until_durable(self) -> None:
-        await self.terminal_durable.wait()
+        durable = asyncio.create_task(self.terminal_durable.wait())
+        lifecycle = self.lifecycle
+        if lifecycle is None:
+            await durable
+            return
+        done, pending = await asyncio.wait(
+            (durable, lifecycle), return_when=asyncio.FIRST_COMPLETED
+        )
+        if durable in done:
+            durable.result()
+            return
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if lifecycle in done:
+            # The bounded retry budget is exhausted. Keep the persisted row
+            # running rather than letting close wait on an unreachable event.
+            lifecycle.exception()
 
     async def release_close_receipt(self) -> None:
         self.defer_receipt_for_close = False
