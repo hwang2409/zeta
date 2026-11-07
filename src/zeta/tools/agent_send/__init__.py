@@ -20,6 +20,7 @@ async def _agent_send(
         registry.session_store,
         child_instance_id,
         arguments.get("message"),
+        owner=registry._agent_owner,
         channel=registry._agent_owner.conversation_channel,
     )
     if error is not None:

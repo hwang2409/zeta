@@ -69,6 +69,7 @@ from zeta.protocol.types import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
     with_message_origin,
 )
@@ -8699,3 +8700,39 @@ async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
         assert backend.calls == []
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path) -> None:
+    policy = ApprovalPolicy(store=ConversationStore(tmp_path))
+    client = ServeControl(
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    call = ToolCall("non-owner-cancel", "agent_cancel", {"handle": "root:1:1"})
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "agent error: unknown child handle",
+                is_error=True,
+            ),
+        ),
+        session_id="session",
+        background=True,
+    )
+
+    assert notifications[0][0] == "tool_end"
+    result = notifications[0][1]["tool_result"]
+    assert result["content"] == "agent error: unknown child handle"
+    assert result["is_error"] is True

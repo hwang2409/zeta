@@ -730,6 +730,7 @@ async def test_agent_send_entry_persists_agent_send_origin(tmp_path: Path) -> No
         store,
         handle,
         "also check tests",
+        owner=loop._background_owner,
         channel=loop._background_owner.conversation_channel,
     ) is None
     backend.release_child.set()

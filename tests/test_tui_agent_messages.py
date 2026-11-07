@@ -447,10 +447,19 @@ def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
         f"agent cancellation confirmed: {nested_handle}",
         {"handle": nested_handle, "status": "cancellation_confirmed"},
     )
+    non_owner_cancel = _tool_result_event(
+        "agent_cancel",
+        {"handle": nested_handle},
+        "agent error: unknown child handle",
+        {},
+        is_error=True,
+    )
 
     spawn_start_output = _render(spawn_start, width)
     spawn_output = _render(spawn, width)
-    controls_output = _render_sequence([spawn, status, output, cancel], width)
+    controls_output = _render_sequence(
+        [spawn, status, output, cancel, non_owner_cancel], width
+    )
 
     assert all(
         value in spawn_start_output
@@ -478,6 +487,7 @@ def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
             "assistant: nested verification passed",
             "cancel → nested verifier :159:1",
             "canceled",
+            "unknown child handle",
         )
     )
     assert "raw child status serialization" not in controls_output

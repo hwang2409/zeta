@@ -1096,6 +1096,10 @@ async def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, Co
     )
     await delivery_flow.initialize()
     channel.register_delivery_flow("root:worker", delivery_flow)
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    app.loop._background_owner.register(
+        "root:worker", watcher.cancel, watcher, parent_store=store
+    )
     notices: list[str] = []
     app._print_system = notices.append
     app._agent_navigation.current_path = child_path
@@ -1232,6 +1236,7 @@ async def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held
             store,
             "root:worker",
             "blocked",
+            owner=app.loop._background_owner,
             channel=app.loop._background_owner.conversation_channel,
         )
     finally:
@@ -1256,6 +1261,7 @@ async def test_send_to_run_rejects_a_missing_child_cleanly(
         store,
         "root:worker",
         "anyone there",
+        owner=app.loop._background_owner,
         channel=app.loop._background_owner.conversation_channel,
     )
     assert result is not None and "no live run/child" in result
@@ -1271,6 +1277,7 @@ async def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Pa
             store,
             "root:worker",
             "while locked",
+            owner=app.loop._background_owner,
             channel=app.loop._background_owner.conversation_channel,
         )
     finally:

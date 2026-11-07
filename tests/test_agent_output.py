@@ -1,7 +1,9 @@
 import asyncio
 import json
+import multiprocessing
 import os
 import threading
+from multiprocessing.connection import Connection
 from pathlib import Path
 
 import pytest
@@ -404,7 +406,7 @@ async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
 
 @pytest.mark.asyncio
 async def test_agent_output_reads_new_live_tail_on_each_call(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
+    store = ConversationStore(tmp_path, session_id="parent")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(
@@ -448,7 +450,7 @@ async def test_agent_output_reads_new_live_tail_on_each_call(tmp_path: Path) -> 
 async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
     tmp_path: Path,
 ) -> None:
-    parent = ConversationStore(tmp_path / "parent")
+    parent = ConversationStore(tmp_path, session_id="parent")
     child = ConversationStore(parent.session_dir / "agents", session_id="1")
     handle = "parent:1"
     child.start_agent_lifecycle(
@@ -952,6 +954,9 @@ async def test_agent_output_reads_adopted_background_descendant_notification(
         {"prompt": "inspect", "description": "grandchild"},
     )
     grandchild.mark_agent_parent(grandchild_call.id)
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(grandchild_call)])
+    )
     child.register_agent_child(
         grandchild_call,
         child_session_path=str(grandchild.session_dir),
@@ -1002,7 +1007,7 @@ async def test_agent_output_reads_adopted_background_descendant_notification(
 async def test_agent_output_reads_snapshot_without_lock_or_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = ConversationStore(tmp_path)
+    store = ConversationStore(tmp_path, session_id="parent")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved")]))
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
@@ -1145,3 +1150,363 @@ async def test_agent_output_error_total_cap_handles_multibyte_handle(
     assert result["isError"] is True
     assert "unknown child handle" in result["content"][0]["text"]
     assert len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= 10_000
+
+
+def _record_running_child(
+    parent: ConversationStore,
+    child: ConversationStore,
+    *,
+    call: ToolCall,
+    handle: str,
+    depth: int,
+) -> None:
+    parent.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    parent.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description=handle,
+        background=True,
+        child_instance_id=handle,
+    )
+    child.mark_agent_parent(call.id)
+    child.start_agent_lifecycle(
+        handle=handle,
+        started_at=f"2026-11-08T00:00:0{depth}+00:00",
+        depth=depth,
+        agent_type="general",
+        description=handle,
+    )
+
+
+@pytest.mark.asyncio
+async def test_root_reads_unadopted_grandchild_status_and_output(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    _record_running_child(
+        root,
+        child,
+        call=ToolCall("child-call", "agent", {"prompt": "child"}),
+        handle="root:1",
+        depth=1,
+    )
+    _record_running_child(
+        child,
+        grandchild,
+        call=ToolCall("grandchild-call", "agent", {"prompt": "grandchild"}),
+        handle="root:1:1",
+        depth=2,
+    )
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("nested answer")])
+    )
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+
+    status = await loop.tool_registry.execute(
+        ToolCall("nested-status", "agent_status", {"handle": "root:1:1"})
+    )
+    output = await loop.tool_registry.execute(
+        ToolCall("nested-output", "agent_output", {"handle": "root:1:1"})
+    )
+
+    assert status["structuredContent"]["children"][0]["handle"] == "root:1:1"
+    assert "assistant: nested answer" in output["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_subtree_reads_reject_exact_path_marker_without_parent_call(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    forged = ToolCall("forged-call", "agent", {"prompt": "forged"})
+    root.register_agent_child(
+        forged,
+        child_session_path=str(child.session_dir),
+        description="forged",
+        background=True,
+        child_instance_id="root:1",
+    )
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+
+    status = await loop.tool_registry.execute(
+        ToolCall("forged-status", "agent_status", {"handle": "root:1"})
+    )
+    output = await loop.tool_registry.execute(
+        ToolCall("forged-output", "agent_output", {"handle": "root:1"})
+    )
+
+    assert status["isError"] is True
+    assert "unknown child handle" in status["content"][0]["text"]
+    assert output["isError"] is True
+    assert "unknown child handle" in output["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_agent_output_reads_and_fits_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    call = ToolCall("output-thread-call", "agent", {"prompt": "work"})
+    root.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    root.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("running")],
+            tool_result=ToolResult(
+                call.id,
+                "running",
+                structured_content={
+                    "child_instance_id": "root:1",
+                    "child_session_path": str(child.session_dir),
+                },
+            ),
+        )
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    event_loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    read_threads: list[int] = []
+    original = agent_tools._read_child_file
+
+    def controlled_read(*args: object, **kwargs: object) -> bytes:
+        read_threads.append(threading.get_ident())
+        asyncio_loop.call_soon_threadsafe(entered.set)
+        assert release.wait(2)
+        return original(*args, **kwargs)
+
+    asyncio_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(agent_tools, "_read_child_file", controlled_read)
+    task = asyncio.create_task(
+        loop.tool_registry.execute(
+            ToolCall("output-thread", "agent_output", {"handle": "root:1"})
+        )
+    )
+    try:
+        await entered.wait()
+        assert read_threads[0] != event_loop_thread
+        assert not task.done()
+    finally:
+        release.set()
+    result = await task
+    assert result["isError"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_status_projects_and_fits_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    _record_running_child(
+        root,
+        child,
+        call=ToolCall("status-thread-call", "agent", {"prompt": "work"}),
+        handle="root:1",
+        depth=1,
+    )
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    event_loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    projection_threads: list[int] = []
+    original = agent_tools._status_response
+    blocked = False
+
+    def controlled_projection(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal blocked
+        projection_threads.append(threading.get_ident())
+        if not blocked:
+            blocked = True
+            asyncio_loop.call_soon_threadsafe(entered.set)
+            assert release.wait(2)
+        return original(*args, **kwargs)
+
+    asyncio_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(agent_tools, "_status_response", controlled_projection)
+    task = asyncio.create_task(
+        loop.tool_registry.execute(ToolCall("status-thread", "agent_status", {}))
+    )
+    try:
+        await entered.wait()
+        assert projection_threads[0] != event_loop_thread
+        assert not task.done()
+    finally:
+        release.set()
+    result = await task
+    assert result["isError"] is False
+
+
+def _create_nested_child_in_process(
+    root_dir: str, ready: Connection
+) -> None:
+    child = ConversationStore(Path(root_dir) / "root" / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    call = ToolCall("process-grandchild", "agent", {"prompt": "nested"})
+    _record_running_child(
+        child,
+        grandchild,
+        call=call,
+        handle="root:1:1",
+        depth=2,
+    )
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("cross-process answer")])
+    )
+    ready.send("ready")
+    ready.recv()
+    grandchild.close()
+    child.close()
+    ready.close()
+
+
+@pytest.mark.asyncio
+async def test_resident_root_discovers_descendant_created_by_second_process(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    _record_running_child(
+        root,
+        child,
+        call=ToolCall("process-child", "agent", {"prompt": "child"}),
+        handle="root:1",
+        depth=1,
+    )
+    child.close()
+    parent_pipe, child_pipe = multiprocessing.get_context("spawn").Pipe()
+    process = multiprocessing.get_context("spawn").Process(
+        target=_create_nested_child_in_process,
+        args=(str(tmp_path), child_pipe),
+    )
+    process.start()
+    child_pipe.close()
+    try:
+        assert await asyncio.to_thread(parent_pipe.recv) == "ready"
+        loop = AgentLoop(
+            FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+        status = await loop.tool_registry.execute(
+            ToolCall("process-status", "agent_status", {"handle": "root:1:1"})
+        )
+        output = await loop.tool_registry.execute(
+            ToolCall("process-output", "agent_output", {"handle": "root:1:1"})
+        )
+
+        assert status["structuredContent"]["children"][0]["handle"] == "root:1:1"
+        assert "cross-process answer" in output["content"][0]["text"]
+    finally:
+        parent_pipe.send("close")
+        await asyncio.to_thread(process.join, 5)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        parent_pipe.close()
+    assert process.exitcode == 0
+    process.close()
+    root.close()
+
+
+@pytest.mark.parametrize(
+    "handle",
+    ["root:1", "root:2", "other:1:1", "root:1:0", "root:10:2", "root:1:bad"],
+)
+@pytest.mark.asyncio
+async def test_nested_reader_rejects_outside_and_malformed_handles_before_file_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    handle: str,
+) -> None:
+    from zeta.tools.agent import subtree
+
+    child = ConversationStore(tmp_path / "root" / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-11-08T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    opens = 0
+
+    def forbidden_open(path: Path) -> ConversationStore:
+        del path
+        nonlocal opens
+        opens += 1
+        raise AssertionError("invalid handle opened a session")
+
+    monkeypatch.setattr(subtree, "_open_snapshot", forbidden_open)
+    loop = AgentLoop(
+        FakeBackend([]), child, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    result = await loop.tool_registry.execute(
+        ToolCall("invalid-output", "agent_output", {"handle": handle})
+    )
+
+    assert result["isError"] is True
+    assert "unknown child handle" in result["content"][0]["text"]
+    assert opens == 0
+
+
+@pytest.mark.asyncio
+async def test_damaged_intermediate_is_unknown_and_healthy_sibling_survives(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    damaged = ConversationStore(root.session_dir / "agents", session_id="1")
+    hidden = ConversationStore(damaged.session_dir / "agents", session_id="1")
+    healthy = ConversationStore(root.session_dir / "agents", session_id="2")
+    _record_running_child(
+        root,
+        damaged,
+        call=ToolCall("damaged", "agent", {"prompt": "damaged"}),
+        handle="root:1",
+        depth=1,
+    )
+    _record_running_child(
+        damaged,
+        hidden,
+        call=ToolCall("hidden", "agent", {"prompt": "hidden"}),
+        handle="root:1:1",
+        depth=2,
+    )
+    _record_running_child(
+        root,
+        healthy,
+        call=ToolCall("healthy", "agent", {"prompt": "healthy"}),
+        handle="root:2",
+        depth=1,
+    )
+    remove_live_agent_lifecycle(damaged.agent_lifecycle_path)
+    damaged.close()
+    damaged.path.write_text("not json\n")
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+
+    status = await loop.tool_registry.execute(
+        ToolCall("damaged-status", "agent_status", {})
+    )
+    output = await loop.tool_registry.execute(
+        ToolCall("damaged-output", "agent_output", {"handle": "root:1"})
+    )
+
+    rows = {
+        row["handle"]: row for row in status["structuredContent"]["children"]
+    }
+    assert rows["root:1"]["state"] == "unknown"
+    assert rows["root:2"]["state"] == "running"
+    assert "root:1:1" not in rows
+    assert output["isError"] is True
+    assert "could not read child transcript" in output["content"][0]["text"]

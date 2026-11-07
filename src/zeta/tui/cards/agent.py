@@ -918,6 +918,7 @@ class AgentRunCommandMixin:
                 self.loop.store,
                 child_id,
                 value,
+                owner=self.loop._background_owner,
                 channel=self.loop._background_owner.conversation_channel,
                 origin=MessageOrigin.USER,
             )
@@ -1011,6 +1012,7 @@ class AgentRunCommandMixin:
             self.loop.store,
             run_id,
             message,
+            owner=self.loop._background_owner,
             channel=self.loop._background_owner.conversation_channel,
             origin=MessageOrigin.USER,
         )
