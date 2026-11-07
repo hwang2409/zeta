@@ -120,6 +120,7 @@ class MCPManagementService:
         self._lock_timeout = lock_timeout
         self._transaction_gate = asyncio.Lock()
         self._snapshot = MCPManagerSnapshot((), 0)
+        self._published_candidate: _ManagementCandidate | None = None
         self._runtime: MCPConfig | None = None
         self._home_path: Path | None = None
         self._project_path: Path | None = None
@@ -511,17 +512,24 @@ class MCPManagementService:
         self._home_path = candidate.home_path
         self._project_path = candidate.project_path
         self._paths_ready = True
-        self._runtime = candidate.runtime_config
-        self._snapshot = MCPManagerSnapshot(
+        snapshot = MCPManagerSnapshot(
             self._with_runtime(candidate.entries), self._snapshot.generation + 1
         )
-        return self._snapshot
+        self._runtime = candidate.runtime_config
+        self._published_candidate = candidate
+        self._snapshot = snapshot
+        return snapshot
 
     async def _transact_reconcile_publish(
         self,
         mutation: Callable[[Path, Path | None, Path], None] | None = None,
     ) -> MCPManagerSnapshot:
         async with self._transaction_gate:
+            if mutation is not None:
+                durable = await asyncio.to_thread(self._transaction)
+                if durable != self._published_candidate:
+                    await self._reconcile(durable.runtime_config)
+                    self._publish(durable)
             candidate = await asyncio.to_thread(self._transaction, mutation)
             await self._reconcile(candidate.runtime_config)
             return self._publish(candidate)
@@ -592,8 +600,6 @@ class MCPManagementService:
 
         def change(servers: dict[str, object]) -> None:
             if name in servers:
-                if servers[name] == raw:
-                    return
                 raise MCPManagementError(f"MCP server already configured: {name}")
             servers[name] = raw
 
@@ -671,7 +677,9 @@ class MCPManagementService:
         return self._runtime
 
     async def _reconcile(self, desired: MCPConfig) -> None:
-        assert self._transaction_gate.locked(), "reconciliation requires transaction gate"
+        assert self._transaction_gate.locked(), (
+            "reconciliation requires transaction gate"
+        )
         if self.mount is None or getattr(self.mount, "pinned", False):
             return
         configured = desired.configured_servers

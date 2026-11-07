@@ -227,9 +227,7 @@ async def test_management_routes_cannot_publish_stale_candidates(
         for task in (route_task, add_task):
             if task is not None and not task.done():
                 task.cancel()
-                await asyncio.wait_for(
-                    asyncio.gather(task, return_exceptions=True), 10
-                )
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
     durable = set(json.loads(manager.path("user").read_text())["servers"])
     assert {item.name for item in manager.snapshot.entries} == durable
@@ -287,7 +285,9 @@ async def test_cancelled_management_owner_keeps_old_snapshot(
     try:
         await asyncio.wait_for(entered.wait(), 10)
         if cancel_at == "transaction":
-            assert await asyncio.to_thread(started.wait, 10), "transaction did not start"
+            assert await asyncio.to_thread(started.wait, 10), (
+                "transaction did not start"
+            )
         elif cancel_at == "reconcile":
             await asyncio.wait_for(started_async.wait(), 10)
         task.cancel()
@@ -304,9 +304,7 @@ async def test_cancelled_management_owner_keeps_old_snapshot(
             )
         if not task.done():
             task.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(task, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
     assert manager.snapshot is before
 
@@ -336,9 +334,7 @@ async def test_concurrent_mutations_do_not_lose_writers(tmp_path):
         await manager.add(f"server-{index}", scope="user", command=sys.executable)
 
     async def run_all():
-        await asyncio.wait_for(
-            asyncio.gather(*(add(index) for index in range(12))), 10
-        )
+        await asyncio.wait_for(asyncio.gather(*(add(index) for index in range(12))), 10)
 
     await run_all()
     assert {
@@ -1021,82 +1017,189 @@ async def test_contended_config_lock_fails_off_loop_with_nonblocking_flock(
     assert all(operation & fcntl.LOCK_NB for _thread, operation in attempted)
 
 
-@pytest.mark.parametrize("failure_at", ("transaction", "reconcile"))
+@pytest.mark.parametrize(
+    "mutation",
+    ("add", "remove", "enable", "disable", "trust", "untrust"),
+)
+@pytest.mark.parametrize(
+    "failure_at",
+    ("worker_await", "reconcile_error", "reconcile_await", "publish"),
+)
 @pytest.mark.asyncio
-async def test_duplicate_add_repairs_a_committed_unpublished_mutation(
-    tmp_path, monkeypatch, failure_at
+async def test_every_mutation_repairs_committed_unpublished_state_before_validation(
+    tmp_path, monkeypatch, mutation, failure_at
 ):
-    class OneFailureMount:
+    class RecordingMount:
         pinned = False
 
         def __init__(self):
             self.configs = {}
             self.statuses = {}
             self._actors = {}
-            self.fail = failure_at == "reconcile"
 
         async def add_server(self, config, **_kwargs):
-            if self.fail:
-                self.fail = False
-                raise RuntimeError("mount failed")
             self.configs[config.name] = config
 
         async def remove_server(self, name):
-            self.configs.pop(name)
+            self.configs.pop(name, None)
 
-    mount = OneFailureMount()
-    manager = service(tmp_path, mount)
-    assert inspect.iscoroutinefunction(manager.add)
-    before = manager.snapshot
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-    original_transaction = manager._transaction
-
-    def gated_transaction(mutation=None):
-        candidate = original_transaction(mutation)
-        if mutation is not None and not started.is_set():
-            started.set()
-            try:
-                assert release.wait(10), "timed out releasing committed transaction"
-            finally:
-                finished.set()
-        return candidate
-
-    if failure_at == "transaction":
-        # test-contract: durability cancel the public call after its commit
-        monkeypatch.setattr(manager, "_transaction", gated_transaction)
-
-    task = asyncio.create_task(
-        manager.add("durable", scope="user", url="https://example.test")
-    )
-    try:
-        if failure_at == "transaction":
-            assert await asyncio.to_thread(started.wait, 10), "transaction did not commit"
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, 10)
+    async def prepare(manager):
+        if mutation in {"remove", "enable", "disable"}:
+            await manager.add(
+                "durable",
+                scope="user",
+                url="https://example.test",
+                enabled=mutation != "enable",
+            )
+        elif mutation in {"trust", "untrust"}:
+            await manager.add("durable", scope="project", command=sys.executable)
+            if mutation == "untrust":
+                await manager.set_trusted("durable", trusted=True)
         else:
-            with pytest.raises(RuntimeError, match="mount failed"):
-                await asyncio.wait_for(task, 10)
-    finally:
-        release.set()
-        if not task.done():
-            task.cancel()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-        if failure_at == "transaction":
-            assert await asyncio.to_thread(finished.wait, 10), "transaction did not finish"
+            await manager.refresh()
 
-    assert manager.snapshot is before
-    assert "durable" in json.loads(manager.path("user").read_text())["servers"]
+    async def mutate(manager):
+        if mutation == "add":
+            return await manager.add(
+                "durable", scope="user", url="https://example.test"
+            )
+        if mutation == "remove":
+            return await manager.remove("durable", scope="user")
+        if mutation in {"enable", "disable"}:
+            return await manager.set_enabled(
+                "durable", scope="user", enabled=mutation == "enable"
+            )
+        return await manager.set_trusted("durable", trusted=mutation == "trust")
 
-    snapshot = await manager.add(
-        "durable", scope="user", url="https://example.test"
-    )
-    assert [item.name for item in snapshot.entries] == ["durable"]
-    assert set(mount.configs) == {"durable"}
-    with pytest.raises(MCPManagementError, match="already configured"):
-        await manager.add("durable", scope="user", url="https://different.test")
+    expected_runtime = {
+        "add": {"durable"},
+        "remove": set(),
+        "enable": {"durable"},
+        "disable": set(),
+        "trust": {"durable"},
+        "untrust": set(),
+    }[mutation]
+
+    for retry in ("same", "different"):
+        root = tmp_path / mutation / failure_at / retry
+        mount = RecordingMount()
+        manager = service(root, mount)
+        await prepare(manager)
+        before = manager.snapshot
+        started = threading.Event()
+        finished = threading.Event()
+        release_thread = threading.Event()
+        entered_reconcile = asyncio.Event()
+        release_reconcile = asyncio.Event()
+
+        with monkeypatch.context() as context:
+            if failure_at == "worker_await":
+                original_transaction = manager._transaction
+
+                def committed_transaction(
+                    change=None,
+                    *,
+                    _original=original_transaction,
+                    _started=started,
+                    _release=release_thread,
+                    _finished=finished,
+                ):
+                    candidate = _original(change)
+                    if change is not None and not _started.is_set():
+                        _started.set()
+                        try:
+                            assert _release.wait(10), "timed out releasing commit"
+                        finally:
+                            _finished.set()
+                    return candidate
+
+                # test-contract: durability cancel the public call after its commit
+                context.setattr(manager, "_transaction", committed_transaction)
+            elif failure_at == "reconcile_error":
+
+                async def fail_reconcile(_desired):
+                    raise RuntimeError("injected reconcile failure")
+
+                # test-contract: seam fail the owner after its durable commit
+                context.setattr(manager, "_reconcile", fail_reconcile)
+            elif failure_at == "reconcile_await":
+
+                async def block_reconcile(
+                    _desired,
+                    _entered=entered_reconcile,
+                    _release=release_reconcile,
+                ):
+                    _entered.set()
+                    await asyncio.wait_for(_release.wait(), 10)
+
+                # test-contract: seam cancel the owner at its post-commit await
+                context.setattr(manager, "_reconcile", block_reconcile)
+            else:
+
+                def fail_publish(_candidate):
+                    raise RuntimeError("injected publish failure")
+
+                # test-contract: seam fail the owner after runtime reconciliation
+                context.setattr(manager, "_publish", fail_publish)
+
+            task = asyncio.create_task(mutate(manager))
+            try:
+                if failure_at == "worker_await":
+                    assert await asyncio.to_thread(started.wait, 10), (
+                        "commit did not finish"
+                    )
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, 10)
+                elif failure_at == "reconcile_await":
+                    await asyncio.wait_for(entered_reconcile.wait(), 10)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, 10)
+                else:
+                    with pytest.raises(RuntimeError, match="injected"):
+                        await asyncio.wait_for(task, 10)
+            finally:
+                release_thread.set()
+                release_reconcile.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+                if failure_at == "worker_await":
+                    assert await asyncio.to_thread(finished.wait, 10), (
+                        "transaction did not finish"
+                    )
+
+        assert manager.snapshot is before
+        if retry == "same":
+            if mutation == "add":
+                with pytest.raises(MCPManagementError, match="already configured"):
+                    await mutate(manager)
+            elif mutation == "remove":
+                with pytest.raises(MCPManagementError, match="unknown MCP server"):
+                    await mutate(manager)
+            else:
+                await mutate(manager)
+        else:
+            await manager.add("other", scope="user", url="https://other.test")
+
+        expected = expected_runtime | ({"other"} if retry == "different" else set())
+        assert set(mount.configs) == expected
+        durable_names = {
+            item.name
+            for item in manager.snapshot.entries
+            if item.enabled and item.trusted
+        }
+        assert durable_names == expected
+
+        restarted_mount = RecordingMount()
+        restarted = service(root, restarted_mount)
+        await restarted.refresh()
+        assert set(restarted_mount.configs) == expected
+
+        if mutation == "add":
+            with pytest.raises(MCPManagementError, match="already configured"):
+                await manager.add("durable", scope="user", url="https://different.test")
 
 
 @pytest.mark.asyncio
