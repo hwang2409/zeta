@@ -126,6 +126,8 @@ class AsyncDurableWritesMixin:
             self._publish_entries_installed("reset")
         elif delta.entries_to_install:
             self._publish_entries_installed(delta.entries_to_install)
+        if isinstance(command, _MethodMutation) and command.persisted_callback is not None:
+            command.persisted_callback()
         return delta
 
     def _before_committed_mutation(self: ConversationStore) -> None:
@@ -236,6 +238,8 @@ class AsyncDurableWritesMixin:
             self._publish_entries_installed("reset")
         elif delta.entries_to_install:
             self._publish_prepared_entries_installed(delta.entries_to_install)
+        if isinstance(command, _MethodMutation) and command.persisted_callback is not None:
+            command.persisted_callback()
         if cancelled:
             raise asyncio.CancelledError
         return delta
@@ -313,7 +317,14 @@ class AsyncDurableWritesMixin:
     async def _refresh_off_loop(self: ConversationStore) -> None:
         await self._commit_method_async(
             type(self).refresh,
-            _patch_fields=_REFRESH_PATCH_FIELDS,
+            _patch_fields=_REFRESH_PATCH_FIELDS
+            + (
+                "_agent_counter",
+                "_agent_children",
+                "_agent_parent",
+                "_agent_canceled",
+                "_agent_lifecycle",
+            ),
             _accept_external_generation=True,
             _method_accepts_store=True,
         )

@@ -21,6 +21,7 @@ from . import (
     load_session_json,
 )
 from .entry_types import sent_message_receipts
+from ..store._incremental_validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
     from ..store._store import ConversationStore
@@ -352,12 +353,25 @@ def _execute_append[ResultT](
             del store._entries[-len(entries) :]
         encoded = b"".join(store._encoded_entry_line(entry) for entry in entries)
         store._write_bytes(encoded)
+        linear = not store._entries or entries[0].parent_id == store._entries[-1].id
         for entry in entries:
             store._entries.append(entry)
             store._record_entry_prefix(entry)
             store._entry_ids.add(entry.id)
-            store._record_active_entry(entry)
             store._sent_message_receipts.extend(sent_message_receipts(entry))
+            if (
+                entry.type == "notification"
+                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+            ):
+                task_id = entry.data.get("task_id")
+                if type(task_id) is str and task_id:
+                    store._task_notification_ids.add(task_id)
+        if linear:
+            for entry in entries:
+                store._record_active_entry(entry)
+        else:
+            store._validate_entries()
+            store._rebuild_incremental_validation_state()
         store._record_client_delivery_entries(entries)
         generation_after = store.conversation_generation
         committed = tuple(store._snapshot_entry(entry) for entry in entries)
@@ -398,18 +412,17 @@ def _execute_method[ResultT](
         if command.baseline_digest is None
         else command.baseline_digest
     )
-    baseline_patch = (
+    expected_patch = (
         _snapshot_patch(store, command.patch_fields)
         if command.baseline_patch is None
         else command.baseline_patch
     )
+    baseline_patch = _snapshot_patch(store, command.patch_fields)
     result = (
         command.method(store, *command.args, **dict(command.kwargs))
         if command.method_accepts_store
         else command.method(*command.args, **dict(command.kwargs))
     )
-    if command.persisted_callback is not None:
-        command.persisted_callback()
     entries = (
         store._installed_delta_from_baseline(
             store._entries, (baseline_count, baseline_digest)
@@ -425,14 +438,14 @@ def _execute_method[ResultT](
         for field, old in baseline_patch.items()
         if getattr(store, field) != old
     }
-    expected_patch = {field: baseline_patch[field] for field in changed_patch}
+    expected_patch = {field: expected_patch[field] for field in changed_patch}
     return CommittedDelta(
         generation_before=expected_generation,
         generation_after=store.conversation_generation,
         committed_entries=copy.deepcopy(entries),
         entries_to_install=copy.deepcopy(entries),
         _resident_patch=_ResidentPatch(
-            changed_patch, expected_patch, replace_entries, True
+            changed_patch, expected_patch, replace_entries
         ),
         result=result,
         log_cursor=_cursor(store),
