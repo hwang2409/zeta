@@ -1181,7 +1181,6 @@ async def finish_background_child(
             for key in ("head_sha", "verdict"):
                 if key in payload_structured:
                     notification_report[key] = payload_structured[key]
-
         async def commit_adopt_publish() -> ConversationEntry:
             transferred = await child_store.finalize_background_agent(
                 parent_store=effective_parent_store,
@@ -1245,6 +1244,7 @@ async def finish_background_child(
             raise asyncio.CancelledError
     finally:
         try:
+            close_cause = f"background child {'cancellation' if status == 'canceled' else 'completion'} cleanup"
             await close_child(close_cause)
             # Let the parent finalize the running/terminal tool result before
             # releasing the child store descriptor.

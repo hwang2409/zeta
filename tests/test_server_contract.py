@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,13 +24,182 @@ async def serve_contract(
             await contract.close()
 
 
+def _install_wrong_readiness_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[asyncio.subprocess.Process, Path]]:
+    spawned: list[tuple[asyncio.subprocess.Process, Path]] = []
+    create_process = asyncio.create_subprocess_exec
+    child = (
+        "import os,signal,socket,sys; "
+        "path=sys.argv[1]; "
+        "server=socket.socket(socket.AF_UNIX); "
+        "server.bind(path); "
+        "sys.stderr.write('wrong readiness marker\\n'); "
+        "sys.stderr.flush(); "
+        "os.close(2); "
+        "signal.pause()"
+    )
+
+    async def create_wrong_readiness_process(
+        *command: object, **kwargs: Any
+    ) -> asyncio.subprocess.Process:
+        socket_argument = command.index("--socket") + 1
+        socket_path = Path(str(command[socket_argument]))
+        process = await create_process(
+            sys.executable,
+            "-c",
+            child,
+            str(socket_path),
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+        spawned.append((process, socket_path))
+        return process
+
+    # test-contract: seam ServeContract has no public process factory
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", create_wrong_readiness_process
+    )
+    return spawned
+
+
+async def _remove_spawned_process(
+    process: asyncio.subprocess.Process,
+    socket_path: Path,
+    unlink: Any = Path.unlink,
+) -> None:
+    if process.returncode is None:
+        process.kill()
+    await process.communicate()
+    unlink(socket_path, missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_start_reaps_process_and_removes_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = _install_wrong_readiness_process(monkeypatch)
+
+    try:
+        with pytest.raises(AssertionError, match="wrong readiness marker"):
+            await ServeContract.start(tmp_path, "unix")
+
+        process, socket_path = spawned[0]
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        assert not socket_path.exists()
+    finally:
+        if spawned:
+            await _remove_spawned_process(*spawned[0])
+
+
+@pytest.mark.asyncio
+async def test_failed_start_preserves_error_when_kill_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = _install_wrong_readiness_process(monkeypatch)
+    real_kill = asyncio.subprocess.Process.kill
+
+    def fail_after_kill(process: asyncio.subprocess.Process) -> None:
+        real_kill(process)
+        raise PermissionError("forced process kill failure")
+
+    monkeypatch.setattr(asyncio.subprocess.Process, "kill", fail_after_kill)
+    try:
+        with pytest.raises(AssertionError, match="wrong readiness marker") as raised:
+            await ServeContract.start(tmp_path, "unix")
+
+        process, socket_path = spawned[0]
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        assert not socket_path.exists()
+        assert any(
+            "forced process kill failure" in note for note in raised.value.__notes__
+        )
+    finally:
+        if spawned:
+            process, socket_path = spawned[0]
+            if process.returncode is None:
+                real_kill(process)
+            await process.communicate()
+            socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_start_preserves_error_when_socket_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = _install_wrong_readiness_process(monkeypatch)
+    real_unlink = Path.unlink
+
+    def fail_socket_removal(path: Path, *, missing_ok: bool = False) -> None:
+        if path.name.startswith("zeta-contract-"):
+            raise OSError("forced socket removal failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    # test-contract: seam ServeContract has no public socket-removal dependency
+    monkeypatch.setattr(Path, "unlink", fail_socket_removal)
+    try:
+        with pytest.raises(AssertionError, match="wrong readiness marker") as raised:
+            await ServeContract.start(tmp_path, "unix")
+
+        process, _socket_path = spawned[0]
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        assert any(
+            "forced socket removal failure" in note for note in raised.value.__notes__
+        )
+    finally:
+        if spawned:
+            await _remove_spawned_process(*spawned[0], unlink=real_unlink)
+
+
+@pytest.mark.asyncio
+async def test_failed_client_close_still_cleans_up_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = await ServeContract.start(tmp_path, "unix")
+    client = await contract.connect()
+    process = contract._process
+    socket_path = contract._socket_path
+    close_error = RuntimeError("forced client close failure")
+    real_close = ServeClient.close
+
+    async def fail_client_close(_client: ServeClient) -> None:
+        raise close_error
+
+    monkeypatch.setattr(ServeClient, "close", fail_client_close)
+    try:
+        with pytest.raises(RuntimeError, match="forced client close failure") as raised:
+            await contract.close()
+
+        assert raised.value is close_error
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        assert not socket_path.exists()
+    finally:
+        await real_close(client)
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+        socket_path.unlink(missing_ok=True)
+
+
 async def _hello(client: ServeClient, request_id: str = "hello") -> dict[str, object]:
     reply = await client.request(
         request_id,
         "hello",
         {
             "protocol_version": "1.2",
-            "features": ["serve_observers", "not_a_server_feature"],
+            "features": [
+                "serve_observers",
+                "session_grants",
+                "not_a_server_feature",
+            ],
         },
     )
     return reply["result"]
@@ -43,8 +215,16 @@ async def test_hello_negotiates_the_same_features(
 
     assert hello["server"] == "zeta"
     assert hello["protocol_version"] == "1.2"
-    assert hello["capabilities"]["features"] == ["serve_observers"]
-    assert {"new_session", "send"} <= set(hello["capabilities"]["requests"])
+    assert hello["capabilities"]["features"] == [
+        "serve_observers",
+        "session_grants",
+    ]
+    assert {
+        "new_session",
+        "send",
+        "session_grants",
+        "revoke_session_grants",
+    } <= set(hello["capabilities"]["requests"])
 
 
 @pytest.mark.asyncio
@@ -118,7 +298,7 @@ async def test_controller_and_observer_roles_match(
         {
             "protocol_version": "1.2",
             "role": "observer",
-            "features": ["serve_observers"],
+            "features": ["serve_observers", "session_grants"],
         },
     )
 
@@ -148,7 +328,10 @@ async def test_controller_and_observer_roles_match(
     )
 
     assert "new_session" in controller_hello["capabilities"]["requests"]
-    assert "new_session" not in observer_hello["result"]["capabilities"]["requests"]
+    observer_requests = observer_hello["result"]["capabilities"]["requests"]
+    assert "new_session" not in observer_requests
+    assert "session_grants" in observer_requests
+    assert "revoke_session_grants" not in observer_requests
     assert observed["result"] == {"sessions": []}
     assert rejected["error"]["code"] == -32008
     assert rejected["error"]["data"] == {
