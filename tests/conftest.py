@@ -30,14 +30,18 @@ os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
 
 
 def _is_repository_test_path(path: Path) -> bool:
-    return path.is_relative_to(_REPOSITORY_ROOT) and "tests" in path.relative_to(
-        _REPOSITORY_ROOT
-    ).parts
+    return (
+        path.is_relative_to(_REPOSITORY_ROOT)
+        and "tests" in path.relative_to(_REPOSITORY_ROOT).parts
+    )
+
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     if not _IS_REPOSITORY_TESTS or not config.pluginmanager.hasplugin("asyncio"):
         return
     for item in items:
@@ -45,8 +49,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         # These modules patch process-wide clock/config during fixture teardown.
         if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name == "test_tui.py":
             item.fixturenames.append("bootstrap_tui_storage_format")
-        elif path.is_relative_to(_TEST_SITE_PACKAGES) and path.name != "test_test_environment.py":
+        elif (
+            path.is_relative_to(_TEST_SITE_PACKAGES)
+            and path.name != "test_test_environment.py"
+        ):
             item.fixturenames.append("close_direct_test_runtime_owners")
+        if (
+            path.is_relative_to(_TEST_SITE_PACKAGES)
+            and path.name != "test_test_environment.py"
+        ):
+            item.fixturenames.append("close_direct_test_agent_loops")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -331,7 +343,9 @@ class LiveHomeWriteGuard:
         try:
             normalized_path.relative_to(self.live_home)
         except ValueError as exc:
-            raise ValueError("external mutation must be inside the watched home") from exc
+            raise ValueError(
+                "external mutation must be inside the watched home"
+            ) from exc
         if kind == "append" and expected is None:
             raise ValueError("append declarations must state the expected suffix")
         self._external_declarations.append(
@@ -404,9 +418,7 @@ def isolate_zeta_home(
         monkeypatch.setenv("ZETA_HOME", str(isolated_home))
         monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
         monkeypatch.setenv("ZETA_TEST_AUDIT_LEDGER", str(live_home_write_guard._ledger))
-        monkeypatch.setenv(
-            "ZETA_TEST_LIVE_HOME", str(live_home_write_guard.live_home)
-        )
+        monkeypatch.setenv("ZETA_TEST_LIVE_HOME", str(live_home_write_guard.live_home))
         monkeypatch.setenv(
             "ZETA_TEST_OWNERSHIP_TOKEN", live_home_write_guard._ownership_token
         )
@@ -462,10 +474,10 @@ def _describe_fd(descriptor: int, directory: str) -> str:
 
 def _group_fds_by_path_prefix(descriptions: tuple[str, ...]) -> str:
     targets = (description.rsplit(" (", 1)[0] for description in descriptions)
-    groups = Counter(str(Path(target).parent) if "/" in target else target for target in targets)
-    return "; ".join(
-        f"{prefix} (+{count})" for prefix, count in groups.most_common()
+    groups = Counter(
+        str(Path(target).parent) if "/" in target else target for target in targets
     )
+    return "; ".join(f"{prefix} (+{count})" for prefix, count in groups.most_common())
 
 
 def _open_file_descriptors() -> dict[int, str]:
@@ -548,10 +560,7 @@ def _format_retained_max() -> str:
         return "none"
     nodeid, count, highest, added = _FD_RETAINED_MAX
     grouped = _group_fds_by_path_prefix(added) if added else "none"
-    return (
-        f"nodeid={nodeid} open={count} highest={highest} "
-        f"added_grouped={grouped}"
-    )
+    return f"nodeid={nodeid} open={count} highest={highest} added_grouped={grouped}"
 
 
 def _fd_summary() -> str:
@@ -638,11 +647,17 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
         root_value = args[0] if args else kwargs.get("session_dir")
-        root = Path(root_value) if root_value is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
+        root = (
+            Path(root_value)
+            if root_value is not None
+            else Path(os.environ["ZETA_HOME"]) / "sessions"
+        )
         home = root
         while home.name != "sessions" and home != home.parent:
             home = home.parent
-        lease = open_test_writer(home.parent if home.name == "sessions" else root.parent)
+        lease = open_test_writer(
+            home.parent if home.name == "sessions" else root.parent
+        )
         try:
             store_init(store, *args, **kwargs)
             stores.append(store)
@@ -651,7 +666,11 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
-        home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
+        home = (
+            Path(args[0])
+            if args and args[0] is not None
+            else Path(os.environ["ZETA_HOME"])
+        )
         lease = open_test_writer(home)
         try:
             manager_init(manager, *args, **kwargs)
@@ -729,7 +748,11 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
         root_value = args[0] if args else kwargs.get("session_dir")
-        root = Path(root_value) if root_value is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
+        root = (
+            Path(root_value)
+            if root_value is not None
+            else Path(os.environ["ZETA_HOME"]) / "sessions"
+        )
         home = root
         while home.name != "sessions" and home != home.parent:
             home = home.parent
@@ -741,7 +764,11 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
-        home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
+        home = (
+            Path(args[0])
+            if args and args[0] is not None
+            else Path(os.environ["ZETA_HOME"])
+        )
         ensure_format(home)
         manager_init(manager, *args, **kwargs)
         managers.append(manager)
@@ -805,7 +832,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
-    """Close AgentLoops whose constructor caller is test code, never src/zeta."""
+    """Close every AgentLoop constructed during a repository test."""
     from zeta.runtime.loop import AgentLoop
     from zeta.tools import ToolRegistry
 
@@ -817,9 +844,7 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
     @wraps(loop_init)
     def tracked_init(loop, *args, **kwargs):
         loop_init(loop, *args, **kwargs)
-        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if _is_repository_test_path(caller):
-            loops.append(loop)
+        loops.append(loop)
 
     monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
     yield
@@ -879,6 +904,7 @@ def block_real_http_connections(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", blocked_sync)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", blocked_async)
 
+
 @pytest.fixture(autouse=True)
 def _inject_scripted_completion_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep provider-backed tests offline through the production backend seam."""
@@ -889,11 +915,14 @@ def _inject_scripted_completion_backend(monkeypatch: pytest.MonkeyPatch) -> None
     from zeta.tui import app as tui_app
 
     def build_backend(provider: str, model: str | None, **_kwargs: object):
-        selected = model or {
-            "claude": "claude-sonnet-4-6",
-            "codex": "gpt-5.6-luna",
-            "ollama": "qwen3:4b",
-        }[provider]
+        selected = (
+            model
+            or {
+                "claude": "claude-sonnet-4-6",
+                "codex": "gpt-5.6-luna",
+                "ollama": "qwen3:4b",
+            }[provider]
+        )
         return FakeInteractiveBackend(delay=0, model=selected), selected
 
     monkeypatch.setattr(tui_app, "build_backend", build_backend)

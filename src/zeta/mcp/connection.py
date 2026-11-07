@@ -32,8 +32,10 @@ def build_mcp_client(
     spill_store = registry.spills if registry is not None else None
     mcp_limits = registry.mcp_limits if registry is not None else None
     if config.transport == "stdio":
-        return StdioMCPClient(config, spill_store=spill_store)
-    return StreamableHTTPMCPClient(config, home=home, spill_store=spill_store, limits=mcp_limits)
+        return StdioMCPClient(config, spill_store=spill_store, limits=mcp_limits)
+    return StreamableHTTPMCPClient(
+        config, home=home, spill_store=spill_store, limits=mcp_limits
+    )
 
 
 __all__ = ["MCPServerPolicyError", "build_mcp_client", "mcp_server_allowed"]
