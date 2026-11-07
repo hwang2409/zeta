@@ -234,7 +234,7 @@ async def test_cancelled_terminal_commit_notifies_exit_once(
     def gated_terminal_persist(rows=None) -> None:
         nonlocal persist_calls
         persist_calls += 1
-        if persist_calls == 1:
+        if persist_calls == 2:
             entered.set()
             assert release.wait(10)
         original_persist(rows)
@@ -288,7 +288,7 @@ async def test_terminal_notice_follows_durable_record(
     monkeypatch.setattr(registry, "_persist", original_persist)
     await registry.close()
     assert not registry.snapshot()[0].running
-    assert [notice.phase for notice in notices] == ["task_kill"]
+    assert [notice.phase for notice in notices] == ["task_kill", "session_shutdown"]
 
 
 @pytest.mark.asyncio

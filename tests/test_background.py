@@ -2568,7 +2568,7 @@ async def test_background_resume_marks_old_task_exited(tmp_path: Path) -> None:
         ToolCall("output", "task_output", {"task_id": task_id})
     )
     assert output["structuredContent"]["running"] is False
-    assert "previous session" in output["structuredContent"]["note"]
+    assert output["structuredContent"]["note"] == "tool registry closed"
     await resumed.close()
 
 

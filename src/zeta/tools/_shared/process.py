@@ -563,13 +563,11 @@ class BackgroundTaskRegistry:
 
     def begin_shutdown(self, cause: str = "session shutdown") -> None:
         """Mark cancellations caused by session teardown as shutdown kills."""
-
         self._shutdown_cause = self._shutdown_cause or cause
 
     async def kill(self, task_id: str, *, cause: str, tui_presented: bool = False) -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
-            record.tui_presented = tui_presented
             phase: Literal["task_kill", "session_shutdown"] = (
                 "session_shutdown" if self._shutdown_cause else "task_kill"
             )
@@ -577,6 +575,7 @@ class BackgroundTaskRegistry:
                 record,
                 reason=self._shutdown_cause or cause,
                 phase=phase,
+                tui_presented=tui_presented,
             )
         return self._status(record)
 
@@ -652,12 +651,13 @@ class BackgroundTaskRegistry:
             records = [record for record, _ in entries]
             killed = [record.task_id for record in records]
             notified_records = [record for record in records if record.notify_on_exit]
-            async with self._transition_lock:
-                for record in records:
-                    record.notify_on_exit = False
-                    record.terminal_phase = "task_kill"
-                    record.note = self._shutdown_cause or "background task registry closed"
-                await finish(self._commit_notice(None))
+            if records:
+                async with self._transition_lock:
+                    for record in records:
+                        record.notify_on_exit = False
+                        record.terminal_phase = "task_kill"
+                        record.note = self._shutdown_cause or "background task registry closed"
+                    await finish(self._commit_notice(None))
             await finish(
                 asyncio.gather(*(self._close_stdin(record) for record in records))
             )
@@ -1012,14 +1012,21 @@ class BackgroundTaskRegistry:
         *,
         reason: str,
         phase: Literal["task_kill", "session_shutdown"],
+        tui_presented: bool,
     ) -> None:
         async with self._transition_lock:
             process = record.process
             if process is None or not record.running:
                 return
-            record.terminal_phase = phase
-            record.note = reason
-            await self._commit_notice(None)
+            previous = record.terminal_phase, record.note, record.tui_presented
+            record.terminal_phase, record.note, record.tui_presented = (
+                phase, reason, tui_presented
+            )
+            try:
+                await self._commit_notice(None)
+            except Exception:
+                record.terminal_phase, record.note, record.tui_presented = previous
+                raise
         await _terminate_process(
             process, self.term_grace, close_stdin=lambda: self._close_stdin(record)
         )
@@ -1222,18 +1229,12 @@ class BackgroundTaskRegistry:
         if cancelled:
             raise asyncio.CancelledError
 
-    def _persistence_rows(
-        self, records: Sequence[_BackgroundRecord] | None = None
-    ) -> tuple[dict[str, object], ...]:
+    def _persistence_rows(self, records: Sequence[_BackgroundRecord] | None = None) -> tuple[dict[str, object], ...]:
         return tuple(
-            {
-                "task_id": record.task_id, "command": record.command,
-                "pid": record.pid, "running": record.running,
-                "exit_code": record.exit_code, "started_at": record.started_at,
-                "ended_at": record.ended_at, "note": record.note,
-                "terminal_phase": record.terminal_phase,
-            }
-            for record in (self._records.values() if records is None else records)
+            {"task_id": r.task_id, "command": r.command, "pid": r.pid,
+             "running": r.running, "exit_code": r.exit_code, "started_at": r.started_at,
+             "ended_at": r.ended_at, "note": r.note, "terminal_phase": r.terminal_phase}
+            for r in (self._records.values() if records is None else records)
         )
 
     def _persist(self, rows: Sequence[dict[str, object]] | None = None) -> None:
