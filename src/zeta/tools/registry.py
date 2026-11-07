@@ -18,7 +18,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..agent.receipt import MIN_AGENT_RECEIPT_BYTES
 from ..config.tool_policy import ToolPolicy, parse_tool_selector
@@ -98,6 +98,7 @@ if TYPE_CHECKING:
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
+HandlerBinding = Literal["loop", "shared"]
 
 
 def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
@@ -155,6 +156,8 @@ class ToolDefinition:
     description: str
     parameters: dict[str, Any]
     handler: ToolHandler
+    binding: HandlerBinding
+    binding_owner: object | None
     handler_factory: ToolHandlerFactory | None = None
     parallel_safe: bool = False
     validate_arguments: bool = True
@@ -495,11 +498,14 @@ class ToolRegistry:
         requires_approval: bool = True,
         actions: Mapping[str, ToolAction] | None = None,
         handler_factory: ToolHandlerFactory | None = None,
+        binding: HandlerBinding = "loop",
         approval_subject: str | None = None,
         approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
+        if binding not in {"loop", "shared"}:
+            raise ValueError("tool binding must be 'loop' or 'shared'")
         if not callable(handler):
             raise TypeError("tool handler must be callable")
         supplied_schemas = [
@@ -559,6 +565,8 @@ class ToolRegistry:
             description=description,
             parameters=normalized,
             handler=handler,
+            binding=binding,
+            binding_owner=self if binding == "loop" else None,
             handler_factory=handler_factory,
             parallel_safe=parallel_safe,
             validate_arguments=validate_arguments,
@@ -615,12 +623,18 @@ class ToolRegistry:
         return resolve_registered_approval_rule(definition, parsed)
 
     def register_session_tool(
-        self, name: str, handler: ToolHandler, **kwargs: Any
+        self,
+        name: str,
+        handler: ToolHandler,
+        *,
+        binding: HandlerBinding,
+        **kwargs: Any,
     ) -> ToolDefinition:
         return self.register(
             name,
             _bind_handler(handler, self),
             handler_factory=partial(_bind_handler, handler),
+            binding=binding,
             **kwargs,
         )
 
@@ -640,7 +654,7 @@ class ToolRegistry:
         """Register one actor-owned MCP definition without replacing collisions."""
         if not self.tool_is_allowed(name) or name in self._tools:
             return False
-        self.register(name, handler, **kwargs)
+        self.register(name, handler, binding="shared", **kwargs)
         self._mcp_hidden.discard(name)
         self._mcp_owned[name] = (owner, generation)
         return True
@@ -721,7 +735,7 @@ class ToolRegistry:
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
-            if name not in exclude_names
+            if name not in exclude_names and definition.binding == "shared"
         }
         clone._mcp_hidden = self._mcp_hidden.intersection(clone._tools)
         clone._mcp_owned = {
