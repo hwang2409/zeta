@@ -275,8 +275,10 @@ async def test_agent_status_reports_child_while_finish_is_being_published(
         assert terminal_child["finished_at"] is not None
     finally:
         release_finish.set()
-        await wait_background_owner(loop)
-        await loop.close()
+        try:
+            await wait_background_owner(loop)
+        finally:
+            await asyncio.wait_for(loop.close(), timeout=10)
 
 
 @pytest.mark.asyncio
