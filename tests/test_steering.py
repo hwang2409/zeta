@@ -6,7 +6,7 @@ import asyncio
 import errno
 import os
 import stat
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -261,6 +261,25 @@ async def test_multiple_steers_deliver_in_order_at_one_boundary(
 async def _await(event: asyncio.Event) -> None:
     async with asyncio.timeout(10):
         await event.wait()
+
+
+# test-contract: seam TUIApp has no public task-draining close method
+@pytest.fixture
+async def release_app_resources() -> AsyncIterator[Callable[..., None]]:
+    owned: list[tuple[TUIApp, tuple[asyncio.Event, ...]]] = []
+
+    def own(app: TUIApp, *release_events: asyncio.Event) -> None:
+        owned.append((app, release_events))
+
+    yield own
+
+    for app, release_events in reversed(owned):
+        for event in release_events:
+            event.set()
+        try:
+            await app._submissions.close()
+        finally:
+            await app.loop.close()
 
 
 async def _await_pipeline_consumer(app: TUIApp) -> None:
@@ -668,13 +687,16 @@ async def test_transient_notification_failure_is_retried(
 
 @pytest.mark.asyncio
 async def test_new_wake_after_permanent_failure_dispatches_normally(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_app_resources: Callable[..., None],
 ) -> None:
     backend = _NotificationBackend(
         errors={0: ErrorInfo("http_error", "unauthorized", status_code=401)},
         blocked={1},
     )
     app = _notification_app(tmp_path, backend)
+    release_app_resources(app, backend.release[1])
     timers, _captured = _capture_notification_timers(monkeypatch)
     stopped = _watch_system_message(app, "automatic retry stopped")
 
@@ -691,6 +713,7 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
     # test-contract: seam notification wake has no public completion future
     app._submissions.wake()
     await _await(backend.call_started[1])
+    # test-contract: seam notification order proves the second wake saw both entries
     assert [entry.data["child_instance_id"] for entry in app.loop.store.agent_notifications()] == [
         "child-1",
         "child-2",
@@ -712,8 +735,6 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
         and not message.metadata.get("turn_failed")
         for message in app.loop.store.messages()
     )
-    await app._submissions.close()
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
@@ -740,6 +761,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     timers[0][1].fire()
     async with asyncio.timeout(10):
         await captured.get()
+    # test-contract: seam provider call count proves one dispatch per retry timer
     assert len(backend.calls) == 2
     assert timers[1][0] == 2.0
     assert app.console.file.getvalue().count("provider stopped") == 1
@@ -751,6 +773,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     assert provider_task is not None
     async with asyncio.timeout(10):
         await provider_task
+    # test-contract: seam provider call count proves the successful retry dispatched once
     assert len(backend.calls) == 3
     assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
     assert sum(
@@ -804,10 +827,13 @@ async def test_user_message_during_pending_retry_cancels_timer(
 
 @pytest.mark.asyncio
 async def test_aborted_notification_turn_is_not_retried(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_app_resources: Callable[..., None],
 ) -> None:
     backend = _BlockingNotificationBackend()
     app = _notification_app(tmp_path, backend)
+    release_app_resources(app, backend.release)
     timers, captured = _capture_notification_timers(monkeypatch)
 
     # test-contract: seam notification wake has no public completion future
@@ -826,8 +852,6 @@ async def test_aborted_notification_turn_is_not_retried(
     assert app._submissions.provider_task is None
     assert len(timers) == 1
     assert len(backend.calls) == 2
-    await app._submissions.close()
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
@@ -848,7 +872,10 @@ async def test_retry_timer_cancelled_on_pipeline_close(
 
 
 @pytest.mark.asyncio
-async def test_pipeline_routes_default_submission_as_steer(tmp_path: Path) -> None:
+async def test_pipeline_routes_default_submission_as_steer(
+    tmp_path: Path,
+    release_app_resources: Callable[..., None],
+) -> None:
     tool_call = ToolCall("call-3", "noop", {})
 
     async def noop_tool(
@@ -868,6 +895,8 @@ async def test_pipeline_routes_default_submission_as_steer(tmp_path: Path) -> No
         console=Console(file=StringIO(), force_terminal=False),
     )
 
+    release_app_resources(app, backend.release_turn1)
+
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
     await backend.turn1_streaming.wait()
@@ -879,7 +908,6 @@ async def test_pipeline_routes_default_submission_as_steer(tmp_path: Path) -> No
     backend.release_turn1.set()
     async with asyncio.timeout(10):
         await provider_task
-    await app.loop.close()
 
     user_texts = [
         block.text
@@ -895,7 +923,10 @@ async def test_pipeline_routes_default_submission_as_steer(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_backslash_prefix_defers_to_after_turn_end(tmp_path: Path) -> None:
+async def test_backslash_prefix_defers_to_after_turn_end(
+    tmp_path: Path,
+    release_app_resources: Callable[..., None],
+) -> None:
     tool_call = ToolCall("call-4", "noop", {})
 
     async def noop_tool(
@@ -915,6 +946,8 @@ async def test_backslash_prefix_defers_to_after_turn_end(tmp_path: Path) -> None
         console=Console(file=StringIO(), force_terminal=False),
     )
 
+    release_app_resources(app, backend.release_turn1)
+
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
     await backend.turn1_streaming.wait()
@@ -928,7 +961,6 @@ async def test_backslash_prefix_defers_to_after_turn_end(tmp_path: Path) -> None
     assert follow_up_task is not None
     async with asyncio.timeout(10):
         await follow_up_task
-    await app.loop.close()
 
     user_texts = [
         block.text
@@ -941,7 +973,10 @@ async def test_backslash_prefix_defers_to_after_turn_end(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_abort_drops_pending_steering(tmp_path: Path) -> None:
+async def test_abort_drops_pending_steering(
+    tmp_path: Path,
+    release_app_resources: Callable[..., None],
+) -> None:
     tool_call = ToolCall("call-5", "noop", {})
 
     async def noop_tool(
@@ -961,6 +996,8 @@ async def test_abort_drops_pending_steering(tmp_path: Path) -> None:
         console=Console(file=StringIO(), force_terminal=False),
     )
 
+    release_app_resources(app, backend.release_turn1)
+
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
     await backend.turn1_streaming.wait()
@@ -970,7 +1007,6 @@ async def test_abort_drops_pending_steering(tmp_path: Path) -> None:
     app.abort_active()
     await _await_pipeline_consumer(app)
     assert app.loop.has_pending_steering is False
-    await app.loop.close()
 
 
 class TextOnlyBackend(CompletionBackend):
@@ -1016,6 +1052,7 @@ class TextOnlyBackend(CompletionBackend):
 @pytest.mark.asyncio
 async def test_toolless_turn_delivers_late_steer_as_next_turn(
     tmp_path: Path,
+    release_app_resources: Callable[..., None],
 ) -> None:
     backend = TextOnlyBackend()
     store = ConversationStore(tmp_path / "sessions")
@@ -1026,6 +1063,8 @@ async def test_toolless_turn_delivers_late_steer_as_next_turn(
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
+
+    release_app_resources(app, backend.release_turn1, backend.release_turn2)
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
@@ -1050,12 +1089,12 @@ async def test_toolless_turn_delivers_late_steer_as_next_turn(
     assert user_texts == ["prompt", "late"]
     assert "steer arrived after the turn ended" not in output.getvalue()
     assert output.getvalue().count("late") == 1
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
 async def test_queued_message_dispatches_after_stale_notification_wake(
     tmp_path: Path,
+    release_app_resources: Callable[..., None],
 ) -> None:
     backend = TextOnlyBackend()
     store = ConversationStore(tmp_path / "sessions")
@@ -1065,6 +1104,8 @@ async def test_queued_message_dispatches_after_stale_notification_wake(
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
+
+    release_app_resources(app, backend.release_turn1, backend.release_turn2)
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
@@ -1089,12 +1130,12 @@ async def test_queued_message_dispatches_after_stale_notification_wake(
         )
         for message in backend.calls[1]
     )
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
 async def test_steer_submitted_as_provider_finishes_is_delivered_once(
     tmp_path: Path,
+    release_app_resources: Callable[..., None],
 ) -> None:
     backend = TextOnlyBackend()
     store = ConversationStore(tmp_path / "sessions")
@@ -1105,6 +1146,8 @@ async def test_steer_submitted_as_provider_finishes_is_delivered_once(
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
+
+    release_app_resources(app, backend.release_turn1, backend.release_turn2)
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
@@ -1127,12 +1170,12 @@ async def test_steer_submitted_as_provider_finishes_is_delivered_once(
     ]
     assert user_texts == ["prompt", "racing"]
     assert output.getvalue().count("racing") == 1
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
 async def test_toolless_turn_delivers_two_late_steers_in_order(
     tmp_path: Path,
+    release_app_resources: Callable[..., None],
 ) -> None:
     backend = TextOnlyBackend()
     store = ConversationStore(tmp_path / "sessions")
@@ -1142,6 +1185,8 @@ async def test_toolless_turn_delivers_two_late_steers_in_order(
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
+
+    release_app_resources(app, backend.release_turn1, backend.release_turn2)
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
@@ -1166,12 +1211,12 @@ async def test_toolless_turn_delivers_two_late_steers_in_order(
         if isinstance(block, TextContent)
     ]
     assert user_texts == ["prompt", "late one", "late two"]
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
 async def test_undo_during_late_steer_auto_turn_restores_steer(
     tmp_path: Path,
+    release_app_resources: Callable[..., None],
 ) -> None:
     backend = TextOnlyBackend(block_turn2=True)
     app = TUIApp(
@@ -1185,6 +1230,7 @@ async def test_undo_during_late_steer_auto_turn_restores_steer(
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
+    release_app_resources(app, backend.release_turn1, backend.release_turn2)
     session = app._make_session()
     app._active_session = session
 
@@ -1201,7 +1247,6 @@ async def test_undo_during_late_steer_auto_turn_restores_steer(
     await _await_pipeline_consumer(app)
 
     assert session.app.current_buffer.text == "late"
-    await app.loop.close()
 
 
 # --- cache-prefix stability -------------------------------------------------
@@ -1425,6 +1470,7 @@ async def test_passthrough_respects_approval_policy(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_8k_steering_alone_over_budget_keeps_main_requeue(
     tmp_path: Path,
+    release_app_resources: Callable[..., None],
 ) -> None:
     tool_call = ToolCall("oversize-tool", "noop", {})
 
@@ -1448,6 +1494,7 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue(
         model="offline",
         console=Console(file=StringIO(), force_terminal=False, width=300),
     )
+    release_app_resources(app, backend.release_turn1)
     oversized = "oversized-steering-" * 10_000
     turns = _watch_turn_starts(app)
     # test-contract: seam composer submission has no public acknowledgement method
@@ -1501,8 +1548,6 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue(
     )
     if app._active_task is not None:
         await _drive(app._active_task)
-    await app._submissions.close()
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
