@@ -281,7 +281,7 @@ _MODEL_INPUT_AUDIT = (
         "/mcp resources server mcp://doc/1",
     ),
     ("escaped slash", MessageOrigin.USER, "//status"),
-    ("unknown slash", MessageOrigin.USER, "/not-a-command"),
+    ("unknown slash", MessageOrigin.USER, "//not-a-command"),
     ("attachments/images", MessageOrigin.USER, "inspect @note.txt"),
     ("paste expansion", MessageOrigin.USER, "inspect [Image #1]"),
     ("steer/queued input", MessageOrigin.USER, "steer now"),
