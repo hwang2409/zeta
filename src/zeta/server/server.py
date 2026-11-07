@@ -859,7 +859,7 @@ class _Client:
                 params, self.features
             )
         if method == "session_settings":
-            return ergonomics.settings(runtime)
+            return ergonomics.settings(runtime, include_plan_mode=True)
         if method in slash_commands.READ_REQUESTS:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self

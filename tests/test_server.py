@@ -5240,7 +5240,9 @@ async def test_close_kill_cause_reaches_live_serve_event(
             ),
             None,
         )
-        assert notification is not None, "durable task-exited notification was not found"
+        assert notification is not None, (
+            "durable task-exited notification was not found"
+        )
         rendered = render_event(
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
@@ -5406,6 +5408,7 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
         assert (await rpc("session_settings"))["result"] == {
             "model": "gpt-5.6-luna",
             "approval_mode": "ask",
+            "plan_mode": False,
         }
         for model, mode in (("invalid", "ask"), ("gpt-5.6-luna", "invalid")):
             assert (await rpc("set_settings", model=model, approval_mode=mode))[
@@ -5424,7 +5427,10 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
         assert (await rpc("set_settings", **settings))["error"]["code"] == -32003
         assert server.runtime.policy.default.value == "ask"
         await _request(reader, writer, "resume", "resume", {"session_id": sid})
-        assert (await rpc("session_settings"))["result"] == settings
+        assert (await rpc("session_settings"))["result"] == {
+            **settings,
+            "plan_mode": False,
+        }
         assert not (tmp_path / "settings.json").exists()
     finally:
         await _close(server, writer)
@@ -7732,9 +7738,7 @@ async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
 @pytest.mark.asyncio
 async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> None:
     observed = [
-        await _hello_wire_line(
-            tmp_path / "hello-1.0", {"protocol_version": "1.0"}
-        ),
+        await _hello_wire_line(tmp_path / "hello-1.0", {"protocol_version": "1.0"}),
         await _hello_wire_line(
             tmp_path / "hello-1.1",
             {
@@ -7850,8 +7854,7 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
     fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
     rows = fixture.read_text().splitlines()
     assert rows[0] == (
-        "# baseline origin/main 66c084d8; accepted deltas: "
-        "W1, W2, W3, W5, text->output"
+        "# baseline origin/main 66c084d8; accepted deltas: W1, W2, W3, W5, text->output"
     )
     assert observed == rows[1:]
 
@@ -7910,6 +7913,8 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "init",
             "review",
             "greet",
+            "plan",
+            "implement",
         } <= set(runnable_by_name)
         assert {
             "always",
@@ -7919,7 +7924,6 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "keys",
             "local",
             "permissions",
-            "plan",
             "restart",
             "shell",
             "theme",
@@ -7935,6 +7939,57 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         )
         assert runnable_by_name["review"]["source"] == "project"
         assert runnable_by_name["greet"]["kind"] == "skill"
+
+        plan_mode = (
+            await _request(
+                reader, writer, "plan-settings", "session_settings", {"session_id": sid}
+            )
+        )[-1]["result"]
+        assert plan_mode["plan_mode"] is False
+        enabled = (
+            await _request(
+                reader,
+                writer,
+                "plan-on",
+                "slash_run",
+                {"session_id": sid, "text": "/plan on"},
+            )
+        )[-1]["result"]
+        assert enabled == {
+            "kind": "output",
+            "text": "plan mode: on (read-only tools; deliver the plan as your answer)",
+        }
+        prompt = (
+            await _request(
+                reader,
+                writer,
+                "plan-prompt",
+                "slash_run",
+                {"session_id": sid, "text": "/plan write a plan"},
+            )
+        )[-1]["result"]
+        assert prompt["kind"] == "model_input"
+        assert prompt["text"] == "write a plan"
+        implemented = (
+            await _request(
+                reader,
+                writer,
+                "implement",
+                "slash_run",
+                {"session_id": sid, "text": "/implement"},
+            )
+        )[-1]["result"]
+        assert implemented["kind"] == "model_input"
+        assert implemented["text"] == "implement the plan you proposed above"
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-settings-2",
+                "session_settings",
+                {"session_id": sid},
+            )
+        )[-1]["result"]["plan_mode"] is False
 
         documented_kinds = set(
             re.findall(
@@ -8066,6 +8121,43 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             )
         )[-1]["error"]
         assert wrong_session["code"] == -32003
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_plan_prompt_returns_opaque_input_id(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path / "home", port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        hello = (
+            await _request(
+                reader,
+                writer,
+                "hello",
+                "hello",
+                {"protocol_version": "1.1", "features": ["model_input_ids"]},
+            )
+        )[-1]["result"]
+        assert "model_input_ids" in hello["capabilities"]["features"]
+        sid = (
+            await _request(reader, writer, "new", "new_session", {"provider": "codex"})
+        )[-1]["result"]["session"]["session_id"]
+        await _request(
+            reader, writer, "on", "slash_run", {"session_id": sid, "text": "/plan on"}
+        )
+        result = (
+            await _request(
+                reader,
+                writer,
+                "prompt",
+                "slash_run",
+                {"session_id": sid, "text": "/plan write a plan"},
+            )
+        )[-1]["result"]
+        assert result["kind"] == "model_input"
+        assert result["input_id"]
+        assert "text" not in result
     finally:
         await _close(server, writer)
 
@@ -8320,9 +8412,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             )
             for _ in range(1_000)
         )
-        store.append_compaction_marker(
-            "summary", sources[0].seq, sources[-1].seq
-        )
+        store.append_compaction_marker("summary", sources[0].seq, sources[-1].seq)
         original_counter = server.runtime.loop.context_assembler.token_counter
 
         def blocked_counter(message: Message) -> int:
@@ -8352,7 +8442,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
                         probe_frames.append(json.loads(stream.readline()))
                         probe_ready.set()
                         if not entered.wait(10):
-                            raise AssertionError("status transcript worker did not start")
+                            raise AssertionError(
+                                "status transcript worker did not start"
+                            )
                         stream.write(
                             b'{"jsonrpc":"2.0","id":"live","method":"status",'
                             b'"params":{}}\n'
@@ -8430,9 +8522,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             or frame.get("params", {}).get("event") is not None
             for frame in frames
         )
-        assert (await _request(observer_reader, observer_writer, "after", "ping"))[
-            -1
-        ]["id"] == "after"
+        assert (await _request(observer_reader, observer_writer, "after", "ping"))[-1][
+            "id"
+        ] == "after"
     finally:
         release.set()
         if request_task is not None and not request_task.done():
@@ -9185,7 +9277,9 @@ async def test_slash_run_guards_mutations_while_approvals_pending(
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
         # MCP config commands mutate shared config — must reject.
-        assert (await run("mcp-disable", "/mcp disable example"))["error"]["code"] == -32004
+        assert (await run("mcp-disable", "/mcp disable example"))["error"][
+            "code"
+        ] == -32004
         # `/project init` mutates the session association — must reject.
         assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only and bypasses the mutation guard.

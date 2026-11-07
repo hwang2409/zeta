@@ -25,6 +25,8 @@ from ..core.slash import (
     SlashStatus,
     _format_status,
     create_slash_registry,
+    run_implement_command,
+    run_plan_command,
 )
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
@@ -108,6 +110,43 @@ class ServerSlashSession:
         self._run_blocking = run_blocking
 
     # --- runnable server-side ---
+
+    @property
+    def plan_mode(self) -> bool:
+        return self._runtime.loop.plan_mode if self._runtime.loop is not None else False
+
+    @property
+    def active(self) -> bool:
+        return False
+
+    @property
+    def pending_approvals(self) -> tuple[str, ...]:
+        if self._approval_control is None:
+            return ()
+        return self._approval_control.pending_approval_labels()
+
+    def set_plan_mode(self, enabled: bool):
+        if self._runtime.loop is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        return self._runtime.loop.set_plan_mode(enabled)
+
+    def invalidate_prompt(self) -> None:
+        return None
+
+    def plan_mode_background_blocker(self) -> str | None:
+        work = tuple(getattr(self._runtime.loop, "background_work_descriptions", ()))
+        if not work:
+            return None
+        return (
+            "plan mode unchanged: background work is active: "
+            f"{', '.join(work)}; stop it or wait"
+        )
+
+    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
+        return await run_plan_command(self, args)
+
+    async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
+        return await run_implement_command(self, args)
 
     def slash_status_command(self, args: str) -> str | Awaitable[str]:
         del args
@@ -406,7 +445,11 @@ async def run_command(
     command = registry.command_for(name)
     if command is not None and not registry.available(command):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    if command is not None and command.serve is not None and command.serve.mutates(tail):
+    if (
+        command is not None
+        and command.serve is not None
+        and command.serve.mutates(tail)
+    ):
         ergonomics.require_mutable(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
@@ -422,9 +465,7 @@ async def run_command(
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(
-        runtime, approval_control, run_blocking=run_blocking
-    )
+    session = ServerSlashSession(runtime, approval_control, run_blocking=run_blocking)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}

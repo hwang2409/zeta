@@ -1320,7 +1320,7 @@ error code and message. Provider status and origin remain internal.
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
-- `session_settings`: returns `model` and `approval_mode`.
+- `session_settings`: returns `model`, `approval_mode`, and `plan_mode`.
 - `account_list`: takes `session_id` and returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
@@ -1431,8 +1431,8 @@ The shared slash registry has this order and surface availability:
 | `mcp` | yes | show MCP server status |
 | `model` | yes | pick a model or switch to one: `/model [name]` |
 | `vim` | yes | show or change vim mode |
-| `plan` | no | show or change plan mode |
-| `implement` | no | implement the proposed plan |
+| `plan` | yes | show or change plan mode |
+| `implement` | yes | implement the proposed plan |
 | `project-instructions` | yes | open or create private project instructions in your editor |
 | `init` | yes | generate or improve project instructions |
 | `paste` | no | paste an image |
