@@ -50,7 +50,6 @@ logger = logging.getLogger(__name__)
 
 MAX_LIST_ITEMS = 10_000
 MAX_LIST_PAGES = 1_000
-MCP_STDIO_LINE_LIMIT = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +199,6 @@ class StdioMCPClient(MCPClient):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=subprocess_env(self.config.env),
-                limit=MCP_STDIO_LINE_LIMIT,
                 start_new_session=True,
             )
         except BaseException:
@@ -396,6 +394,8 @@ class StdioMCPClient(MCPClient):
                 )
                 if invalidation.task is not None:
                     await asyncio.shield(invalidation.task)
+            if response.done() and not response.cancelled():
+                response.exception()
             raise
         finally:
             self._pending.pop(request_id, None)
@@ -771,7 +771,7 @@ class StdioMCPClient(MCPClient):
                 pending.future.set_exception(error)
 
 
-__all__ = ["MCP_STDIO_LINE_LIMIT", "StdioMCPClient"]
+__all__ = ["StdioMCPClient"]
 
 
 def _error_text(error: BaseException) -> str:

@@ -162,3 +162,4 @@ class ServeContract:
         stdout, stderr = await self._process.communicate()
         assert self._process.returncode == 0, (stdout + stderr).decode(errors="replace")
         assert not self._socket_path.exists(), "serve left its Unix socket behind"
+        Path(f"{self._socket_path}.lock").unlink(missing_ok=True)

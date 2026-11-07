@@ -885,11 +885,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         child_stores.append(child_store), track_store(child_store)
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    for _ in range(100):
-        if not owner._stores:
-            break
-        await asyncio.sleep(0.01)
-    await owner.wait_for_store_closes()
+    await asyncio.wait_for(owner.wait(), timeout=10)
     child_store = child_stores[0]
     with pytest.raises(OSError):
         os.fstat(child_store.directory_fd)
@@ -1763,16 +1759,18 @@ def test_many_finished_tasks_hold_bounded_descriptors(tmp_path: Path) -> None:
 import asyncio, json, os, resource, sys
 from pathlib import Path
 from zeta.core.store import ConversationStore
+from zeta.storage_format import advance, open_writer
 from zeta.tools._shared.process import BackgroundTaskRegistry
 
-async def main(root: Path) -> None:
+async def main(root: Path, lease) -> None:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, hard), hard))
-    with ConversationStore(root / "sessions", session_id="fd-bound") as store:
+    with ConversationStore(root / "sessions", session_id="fd-bound", _storage_lease=lease) as store:
         tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
             output_limit=4,
+            storage_lease=lease,
         )
         baseline = len(os.listdir("/dev/fd"))
         task_ids = []
@@ -1790,7 +1788,13 @@ async def main(root: Path) -> None:
         assert final <= baseline + 2
         await tasks.close()
 
-asyncio.run(main(Path(sys.argv[1])))
+root = Path(sys.argv[1])
+advance(root, expected_epoch=0)
+lease = open_writer(root)
+try:
+    asyncio.run(main(root, lease))
+finally:
+    lease.close()
 '''
     completed = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path)],

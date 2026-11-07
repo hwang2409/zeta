@@ -334,7 +334,7 @@ def _open_fds_under(path: Path) -> list[int]:
                 target = Path(os.path.realpath(f"/proc/self/fd/{fd}"))
         except (OSError, ValueError):
             continue
-        if target == root or root in target.parents:
+        if (target == root or root in target.parents) and target.name != ".storage-format.lock":
             open_fds.append(fd)
     return open_fds
 

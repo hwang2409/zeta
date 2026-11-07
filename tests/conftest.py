@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import json
 import os
 import stat
 import sys
+import threading
 import uuid
+import weakref
 from collections import Counter
 from collections.abc import Generator
 from contextlib import ExitStack
@@ -24,26 +27,34 @@ from rich.console import Console
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
+os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
+os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
 
 
 def _is_repository_test_path(path: Path) -> bool:
-    return path.is_relative_to(_REPOSITORY_ROOT) and "tests" in path.relative_to(
-        _REPOSITORY_ROOT
-    ).parts
+    return (
+        path.is_relative_to(_REPOSITORY_ROOT)
+        and "tests" in path.relative_to(_REPOSITORY_ROOT).parts
+    )
+
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     if not _IS_REPOSITORY_TESTS or not config.pluginmanager.hasplugin("asyncio"):
         return
     for item in items:
         path = item.path.resolve()
         # These modules patch process-wide clock/config during fixture teardown.
-        if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name not in {
-            "test_test_environment.py",
-            "test_tui.py",
-        }:
+        if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name == "test_tui.py":
+            item.fixturenames.append("bootstrap_tui_storage_format")
+        elif (
+            path.is_relative_to(_TEST_SITE_PACKAGES)
+            and path.name != "test_test_environment.py"
+        ):
             item.fixturenames.append("close_direct_test_runtime_owners")
 
 
@@ -329,7 +340,9 @@ class LiveHomeWriteGuard:
         try:
             normalized_path.relative_to(self.live_home)
         except ValueError as exc:
-            raise ValueError("external mutation must be inside the watched home") from exc
+            raise ValueError(
+                "external mutation must be inside the watched home"
+            ) from exc
         if kind == "append" and expected is None:
             raise ValueError("append declarations must state the expected suffix")
         self._external_declarations.append(
@@ -356,7 +369,9 @@ class LiveHomeWriteGuard:
 # These variables control the test harness itself and must survive environment
 # isolation.  Keep this list explicit so adding a ZETA_* setting cannot silently
 # change CI behavior.
-_TEST_HARNESS_ENV_ALLOWLIST = frozenset()
+_TEST_HARNESS_ENV_ALLOWLIST = frozenset(
+    {"ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT", "ZETA_TEST_PARENT_PID"}
+)
 
 
 _HOME_GUARD = pytest.StashKey[LiveHomeWriteGuard]()
@@ -400,9 +415,7 @@ def isolate_zeta_home(
         monkeypatch.setenv("ZETA_HOME", str(isolated_home))
         monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
         monkeypatch.setenv("ZETA_TEST_AUDIT_LEDGER", str(live_home_write_guard._ledger))
-        monkeypatch.setenv(
-            "ZETA_TEST_LIVE_HOME", str(live_home_write_guard.live_home)
-        )
+        monkeypatch.setenv("ZETA_TEST_LIVE_HOME", str(live_home_write_guard.live_home))
         monkeypatch.setenv(
             "ZETA_TEST_OWNERSHIP_TOKEN", live_home_write_guard._ownership_token
         )
@@ -458,10 +471,10 @@ def _describe_fd(descriptor: int, directory: str) -> str:
 
 def _group_fds_by_path_prefix(descriptions: tuple[str, ...]) -> str:
     targets = (description.rsplit(" (", 1)[0] for description in descriptions)
-    groups = Counter(str(Path(target).parent) if "/" in target else target for target in targets)
-    return "; ".join(
-        f"{prefix} (+{count})" for prefix, count in groups.most_common()
+    groups = Counter(
+        str(Path(target).parent) if "/" in target else target for target in targets
     )
+    return "; ".join(f"{prefix} (+{count})" for prefix, count in groups.most_common())
 
 
 def _open_file_descriptors() -> dict[int, str]:
@@ -550,10 +563,7 @@ def _format_retained_max() -> str:
         return "none"
     nodeid, count, highest, added = _FD_RETAINED_MAX
     grouped = _group_fds_by_path_prefix(added) if added else "none"
-    return (
-        f"nodeid={nodeid} open={count} highest={highest} "
-        f"added_grouped={grouped}"
-    )
+    return f"nodeid={nodeid} open={count} highest={highest} added_grouped={grouped}"
 
 
 def _fd_summary() -> str:
@@ -616,41 +626,233 @@ def pytest_testnodedown(node, error) -> None:
 
 
 @pytest.fixture
-async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
-    """Close stores and registries constructed directly by repository tests."""
+def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
+    from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
+    from zeta.storage_format import advance, open_writer
     from zeta.tools import ToolRegistry
 
-    stores: list[ConversationStore] = []
-    registries: list[ToolRegistry] = []
+    stores = []
+    managers = []
+    registries = []
     store_init = ConversationStore.__init__
+    manager_init = SessionManager.__init__
     registry_init = ToolRegistry.__init__
-    store_close = ConversationStore.close
-    registry_close = ToolRegistry.close
+
+    def open_test_writer(home: Path):
+        home.mkdir(parents=True, exist_ok=True)
+        if not (home / "storage-format.json").exists():
+            advance(home, expected_epoch=0)
+        result = []
+        thread = threading.Thread(target=lambda: result.append(open_writer(home)))
+        thread.start()
+        thread.join()
+        return result[0]
 
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
-        store_init(store, *args, **kwargs)
-        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if _is_repository_test_path(caller):
+        root_value = args[0] if args else kwargs.get("session_dir")
+        root = (
+            Path(root_value)
+            if root_value is not None
+            else Path(os.environ["ZETA_HOME"]) / "sessions"
+        )
+        home = root
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        lease = open_test_writer(
+            home.parent if home.name == "sessions" else root.parent
+        )
+        try:
+            store_init(store, *args, **kwargs)
             stores.append(store)
+        finally:
+            lease.close()
+
+    @wraps(manager_init)
+    def tracked_manager_init(manager, *args, **kwargs):
+        home = (
+            Path(args[0])
+            if args and args[0] is not None
+            else Path(os.environ["ZETA_HOME"])
+        )
+        lease = open_test_writer(home)
+        try:
+            manager_init(manager, *args, **kwargs)
+            managers.append(manager)
+        finally:
+            lease.close()
 
     @wraps(registry_init)
     def tracked_registry_init(registry, *args, **kwargs):
         registry_init(registry, *args, **kwargs)
-        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if _is_repository_test_path(caller):
-            registries.append(registry)
+        registries.append(registry)
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     yield
     for registry in reversed(registries):
         if not registry._closed:
-            await registry_close(registry)
+            try:
+                asyncio.run(registry.close())
+            except (AttributeError, RuntimeError):
+                pass
     for store in reversed(stores):
         if not store._closed:
-            store_close(store)
+            store.close()
+    for manager in reversed(managers):
+        manager._release_storage_lease()
+
+
+@pytest.fixture
+async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
+    """Close runtime owners constructed during repository tests."""
+    from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
+    from zeta.core.session import SessionManager
+    from zeta.core.store import ConversationStore
+    from zeta.runtime.loop import AgentLoop
+    from zeta.storage_format import StorageFormatError, advance, open_writer
+    from zeta.tools import ToolRegistry
+    from zeta.tools._shared.process import BackgroundTaskRegistry
+
+    loops: list[AgentLoop] = []
+    stores: list[ConversationStore] = []
+    composed_stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
+    managers: list[SessionManager] = []
+    workspaces: list[WorkspaceSnapshotStore] = []
+    registries: list[ToolRegistry] = []
+    test_home_leases = {}
+    loop_init = AgentLoop.__init__
+    loop_close = AgentLoop.close
+    store_init = ConversationStore.__init__
+    manager_init = SessionManager.__init__
+
+    @wraps(loop_init)
+    def tracked_loop_init(loop, *args, **kwargs):
+        loop_init(loop, *args, **kwargs)
+        loops.append(loop)
+
+    workspace_init = WorkspaceSnapshotStore.__init__
+    registry_init = ToolRegistry.__init__
+    background_init = BackgroundTaskRegistry.__init__
+    store_close = ConversationStore.close
+    registry_close = ToolRegistry.close
+
+    def ensure_format(home: Path) -> None:
+        home.mkdir(parents=True, exist_ok=True)
+        if not (home / "storage-format.json").exists():
+            advance(home, expected_epoch=0)
+        canonical = home.resolve()
+        if canonical not in test_home_leases:
+            result = []
+            error = []
+
+            def open_test_writer() -> None:
+                try:
+                    result.append(open_writer(home))
+                except StorageFormatError as exc:
+                    error.append(exc)
+
+            thread = threading.Thread(target=open_test_writer)
+            thread.start()
+            thread.join()
+            if error:
+                raise error[0]
+            test_home_leases[canonical] = result[0]
+
+    @wraps(store_init)
+    def tracked_store_init(store, *args, **kwargs):
+        root_value = args[0] if args else kwargs.get("session_dir")
+        root = (
+            Path(root_value)
+            if root_value is not None
+            else Path(os.environ["ZETA_HOME"]) / "sessions"
+        )
+        home = root
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        ensure_format(home.parent if home.name == "sessions" else root.parent)
+        store_init(store, *args, **kwargs)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            stores.append(store)
+        else:
+            composed_stores.add(store)
+
+    @wraps(manager_init)
+    def tracked_manager_init(manager, *args, **kwargs):
+        home = (
+            Path(args[0])
+            if args and args[0] is not None
+            else Path(os.environ["ZETA_HOME"])
+        )
+        ensure_format(home)
+        manager_init(manager, *args, **kwargs)
+        managers.append(manager)
+
+    @wraps(workspace_init)
+    def tracked_workspace_init(workspace, *args, **kwargs):
+        session_dir = Path(args[0])
+        home = session_dir.parent
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        ensure_format(home.parent if home.name == "sessions" else session_dir.parent)
+        workspace_init(workspace, *args, **kwargs)
+        workspaces.append(workspace)
+
+    @wraps(background_init)
+    def tracked_background_init(background, *args, **kwargs):
+        session_dir = kwargs.get("session_dir")
+        if session_dir is not None and kwargs.get("storage_lease") is None:
+            session_path = Path(session_dir)
+            home = session_path.parent
+            while home.name != "sessions" and home != home.parent:
+                home = home.parent
+            home = home.parent if home.name == "sessions" else session_path.parent
+            ensure_format(home)
+            kwargs["storage_lease"] = test_home_leases[home.resolve()]
+        background_init(background, *args, **kwargs)
+
+    @wraps(registry_init)
+    def tracked_registry_init(registry, *args, **kwargs):
+        registry_init(registry, *args, **kwargs)
+        registries.append(registry)
+
+    monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
+    monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
+    monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
+    monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
+    yield
+    for loop in reversed(loops):
+        if not loop._closed:
+            try:
+                await loop_close(loop)
+            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                pass
+    for registry in reversed(registries):
+        if not registry._closed:
+            try:
+                await registry_close(registry)
+            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                pass
+    for store in reversed((*stores, *composed_stores)):
+        if not store._closed:
+            try:
+                store_close(store)
+            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                pass
+    for workspace in reversed(workspaces):
+        try:
+            workspace.close()
+        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+            pass
+    for manager in reversed(managers):
+        manager._release_storage_lease()
+    for lease in test_home_leases.values():
+        lease.close()
 
 
 @pytest.fixture
@@ -729,6 +931,7 @@ def block_real_http_connections(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", blocked_sync)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", blocked_async)
 
+
 @pytest.fixture(autouse=True)
 def _inject_scripted_completion_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep provider-backed tests offline through the production backend seam."""
@@ -739,11 +942,14 @@ def _inject_scripted_completion_backend(monkeypatch: pytest.MonkeyPatch) -> None
     from zeta.tui import app as tui_app
 
     def build_backend(provider: str, model: str | None, **_kwargs: object):
-        selected = model or {
-            "claude": "claude-sonnet-4-6",
-            "codex": "gpt-5.6-luna",
-            "ollama": "qwen3:4b",
-        }[provider]
+        selected = (
+            model
+            or {
+                "claude": "claude-sonnet-4-6",
+                "codex": "gpt-5.6-luna",
+                "ollama": "qwen3:4b",
+            }[provider]
+        )
         return FakeInteractiveBackend(delay=0, model=selected), selected
 
     monkeypatch.setattr(tui_app, "build_backend", build_backend)
