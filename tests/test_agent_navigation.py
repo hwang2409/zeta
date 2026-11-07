@@ -1227,7 +1227,7 @@ async def test_close_waits_for_in_flight_child_send_outcome(
         release_ui_ownership()
         close_started.set()
 
-    # test-contract: no public seam reports child-send drain entry after UI release.
+    # test-contract: seam no public child-send drain-entry signal exists.
     monkeypatch.setattr(app, "_release_ui_ownership", track_release_ui_ownership)
     closing = asyncio.create_task(app.close())
     await asyncio.wait_for(close_started.wait(), 10)
