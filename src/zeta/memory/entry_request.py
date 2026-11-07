@@ -11,7 +11,12 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from .entry_store import MAX_ENTRY_TEXT_BYTES, MemoryEntry, MemoryState
+from .entry_store import (
+    MAX_ENTRY_TEXT_BYTES,
+    MemoryEntry,
+    MemoryState,
+    state_digest,
+)
 from .reconciler import (
     ReconciliationError,
     RequestTooLargeError,
@@ -108,7 +113,7 @@ class _CachedEntry:
     words: frozenset[str]
 
 
-_ENTRY_CACHE: tuple[tuple[str, int], dict[str, _CachedEntry]] | None = None
+_ENTRY_CACHE: tuple[tuple[str, str], dict[str, _CachedEntry]] | None = None
 
 
 def _active_entries_by_priority(state: MemoryState) -> list[MemoryEntry]:
@@ -190,9 +195,11 @@ def _entry_relevance_terms(entry: MemoryEntry) -> tuple[frozenset[str], frozense
     )
 
 
-def _cached_entries(state: MemoryState) -> dict[str, _CachedEntry]:
+def _cached_entries(
+    state: MemoryState, *, snapshot_digest: str | None = None
+) -> dict[str, _CachedEntry]:
     global _ENTRY_CACHE
-    key = (state.project_id, state.generation)
+    key = (state.project_id, snapshot_digest or state_digest(state))
     if _ENTRY_CACHE is not None and _ENTRY_CACHE[0] == key:
         return _ENTRY_CACHE[1]
     cached: dict[str, _CachedEntry] = {}
@@ -213,10 +220,13 @@ def _cached_entries(state: MemoryState) -> dict[str, _CachedEntry]:
 
 
 def _active_entries_for_request(
-    state: MemoryState, transcript: Transcript
+    state: MemoryState,
+    transcript: Transcript,
+    *,
+    snapshot_digest: str | None = None,
 ) -> list[MemoryEntry]:
     active = _active_entries_by_priority(state)
-    cached = _cached_entries(state)
+    cached = _cached_entries(state, snapshot_digest=snapshot_digest)
     transcript_opaque, transcript_words = _relevance_terms(
         _transcript_relevance_text(transcript),
         max_chars=_MAX_RELEVANCE_TRANSCRIPT_CHARS,
@@ -382,18 +392,25 @@ def _render_transcript_row(session_id: str, row: dict[str, Any]) -> str:
 
 
 def _prepare_request(
-    transcript: Transcript, state: MemoryState, *, as_of: date
+    transcript: Transcript,
+    state: MemoryState,
+    *,
+    as_of: date,
+    snapshot_digest: str | None = None,
 ) -> _EntryPreparedRequest:
     empty = Transcript(transcript.session_id, ())
     priority = _active_entries_by_priority(state)
     components = {
-        entry.id: _cached_entries(state)[entry.id].component for entry in priority
+        entry.id: _cached_entries(state, snapshot_digest=snapshot_digest)[entry.id].component
+        for entry in priority
     }
     empty_size = len(_prompt(empty, state, as_of=as_of).encode())
 
     def entry_parts(rows: Sequence[dict[str, Any]]):
         candidate = Transcript(transcript.session_id, tuple(rows))
-        active = _active_entries_for_request(state, candidate)
+        active = _active_entries_for_request(
+            state, candidate, snapshot_digest=snapshot_digest
+        )
         return active, _entry_prompt_parts(active, components, base_size=empty_size)
 
     preliminary_size = entry_parts(())[1][4]

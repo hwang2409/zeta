@@ -873,15 +873,25 @@ def test_prepare_reuses_entry_safety_and_relevance_work_until_memory_changes(
     )
     transcript = _transcript(_row(1, "PR #425 merged."))
     projections = 0
+    relevance_terms = 0
     original_projection = entry_request._entry_projection
+    original_relevance_terms = entry_request._entry_relevance_terms
 
     def projection(entry):
         nonlocal projections
         projections += 1
         return original_projection(entry)
 
-    # test-contract: seam count cache work through the prepare path
+    def entry_relevance_terms(entry):
+        nonlocal relevance_terms
+        relevance_terms += 1
+        return original_relevance_terms(entry)
+
+    # test-contract: seams count projection and relevance cache work through prepare
     monkeypatch.setattr(entry_request, "_entry_projection", projection)
+    monkeypatch.setattr(
+        entry_request, "_entry_relevance_terms", entry_relevance_terms
+    )
 
     first = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
     second = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
@@ -889,7 +899,9 @@ def test_prepare_reuses_entry_safety_and_relevance_work_until_memory_changes(
     # test-contract: seam cache invalidation is observed only through prepare output
     assert second.prompt == first.prompt
     first_projections = projections
+    first_relevance_terms = relevance_terms
     assert first_projections > 0
+    assert first_relevance_terms > 0
 
     changed_entry = next(
         entry for entry in state.entries.values() if isinstance(entry, MemoryEntry)
@@ -897,11 +909,16 @@ def test_prepare_reuses_entry_safety_and_relevance_work_until_memory_changes(
     changed = replace(changed_entry, text=changed_entry.text + " changed")
     changed_state = replace(
         state,
-        generation=state.generation + 1,
+        # A restored snapshot can change content without changing its generation.
+        generation=state.generation,
         entries={**state.entries, changed.id: changed},
     )
-    _prepare_request(transcript, changed_state, as_of=date(2026, 10, 9))
+    changed_request = _prepare_request(
+        transcript, changed_state, as_of=date(2026, 10, 9)
+    )
+    assert changed.text in changed_request.prompt
     assert projections == first_projections * 2
+    assert relevance_terms == first_relevance_terms * 2
 
 
 def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
