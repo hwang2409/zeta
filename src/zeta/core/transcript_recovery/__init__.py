@@ -95,7 +95,10 @@ def repair_target_for_session_dir(
     ):
         return RepairTarget(session_id)
     child_run_id = ":".join((root, *relative[1::2]))
-    return RepairTarget(root, child_run_id)
+    try:
+        return RepairTarget(root, child_run_id)
+    except ValueError:
+        return RepairTarget(session_id)
 
 
 @dataclass(frozen=True, slots=True)
