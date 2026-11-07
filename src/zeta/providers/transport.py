@@ -126,7 +126,7 @@ async def _report_cleanup_failure(
         )
     except BaseException as diagnostic_error:
         if is_control_exception(diagnostic_error):
-            raise
+            raise merge_exception(primary_exception, diagnostic_error)
         _report_loop_cleanup_failure(
             diagnostic_error,
             stage=f"{stage}_diagnostic",
@@ -647,7 +647,7 @@ async def stall_watchdog[T](
             outcome = await close_transport_resources(close())
             for failure in outcome.failures:
                 if is_control_exception(failure.error):
-                    raise failure.error
+                    raise merge_exception(primary_exception, failure.error)
                 await _report_cleanup_failure(
                     failure.error,
                     stage="stream_iterator",
