@@ -171,6 +171,16 @@ async def consume_run(
                 and structured.get("status") == "running"
             )
             flow = await child_loop._ensure_step_delivery()
+            running_tasks = any(
+                task.running
+                for task in child_loop.tool_registry.background_tasks.snapshot()
+            )
+            if not running_tasks:
+                safety_started = None
+                if safety_task is not None:
+                    safety_task.cancel()
+                    await asyncio.gather(safety_task, return_exceptions=True)
+                    safety_task = None
             if flow.has_pending_edge:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
                 idle_lifecycle.reset_idle_period()
@@ -227,17 +237,7 @@ async def consume_run(
                             text=text,
                         )
                     idle_published = True
-                running_tasks = any(
-                    task.running
-                    for task in child_loop.tool_registry.background_tasks.snapshot()
-                )
-                if not running_tasks:
-                    safety_started = None
-                    if safety_task is not None:
-                        safety_task.cancel()
-                        await asyncio.gather(safety_task, return_exceptions=True)
-                        safety_task = None
-                elif safety_started is None:
+                if running_tasks and safety_started is None:
                     safety_started = idle_clock()
                     safety_task = asyncio.create_task(
                         kill_tasks_after_deadline(
