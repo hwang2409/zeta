@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import select
 import selectors
 import shlex
 import subprocess
@@ -125,6 +126,67 @@ def reap_process(process: subprocess.Popen[object], *, timeout: float = 30) -> i
     except subprocess.TimeoutExpired:
         process.kill()
         return process.wait()
+
+
+async def wait_pid_exited(pid: int, timeout: float = 10) -> None:
+    await asyncio.to_thread(_wait_pid_exited_sync, pid, timeout)
+
+
+def _wait_pid_exited_sync(pid: int, timeout: float) -> None:
+    if hasattr(os, "pidfd_open"):
+        try:
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(pidfd, selectors.EVENT_READ)
+                if selector.select(timeout):
+                    return
+        finally:
+            os.close(pidfd)
+    elif hasattr(select, "kqueue"):
+        queue = select.kqueue()
+        event = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        try:
+            if queue.control([event], 1, timeout):
+                return
+        except ProcessLookupError:
+            return
+        finally:
+            queue.close()
+    else:
+        # Poll only on platforms without a process-exit event API.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = _pid_state(pid)
+            if state is None or state.startswith("Z"):
+                return
+            time.sleep(0.05)
+
+    state = _pid_state(pid)
+    if state is None or state.startswith("Z"):
+        return
+    raise AssertionError(
+        f"pid {pid} did not exit within {timeout}s; last ps state: {state!r}"
+    )
+
+
+def _pid_state(pid: int) -> str | None:
+    result = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def wait_for_path_command(
