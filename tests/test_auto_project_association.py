@@ -694,7 +694,9 @@ async def test_project_init_rebinds_runtime_child_and_approval(
         assert len(receipts) == 1
 
         associated_metadata = app.loop.session_metadata
+        lineage_publisher = app.loop._child_lineage_publisher
         app.loop._set_runtime_project(replace(associated_metadata, project_id=None))
+        assert app.loop._child_lineage_publisher is lineage_publisher
         assert app.loop.session_metadata.project_id is None
         assert app.loop.store._collect_persisted_appends is False
         assert app.loop.tool_registry.project_id is None
