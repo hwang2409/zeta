@@ -10305,7 +10305,7 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     assert not task.done()
     release.set()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
 
     assert [
         entry.data["text"]
@@ -10339,7 +10339,7 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
 
     async def blocked_cleanup(*args, **kwargs):
         cleanup_started.set()
-        await release_cleanup.wait()
+        await asyncio.wait_for(release_cleanup.wait(), 10)
         return await original_gather(*args, **kwargs)
 
     monkeypatch.setattr(execution_module.asyncio, "gather", blocked_cleanup)
@@ -10359,10 +10359,10 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
         )
     )
 
-    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+    await asyncio.wait_for(cleanup_started.wait(), timeout=10)
     task.cancel()
     release_cleanup.set()
-    result = await task
+    result = await asyncio.wait_for(task, 10)
 
     assert result["isError"] is False
     assert result["content"][0]["text"] == (
@@ -15704,6 +15704,7 @@ async def test_agent_cancel_reports_failed_confirmation_and_allows_retry(
         register_builtin=True,
     )
     owner = BackgroundAgentOwner(parent_store)
+    # test-contract: seam placeholder task models a live child watcher
     watcher = asyncio.create_task(asyncio.Event().wait())
     attempts = 0
     fence = TerminalTransitionFence(child_store)
@@ -15752,7 +15753,7 @@ async def test_agent_cancel_reports_failed_confirmation_and_allows_retry(
     finally:
         owner.unregister("root:1")
         watcher.cancel()
-        await asyncio.gather(watcher, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(watcher, return_exceptions=True), 10)
         await registry.close()
         child_store.close()
 
@@ -15771,6 +15772,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         register_builtin=True,
     )
     owner = BackgroundAgentOwner(parent_store)
+    # test-contract: seam placeholder task models a live child watcher
     watcher = asyncio.create_task(asyncio.Event().wait())
     release = asyncio.Event()
     wait_started = asyncio.Event()
@@ -15779,7 +15781,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     attempts = 0
 
     async def confirm() -> bool:
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return await fence.cancel()
 
     def cancel() -> CancellationRequest:
@@ -15800,7 +15802,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
             first_wait = False
             confirm_timeouts.append(timeout)
             wait_started.set()
-            await wait_gate.wait()
+            await asyncio.wait_for(wait_gate.wait(), 10)
             return set(), set(awaitables)
         return await original_wait(awaitables, timeout=timeout)
 
@@ -15812,10 +15814,10 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     try:
         call = ToolCall("cancel-1", "agent_cancel", {"handle": "root:1"})
         pending = asyncio.create_task(registry.execute(call))
-        await wait_started.wait()
+        await asyncio.wait_for(wait_started.wait(), 10)
         assert confirm_timeouts == [1.0]
         wait_gate.set()
-        unconfirmed = await pending
+        unconfirmed = await asyncio.wait_for(pending, 10)
         assert unconfirmed["isError"] is True
         assert unconfirmed["structuredContent"]["status"] == "cancellation_unconfirmed"
         assert "not confirmed" in unconfirmed["content"][0]["text"]
@@ -15857,7 +15859,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         wait_gate.set()
         owner.unregister("root:1")
         watcher.cancel()
-        await asyncio.gather(watcher, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(watcher, return_exceptions=True), 10)
         await registry.close()
         child_store.close()
 
@@ -16566,7 +16568,7 @@ async def test_tui_child_send_keeps_target_history_across_view_switch(
 
     async def delayed_send(*args, **kwargs):
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return await original_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_card_module, "send_to_run", delayed_send)
@@ -16581,10 +16583,10 @@ async def test_tui_child_send_keeps_target_history_across_view_switch(
     commands._print_system = lambda _text: None
 
     assert commands._send_to_child("message for a") is False
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 10)
     commands._agent_navigation.current_path = child_b.session_dir
     release.set()
-    await asyncio.wait_for(commands._child_send_tasks[handle][0], timeout=2)
+    await asyncio.wait_for(commands._child_send_tasks[handle][0], timeout=10)
     await asyncio.sleep(0)
 
     assert commands._prompt_history.snapshot(child_a.session_dir) == ("message for a",)
@@ -16770,7 +16772,7 @@ async def test_slash_send_answer_closes_matching_question(tmp_path: Path) -> Non
 
     result = commands.slash_send(f"{handle} Re q-slash: approved")
     if asyncio.iscoroutine(result):
-        result = await result
+        result = await asyncio.wait_for(result, 10)
 
     assert result.startswith(f"queued for {handle}")
     assert question.id not in {entry.id for entry in parent.agent_notifications()}
@@ -16827,7 +16829,7 @@ async def test_retry_before_provider_event_leaves_prompt_pending(
     await asyncio.wait_for(retry_backend.retry_sent.wait(), timeout=10)
     first_attempt.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await first_attempt
+        await asyncio.wait_for(first_attempt, 10)
     assert [entry.id for entry in await asyncio.to_thread(child.pending_prompts)] == [
         pending.id
     ]
