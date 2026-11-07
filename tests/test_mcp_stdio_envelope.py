@@ -490,11 +490,7 @@ async def test_cancel_during_stdio_invalidation_observes_pending_future_error(
         loop.call_soon(callbacks_drained.set_result, None)
         await callbacks_drained
         gc.collect()
-        assert [
-            context.get("message")
-            for context in unhandled
-            if "Future exception was never retrieved" in str(context.get("message"))
-        ] == []
+        assert unhandled == []
     finally:
         loop.set_exception_handler(old_handler)
 
