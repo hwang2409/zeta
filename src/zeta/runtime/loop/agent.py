@@ -141,7 +141,6 @@ TaskResult = TypeVar("TaskResult")
 class _ToollessTransition:
     continue_turn: bool
     consuming_notifications: bool
-    nudged_empty_turn: bool
     nudge_turn_pending: bool
     empty_nudge_count: int
     empty_nudge_episode: int
@@ -698,7 +697,6 @@ class AgentLoop(
         *,
         iteration_consuming_notifications: bool,
         notification_turn: bool,
-        nudged_empty_turn: bool,
         empty_nudge_count: int,
         empty_nudge_episode: int,
         tool_result_episode: int,
@@ -745,7 +743,6 @@ class AgentLoop(
         return _ToollessTransition(
             continue_turn=consume_pending or should_nudge,
             consuming_notifications=consume_pending,
-            nudged_empty_turn=nudged_empty_turn or should_nudge,
             nudge_turn_pending=should_nudge,
             empty_nudge_count=empty_nudge_count + int(should_nudge),
             empty_nudge_episode=(tool_result_episode if should_nudge else empty_nudge_episode),
@@ -826,7 +823,6 @@ class AgentLoop(
         retrying_provider = False
         provider_retry_budget: ProviderRetryBudget | None = None
         self._turn_provider_retry_records = []
-        nudged_empty_turn = False
         empty_nudge_count = 0
         empty_nudge_episode = -1
         tool_result_episode = 0
@@ -1228,14 +1224,12 @@ class AgentLoop(
                         iteration_consuming_notifications
                     ),
                     notification_turn=notification_turn,
-                    nudged_empty_turn=nudged_empty_turn,
                     empty_nudge_count=empty_nudge_count,
                     empty_nudge_episode=empty_nudge_episode,
                     tool_result_episode=tool_result_episode,
                     last_tool_call=last_tool_call,
                     last_tool_result=last_tool_result,
                 )
-                nudged_empty_turn = transition.nudged_empty_turn
                 empty_nudge_count = transition.empty_nudge_count
                 empty_nudge_episode = transition.empty_nudge_episode
                 nudge_turn_pending = transition.nudge_turn_pending
