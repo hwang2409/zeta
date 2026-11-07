@@ -1309,6 +1309,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
         load_threads.append(threading.get_ident())
         original_load_full(candidate)
 
+    # test-contract: seam observe transcript loading across the async store boundary
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
 
     original_record_active_entry = ConversationStore._record_active_entry
@@ -2125,6 +2126,7 @@ def test_full_load_validates_the_final_branch_once(
         validations += 1
         original(self, entry)
 
+    # test-contract: seam count active-branch validation through a real store reopen
     monkeypatch.setattr(ConversationStore, "_record_active_entry", count_validation)
 
     reopened = ConversationStore(tmp_path, session_id="branch-rich", _read_only=True)
