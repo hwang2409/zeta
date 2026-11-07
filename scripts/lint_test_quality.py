@@ -26,6 +26,12 @@ CONTRACT_ERROR = (
 )
 CONTRACT_KINDS = {"complexity", "durability", "latency", "seam"}
 MIN_HANG_GUARD_SECONDS = 10
+AWAIT_DEADLINE_ERROR = (
+    "await without a deadline: use `await await_or_fail(x, what=...)` "
+    "(tests/support/owned.py), or asyncio.wait_for(x, 10)"
+)
+AWAIT_DEADLINE_CODE = "TQ004"
+RATCHET_PATH = Path("tests/test_quality_ratchet.txt")
 
 
 @dataclass(frozen=True)
@@ -280,10 +286,11 @@ def _mock_contract_assertion(node: ast.AST) -> bool:
     return False
 
 
-def _wait_for_timeout(node: ast.Call) -> float | None:
-    if _name(node.func) not in {"asyncio.wait_for", "wait_for"}:
+def _wait_timeout(node: ast.Call) -> float | None:
+    function = _name(node.func)
+    if function not in {"asyncio.wait_for", "wait_for", "await_or_fail"}:
         return None
-    if len(node.args) > 1:
+    if function in {"asyncio.wait_for", "wait_for"} and len(node.args) > 1:
         return _literal_number(node.args[1])
     for keyword in node.keywords:
         if keyword.arg == "timeout":
@@ -291,10 +298,28 @@ def _wait_for_timeout(node: ast.Call) -> float | None:
     return None
 
 
+def _keyword_is_true(node: ast.Call, name: str) -> bool:
+    return any(
+        keyword.arg == name
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in node.keywords
+    )
+
+
 def _timing_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Finding]:
     if isinstance(node, ast.Call):
-        timeout = _wait_for_timeout(node)
-        if timeout is not None and 0 < timeout < MIN_HANG_GUARD_SECONDS:
+        timeout = _wait_timeout(node)
+        short_override = (
+            _name(node.func) == "await_or_fail"
+            and _keyword_is_true(node, "allow_short")
+            and _has_marker(lines, node.lineno, {"latency"})
+        )
+        if (
+            timeout is not None
+            and 0 < timeout < MIN_HANG_GUARD_SECONDS
+            and not short_override
+        ):
             return [
                 Finding(
                     path, node.lineno, node.col_offset + 1, "TQ001", SHORT_TIMEOUT_ERROR
@@ -361,6 +386,113 @@ def _contract_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Find
     return [Finding(path, node.lineno, node.col_offset + 1, "TQ003", CONTRACT_ERROR)]
 
 
+def _enclosing_nodes(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> list[ast.AST]:
+    ancestors: list[ast.AST] = []
+    while node in parents:
+        node = parents[node]
+        ancestors.append(node)
+    return ancestors
+
+
+def _inside_timeout_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    return any(
+        isinstance(ancestor, ast.AsyncWith)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and _name(item.context_expr.func) in {"asyncio.timeout", "timeout"}
+            for item in ancestor.items
+        )
+        for ancestor in _enclosing_nodes(node, parents)
+    )
+
+
+def _inside_deadline_argument(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    child = node
+    for ancestor in _enclosing_nodes(node, parents):
+        if (
+            isinstance(ancestor, ast.Call)
+            and _name(ancestor.func)
+            in {
+                "asyncio.wait_for",
+                "wait_for",
+                "asyncio.timeout",
+                "timeout",
+                "await_or_fail",
+            }
+            and any(child is argument for argument in ancestor.args)
+        ):
+            return True
+        if isinstance(ancestor, (ast.stmt, ast.comprehension)):
+            return False
+        child = ancestor
+    return False
+
+
+def _support_function_implements_deadline(
+    path: Path, node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    if path.parts[:2] != ("tests", "support"):
+        return False
+    function = next(
+        (
+            ancestor
+            for ancestor in _enclosing_nodes(node, parents)
+            if isinstance(ancestor, (ast.AsyncFunctionDef, ast.FunctionDef))
+        ),
+        None,
+    )
+    if function is None:
+        return False
+    return any(
+        isinstance(part, ast.Call)
+        and _name(part.func)
+        in {
+            "asyncio.wait",
+            "asyncio.wait_for",
+            "asyncio.timeout",
+            "wait_for",
+            "timeout",
+            "await_or_fail",
+        }
+        for part in ast.walk(function)
+    )
+
+
+def _await_deadline_findings(
+    path: Path,
+    node: ast.AST,
+    lines: list[str],
+    parents: dict[ast.AST, ast.AST],
+) -> list[Finding]:
+    if not isinstance(node, ast.Await):
+        return []
+    value = node.value
+    violates = isinstance(value, (ast.Name, ast.Attribute)) or (
+        isinstance(value, ast.Call)
+        and (
+            _name(value.func) == "asyncio.gather"
+            or (isinstance(value.func, ast.Attribute) and value.func.attr == "wait")
+        )
+    )
+    if (
+        not violates
+        or _has_marker(lines, node.lineno, CONTRACT_KINDS)
+        or _inside_timeout_context(node, parents)
+        or _inside_deadline_argument(node, parents)
+        or _support_function_implements_deadline(path, node, parents)
+    ):
+        return []
+    return [
+        Finding(
+            path,
+            node.lineno,
+            node.col_offset + 1,
+            AWAIT_DEADLINE_CODE,
+            AWAIT_DEADLINE_ERROR,
+        )
+    ]
+
+
 def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
@@ -378,6 +510,11 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     lines = source.splitlines()
     literal_names = _literal_names(tree)
     serialized_names = _serialized_names(tree)
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
     findings: list[Finding] = []
     for node in ast.walk(tree):
         if not hasattr(node, "lineno") or not _touches_added_line(node, added):
@@ -385,6 +522,7 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
         findings.extend(_timing_findings(path, node, lines))
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
         findings.extend(_contract_findings(path, node, lines))
+        findings.extend(_await_deadline_findings(path, node, lines, parents))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
 
@@ -402,6 +540,62 @@ def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
     return sorted(
         findings, key=lambda item: (str(item.path), item.line, item.column, item.code)
     )
+
+
+def _function_at_line(tree: ast.AST, line: int) -> str:
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.lineno <= line <= (node.end_lineno or node.lineno)
+    ]
+    if not matches:
+        return "<module>"
+    return min(
+        matches, key=lambda node: (node.end_lineno or node.lineno) - node.lineno
+    ).name
+
+
+def finding_ratchet_key(root: Path, finding: Finding) -> str:
+    tree = ast.parse((root / finding.path).read_text(encoding="utf-8"))
+    return f"{finding.path}::{_function_at_line(tree, finding.line)}"
+
+
+def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Finding]:
+    root = Path.cwd() if root is None else root
+    findings: list[Finding] = []
+    trees: dict[Path, ast.AST] = {}
+    for source_path in sorted((root / "tests").rglob("*.py")):
+        path = source_path.relative_to(root)
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        trees[path] = tree
+        lines = source.splitlines()
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            findings.extend(_await_deadline_findings(path, node, lines, parents))
+    if not use_ratchet:
+        return findings
+    ratchet_path = root / RATCHET_PATH
+    ratchet = (
+        {
+            line.strip()
+            for line in ratchet_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        if ratchet_path.is_file()
+        else set()
+    )
+    return [
+        finding
+        for finding in findings
+        if f"{finding.path}::{_function_at_line(trees[finding.path], finding.line)}"
+        not in ratchet
+    ]
 
 
 def select_base(event_name: str, base_ref: str = "") -> str:
@@ -422,19 +616,22 @@ def main(argv: list[str] | None = None) -> int:
     if arguments[:1] == ["--base"] and len(arguments) in {2, 3}:
         print(select_base(arguments[1], arguments[2] if len(arguments) == 3 else ""))
         return 0
-    if len(arguments) != 1:
+    if arguments == ["--all"]:
+        findings = lint_all()
+    elif len(arguments) == 1:
+        diff = (
+            sys.stdin.read()
+            if arguments[0] == "-"
+            else Path(arguments[0]).read_text(encoding="utf-8")
+        )
+        findings = lint_diff(diff)
+    else:
         print(
-            "usage: lint_test_quality.py <unified-diff-path|-> | "
+            "usage: lint_test_quality.py <unified-diff-path|-> | --all | "
             "--base <pull_request|push> [base-ref]",
             file=sys.stderr,
         )
         return 2
-    diff = (
-        sys.stdin.read()
-        if arguments[0] == "-"
-        else Path(arguments[0]).read_text(encoding="utf-8")
-    )
-    findings = lint_diff(diff)
     for finding in findings:
         print(finding.render())
     return bool(findings)

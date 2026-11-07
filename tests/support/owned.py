@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager, ExitStack, asynccontextmanager
 from typing import TypeVar
+
+import pytest
 
 from zeta.tui.app import TUIApp
 
@@ -11,7 +13,7 @@ T = TypeVar("T")
 
 
 async def _cancel_and_drain(
-    tasks: list[asyncio.Task[object]],
+    tasks: list[asyncio.Future[object]],
     *,
     timeout: float = 10,
     what: str = "test tasks",
@@ -26,8 +28,42 @@ async def _cancel_and_drain(
     done, pending = await asyncio.wait(unique, timeout=timeout)
     await asyncio.gather(*done, return_exceptions=True)
     if pending:
-        names = ", ".join(sorted(task.get_name() for task in pending))
+        names = ", ".join(
+            sorted(
+                task.get_name() if isinstance(task, asyncio.Task) else repr(task)
+                for task in pending
+            )
+        )
         raise AssertionError(f"{what} did not stop within {timeout:g} s: {names}")
+
+
+async def await_or_fail[T](
+    awaitable: Awaitable[T],
+    *,
+    timeout: float = 10,
+    what: str,
+    allow_short: bool = False,
+) -> T:
+    if timeout < 10 and not allow_short:
+        raise ValueError("timeout must be at least 10 s")
+
+    future = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait([future], timeout=timeout)
+    if done:
+        return await future
+
+    timeout_error = TimeoutError(f"{what} did not finish within {timeout} s")
+    try:
+        await _cancel_and_drain([future], timeout=10, what=what)
+    except AssertionError as cleanup_error:
+        timeout_error.add_note(str(cleanup_error))
+    try:
+        pytest.fail(
+            f"hang: {what} did not finish within {timeout} s",
+            pytrace=False,
+        )
+    except pytest.fail.Exception as failure:
+        raise failure from timeout_error
 
 
 class AppOwner:

@@ -111,6 +111,92 @@ def test_time_rule_ignores_sleep_inside_child_process_script(tmp_path: Path) -> 
     assert _lint(tmp_path, source) == []
 
 
+@pytest.mark.parametrize(
+    ("statement", "line"),
+    [
+        ("await ready.wait()", 2),
+        ("await task", 2),
+        ("await owner.task", 2),
+        ("await asyncio.gather(first, second)", 2),
+    ],
+)
+def test_await_deadline_rule_rejects_unbounded_waits(
+    tmp_path: Path, statement: str, line: int
+) -> None:
+    source = f"async def test_wait():\n    {statement}\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", line)]
+    assert findings[0].message == (
+        "await without a deadline: use `await await_or_fail(x, what=...)` "
+        "(tests/support/owned.py), or asyncio.wait_for(x, 10)"
+    )
+
+
+def test_await_deadline_rule_catches_pr_765_original_bare_task_await(
+    tmp_path: Path,
+) -> None:
+    source = """async def test_wait_returns_terminal_state_after_kill_cancels_monitor():
+    waiter = asyncio.create_task(registry.wait(task_id))
+    status = await waiter
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 3)]
+
+
+def test_await_deadline_rule_catches_both_pr_772_notification_gates(
+    tmp_path: Path,
+) -> None:
+    source = """async def force_parent_tool_end_before_approval_end(event):
+    if event == "tool_end":
+        await parent_tool_end_release.wait()
+    elif event == "approval_end":
+        await approval_end_release.wait()
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ004", 3),
+        ("TQ004", 5),
+    ]
+
+
+def test_await_deadline_rule_accepts_supported_deadlines(tmp_path: Path) -> None:
+    source = """async def test_waits():
+    await asyncio.wait_for(ready.wait(), timeout=10)
+    async with asyncio.timeout(10):
+        await task
+    await await_or_fail(task, what="worker")
+"""
+
+    assert _lint(tmp_path, source) == []
+
+
+def test_await_deadline_rule_accepts_reasoned_marker(tmp_path: Path) -> None:
+    source = """async def test_waits():
+    # test-contract: seam no public event exposes worker readiness
+    await worker._ready
+"""
+
+    assert _lint(tmp_path, source) == []
+
+
+def test_short_await_or_fail_requires_latency_override(tmp_path: Path) -> None:
+    source = """async def test_waits():
+    await await_or_fail(task, timeout=1, what="worker")
+    # test-contract: latency verifies a real one-second product deadline
+    await await_or_fail(task, timeout=1, what="worker", allow_short=True)
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 2)]
+
+
 def test_digest_rule_rejects_real_action_policy_payload_hash(tmp_path: Path) -> None:
     source = """def test_existing_tool_payloads_match_pre_action_policy_snapshots():
     snapshots = {"schemas": existing_schemas, "codex": payload}
@@ -323,6 +409,37 @@ rename to tests/test_example.py
 """
 
     assert _lint(tmp_path, source, diff=diff) == []
+
+
+def test_all_mode_reads_function_ratchet(tmp_path: Path) -> None:
+    source = """async def test_existing_wait():
+    await task
+
+async def test_new_wait():
+    await other_task
+"""
+    target = tmp_path / "tests/test_example.py"
+    target.parent.mkdir()
+    target.write_text(source)
+    ratchet = tmp_path / quality.RATCHET_PATH
+    ratchet.write_text("tests/test_example.py::test_existing_wait\n")
+
+    findings = quality.lint_all(tmp_path)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 5)]
+
+
+def test_deadline_implementing_support_helper_is_not_flagged(tmp_path: Path) -> None:
+    path = "tests/support/waits.py"
+    source = """async def drain(task):
+    done, pending = await asyncio.wait([task], timeout=10)
+    await asyncio.gather(*done)
+"""
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_text(source)
+
+    assert lint_diff(_diff(path, source), tmp_path) == []
 
 
 def test_select_base_fetches_and_uses_pull_request_merge_base(monkeypatch) -> None:
