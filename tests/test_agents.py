@@ -156,15 +156,33 @@ def test_agent_snapshot_round_trip_keeps_project_source(tmp_path: Path) -> None:
     assert restored.find("custom").source == "project"
 
 
-def test_agent_snapshot_omits_body(tmp_path: Path) -> None:
+def test_agent_snapshot_commits_body(tmp_path: Path) -> None:
     path = tmp_path / "home" / "agents" / "custom.md"
     _write_agent(path, "custom", "custom", "original body")
     catalog = discover_session_agents(home=tmp_path / "home")
     snapshot = catalog.to_snapshot()
     custom_snapshot = next(item for item in snapshot if item["name"] == "custom")
 
-    assert "prompt_suffix" not in custom_snapshot
-    assert "original body" not in str(custom_snapshot)
+    assert custom_snapshot["prompt_suffix"] == "original body"
+    assert AgentCatalog.from_snapshot(snapshot).find("custom").prompt_suffix == (
+        "original body"
+    )
+
+
+def test_legacy_agent_snapshot_cannot_be_republished_with_empty_body(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "home" / "agents" / "custom.md"
+    _write_agent(path, "custom", "custom", "original body")
+    snapshot = discover_session_agents(home=tmp_path / "home").to_snapshot()
+    for item in snapshot:
+        item.pop("prompt_suffix")
+
+    restored = AgentCatalog.from_snapshot(snapshot)
+
+    assert restored.find("custom").prompt_suffix == ""
+    with pytest.raises(ValueError, match="does not contain committed profile bodies"):
+        restored.to_snapshot()
 
 
 def test_custom_agent_can_accept_follow_ups(tmp_path: Path) -> None:

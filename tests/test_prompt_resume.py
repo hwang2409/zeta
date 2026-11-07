@@ -12,14 +12,17 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
+from zeta.core.session_files import SessionError
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.prompt_resume import ResumedPrompt, resume_prompt
 from zeta.skills import SkillCatalog
-from zeta.skills.agent_catalog import AgentCatalog
+from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
 from zeta.tools import ToolRegistry
 
 
@@ -264,6 +267,148 @@ def test_conservative_resume_discovers_new_agent_profile(tmp_path: Path) -> None
     assert manager.read_metadata(session_id).agent_catalog == (
         resumed.agent_catalog.to_snapshot()
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resume_child_uses_committed_profile_body(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manager, session_id = await asyncio.to_thread(
+        _manager_with_prompt,
+        home,
+        tmp_path,
+        system_prompt="unknown recipe prompt bytes",
+        prompt_recipe=None,
+    )
+    _write_agent(home / "agents" / "specialist.md", name="specialist")
+    first_opened = await asyncio.to_thread(manager.open, session_id)
+    second_opened = None
+    loop = None
+    try:
+        first = await asyncio.to_thread(
+            resume_prompt,
+            first_opened.metadata,
+            manager=manager,
+            store=first_opened.store,
+            home=home,
+            repo_root=tmp_path,
+            inbox_enabled=False,
+        )
+        second_opened = await asyncio.to_thread(manager.open, session_id)
+        second = await asyncio.to_thread(
+            resume_prompt,
+            second_opened.metadata,
+            manager=manager,
+            store=second_opened.store,
+            home=home,
+            repo_root=tmp_path,
+            inbox_enabled=False,
+        )
+
+        assert first.agent_catalog.find("specialist").prompt_suffix == "agent body"
+        assert second.agent_catalog.find("specialist").prompt_suffix == "agent body"
+
+        backend = FakeBackend(
+            [
+                ScriptedTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "specialist-1",
+                            "agent",
+                            {
+                                "prompt": "inspect the task",
+                                "description": "specialist task",
+                                "preset": "specialist",
+                            },
+                        )
+                    ]
+                ),
+                ScriptedTurn([TextContent("child complete")]),
+            ]
+        )
+        registry = ToolRegistry(
+            tmp_path,
+            session_store=second_opened.store,
+            skill_catalog=second.skill_catalog,
+            agent_catalog=second.agent_catalog,
+        )
+        loop = AgentLoop(
+            backend,
+            second_opened.store,
+            registry=registry,
+            max_turns=1,
+            system_prompt=second.context.system_prompt,
+            skill_catalog=second.skill_catalog,
+        )
+        _ = [
+            event
+            async for event in loop.run_turn("start", origin=MessageOrigin.USER)
+        ]
+
+        assert len(backend.calls) == 2
+        child_system = backend.calls[1][0][0]
+        assert any(
+            isinstance(block, TextContent) and "agent body" in block.text
+            for block in child_system.content
+        )
+    finally:
+        if loop is not None:
+            await loop.close()
+        if second_opened is not None:
+            second_opened.store.close()
+        first_opened.store.close()
+
+
+def test_legacy_agent_catalog_requires_old_runtime_restart(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "specialist.md"
+    _write_agent(profile, name="specialist")
+    catalog = discover_session_agents(home=home)
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=tmp_path,
+        system_prompt="unknown recipe prompt bytes",
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+        prompt_recipe=None,
+        auto_project=False,
+    )
+    metadata = opened.metadata
+    opened.store.close()
+    assert metadata.agent_catalog is not None
+    for item in metadata.agent_catalog:
+        item.pop("prompt_suffix")
+    manager._write(metadata)
+
+    old_runtime = manager.open(metadata.session_id)
+    old_runtime.store.activate_runtime_lease()
+    adopter = manager.open(metadata.session_id)
+    try:
+        with pytest.raises(
+            SessionError,
+            match="close the other runtime and resume again",
+        ):
+            resume_prompt(
+                adopter.metadata,
+                manager=manager,
+                store=adopter.store,
+                home=home,
+                repo_root=tmp_path,
+                inbox_enabled=False,
+            )
+    finally:
+        adopter.store.close()
+        old_runtime.store.close()
+
+    resumed = _resume(manager, metadata.session_id, home, tmp_path, lambda **kwargs: None)
+
+    assert resumed.agent_catalog.find("specialist").prompt_suffix == "agent body"
+    saved = manager.read_metadata(metadata.session_id)
+    assert saved.agent_catalog is not None
+    assert all("prompt_suffix" in item for item in saved.agent_catalog)
 
 
 @pytest.mark.parametrize("prompt_recipe", [None, "default"])
