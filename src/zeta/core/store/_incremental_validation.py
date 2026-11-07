@@ -126,6 +126,7 @@ class IncrementalValidationMixin:
             staged._active_notification_delivery_message
         )
         self._active_last_message = staged._active_last_message
+        self._active_last_turn_end = staged._active_last_turn_end
         self._task_notification_ids = staged._task_notification_ids
         self._sent_message_receipts = staged._sent_message_receipts
         # Publish entries last so readers never see rows without matching indexes.

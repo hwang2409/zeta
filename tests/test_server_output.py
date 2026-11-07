@@ -14,7 +14,8 @@ import pytest
 from tests import test_server_websocket as websocket
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import TIMEOUT, _socket_path
-from zeta.protocol.types import TextContent
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
 from zeta.server import connections as connections_module
 from zeta.server.server import _Client
@@ -690,7 +691,9 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
         await server.close()
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 10
+        )
 
 
 @pytest.mark.asyncio
@@ -916,6 +919,65 @@ async def test_status_outcome_follows_active_branch_and_connection_feature(
 
 
 @pytest.mark.asyncio
+async def test_status_projects_foreign_turn_end_after_resident_append(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        port=None,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server, "unix", "controller")
+    foreign: ConversationStore | None = None
+    try:
+        await _rpc(
+            reader,
+            writer,
+            "unix",
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["served_turn_end"],
+            },
+        )
+        created = await _rpc(
+            reader,
+            writer,
+            "unix",
+            2,
+            "new_session",
+            {"provider": "codex"},
+        )
+        session_id = created["result"]["session"]["session_id"]
+        assert server.runtime.opened is not None
+        resident = server.runtime.opened.store
+        foreign = ConversationStore(resident.root_dir, session_id=session_id)
+        await foreign.append_turn_end_async("1" * 32, "error")
+
+        resident.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("resident append")])
+        )
+
+        status = (await _rpc(reader, writer, "unix", 3, "status"))["result"]
+        assert status["last_turn_outcome"] == {
+            "turn_id": "1" * 32,
+            "reason": "error",
+        }
+    finally:
+        if foreign is not None:
+            foreign.close()
+        writer.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["unix", "websocket"])
 async def test_observer_status_rejects_session_swap_snapshot(
     tmp_path: Path,
@@ -935,6 +997,7 @@ async def test_observer_status_rejects_session_swap_snapshot(
         server, transport, "controller"
     )
     observer_writer: asyncio.StreamWriter | None = None
+    stale: asyncio.Task[dict[str, Any]] | None = None
     release_projection = threading.Event()
     try:
         await _rpc(
@@ -995,7 +1058,9 @@ async def test_observer_status_rejects_session_swap_snapshot(
 
         def gated_project_status(target: object, **kwargs: object) -> dict[str, Any]:
             projection_started.set()
-            release_projection.wait()
+            assert release_projection.wait(timeout=10), (
+                "status projection was not released"
+            )
             return original_project_status(target, **kwargs)
 
         # test-contract: seam pauses the off-loop projection after capture
@@ -1003,7 +1068,24 @@ async def test_observer_status_rejects_session_swap_snapshot(
         stale = asyncio.create_task(
             _rpc(observer_reader, observer_writer, transport, 6, "status")
         )
-        await asyncio.to_thread(projection_started.wait)
+        try:
+            projection_ready = await asyncio.wait_for(
+                asyncio.to_thread(projection_started.wait, 10), TIMEOUT
+            )
+        except TimeoutError:
+            release_projection.set()
+            stale.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(stale, return_exceptions=True), 10
+            )
+            raise
+        if not projection_ready:
+            release_projection.set()
+            stale.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(stale, return_exceptions=True), 10
+            )
+            pytest.fail("status projection did not start")
         session_b = (
             await _rpc(
                 controller_reader,
@@ -1025,6 +1107,11 @@ async def test_observer_status_rejects_session_swap_snapshot(
         assert fresh["last_turn_outcome"] is None
     finally:
         release_projection.set()
+        if stale is not None:
+            stale.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(stale, return_exceptions=True), 10
+            )
         controller_writer.close()
         if observer_writer is not None:
             observer_writer.close()

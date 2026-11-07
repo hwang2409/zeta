@@ -674,7 +674,9 @@ With the negotiated `served_turn_end` feature, the result also contains
 outcome. Otherwise it contains the last outcome on that branch as
 `{"turn_id": string, "reason": string}`. Each status result is authoritative for
 the reported session and active branch, so clients replace any cached value even
-when the new value is `null`. The reason mapping is:
+when the new value is `null`. Like other serve reads, `last_turn_outcome` reflects
+the server's resident session state and is current for turns this server ran. The
+reason mapping is:
 
 | user-facing semantic | wire reason |
 | --- | --- |

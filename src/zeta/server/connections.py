@@ -826,15 +826,14 @@ def project_status(target: object, *, served_turn_end: bool = False) -> dict[str
         store.compaction_marker_count() if store is not None else 0
     )
     if served_turn_end:
+        outcome = None
         entry = store.last_turn_end() if store is not None else None
-        status["last_turn_outcome"] = (
-            {
+        if entry is not None:
+            outcome = {
                 "turn_id": entry.data["turn_id"],
                 "reason": entry.data["reason"],
             }
-            if entry is not None
-            else None
-        )
+        status["last_turn_outcome"] = outcome
     return status
 
 
