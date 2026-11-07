@@ -17,6 +17,7 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..attention_decisions import DecisionItem
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
@@ -111,76 +112,128 @@ class ServerSlashSession:
 
     async def slash_decisions(self, args: str) -> str:
         from ..attention_decisions import open_decisions
-        from ..attention_replies import AttentionReplies
 
-        loop = self._runtime.loop
-        opened = self._runtime.opened
-        if loop is None or opened is None:
-            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
-        command, separator, remainder = args.strip().partition(" ")
-        parts = [command]
-        if separator:
-            parts.extend([remainder] if command == "batch" else remainder.split(maxsplit=1))
+        _loop, opened = self._active_loop_and_session()
+        command, _, remainder = args.strip().partition(" ")
         registry_state = self._runtime.manager.project_registry_state
-        recovered = await asyncio.to_thread(
-            AttentionReplies(self._runtime.home, opened.metadata.session_id, registry_state=registry_state).recover
+        if command == "batch":
+            return await self._slash_decisions_batch(
+                remainder, opened.metadata.session_id
+            )
+        if command in {"dismiss", "reply"}:
+            items = await asyncio.to_thread(
+                open_decisions,
+                self._runtime.home,
+                opened.metadata.session_id,
+                registry_state,
+            )
+            return await self._slash_decisions_action(
+                command, remainder, items, opened.metadata.session_id
+            )
+        outcome = await asyncio.to_thread(
+            self._attention_replies(opened.metadata.session_id).recover
         )
-        if recovered.published:
-            await loop._check_project_inbox()
+        await self._check_attention_outcome(outcome)
         items = await asyncio.to_thread(
             open_decisions,
             self._runtime.home,
             opened.metadata.session_id,
             registry_state,
         )
-        if parts and parts[0] == "batch":
-            if len(parts) != 2:
-                return "usage: /decisions batch <json array>"
-            try:
-                submitted = json.loads(parts[1])
-                if not isinstance(submitted, list):
-                    raise TypeError
-                batch = [(item["id"], item["reply"]) for item in submitted]
-                if (
-                    any(not isinstance(item_id, str) or not isinstance(reply, str) for item_id, reply in batch)
-                    or len({item_id for item_id, _ in batch}) != len(batch)
-                ):
-                    raise TypeError
-            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                return "batch must be a JSON array of objects with id and reply"
-            await asyncio.to_thread(
-                AttentionReplies(self._runtime.home, opened.metadata.session_id, registry_state=registry_state).stage_and_flush,
-                batch,
-                opened.metadata.session_id,
-            )
-            await loop._check_project_inbox()
-            return f"replied to {len(batch)} attention item(s)"
-        if parts and parts[0] in {"dismiss", "reply"}:
-            if len(parts) < 2:
-                return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
-            item = next((item for item in items if item.record.id == parts[1]), None)
-            if item is None:
-                return "attention item not found"
-            replies = AttentionReplies(self._runtime.home, item.session_id, registry_state=registry_state)
-            if parts[0] == "dismiss":
-                await asyncio.to_thread(replies.dismiss, item.record.id)
-                return f"dismissed {item.record.id}"
-            if len(parts) < 3 or not parts[2].strip():
-                return "reply text must be nonempty"
-            await asyncio.to_thread(
-                replies.reply,
-                item.record.id,
-                parts[2],
-                opened.metadata.session_id,
-            )
-            await loop._check_project_inbox()
-            return f"replied to {item.record.id}"
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
             f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
             for item in items
         )
+
+    def _active_loop_and_session(self):
+        loop = self._runtime.loop
+        opened = self._runtime.opened
+        if loop is None or opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        return loop, opened
+
+    def _attention_replies(self, session_id: str):
+        from ..attention_replies import AttentionReplies
+
+        return AttentionReplies(
+            self._runtime.home,
+            session_id,
+            registry_state=self._runtime.manager.project_registry_state,
+        )
+
+    async def _check_attention_outcome(self, outcome) -> None:
+        if outcome.published:
+            loop, _opened = self._active_loop_and_session()
+            await loop._check_project_inbox()
+
+    async def _slash_decisions_batch(self, payload: str, from_session: str) -> str:
+        if not payload:
+            return "usage: /decisions batch <json array>"
+        try:
+            submitted = json.loads(payload)
+            if not isinstance(submitted, list):
+                raise TypeError
+            batch = [(item["id"], item["reply"]) for item in submitted]
+            if any(
+                not isinstance(item_id, str) or not isinstance(reply, str)
+                for item_id, reply in batch
+            ) or len({item_id for item_id, _ in batch}) != len(batch):
+                raise TypeError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return "batch must be a JSON array of objects with id and reply"
+        return await self._run_decisions_batch(batch, from_session)
+
+    async def _run_decisions_batch(
+        self, batch: list[tuple[str, str]], from_session: str
+    ) -> str:
+        from ..attention_replies import ReplyConflict
+
+        try:
+            outcome = await asyncio.to_thread(
+                self._attention_replies(from_session).stage_and_flush,
+                batch,
+                from_session,
+            )
+        except ReplyConflict as exc:
+            await self._check_attention_outcome(exc.outcome)
+            raise
+        await self._check_attention_outcome(outcome)
+        return f"replied to {len(batch)} attention item(s)"
+
+    async def _slash_decisions_action(
+        self,
+        command: str,
+        remainder: str,
+        items: tuple[DecisionItem, ...],
+        from_session: str,
+    ) -> str:
+        from ..attention_replies import ReplyConflict
+
+        attention_id, separator, reply = remainder.partition(" ")
+        if not attention_id:
+            return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
+        item = next((item for item in items if item.record.id == attention_id), None)
+        if item is None:
+            return "attention item not found"
+        replies = self._attention_replies(item.session_id)
+        try:
+            if command == "dismiss":
+                outcome = await asyncio.to_thread(replies.dismiss, item.record.id)
+                text = f"dismissed {item.record.id}"
+            else:
+                if not separator or not reply.strip():
+                    return "reply text must be nonempty"
+                outcome = await asyncio.to_thread(
+                    replies.reply, item.record.id, reply, from_session
+                )
+                text = f"replied to {item.record.id}"
+        except ReplyConflict as exc:
+            await self._check_attention_outcome(exc.outcome)
+            raise
+        await self._check_attention_outcome(outcome)
+        return text
 
     def slash_status_command(self, args: str) -> str | Awaitable[str]:
         del args
@@ -479,7 +532,11 @@ async def run_command(
     command = registry.command_for(name)
     if command is not None and not registry.available(command):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    if command is not None and command.serve is not None and command.serve.mutates(tail):
+    if (
+        command is not None
+        and command.serve is not None
+        and command.serve.mutates(tail)
+    ):
         ergonomics.require_mutable(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
@@ -495,9 +552,7 @@ async def run_command(
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(
-        runtime, approval_control, run_blocking=run_blocking
-    )
+    session = ServerSlashSession(runtime, approval_control, run_blocking=run_blocking)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}

@@ -89,9 +89,11 @@ class DecisionsMixin:
         from ...attention_replies import AttentionReplies
 
         parts = args.split(maxsplit=2)
-        recovered = await DecisionsMixin._recover_decisions(self, self._decisions_session_id)
-        if recovered.published:
-            self._schedule_background_wake()
+        if not parts or parts[0] not in {"reply", "dismiss"}:
+            recovered = await DecisionsMixin._recover_decisions(
+                self, self._decisions_session_id
+            )
+            DecisionsMixin._wake_for_attention_outcome(self, recovered)
         items = await asyncio.to_thread(
             open_decisions,
             self._home,
@@ -107,20 +109,22 @@ class DecisionsMixin:
             )
             if record is None:
                 return "attention item not found"
+            replies = AttentionReplies(
+                self._home,
+                record.session_id,
+                registry_state=_registry_state(self),
+            )
             if parts[0] == "dismiss":
-                await asyncio.to_thread(
-                    AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self)).dismiss,
-                    attention_id,
-                )
+                await self._run_attention_operation(replies.dismiss, attention_id)
                 return f"dismissed {attention_id}"
             if len(parts) < 3 or not parts[2].strip():
                 return "reply text must be nonempty"
-            _message_id, already_resolved = await asyncio.to_thread(
-                AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self)).reply,
-                record.id, parts[2], self.loop.store.session_id,
+            await self._run_attention_operation(
+                replies.reply,
+                record.id,
+                parts[2],
+                self.loop.store.session_id,
             )
-            if not already_resolved:
-                self._schedule_background_wake()
             return f"replied to {attention_id}"
         if not items:
             return "no open attention items"
@@ -185,6 +189,21 @@ class DecisionsMixin:
             ).recover
         )
 
+    def _wake_for_attention_outcome(self, outcome) -> None:
+        if outcome.published:
+            self._schedule_background_wake()
+
+    async def _run_attention_operation(self, operation, *args, **kwargs):
+        from ...attention_replies import ReplyConflict
+
+        try:
+            outcome = await asyncio.to_thread(operation, *args, **kwargs)
+        except ReplyConflict as exc:
+            self._wake_for_attention_outcome(exc.outcome)
+            raise
+        self._wake_for_attention_outcome(outcome)
+        return outcome
+
     def open_decisions_panel(self) -> asyncio.Task[None]:
         return asyncio.create_task(self._open_decisions_panel())
 
@@ -193,8 +212,7 @@ class DecisionsMixin:
         if not isinstance(session, FullScreenPromptSession):
             return
         recovered = await self._recover_decisions(self._decisions_session_id)
-        if recovered.published:
-            self._schedule_background_wake()
+        self._wake_for_attention_outcome(recovered)
         await self._decisions_tick()
         if self._decisions_panel_open:
             return
@@ -229,12 +247,14 @@ class DecisionsMixin:
 
         try:
             for session_id in self._decisions_session_ids():
-                result = await asyncio.to_thread(
-                    AttentionReplies(self._home, session_id, registry_state=_registry_state(self)).flush,
+                await self._run_attention_operation(
+                    AttentionReplies(
+                        self._home,
+                        session_id,
+                        registry_state=_registry_state(self),
+                    ).flush,
                     self.loop.store.session_id,
                 )
-                if result.published:
-                    self._schedule_background_wake()
         except (OSError, ValueError) as exc:
             self._print_system(f"decisions not delivered: {exc}")
 
@@ -336,28 +356,30 @@ class DecisionsMixin:
         record = item.record
 
         async def run() -> None:
-            from ...attention_replies import AttentionReplies
+            from ...attention_replies import AttentionReplies, ReplyConflict
 
-            published = False
+            item_ids = {
+                panel_item.record.id
+                for panel_item in self._decisions_panel.items
+                if panel_item.session_id == record.session_id
+            }
             try:
-                replies = AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self))
-                recovered = await self._recover_decisions(record.session_id)
-                published = recovered.published
-                await asyncio.to_thread(replies.stage, record.id, decision)
-                staged = await self._recover_decisions(record.session_id)
-                published = published or staged.published
-                item_ids = {
-                    item.record.id
-                    for item in self._decisions_panel.items
-                    if item.session_id == record.session_id
-                }
-                if item_ids <= {item_id for item_id, _reply in staged.staged}:
-                    result = await asyncio.to_thread(replies.flush, self.loop.store.session_id)
-                    published = published or result.published
+                replies = AttentionReplies(
+                    self._home,
+                    record.session_id,
+                    registry_state=_registry_state(self),
+                )
+                await self._run_attention_operation(
+                    replies.stage,
+                    record.id,
+                    decision,
+                    flush_ids=item_ids,
+                    from_session=self.loop.store.session_id,
+                )
+            except ReplyConflict as exc:
+                self._print_system(f"decision not delivered: {exc}")
             except (OSError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
-            if published:
-                self._schedule_background_wake()
             await self._decisions_tick()
             self._refresh_decisions_panel()
 
@@ -370,18 +392,19 @@ class DecisionsMixin:
             return
 
         async def run() -> None:
-            from ...attention_replies import AttentionReplies
+            from ...attention_replies import AttentionReplies, ReplyConflict
 
-            published = False
             try:
-                replies = AttentionReplies(self._home, item.session_id, registry_state=_registry_state(self))
-                recovered = await self._recover_decisions(item.session_id)
-                published = recovered.published
-                await asyncio.to_thread(replies.dismiss, item.record.id)
+                replies = AttentionReplies(
+                    self._home,
+                    item.session_id,
+                    registry_state=_registry_state(self),
+                )
+                await self._run_attention_operation(replies.dismiss, item.record.id)
+            except ReplyConflict as exc:
+                self._print_system(f"attention not dismissed: {exc}")
             except (OSError, ValueError) as exc:
                 self._print_system(f"attention not dismissed: {exc}")
-            if published:
-                self._schedule_background_wake()
             await self._decisions_tick()
 
         asyncio.create_task(run())

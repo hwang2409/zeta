@@ -77,8 +77,10 @@ def test_information_item_dismisses_without_reply(tmp_path: Path) -> None:
     from zeta.attention_replies import AttentionReplies
 
     replies = AttentionReplies(tmp_path, opened.store.session_id)
-    assert not replies.dismiss(record.id)
-    assert replies.dismiss(record.id)
+    first = replies.dismiss(record.id)
+    second = replies.dismiss(record.id)
+    assert first.items[0].status == "applied"
+    assert second.already_resolved
     dismissed = store.get(record.id)
     assert dismissed.status == "resolved" and dismissed.decision is None
     opened.store.close()

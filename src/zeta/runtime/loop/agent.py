@@ -577,6 +577,10 @@ class AgentLoop(
             )
         )
 
+    async def _check_attention_outcome(self, outcome: Any) -> None:
+        if outcome.published:
+            await self._check_project_inbox()
+
     async def activate(self) -> None:
         """Run frontend startup hooks after the frontend installs its sinks."""
 
@@ -596,8 +600,7 @@ class AgentLoop(
             ).recover
         )
         await self._ensure_step_delivery()
-        if recovered.published:
-            await self._check_project_inbox()
+        await self._check_attention_outcome(recovered)
         for item in self._pending_task_recovery:
             await self.tool_registry.background_tasks._notify_exit(
                 item.task_id,

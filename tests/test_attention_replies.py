@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from zeta import attention_replies
 from zeta.attention_records import AttentionRecord, AttentionStore
 from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
@@ -113,7 +115,9 @@ def _fail_once(kind: str) -> BaseException:
     return RuntimeError("injected crash")
 
 
-def test_popup_stage_syncs_contents_before_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_popup_stage_syncs_contents_before_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     fixture = _fixture(tmp_path, count=1)
     events: list[tuple[str, str]] = []
     real_sync = AttentionReplies._sync_file
@@ -123,7 +127,9 @@ def test_popup_stage_syncs_contents_before_rename(tmp_path: Path, monkeypatch: p
         events.append(("sync", path.name))
         real_sync(path)
 
-    def replace(source: object, destination: object, *args: object, **kwargs: object) -> None:
+    def replace(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
         if Path(destination).parent.name == "staged":
             events.append(("rename", Path(destination).name))
         real_replace(source, destination, *args, **kwargs)
@@ -132,7 +138,9 @@ def test_popup_stage_syncs_contents_before_rename(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(AttentionReplies, "_sync_file", staticmethod(sync))
     monkeypatch.setattr(os, "replace", replace)
     fixture.replies.stage(fixture.records[0].id, "durable answer")
-    rename_index = next(index for index, event in enumerate(events) if event[0] == "rename")
+    rename_index = next(
+        index for index, event in enumerate(events) if event[0] == "rename"
+    )
     # test-contract: durability verify the private file barrier precedes atomic staging rename
     assert any(kind == "sync" for kind, _name in events[:rename_index])
 
@@ -153,6 +161,22 @@ def test_attention_reply_behavior_on_pre_batch_surface(
     fixture.replies.stage(record.id, "popup answer")
     with pytest.raises(ValueError, match="TUI decisions popup"):
         fixture.replies.reply(record.id, "different answer", fixture.session_id)
+
+
+_OPERATIONS = (
+    "stage",
+    "flush",
+    "reply",
+    "dismiss",
+    "stage_and_flush",
+    "resolve_local",
+    "recover",
+)
+_CONCURRENT_ROWS = [
+    f"concurrent-seal-{operation}-{selection}"
+    for operation in _OPERATIONS
+    for selection in ("unrelated", "selected")
+]
 
 
 _FAULT_ROWS = [
@@ -177,6 +201,7 @@ _FAULT_ROWS = [
     "case",
     [
         "success",
+        *_CONCURRENT_ROWS,
         *_FAULT_ROWS,
         "publish-body",
         "publish-record",
@@ -193,6 +218,81 @@ def test_attention_replies_public_table(
     """Exercise durable reply outcomes only through the public AttentionReplies API."""
     fixture = _fixture(tmp_path, count=3)
     replies = fixture.replies
+
+    if case.startswith("concurrent-seal-"):
+        operation, selection = case.removeprefix("concurrent-seal-").rsplit("-", 1)
+        sealed = fixture.records[0]
+        target = sealed if selection == "selected" else fixture.records[1]
+        if operation == "flush":
+            target = fixture.records[1]
+            replies.stage(target.id, "target")
+        if operation == "dismiss":
+            _make_information_item(fixture, target)
+        real_lock = replies._lock
+        injected = False
+
+        @contextmanager
+        def seal_before_lock() -> Any:
+            nonlocal injected
+            if not injected:
+                injected = True
+                sealer = AttentionReplies(fixture.home, fixture.session_id)
+
+                def stop_after_seal(_journal: Path) -> None:
+                    raise RuntimeError("leave journal sealed")
+
+                sealer._send_journal = stop_after_seal  # type: ignore[method-assign]
+                with pytest.raises(RuntimeError, match="leave journal sealed"):
+                    sealer.reply(sealed.id, "sealed", fixture.answerer_session_id)
+            with real_lock():
+                yield
+
+        replies._lock = seal_before_lock  # type: ignore[method-assign]
+        if operation == "stage":
+            outcome = replies.stage(
+                target.id, "sealed" if target is sealed else "target"
+            )
+        elif operation == "flush":
+            outcome = replies.flush(fixture.answerer_session_id)
+        elif operation == "reply":
+            outcome = replies.reply(
+                target.id,
+                "sealed" if target is sealed else "target",
+                fixture.answerer_session_id,
+            )
+        elif operation == "dismiss":
+            outcome = replies.dismiss(target.id)
+        elif operation == "stage_and_flush":
+            outcome = replies.stage_and_flush(
+                [(target.id, "sealed" if target is sealed else "target")],
+                fixture.answerer_session_id,
+            )
+        elif operation == "resolve_local":
+            outcome = replies.resolve_local(
+                target.id, "sealed" if target is sealed else "target"
+            )
+        else:
+            assert operation == "recover"
+            outcome = replies.recover()
+        assert outcome is not None, "terminal operation lost its recovery publication"
+        assert hasattr(outcome, "published"), (
+            "terminal operation lost its recovery publication"
+        )
+        assert outcome.published, "terminal operation lost its recovery publication"
+
+        class WakeAdapter:
+            def __init__(self) -> None:
+                self.count = 0
+
+            def _schedule_background_wake(self) -> None:
+                self.count += 1
+
+        from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin
+
+        adapter = WakeAdapter()
+        DecisionsMixin._wake_for_attention_outcome(adapter, outcome)
+        assert adapter.count == 1
+        return
 
     if case == "success":
         values = _stage_all(fixture)
@@ -397,10 +497,9 @@ def test_attention_replies_public_table(
         replies.flush(fixture.session_id)
         first = fixture.replies.recover()
         second = fixture.replies.recover()
-        message_id, already = fixture.replies.reply(
-            record.id, "same", fixture.session_id
-        )
-        assert already and message_id == fixture.inbox_messages()[0]["id"]
+        outcome = fixture.replies.reply(record.id, "same", fixture.session_id)
+        assert outcome.already_resolved
+        assert outcome.message_id == fixture.inbox_messages()[0]["id"]
         assert first.staged == second.staged == ()
         assert len(fixture.inbox_messages()) == 1
         return
@@ -416,8 +515,12 @@ def test_attention_replies_public_table(
             lambda: replies.dismiss(popup.id),
             lambda: replies.stage_and_flush([(popup.id, "other")], fixture.session_id),
         ):
-            with pytest.raises(ValueError, match="TUI decisions popup"):
+            with pytest.raises(
+                attention_replies.ReplyConflict, match="TUI decisions popup"
+            ) as raised:
                 operation()
+            assert raised.value.outcome.items[0].status == "conflict"
+            assert not raised.value.outcome.published
         replies.reply(immediate.id, "unrelated", fixture.session_id)
         replies.dismiss(dismissed.id)
         after = {path.name: path.read_bytes() for path in staged_dir.iterdir()}
@@ -499,8 +602,10 @@ def test_attention_replies_public_table(
     assert case == "dismiss-information"
     record = fixture.records[0]
     _make_information_item(fixture, record)
-    assert not replies.dismiss(record.id)
-    assert replies.dismiss(record.id)
+    first = replies.dismiss(record.id)
+    second = replies.dismiss(record.id)
+    assert first.items[0].status == "applied"
+    assert second.already_resolved
     resolved = AttentionStore(fixture.home / "sessions" / fixture.session_id).get(
         record.id
     )

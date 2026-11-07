@@ -41,28 +41,31 @@ async def _resolve_attention(
         directory_fd=store.directory_fd,
         registry_state=state,
     )
-    message_id, already_resolved = await asyncio.to_thread(
+    outcome = await asyncio.to_thread(
         AttentionReplies(home, validated.record.session_id, registry_state=state).reply,
         validated.record.id,
         arguments["decision"],
         store.session_id,
     )
     record = await asyncio.to_thread(
-        AttentionStore(home / "sessions" / validated.record.session_id).get, validated.record.id
+        AttentionStore(home / "sessions" / validated.record.session_id).get,
+        validated.record.id,
     )
-    if already_resolved:
+    if outcome.already_resolved:
         return _success_result(
-            text_block(f"Decision was already delivered ({message_id})."),
+            text_block(f"Decision was already delivered ({outcome.message_id})."),
             structured_content={
-                "message_id": message_id,
+                "message_id": outcome.message_id,
                 "already_resolved": True,
                 "decision": record.decision,
             },
         )
     return _success_result(
-        text_block(f"Decision delivered to the original session ({message_id})."),
+        text_block(
+            f"Decision delivered to the original session ({outcome.message_id})."
+        ),
         structured_content={
-            "message_id": message_id,
+            "message_id": outcome.message_id,
             "already_resolved": False,
             "decision": record.decision,
         },
@@ -74,12 +77,17 @@ async def _close_attention(
 ) -> StructuredToolResult:
     store = registry.session_store
     home = store.session_dir.parent.parent
-    already_resolved = await asyncio.to_thread(
-        AttentionReplies(home, store.session_id, registry_state=registry.project_registry_state).resolve_local,
-        arguments["attention_id"], arguments["decision"],
+    outcome = await asyncio.to_thread(
+        AttentionReplies(
+            home, store.session_id, registry_state=registry.project_registry_state
+        ).resolve_local,
+        arguments["attention_id"],
+        arguments["decision"],
     )
-    record = await asyncio.to_thread(AttentionStore(store.session_dir).get, arguments["attention_id"])
-    if already_resolved:
+    record = await asyncio.to_thread(
+        AttentionStore(store.session_dir).get, arguments["attention_id"]
+    )
+    if outcome.already_resolved:
         return _success_result(
             text_block(f"Decision was already resolved ({record.id})."),
             structured_content={
