@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import os
 from itertools import pairwise
 from typing import NotRequired, TypedDict
 
 from ...protocol.types import StructuredToolResult
-from .._atomic_replace import ConcurrentFileChangeError, atomic_replace
+from .._atomic_replace import (
+    ConcurrentFileChangeError,
+    atomic_replace,
+    run_file_worker,
+)
 from .._shared.sandbox import _path_from_fd, open_target
 from ..registry import (
     AbortSignal,
@@ -55,6 +58,7 @@ def _edit_target(
     replacements: list[tuple[str, str]],
     *,
     batch: bool,
+    abort_signal: AbortSignal,
     execution_context: ToolExecutionContext,
 ) -> StructuredToolResult:
     try:
@@ -112,6 +116,7 @@ def _edit_target(
                 file_descriptor,
                 path,
                 updated_bytes,
+                abort_signal,
                 expected_digest=hashlib.sha256(content_bytes).digest(),
             )
         except ConcurrentFileChangeError as exc:
@@ -137,7 +142,7 @@ def _edit_target(
 async def _edit(
     registry: ToolRegistry,
     arguments: EditArguments,
-    _abort_signal: AbortSignal,
+    abort_signal: AbortSignal,
     *,
     execution_context: ToolExecutionContext,
 ) -> StructuredToolResult:
@@ -157,13 +162,15 @@ async def _edit(
             )
         replacements = [(edit["old_string"], edit["new_string"]) for edit in batch]
 
-    return await asyncio.to_thread(
+    return await run_file_worker(
         _edit_target,
         registry,
         arguments["path"],
         replacements,
         batch=batch is not None,
+        abort_signal=abort_signal,
         execution_context=execution_context,
+        signal=abort_signal,
     )
 
 

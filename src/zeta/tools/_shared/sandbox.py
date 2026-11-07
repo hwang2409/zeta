@@ -486,6 +486,61 @@ def _open_approved_target(
 
 
 @contextmanager
+def open_parent(
+    registry: ToolRegistry,
+    raw_path: str,
+    *,
+    execution_context: ToolExecutionContext,
+    create_parents: bool = False,
+) -> Iterator[tuple[int, str, Path]]:
+    """Yield the verified parent descriptor for atomic absent-file publication."""
+
+    approved = execution_context.consume_path_binding(raw_path)
+    if approved is not None:
+        if not isinstance(approved.target_state, ApprovedPathAbsent):
+            raise ValueError("approved target already existed")
+        with _open_approved_parent(
+            approved,
+            create_parents=create_parents,
+        ) as (parent_fd, components):
+            yield parent_fd, components[-1], Path(approved.target)
+        return
+
+    resolved = registry.policy.resolve(raw_path)
+    if resolved.in_cwd:
+        components = _cwd_relative_components(registry.cwd, resolved.absolute)
+        with _open_parent_in_cwd(
+            registry,
+            components,
+            resolved.absolute,
+            create_parents=create_parents,
+        ) as (parent_fd, absolute):
+            yield parent_fd, components[-1], absolute
+        return
+
+    if create_parents:
+        try:
+            resolved.absolute.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(
+                f"could not create parent directory: {resolved.absolute.parent}: {exc}"
+            ) from exc
+    try:
+        parent_fd = os.open(
+            resolved.absolute.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"could not open parent directory: {resolved.absolute.parent}: {exc}"
+        ) from exc
+    try:
+        yield parent_fd, resolved.absolute.name, resolved.absolute
+    finally:
+        os.close(parent_fd)
+
+
+@contextmanager
 def open_target(
     registry: ToolRegistry,
     raw_path: str,

@@ -1,16 +1,119 @@
-"""Verified atomic replacement for user-managed files."""
+"""Verified atomic publication for user-managed files."""
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import hashlib
 import os
 import secrets
 import stat
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+from ..core.abort import AbortSignal
 
 
 class ConcurrentFileChangeError(ValueError):
     """The opened file no longer matches the file at its path."""
+
+
+async def run_file_worker[Result](
+    function: Callable[..., Result],
+    /,
+    *args: Any,
+    signal: AbortSignal,
+    **kwargs: Any,
+) -> Result:
+    """Keep ownership of file work until its disk outcome is known."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+    result = task.result()
+    if interrupted and not signal.is_set():
+        raise asyncio.CancelledError
+    return result
+
+
+def _temporary_name(name: str) -> str:
+    return f".{name}.{secrets.token_hex(16)}.tmp"
+
+
+def _write_temporary(
+    parent_fd: int,
+    temporary_name: str,
+    content: bytes,
+    mode: int,
+) -> int:
+    temporary_fd = os.open(
+        temporary_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        mode,
+        dir_fd=parent_fd,
+    )
+    try:
+        with os.fdopen(temporary_fd, "wb", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+        os.fsync(temporary_fd)
+    except BaseException:
+        os.close(temporary_fd)
+        raise
+    return temporary_fd
+
+
+def atomic_create(
+    parent_fd: int,
+    name: str,
+    path: str,
+    content: bytes,
+    abort_signal: AbortSignal,
+) -> None:
+    """Publish a complete new file without replacing an existing target."""
+
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), path)
+
+    temporary_name = _temporary_name(name)
+    temporary_fd = -1
+    try:
+        try:
+            temporary_fd = _write_temporary(
+                parent_fd,
+                temporary_name,
+                content,
+                0o666,
+            )
+        except OSError as exc:
+            raise ValueError(f"could not write file: {path}: {exc}") from exc
+        if abort_signal.is_set():
+            raise asyncio.CancelledError
+        os.link(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
 
 
 def _open_current(parent_fd: int, name: str) -> int:
@@ -57,6 +160,7 @@ def atomic_replace(
     file_descriptor: int,
     path: str,
     content: bytes,
+    abort_signal: AbortSignal,
     *,
     expected_digest: bytes | None = None,
 ) -> None:
@@ -79,42 +183,43 @@ def atomic_replace(
             f"could not open parent directory: {target.parent}: {exc}"
         ) from exc
 
-    temporary_name = f".{target.name}.{secrets.token_hex(16)}.tmp"
+    temporary_name = _temporary_name(target.name)
     temporary_fd = -1
     published = False
     try:
-        temporary_fd = os.open(
-            temporary_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            stat.S_IMODE(target_stat.st_mode),
-            dir_fd=parent_fd,
-        )
         try:
+            temporary_fd = _write_temporary(
+                parent_fd,
+                temporary_name,
+                content,
+                stat.S_IMODE(target_stat.st_mode),
+            )
             os.fchmod(temporary_fd, stat.S_IMODE(target_stat.st_mode))
-            with os.fdopen(temporary_fd, "wb", closefd=False) as handle:
-                handle.write(content)
-                handle.flush()
-            os.fsync(temporary_fd)
         except OSError as exc:
             raise ValueError(f"could not write file: {path}: {exc}") from exc
 
         current_fd = _open_current(parent_fd, target.name)
         try:
-            _verify_current(
-                current_fd,
-                (target_stat.st_dev, target_stat.st_ino),
-                expected_digest,
-            )
-            os.replace(
-                temporary_name,
-                target.name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-            )
-            published = True
-            os.fsync(parent_fd)
+            expected_identity = target_stat.st_dev, target_stat.st_ino
+            _verify_current(current_fd, expected_identity, expected_digest)
         finally:
             os.close(current_fd)
+
+        final_fd = _open_current(parent_fd, target.name)
+        try:
+            _verify_current(final_fd, expected_identity, None)
+        finally:
+            os.close(final_fd)
+        if abort_signal.is_set():
+            raise asyncio.CancelledError
+        os.replace(
+            temporary_name,
+            target.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        published = True
+        os.fsync(parent_fd)
     finally:
         if temporary_fd >= 0:
             os.close(temporary_fd)

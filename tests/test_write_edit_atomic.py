@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
-import stat
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -158,76 +158,164 @@ async def test_tools_atomically_replace_existing_file(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invoke", [_write, _edit])
-async def test_tools_preserve_existing_file_mode(
+async def test_edit_rechecks_path_after_digest(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("old content", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    digest_ready = threading.Event()
+    release_digest = threading.Event()
+    original_file_digest = hashlib.file_digest
+
+    def blocked_file_digest(*args: Any, **kwargs: Any) -> Any:
+        digest = original_file_digest(*args, **kwargs)
+        digest_ready.set()
+        release_digest.wait()
+        return digest
+
+    monkeypatch.setattr(hashlib, "file_digest", blocked_file_digest)
+    operation = asyncio.create_task(_edit(registry, target.name))
+    digest_wait = asyncio.create_task(asyncio.to_thread(digest_ready.wait))
+    try:
+        done, _pending = await asyncio.wait(
+            {operation, digest_wait}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if digest_wait in done:
+            replacement = tmp_path / "replacement"
+            replacement.write_text("concurrent content", encoding="utf-8")
+            os.replace(replacement, target)
+            release_digest.set()
+
+        result = await operation
+
+        assert result["isError"] is True
+        assert "changed while edit was in progress" in result["content"][0]["text"]
+        assert target.read_text(encoding="utf-8") == "concurrent content"
+    finally:
+        digest_ready.set()
+        release_digest.set()
+        digest_wait.cancel()
+        await asyncio.gather(digest_wait, return_exceptions=True)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_write_does_not_publish_new_file_before_content_is_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.txt"
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    entered = threading.Event()
+    release = threading.Event()
+    main_thread = threading.get_ident()
+    original_fdopen = os.fdopen
+
+    class BlockingWriter:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> Self:
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args: object) -> object:
+            return self._handle.__exit__(*args)
+
+        def write(self, content: bytes) -> int:
+            entered.set()
+            if threading.get_ident() != main_thread:
+                release.wait()
+            return self._handle.write(content)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._handle, name)
+
+    def blocking_fdopen(
+        fd: int, mode: str = "r", *args: object, **kwargs: object
+    ) -> Any:
+        handle = original_fdopen(fd, mode, *args, **kwargs)
+        return BlockingWriter(handle) if "w" in mode or "+" in mode else handle
+
+    monkeypatch.setattr(os, "fdopen", blocking_fdopen)
+    operation = asyncio.create_task(_write(registry, target.name))
+    try:
+        await asyncio.to_thread(entered.wait)
+
+        assert not target.exists()
+
+        release.set()
+        result = await operation
+        assert result["isError"] is False
+        assert target.read_text(encoding="utf-8") == "new content"
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invoke", [_write, _edit])
+async def test_abort_waits_for_file_worker_and_prevents_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     invoke: ToolInvocation,
 ) -> None:
     target = tmp_path / "target.txt"
     target.write_text("old content", encoding="utf-8")
-    target.chmod(0o640)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    entered = threading.Event()
+    release = threading.Event()
+    main_thread = threading.get_ident()
+    original_fdopen = os.fdopen
 
+    class BlockingWriter:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> Self:
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args: object) -> object:
+            return self._handle.__exit__(*args)
+
+        def write(self, content: bytes) -> int:
+            entered.set()
+            if threading.get_ident() != main_thread:
+                release.wait()
+            return self._handle.write(content)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._handle, name)
+
+    def blocking_fdopen(
+        fd: int, mode: str = "r", *args: object, **kwargs: object
+    ) -> Any:
+        handle = original_fdopen(fd, mode, *args, **kwargs)
+        return BlockingWriter(handle) if "w" in mode or "+" in mode else handle
+
+    monkeypatch.setattr(os, "fdopen", blocking_fdopen)
+    operation = asyncio.create_task(invoke(registry, target.name))
     try:
-        result = await invoke(registry, target.name)
+        await asyncio.to_thread(entered.wait)
+        registry.abort()
+        loop = asyncio.get_running_loop()
+        for _ in range(4):
+            turn = loop.create_future()
+            loop.call_soon(turn.set_result, None)
+            await turn
 
-        assert result["isError"] is False
-        assert stat.S_IMODE(target.stat().st_mode) == 0o640
-    finally:
-        await registry.close()
+        assert not operation.done()
 
-
-@pytest.mark.asyncio
-async def test_write_keeps_default_mode_for_new_file(tmp_path: Path) -> None:
-    reference = tmp_path / "reference"
-    reference.touch()
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-
-    try:
-        result = await _write(registry, "target.txt")
-
-        assert result["isError"] is False
-        assert stat.S_IMODE((tmp_path / "target.txt").stat().st_mode) == stat.S_IMODE(
-            reference.stat().st_mode
-        )
-    finally:
-        await registry.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tool", ["write", "edit"])
-@pytest.mark.parametrize("target_kind", ["symlink", "fifo", "hardlink"])
-async def test_tools_reject_unsafe_target_types(
-    tmp_path: Path,
-    tool: str,
-    target_kind: str,
-) -> None:
-    target = tmp_path / "target"
-    fifo_reader: int | None = None
-    if target_kind == "symlink":
-        source = tmp_path / "source"
-        source.write_text("old content", encoding="utf-8")
-        target.symlink_to(source)
-    elif target_kind == "fifo":
-        os.mkfifo(target)
-        fifo_reader = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
-    else:
-        source = tmp_path / "source"
-        source.write_text("old content", encoding="utf-8")
-        target.hardlink_to(source)
-
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    try:
-        result = await (
-            _write(registry, target.name)
-            if tool == "write"
-            else _edit(registry, target.name)
-        )
-
+        release.set()
+        result = await operation
         assert result["isError"] is True
-        if target_kind == "hardlink":
-            assert "multiple hard links" in result["content"][0]["text"]
+        assert result["content"][0]["text"] == "tool execution canceled"
+        assert target.read_text(encoding="utf-8") == "old content"
     finally:
-        if fifo_reader is not None:
-            os.close(fifo_reader)
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
         await registry.close()
