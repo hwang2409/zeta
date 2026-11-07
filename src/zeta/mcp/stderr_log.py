@@ -11,7 +11,7 @@ import stat
 import time
 from pathlib import Path
 
-from .._fsio import write_all
+from ..core.fsio import write_all
 
 MCP_STDERR_LOG_FILE_BYTES = 2 * 1024 * 1024
 MCP_STDERR_LOG_FILE_COUNT = 3

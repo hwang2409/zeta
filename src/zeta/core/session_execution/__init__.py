@@ -12,9 +12,9 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ..._fsio import write_all
 from ...storage_format import WriterLease
 from ..checkpoints import ConversationIntegrityError
+from ..fsio import write_all
 from ..session_files import SessionInUseError, open_session_file
 
 RUNTIME_LEASE_NAME = "runtime.lease"

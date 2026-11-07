@@ -17,7 +17,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
-from .._fsio import write_all
+from ..core.fsio import write_all
 
 logger = logging.getLogger(__name__)
 

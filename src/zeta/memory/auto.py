@@ -14,13 +14,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .._fsio import write_all
 from ..context_eviction import estimated_text_tokens
 from ..core.checkpoints import (
     CONVERSATION_ENTRY_TYPES,
     ConversationIntegrityError,
     load_session_json,
 )
+from ..core.fsio import write_all
 from ..oauth import ProviderLoginRequiredError
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError

@@ -15,7 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict
 
-from .._fsio import write_all
+from ..core.fsio import write_all
 from ..core.session import env_home
 from ..storage_format import WriterLease, mapping_mutations, open_writer
 from .client import MCPError

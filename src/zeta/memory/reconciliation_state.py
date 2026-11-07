@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .._fsio import write_all
+from ..core.fsio import write_all
 from ..providers.stream_diagnostics import write_stream_diagnostic
 from ..storage_format import PatchRecords, SetValue, WriterLease
 
