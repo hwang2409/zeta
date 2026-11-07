@@ -32,6 +32,7 @@ from tests.support.agent_lifecycle import (
     watch_delegated_registrations,
 )
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
@@ -13573,7 +13574,9 @@ async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
     )
     loop.explicit_finish = True
     register_finish(registry, child_loop=loop)
-    owned = asyncio.create_task(asyncio.Event().wait())
+    owned = asyncio.create_task(
+        asyncio.wait_for(asyncio.Event().wait(), timeout=10)
+    )
     loop._background_owner.register(
         "root:1:1",
         owned.cancel,
@@ -13606,7 +13609,10 @@ async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
     finally:
         loop._background_owner.unregister("root:1:1")
         owned.cancel()
-        await asyncio.gather(owned, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(owned, return_exceptions=True),
+            what="owned task cleanup",
+        )
         await loop.close()
         store.close()
 
@@ -14010,7 +14016,9 @@ async def test_idle_with_open_work_does_not_notify_parent(
             ),
         )
     elif wake_source in {"child", "idle_child"}:
-        owned_child = asyncio.create_task(asyncio.Event().wait())
+        owned_child = asyncio.create_task(
+            asyncio.wait_for(asyncio.Event().wait(), timeout=10)
+        )
         if wake_source == "idle_child":
             owned_child_store = ConversationStore(tmp_path / "idle-owned-child")
             child.register_agent_child(
@@ -14557,7 +14565,9 @@ async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child
             ),
         )
     else:
-        owned_child = asyncio.create_task(asyncio.Event().wait())
+        owned_child = asyncio.create_task(
+            asyncio.wait_for(asyncio.Event().wait(), timeout=10)
+        )
         loop._background_owner.register(
             "root:1:1",
             lambda: None,
@@ -14579,7 +14589,7 @@ async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child
 
     async def wait_idle(_wake, _timeout):
         idle_waiting.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="idle wait")
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
@@ -14592,10 +14602,13 @@ async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child
     assert prompts == ["work"]
     run.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await run
+        await await_or_fail(run, what="cancelled reminder run")
     if owned_child is not None:
         owned_child.cancel()
-        await asyncio.gather(owned_child, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(owned_child, return_exceptions=True),
+            what="owned child cleanup",
+        )
     await registry.close()
     store.close()
 
@@ -16881,8 +16894,12 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
     parent = ConversationStore(tmp_path / "parent")
     grandchild = ConversationStore(tmp_path / "grandchild")
     owner = BackgroundAgentOwner(root)
-    parent_task = asyncio.create_task(asyncio.Event().wait())
-    grandchild_task = asyncio.create_task(asyncio.Event().wait())
+    parent_task = asyncio.create_task(
+        asyncio.wait_for(asyncio.Event().wait(), timeout=10)
+    )
+    grandchild_task = asyncio.create_task(
+        asyncio.wait_for(asyncio.Event().wait(), timeout=10)
+    )
     owner.register(
         "root:1",
         parent_task.cancel,
