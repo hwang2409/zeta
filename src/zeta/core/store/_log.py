@@ -1106,14 +1106,22 @@ class ConversationLogMixin:
         return b"".join(chunks)
 
     def _strict_reopen_repaired_transcript(self: ConversationStore) -> None:
-        candidate = type(self)(
-            self.root_dir,
-            session_id=self.session_id,
-            _read_only=True,
-            _must_exist=True,
-            _storage_lease=self._storage_lease,
-        )
-        candidate.close()
+        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+        try:
+            stat = os.fstat(fd)
+            raw = self._read_fd(fd, stat.st_size)
+        finally:
+            os.close(fd)
+        validator = _FullLoadValidator(self, raw, stat)
+        for physical_row in self._iter_physical_rows(
+            raw, stat, validator.validated_prefix
+        ):
+            if physical_row.torn:
+                raise ConversationIntegrityError(
+                    f"invalid conversation row {physical_row.row_number}: {self.path}"
+                )
+            validator.accept(physical_row)
+        validator.finish()
 
     def _write_line(self: ConversationStore, row: dict[str, Any]) -> None:
         encoded = encode_json(row) + b"\n"
