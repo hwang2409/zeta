@@ -4,6 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(
     os.environ.get(
         "SCRIPT", Path(__file__).parents[1] / "scripts/check_merge_resolution.py"
@@ -347,6 +349,27 @@ def make_merge(
     return merge, parents[1], parents[2]
 
 
+def _make_conflict_merge(r: Path) -> str:
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "b"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def branch(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def main(): pass\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "b"], cwd=r, check=False)
+    (r / "src/a.py").write_text(
+        "def main(): pass\n<<<<<<< HEAD\ndef branch(): pass\n>>>>>>> b\n"
+    )
+    commit(r, "unresolved")
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+
+
 def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
@@ -376,6 +399,307 @@ def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     assert "merge does not parse:" in result.stderr
     assert "src/a.py:" in result.stderr
     assert "main:" not in result.stdout
+
+
+def _final_loss(
+    r: Path,
+    main_text: str,
+    branch_text: str,
+    merge_text: str,
+    final_text: str | None = None,
+    final_path: str = "src/a.py",
+    merge_extra: tuple[str, str] | None = None,
+) -> tuple[str, str]:
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("base = 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(branch_text)
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(main_text)
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(merge_text)
+    if merge_extra is not None:
+        extra_path, extra_text = merge_extra
+        extra = r / extra_path
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text(extra_text)
+    commit(r, "merge")
+    merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    if final_text is None:
+        return merge, merge
+    target = r / final_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(final_text)
+    commit(r, "final")
+    final = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    return merge, final
+
+
+def _final_marker_case(r: Path, case: str) -> tuple[str, str, int, str] | None:
+    if case == "fixed marker":
+        merge = _make_conflict_merge(r)
+        (r / "src/a.py").write_text("def main(): pass\ndef branch(): pass\n")
+        commit(r, "fix")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 0, "fixed later"
+    if case == "final marker":
+        merge = _make_conflict_merge(r)
+        return merge, merge, 2, "merge does not parse"
+    if case == "parse allow-list":
+        merge = _make_conflict_merge(r)
+        body = r / "body.txt"
+        body.write_text("merge-resolution: src/a.py parse -> intentional\n")
+        return merge, body.as_posix(), 0, "allowed merge parse diagnostic"
+    return None
+
+
+def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
+    if case == "unrelated same-name def":
+        return (
+            *_final_loss(
+                r,
+                "def helper(): return 1\n",
+                "def branch(): pass\n",
+                "base = 1\n",
+                "def helper(): return 2\n",
+                "src/b.py",
+            ),
+            1,
+            "def helper",
+        )
+    if case == "true move":
+        return (
+            *_final_loss(
+                r,
+                "def helper(): return 1\n",
+                "def branch(): pass\n",
+                "base = 1\n",
+                "def helper(): return 1\n",
+                "src/b.py",
+            ),
+            0,
+            "moved/restored later: src/b.py",
+        )
+    if case == "restored in place":
+        return (
+            *_final_loss(
+                r,
+                "def helper(): return 1\n",
+                "def branch(): pass\n",
+                "base = 1\n",
+                "def helper(): return 1\n",
+            ),
+            0,
+            "moved/restored later: src/a.py",
+        )
+    if case == "element unrelated":
+        return (
+            *_final_loss(
+                r,
+                'TARGET = {"lost"}\n',
+                'TARGET = {"lost"}\n',
+                "TARGET = set()\n",
+                'OTHER = {"lost"}\n',
+                "src/b.py",
+            ),
+            1,
+            "TARGET",
+        )
+    if case == "element restored":
+        return (
+            *_final_loss(
+                r,
+                'TARGET = {"lost"}\n',
+                'TARGET = {"lost"}\n',
+                "TARGET = set()\n",
+                'TARGET = {"lost"}\n',
+            ),
+            0,
+            "moved/restored later: src/a.py",
+        )
+    if case == "constant different value":
+        return (
+            *_final_loss(r, "VALUE = 1\n", "VALUE = 2\n", "VALUE = 3\n", "VALUE = 4\n"),
+            1,
+            "VALUE",
+        )
+    if case == "constant moved same value":
+        return (
+            *_final_loss(
+                r,
+                "VALUE = 1\n",
+                "VALUE = 2\n",
+                "base = 1\n",
+                "VALUE = 1\n",
+                "src/b.py",
+            ),
+            0,
+            "moved/restored later: src/b.py",
+        )
+    if case == "constant duplicate final":
+        merge, final = _final_loss(
+            r,
+            "VALUE = 1\n",
+            "VALUE = 2\n",
+            "base = 1\n",
+            "VALUE = 1\n",
+            "src/b.py",
+        )
+        (r / "src/c.py").write_text("VALUE = 1\n")
+        commit(r, "duplicate final constant")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 1, "VALUE"
+    if case == "class moved with member":
+        return (
+            *_final_loss(
+                r,
+                "class Box:\n    value = 1\n    def method(self): return 1\n",
+                "class Branch:\n    pass\n",
+                "base = 1\n",
+                "class Box:\n    value = 1\n    def method(self): return 1\n",
+                "src/b.py",
+            ),
+            0,
+            "moved/restored later: src/b.py",
+        )
+    if case == "element same-named collection moved":
+        merge, final = _final_loss(
+            r,
+            'TARGET = {"lost"}\n',
+            'TARGET = {"lost"}\n',
+            "TARGET = set()\n",
+            'TARGET = {"lost"}\n',
+            "src/b.py",
+        )
+        (r / "src/a.py").unlink()
+        commit(r, "move final collection")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 0, "moved/restored later: src/b.py"
+    if case == "duplicate final collection":
+        merge, final = _final_loss(
+            r,
+            'TARGET = {"lost"}\n',
+            'TARGET = {"lost"}\n',
+            "TARGET = set()\n",
+            'TARGET = {"lost"}\n',
+            "src/b.py",
+        )
+        (r / "src/c.py").write_text('TARGET = {"lost"}\n')
+        commit(r, "duplicate final collection")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 1, "TARGET"
+    if case == "dispatch restored":
+        return (
+            *_final_loss(
+                r,
+                'def route(name):\n    return name == "mcp"\n',
+                "def branch(): pass\n",
+                "base = 1\n",
+                'def route(name):\n    return name == "mcp"\n',
+            ),
+            0,
+            "moved/restored later: src/a.py",
+        )
+    if case == "dispatch other function":
+        return (
+            *_final_loss(
+                r,
+                'def route(name):\n    return name == "mcp"\n',
+                "def branch(): pass\n",
+                "base = 1\n",
+                'def other(name):\n    return name == "mcp"\n',
+            ),
+            1,
+            "route",
+        )
+    if case.startswith("checked merge collision"):
+        merge, _ = _final_loss(
+            r,
+            "def helper(): return 1\n",
+            "def branch(): pass\n",
+            "base = 1\n",
+            merge_extra=("src/b.py", "def helper(): return 1\n"),
+        )
+        final = {
+            "checked merge collision full": merge,
+            "checked merge collision short": merge[:7],
+            "checked merge collision HEAD": "HEAD",
+        }[case]
+        return merge, final, 1, "def helper"
+    if case == "checked merge":
+        return (
+            *_final_loss(
+                r, "def helper(): return 1\n", "def branch(): pass\n", "base = 1\n"
+            ),
+            1,
+            "def helper",
+        )
+    marker_case = _final_marker_case(r, case)
+    if marker_case is not None:
+        return marker_case
+    raise AssertionError(f"unknown final case: {case}")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected", "needle"),
+    [
+        ("unrelated same-name def", 1, "def helper"),
+        ("true move", 0, "moved/restored later: src/b.py"),
+        ("restored in place", 0, "moved/restored later: src/a.py"),
+        ("element unrelated", 1, "TARGET"),
+        ("element restored", 0, "moved/restored later: src/a.py"),
+        ("constant different value", 1, "VALUE"),
+        ("constant moved same value", 0, "moved/restored later: src/b.py"),
+        ("constant duplicate final", 1, "VALUE"),
+        ("class moved with member", 0, "moved/restored later: src/b.py"),
+        ("element same-named collection moved", 0, "moved/restored later: src/b.py"),
+        ("duplicate final collection", 1, "TARGET"),
+        ("dispatch restored", 0, "moved/restored later: src/a.py"),
+        ("dispatch other function", 1, "route"),
+        ("checked merge collision full", 1, "def helper"),
+        ("checked merge collision short", 1, "def helper"),
+        ("checked merge collision HEAD", 1, "def helper"),
+        ("checked merge", 1, "def helper"),
+        ("fixed marker", 0, "fixed later"),
+        ("final marker", 2, "merge does not parse"),
+        ("parse allow-list", 0, "allowed merge parse diagnostic"),
+    ],
+)
+def test_final_head_identity_table(
+    tmp_path: Path, case: str, expected: int, needle: str
+) -> None:
+    r = repo(tmp_path)
+    merge, final_or_body, expected_code, expected_line = _final_case(r, case)
+    assert expected_code == expected
+    args = (
+        ("--pr-body-file", final_or_body)
+        if case == "parse allow-list"
+        else ("--final", final_or_body)
+    )
+    result = run(r, merge, *args)
+    output = result.stdout + result.stderr
+    assert result.returncode == expected
+    assert expected_line in output
+    if case.startswith("checked merge collision"):
+        assert "moved/restored later" not in output
 
 
 def _api_repo(r: Path) -> None:
@@ -513,9 +837,6 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
     return merge, train_merge, pr_head, "main_only"
-
-
-import pytest
 
 
 @pytest.mark.parametrize(
