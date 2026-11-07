@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import threading
 from pathlib import Path
@@ -19,7 +18,6 @@ from zeta.skills.loader import (
     discover_session_skills,
     discover_skills,
     load_skill,
-    replace_skill_index_metadata,
 )
 from zeta.tools import ToolRegistry
 
@@ -577,7 +575,13 @@ async def test_unknown_skill_tool_refresh_keeps_tool_batch_adjacent(
         for block in message.content
         if isinstance(block, TextContent) and block.text.startswith("skills changed:")
     ]
-    assert notices == ["skills changed: added instant"]
+    assert notices == [
+        (
+            "skills changed: added instant\n"
+            "skills changed, but this session's prompt predates owned skill spans; "
+            "restart the session to refresh its skill index"
+        )
+    ]
     store.close()
 
 
@@ -679,38 +683,6 @@ def test_live_slash_skills_replace_added_and_removed_entries(tmp_path: Path) -> 
     registry.register_skills(SkillCatalog((second,)))
 
     assert [skill.name for skill in registry.skill_entries] == ["second"]
-
-
-def test_skill_index_refresh_moves_memory_component() -> None:
-    old = SkillCatalog((SkillMeta("old", "old", [], Path("old.md")),))
-    new = SkillCatalog(
-        (SkillMeta("longer", "a much longer description", [], Path("new.md")),)
-    )
-    memory = "<zeta-project-memory>memory</zeta-project-memory>"
-    prompt = f"identity\n{old.index()}\n{memory}\ntail"
-    offset = prompt.index(memory)
-    components = {
-        "default_context": {
-            "offset": 0,
-            "length": len(prompt),
-            "digest": hashlib.sha256(prompt.encode()).hexdigest(),
-        },
-        "project_memory": {
-            "offset": offset,
-            "length": len(memory),
-            "digest": hashlib.sha256(memory.encode()).hexdigest(),
-        },
-    }
-
-    updated, moved = replace_skill_index_metadata(prompt, new, components)
-
-    memory_component = moved["project_memory"]
-    moved_offset = int(memory_component["offset"])
-    assert updated[moved_offset : moved_offset + len(memory)] == memory
-    assert memory_component["digest"] == hashlib.sha256(memory.encode()).hexdigest()
-    default = moved["default_context"]
-    assert default["length"] == len(updated)
-    assert default["digest"] == hashlib.sha256(updated.encode()).hexdigest()
 
 
 def test_skill_index_is_bounded_and_omits_whole_entries() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fcntl
 import inspect
 import json
 import multiprocessing
@@ -668,6 +669,12 @@ def _socket_path(tmp_path: Path) -> Path:
     return Path("/tmp") / f"zeta-{tmp_path.name}.sock"
 
 
+@pytest.fixture(autouse=True)
+def _remove_test_socket_lock(tmp_path: Path):
+    yield
+    Path(f"{_socket_path(tmp_path)}.lock").unlink(missing_ok=True)
+
+
 async def _connect(server: ZetaServer):
     await asyncio.wait_for(server.start(), TIMEOUT)
     if server.port is None:
@@ -796,6 +803,52 @@ class BlockingThenCaptureBackend:
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
         )
+
+
+class ConcurrentDelegatedApprovalBackend:
+    def __init__(self, parent_calls: list[ToolCall], child_call: ToolCall) -> None:
+        self.parent = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=parent_calls),
+                ScriptedTurn([TextContent("done")]),
+            ]
+        )
+        self.children = {
+            prompt: FakeBackend(
+                [
+                    ScriptedTurn(tool_calls=[child_call]),
+                    ScriptedTurn([TextContent("done")]),
+                ]
+            )
+            for prompt in ("read one", "read two")
+        }
+        self.child_started = {prompt: asyncio.Event() for prompt in self.children}
+        self.release_children = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        child_prompt = next(
+            (
+                block.text
+                for message in messages
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent) and block.text in self.children
+            ),
+            None,
+        )
+        backend = self.children.get(child_prompt, self.parent)
+        if child_prompt is not None and not backend.calls:
+            self.child_started[child_prompt].set()
+            await self.release_children.wait()
+        stream = backend.complete(messages, tool_schemas)
+        if child_prompt is None and self.parent.calls:
+            await asyncio.gather(
+                *(started.wait() for started in self.child_started.values())
+            )
+            yield await anext(stream)
+            self.release_children.set()
+        async for event in stream:
+            yield event
 
 
 class DelegatedApprovalBackend:
@@ -3059,6 +3112,18 @@ async def test_invalid_utf8_tail_preserves_request_id(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
+async def _unix_hello(server: ZetaServer, request_id: str) -> None:
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        reply = await _request(
+            reader, writer, request_id, "hello", {"protocol_version": "1.0"}
+        )
+        assert reply[-1]["result"]["server"] == "zeta"
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
     tmp_path: Path,
@@ -3074,10 +3139,110 @@ async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
     stale.bind(str(socket_path))
     stale.close()
     await server.start()
+    contender = ZetaServer(
+        home=tmp_path / "contender", socket_path=socket_path, provider="codex"
+    )
     try:
         assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
+        await _unix_hello(server, "stale-replaced")
+        with pytest.raises(RuntimeError, match="already listening"):
+            await contender.start()
+        await _unix_hello(server, "live-server-preserved")
     finally:
+        await contender.close()
         await server.close()
+    assert not socket_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_old_server_close_preserves_replacement_protocol_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = _socket_path(tmp_path)
+    old_server = ZetaServer(
+        home=tmp_path / "old", socket_path=socket_path, provider="codex"
+    )
+    replacement = ZetaServer(
+        home=tmp_path / "replacement", socket_path=socket_path, provider="codex"
+    )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fcntl, "flock", lambda *_args: None)
+        await old_server.start()
+    socket_path.unlink()
+    await replacement.start()
+    try:
+        await _unix_hello(replacement, "replacement-before-close")
+        await old_server.close()
+        await _unix_hello(replacement, "replacement-after-close")
+    finally:
+        await old_server.close()
+        await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_socket_lock_prevents_replacement_during_owner_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = _socket_path(tmp_path)
+    owner = ZetaServer(
+        home=tmp_path / "owner", socket_path=socket_path, provider="codex"
+    )
+    contender = ZetaServer(
+        home=tmp_path / "contender", socket_path=socket_path, provider="codex"
+    )
+    socket_path = owner.socket_path
+    await owner.start()
+    await _unix_hello(owner, "owner")
+
+    real_unlink = os.unlink
+    attempted = False
+    contender_error: Exception | None = None
+    path_after_attempt: bool | None = None
+
+    def interleaved_unlink(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal attempted, contender_error, path_after_attempt
+        if Path(os.fsdecode(path)) != socket_path or attempted:
+            real_unlink(path, *args, **kwargs)
+            return
+        attempted = True
+        real_unlink(path)
+
+        def run_contender() -> None:
+            nonlocal contender_error
+            try:
+                asyncio.run(contender.start())
+            except RuntimeError as exc:
+                contender_error = exc
+
+        thread = threading.Thread(target=run_contender)
+        thread.start()
+        thread.join()
+        path_after_attempt = socket_path.exists()
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", interleaved_unlink)
+    await owner.close()
+
+    assert attempted
+    assert isinstance(contender_error, RuntimeError)
+    assert "already listening" in str(contender_error)
+    assert path_after_attempt is False
+
+    replacement = ZetaServer(
+        home=tmp_path / "replacement", socket_path=socket_path, provider="codex"
+    )
+    await replacement.start()
+    try:
+        await _unix_hello(replacement, "replacement-after-owner-close")
+    finally:
+        await replacement.close()
     assert not socket_path.exists()
 
 
@@ -3712,24 +3877,15 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         ToolCall(
             "agent-one",
             "agent",
-            {"prompt": "read", "description": "child one", "background": True},
+            {"prompt": "read one", "description": "child one", "background": True},
         ),
         ToolCall(
             "agent-two",
             "agent",
-            {"prompt": "read", "description": "child two", "background": True},
+            {"prompt": "read two", "description": "child two", "background": True},
         ),
     ]
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=parent_calls),
-            ScriptedTurn(tool_calls=[child_call]),
-            ScriptedTurn(tool_calls=[child_call]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("done")]),
-        ]
-    )
+    backend = ConcurrentDelegatedApprovalBackend(parent_calls, child_call)
     server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -3743,6 +3899,7 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         assert first["request_id"] != second["request_id"]
         assert first["tool_call"]["id"] == second["tool_call"]["id"]
         assert first["delegated"] is True
+        assert second["delegated"] is True
         rejected = await _request(
             reader,
             writer,
@@ -6289,6 +6446,14 @@ def _seed_slash_fixtures(tmp_path: Path) -> Path:
         "---\ndescription: greet\n---\nSay hi to $ARGUMENTS\n",
         encoding="utf-8",
     )
+    (project / ".zeta" / "commands" / "local.md").write_text(
+        "---\ndescription: inspect locally\nkind: exec\n---\nprintf local\n",
+        encoding="utf-8",
+    )
+    (project / ".zeta" / "commands" / "shell.md").write_text(
+        "---\ndescription: inspect the branch\n---\nBranch: !`git branch --show-current`\n",
+        encoding="utf-8",
+    )
     home = tmp_path / "home"
     skill_dir = home / "skills" / "greet"
     skill_dir.mkdir(parents=True)
@@ -6301,42 +6466,101 @@ def _seed_slash_fixtures(tmp_path: Path) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path) -> None:
+async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
+    tmp_path: Path,
+) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
-        result = (
+        runnable = (
             await _request(
-                reader, writer, 5, "slash_list", {"session_id": sid}
+                reader, writer, "runnable", "slash_list", {"session_id": sid}
             )
         )[-1]["result"]
-        commands = {entry["name"]: entry for entry in result["commands"]}
-        assert "restart" not in commands  # TUI process lifecycle is not a serve command.
-        # Runnable built-ins the server drives directly. `/init` and `/help`
-        # live at the scope floor — the menu depends on them appearing here
-        # or the ZETA-130 lane loses two anchor commands.
-        for name in ("status", "compact", "model", "help", "init"):
-            assert name in commands
-            assert commands[name]["client_only"] is False
-        # Client-only built-ins still appear so the menu can render them.
-        for name in ("theme", "fork"):
-            assert commands[name]["client_only"] is True
-        assert commands["vim"]["client_only"] is False
-        # Prompt macros advertise their source directory.
-        assert commands["review"]["kind"] == "macro-prompt"
-        assert commands["review"]["source"] == "project"
-        # The named skill from `~/.zeta/skills/greet/` must be present and
-        # tagged as a skill so a frontend client can source-badge it.
-        assert commands["greet"]["kind"] == "skill"
-        assert commands["greet"]["client_only"] is False
-        # session_id must match the active session.
-        error = (
+        complete = (
             await _request(
-                reader, writer, 6, "slash_list", {"session_id": "other"}
+                reader,
+                writer,
+                "complete",
+                "slash_list",
+                {"session_id": sid, "include_unavailable": True},
+            )
+        )[-1]["result"]
+        runnable_by_name = {entry["name"]: entry for entry in runnable["commands"]}
+        complete_by_name = {entry["name"]: entry for entry in complete["commands"]}
+        unavailable = set(complete_by_name) - set(runnable_by_name)
+
+        assert {"status", "compact", "model", "help", "init", "review", "greet"} <= set(
+            runnable_by_name
+        )
+        assert {"keys", "mcp", "plan", "fork", "theme", "local", "shell"} <= unavailable
+        assert all(entry["unavailable"] is None for entry in runnable_by_name.values())
+        assert all(
+            complete_by_name[name]["unavailable"] == "requires_tui"
+            and complete_by_name[name]["client_only"] is True
+            for name in unavailable
+        )
+        assert runnable_by_name["review"]["source"] == "project"
+        assert runnable_by_name["greet"]["kind"] == "skill"
+
+        for number, name in enumerate(runnable_by_name, 10):
+            response = (
+                await _request(
+                    reader,
+                    writer,
+                    number,
+                    "slash_run",
+                    {"session_id": sid, "text": f"/{name}"},
+                )
+            )[-1]
+            assert "result" in response, (name, response)
+            result = response["result"]
+            assert result["kind"] not in {"client_only", "error", "unknown"}, (
+                name,
+                result,
+            )
+            assert "unsupported" not in str(result).lower()
+
+        model_with_name = (
+            await _request(
+                reader,
+                writer,
+                "model-with-name",
+                "slash_run",
+                {"session_id": sid, "text": "/model not-a-real-model"},
+            )
+        )[-1]["result"]
+        assert model_with_name["kind"] == "output"
+        assert "unsupported" not in str(model_with_name).lower()
+
+        mcp_status = (
+            await _request(
+                reader,
+                writer,
+                "mcp-status",
+                "slash_run",
+                {"session_id": sid, "text": "/mcp status"},
+            )
+        )[-1]["result"]
+        assert mcp_status == {"kind": "client_only", "name": "mcp"}
+
+        invalid = (
+            await _request(
+                reader,
+                writer,
+                "invalid",
+                "slash_list",
+                {"session_id": sid, "include_unavailable": "yes"},
             )
         )[-1]["error"]
-        assert error["code"] == -32003
+        assert invalid["code"] == -32602
+        wrong_session = (
+            await _request(
+                reader, writer, "wrong", "slash_list", {"session_id": "other"}
+            )
+        )[-1]["error"]
+        assert wrong_session["code"] == -32003
     finally:
         await _close(server, writer)
 
@@ -6529,11 +6753,12 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         assert result["kind"] == "model_input"
         assert result["text"]
 
-        # /model without arguments hands off to the client's picker
-        # surface (Settings on the frontend client); it never returns a bare text
-        # notice a user cannot act on.
+        # /model without arguments reports the current model.
         result = (await run("/model"))["result"]
-        assert result == {"kind": "client_only", "name": "model"}
+        assert result == {
+            "kind": "output",
+            "text": f"model: {server.runtime.model} (open Settings to switch)",
+        }
 
         # /model switching applies through the shared settings path.
         result = (await run("/model gpt-5.6-sol"))["result"]
@@ -6572,12 +6797,8 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         result = (await run("/theme"))["result"]
         assert result == {"kind": "client_only", "name": "theme"}
 
-        # Client-only notices are frontend-neutral.
         result = (await run("/fork"))["result"]
         assert result == {"kind": "client_only", "name": "fork"}
-        assert ServerSlashSession(server.runtime)._client_only("fork") == (
-            "/fork: runs client-side; open the command in your frontend client"
-        )
 
         # Unknown commands are rejected structurally, never posted to the model.
         result = (await run("/nosuchcommand"))["result"]
@@ -6994,11 +7215,10 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
-        # `/model` with no args is read-only — must still hand off to the
-        # client's picker (never the mutation guard).
+        # `/model` with no args is read-only and bypasses the mutation guard.
         assert (await run(6, "/model"))["result"] == {
-            "kind": "client_only",
-            "name": "model",
+            "kind": "output",
+            "text": f"model: {server.runtime.model} (open Settings to switch)",
         }
     finally:
         await _close(server, writer)

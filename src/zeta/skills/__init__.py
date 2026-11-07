@@ -11,8 +11,6 @@ from .loader import (
     is_slash_safe_name,
     load_skill,
     load_skill_prompt,
-    replace_skill_index,
-    replace_skill_index_metadata,
 )
 
 __all__ = [
@@ -26,6 +24,4 @@ __all__ = [
     "is_slash_safe_name",
     "load_skill",
     "load_skill_prompt",
-    "replace_skill_index",
-    "replace_skill_index_metadata",
 ]

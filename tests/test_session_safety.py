@@ -680,8 +680,12 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace
 
+    from tests.support.fake_backend import FakeBackend
+    from zeta.core.loop import AgentLoop
     from zeta.runtime.loop.persistence import DraftPersistence
+    from zeta.skills import SkillCatalog
     from zeta.tui import composer
+    from zeta.tui.app import TUIApp
 
     png = bytes.fromhex(
         "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -695,8 +699,11 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
     store.session_dir.symlink_to(outside, target_is_directory=True)
     monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(composer.shutil, "which", lambda _: "pngpaste")
+    real_subprocess_run = subprocess.run
 
     def clipboard(command, **kwargs):
+        if command[0] != "pngpaste":
+            return real_subprocess_run(command, **kwargs)
         Path(command[1]).write_bytes(png)
         return SimpleNamespace(returncode=0)
 
@@ -717,8 +724,17 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
         assert (pinned / path.name).read_bytes() == png
         message = composer.build_user_message("image", tmp_path, (path,), session_store=store)
         assert message.content[1].mime_type == "image/png"
-        app = SimpleNamespace(loop=SimpleNamespace(store=store))
-        composer.ComposerAttachmentMixin._delete_staged_attachment(app, path)
+        async def delete_staged_attachment() -> None:
+            app = TUIApp(
+                AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+                provider="codex",
+                model="offline",
+            )
+            app._delete_staged_attachment(path)
+            await app._paste_runtime.reset()
+            await app.loop.close()
+
+        asyncio.run(delete_staged_attachment())
         assert not (pinned / path.name).exists()
         assert list(outside.iterdir()) == []
     finally:

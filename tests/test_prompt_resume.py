@@ -12,11 +12,13 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.prompt_resume import ResumedPrompt, resume_prompt
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
@@ -32,6 +34,7 @@ def _manager_with_prompt(
     project_memory_offset: int | None = None,
     project_memory_length: int | None = None,
     project_memory_digest: str | None = None,
+    prompt_components: dict[str, dict[str, int | str]] | None = None,
 ) -> tuple[SessionManager, str]:
     manager = SessionManager(home)
     opened = manager.create(
@@ -45,6 +48,7 @@ def _manager_with_prompt(
         project_memory_offset=project_memory_offset,
         project_memory_length=project_memory_length,
         project_memory_digest=project_memory_digest,
+        prompt_components=prompt_components,
         auto_project=False,
     )
     opened.store.close()
@@ -266,6 +270,120 @@ def test_conservative_resume_discovers_new_agent_profile(tmp_path: Path) -> None
     )
 
 
+@pytest.mark.asyncio
+async def test_concurrent_resume_child_uses_one_fresh_profile_generation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "specialist.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\nname: specialist\ndescription: version one specialist\n"
+        "tools: [read]\n---\nv1 body\n",
+        encoding="utf-8",
+    )
+    manager, session_id = await asyncio.to_thread(
+        _manager_with_prompt,
+        home,
+        tmp_path,
+        system_prompt="unknown recipe prompt bytes",
+        prompt_recipe=None,
+    )
+    first_opened = await asyncio.to_thread(manager.open, session_id)
+    second_opened = None
+    loop = None
+    try:
+        first = await asyncio.to_thread(
+            resume_prompt,
+            first_opened.metadata,
+            manager=manager,
+            store=first_opened.store,
+            home=home,
+            repo_root=tmp_path,
+            inbox_enabled=False,
+        )
+        assert first.agent_catalog.find("specialist").prompt_suffix == "v1 body"
+
+        profile.write_text(
+            "---\nname: specialist\ndescription: version two specialist\n"
+            "tools: [read, bash]\nallow_delegation: false\n---\nv2 body\n",
+            encoding="utf-8",
+        )
+        second_opened = await asyncio.to_thread(manager.open, session_id)
+        second = await asyncio.to_thread(
+            resume_prompt,
+            second_opened.metadata,
+            manager=manager,
+            store=second_opened.store,
+            home=home,
+            repo_root=tmp_path,
+            inbox_enabled=False,
+        )
+        profile.unlink()
+
+        backend = FakeBackend(
+            [
+                ScriptedTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "specialist-1",
+                            "agent",
+                            {
+                                "prompt": "inspect the task",
+                                "description": "specialist task",
+                                "preset": "specialist",
+                            },
+                        )
+                    ]
+                ),
+                ScriptedTurn([TextContent("child complete")]),
+            ]
+        )
+        registry = ToolRegistry(
+            tmp_path,
+            session_store=second_opened.store,
+            skill_catalog=second.skill_catalog,
+            agent_catalog=second.agent_catalog,
+        )
+        loop = AgentLoop(
+            backend,
+            second_opened.store,
+            registry=registry,
+            max_turns=1,
+            system_prompt=second.context.system_prompt,
+            skill_catalog=second.skill_catalog,
+        )
+        agent_schema = next(
+            schema for schema in registry.schemas if schema["name"] == "agent"
+        )
+        _ = [
+            event
+            async for event in loop.run_turn("start", origin=MessageOrigin.USER)
+        ]
+
+        assert len(backend.calls) == 2, "child did not start from runtime b's catalog"
+        preset = second.agent_catalog.find("specialist")
+        assert preset.prompt_suffix == "v2 body"
+        assert preset.selection_guidance == "version two specialist"
+        assert preset.tool_names == frozenset({"read", "bash"})
+        assert preset.allow_delegation is False
+        assert loop.tool_registry.agent_catalog is second.agent_catalog
+        agent_type = agent_schema["parameters"]["properties"]["agent_type"]
+        assert agent_type["enum"] == second.agent_catalog.names()
+        assert "version two specialist" in agent_type["description"]
+        child_system = backend.calls[1][0][0]
+        assert any(
+            isinstance(block, TextContent) and "v2 body" in block.text
+            for block in child_system.content
+        )
+    finally:
+        if loop is not None:
+            await loop.close()
+        if second_opened is not None:
+            second_opened.store.close()
+        first_opened.store.close()
+
+
 @pytest.mark.parametrize("prompt_recipe", [None, "default"])
 def test_resume_surfaces_skill_parse_notice(
     tmp_path: Path, prompt_recipe: str | None
@@ -378,13 +496,54 @@ def test_staggered_memory_span_resumes_adopt_live_runtime(
     assert calls == [1]
 
 
+def test_custom_prompt_without_owned_skill_span_stays_unchanged_and_notices_restart(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    prompt = (
+        "custom before\n<zeta-skills>\nAvailable skills:\n- user: keep me\n"
+        "</zeta-skills>\ncustom after"
+    )
+    manager, session_id = _manager_with_prompt(
+        home, tmp_path, system_prompt=prompt, prompt_recipe="custom"
+    )
+    _write_skill(home / "skills" / "new.md")
+
+    resumed = _resume(
+        manager,
+        session_id,
+        home,
+        tmp_path,
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"unexpected default rebuild: {kwargs}")
+        ),
+    )
+
+    assert resumed.context.system_prompt == prompt
+    assert resumed.context.notices.count(
+        "skills changed, but this session's prompt predates owned skill spans; "
+        "restart the session to refresh its skill index"
+    ) == 1
+
+
 def test_live_runtime_adoption_uses_current_skill_index_in_memory(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
     prompt = f"identity\n\n{SkillCatalog.empty().index()}"
+    index = SkillCatalog.empty().index()
     manager, session_id = _manager_with_prompt(
-        home, tmp_path, system_prompt=prompt, prompt_recipe="custom"
+        home,
+        tmp_path,
+        system_prompt=prompt,
+        prompt_recipe="custom",
+        prompt_components={
+            "skill_index": {
+                "offset": prompt.index(index),
+                "length": len(index),
+                "digest": hashlib.sha256(index.encode()).hexdigest(),
+            }
+        },
     )
     stores: list[object] = []
 
