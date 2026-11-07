@@ -12891,9 +12891,17 @@ async def test_undo_restores_next_image_token_after_deleted_token(
 
 
 
+@pytest.mark.parametrize(
+    ("text", "hint"),
+    [
+        ("/quit", None),
+        ("/modle x", "/model?"),
+        ("/statu", "/status?"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_unknown_slash_command_is_rendered_without_model_request(
-    tmp_path: Path,
+    tmp_path: Path, text: str, hint: str | None
 ) -> None:
     output = StringIO()
     backend = FakeBackend([])
@@ -12906,13 +12914,16 @@ async def test_unknown_slash_command_is_rendered_without_model_request(
     )
     try:
         app._submissions.wake()
-        app._submissions.submit("/statu", steer=False)
+        app._submissions.submit(text, steer=False)
         await wait_until(lambda: not app._submissions.active)
 
         assert backend.calls == []
-        assert "unknown command /statu" in output.getvalue()
-        assert "did you mean" in output.getvalue()
-        assert "/status?" in output.getvalue()
+        assert f"unknown command {text.split(maxsplit=1)[0]}" in output.getvalue()
+        if hint is None:
+            assert "did you mean" not in output.getvalue()
+        else:
+            assert "did you mean" in output.getvalue()
+            assert hint in output.getvalue()
     finally:
         await app._submissions.close()
         await app.loop.close()
