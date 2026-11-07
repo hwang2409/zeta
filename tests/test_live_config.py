@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MessageOrigin,
@@ -25,6 +26,14 @@ from zeta.skills.agent_catalog import discover_session_agents
 from zeta.tools import ToolRegistry
 from zeta.tui import theme
 from zeta.tui.render import render_event
+
+
+def _write_skill(path: Path, name: str, description: str = "focused") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\nskill body\n",
+        encoding="utf-8",
+    )
 
 
 def _write_agent(
@@ -370,6 +379,66 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
 
 
 @pytest.mark.asyncio
+async def test_live_config_initial_manifest_is_not_read_during_loop_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.config.live as live_module
+
+    event_thread = threading.get_ident()
+    observed: list[int] = []
+    original = live_module._manifest
+
+    def record_manifest(scope):
+        observed.append(threading.get_ident())
+        return original(scope)
+
+    # test-contract: seam thread identity is observable only at the manifest seam
+    monkeypatch.setattr(live_module, "_manifest", record_manifest)
+    loop, _home, _project = _loop(tmp_path)
+
+    assert observed == [], "loop construction read the live-config filesystem"
+    await loop.refresh_live_config(force=True)
+    assert observed and all(thread != event_thread for thread in observed)
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_live_slash_projection_is_prepared_off_loop(tmp_path: Path) -> None:
+    loop, home, project = _loop(tmp_path)
+    registry = create_slash_registry(
+        zeta_home=home,
+        project_dir=project,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    event_thread = threading.get_ident()
+    prepared_on: list[int] = []
+    committed_on: list[int] = []
+
+    class SurfaceListener:
+        def __call__(self, catalog, _agents) -> None:
+            committed_on.append(threading.get_ident())
+            registry.register_skills(catalog)
+
+        def prepare_live_config(self, catalog, agents):
+            prepared_on.append(threading.get_ident())
+            return registry.prepare_live_config(catalog, agents)
+
+        def commit_live_config(self, projection) -> None:
+            committed_on.append(threading.get_ident())
+            registry.commit_live_config(projection)
+
+    loop.add_live_config_listener(SurfaceListener())
+    _write_skill(home / "skills" / "new-skill.md", "new-skill")
+
+    await loop.refresh_live_config()
+
+    assert prepared_on and prepared_on[0] != event_thread
+    assert committed_on == [event_thread]
+    assert [skill.name for skill in registry.skill_entries] == ["new-skill"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_live_config_prepares_schema_and_prompt_off_loop(
     tmp_path: Path,
 ) -> None:
@@ -439,6 +508,49 @@ async def test_config_changed_event_renders_through_real_render_event(
     assert isinstance(rendered, Text)
     assert rendered.style == theme.NOTICE
     assert console.export_text().strip() == "agent profiles changed: added specialist"
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_many_live_changes_stay_bounded_on_tui_and_serve_paths(
+    tmp_path: Path,
+) -> None:
+    from zeta.server.event_contract import config_changed_wire_fields
+    from zeta.server.protocol import MAX_FRAME_BYTES, FrameCodec
+
+    loop, home, _project = _loop(tmp_path)
+    events: list[StreamEvent] = []
+    loop.set_background_event_sink(events.append)
+    for index in range(132):
+        name = f"item-{index}-" + "x" * 8_000
+        _write_skill(home / "skills" / f"skill-{index}.md", name)
+        _write_agent(home / "agents" / f"agent-{index}.md", name, "focused")
+
+    await loop.refresh_live_config()
+
+    assert len(events) == 1
+    payload = events[0].data
+    skill_changes = payload["changes"]["skills"]
+    agent_changes = payload["changes"]["agents"]
+    assert len(skill_changes["added"]) == 26, "skill changes were not bounded"
+    assert len(agent_changes["added"]) == 26, "agent changes were not bounded"
+    assert skill_changes["added_count"] == 132
+    assert agent_changes["added_count"] == 132
+    assert skill_changes["added"][-1] == "and 107 more"
+    assert agent_changes["added"][-1] == "and 107 more"
+
+    rendered = render_event(events[0])
+    assert isinstance(rendered, Text)
+    assert rendered.plain == payload["message"]
+    assert rendered.plain.count("and 107 more") == 2
+
+    encoded = FrameCodec().notification(
+        "config_changed", "session-1", **config_changed_wire_fields(events[0])
+    )
+    frame = json.loads(encoded)
+    assert len(encoded) < MAX_FRAME_BYTES
+    assert frame["params"]["event"] == "config_changed"
+    assert frame["params"]["data"] == payload
     await loop.close()
 
 

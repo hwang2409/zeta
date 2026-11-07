@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ..agent.plan_mode import plan_mode_prompt
 from ..protocol.types import ToolSchema
@@ -30,6 +30,16 @@ class LiveConfigScope:
     project_dir: Path
 
 
+class LiveConfigListener(Protocol):
+    """Prepare a catalog surface off-loop, then commit it by reference."""
+
+    def prepare_live_config(
+        self, skill_catalog: SkillCatalog, agent_catalog: AgentCatalog
+    ) -> object: ...
+
+    def commit_live_config(self, prepared: object) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class LiveConfigBase:
     """Loop-owned references captured before worker preparation starts."""
@@ -44,6 +54,7 @@ class LiveConfigBase:
     agent_definition: ToolDefinition | None
     tool_schemas: tuple[ToolSchema, ...]
     explicit_tool_schemas: bool
+    listeners: tuple[LiveConfigListener, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +85,9 @@ class LiveConfigCandidate:
     diagnostics: tuple[str, ...]
     notice: str | None
     payload: dict[str, object] | None
+    listener_updates: tuple[tuple[LiveConfigListener, object], ...]
+    skill_snapshot: list[dict[str, object]] | None
+    agent_snapshot: list[dict[str, object]] | None
     changed: bool
     legacy_skill_notice: bool
 
@@ -191,21 +205,150 @@ def _replace_agent_schema(
     )
 
 
+_CHANGE_ITEM_LIMIT = 25
+_CHANGE_NAME_LIMIT = 200
+_DIAGNOSTIC_LIMIT = 10
+_DIAGNOSTIC_TEXT_LIMIT = 400
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    return value if len(value) <= limit else f"{value[: limit - 3]}..."
+
+
+def _bounded_values(values: tuple[str, ...], limit: int) -> tuple[str, ...]:
+    selected = tuple(_bounded_text(value, _CHANGE_NAME_LIMIT) for value in values[:limit])
+    omitted = len(values) - len(selected)
+    return (*selected, f"and {omitted} more") if omitted else selected
+
+
+def _bounded_delta(delta: CatalogDelta) -> CatalogDelta:
+    return CatalogDelta(
+        _bounded_values(delta.added, _CHANGE_ITEM_LIMIT),
+        _bounded_values(delta.removed, _CHANGE_ITEM_LIMIT),
+        _bounded_values(delta.updated, _CHANGE_ITEM_LIMIT),
+    )
+
+
 def _format_change(kind: str, delta: CatalogDelta) -> str | None:
-    changes: list[str] = []
-    if delta.added:
-        changes.append(f"added {', '.join(delta.added)}")
-    if delta.removed:
-        changes.append(f"removed {', '.join(delta.removed)}")
-    if delta.updated:
-        changes.append(f"updated {', '.join(delta.updated)}")
+    changes = tuple(
+        f"{verb} {', '.join(values)}"
+        for verb, values in (
+            ("added", delta.added),
+            ("removed", delta.removed),
+            ("updated", delta.updated),
+        )
+        if values
+    )
     return f"{kind} changed: {'; '.join(changes)}" if changes else None
 
 
 def _bounded_diagnostics(values: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(
-        value if len(value) <= 400 else f"{value[:397]}..." for value in values
+    selected = tuple(
+        _bounded_text(value, _DIAGNOSTIC_TEXT_LIMIT)
+        for value in values[:_DIAGNOSTIC_LIMIT]
     )
+    omitted = len(values) - len(selected)
+    return (*selected, f"and {omitted} more diagnostics") if omitted else selected
+
+
+def _discover_skills(
+    scope: LiveConfigScope, base: LiveConfigBase
+) -> tuple[SkillCatalog, tuple[str, ...]]:
+    try:
+        discovered = discover_session_skills(
+            home=scope.home, project_dir=scope.project_dir
+        )
+        prepared = _retained_skills(base.skill_catalog, discovered)
+    except (OSError, ValueError) as exc:
+        return base.skill_catalog, (f"skill discovery failed: {exc}",)
+    diagnostics = tuple(
+        notice
+        for notice in prepared.notices
+        if notice not in base.skill_catalog.notices
+    )
+    catalog = (
+        base.skill_catalog
+        if prepared.skills == base.skill_catalog.skills
+        else SkillCatalog(prepared.skills, base.skill_catalog.notices)
+    )
+    return catalog, diagnostics
+
+
+def _discover_agents(
+    scope: LiveConfigScope, base: LiveConfigBase
+) -> tuple[AgentCatalog, tuple[str, ...]]:
+    try:
+        discovered = discover_session_agents(
+            home=scope.home, project_dir=scope.project_dir
+        )
+        prepared = _retained_agents(base.agent_catalog, discovered)
+    except (OSError, ValueError) as exc:
+        return base.agent_catalog, (f"agent discovery failed: {exc}",)
+    diagnostics = tuple(
+        notice
+        for notice in prepared.notices
+        if notice not in base.agent_catalog.notices
+    )
+    catalog = (
+        base.agent_catalog
+        if prepared.agents == base.agent_catalog.agents
+        else AgentCatalog(prepared.agents, base.agent_catalog.notices)
+    )
+    return catalog, diagnostics
+
+
+def _delta_payload(
+    original: CatalogDelta, bounded: CatalogDelta
+) -> dict[str, object]:
+    return {
+        "added_count": len(original.added),
+        "added": list(bounded.added),
+        "removed_count": len(original.removed),
+        "removed": list(bounded.removed),
+        "updated_count": len(original.updated),
+        "updated": list(bounded.updated),
+    }
+
+
+def _change_payload(
+    skill_delta: CatalogDelta,
+    agent_delta: CatalogDelta,
+    diagnostics: tuple[str, ...],
+) -> tuple[str, dict[str, object]]:
+    bounded_skills = _bounded_delta(skill_delta)
+    bounded_agents = _bounded_delta(agent_delta)
+    notice = "\n".join(
+        value
+        for value in (
+            _format_change("skills", bounded_skills),
+            _format_change("agent profiles", bounded_agents),
+            *diagnostics,
+        )
+        if value
+    )
+    payload: dict[str, object] = {
+        "changes": {
+            "skills": _delta_payload(skill_delta, bounded_skills),
+            "agents": _delta_payload(agent_delta, bounded_agents),
+        },
+        "diagnostics": list(diagnostics),
+        "message": notice.replace("\n", " · "),
+    }
+    return notice, payload
+
+
+def _prepared_agent_definition(
+    base: LiveConfigBase, agents: AgentCatalog, changed: bool
+) -> tuple[ToolDefinition | None, tuple[ToolSchema, ...]]:
+    definition = base.agent_definition
+    schemas = base.tool_schemas
+    if definition is None or not changed:
+        return definition, schemas
+    description, parameters = agent_tool_schema(agents)
+    definition = replace(definition, description=description, parameters=parameters)
+    if base.explicit_tool_schemas:
+        schemas = _replace_agent_schema(schemas, definition.schema())
+    return definition, schemas
 
 
 class LiveConfigWatcher:
@@ -219,7 +362,7 @@ class LiveConfigWatcher:
         agent_catalog: AgentCatalog,
     ) -> None:
         self.scope = scope
-        self.manifest = _manifest(scope)
+        self.manifest: _Manifest | None = None
         self.skill_catalog = skill_catalog
         self.agent_catalog = agent_catalog
         self.legacy_skill_notice_emitted = False
@@ -230,131 +373,80 @@ class LiveConfigWatcher:
         manifest = _manifest(self.scope)
         if not force and manifest == self.manifest:
             return None
-        discovery_diagnostics: list[str] = []
-        try:
-            discovered_skills = discover_session_skills(
-                home=self.scope.home, project_dir=self.scope.project_dir
-            )
-            prepared_skills = _retained_skills(base.skill_catalog, discovered_skills)
-            discovery_diagnostics.extend(
-                notice
-                for notice in prepared_skills.notices
-                if notice not in base.skill_catalog.notices
-            )
-            skills = (
-                base.skill_catalog
-                if prepared_skills.skills == base.skill_catalog.skills
-                else SkillCatalog(prepared_skills.skills, base.skill_catalog.notices)
-            )
-        except (OSError, ValueError) as exc:
-            skills = base.skill_catalog
-            discovery_diagnostics.append(f"skill discovery failed: {exc}")
-        try:
-            discovered_agents = discover_session_agents(
-                home=self.scope.home, project_dir=self.scope.project_dir
-            )
-            prepared_agents = _retained_agents(base.agent_catalog, discovered_agents)
-            discovery_diagnostics.extend(
-                notice
-                for notice in prepared_agents.notices
-                if notice not in base.agent_catalog.notices
-            )
-            agents = (
-                base.agent_catalog
-                if prepared_agents.agents == base.agent_catalog.agents
-                else AgentCatalog(prepared_agents.agents, base.agent_catalog.notices)
-            )
-        except (OSError, ValueError) as exc:
-            agents = base.agent_catalog
-            discovery_diagnostics.append(f"agent discovery failed: {exc}")
-
+        skills, skill_diagnostics = _discover_skills(self.scope, base)
+        agents, agent_diagnostics = _discover_agents(self.scope, base)
         skill_delta = _delta(base.skill_catalog.skills, skills.skills)
         agent_delta = _delta(base.agent_catalog.agents, agents.agents)
-        legacy_skill_notice = (
-            skill_delta.changed
-            and "skill_index" not in base.prompt_base.prompt_components
-            and not self.legacy_skill_notice_emitted
+        legacy_notice = self._legacy_skill_notice(base, skill_delta)
+        diagnostics = _bounded_diagnostics(
+            (*skill_diagnostics, *agent_diagnostics, *legacy_notice)
         )
-        if legacy_skill_notice:
-            discovery_diagnostics.append(
+        changed = skill_delta.changed or agent_delta.changed or bool(diagnostics)
+        if not changed:
+            return LiveConfigCandidate(
+                base=base,
+                manifest=manifest,
+                skill_catalog=base.skill_catalog,
+                agent_catalog=base.agent_catalog,
+                agent_definition=base.agent_definition,
+                tool_schemas=base.tool_schemas,
+                prompt_base=base.prompt_base,
+                runtime_prompt=base.runtime_prompt,
+                skills=skill_delta,
+                agents=agent_delta,
+                diagnostics=(),
+                notice=None,
+                payload=None,
+                listener_updates=(),
+                skill_snapshot=None,
+                agent_snapshot=None,
+                changed=False,
+                legacy_skill_notice=False,
+            )
+        definition, schemas = _prepared_agent_definition(
+            base, agents, agent_delta.changed
+        )
+        prompt_base, runtime_prompt = _prepare_prompt(base, skills)
+        notice, payload = _change_payload(skill_delta, agent_delta, diagnostics)
+        listener_updates = tuple(
+            (listener, listener.prepare_live_config(skills, agents))
+            for listener in base.listeners
+        )
+        return LiveConfigCandidate(
+            base=base,
+            manifest=manifest,
+            skill_catalog=skills,
+            agent_catalog=agents,
+            agent_definition=definition,
+            tool_schemas=schemas,
+            prompt_base=prompt_base,
+            runtime_prompt=runtime_prompt,
+            skills=skill_delta,
+            agents=agent_delta,
+            diagnostics=diagnostics,
+            notice=notice,
+            payload=payload,
+            listener_updates=listener_updates,
+            skill_snapshot=skills.to_snapshot(),
+            agent_snapshot=agents.to_snapshot(),
+            changed=True,
+            legacy_skill_notice=bool(legacy_notice),
+        )
+
+    def _legacy_skill_notice(
+        self, base: LiveConfigBase, delta: CatalogDelta
+    ) -> tuple[str, ...]:
+        if (
+            not delta.changed
+            or "skill_index" in base.prompt_base.prompt_components
+            or self.legacy_skill_notice_emitted
+        ):
+            return ()
+        return (
+            (
                 "skills changed, but this session's prompt predates owned skill spans; "
                 "restart the session to refresh its skill index"
-            )
-        diagnostics = _bounded_diagnostics(tuple(discovery_diagnostics))
-        semantic_change = (
-            skill_delta.changed or agent_delta.changed or bool(diagnostics)
-        )
-        if not semantic_change:
-            return LiveConfigCandidate(
-                base,
-                manifest,
-                base.skill_catalog,
-                base.agent_catalog,
-                base.agent_definition,
-                base.tool_schemas,
-                base.prompt_base,
-                base.runtime_prompt,
-                skill_delta,
-                agent_delta,
-                (),
-                None,
-                None,
-                False,
-                False,
-            )
-
-        definition = base.agent_definition
-        schemas = base.tool_schemas
-        if definition is not None and agent_delta.changed:
-            description, parameters = agent_tool_schema(agents)
-            definition = replace(
-                definition, description=description, parameters=parameters
-            )
-            if base.explicit_tool_schemas:
-                schemas = _replace_agent_schema(schemas, definition.schema())
-        prompt_base, runtime_prompt = _prepare_prompt(base, skills)
-        notice_parts = tuple(
-            value
-            for value in (
-                _format_change("skills", skill_delta),
-                _format_change("agent profiles", agent_delta),
-                *diagnostics,
-            )
-            if value
-        )
-        notice = "\n".join(notice_parts)
-        payload: dict[str, object] = {
-            "changes": {
-                "skills": {
-                    "added": list(skill_delta.added),
-                    "removed": list(skill_delta.removed),
-                    "updated": list(skill_delta.updated),
-                },
-                "agents": {
-                    "added": list(agent_delta.added),
-                    "removed": list(agent_delta.removed),
-                    "updated": list(agent_delta.updated),
-                },
-            },
-            "diagnostics": list(diagnostics),
-            "message": notice,
-        }
-        return LiveConfigCandidate(
-            base,
-            manifest,
-            skills,
-            agents,
-            definition,
-            schemas,
-            prompt_base,
-            runtime_prompt,
-            skill_delta,
-            agent_delta,
-            diagnostics,
-            notice,
-            payload,
-            True,
-            legacy_skill_notice,
+            ),
         )
 
     def commit(self, candidate: LiveConfigCandidate) -> None:
@@ -368,6 +460,7 @@ class LiveConfigWatcher:
 __all__ = [
     "LiveConfigBase",
     "LiveConfigCandidate",
+    "LiveConfigListener",
     "LiveConfigScope",
     "LiveConfigWatcher",
 ]

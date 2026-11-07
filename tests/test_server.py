@@ -8754,8 +8754,63 @@ async def test_config_changed_requires_live_config_changed_feature(
 
 
 @pytest.mark.asyncio
-async def test_active_status_overlays_live_config_without_persisting_metadata(
+async def test_many_config_changes_reach_negotiated_serve_client_bounded(
     tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["live_config_changed"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        for index in range(132):
+            name = f"item-{index}-" + "x" * 8_000
+            for kind, body in (("skills", "skill body"), ("agents", "profile body")):
+                path = tmp_path / kind / f"item-{index}.md"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"---\nname: {name}\ndescription: focused\n---\n{body}\n",
+                    encoding="utf-8",
+                )
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        await server.runtime.loop.refresh_live_config()
+
+        assert len(prepared_events) == 1
+        await server.control._event(prepared_events[0], background=True)
+        frame = await _read(reader)
+        assert frame["params"]["event"] == "config_changed", (
+            "bounded config changes became a serve error frame"
+        )
+        config_event = frame["params"]
+
+        skills = config_event["data"]["changes"]["skills"]
+        agents = config_event["data"]["changes"]["agents"]
+        assert len(skills["added"]) == 26, "serve skill changes were not bounded"
+        assert len(agents["added"]) == 26, "serve agent changes were not bounded"
+        assert skills["added"][-1] == "and 107 more"
+        assert agents["added"][-1] == "and 107 more"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_active_status_overlays_live_config_without_persisting_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server = ZetaServer(
         provider="codex",
@@ -8789,9 +8844,26 @@ async def test_active_status_overlays_live_config_without_persisting_metadata(
         if refresher is None:
             refresher = server.runtime.loop.refresh_skills
         await refresher()
+        from zeta.skills.agent_catalog import AgentCatalog
+        from zeta.skills.catalog import SkillCatalog
 
+        snapshot_calls: list[str] = []
+        original_skill_snapshot = SkillCatalog.to_snapshot
+        original_agent_snapshot = AgentCatalog.to_snapshot
+
+        def skill_snapshot(catalog: SkillCatalog):
+            snapshot_calls.append("skills")
+            return original_skill_snapshot(catalog)
+
+        def agent_snapshot(catalog: AgentCatalog):
+            snapshot_calls.append("agents")
+            return original_agent_snapshot(catalog)
+
+        monkeypatch.setattr(SkillCatalog, "to_snapshot", skill_snapshot)
+        monkeypatch.setattr(AgentCatalog, "to_snapshot", agent_snapshot)
         status = (await _request(reader, writer, 3, "status", {}))[-1]["result"]
 
+        assert snapshot_calls == [], "status rebuilt active catalog snapshots"
         assert "specialist" in {
             item["name"] for item in status["session"]["agent_catalog"]
         }

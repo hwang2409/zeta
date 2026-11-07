@@ -46,13 +46,9 @@ def image_stub(block: Mapping[str, object]) -> dict[str, object]:
 
 
 def config_changed_wire_fields(event: StreamEvent) -> dict[str, object]:
-    """Project one bounded live-config event for the serve wire."""
+    """Return the worker-bounded live-config payload by reference."""
 
-    data, truncated = project_tool_value(event.data)
-    fields: dict[str, object] = {"data": data}
-    if truncated:
-        fields["truncated"] = True
-    return fields
+    return {"data": event.data}
 
 
 def project_tool_value(value: object) -> tuple[object, bool]:

@@ -611,6 +611,23 @@ class ServeControl:
             await self._event(agent_end, session_id=session_id)
             self._schedule_background_wake(session_id)
 
+    async def _publish_config_changed(
+        self, event: StreamEvent, session_id: str | None
+    ) -> None:
+        controller = (
+            self.server.connections.controller_metadata()
+            if self.server.connections is not None
+            else None
+        )
+        if controller is None or "live_config_changed" not in controller.features:
+            return
+        await self._end_stale_approvals(session_id)
+        await self._notify(
+            event_contract.STREAM_EVENT_WIRE_EVENTS[event.type],
+            session_id,
+            **event_contract.config_changed_wire_fields(event),
+        )
+
     async def _event(
         self,
         event: StreamEvent,
@@ -629,26 +646,14 @@ class ServeControl:
         )
         kind = event.type
         if kind is StreamEventType.CONFIG_CHANGED:
-            controller = (
-                self.server.connections.controller_metadata()
-                if self.server.connections is not None
-                else None
-            )
-            if controller is None or "live_config_changed" not in controller.features:
-                return
+            await self._publish_config_changed(event, session_id)
+            return
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
         if kind not in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
         }:
             await self._end_stale_approvals(session_id)
-        if kind is StreamEventType.CONFIG_CHANGED:
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.config_changed_wire_fields(event),
-            )
-            return
         if kind is StreamEventType.MESSAGE_UPDATE:
             delta = event.delta
             stream_kind = "assistant"

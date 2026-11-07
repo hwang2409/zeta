@@ -834,8 +834,12 @@ class _Client:
                 key: dict(component)
                 for key, component in loop._runtime_prompt.prompt_components.items()
             }
-            snapshot["skill_catalog"] = loop.tool_registry.skill_catalog.to_snapshot()
-            snapshot["agent_catalog"] = loop.tool_registry.agent_catalog.to_snapshot()
+            snapshot["skill_catalog"] = _active_catalog_snapshot(
+                loop._live_skill_catalog_snapshot, snapshot.get("skill_catalog")
+            )
+            snapshot["agent_catalog"] = _active_catalog_snapshot(
+                loop._live_agent_catalog_snapshot, snapshot.get("agent_catalog")
+            )
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
@@ -947,6 +951,12 @@ class _Client:
     async def _write_physical(self, payload: bytes) -> bool:
         async with self._write_lock:
             return await finish_frame_write(self.codec, self.writer, payload)
+
+
+def _active_catalog_snapshot(
+    prepared: object | None, persisted: object | None
+) -> object | None:
+    return persisted if prepared is None else prepared
 
 
 def _home() -> Path:

@@ -684,7 +684,7 @@ def render_event(
         if not isinstance(message, str) or not message:
             return Text("live config changed", style=theme.NOTICE)
         return Text(
-            message.replace("\n", " · "),
+            message,
             style=theme.NOTICE,
             overflow="ellipsis",
             no_wrap=True,

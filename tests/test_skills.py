@@ -555,7 +555,6 @@ async def test_newer_live_config_generation_wins(
     path = home / "skills" / "live.md"
     _write_skill(path, "live", "first")
     scanned = threading.Event()
-    second_scanned = threading.Event()
     release = threading.Event()
     original = live_module.discover_session_skills
     calls = 0
@@ -567,8 +566,6 @@ async def test_newer_live_config_generation_wins(
         if calls == 1:
             scanned.set()
             release.wait(timeout=2)
-        elif calls == 2:
-            second_scanned.set()
         return result
 
     monkeypatch.setattr(live_module, "discover_session_skills", delayed_discovery)
@@ -579,7 +576,8 @@ async def test_newer_live_config_generation_wins(
         encoding="utf-8",
     )
     newer = asyncio.create_task(loop.refresh_live_config())
-    await asyncio.to_thread(second_scanned.wait, 0.2)
+    while loop._live_config_generation < 2:
+        await asyncio.sleep(0)
     release.set()
     await asyncio.gather(older, newer)
 
@@ -587,7 +585,7 @@ async def test_newer_live_config_generation_wins(
     assert loop.tool_registry.skill_catalog.find("live").description == (
         "newest description"
     )
-    loop.store.close()
+    await loop.close()
 
 
 def test_live_slash_skills_replace_added_and_removed_entries(tmp_path: Path) -> None:

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ...config.live import LiveConfigBase, LiveConfigScope, LiveConfigWatcher
+from ...config.live import (
+    LiveConfigBase,
+    LiveConfigListener,
+    LiveConfigScope,
+    LiveConfigWatcher,
+)
 from ...protocol.types import (
     Message,
     MessageOrigin,
@@ -59,9 +63,9 @@ class LiveConfigMixin:
         self._live_config_generation = 0
         self._prompt_generation = 0
         self._live_config_notices: list[str] = []
-        self._live_config_listeners: list[
-            Callable[[SkillCatalog, AgentCatalog], None]
-        ] = []
+        self._live_config_listeners: list[LiveConfigListener] = []
+        self._live_skill_catalog_snapshot: list[dict[str, object]] | None = None
+        self._live_agent_catalog_snapshot: list[dict[str, object]] | None = None
         self._runtime_prompt = RuntimePrompt(
             self.context_assembler.system_prompt,
             (
@@ -85,9 +89,7 @@ class LiveConfigMixin:
             return self._plan_mode_prior_prompt
         return self._runtime_prompt
 
-    def add_live_config_listener(
-        self, listener: Callable[[SkillCatalog, AgentCatalog], None]
-    ) -> None:
+    def add_live_config_listener(self, listener: LiveConfigListener) -> None:
         self._live_config_listeners.append(listener)
 
     async def refresh_live_config(self, force: bool = False) -> None:
@@ -109,6 +111,7 @@ class LiveConfigMixin:
             agent_definition=self.tool_registry.definition_reference("agent"),
             tool_schemas=self.tool_schemas,
             explicit_tool_schemas=self._provided_tool_schemas,
+            listeners=tuple(self._live_config_listeners),
         )
         async with self._live_config_lock:
             candidate = await asyncio.to_thread(watcher.prepare, base, force=force)
@@ -129,8 +132,10 @@ class LiveConfigMixin:
                 if self._plan_mode:
                     self._plan_mode_prior_prompt = candidate.prompt_base
                 self._set_runtime_prompt(candidate.runtime_prompt)
-            for listener in self._live_config_listeners:
-                listener(candidate.skill_catalog, candidate.agent_catalog)
+            for listener, prepared in candidate.listener_updates:
+                listener.commit_live_config(prepared)
+            self._live_skill_catalog_snapshot = candidate.skill_snapshot
+            self._live_agent_catalog_snapshot = candidate.agent_snapshot
             if candidate.notice:
                 self._live_config_notices.append(candidate.notice)
             if candidate.payload is not None:
@@ -149,6 +154,7 @@ class LiveConfigMixin:
             and base.agent_definition
             is self.tool_registry.definition_reference("agent")
             and base.tool_schemas is self.tool_schemas
+            and base.listeners == tuple(self._live_config_listeners)
         )
 
     async def _flush_live_config_notices(self) -> None:

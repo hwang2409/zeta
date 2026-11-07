@@ -8,6 +8,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -450,8 +451,8 @@ async def _build_child_loop(
             )
 
         child_home = Path(loop.active_home) if loop.active_home else env_home()
-        child_discovery = discover_project(
-            child_registry.cwd, user_home=child_home.parent
+        prepared_prompt = await asyncio.to_thread(
+            _child_base_system_prompt, loop, cwd_override, child_registry
         )
         child_loop = AgentLoop(
             child_backend,
@@ -462,9 +463,7 @@ async def _build_child_loop(
             token_budget=child_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=_compose_child_system_prompt(
-                await asyncio.to_thread(
-                    _child_base_system_prompt, loop, cwd_override, child_registry
-                ),
+                prepared_prompt.prompt,
                 preset,
                 explicit_finish=explicit_finish,
             ),
@@ -478,9 +477,7 @@ async def _build_child_loop(
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
             live_config_home=child_home,
-            live_config_project_dir=(
-                child_discovery.primary_root or child_discovery.cwd
-            ),
+            live_config_project_dir=prepared_prompt.project_dir,
         )
         child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)
@@ -1189,15 +1186,25 @@ async def run_agent_tool(
         await child_loop.close(cancel_background=False)
 
 
+@dataclass(frozen=True, slots=True)
+class _ChildPromptPreparation:
+    prompt: str | Message
+    project_dir: Path
+
+
 def _child_base_system_prompt(
     loop: AgentLoop,
     cwd_override: str | None,
     child_registry: ToolRegistry | None = None,
-) -> str | Message:
-    """Compose project context from an explicit cwd that differs from the parent."""
+) -> _ChildPromptPreparation:
+    """Prepare child project context and its live-config root in one worker."""
 
     if cwd_override is None or same_physical_path(cwd_override, loop.store.cwd):
-        return loop.context_assembler.system_prompt
+        scope = getattr(loop, "_live_config_scope", None)
+        project_dir = scope.project_dir if scope is not None else Path(loop.store.cwd)
+        return _ChildPromptPreparation(
+            loop.context_assembler.system_prompt, project_dir
+        )
     if child_registry is not None:
         child_registry.verify_cwd_identity()
     home_hint = loop.active_home
@@ -1222,7 +1229,9 @@ def _child_base_system_prompt(
         cwd_project=cwd_project,
         inbox_enabled=False,
     )
-    return context.system_prompt
+    return _ChildPromptPreparation(
+        context.system_prompt, discovery.primary_root or discovery.cwd
+    )
 
 
 _EXPLICIT_FINISH_GUIDANCE = (
