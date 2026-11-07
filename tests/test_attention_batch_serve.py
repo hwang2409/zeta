@@ -14,8 +14,10 @@ from tests.test_server import (
     _seed_slash_fixtures,
 )
 from zeta.attention_records import AttentionStore
+from zeta.attention_replies import AttentionReplies
 from zeta.project_inbox import ProjectInbox
 from zeta.server import ZetaServer
+from zeta.server.slash_commands import ServerSlashSession
 
 
 @pytest.mark.asyncio
@@ -77,8 +79,6 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
             why="choose",
             options=("yes",),
         )
-        from zeta.attention_replies import AttentionReplies
-
         await asyncio.to_thread(
             AttentionReplies(tmp_path / "home", session_id).stage, conflict.id, "staged"
         )
@@ -133,8 +133,6 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
             why="inform",
             kind="answer",
         )
-        from zeta.attention_replies import AttentionReplies
-
         real_dismiss = AttentionReplies.dismiss
         injected = False
 
@@ -177,6 +175,149 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
             )
         )[-1]["result"]
         assert dismissed["text"] == f"dismissed {dismissible.id}"
+        assert checks == 1
+    finally:
+        await _close(server, writer)
+
+
+async def _seed_attention_record(
+    store: AttentionStore, session_id: str, project_id: str, title: str
+):
+    return await asyncio.to_thread(
+        store.request,
+        session_id=session_id,
+        project_id=project_id,
+        entry_id=None,
+        entry_seq=None,
+        title=title,
+        why="choose",
+        options=("yes",),
+    )
+
+
+def _leave_sealed_reply(
+    home: Path, session_id: str, attention_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replies = AttentionReplies(home, session_id)
+
+    def stop_after_seal(_journal: Path) -> None:
+        raise RuntimeError("leave journal sealed")
+
+    monkeypatch.setattr(replies, "_send_journal", stop_after_seal)
+    with pytest.raises(Exception, match="leave journal sealed"):
+        replies.reply(attention_id, "yes", session_id)
+
+
+@pytest.mark.asyncio
+async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        opened = server.runtime.opened
+        assert opened is not None
+        registry = server.runtime.manager.project_registry
+        assert registry is not None
+        project_id = (
+            await asyncio.to_thread(registry.create_project, "invalid batch", "test")
+        ).project_id
+        store = AttentionStore(opened.store.session_dir)
+        sealed = await _seed_attention_record(store, session_id, project_id, "sealed")
+        invalid = await _seed_attention_record(store, session_id, project_id, "invalid")
+        _leave_sealed_reply(tmp_path / "home", session_id, sealed.id, monkeypatch)
+
+        loop = server.runtime.loop
+        assert loop is not None
+        checks = 0
+
+        async def count_check() -> None:
+            nonlocal checks
+            checks += 1
+
+        # test-contract: seam count inbox admission through the real serve adapter
+        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
+        payload = json.dumps([{"id": invalid.id, "reply": "   "}])
+        error = (
+            await _request(
+                reader,
+                writer,
+                "invalid-batch",
+                "slash_run",
+                {"session_id": session_id, "text": f"/decisions batch {payload}"},
+            )
+        )[-1]["error"]
+
+        assert "reply must be nonempty and within the size limit" in error["message"]
+        assert store.get(sealed.id).status == "open"
+        assert checks == 0
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        opened = server.runtime.opened
+        assert opened is not None
+        registry = server.runtime.manager.project_registry
+        assert registry is not None
+        project_id = (
+            await asyncio.to_thread(registry.create_project, "operation error", "test")
+        ).project_id
+        store = AttentionStore(opened.store.session_dir)
+        sealed = await _seed_attention_record(store, session_id, project_id, "sealed")
+        target = await _seed_attention_record(store, session_id, project_id, "target")
+        _leave_sealed_reply(tmp_path / "home", session_id, sealed.id, monkeypatch)
+
+        real_record = AttentionReplies._record
+
+        def fail_target(replies: AttentionReplies, attention_id: str):
+            if attention_id == target.id:
+                raise RuntimeError("unexpected operation failure")
+            return real_record(replies, attention_id)
+
+        loop = server.runtime.loop
+        assert loop is not None
+        checks = 0
+        outcomes = []
+        real_check = ServerSlashSession._check_attention_outcome
+
+        async def count_check() -> None:
+            nonlocal checks
+            checks += 1
+
+        async def capture_outcome(session: ServerSlashSession, outcome) -> None:
+            outcomes.append(outcome)
+            await real_check(session, outcome)
+
+        # test-contract: seam fail after recovery publishes but before the action completes
+        monkeypatch.setattr(AttentionReplies, "_record", fail_target)
+        # test-contract: seam inspect the outcome passed through the real serve adapter
+        monkeypatch.setattr(ServerSlashSession, "_check_attention_outcome", capture_outcome)
+        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
+        error = (
+            await _request(
+                reader,
+                writer,
+                "operation-error",
+                "slash_run",
+                {
+                    "session_id": session_id,
+                    "text": f"/decisions dismiss {target.id}",
+                },
+            )
+        )[-1]["error"]
+
+        assert "unexpected operation failure" in error["message"]
+        assert len(outcomes) == 1
+        assert outcomes[0].published
         assert checks == 1
     finally:
         await _close(server, writer)

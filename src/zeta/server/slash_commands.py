@@ -130,10 +130,9 @@ class ServerSlashSession:
             return await self._slash_decisions_action(
                 command, remainder, items, opened.metadata.session_id
             )
-        outcome = await asyncio.to_thread(
+        await self._run_attention_operation(
             self._attention_replies(opened.metadata.session_id).recover
         )
-        await self._check_attention_outcome(outcome)
         items = await asyncio.to_thread(
             open_decisions,
             self._runtime.home,
@@ -168,6 +167,17 @@ class ServerSlashSession:
             loop, _opened = self._active_loop_and_session()
             await loop._check_project_inbox()
 
+    async def _run_attention_operation(self, operation, *args):
+        from ..attention_replies import ReplyOperationError
+
+        try:
+            outcome = await asyncio.to_thread(operation, *args)
+        except ReplyOperationError as exc:
+            await self._check_attention_outcome(exc.outcome)
+            raise
+        await self._check_attention_outcome(outcome)
+        return outcome
+
     async def _slash_decisions_batch(self, payload: str, from_session: str) -> str:
         if not payload:
             return "usage: /decisions batch <json array>"
@@ -188,18 +198,11 @@ class ServerSlashSession:
     async def _run_decisions_batch(
         self, batch: list[tuple[str, str]], from_session: str
     ) -> str:
-        from ..attention_replies import ReplyConflict
-
-        try:
-            outcome = await asyncio.to_thread(
-                self._attention_replies(from_session).stage_and_flush,
-                batch,
-                from_session,
-            )
-        except ReplyConflict as exc:
-            await self._check_attention_outcome(exc.outcome)
-            raise
-        await self._check_attention_outcome(outcome)
+        await self._run_attention_operation(
+            self._attention_replies(from_session).stage_and_flush,
+            batch,
+            from_session,
+        )
         return f"replied to {len(batch)} attention item(s)"
 
     async def _slash_decisions_action(
@@ -209,8 +212,6 @@ class ServerSlashSession:
         items: tuple[DecisionItem, ...],
         from_session: str,
     ) -> str:
-        from ..attention_replies import ReplyConflict
-
         attention_id, separator, reply = remainder.partition(" ")
         if not attention_id:
             return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
@@ -218,21 +219,16 @@ class ServerSlashSession:
         if item is None:
             return "attention item not found"
         replies = self._attention_replies(item.session_id)
-        try:
-            if command == "dismiss":
-                outcome = await asyncio.to_thread(replies.dismiss, item.record.id)
-                text = f"dismissed {item.record.id}"
-            else:
-                if not separator or not reply.strip():
-                    return "reply text must be nonempty"
-                outcome = await asyncio.to_thread(
-                    replies.reply, item.record.id, reply, from_session
-                )
-                text = f"replied to {item.record.id}"
-        except ReplyConflict as exc:
-            await self._check_attention_outcome(exc.outcome)
-            raise
-        await self._check_attention_outcome(outcome)
+        if command == "dismiss":
+            await self._run_attention_operation(replies.dismiss, item.record.id)
+            text = f"dismissed {item.record.id}"
+        else:
+            if not separator or not reply.strip():
+                return "reply text must be nonempty"
+            await self._run_attention_operation(
+                replies.reply, item.record.id, reply, from_session
+            )
+            text = f"replied to {item.record.id}"
         return text
 
     def slash_status_command(self, args: str) -> str | Awaitable[str]:

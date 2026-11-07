@@ -181,7 +181,7 @@ class DecisionsMixin:
     async def _recover_decisions(self, session_id: str):
         from ...attention_replies import AttentionReplies
 
-        return await asyncio.to_thread(
+        return await self._run_attention_operation(
             AttentionReplies(
                 self._home,
                 session_id,
@@ -194,11 +194,11 @@ class DecisionsMixin:
             self._schedule_background_wake()
 
     async def _run_attention_operation(self, operation, *args, **kwargs):
-        from ...attention_replies import ReplyConflict
+        from ...attention_replies import ReplyOperationError
 
         try:
             outcome = await asyncio.to_thread(operation, *args, **kwargs)
-        except ReplyConflict as exc:
+        except ReplyOperationError as exc:
             self._wake_for_attention_outcome(exc.outcome)
             raise
         self._wake_for_attention_outcome(outcome)
@@ -211,8 +211,7 @@ class DecisionsMixin:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
-        recovered = await self._recover_decisions(self._decisions_session_id)
-        self._wake_for_attention_outcome(recovered)
+        await self._recover_decisions(self._decisions_session_id)
         await self._decisions_tick()
         if self._decisions_panel_open:
             return
@@ -356,7 +355,7 @@ class DecisionsMixin:
         record = item.record
 
         async def run() -> None:
-            from ...attention_replies import AttentionReplies, ReplyConflict
+            from ...attention_replies import AttentionReplies, ReplyOperationError
 
             item_ids = {
                 panel_item.record.id
@@ -376,7 +375,7 @@ class DecisionsMixin:
                     flush_ids=item_ids,
                     from_session=self.loop.store.session_id,
                 )
-            except ReplyConflict as exc:
+            except ReplyOperationError as exc:
                 self._print_system(f"decision not delivered: {exc}")
             except (OSError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
@@ -392,7 +391,7 @@ class DecisionsMixin:
             return
 
         async def run() -> None:
-            from ...attention_replies import AttentionReplies, ReplyConflict
+            from ...attention_replies import AttentionReplies, ReplyOperationError
 
             try:
                 replies = AttentionReplies(
@@ -401,7 +400,7 @@ class DecisionsMixin:
                     registry_state=_registry_state(self),
                 )
                 await self._run_attention_operation(replies.dismiss, item.record.id)
-            except ReplyConflict as exc:
+            except ReplyOperationError as exc:
                 self._print_system(f"attention not dismissed: {exc}")
             except (OSError, ValueError) as exc:
                 self._print_system(f"attention not dismissed: {exc}")

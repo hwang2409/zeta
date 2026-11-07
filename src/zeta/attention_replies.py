@@ -47,12 +47,19 @@ class ReplyOutcome:
         )
 
 
-class ReplyConflict(ValueError):
-    """A terminal conflict, including publication completed during recovery."""
+class ReplyOperationError(RuntimeError):
+    """An operation error, including publication completed during recovery."""
 
     def __init__(self, message: str, outcome: ReplyOutcome) -> None:
         super().__init__(message)
         self.outcome = outcome
+
+
+class ReplyConflict(ValueError, ReplyOperationError):
+    """A terminal conflict, including publication completed during recovery."""
+
+    def __init__(self, message: str, outcome: ReplyOutcome) -> None:
+        ReplyOperationError.__init__(self, message, outcome)
 
 
 class AttentionReplies:
@@ -85,14 +92,26 @@ class AttentionReplies:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-    def recover(self) -> ReplyOutcome:
+    @contextmanager
+    def _operation(self) -> Iterator[ReplyOutcome]:
         with self._lock():
-            return self._recover_locked()
+            recovered = ReplyOutcome()
+            try:
+                recovered = self._recover_locked()
+                yield recovered
+            except ReplyOperationError:
+                raise
+            except Exception as exc:
+                raise ReplyOperationError(str(exc), recovered) from exc
+
+    def recover(self) -> ReplyOutcome:
+        with self._operation() as recovered:
+            return recovered
 
     def resolve_local(self, attention_id: str, reply: str) -> ReplyOutcome:
+        attention_id = self._validate_attention_id(attention_id)
         reply = self._validate_reply(reply)
-        with self._lock():
-            recovered = self._recover_locked()
+        with self._operation() as recovered:
             self._reject_staged(attention_id, recovered)
             record = self._record(attention_id)
             self._check_session(record)
@@ -161,9 +180,12 @@ class AttentionReplies:
         flush_ids: set[str] | None = None,
         from_session: str | None = None,
     ) -> ReplyOutcome:
+        attention_id = self._validate_attention_id(attention_id)
         reply = self._validate_reply(reply)
-        with self._lock():
-            recovered = self._recover_locked()
+        flush_ids = self._validate_flush_ids(flush_ids)
+        if flush_ids is not None or from_session is not None:
+            from_session = self._validate_from_session(from_session)
+        with self._operation() as recovered:
             record = self._record(attention_id)
             self._check_session(record)
             if record.status == "resolved":
@@ -202,10 +224,6 @@ class AttentionReplies:
             if flush_ids is not None and flush_ids <= {
                 item_id for item_id, _ in staged
             }:
-                if from_session is None:
-                    raise ValueError(
-                        "from_session is required when staged replies can flush"
-                    )
                 journal = self._prepare_locked(
                     list(staged), source=self.staged_dir, from_session=from_session
                 )
@@ -224,8 +242,8 @@ class AttentionReplies:
             )
 
     def flush(self, from_session: str) -> ReplyOutcome:
-        with self._lock():
-            recovered = self._recover_locked()
+        from_session = self._validate_from_session(from_session)
+        with self._operation() as recovered:
             outcomes: list[ReplyItemOutcome] = []
             open_pairs: list[tuple[str, str]] = []
             for item_id, reply in recovered.staged:
@@ -263,9 +281,10 @@ class AttentionReplies:
             )
 
     def reply(self, attention_id: str, reply: str, from_session: str) -> ReplyOutcome:
+        attention_id = self._validate_attention_id(attention_id)
         reply = self._validate_reply(reply)
-        with self._lock():
-            recovered = self._recover_locked()
+        from_session = self._validate_from_session(from_session)
+        with self._operation() as recovered:
             self._reject_staged(attention_id, recovered)
             record = self._record(attention_id)
             self._check_session(record)
@@ -294,8 +313,8 @@ class AttentionReplies:
             )
 
     def dismiss(self, attention_id: str) -> ReplyOutcome:
-        with self._lock():
-            recovered = self._recover_locked()
+        attention_id = self._validate_attention_id(attention_id)
+        with self._operation() as recovered:
             self._reject_staged(attention_id, recovered)
             record = self._record(attention_id)
             self._check_session(record)
@@ -320,15 +339,13 @@ class AttentionReplies:
     def stage_and_flush(
         self, replies: list[tuple[str, str]], from_session: str
     ) -> ReplyOutcome:
-        with self._lock():
-            recovered = self._recover_locked()
+        pairs = self._validate_batch(replies)
+        from_session = self._validate_from_session(from_session)
+        with self._operation() as recovered:
             staged = dict(recovered.staged)
-            conflicting = tuple(item_id for item_id, _ in replies if item_id in staged)
+            conflicting = tuple(item_id for item_id, _ in pairs if item_id in staged)
             if conflicting:
                 self._raise_staged_conflict(conflicting[0], recovered, conflicting)
-            pairs = [
-                (item_id, self._validate_reply(reply)) for item_id, reply in replies
-            ]
             outcomes: list[ReplyItemOutcome] = []
             open_pairs: list[tuple[str, str]] = []
             for item_id, reply in pairs:
@@ -433,7 +450,17 @@ class AttentionReplies:
             raise ValueError("attention item is already resolved")
 
     @staticmethod
-    def _validate_reply(reply: str) -> str:
+    def _validate_attention_id(attention_id: object) -> str:
+        if (
+            not isinstance(attention_id, str)
+            or len(attention_id) != 32
+            or any(character not in "0123456789abcdef" for character in attention_id)
+        ):
+            raise ValueError("invalid attention id")
+        return attention_id
+
+    @staticmethod
+    def _validate_reply(reply: object) -> str:
         if (
             not isinstance(reply, str)
             or not reply.strip()
@@ -441,6 +468,35 @@ class AttentionReplies:
         ):
             raise ValueError("reply must be nonempty and within the size limit")
         return reply.strip()
+
+    @staticmethod
+    def _validate_from_session(from_session: object) -> str:
+        if not isinstance(from_session, str) or not from_session:
+            raise ValueError("from_session must be nonempty")
+        return from_session
+
+    @classmethod
+    def _validate_flush_ids(cls, flush_ids: object) -> set[str] | None:
+        if flush_ids is None:
+            return None
+        if not isinstance(flush_ids, set):
+            raise TypeError("flush_ids must be a set of attention ids")
+        return {cls._validate_attention_id(item_id) for item_id in flush_ids}
+
+    @classmethod
+    def _validate_batch(cls, replies: object) -> list[tuple[str, str]]:
+        if not isinstance(replies, list):
+            raise TypeError("replies must be a list of attention id and reply pairs")
+        pairs: list[tuple[str, str]] = []
+        for item in replies:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise TypeError("replies must be a list of attention id and reply pairs")
+            pairs.append(
+                (cls._validate_attention_id(item[0]), cls._validate_reply(item[1]))
+            )
+        if len({item_id for item_id, _reply in pairs}) != len(pairs):
+            raise ValueError("replies must contain unique attention ids")
+        return pairs
 
     def _prepare_locked(
         self,

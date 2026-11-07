@@ -229,10 +229,14 @@ def test_orchestrator_resolve_attention_rejects_unknown_and_foreign_items(
         why="Only the user can choose.",
     )
     handler = registry.definitions_by_name["resolve_attention"].handler
-    with pytest.raises(FileNotFoundError):
+    from zeta.attention_replies import ReplyOperationError
+
+    with pytest.raises(ReplyOperationError) as foreign:
         asyncio.run(handler({"attention_id": record.id, "decision": "no"}))
-    with pytest.raises(FileNotFoundError):
+    assert isinstance(foreign.value.__cause__, FileNotFoundError)
+    with pytest.raises(ReplyOperationError) as missing:
         asyncio.run(handler({"attention_id": "0" * 32, "decision": "no"}))
+    assert isinstance(missing.value.__cause__, FileNotFoundError)
     with pytest.raises(ValueError, match="nonempty"):
         asyncio.run(handler({"attention_id": own_record.id, "decision": "   "}))
     assert "resolve_attention" in registry.registered_names
