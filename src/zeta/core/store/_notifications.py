@@ -623,6 +623,10 @@ class NotificationStateMixin:
             ]
             if rows:
                 self._append_many_unlocked(rows)
+                writer = self._durable_writer
+                if writer is not None and writer is not self:
+                    writer.close()
+                    self._durable_writer = None
 
     async def acknowledge_agent_notifications_async(
         self: ConversationStore, notification_ids: list[str]

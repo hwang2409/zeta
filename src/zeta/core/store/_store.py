@@ -564,10 +564,6 @@ class ConversationStore(
     def _append_many_unlocked(
         self, rows: list[tuple[str, dict[str, Any]]]
     ) -> list[ConversationEntry]:
-        writer = self._durable_writer
-        if writer is not None and writer is not self:
-            writer.close()
-            self._durable_writer = None
         prior_ids = set(self._entry_ids)
         parent_id = self._entries[-1].id if self._entries else None
         next_seq = self._entries[-1].seq + 1 if self._entries else 1

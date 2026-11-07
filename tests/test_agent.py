@@ -3893,7 +3893,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def aiter_bytes(self) -> AsyncIterator[bytes]:
             stream_started.set()
             yield b'{"message":{"content":"partial"}}\n'
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="test await")
 
     class StreamContext:
         def __init__(self) -> None:
@@ -3906,7 +3906,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def __aexit__(self, *args: object) -> None:
             self.close_started.set()
             try:
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="test await")
             except asyncio.CancelledError:
                 self.close_cancelled.set()
                 raise
@@ -3924,7 +3924,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def aclose(self) -> None:
             self.close_started.set()
             try:
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="test await")
             except asyncio.CancelledError:
                 self.close_cancelled.set()
                 raise
@@ -3947,9 +3947,9 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
             child_loop, OllamaBackend(stall_seconds=0).complete([], []), consume_stream
         )
     )
-    await stream_started.wait()
+    await await_or_fail(stream_started.wait(), what="test await")
     deadlines.expire(state)
-    result = await model_turn
+    result = await await_or_fail(model_turn, what="test await")
     await asyncio.sleep(0)
 
     assert result is not None
@@ -15506,6 +15506,7 @@ async def test_recovery_refresh_never_runs_on_event_loop(
             raise RuntimeError("refresh load ran on event-loop thread")
         original_before(target)
 
+    # test-contract: seam private hook proves the refresh worker thread
     monkeypatch.setattr(
         ConversationStore, "_before_committed_mutation", guarded_refresh_load
     )

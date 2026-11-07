@@ -17,6 +17,7 @@ from ..checkpoints.mutation import (
     _MethodMutation,
     execute_mutation,
 )
+from ._pending_prompts import PendingPromptWriterReloadedError
 
 _REFRESH_PATCH_FIELDS = (
     "cwd",
@@ -158,7 +159,7 @@ class AsyncDurableWritesMixin:
             cancelled_before_write.write_started.set()
             delta = execute_mutation(writer, command, expected_generation)
             return delta, writer.take_persisted_appends()
-        except ConversationGenerationConflict:
+        except (ConversationGenerationConflict, PendingPromptWriterReloadedError):
             raise
         except BaseException:
             if writer is not None:
