@@ -432,8 +432,11 @@ class ContextAssembler(ContextMarkerMixin):
             )
             if truncated is not None:
                 return self._save(truncated, False)
+        # Every evicted user is either pinned at its source position or sent to the summary.
         candidates = [
-            item for index, item in enumerate(items[:boundary]) if index != latest_user
+            item
+            for index, item in enumerate(items[:boundary])
+            if pinned_user is None or index != latest_user
         ]
         evicted = await self._evict_context(
             backend=backend,

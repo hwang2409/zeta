@@ -3252,6 +3252,51 @@ class EmptyEvictionPolicy(CompactionPolicy):
         return "fallback summary"
 
 
+class RecordingSummaryPolicy(CompactionPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs: list[list[Message]] = []
+
+    async def summarize_chunked(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        self.inputs.append(list(messages))
+        return "\n".join(
+            content.text
+            for message in messages
+            for content in message.content
+            if isinstance(content, TextContent)
+        )
+
+
+@pytest.mark.asyncio
+async def test_answered_latest_user_is_summarized_not_dropped(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(with_message_origin(text(MessageRole.USER, "answered request"), MessageOrigin.USER))
+    store.append_message(text(MessageRole.ASSISTANT, "completed answer"))
+    store.append_message(text(MessageRole.SYSTEM, "later background update"))
+    policy = RecordingSummaryPolicy()
+    assembler = ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        compaction_policy=policy,
+    )
+
+    async def no_eviction(**kwargs):  # type: ignore[no-untyped-def]
+        return None
+
+    with patch.object(assembler, "_evict_context", side_effect=no_eviction):
+        context = await assembler.assemble_context(force=True)
+
+    assert [message.content[0].text for message in policy.inputs[0]] == [
+        "answered request",
+        "completed answer",
+    ]
+    rendered = rendered_text(context.messages)
+    assert rendered.count("answered request") == 1
+    assert "completed answer" in rendered
+    assert "later background update" in rendered
+
+
 @pytest.mark.asyncio
 async def test_forced_retry_reuses_existing_eviction_inside_hysteresis(
     tmp_path: Path,

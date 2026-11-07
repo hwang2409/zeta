@@ -100,77 +100,63 @@ class ContextMarkerMixin:
         pinned: Message | None = None,
         floor: Sequence[Message] = (),
     ) -> list[Message]:
-        """Project a stored or proposed eviction view into request messages."""
-        projected_pinned = pinned
+        """Project every evicted message once, at its source sequence."""
         pinned_seq = None if pinned is None else pinned.metadata.get("source_seq")
         if pinned is not None and type(pinned_seq) is int:
-            projected_pinned = Message(
+            pinned = Message(
                 pinned.role,
                 list(pinned.content),
                 tool_result=pinned.tool_result,
-                metadata={key: value for key, value in pinned.metadata.items() if key != "source_seq"},
-            )
-        messages = ContextMarkerMixin._merge_eviction_view(view, projected_pinned, pinned_seq)
-        if floor:
-            pin_index = next(
-                (
-                    index
-                    for index, message in enumerate(messages)
-                    if message is projected_pinned
-                    or (pinned is not None and message == projected_pinned)
-                ),
-                len(messages),
-            )
-            messages[pin_index:pin_index] = floor
-        return messages
-
-    @staticmethod
-    def _merge_eviction_view(
-        view: Sequence[Mapping[str, Any]],
-        pinned: Message | None,
-        pinned_seq: object,
-    ) -> list[Message]:
-        messages: list[Message] = []
-        inserted = False
-        for index, item in enumerate(view):
-            seq = item["seq"]
-            if pinned is not None and type(pinned_seq) is int and seq == pinned_seq:
-                messages.append(pinned)
-                inserted = True
-            elif pinned is not None and not inserted and type(pinned_seq) is int and seq > pinned_seq:
-                messages.extend((pinned, ContextMarkerMixin._eviction_view_message(item)))
-                inserted = True
-            else:
-                messages.append(ContextMarkerMixin._eviction_view_message(item))
-            if index % 4 == 3:
-                cooperative_pause()
-        if pinned is not None and not inserted:
-            if type(pinned_seq) is not int and any(
-                message.role is pinned.role
-                and message.content == pinned.content
-                and message.tool_result == pinned.tool_result
-                and {
-                    key: value
-                    for key, value in message.metadata.items()
-                    if key != "source_seq"
-                }
-                == {
+                metadata={
                     key: value
                     for key, value in pinned.metadata.items()
                     if key != "source_seq"
-                }
-                for message in messages
-            ):
-                return messages
+                },
+            )
+        messages: list[Message] = []
+        pin_index: int | None = None
+        for index, item in enumerate(view):
+            seq = item["seq"]
+            if pinned is not None and type(pinned_seq) is int and seq >= pinned_seq and pin_index is None:
+                pin_index = len(messages)
+                messages.append(pinned)
+                if seq == pinned_seq:
+                    if index % 4 == 3:
+                        cooperative_pause()
+                    continue
+            if pinned is not None and type(pinned_seq) is not int:
+                candidate = ContextMarkerMixin._eviction_view_message(item)
+                if (
+                    candidate.role is pinned.role
+                    and candidate.content == pinned.content
+                    and candidate.tool_result == pinned.tool_result
+                    and {
+                        key: value
+                        for key, value in candidate.metadata.items()
+                        if key != "source_seq"
+                    }
+                    == {
+                        key: value
+                        for key, value in pinned.metadata.items()
+                        if key != "source_seq"
+                    }
+                ):
+                    continue
+            messages.append(ContextMarkerMixin._eviction_view_message(item))
+            if index % 4 == 3:
+                cooperative_pause()
+        if pinned is not None and pin_index is None:
+            pin_index = len(messages)
             if type(pinned_seq) is not int:
-                # Legacy markers may not have the original row. This preserves the old safe fallback.
                 last_user = max(
                     (i for i, message in enumerate(messages) if message.role is MessageRole.USER),
                     default=-1,
                 )
-                messages.insert(last_user + 1, pinned)
-            else:
-                messages.append(pinned)
+                pin_index = last_user + 1
+            messages.insert(pin_index, pinned)
+        if floor:
+            floor_index = len(messages) if pin_index is None else pin_index
+            messages[floor_index:floor_index] = floor
         return messages
 
     @staticmethod
