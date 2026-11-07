@@ -1537,6 +1537,7 @@ def terminal_plain(renderable: object) -> str:
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
 
+
 def test_task_safety_kill_renders_cause() -> None:
     cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     event = StreamEvent(

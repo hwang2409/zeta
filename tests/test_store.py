@@ -1015,9 +1015,11 @@ async def test_installed_hook_async_writer_publishes_on_owner_thread(
 
     def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
         observed.append((threading.get_ident(), delta))
+        # test-contract: seam validates the installed-delta callback payload
         assert delta != "reset"
         delta[0].data["message"]["content"][0]["text"] = "corrupted"
 
+    # test-contract: seam injects the private installed-delta copy hook
     monkeypatch.setattr(
         type(store), "_owned_installed_delta", staticmethod(tracked_copy)
     )
@@ -1807,6 +1809,7 @@ async def test_async_write_cancelled_before_worker_start_writes_nothing(
         started.set()
         raise AssertionError("worker started")
 
+    # test-contract: seam injects the private durable-write start hook
     monkeypatch.setattr(store, "_start_durable_write", block_start)
     task = asyncio.create_task(
         store._to_thread_durable(store.append_pending_prompt, "nope")
@@ -1902,10 +1905,12 @@ async def test_async_batch_is_never_partially_visible_in_memory(
         assert release_install.wait(timeout=5)
 
     def observe_while_blocked() -> None:
+        # test-contract: seam coordinates the private install-order hook
         assert install_blocked.wait(timeout=2)
         visible_during_install.update(entry.type for entry in store.entries)
         release_install.set()
 
+    # test-contract: seam injects the private state-install ordering hook
     monkeypatch.setattr(
         store, "_before_incremental_state_install", block_before_install
     )
