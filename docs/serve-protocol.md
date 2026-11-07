@@ -1032,6 +1032,7 @@ Event fields are:
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
+| `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 | `account_limit` | `event`, `data: object` | `session_id` |
 | `account_state_unknown` | `event`, `data: object` | `session_id` |
 | `memory_updated` (feature `memory_updated`) | `event`, `session_id: string`, `message: string` | none |
