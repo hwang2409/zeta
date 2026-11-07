@@ -22,15 +22,16 @@ from ..accounts import (
     AccountStore,
     AccountUsage,
 )
-from ..accounts.login import login_named_account
+from ..accounts.login import login_failure_message, login_named_account
 from ..accounts.usage import format_usage_lines, usage_json
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
-from ..core.login_flow import LoginPublicationError, run_login
+from ..core.login_flow import run_login
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
+from ..storage_format import StorageFormatError, advance
 from ..tui.app import create_app
 from ..tui.key_bindings import TerminalRenderError
 
@@ -408,6 +409,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="run trusted global command hooks in restricted served sessions",
     )
+    storage_format_parser = commands.add_parser(
+        "storage-format", help="manage the home stored-format gate"
+    )
+    storage_format_commands = storage_format_parser.add_subparsers(
+        dest="storage_format_action", required=True
+    )
+    storage_format_advance = storage_format_commands.add_parser("advance")
+    storage_format_advance.add_argument("--expected-epoch", type=int, required=True)
+    storage_format_advance.add_argument("--target-epoch", type=int, default=1)
     completion_parser = commands.add_parser(
         "completion",
         help="print a static shell completion script",
@@ -451,11 +461,8 @@ def _handle_login(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
         return 1
-    except (AccountError, LoginPublicationError, ValueError) as exc:
-        print(f"login failed: {exc}", file=sys.stderr)
-        return 1
-    except Exception:
-        print("login failed", file=sys.stderr)
+    except Exception as exc:
+        print(login_failure_message(exc), file=sys.stderr)
         return 1
     print(f"logged in as {handle}" if handle else "ok")
     return 0
@@ -1056,6 +1063,18 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         except KeyboardInterrupt:
             return 130
+        return 0
+    if args.command == "storage-format":
+        try:
+            advance(
+                env_home(),
+                expected_epoch=args.expected_epoch,
+                target_epoch=args.target_epoch,
+            )
+        except StorageFormatError as exc:
+            print(f"zeta storage-format: {exc}", file=sys.stderr)
+            return 2
+        print(f"stored format advanced to epoch {args.target_epoch}")
         return 0
     if args.command == "completion":
         print(completion_script(args.shell), end="")

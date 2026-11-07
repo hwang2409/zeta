@@ -1246,14 +1246,19 @@ both cases.
 Protocol 1.1 exposes the shared slash dispatcher without forking a second
 implementation for the frontend client. Two RPCs cover the surface.
 
-- `slash_list`: params `session_id`. Returns `commands` and `notices`.
+- `slash_list`: params `session_id` and optional boolean `include_unavailable`
+  (default `false`). Returns `commands` and `notices`. By default, `commands`
+  contains only commands that `slash_run` can execute. With
+  `include_unavailable: true`, it is the complete shared catalog, including
+  TUI-owned commands that serve cannot execute.
   Each command entry has `name`, `description`, `kind` (`builtin`,
   `macro-prompt`, `macro-exec`, `skill`, or `mcp-prompt`), `source`
-  (`builtin`, `home`, `project`, or `mcp:<server>`), `client_only`
-  (`true` when the command needs a client-side surface — for example a
-  picker or workspace mutation), and `unavailable` (a bounded reason
-  string, or `null` when the command runs cleanly). The frontend client renders every
-  entry so users see what is available, then routes runs by the flags.
+  (`builtin`, `home`, `project`, or `mcp:<server>`), `client_only`, and
+  `unavailable`. Runnable entries have `client_only: false` and
+  `unavailable: null`. Complete-catalog entries that need the TUI have
+  `client_only: true` and the stable machine-readable reason
+  `unavailable: "requires_tui"`. Invalid `include_unavailable` values return
+  `-32602`.
 - `slash_run`: params `session_id` and `text` (the raw composer value
   starting with `/`). Rejects the request when a turn is running with
   `-32004`. Returns a `kind` discriminator:
@@ -1267,14 +1272,16 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `unknown`: no command matched the leading token.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
-The scope floor served over `slash_run` is `/status`, `/compact`,
-`/model`, `/init`, `/help`, and user prompt macros (`.zeta/commands/*.md` with
-`kind: prompt`) plus skills. `/model` splits by argument shape: argless
-`/model` returns `client_only` so the frontend client can open Settings for the
-picker surface, while `/model <name>` dispatches server-side through the
-shared settings-apply path. Exec macros and every command in the
-`client_only` set report themselves as client-only rather than
-half-executing here.
+The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
+`/inbox`, `/init`, `/memory`, `/model`, `/project-instructions`, `/status`, and
+`/vim`. Runnable user commands also include prompt macros
+(`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
+plus skills. Argless `/model` reports the current model, while `/model <name>`
+dispatches server-side through the shared settings-apply path. TUI-owned
+built-ins, exec macros, prompt macros with inline shell spans, and MCP prompt
+commands are omitted from the default catalog. Every invocation of one of
+these unavailable commands, including `/mcp status`, reports `client_only`
+instead of half-executing.
 
 When `model_input_ids` is negotiated, `send` accepts `input_id` instead of
 `text`. IDs are bounded, single-use, and valid only for the active session on
@@ -1340,4 +1347,4 @@ observers are limited to `list_sessions`, `status`, `session_tree`, `session_his
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 
-this is serve-only; no tui surface is added. serve owns connection output. controller writes remain direct and awaited. A claimed controller's pre-`hello` output is retained in emission order, up to 256 frames or 4 MiB, and is flushed after the successful `hello` response. If that bound is exceeded, the controller receives `-32011` (`controller output overflow`) after `hello` and is closed. Observer output is bounded; an observer that exceeds the queue limit is closed with `-32011`. Requests are read and dispatched sequentially.
+this is serve-only; no tui surface is added. serve owns connection output. each claimed connection has one retained-output bound of 256 frames or 4 MiB. the bound includes the frame being written, queued ordinary frames, and one reserved overflow error. a controller that exceeds the bound receives `-32011` (`controller output overflow`) when output can progress; an observer receives `-32011` (`observer output overflow`). after the error, the connection closes. if output cannot progress within the 1.0-second overflow deadline, serve aborts the transport and closes the connection without promising delivery of the error or a websocket close frame. requests are read and dispatched sequentially.

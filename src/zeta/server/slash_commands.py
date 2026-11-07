@@ -17,7 +17,6 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
-from ..core.commands.custom_commands import CustomCommand
 from ..core.project_context import discover_repo_root
 from ..core.session import persist_metadata_change
 from ..core.slash import (
@@ -39,31 +38,23 @@ from .model_selection import apply as apply_settings
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
-# Composed once at the model layer so the wire text is not literal in the frontend client.
-_CLIENT_ONLY_NOTICE = "runs client-side; open the command in your frontend client"
 _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
+_UNAVAILABLE_REASON = "requires_tui"
 
-# Commands that need a client-side surface (picker, workspace mutation,
-# transcript navigation, or a shell macro loop). They still appear in the
-# list response so a frontend client can render the menu; ``slash_run`` reports them as
-# client-only rather than half-executing them here.
-CLIENT_ONLY_BUILTINS: frozenset[str] = frozenset(
+# This allowlist is the capability seam shared by slash_list and slash_run.
+# A new shared builtin stays unavailable until serve has an executor for it.
+EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
     {
-        "plan",
-        "implement",
-        "paste",
-        "checkpoint",
-        "fork",
-        "tree",
-        "tools",
-        "undo",
-        "redo",
-        "new",
-        "name",
-        "theme",
-        "runs",
-        "send",
-        "mcp",
+        "accounts",
+        "compact",
+        "help",
+        "inbox",
+        "init",
+        "memory",
+        "model",
+        "project-instructions",
+        "status",
+        "vim",
     }
 )
 
@@ -77,7 +68,7 @@ class SlashCommandInfo:
     kind: str
     source: str
     client_only: bool
-    unavailable: str  # empty when the command is fine
+    unavailable: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -86,7 +77,7 @@ class SlashCommandInfo:
             "kind": self.kind,
             "source": self.source,
             "client_only": self.client_only,
-            "unavailable": self.unavailable or None,
+            "unavailable": self.unavailable,
         }
 
 
@@ -98,12 +89,15 @@ class _ApprovalProjection(Protocol):
 class ServerSlashSession:
     """Session shim over ``ServerRuntime`` for the shared slash dispatcher.
 
-    Methods that the server can drive return real output. The rest keep the
-    ``SlashSession`` structural type intact but return a client-only notice
-    so the shared dispatcher never leaks half-executed state.
+    Only methods backed by ``EXECUTABLE_BUILTINS`` live here. The catalog and
+    dispatcher reject every other shared command before it reaches this shim.
     """
 
-    def __init__(self, runtime: ServerRuntime, approval_control: _ApprovalProjection | None = None) -> None:
+    def __init__(
+        self,
+        runtime: ServerRuntime,
+        approval_control: _ApprovalProjection | None = None,
+    ) -> None:
         self._runtime = runtime
         self._approval_control = approval_control
 
@@ -117,7 +111,11 @@ class ServerSlashSession:
             raise ProtocolError(-32003, "no active session")
         assembler = loop.context_assembler
         child_usage = assembler.descendant_usage
-        pending = self._approval_control.pending_approval_labels() if self._approval_control is not None else ()
+        pending = (
+            self._approval_control.pending_approval_labels()
+            if self._approval_control is not None
+            else ()
+        )
         items = loop.store.todo_items()
         return SlashStatus(
             session_id=opened.metadata.session_id,
@@ -134,7 +132,9 @@ class ServerSlashSession:
             uncached_input_tokens=assembler.uncached_input_tokens_this_session,
             output_tokens_this_session=assembler.output_tokens_this_session,
             child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
-            child_cache_creation_input_tokens=child_usage["cache_creation_input_tokens"],
+            child_cache_creation_input_tokens=child_usage[
+                "cache_creation_input_tokens"
+            ],
             child_uncached_input_tokens=child_usage["input_tokens"],
             child_output_tokens_this_session=child_usage["output_tokens"],
             context_files=tuple(opened.metadata.context_files),
@@ -222,11 +222,6 @@ class ServerSlashSession:
             f"tokens after: {context.token_count}"
         )
 
-    # --- client-only stubs ---
-
-    def _client_only(self, name: str) -> str:
-        return f"/{name}: {_CLIENT_ONLY_NOTICE}"
-
     async def slash_vim(self, args: str) -> str:
         runtime = self._runtime
         requested = args.strip().lower()
@@ -246,30 +241,6 @@ class ServerSlashSession:
             )
         return f"vim mode: {'on' if enabled else 'off'}"
 
-    def slash_plan(self, args: str) -> str | ModelInputEnvelope:
-        del args
-        return self._client_only("plan")
-
-    def slash_implement(self, args: str) -> str | ModelInputEnvelope:
-        del args
-        return self._client_only("implement")
-
-    def slash_paste(self, args: str) -> str:
-        del args
-        return self._client_only("paste")
-
-    def slash_checkpoint(self, args: str) -> str:
-        del args
-        return self._client_only("checkpoint")
-
-    def slash_fork(self, args: str) -> str:
-        del args
-        return self._client_only("fork")
-
-    def slash_tree(self, args: str) -> str:
-        del args
-        return self._client_only("tree")
-
     def slash_memory(self, args: str) -> str:
         runtime = self._runtime
         project_id = runtime.metadata.project_id
@@ -287,26 +258,6 @@ class ServerSlashSession:
             reconciler,
             MemoryMutationAuthorization.direct_slash(),
         )
-
-    def slash_tools(self, args: str) -> str:
-        del args
-        return self._client_only("tools")
-
-    def slash_undo(self, args: str) -> str:
-        del args
-        return self._client_only("undo")
-
-    def slash_redo(self, args: str) -> str:
-        del args
-        return self._client_only("redo")
-
-    def slash_new(self, args: str) -> str:
-        del args
-        return self._client_only("new")
-
-    def slash_name(self, args: str) -> str:
-        del args
-        return self._client_only("name")
 
     def slash_inbox(self, args: str) -> str:
         if args.strip():
@@ -326,32 +277,6 @@ class ServerSlashSession:
             return f"project inbox unavailable: {exc}"
         return json.dumps(state, indent=2, sort_keys=True)
 
-    def slash_theme(self, args: str) -> str:
-        del args
-        return self._client_only("theme")
-
-    def slash_runs(self, args: str) -> str:
-        del args
-        return self._client_only("runs")
-
-    def slash_send(self, args: str) -> str:
-        del args
-        return self._client_only("send")
-
-    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
-        del args
-        return self._client_only("mcp")
-
-    async def slash_mcp_prompt(
-        self, name: str, arguments: dict[str, str]
-    ) -> str:
-        del name, arguments
-        raise RuntimeError(_UNAVAILABLE_NOTICE)
-
-    async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
-        del command, args
-        return _UNAVAILABLE_NOTICE
-
 
 def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
     """Build a per-request registry so custom commands and skills stay current."""
@@ -370,7 +295,11 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
         extra_commands=(
-            SlashCommand("accounts", lambda session, args: session.slash_accounts(args), "list or label accounts"),
+            SlashCommand(
+                "accounts",
+                lambda session, args: session.slash_accounts(args),
+                "list or label accounts",
+            ),
         ),
     )
 
@@ -386,20 +315,25 @@ async def read_request(
     owner: object,
 ) -> dict[str, object]:
     if method == "slash_list":
-        return await list_commands(runtime)
+        include_unavailable = params.get("include_unavailable", False)
+        if not isinstance(include_unavailable, bool):
+            raise ProtocolError(-32602, "include_unavailable must be a boolean")
+        return await list_commands(runtime, include_unavailable=include_unavailable)
     operation = accounts.request(method, runtime, require_idle, params)
     if method == "account_switch":
         return await accounts.run_owned_switch(owner, operation)
     return await operation
 
 
-async def list_commands(runtime: ServerRuntime) -> dict[str, object]:
-    """Enumerate every command the shared registry knows about."""
+async def list_commands(
+    runtime: ServerRuntime, *, include_unavailable: bool = False
+) -> dict[str, object]:
+    """Enumerate runnable commands, with an optional complete catalog."""
 
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
-    entries = _entries_from_registry(registry)
+    entries = _entries_from_registry(registry, include_unavailable=include_unavailable)
     return {
         "commands": [entry.to_dict() for entry in entries],
         "notices": list(registry.notices),
@@ -434,31 +368,27 @@ async def run_command(
         # the store or settings while background children are still running
         # or an approval is outstanding. Read-only calls (`/status`,
         # `/help`, argless `/model`) stay guard-free.
-        ergonomics.require_mutable(runtime, approval_control is not None and approval_control.has_pending_approvals())
-    if name == "model" and not tail.strip():
-        # Argless `/model` opens the client's picker surface (Settings on
-        # the frontend client) rather than returning a bare text notice — the doc
-        # contract at docs/serve-protocol.md. `/model <name>` still
-        # dispatches server-side through the shared apply-settings path.
-        return {"kind": "client_only", "name": name}
+        ergonomics.require_mutable(
+            runtime,
+            approval_control is not None and approval_control.has_pending_approvals(),
+        )
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
-    if name == "mcp" and tail.strip() == "status":
-        if runtime.loop is None:
-            raise ProtocolError(-32003, "no active session")
-        return {"kind": "text", "text": await runtime.loop.slash_mcp("status")}
-    if name in CLIENT_ONLY_BUILTINS:
+    builtin_names = {command.name for command in registry.builtin_commands}
+    if name in builtin_names and name not in EXECUTABLE_BUILTINS:
         return {"kind": "client_only", "name": name}
     # Prompt macros expand to user input rather than dispatch through a handler.
     # Inline shell spans need the client's approval loop; report those as
     # client-only rather than resolving with unapproved output here.
     custom = registry.custom_command_for(name)
-    if custom is not None and custom.kind == "prompt":
-        if registry.needs_inline_shell_resolution(text):
+    if custom is not None:
+        if custom.kind != "prompt" or registry.needs_inline_shell_resolution(text):
             return {"kind": "client_only", "name": name}
         envelope = registry.input_for_model(text)
         return _model_input_result(envelope, register_model_input)
+    if name in {entry[0] for entry in registry.mcp_prompt_entries}:
+        return {"kind": "client_only", "name": name}
     session = ServerSlashSession(runtime, approval_control)
     result = await registry.dispatch_async(session, text)
     if result is None:
@@ -491,40 +421,44 @@ def _model_input_result(
 
 
 def _entries_from_registry(
-    registry: SlashCommandRegistry,
+    registry: SlashCommandRegistry, *, include_unavailable: bool
 ) -> list[SlashCommandInfo]:
-    """Walk the registry once into a stable, wire-safe list."""
+    """Project the shared registry through serve's executable capabilities."""
 
     entries: list[SlashCommandInfo] = []
     for command in registry.builtin_commands:
-        name = command.name
-        client_only = name in CLIENT_ONLY_BUILTINS
-        entries.append(
-            SlashCommandInfo(
-                name=name,
-                description=command.description,
-                kind="builtin",
-                source="builtin",
-                client_only=client_only,
-                unavailable="",
-            )
+        unavailable = (
+            None if command.name in EXECUTABLE_BUILTINS else _UNAVAILABLE_REASON
         )
+        if unavailable is None or include_unavailable:
+            entries.append(
+                SlashCommandInfo(
+                    name=command.name,
+                    description=command.description,
+                    kind="builtin",
+                    source="builtin",
+                    client_only=unavailable is not None,
+                    unavailable=unavailable,
+                )
+            )
     for command in registry.custom_commands:
-        entries.append(
-            SlashCommandInfo(
-                name=command.name,
-                description=command.description,
-                kind=f"macro-{command.kind}",
-                source=command.source,
-                # Exec macros need the tool-approval loop the server does not
-                # drive over the RPC surface; list them so the menu shows them
-                # and let the frontend client decide how to surface the limitation.
-                client_only=command.kind == "exec",
-                unavailable=(
-                    "" if command.kind == "prompt" else _UNAVAILABLE_NOTICE
-                ),
-            )
+        unavailable = (
+            None
+            if command.kind == "prompt"
+            and not registry.needs_inline_shell_resolution(f"/{command.name}")
+            else _UNAVAILABLE_REASON
         )
+        if unavailable is None or include_unavailable:
+            entries.append(
+                SlashCommandInfo(
+                    name=command.name,
+                    description=command.description,
+                    kind=f"macro-{command.kind}",
+                    source=command.source,
+                    client_only=unavailable is not None,
+                    unavailable=unavailable,
+                )
+            )
     for skill in registry.skill_entries:
         entries.append(
             SlashCommandInfo(
@@ -533,25 +467,26 @@ def _entries_from_registry(
                 kind="skill",
                 source=skill.source,
                 client_only=False,
-                unavailable="",
+                unavailable=None,
             )
         )
-    for name, description, source in registry.mcp_prompt_entries:
-        entries.append(
-            SlashCommandInfo(
-                name=name,
-                description=description,
-                kind="mcp-prompt",
-                source=f"mcp:{source}",
-                client_only=False,
-                unavailable="",
+    if include_unavailable:
+        for name, description, source in registry.mcp_prompt_entries:
+            entries.append(
+                SlashCommandInfo(
+                    name=name,
+                    description=description,
+                    kind="mcp-prompt",
+                    source=f"mcp:{source}",
+                    client_only=True,
+                    unavailable=_UNAVAILABLE_REASON,
+                )
             )
-        )
     return entries
 
 
 __all__ = [
-    "CLIENT_ONLY_BUILTINS",
+    "EXECUTABLE_BUILTINS",
     "ServerSlashSession",
     "SlashCommandInfo",
     "build_registry",

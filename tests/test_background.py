@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import read_pid_file, wait_for_path_command
 from zeta.agent.background import BackgroundAgentOwner
@@ -211,6 +212,71 @@ async def test_real_background_producers_preserve_owner_on_start_and_exit(
     expected_owner = "background_macro" if background else "run_background"
     assert [notice.owner for notice in lifecycle] == [expected_owner, expected_owner]
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = BackgroundTaskRegistry()
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    archive_entered = asyncio.Event()
+    monitor_cancelled = asyncio.Event()
+    release_archive = asyncio.Event()
+    original_archive_record = registry._archive_record
+
+    async def gated_archive_record(record, log_handle) -> None:
+        archive_entered.set()
+        try:
+            await release_archive.wait()
+        except asyncio.CancelledError:
+            monitor_cancelled.set()
+            await release_archive.wait()
+            await original_archive_record(record, log_handle)
+            raise
+        await original_archive_record(record, log_handle)
+
+    # test-contract: seam force the archive-pending monitor cancellation order
+    monkeypatch.setattr(registry, "_archive_record", gated_archive_record)
+    monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
+    waiter = asyncio.create_task(registry.wait(task_id))
+    killer = asyncio.create_task(registry.kill(task_id))
+    try:
+        await archive_entered.wait()
+        await monitor_cancelled.wait()
+        release_archive.set()
+
+        status = await waiter
+        assert status["running"] is False
+        await killer
+    finally:
+        release_archive.set()
+        await asyncio.gather(waiter, killer, return_exceptions=True)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
+    tmp_path: Path,
+) -> None:
+    registry = BackgroundTaskRegistry()
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    wait_started = asyncio.Event()
+
+    async def wait_for_task() -> None:
+        wait_started.set()
+        await registry.wait(task_id)
+
+    waiter = asyncio.create_task(wait_for_task())
+    try:
+        await wait_started.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert registry.snapshot()[0].running is True
+    finally:
+        await registry.kill(task_id)
+        await registry.close()
 
 
 @pytest.mark.asyncio
@@ -884,11 +950,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         child_stores.append(child_store), track_store(child_store)
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    for _ in range(100):
-        if not owner._stores:
-            break
-        await asyncio.sleep(0.01)
-    await owner.wait_for_store_closes()
+    await asyncio.wait_for(owner.wait(), timeout=10)
     child_store = child_stores[0]
     with pytest.raises(OSError):
         os.fstat(child_store.directory_fd)
@@ -1762,16 +1824,18 @@ def test_many_finished_tasks_hold_bounded_descriptors(tmp_path: Path) -> None:
 import asyncio, json, os, resource, sys
 from pathlib import Path
 from zeta.core.store import ConversationStore
+from zeta.storage_format import advance, open_writer
 from zeta.tools._shared.process import BackgroundTaskRegistry
 
-async def main(root: Path) -> None:
+async def main(root: Path, lease) -> None:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, hard), hard))
-    with ConversationStore(root / "sessions", session_id="fd-bound") as store:
+    with ConversationStore(root / "sessions", session_id="fd-bound", _storage_lease=lease) as store:
         tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
             output_limit=4,
+            storage_lease=lease,
         )
         baseline = len(os.listdir("/dev/fd"))
         task_ids = []
@@ -1789,7 +1853,13 @@ async def main(root: Path) -> None:
         assert final <= baseline + 2
         await tasks.close()
 
-asyncio.run(main(Path(sys.argv[1])))
+root = Path(sys.argv[1])
+advance(root, expected_epoch=0)
+lease = open_writer(root)
+try:
+    asyncio.run(main(root, lease))
+finally:
+    lease.close()
 '''
     completed = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path)],
@@ -2248,7 +2318,19 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
 
 
 @pytest.mark.asyncio
-async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -> None:
+async def test_close_terminates_many_tasks_in_one_grace_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    termination_batches: list[int] = []
+    # test-contract: complexity no public process-termination batch seam exists
+    terminate_processes = process_module._terminate_processes
+
+    async def record_batch(processes, term_grace, *, finish):
+        termination_batches.append(len(processes))
+        return await terminate_processes(processes, term_grace, finish=finish)
+
+    # test-contract: complexity shutdown must expose one bounded termination batch
+    monkeypatch.setattr(process_module, "_terminate_processes", record_batch)
     tasks = BackgroundTaskRegistry(term_grace=0.25)
     task_ids = [
         await tasks.start(
@@ -2258,11 +2340,10 @@ async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -
         for _ in range(20)
     ]
 
-    started = asyncio.get_running_loop().time()
     await tasks.close()
-    elapsed = asyncio.get_running_loop().time() - started
 
-    assert elapsed < 1
+    # test-contract: complexity shutdown cost is one batch, not one grace per task
+    assert termination_batches == [len(task_ids)]
     assert all(not _group_exists(tasks.records[index].pid) for index in range(len(task_ids)))
 
 

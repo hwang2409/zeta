@@ -10,10 +10,8 @@ from ..agent.presets import AGENT_PRESETS, AgentPreset
 from ..models.catalog import known_model_names
 from .discovery import (
     MarkdownDocument,
-    contained_path,
     discover_markdown,
     discover_session_items,
-    read_markdown,
     snapshot_metadata,
     warn_discovery,
 )
@@ -281,25 +279,10 @@ def discover_packaged_agents() -> AgentCatalog:
     return discover_session_agents()
 
 
-def load_agent(meta: AgentPreset) -> str:
-    """Load an agent body at execution time from its pinned path."""
-
-    if meta.path is None:
-        return meta.prompt_suffix
-    root = meta.agents_root or meta.path.parent
-    resolved = contained_path(meta.path, root, "agent")
-    try:
-        _, body = read_markdown(resolved, "agent")
-    except FileNotFoundError as exc:
-        raise ValueError(f"agent definition {meta.path} no longer exists") from exc
-    return body
-
-
 __all__ = [
     "AgentCatalog",
     "AgentMeta",
     "discover_agents",
     "discover_packaged_agents",
     "discover_session_agents",
-    "load_agent",
 ]

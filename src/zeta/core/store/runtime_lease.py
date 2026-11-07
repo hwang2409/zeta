@@ -7,6 +7,7 @@ import os
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 
+from ...storage_format import WriterLease
 from ..checkpoints import ConversationIntegrityError
 from ..session_files import open_session_file, require_off_loop_lock
 
@@ -126,8 +127,11 @@ class SessionRuntimeLease:
 
 
 def close_store_leases(
-    runtime_lease: SessionRuntimeLease | None, directory_lease: ExitStack
+    runtime_lease: SessionRuntimeLease | None,
+    directory_lease: ExitStack,
+    storage_lease: WriterLease,
 ) -> None:
     if runtime_lease is not None:
         runtime_lease.close()
     directory_lease.close()
+    storage_lease.close()
