@@ -381,8 +381,11 @@ async def test_preregistered_client_uses_fixed_callback_scopes_and_extra_params(
         )
 
     loop = asyncio.get_running_loop()
+    loop_thread_id = threading.get_ident()
+    browser_threads: list[int] = []
 
     def open_browser(url: str) -> None:
+        browser_threads.append(threading.get_ident())
         asyncio.run_coroutine_threadsafe(redirect(url), loop)
 
     token = await authorize(
@@ -398,6 +401,9 @@ async def test_preregistered_client_uses_fixed_callback_scopes_and_extra_params(
     )
     await http_client.aclose()
 
+    assert browser_threads and all(
+        thread != loop_thread_id for thread in browser_threads
+    )
     assert not auth.registrations
     assert token.client_id == "registered-client"
     assert auth.token_requests == [
