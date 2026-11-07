@@ -3299,7 +3299,7 @@ def test_concurrent_overrides_are_first_writer_wins(tmp_path: Path) -> None:
 
     def override(index: int) -> None:
         try:
-            barrier.wait()
+            barrier.wait(timeout=10)
             managers[index].record_override(
                 metadata[index],
                 provider=f"provider-{index}",
@@ -3312,8 +3312,10 @@ def test_concurrent_overrides_are_first_writer_wins(tmp_path: Path) -> None:
     second = threading.Thread(target=override, args=(1,))
     first.start()
     second.start()
-    first.join()
-    second.join()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive()
+    assert not second.is_alive()
 
     current = manager.read_metadata(session_id)
     assert len(errors) == 1
@@ -3360,7 +3362,7 @@ def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:
     barrier = threading.Barrier(2)
 
     def override() -> None:
-        barrier.wait()
+        barrier.wait(timeout=10)
         override_manager.record_override(
             override_metadata,
             provider="claude",
@@ -3368,15 +3370,17 @@ def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:
         )
 
     def touch() -> None:
-        barrier.wait()
+        barrier.wait(timeout=10)
         touch_manager.touch(touch_metadata)
 
     first = threading.Thread(target=override)
     second = threading.Thread(target=touch)
     first.start()
     second.start()
-    first.join()
-    second.join()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive()
+    assert not second.is_alive()
 
     current = manager.read_metadata(session_id)
     assert current.provider == "claude"
