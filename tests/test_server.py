@@ -3082,6 +3082,67 @@ async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
 
 
 @pytest.mark.asyncio
+async def test_server_start_preserves_socket_replaced_after_stale_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = _socket_path(tmp_path)
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(socket_path))
+    stale.close()
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server = ZetaServer(home=tmp_path, socket_path=socket_path, provider="codex")
+    owned_path = server.socket_path
+    real_unlink = Path.unlink
+    replacement_bound = False
+
+    def replace_after_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal replacement_bound
+        real_unlink(path, *args, **kwargs)
+        if path == owned_path and not replacement_bound:
+            replacement.bind(str(owned_path))
+            replacement.listen()
+            replacement_bound = True
+
+    monkeypatch.setattr(Path, "unlink", replace_after_unlink)
+    try:
+        with pytest.raises(OSError, match="Address already in use"):
+            await server.start()
+
+        assert socket_path.exists()
+        probe.connect(str(socket_path))
+    finally:
+        probe.close()
+        replacement.close()
+        await server.close()
+        real_unlink(socket_path, missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_server_close_preserves_replacement_unix_socket(tmp_path: Path) -> None:
+    socket_path = _socket_path(tmp_path)
+    server = ZetaServer(home=tmp_path, socket_path=socket_path, provider="codex")
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    await server.start()
+    try:
+        socket_path.unlink()
+        replacement.bind(str(socket_path))
+        replacement.listen()
+
+        await server.close()
+
+        assert socket_path.exists()
+        probe.connect(str(socket_path))
+    finally:
+        probe.close()
+        replacement.close()
+        await server.close()
+        socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     await server.start()

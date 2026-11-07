@@ -130,7 +130,7 @@ class ZetaServer:
         self._client: _Client | None = None
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
-        self._socket_created = False
+        self._socket_identity: tuple[int, int] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
@@ -151,11 +151,21 @@ class ZetaServer:
         self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
             self._prepare_socket_path()
-            self._server = await asyncio.start_unix_server(
-                self._accept, path=str(self.socket_path), limit=MAX_FRAME_BYTES + 1
-            )
+            unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                unix_socket.bind(str(self.socket_path))
+                socket_stat = self.socket_path.lstat()
+                self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
+                self._server = await asyncio.start_unix_server(
+                    self._accept, sock=unix_socket, limit=MAX_FRAME_BYTES + 1
+                )
+            except BaseException:
+                unix_socket.close()
+                if self._socket_identity is not None:
+                    self._unlink_socket_if_owned(self._socket_identity)
+                    self._socket_identity = None
+                raise
             os.chmod(self.socket_path, 0o600)
-            self._socket_created = True
         else:
             self._server = await asyncio.start_server(
                 self._accept, "127.0.0.1", self.port, limit=MAX_FRAME_BYTES + 1
@@ -202,11 +212,9 @@ class ZetaServer:
                         await self._server.wait_closed()
                 finally:
                     self._server = None
-                    if self.port is None and self._socket_created:
-                        with contextlib.suppress(FileNotFoundError):
-                            if stat.S_ISSOCK(self.socket_path.stat().st_mode):
-                                self.socket_path.unlink()
-                        self._socket_created = False
+                    if self.port is None and self._socket_identity is not None:
+                        self._unlink_socket_if_owned(self._socket_identity)
+                        self._socket_identity = None
 
     def _prepare_socket_path(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -217,10 +225,10 @@ class ZetaServer:
         except OSError:
             pass
         try:
-            path_mode = self.socket_path.lstat().st_mode
+            path_stat = self.socket_path.lstat()
         except FileNotFoundError:
             return
-        if not stat.S_ISSOCK(path_mode):
+        if not stat.S_ISSOCK(path_stat.st_mode):
             raise RuntimeError(
                 f"refusing to replace non-socket path: {self.socket_path}"
             )
@@ -237,7 +245,15 @@ class ZetaServer:
             raise RuntimeError(f"a server is already listening on {self.socket_path}")
         finally:
             probe.close()
-        self.socket_path.unlink()
+        self._unlink_socket_if_owned((path_stat.st_dev, path_stat.st_ino))
+
+    def _unlink_socket_if_owned(self, identity: tuple[int, int]) -> None:
+        try:
+            path_stat = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if (path_stat.st_dev, path_stat.st_ino) == identity:
+            self.socket_path.unlink()
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
