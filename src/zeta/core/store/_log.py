@@ -31,6 +31,7 @@ from ..checkpoints import (
     load_session_json,
 )
 from ..session_files import open_session_file
+from ..transcript_recovery import TranscriptSourceFacts, ValidatedPrefix
 from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
@@ -89,6 +90,7 @@ class TranscriptLoadError(ConversationIntegrityError):
         source_inode: int,
         source_size: int,
         prefix_digest: str,
+        source_facts: TranscriptSourceFacts | None = None,
     ) -> None:
         self.kind = kind
         self.session_id = session_id
@@ -101,6 +103,7 @@ class TranscriptLoadError(ConversationIntegrityError):
         self.source_inode = source_inode
         self.source_size = source_size
         self.prefix_digest = prefix_digest
+        self._source_facts = source_facts
         location = f" at row {row_number}" if row_number is not None else ""
         detail = {
             "invalid_payload": "invalid payload for conversation entry",
@@ -235,6 +238,9 @@ class _FullLoadValidator:
             repairable=repairable,
             raw=self.raw,
             stat=self.stat,
+            validated_prefix=(
+                self.validated_prefix(row.byte_offset) if row.row_number > 1 else None
+            ),
         )
 
     def accept(self, row: _PhysicalRow) -> ConversationEntry | None:
@@ -327,6 +333,16 @@ class _FullLoadValidator:
             if type(task_id) is str and task_id:
                 self.state._task_notification_ids.add(task_id)
         return entry
+
+    def validated_prefix(self, end_offset: int) -> ValidatedPrefix:
+        """Return the exact prefix already accepted by this one-pass validator."""
+        last = self.state._entries[-1] if self.state._entries else None
+        return ValidatedPrefix(
+            end_offset=end_offset,
+            last_sequence=last.seq if last is not None else 0,
+            last_entry_id=last.id if last is not None else None,
+            last_lane=last.lane if last is not None else "main",
+        )
 
     def _select_branch(self, head: ConversationEntry) -> None:
         entry_ids = set(self.by_id)
@@ -810,6 +826,7 @@ class ConversationLogMixin:
         repairable: bool,
         raw: bytes,
         stat: os.stat_result,
+        validated_prefix: ValidatedPrefix | None = None,
     ) -> TranscriptLoadError:
         prefix_end = valid_prefix_end or 0
         return TranscriptLoadError(
@@ -824,10 +841,31 @@ class ConversationLogMixin:
             source_inode=stat.st_ino,
             source_size=stat.st_size,
             prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
+            source_facts=(
+                TranscriptSourceFacts(
+                    device=stat.st_dev,
+                    inode=stat.st_ino,
+                    size=stat.st_size,
+                    source_digest=hashlib.sha256(raw).hexdigest(),
+                    prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
+                    first_bad_row=row_number,
+                    first_bad_offset=byte_offset,
+                    prefix=validated_prefix,
+                    diagnosed_at=_now(),
+                )
+                if repairable
+                and row_number is not None
+                and byte_offset is not None
+                and validated_prefix is not None
+                else None
+            ),
         )
 
     def _iter_physical_rows(
-        self: ConversationStore, raw: bytes, stat: os.stat_result
+        self: ConversationStore,
+        raw: bytes,
+        stat: os.stat_result,
+        validated_prefix: Callable[[int], ValidatedPrefix] | None = None,
     ) -> Iterator[_PhysicalRow]:
         """Yield decoded physical rows and one marker for a writable torn tail."""
         offset = 0
@@ -863,6 +901,11 @@ class ConversationLogMixin:
                     repairable=index > 0,
                     raw=raw,
                     stat=stat,
+                    validated_prefix=(
+                        validated_prefix(row_offset)
+                        if validated_prefix is not None and index > 0
+                        else None
+                    ),
                 ) from exc
             if not isinstance(value, dict):
                 raise self._transcript_error(
@@ -874,6 +917,11 @@ class ConversationLogMixin:
                     repairable=index > 0,
                     raw=raw,
                     stat=stat,
+                    validated_prefix=(
+                        validated_prefix(row_offset)
+                        if validated_prefix is not None and index > 0
+                        else None
+                    ),
                 )
             offset += len(line)
             yield _PhysicalRow(row_number, row_offset, value)
@@ -890,7 +938,9 @@ class ConversationLogMixin:
 
         validator = _FullLoadValidator(self, raw, stat)
         torn_offset: int | None = None
-        for physical_row in self._iter_physical_rows(raw, stat):
+        for physical_row in self._iter_physical_rows(
+            raw, stat, validator.validated_prefix
+        ):
             if physical_row.torn:
                 torn_offset = physical_row.byte_offset
                 break
