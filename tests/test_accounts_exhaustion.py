@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from zeta.core.loop import AgentLoop
 
 import zeta.server.accounts as server_accounts
 import zeta.tui.slash_handlers as tui_slash_handlers
@@ -40,7 +41,6 @@ from zeta.accounts.usage import (
     read_usage,
     record_subscription_limit,
 )
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens

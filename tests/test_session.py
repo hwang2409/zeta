@@ -28,7 +28,6 @@ from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.project_context import project_instructions_editor_command
 from zeta.core.session import (
     SessionError,
@@ -52,6 +51,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog

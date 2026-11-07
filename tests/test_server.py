@@ -16,7 +16,7 @@ import stat
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Collection
+from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
@@ -34,7 +34,7 @@ import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.completion import completion_control
 from tests.support.credentials import named_account_credentials
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
@@ -848,87 +848,6 @@ class BlockingThenCaptureBackend:
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
         )
-
-
-def _public_input_prompt(messages, prompts: Collection[str]) -> str:
-    public_inputs = [
-        block.text
-        for message in messages
-        if message.role is MessageRole.USER
-        for block in message.content
-        if isinstance(block, TextContent)
-    ]
-    prompt = next((text for text in public_inputs if text in prompts), None)
-    if prompt is None:
-        raise AssertionError(f"no scripted backend for actor prompt {public_inputs!r}")
-    return prompt
-
-
-def test_public_input_prompt_rejects_unknown_actor() -> None:
-    messages = [Message(MessageRole.USER, [TextContent("unknown-child")])]
-
-    with pytest.raises(
-        AssertionError, match="no scripted backend for actor prompt.*unknown-child"
-    ):
-        _public_input_prompt(messages, {"parent", "known-child"})
-
-
-class PerActorFakeBackend:
-    def __init__(
-        self,
-        parent_turns: list[ScriptedTurn],
-        child_turns: dict[str, list[ScriptedTurn]],
-        *,
-        parent_prompt: str,
-        gated_child_call: int = 1,
-    ) -> None:
-        self.parent_prompt = parent_prompt
-        self.parent = FakeBackend(parent_turns)
-        self.children = {
-            prompt: FakeBackend(turns) for prompt, turns in child_turns.items()
-        }
-        self.child_started = {prompt: asyncio.Event() for prompt in self.children}
-        self.child_calls = dict.fromkeys(self.children, 0)
-        self.release_children = asyncio.Event()
-        self.gated_child_call = gated_child_call
-
-    @owned_completion
-    async def complete(self, messages, tool_schemas):
-        actor_prompt = _public_input_prompt(
-            messages, {self.parent_prompt, *self.children}
-        )
-        child_prompt = actor_prompt if actor_prompt in self.children else None
-        backend = (
-            self.children[child_prompt] if child_prompt is not None else self.parent
-        )
-        if child_prompt is not None:
-            self.child_calls[child_prompt] += 1
-        if (
-            child_prompt is not None
-            and self.child_calls[child_prompt] == self.gated_child_call
-        ):
-            self.child_started[child_prompt].set()
-            try:
-                await asyncio.wait_for(self.release_children.wait(), TIMEOUT)
-            except TimeoutError as error:
-                raise AssertionError("children were not released") from error
-        stream = backend.complete(messages, tool_schemas, control=completion_control())
-        if child_prompt is None and self.parent.calls:
-            try:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(
-                            *(started.wait() for started in self.child_started.values())
-                        ),
-                        TIMEOUT,
-                    )
-                except TimeoutError as error:
-                    raise AssertionError("child did not start") from error
-                yield await anext(stream)
-            finally:
-                self.release_children.set()
-        async for event in stream:
-            yield event
 
 
 class DelegatedApprovalBackend:
@@ -6102,10 +6021,11 @@ async def test_cross_provider_settings_reject_mid_turn_then_apply_when_idle(tmp_
 async def test_cross_provider_missing_credentials_returns_rpc_error(
     tmp_path, monkeypatch, target
 ):
+    from zeta.providers.auth import OAuthTokens
+
     from zeta.accounts import AccountCredentials
     from zeta.codex import CodexCredentialDriver
     from zeta.providers.anthropic import AnthropicCredentialDriver
-    from zeta.providers.auth import OAuthTokens
     from zeta.providers.factory import credential_store
 
     monkeypatch.delenv("ZETA_ALLOW_API_KEY", raising=False)
@@ -6966,6 +6886,7 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
 @pytest.mark.asyncio
 async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
     from zeta.providers.codex_errors import CodexAuthError
+
     from zeta.server import model_selection
 
     server = ZetaServer(

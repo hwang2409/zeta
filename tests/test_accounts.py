@@ -21,6 +21,7 @@ import httpx
 import pytest
 from rich.console import Console
 from rich.text import Text
+from zeta.core.loop import AgentLoop
 
 import zeta.accounts.store as account_store
 import zeta.cli.main as cli_main
@@ -47,7 +48,6 @@ from zeta.accounts import (
 )
 from zeta.agent.runner import resolve_child_backend
 from zeta.core.login_flow import LoginPublicationError
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager, account_home
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens, ProviderLoginRequiredError

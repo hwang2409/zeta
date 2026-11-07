@@ -355,7 +355,9 @@ class _GatedFakeBackend(FakeBackend):
         if gated:
             self.completion_started.set()
             await self.completion_gate.wait()
-        async for event in super().complete(messages, tool_schemas, control=completion_control()):
+        async for event in super().complete(
+            messages, tool_schemas, control=completion_control()
+        ):
             yield event
 
 
@@ -734,7 +736,7 @@ def test_store_replay_accepts_task_and_unknown_notification_kinds(
 
 
 def test_child_question_notification_renders_question() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -759,7 +761,7 @@ def test_child_question_notification_renders_question() -> None:
 
 
 def test_child_idle_notification_renders_readable_report() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -785,7 +787,7 @@ def test_child_idle_notification_renders_readable_report() -> None:
 
 
 def test_child_idle_notification_without_description_shows_error_line() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui import theme
     from zeta.tui.render import render_agent_notification
 
@@ -806,7 +808,7 @@ def test_child_idle_notification_without_description_shows_error_line() -> None:
 
 
 def test_child_question_withdrawn_notification_renders_text() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -830,7 +832,7 @@ def test_child_question_withdrawn_notification_renders_text() -> None:
     assert "question withdrawn: child finished" not in plain
 
 def test_child_question_notification_strips_terminal_controls() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -857,7 +859,7 @@ def test_child_question_notification_strips_terminal_controls() -> None:
 
 
 def test_child_question_withdrawn_notification_ignores_legacy_text() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -882,7 +884,7 @@ def test_child_question_withdrawn_notification_ignores_legacy_text() -> None:
 def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
     # S7: the TUI renders task_exited receipts and tolerates unknown kinds
     # without ever rendering them as agent completions.
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     def render(data: dict) -> str:
@@ -1128,11 +1130,13 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-        await asyncio.wait_for(backend.completion_started.wait(), timeout=10)
+        await asyncio.wait_for(
+            backend.child_started["grandchild"].wait(), timeout=10
+        )
         await asyncio.wait_for(tracked_ready.wait(), timeout=10)
         os.fstat(tracked[0].directory_fd)
 
-        backend.completion_gate.set()
+        backend.release_children.set()
         await asyncio.wait_for(owner.wait(), timeout=10)
         for child_store in tracked:
             with pytest.raises(OSError):

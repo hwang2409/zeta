@@ -13,11 +13,11 @@ import pytest
 from rich.console import Console
 
 import zeta.providers.stream_diagnostics as stream_diagnostics_module
+from zeta.codex import CodexHTTPError, CodexStreamError
 from zeta.protocol.types import (
     ErrorInfo,
 )
 from zeta.providers.anthropic_errors import AnthropicStreamError
-from zeta.providers.codex_errors import CodexHTTPError, CodexStreamError
 from zeta.providers.completion import retryable_provider_error
 from zeta.providers.transport import (
     build_response_error,

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from zeta.core.loop import AgentLoop
 
 import zeta.agent.runner as agent_runner_module
 import zeta.providers.anthropic as anthropic_module
@@ -22,7 +23,6 @@ from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
 from zeta.protocol.types import (

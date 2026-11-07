@@ -16,12 +16,12 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
+from zeta.core.loop import AgentLoop
 
 import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import BudgetExceeded, ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,

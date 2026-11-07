@@ -21,7 +21,7 @@ import zeta.providers.stream_diagnostics as diagnostics_module
 from zeta.core.context import ContextAssembler
 from tests.support.credentials import anthropic_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.core.loop import AgentLoop
+from zeta.runtime.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
 from zeta.providers.factory import credential_store

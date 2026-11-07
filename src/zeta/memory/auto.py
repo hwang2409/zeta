@@ -568,7 +568,6 @@ class AutoMemoryReconciler:
                 self._transcript_chunk, cursor, item.end
             )
             if self._transcript_scan_error is not None:
-                self._reported_transcript_scan_error = self._transcript_scan_error
                 raise _TranscriptScanError(self._transcript_scan_error)
             if not rows:
                 if scanned_end < cursor:

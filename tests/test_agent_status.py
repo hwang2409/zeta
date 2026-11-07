@@ -77,7 +77,9 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
         async def complete(self, messages, tool_schemas):
             if len(self.calls) == 3:
                 await release_background.wait()
-            async for event in super().complete(messages, tool_schemas, control=completion_control()):
+            async for event in super().complete(
+                messages, tool_schemas, control=completion_control()
+            ):
                 yield event
 
     foreground_call = ToolCall(

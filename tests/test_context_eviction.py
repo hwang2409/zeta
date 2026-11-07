@@ -83,6 +83,100 @@ def test_invalid_eviction_view_sequences_are_boundaries(
     assert all(item.message.metadata["eviction_view_invalid"] for item in items)
 
 
+def test_legacy_pinned_message_uses_original_source_order() -> None:
+    request = text(MessageRole.USER, "request")
+    entries = [
+        ConversationEntry(
+            seq=seq,
+            id=str(seq),
+            parent_id=None,
+            lane="main",
+            type="message",
+            data={"message": message.to_dict()},
+        )
+        for seq, message in (
+            (4616, text(MessageRole.ASSISTANT, "before")),
+            (4798, request),
+            (4799, text(MessageRole.ASSISTANT, "after")),
+        )
+    ]
+    marker = ConversationEntry(
+        seq=5000,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 4616,
+            "source_seq_end": 4799,
+            "view": [
+                {"seq": 4616, "message": entries[0].data["message"]},
+                {"seq": 4799, "message": entries[2].data["message"]},
+            ],
+            "pinned_message": request.to_dict(),
+        },
+    )
+
+    assembler = object.__new__(ContextAssembler)
+    projected = assembler._visible_items([*entries, marker])
+
+    assert [item.message.content[0].text for item in projected] == [
+        "before",
+        "request",
+        "after",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reopened_legacy_marker_matches_delivered_user_source(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    older_request = store.append_message(text(MessageRole.USER, "older request"))
+    older_answer = store.append_message(text(MessageRole.ASSISTANT, "older answer"))
+    delivered_request = text(MessageRole.USER, "latest request")
+    store.append_client_delivery(
+        "delivery-1",
+        "send",
+        "delivered",
+        {"accepted": True, "session_id": store.session_id},
+        message=delivered_request,
+    )
+    latest_answer = store.append_message(text(MessageRole.ASSISTANT, "latest answer"))
+    later_update = store.append_message(text(MessageRole.ASSISTANT, "later update"))
+    store.append_compaction_marker(
+        "summary",
+        older_request.seq,
+        later_update.seq,
+        kind="evict",
+        pinned_message=delivered_request,
+        view=[
+            {"seq": older_request.seq, "message": older_request.data["message"]},
+            {"seq": older_answer.seq, "message": older_answer.data["message"]},
+            {"seq": latest_answer.seq, "message": latest_answer.data["message"]},
+            {"seq": later_update.seq, "message": later_update.data["message"]},
+        ],
+    )
+    session_id = store.session_id
+    store.close()
+
+    reopened = ConversationStore(
+        tmp_path / "sessions", session_id=session_id, _must_exist=True
+    )
+    try:
+        assembled = await ContextAssembler(
+            reopened, token_budget=100_000, retained_tail=1
+        ).assemble_context()
+        assert [message.content[0].text for message in assembled.messages] == [
+            "older request",
+            "older answer",
+            "latest request",
+            "latest answer",
+            "later update",
+        ]
+    finally:
+        reopened.close()
+
+
 def test_view_seq_is_authoritative_over_metadata_source_seq() -> None:
     message = Message(
         MessageRole.ASSISTANT,
@@ -3032,10 +3126,25 @@ async def test_latest_user_message_never_evicted(tmp_path: Path) -> None:
     ).assemble_context()
 
     assert "latest request verbatim" in rendered_text(context.messages)
+    request_index = next(
+        index
+        for index, message in enumerate(context.messages)
+        if message.role is MessageRole.USER
+        and "latest request verbatim" in rendered_text([message])
+    )
+    answer_index = next(
+        index
+        for index, message in enumerate(context.messages)
+        if message.tool_result is not None
+        and message.tool_result.tool_call_id == "read-new"
+    )
+    assert request_index < answer_index
     marker = next(entry for entry in store.replay() if entry.type == "compaction")
-    assert marker.data["pinned_message"] == text(
+    expected_pinned = text(
         MessageRole.USER, "latest request verbatim"
     ).to_dict()
+    expected_pinned["metadata"]["source_seq"] = 4
+    assert marker.data["pinned_message"] == expected_pinned
 
 
 @pytest.mark.asyncio
@@ -3192,6 +3301,52 @@ class EmptyEvictionPolicy(CompactionPolicy):
     async def summarize_chunked(self, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.calls += 1
         return "fallback summary"
+
+
+class RecordingSummaryPolicy(CompactionPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs: list[list[Message]] = []
+
+    async def summarize_chunked(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        self.inputs.append(list(messages))
+        return "\n".join(
+            content.text
+            for message in messages
+            for content in message.content
+            if isinstance(content, TextContent)
+        )
+
+
+@pytest.mark.asyncio
+async def test_answered_latest_user_is_summarized_not_dropped(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(with_message_origin(text(MessageRole.USER, "answered request"), MessageOrigin.USER))
+    store.append_message(text(MessageRole.ASSISTANT, "completed answer"))
+    store.append_message(text(MessageRole.SYSTEM, "later background update"))
+    policy = RecordingSummaryPolicy()
+    assembler = ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        compaction_policy=policy,
+    )
+
+    async def no_eviction(**kwargs):  # type: ignore[no-untyped-def]
+        return None
+
+    # test-contract: seam patch eviction seam to force the production summary path
+    with patch.object(assembler, "_evict_context", side_effect=no_eviction):
+        context = await assembler.assemble_context(force=True)
+
+    assert [message.content[0].text for message in policy.inputs[0]] == [  # test-contract: seam production summarizer input
+        "answered request",
+        "completed answer",
+    ]
+    rendered = rendered_text(context.messages)
+    assert rendered.count("answered request") == 1
+    assert "completed answer" in rendered
+    assert "later background update" in rendered
 
 
 @pytest.mark.asyncio
