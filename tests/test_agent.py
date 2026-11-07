@@ -30,6 +30,7 @@ from tests.support.agent_lifecycle import (
     watch_delegated_registrations,
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import owned_resources
 from tests.support.processes import wait_for_path_command
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
@@ -11245,43 +11246,46 @@ async def test_killed_task_receipt_never_contains_command_secrets(
                 yield event
 
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
-    store = ConversationStore(tmp_path)
-    owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
-    loop = AgentLoop(
-        FailingBackend(command),
-        store,
-        max_turns=1,
-        background_owner=owner,
-        skill_catalog=SkillCatalog.empty(),
-    )
-    receipt_published = asyncio.Event()
+    async with owned_resources() as resources:
+        store = resources.store(ConversationStore(tmp_path))
+        owner = BackgroundAgentOwner(store, finish_gate_max_turns=1)
+        loop = resources.async_resource(
+            AgentLoop(
+                FailingBackend(command),
+                store,
+                max_turns=1,
+                background_owner=owner,
+                skill_catalog=SkillCatalog.empty(),
+            ),
+            what="agent loop",
+        )
+        receipt_published = asyncio.Event()
 
-    def collect_event(event: StreamEvent) -> None:
-        if event.data.get("notification_id"):
-            receipt_published.set()
+        def collect_event(event: StreamEvent) -> None:
+            if event.data.get("notification_id"):
+                receipt_published.set()
 
-    loop.set_background_event_sink(collect_event)
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await deadlines.started_event.wait()
-    for state, _configured_timeout in deadlines.started:
-        deadlines.expire(state)
-    await asyncio.wait_for(receipt_published.wait(), timeout=10)
-    await wait_background_owner(loop)
-    notifications = store.agent_notifications(pending_only=False)
-    # test-contract: durability secret filtering preserves one completion receipt.
-    assert len(notifications) == 1
-    notification = notifications[0]
-    killed_task_ids = notification.data.get("killed_task_ids")
-    assert isinstance(killed_task_ids, list) and len(killed_task_ids) == 1
-    text = notification.data["text"]
-    assert "background tasks killed on child completion" in text
-    task_id = notification.data["killed_task_ids"][0]
-    assert task_id in text
-    assert secret not in text
-    assert "background command" in text
-    assert "archive: " + str(loop.store.session_dir / "agents/1/background-output.archive") in text
-    assert "command unavailable" not in text
-    await loop.close()
+        loop.set_background_event_sink(collect_event)
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await deadlines.started_event.wait()
+        for state, _configured_timeout in deadlines.started:
+            deadlines.expire(state)
+        await asyncio.wait_for(receipt_published.wait(), timeout=10)
+        await wait_background_owner(loop)
+        notifications = store.agent_notifications(pending_only=False)
+        # test-contract: durability secret filtering preserves one completion receipt.
+        assert len(notifications) == 1
+        notification = notifications[0]
+        killed_task_ids = notification.data.get("killed_task_ids")
+        assert isinstance(killed_task_ids, list) and len(killed_task_ids) == 1
+        text = notification.data["text"]
+        assert "background tasks killed on child completion" in text
+        task_id = notification.data["killed_task_ids"][0]
+        assert task_id in text
+        assert secret not in text
+        assert "background command" in text
+        assert "archive: " + str(loop.store.session_dir / "agents/1/background-output.archive") in text
+        assert "command unavailable" not in text
 
 
 @pytest.mark.asyncio
