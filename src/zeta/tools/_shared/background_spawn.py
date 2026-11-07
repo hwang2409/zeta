@@ -225,7 +225,9 @@ async def spawn_background(
             raise asyncio.CancelledError
         if isinstance(admission_error, asyncio.CancelledError):
             raise
-        raise BackgroundSpawnNotAdmittedError(str(admission_error)) from admission_error
+        raise BackgroundSpawnNotAdmittedError(
+            f"zeta stopped the spawned task before registry admission: {admission_error}"
+        ) from admission_error
     return process
 
 
