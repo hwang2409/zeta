@@ -1033,7 +1033,12 @@ async def run_agent_tool(
         if child_canceled:
             return False
         if terminal_fence is not None and not await terminal_fence.cancel():
-            return False
+            transition = await child_store._to_thread_durable(
+                child_store._terminal_transition
+            )
+            lifecycle = child_store.agent_lifecycle() or {}
+            if transition != "cancel" or lifecycle.get("state") == "canceled":
+                return False
         await child_store._to_thread_agent_state(
             child_store.mark_agent_canceled, tool_call.id
         )
@@ -1043,7 +1048,11 @@ async def run_agent_tool(
     async def cleanup_canceled_child(
         confirmation: asyncio.Task[bool],
     ) -> None:
-        if not await confirmation:
+        try:
+            confirmed = await confirmation
+        except Exception:  # noqa: BLE001 - the caller reports confirmation failures
+            return
+        if not confirmed:
             return
         child_loop.admit_abort()
         child_loop.tool_registry.abort()

@@ -73,6 +73,9 @@ class PendingPromptStoreMixin:
     def _explicit_finish_report(self) -> dict[str, object] | None:
         return self.pending_prompt_queue.explicit_finish_report()
 
+    def _terminal_transition(self) -> str | None:
+        return self.pending_prompt_queue.terminal_transition()
+
     def _idle_nudge_eligible(
         self, persisted_notification_ids: frozenset[str]
     ) -> bool:

@@ -17834,6 +17834,119 @@ async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
 
 
 @pytest.mark.asyncio
+async def test_agent_cancel_retries_lifecycle_write_after_terminal_fence_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CancelIdleTreeBackend(with_grandchild=True)
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    transition_idle = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        transition_idle(child_store)
+        lifecycle = child_store.agent_lifecycle() or {}
+        handle = lifecycle.get("handle")
+        if isinstance(handle, str) and handle.count(":") == 1:
+            backend.child_idle.set()
+
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    mark_agent_canceled = ConversationStore.mark_agent_canceled
+    admit_abort = AgentLoop.admit_abort
+    child_handle: str | None = None
+    write_attempts = 0
+    cleanup_calls = 0
+
+    @wraps(mark_agent_canceled)
+    def fail_first_lifecycle_write(
+        child_store: ConversationStore, parent_tool_call_id: str
+    ) -> None:
+        nonlocal write_attempts
+        lifecycle = child_store.agent_lifecycle() or {}
+        if lifecycle.get("handle") == child_handle:
+            write_attempts += 1
+            if write_attempts == 1:
+                raise OSError("durable lifecycle write failed")
+        mark_agent_canceled(child_store, parent_tool_call_id)
+
+    def count_child_cleanup(child_loop: AgentLoop) -> None:
+        nonlocal cleanup_calls
+        lifecycle = child_loop.store.agent_lifecycle() or {}
+        if lifecycle.get("handle") == child_handle:
+            cleanup_calls += 1
+        admit_abort(child_loop)
+
+    monkeypatch.setattr(
+        ConversationStore, "mark_agent_canceled", fail_first_lifecycle_write
+    )
+    monkeypatch.setattr(AgentLoop, "admit_abort", count_child_cleanup)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        max_agent_depth=3,
+    )
+    loop.explicit_finish = True
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_idle.wait(), 10)
+        await asyncio.wait_for(backend.question_seen.wait(), 10)
+        child_handle = _run_handle_from_receipt(store)
+        child_path = Path(store.agent_children()[child_handle]["child_session_path"])
+        child_store = ConversationStore(
+            child_path.parent, session_id=child_path.name, _read_only=True
+        )
+        try:
+            grandchild_handle = next(iter(child_store.agent_children()))
+        finally:
+            child_store.close()
+
+        first = await loop.tool_registry.execute(
+            ToolCall("cancel-fails", "agent_cancel", {"handle": child_handle})
+        )
+        assert first["structuredContent"]["status"] == "cancellation_failed"
+        assert first["structuredContent"]["confirmation_error"] == (
+            "durable lifecycle write failed"
+        )
+        assert write_attempts == 1
+        assert cleanup_calls == 0
+
+        second = await loop.tool_registry.execute(
+            ToolCall("cancel-retries", "agent_cancel", {"handle": child_handle})
+        )
+        assert second["structuredContent"]["status"] == "cancellation_confirmed"
+        assert write_attempts == 2
+        status = await loop.tool_registry.execute(
+            ToolCall("status-after-retry", "agent_status", {"handle": child_handle})
+        )
+        assert status["structuredContent"]["children"][0]["state"] == "canceled"
+
+        try:
+            await asyncio.wait_for(loop._background_owner.wait(), 10)
+        except TimeoutError:
+            pytest.fail(
+                "canceled subtree did not drain: "
+                f"{loop._background_owner.active_instance_ids}"
+            )
+        assert cleanup_calls == 1
+        assert child_handle not in loop._background_owner.active_instance_ids
+        assert grandchild_handle not in loop._background_owner.active_instance_ids
+        third = await loop.tool_registry.execute(
+            ToolCall("cancel-again", "agent_cancel", {"handle": child_handle})
+        )
+        assert third["structuredContent"]["status"] == "already_finished"
+        assert cleanup_calls == 1
+    finally:
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
