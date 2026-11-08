@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import http.server
 import os
 import select
 import signal
@@ -191,30 +190,52 @@ def test_codex_authorization_url_includes_upstream_flow_fields() -> None:
     assert query["originator"] == ["codex_cli_rs"]
 
 
-def test_redirect_server_binds_without_reverse_dns(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.asyncio
+async def test_cancelled_login_closes_listener_without_waiting_for_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """ZETA-91: binding must never reverse-resolve 127.0.0.1.
+    store = _Store()
+    url_ready = asyncio.Event()
+    callback_url = ""
+    join_gate = threading.Event()
 
-    ``HTTPServer.server_bind`` calls ``socket.getfqdn`` on the bind address;
-    on a host whose resolver has no answer for it the lookup blocks until the
-    resolver times out and ``zeta login`` prints nothing meanwhile.
-    """
+    def build_url(state: str, challenge: str, redirect_uri: str) -> str:
+        nonlocal callback_url
+        del state, challenge
+        callback_url = redirect_uri
+        url_ready.set()
+        return "https://authorize.invalid/"
 
-    def _no_lookup(name: str = "") -> str:
-        raise AssertionError(f"reverse lookup attempted for {name!r}")
+    async def exchange(*args: object) -> OAuthTokens:
+        raise AssertionError("exchange must not run after cancellation")
 
-    monkeypatch.setattr(socket, "getfqdn", _no_lookup)
+    original_join = threading.Thread.join
 
-    server = login_flow._create_redirect_server(
-        http.server.BaseHTTPRequestHandler, port=0
+    def held_join(thread: threading.Thread, timeout: float | None = None) -> None:
+        if thread.name == "zeta-login-redirect":
+            join_gate.wait()
+        else:
+            original_join(thread, timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", held_join)
+    task = asyncio.create_task(
+        run_login(_provider(store, build_url, exchange), lambda: ("v", "c", "s"))
     )
+    await asyncio.wait_for(url_ready.wait(), timeout=10)
+    port = int(urlsplit(callback_url).port or 0)
+    task.cancel()
     try:
-        assert server.server_name == "localhost"
-        assert server.server_port == server.server_address[1]
-        assert server.server_port > 0
+        done, _ = await asyncio.wait({task}, timeout=10)
+        assert task in done, "login cancellation waited for the listener thread"
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
+        with pytest.raises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=1)
+        assert store.saved is None
+        assert not list(tmp_path.iterdir())
     finally:
-        server.server_close()
+        join_gate.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
@@ -634,7 +655,11 @@ async def test_login_reraises_non_port_bind_error(monkeypatch: pytest.MonkeyPatc
         del args, kwargs
         raise OSError(errno.EACCES, "permission denied")
 
-    monkeypatch.setattr(login_flow, "_create_redirect_server", raise_permission_denied)
+    async def start_server(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(login_flow.asyncio, "start_server", start_server)
     provider = _provider(_Store(), lambda *_: "https://authorize.invalid/", exchange)
 
     with pytest.raises(OSError, match="permission denied") as exc_info:
