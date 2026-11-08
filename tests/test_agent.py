@@ -2829,10 +2829,11 @@ async def test_abort_during_next_request_preparation_skips_provider_dispatch(
     tmp_path: Path,
 ) -> None:
     call = ToolCall("first-tool", "echo", {})
+    next_reply = "the next run completed"
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[call]),
-            ScriptedTurn([TextContent("must not dispatch")]),
+            ScriptedTurn([TextContent(next_reply)]),
         ]
     )
     loop = AgentLoop(
@@ -2866,6 +2867,20 @@ async def test_abort_during_next_request_preparation_skips_provider_dispatch(
         allow_request_preparation.set()
         await asyncio.wait_for(run, 10)
         assert len(backend.calls) == 1
+
+        next_events = await _collect(
+            loop.run_turn("after abort", origin=MessageOrigin.USER)
+        )
+        assert [
+            event.type
+            for event in next_events
+            if event.type
+            in {StreamEventType.TURN_START, StreamEventType.TURN_END}
+        ] == [StreamEventType.TURN_START, StreamEventType.TURN_END]
+        assert len(backend.calls) == 2
+        assert next_reply in json.dumps(
+            [message.to_dict() for message in loop.store.messages()]
+        )
     finally:
         allow_request_preparation.set()
         if not run.done():
