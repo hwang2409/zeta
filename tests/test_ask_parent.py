@@ -8,6 +8,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
@@ -81,8 +82,20 @@ def _setup(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_ask_parent_returns_immediately_and_persists_once(tmp_path: Path) -> None:
+async def test_ask_parent_returns_immediately_and_persists_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     parent, _child, registry, handle, owner = _setup(tmp_path)
+    published = asyncio.Event()
+    channel = owner.conversation_channel
+    original_publish = channel.publish_question
+
+    async def observe_publish(**kwargs):
+        result = await original_publish(**kwargs)
+        published.set()
+        return result
+
+    monkeypatch.setattr(channel, "publish_question", observe_publish)
     result = await asyncio.wait_for(
         registry.execute(
             ToolCall(
@@ -94,6 +107,7 @@ async def test_ask_parent_returns_immediately_and_persists_once(tmp_path: Path) 
         timeout=0.2,
     )
 
+    await await_or_fail(published.wait(), what="ask_parent persistence")
     questions = parent.agent_notifications()
     assert result["isError"] is False
     assert "continue your work" in result["content"][0]["text"]
@@ -101,6 +115,43 @@ async def test_ask_parent_returns_immediately_and_persists_once(tmp_path: Path) 
     assert questions[0].data["kind"] == "child_question"
     assert questions[0].data["child_instance_id"] == handle
     owner.cancel_all()
+
+
+@pytest.mark.asyncio
+async def test_ask_parent_does_not_wait_for_parent_store_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, _child, registry, _handle, owner = _setup(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    publication: asyncio.Task[object] | None = None
+    channel = owner.conversation_channel
+    original_publish = channel.publish_question
+
+    async def blocked_publish(**kwargs):
+        nonlocal publication
+        publication = asyncio.current_task()
+        started.set()
+        await await_or_fail(release.wait(), what="release question publication")
+        return await original_publish(**kwargs)
+
+    monkeypatch.setattr(channel, "publish_question", blocked_publish)
+    try:
+        execution = asyncio.create_task(
+            registry.execute(
+                ToolCall("ask-1", "ask_parent", {"question": "Which approach?"})
+            )
+        )
+        await await_or_fail(started.wait(), what="question publication start")
+        assert execution.done(), "ask_parent waited for parent persistence"
+        assert (await execution)["isError"] is False
+        assert publication is not None
+        release.set()
+        await await_or_fail(publication, what="question persistence")
+        assert len(parent.agent_notifications()) == 1
+    finally:
+        release.set()
+        owner.cancel_all()
 
 
 @pytest.mark.asyncio
