@@ -27,10 +27,15 @@ def _finalizer_violations() -> list[str]:
             where = f"{path.relative_to(SRC.parent)}:{getattr(node, 'lineno', 0)}"
             if isinstance(node, ast.FunctionDef) and node.name == "__del__":
                 violations.append(f"{where} defines __del__")
-            if not isinstance(node, ast.Call) or ast.unparse(node.func) not in {
-                "weakref.finalize",
-                "finalize",
-            }:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "weakref"
+                and any(alias.name == "finalize" for alias in node.names)
+            ):
+                violations.append(f"{where} imports finalize unqualified")
+            if not isinstance(node, ast.Call) or ast.unparse(node.func) != (
+                "weakref.finalize"
+            ):
                 continue
             callback = ast.unparse(node.args[1]) if len(node.args) > 1 else ""
             if callback not in {"os.close", "release_later"}:
@@ -130,12 +135,21 @@ class _CollectOnCapability(int):
         return int.__lt__(self, other)
 
 
+def _untracked(cls: type, *args: object) -> object:
+    # The repository conftest wraps owner constructors to keep owners (and an
+    # extra home writer lease) alive for cleanup; this test needs the collector
+    # to free the only owner of the home lease.
+    owner = cls.__new__(cls)
+    getattr(cls.__init__, "__wrapped__", cls.__init__)(owner, *args)
+    return owner
+
+
 def _manager_owner(home: Path) -> object:
-    return SessionManager(home)
+    return _untracked(SessionManager, home)
 
 
 def _workspace_owner(home: Path) -> object:
-    return WorkspaceSnapshotStore(home / "sessions" / "owner", "owner")
+    return _untracked(WorkspaceSnapshotStore, home / "sessions" / "owner", "owner")
 
 
 @pytest.mark.parametrize("make_owner", [_manager_owner, _workspace_owner])
