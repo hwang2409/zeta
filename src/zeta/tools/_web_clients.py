@@ -5,6 +5,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from http.cookiejar import CookieJar
 
 import httpx
 
@@ -19,6 +20,14 @@ class _ClientEntry:
     active: int = 0
 
 
+class _NoStoreCookieJar(CookieJar):
+    def extract_cookies(self, response: object, request: object) -> None:
+        return None
+
+    def add_cookie_header(self, request: object) -> None:
+        return None
+
+
 class SessionWebClients:
     """Own credential-free HTTP pools for one tool registry."""
 
@@ -26,7 +35,9 @@ class SessionWebClients:
         self._anonymous: OrderedDict[str, _ClientEntry] = OrderedDict()
         self._codex: _ClientEntry | None = None
         self._condition = asyncio.Condition()
+        self._close_task: asyncio.Task[None] | None = None
         self._retired = False
+        self._closed = False
 
     @asynccontextmanager
     async def anonymous(self, origin: str) -> AsyncIterator[httpx.AsyncClient]:
@@ -40,6 +51,7 @@ class SessionWebClients:
                         timeout=15.0,
                         follow_redirects=False,
                         trust_env=False,
+                        cookies=_NoStoreCookieJar(),
                     )
                 )
                 self._anonymous[origin] = entry
@@ -73,7 +85,9 @@ class SessionWebClients:
             if self._retired:
                 raise RuntimeError("web client owner is closed")
             if self._codex is None:
-                self._codex = _ClientEntry(httpx.AsyncClient(timeout=timeout))
+                self._codex = _ClientEntry(
+                    httpx.AsyncClient(timeout=timeout, cookies=_NoStoreCookieJar())
+                )
             self._codex.active += 1
             entry = self._codex
         try:
@@ -84,15 +98,26 @@ class SessionWebClients:
                 self._condition.notify_all()
 
     async def close(self) -> None:
-        async with self._condition:
-            self._retired = True
-            await self._condition.wait_for(self._all_idle)
-            clients = [entry.client for entry in self._anonymous.values()]
-            if self._codex is not None:
-                clients.append(self._codex.client)
-            self._anonymous.clear()
-            self._codex = None
-        await self._close_clients(clients)
+        if self._closed:
+            return
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_owned())
+        await asyncio.shield(self._close_task)
+
+    async def _close_owned(self) -> None:
+        try:
+            async with self._condition:
+                self._retired = True
+                await self._condition.wait_for(self._all_idle)
+                clients = [entry.client for entry in self._anonymous.values()]
+                if self._codex is not None:
+                    clients.append(self._codex.client)
+                self._anonymous.clear()
+                self._codex = None
+            await self._close_clients(clients)
+            self._closed = True
+        finally:
+            self._close_task = None
 
     def _all_idle(self) -> bool:
         return all(entry.active == 0 for entry in self._anonymous.values()) and (

@@ -80,11 +80,19 @@ class _ChunkedByteStream(httpx.AsyncByteStream):
 
 
 class _KeepAliveServer:
-    def __init__(self, body_for_host=None, *, response_gate: asyncio.Event | None = None):
+    def __init__(
+        self,
+        body_for_host=None,
+        *,
+        response_gate: asyncio.Event | None = None,
+        response_headers: bytes = b"",
+    ):
         self.body_for_host = body_for_host or (lambda _host: b"ok")
         self.response_gate = response_gate
+        self.response_headers = response_headers
         self.accepted = 0
         self.closed = 0
+        self.request_headers: list[dict[str, str]] = []
         self.request_started = asyncio.Event()
         self.connection_closed = asyncio.Event()
         self._server: asyncio.Server | None = None
@@ -128,6 +136,7 @@ class _KeepAliveServer:
                     if ":" in line
                     for key, value in [line.split(":", 1)]
                 }
+                self.request_headers.append(headers)
                 length = int(headers.get("content-length", "0"))
                 if length:
                     await reader.readexactly(length)
@@ -140,7 +149,9 @@ class _KeepAliveServer:
                 writer.write(
                     b"HTTP/1.1 200 OK\r\n"
                     + f"Content-Length: {len(body)}\r\n".encode()
-                    + b"Content-Type: text/html\r\nConnection: keep-alive\r\n\r\n"
+                    + b"Content-Type: text/html\r\nConnection: keep-alive\r\n"
+                    + self.response_headers
+                    + b"\r\n"
                     + body
                 )
                 await writer.drain()
@@ -323,7 +334,7 @@ async def test_real_network_connections_are_blocked() -> None:
 async def test_registry_reuses_fetch_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    server = _KeepAliveServer()
+    server = _KeepAliveServer(response_headers=b"Set-Cookie: session=secret\r\n")
     await server.start()
     _route_test_hosts(monkeypatch)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
@@ -339,6 +350,7 @@ async def test_registry_reuses_fetch_connection(
             assert result["isError"] is False, result
 
         assert server.accepted == 1
+        assert "cookie" not in server.request_headers[1]
     finally:
         await registry.close()
         await server.close()
@@ -393,7 +405,10 @@ async def test_registry_reuses_codex_search_connection(
         b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
         b"data: [DONE]\n\n"
     )
-    server = _KeepAliveServer(lambda _host: body)
+    server = _KeepAliveServer(
+        lambda _host: body,
+        response_headers=b"Set-Cookie: session=secret\r\n",
+    )
     await server.start()
     _route_test_hosts(monkeypatch)
     monkeypatch.setattr(
@@ -420,6 +435,7 @@ async def test_registry_reuses_codex_search_connection(
             assert result["structuredContent"]["backend"] == "codex", result
 
         assert server.accepted == 1
+        assert "cookie" not in server.request_headers[1]
     finally:
         await registry.close()
         await server.close()
@@ -464,14 +480,18 @@ async def test_registry_close_drains_in_flight_web_request(
         assert rejected["isError"] is True
         assert "web client owner is closed" in rejected["content"][0]["text"]
 
+        close_task.cancel()
+        cancelled = await await_or_fail(
+            asyncio.gather(close_task, return_exceptions=True),
+            what="cancelled registry close caller to finish",
+        )
+        assert isinstance(cancelled[0], asyncio.CancelledError)
         response_gate.set()
-        result = await await_or_fail(request, what="in-flight fetch to finish")
-        assert result["isError"] is False
-        await await_or_fail(close_task, what="registry web clients to close")
+        await await_or_fail(request, what="in-flight fetch to release its web client")
         await await_or_fail(
             server.connection_closed.wait(), what="request connection context to close"
         )
-        assert close_task.done()
+        assert registry.web_clients._close_task is None
         assert server.open_connections == 0
     finally:
         response_gate.set()
