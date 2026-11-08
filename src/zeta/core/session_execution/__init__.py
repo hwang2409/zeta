@@ -14,6 +14,7 @@ from typing import Literal
 
 from ...storage_format import WriterLease
 from ..checkpoints import ConversationIntegrityError
+from ..fsio import write_all
 from ..session_files import SessionInUseError, open_session_file
 
 RUNTIME_LEASE_NAME = "runtime.lease"
@@ -116,6 +117,36 @@ def session_owner_status(directory_fd: int) -> tuple[bool, int | None]:
     return True, pid
 
 
+def execution_owner_state(
+    directory_fd: int,
+) -> Literal["owned", "recovery", "external"] | None:
+    """Inspect kernel-backed ownership without trusting a reusable pid."""
+
+    stat = os.fstat(directory_fd)
+    identity = (stat.st_dev, stat.st_ino)
+    with _REGISTRY_LOCK:
+        local = _REGISTRY.get(identity)
+        if (
+            local is not None
+            and local.pid == os.getpid()
+            and local.state in {"owned", "recovery"}
+        ):
+            return local.state
+    try:
+        fd = open_session_file(directory_fd, RUNTIME_LEASE_NAME, os.O_RDWR)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "external"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
+
+
 def _publish_owner(fd: int, owner: OwnerHint, epoch: str) -> None:
     record = json.dumps(
         {
@@ -129,7 +160,7 @@ def _publish_owner(fd: int, owner: OwnerHint, epoch: str) -> None:
     ).encode()
     os.lseek(fd, 0, os.SEEK_SET)
     os.ftruncate(fd, 0)
-    os.write(fd, record)
+    write_all(fd, record)
 
 
 class SessionExecutionLease:

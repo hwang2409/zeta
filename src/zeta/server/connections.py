@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -18,6 +19,22 @@ from .protocol import (
     _Frame,
 )
 
+CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
+
+OBSERVER_REQUESTS = frozenset(
+    {
+        "list_sessions",
+        "status",
+        "session_tree",
+        "session_history",
+        "content_read",
+        "model_catalog",
+        "session_settings",
+        "ping",
+        "delivery_status",
+        "session_grants",
+    }
+)
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
@@ -26,6 +43,19 @@ OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
 
 async def _overflow_deadline_wait() -> None:
     await asyncio.sleep(OUTPUT_OVERFLOW_CLOSE_DEADLINE)
+
+
+@dataclass(frozen=True, slots=True)
+class Admission:
+    kind: Literal[
+        "admitted",
+        "no_controller",
+        "feature_rejected",
+        "codec_rejected",
+        "not_writable",
+        "capacity_rejected",
+    ]
+    connection: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +90,7 @@ class _OutputState:
     overflow_deadline_task: asyncio.Task[None] | None = None
     overflowed: bool = False
     released: bool = False
+    drained: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
@@ -78,6 +109,7 @@ class ConnectionRegistry:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
         self._controller: _Connection | None = None
+        self._controller_output_paused = False
         self._observers: list[_Connection] = []
         self._closed = False
         self._read_condition = threading.Condition()
@@ -101,6 +133,7 @@ class ConnectionRegistry:
         output = _OutputState()
         output.ready = self.loop.create_future()
         output.callers_settled.set()
+        output.drained.set()
         state.output = output
         self._connections[connection] = state
         output.writer_task = asyncio.create_task(self._output_writer(state))
@@ -177,6 +210,10 @@ class ConnectionRegistry:
         state = self._connections.get(connection)
         return state is not None and state is self._controller
 
+    def activate_controller(self, connection: Any) -> None:
+        if self.is_controller(connection):
+            self._controller_output_paused = False
+
     def controller_metadata(self) -> ControllerMetadata | None:
         state = self._controller
         if state is None:
@@ -184,6 +221,67 @@ class ConnectionRegistry:
         return ControllerMetadata(
             state.connection, state.protocol_version, state.features
         )
+
+    def _controller_preflight(
+        self,
+        state: _Connection | None,
+        event: EventDescriptor,
+        session_id: str | None,
+        *,
+        required_feature: str | None,
+        fields: dict[str, object],
+    ) -> tuple[Admission, _Frame | None, _OutputState | None]:
+        if state is None:
+            return Admission("no_controller"), None, None
+        if state is self._controller and self._controller_output_paused:
+            return Admission("not_writable"), None, None
+        if required_feature is not None and required_feature not in state.features:
+            return Admission("feature_rejected"), None, None
+        if (
+            event is EventDescriptor.APPROVAL_END
+            and "approval_reconnect" not in state.features
+            and isinstance(fields.get("data"), dict)
+            and fields["data"].get("reason") == "grace_expired"
+        ):
+            return Admission("feature_rejected"), None, None
+        frame = state.connection.codec.notification(event, session_id, **fields)
+        if frame is None:
+            return Admission("codec_rejected"), None, None
+        output = state.output
+        if output is None or output.phase not in {
+            "claimed_buffering",
+            "flushing",
+            "ready",
+        }:
+            return Admission("not_writable"), None, None
+        return Admission("admitted", state.connection), frame, output
+
+    def try_admit_controller(
+        self,
+        event: EventDescriptor,
+        session_id: str | None,
+        *,
+        required_feature: str | None = None,
+        **fields: object,
+    ) -> Admission:
+        """Admit one controller event without waiting for physical output."""
+        outcome, frame, output = self._controller_preflight(
+            self._controller,
+            event,
+            session_id,
+            required_feature=required_feature,
+            fields=fields,
+        )
+        if outcome.kind != "admitted" or frame is None or output is None:
+            return outcome
+        if not self._admit(self._controller, frame):
+            return Admission("capacity_rejected")
+        self._enqueue(
+            output,
+            _OutputFrame(frame),
+            wake=True,
+        )
+        return outcome
 
     async def publish_controller(
         self,
@@ -193,25 +291,17 @@ class ConnectionRegistry:
         required_feature: str | None = None,
         **fields: object,
     ) -> bool:
+        outcome, frame, output = self._controller_preflight(
+            self._controller,
+            event,
+            session_id,
+            required_feature=required_feature,
+            fields=fields,
+        )
+        if outcome.kind != "admitted" or frame is None or output is None:
+            return False
         state = self._controller
-        if state is None or (
-            required_feature is not None and required_feature not in state.features
-        ):
-            return False
-        if (
-            event is EventDescriptor.APPROVAL_END
-            and "approval_reconnect" not in state.features
-            and isinstance(fields.get("data"), dict)
-            and fields["data"].get("reason") == "grace_expired"
-        ):
-            return False
-        frame = state.connection.codec.notification(event, session_id, **fields)
-        if frame is None:
-            return False
-        output = state.output
-        assert output is not None
-        if output.phase not in {"claimed_buffering", "flushing", "ready"}:
-            return False
+        assert state is not None
         if not self._admit(state, frame):
             return False
         if output.phase in {"claimed_buffering", "flushing"}:
@@ -235,7 +325,9 @@ class ConnectionRegistry:
         states = tuple(
             state
             for state in (self._controller, *self._observers)
-            if state is not None and feature in state.features
+            if state is not None
+            and feature in state.features
+            and (state is not self._controller or not self._controller_output_paused)
         )
         for state in states:
             frame = state.connection.codec.notification(event, session_id, data=data)
@@ -252,6 +344,7 @@ class ConnectionRegistry:
             return
         if state is self._controller:
             self._controller = None
+            self._controller_output_paused = True
         if state in self._observers:
             self._observers.remove(state)
         output = state.output
@@ -320,6 +413,17 @@ class ConnectionRegistry:
         finally:
             self._finish_caller(output)
 
+    async def flush(
+        self,
+        connection: Any,
+        timeout: float = CONNECTION_FLUSH_DEADLINE_SECONDS,
+    ) -> None:
+        state = self._connections.get(connection)
+        if state is None or state.output is None:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(state.output.drained.wait(), timeout)
+
     async def wait_until_settled(self, connection: Any) -> None:
         state = self._connections.get(connection)
         if state is not None and state.output is not None:
@@ -342,6 +446,7 @@ class ConnectionRegistry:
     def _enqueue(
         self, output: _OutputState, frame: _OutputFrame, *, wake: bool = True
     ) -> None:
+        output.drained.clear()
         output.queue.append(frame)
         self._charge(output, frame)
         if wake:
@@ -357,6 +462,7 @@ class ConnectionRegistry:
                     await self._write_output_frame(
                         state, output, output.queue.popleft()
                     )
+                output.drained.set()
                 output.wake.clear()
                 if await self._complete_output_phase(state, output):
                     return
@@ -579,15 +685,24 @@ class ConnectionRegistry:
         self._cancel_overflow_deadline(output)
         if role == "observer":
             self._clear_output(output)
-            if output.writer_task is not None:
+            if (
+                output.writer_task is not None
+                and output.writer_task is not asyncio.current_task()
+            ):
                 output.writer_task.cancel()
             return
+        self._clear_output(output, result=False)
+        writer_task = output.writer_task
+        current_task = asyncio.current_task()
         if (
-            output.current_frame is None
-            and not output.queue
-            and output.writer_task is not None
+            writer_task is None
+            or writer_task is current_task
+            or output.current_write is current_task
         ):
-            output.writer_task.cancel()
+            return
+        if output.current_frame is not None:
+            self._finish_future(output.current_frame.future, False)
+        writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
         while output.queue:

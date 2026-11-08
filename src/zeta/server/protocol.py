@@ -64,6 +64,11 @@ class ErrorDescriptor(Enum):
     CONTROLLER_OUTPUT_OVERFLOW = (-32011, None, "controller output overflow")
     OBSERVER_OUTPUT_OVERFLOW = (-32011, None, "observer output overflow")
     CONTENT_NOT_FOUND = (-32012, "content_not_found", "content handle was not found")
+    TRANSCRIPT_REPAIR_REQUIRES_UPGRADE = (
+        -32013,
+        "transcript_repair_requires_upgrade",
+        "transcript repair requires the stored-format upgrade",
+    )
     CORRUPT_TRANSCRIPT = (
         -32000,
         "corrupt_transcript",
@@ -250,6 +255,7 @@ class MethodDescriptor(Enum):
     STATUS = ("status", None, None, Access.READ)
     RENAME_SESSION = ("rename_session", "1.1", None, Access.SESSION_MUTATION)
     DELETE_SESSION = ("delete_session", "1.1", None, Access.CONTROLLER_WRITE)
+    REPAIR_TRANSCRIPT = ("repair_transcript", "1.1", None, Access.SESSION_MUTATION)
     SESSION_TREE = ("session_tree", "1.1", None, Access.READ)
     SESSION_HISTORY = ("session_history", "1.1", None, Access.READ)
     CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)

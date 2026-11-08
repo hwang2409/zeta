@@ -20,6 +20,9 @@ from ..core.checkpoints import (
     ConversationIntegrityError,
     load_session_json,
 )
+from ..core.fsio import write_all
+from ..core.store import ConversationStore
+from ..core.transcript_recovery import resume_memory_review
 from ..oauth import ProviderLoginRequiredError
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError
@@ -29,7 +32,7 @@ from ..protocol.types import (
     MessageOrigin,
 )
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
-from ..storage_format import WriterLease, open_writer
+from ..storage_format import WRITER_EPOCH, WriterLease, open_writer
 from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
 from .profiles import early_update_debounce_seconds, early_update_max_wait_seconds
 from .reconciler import (
@@ -209,6 +212,10 @@ class AutoMemoryReconciler:
         self._transcript_cursor: _TranscriptCursor | None = None
         self._transcript_scan_error: str | None = None
         self._transcript_scan_error_seq: int | None = None
+        self._recovery_generation = self.state.generation
+        self._recovery_cutoff = self.state.recovery_cutoff
+        self._paused_for_recovery = self.state.paused_for_recovery
+        self._resume_catch_up = self._recovery_cutoff is not None and not self._paused_for_recovery
 
     @property
     def last_reconciled_seq(self) -> int:
@@ -224,6 +231,9 @@ class AutoMemoryReconciler:
 
     @property
     def automatic_memory_status(self) -> str | None:
+        broken = self.state.broken
+        if broken is not None:
+            return broken.status_line()
         scanner_failure = self.scanner_failure
         if scanner_failure is not None:
             seq, cause = scanner_failure
@@ -249,7 +259,11 @@ class AutoMemoryReconciler:
 
     def retry_terminal(self, key: str) -> bool:
         """Re-queue one terminal receipt for this session."""
-        if self._paused_for_login or self.scanner_failure is not None:
+        if (
+            self._paused_for_login
+            or self.state.broken is not None
+            or self.scanner_failure is not None
+        ):
             return False
         queued = self.state.retry_terminal(key, now=self._retry_clock())
         if queued and not self._closing:
@@ -259,11 +273,82 @@ class AutoMemoryReconciler:
             self._ensure_worker()
         return queued
 
+    async def recovery_committed(
+        self,
+        *,
+        quarantine_id: str,
+        retained_last_sequence: int,
+        memory_review_required: bool,
+    ) -> None:
+        """Apply a repaired transcript only on this reconciler's owner loop."""
+        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+            raise ProjectRegistryError("memory writes are unavailable before the writer epoch")
+        generation = self.state.generation + 1
+        await asyncio.to_thread(
+            self.state.reset_for_recovery,
+            generation=generation,
+            retained_last_sequence=retained_last_sequence,
+            quarantine_id=quarantine_id,
+            paused=memory_review_required,
+        )
+        self._recovery_generation = generation
+        self._recovery_cutoff = retained_last_sequence
+        self._transcript_cursor = None
+        self._pending.clear()
+        self._resume_catch_up = not memory_review_required
+        self._paused_for_recovery = memory_review_required
+        if not memory_review_required:
+            self._wake.set()
+            self._drained.clear()
+            self._ensure_worker()
+
+    async def resume_recovery(
+        self, root_session_id: str, quarantine_id: str
+    ) -> str:
+        """Commit one recovery review, then resume scanning from its cutoff."""
+        if root_session_id != self.session_id:
+            return "memory recovery: unavailable for this session"
+        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+            raise ProjectRegistryError(
+                "memory writes are unavailable before the writer epoch"
+            )
+
+        def resume() -> int:
+            with ConversationStore(
+                self.session_dir.parent,
+                session_id=self.session_id,
+                cwd=self.session_dir,
+                _storage_lease=self._storage_lease,
+                _owner_surface="recovery",
+                _recovery_owner=True,
+            ) as store, store._append_lock():
+                return resume_memory_review(
+                    store.directory_fd, quarantine_id
+                ).cutoff_sequence
+
+        retained_last_sequence = await asyncio.to_thread(resume)
+        await asyncio.to_thread(self.state.resume_recovery, quarantine_id)
+        self._recovery_cutoff = retained_last_sequence
+        self._paused_for_recovery = False
+        self._resume_catch_up = True
+        if not self._closing:
+            self._drained.clear()
+            self._ensure_worker()
+            self._wake.set()
+        return "memory recovery resumed"
+
     def activity(self, seq: int | None = None) -> None:
         """Report a transcript append after it has been durably persisted."""
-        del seq  # The worker reads the authoritative durable sequence itself.
-        if not self.config.enabled or self._closing or self._paused_for_login:
+        if (
+            not self.config.enabled
+            or self._closing
+            or self._paused_for_login
+            or self._paused_for_recovery
+            or self.state.broken is not None
+            or (seq is not None and self._recovery_cutoff is not None and seq <= self._recovery_cutoff)
+        ):
             return
+        # the worker reads the authoritative durable sequence itself.
         self._begin_work_cycle()
         self._activity_generation += 1
         self._idle_deadline = self._clock() + self.config.idle_seconds
@@ -277,6 +362,7 @@ class AutoMemoryReconciler:
             not self.config.enabled
             or self._closing
             or self._paused_for_login
+            or self.state.broken is not None
             or seq_end < seq_start
         ):
             return
@@ -288,7 +374,11 @@ class AutoMemoryReconciler:
 
     async def drain(self) -> None:
         """Wait until all work currently caused by activity has settled."""
-        if not self.config.enabled or self._paused_for_login:
+        if (
+            not self.config.enabled
+            or self._paused_for_login
+            or self.state.broken is not None
+        ):
             return
         self._begin_work_cycle()
         self._ensure_worker()
@@ -323,7 +413,12 @@ class AutoMemoryReconciler:
 
     def catch_up(self) -> None:
         """Queue durable transcript content left behind by an earlier shutdown."""
-        if not self.config.enabled or self._closing or self._paused_for_login:
+        if (
+            not self.config.enabled
+            or self._closing
+            or self._paused_for_login
+            or self.state.broken is not None
+        ):
             return
         self._begin_work_cycle()
         self._resume_catch_up = True
@@ -335,7 +430,7 @@ class AutoMemoryReconciler:
             self._retry_attempts_in_cycle.clear()
 
     def _ready_retries(self) -> tuple[ReconciliationWork, ...]:
-        if self.scanner_failure is not None:
+        if self.state.broken is not None or self.scanner_failure is not None:
             return ()
         return tuple(
             work
@@ -344,11 +439,13 @@ class AutoMemoryReconciler:
         )
 
     def _ensure_worker(self) -> None:
+        if self.state.broken is not None:
+            return
         if self._worker_task is None:
             self._worker_task = asyncio.create_task(self._worker())
 
     def _add_pending(self, start: int, end: int, *reasons: str) -> None:
-        if self.state.scanner_failure is not None:
+        if self.state.broken is not None or self.state.scanner_failure is not None:
             return
         for uncovered_start, uncovered_end in self.state.uncovered_ranges(start, end):
             merged = _PendingRange(uncovered_start, uncovered_end, set(reasons))
@@ -366,7 +463,7 @@ class AutoMemoryReconciler:
             self._pending = sorted(remaining, key=lambda item: item.start)
 
     def _queue_ready_retries(self) -> None:
-        if self.scanner_failure is not None:
+        if self.state.broken is not None or self.scanner_failure is not None:
             return
         queued = {item.key for item in self._pending if item.key is not None}
         for work in self._ready_retries():
@@ -887,7 +984,7 @@ class AutoMemoryReconciler:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
             os.close(fd)
             fd = -1

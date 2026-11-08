@@ -218,9 +218,7 @@ class NotificationStateMixin:
                 or not options
                 or len(options) > 10
                 or any(
-                    type(option) is not str
-                    or not option.strip()
-                    or len(option) > 1_000
+                    type(option) is not str or not option.strip() or len(option) > 1_000
                     for option in options
                 )
             )
@@ -371,6 +369,7 @@ class NotificationStateMixin:
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool = False,
         background_metadata: tuple[str, str] | None = None,
+        display_only: bool = False,
         report: dict[str, object] | None = None,
     ) -> tuple[ConversationEntry, bool]:
         """Atomically return the first completion notification or append one."""
@@ -385,6 +384,7 @@ class NotificationStateMixin:
             killed_task_count=killed_task_count,
             killed_task_ids_truncated=killed_task_ids_truncated,
             background_metadata=background_metadata,
+            display_only=display_only,
             report=report,
         )
         with self._append_lock():
@@ -453,6 +453,7 @@ class NotificationStateMixin:
                 "notification_ack",
                 "notification_tui_presented",
                 "turn_end",
+                "warning",
             }:
                 data = copy.deepcopy(entry.data)
             else:
@@ -477,9 +478,7 @@ class NotificationStateMixin:
             self._active_notifications.values()
             if pending_only
             else (
-                entry
-                for entry in self._active_branch()
-                if entry.type == "notification"
+                entry for entry in self._active_branch() if entry.type == "notification"
             )
         )
         return [

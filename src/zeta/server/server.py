@@ -14,6 +14,10 @@ from typing import Any
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
+from ..core.transcript_recovery.runtime import (
+    TranscriptRepairRequiresUpgrade,
+    repair_transcript_for_runtime,
+)
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -30,6 +34,7 @@ from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
+    PROJECT_REQUESTS,
     ProjectRequests,
     project_request_error,
 )
@@ -227,6 +232,28 @@ _LOGIN_METHODS = frozenset(
     MethodDescriptor[name]
     for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
 )
+LOADED_SESSION_MUTATIONS = frozenset(
+    {
+        "abort",
+        "approve",
+        "clear_steering",
+        "deny",
+        "fork_message",
+        "rename_session",
+        "repair_transcript",
+        "revoke_session_grants",
+        "send",
+        "send_images",
+        "set_compaction",
+        "set_settings",
+        "set_turn_context",
+        "slash_run",
+        "steer",
+        "switch_branch",
+    }
+
+
+)
 _ERGONOMICS_METHODS = frozenset(
     MethodDescriptor[name]
     for name in (
@@ -267,6 +294,12 @@ async def _handle_rename_session(
         params.get("name"),
         client.server.control.require_idle,  # type: ignore[attr-defined]
     )
+
+
+async def _handle_repair_transcript(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._repair_transcript(params)  # type: ignore[attr-defined]
 
 
 async def _handle_delete_session(
@@ -515,6 +548,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.STATUS: _handle_status,
     MethodDescriptor.RENAME_SESSION: _handle_rename_session,
     MethodDescriptor.DELETE_SESSION: _handle_delete_session,
+    MethodDescriptor.REPAIR_TRANSCRIPT: _handle_repair_transcript,
     MethodDescriptor.SESSION_TREE: _handle_session_tree,
     MethodDescriptor.SESSION_HISTORY: _handle_session_history,
     MethodDescriptor.CONTENT_READ: _handle_content_read,
@@ -766,7 +800,7 @@ class ZetaServer:
     async def close(self) -> None:
         try:
             if self._client is not None:
-                await self._client.close()
+                await self._client.close(graceful=True)
         finally:
             self._client = None
             self._client_active = False
@@ -837,6 +871,9 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._local_close = False
+        self._controller_release: asyncio.Task[None] | None = None
+        self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
@@ -844,10 +881,13 @@ class _Client:
         )
 
     async def run(self) -> None:
+        graceful = True
         try:
             while True:
                 line = await self._read_frame()
                 if not line:
+                    self._release_dead_connection()
+                    graceful = False
                     break
                 await self.connections.wait_until_settled(self)
                 try:
@@ -877,6 +917,8 @@ class _Client:
                             exc.data,
                         )
                     )
+                    if not self.handshaken:
+                        self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     descriptor, message, data = project_request_error(exc)
                     await self._write(
@@ -889,6 +931,18 @@ class _Client:
                             ErrorDescriptor.PROJECT_REGISTRY_BUSY,
                             str(exc),
                             {"retryable": exc.retryable},
+                        )
+                    )
+                except TranscriptRepairRequiresUpgrade as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+                            str(exc),
+                            {
+                                "home_epoch": exc.home_epoch,
+                                "required_epoch": exc.required_epoch,
+                            },
                         )
                     )
                 except TranscriptLoadError as exc:
@@ -930,7 +984,7 @@ class _Client:
                 if not self.handshaken:
                     break
         finally:
-            await self.close()
+            await self.close(graceful=graceful and not self._transport_failed)
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -970,19 +1024,37 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
-    async def close(self) -> None:
+    def _begin_controller_release(self) -> asyncio.Task[None] | None:
+        if self._controller_release is not None:
+            return self._controller_release
+        if self.role == "controller" and self.connections.is_controller(self):
+            self._controller_release = self.server.control.begin_controller_release(
+                reconnect="approval_reconnect" in self.features
+            )
+        return self._controller_release
+
+    def _release_dead_connection(self) -> None:
+        if self._local_close:
+            return
+        self._begin_controller_release()
+        self.connections.release(self)
+
+    async def close(self, *, graceful: bool = False) -> None:
         async with self._close_lock:
             if self._closed:
                 return
-            if self.role == "controller" and self.connections.is_controller(self):
-                await self.server.control.controller_released(
-                    reconnect="approval_reconnect" in self.features
-                )
+            release = self._begin_controller_release()
+            if release is not None:
+                await asyncio.shield(release)
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
+            if graceful:
+                await self.connections.flush(self)
+            self._local_close = True
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
+            self.connections.release(self)
             self._closed = True
 
     async def _route_request(
@@ -991,13 +1063,20 @@ class _Client:
         if method == "hello":
             result = self._hello(params)
             if self.role == "controller":
-                self.server._client_active = True
-                self.server._client = self
                 reconnect = "approval_reconnect" in self.features
-                await self.server.control.controller_claimed(
+                claimed = await self.server.control.controller_claimed(
                     reconnect=reconnect,
                     require_host_binding="session_host_commands" in self.features,
                 )
+                if not claimed:
+                    self.handshaken = False
+                    raise ProtocolError(
+                        ErrorDescriptor.CONNECTION_CAPACITY,
+                        "another client is already connected",
+                    )
+                self.server._client_active = True
+                self.server._client = self
+                self.connections.activate_controller(self)
                 if not reconnect:
                     await self.server.control.controller_ready()
             return True, result
@@ -1238,6 +1317,123 @@ class _Client:
                 f"{param} requires the negotiated {feature} feature",
             )
 
+    async def _repair_transcript(self, params: dict[str, Any]) -> dict[str, object]:
+        runtime = self.server.runtime
+        await self.server.control.require_idle()
+        if params.get("confirm") is not True:
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "repair_transcript requires confirm=true",
+            )
+        session_id = _required_string(params, "session_id")
+        child_run_id = params.get("child_run_id")
+        if child_run_id is not None and not isinstance(child_run_id, str):
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "child_run_id must be a string",
+            )
+        try:
+            result = await repair_transcript_for_runtime(
+                runtime.manager,
+                session_id,
+                child_run_id,
+                parent_store=(
+                    runtime.opened.store if runtime.opened is not None else None
+                ),
+                memory_reconciler=(
+                    runtime.loop.memory_reconciler
+                    if runtime.loop is not None
+                    else None
+                ),
+            )
+        except TranscriptRepairRequiresUpgrade:
+            raise
+        except (ValueError, SessionError) as exc:
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
+        return {
+            "session_id": session_id,
+            "child_run_id": child_run_id,
+            "quarantine_id": result.quarantine_id,
+            "retained_last_sequence": result.retained_last_sequence,
+            "memory_review_required": result.memory_review_required,
+            "overlapping_memory_versions": list(result.overlapping_memory_versions),
+        }
+
+    async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
+        runtime = self.server.runtime
+        if method == "repair_transcript":
+            return await self._repair_transcript(params)
+        if method in {"rename_session", "delete_session"}:
+            return await ergonomics.mutate_session(
+                runtime,
+                method,
+                _required_string(params, "session_id"),
+                params.get("name"),
+                self.server.control.require_idle,
+            )
+        if method in {"session_tree", "session_history"}:
+            assert self.server.connections is not None
+            return await self.server.connections.read_session(self, method, params)
+        if method == "content_read":
+            if "content_read" not in self.features:
+                raise ProtocolError(
+                    ErrorDescriptor.METHOD_NOT_FOUND,
+                    "content_read requires the negotiated content_read feature",
+                )
+            assert self.server.connections is not None
+            return await self.server.connections.read_session(self, method, params)
+        if method == "model_catalog":
+            return ergonomics.catalog(runtime)
+        store = ergonomics.active(runtime, params)
+        if method == "send_images":
+            return await self.server.control.deliveries.send_images(
+                params, self.features
+            )
+        if method == "session_settings":
+            return ergonomics.settings(runtime, include_plan_mode=True)
+        if method in slash_commands.READ_REQUESTS:
+            return await slash_commands.read_request(
+                method, runtime, self.server.control.require_idle, params, self
+            )
+        if method == "slash_run":
+            text = _required_string(params, "text")
+            if (
+                self.server.control.turn_busy()
+                and not await slash_commands.can_run_while_busy(runtime, text)
+            ):
+                await self.server.control.require_idle()
+            register = self.server.control.model_input_registrar(self.features)
+            return await slash_commands.run_command(
+                runtime,
+                text,
+                register_model_input=register,
+                approval_control=self.server.control,
+                run_blocking=self.server.control._run_blocking,
+                busy=self.server.control.turn_busy(),
+            )
+        await self.server.control.require_idle()
+        ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
+        if method == "set_settings":
+            model = _required_string(params, "model")
+            mode = _required_string(params, "approval_mode")
+            model_selection.validate(model, mode)
+            await model_selection.apply_rpc(runtime, model, mode)
+            return ergonomics.settings(runtime)
+        if method == "set_compaction":
+            _required_string(params, "mode")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "compaction mode selection was removed; eviction is always used",
+            )
+        if method == "fork_message":
+            store.append_message_fork(_required_string(params, "message_id"))
+        elif method == "switch_branch":
+            head = _required_string(params, "head_id")
+            current = store.replay()
+            if not current or current[-1].id != head:
+                store.switch_to_branch(head)
+        return ergonomics.tree(runtime)
+
     def _session_snapshot(self) -> dict[str, object] | None:
         runtime = self.server.runtime
         if runtime.opened is None:
@@ -1396,7 +1592,10 @@ class _Client:
         }, page_ids
 
     async def _write(self, payload: _Frame) -> bool:
-        return await self.connections.send(self, payload)
+        written = await self.connections.send(self, payload)
+        if not written:
+            self._transport_failed = True
+        return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
         async with self._write_lock:
