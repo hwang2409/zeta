@@ -989,6 +989,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self, directory_fd: int, metadata: SessionMetadata, *, sync: bool = True
     ) -> None:
         value = metadata.to_storage_dict()
+        # Refuse a shape the reader would reject, so no writer leaves an
+        # unreadable meta.json behind.
+        SessionMetadata.from_dict(
+            value, path=self.sessions_dir / metadata.session_id / "meta.json"
+        )
         delete = () if "tool_allow_layers" in value else ("tool_allow_layers",)
         self._storage_lease.publish_json(
             directory_fd,
