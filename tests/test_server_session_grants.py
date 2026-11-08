@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from rich.console import Console
 
+from tests.support import server_client
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
@@ -239,20 +240,6 @@ async def _wait_idle(
         request_id += 1
         if result["state"] == "idle":
             return request_id
-
-
-async def _assert_completes_in_ready_turns(
-    task: asyncio.Task[Any], *, turns: int = 20
-) -> Any:
-    loop = asyncio.get_running_loop()
-    for _ in range(turns):
-        if task.done():
-            break
-        turn = loop.create_future()
-        loop.call_soon(turn.set_result, None)
-        await turn
-    assert task.done(), "controller response waited for observer output"
-    return await task
 
 
 async def _hello_and_create(
@@ -723,6 +710,8 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
     reader, writer = await _connect(server)
     observer_writer: asyncio.StreamWriter | None = None
     replacement_writer: asyncio.StreamWriter | None = None
+    release_observer = asyncio.Event()
+    release_controller_read = asyncio.Event()
     try:
         await _hello_and_create(reader, writer)
         observer_reader, observer_writer = await _observer(
@@ -732,26 +721,55 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         await _event(reader, "approval_request")
         assert server.connections is not None
         observer_connection = server.connections._observers[0].connection
-        original_write = observer_connection._write_physical
+        controller_connection = server.connections._controller.connection
+        original_observer_write = observer_connection._write_physical
+        original_controller_write = controller_connection._write_physical
+        original_client_read = server_client.read
         observer_blocked = asyncio.Event()
-        release_observer = asyncio.Event()
+        approve_response_written = asyncio.Event()
+        revoke_response_written = asyncio.Event()
 
         async def block_observer(payload: bytes) -> bool:
             if b"session_grants_changed" in payload:
                 observer_blocked.set()
                 await asyncio.wait_for(release_observer.wait(), 10)
-            return await original_write(payload)
+            return await original_observer_write(payload)
 
-        # test-contract: seam gate the real observer transport write
+        async def observe_controller_write(payload: bytes) -> bool:
+            written = await original_controller_write(payload)
+            if b'"id":4' in payload:
+                approve_response_written.set()
+            if b'"id":5' in payload:
+                revoke_response_written.set()
+            return written
+
+        async def block_controller_read(
+            stream: asyncio.StreamReader,
+        ) -> dict[str, Any]:
+            await asyncio.wait_for(release_controller_read.wait(), 10)
+            return await original_client_read(stream)
+
+        # test-contract: seam gate the real observer and controller transports
         monkeypatch.setattr(observer_connection, "_write_physical", block_observer)
+        # test-contract: seam observe the real controller transport write
+        monkeypatch.setattr(
+            controller_connection, "_write_physical", observe_controller_write
+        )
+        monkeypatch.setattr(server_client, "read", block_controller_read)
         approve = asyncio.create_task(
             approve_and_collect_grant(
                 reader, writer, 4, "call-1", "always_tool", ["bash"]
             )
         )
         await asyncio.wait_for(observer_blocked.wait(), 10)
-        controller_event = await asyncio.wait_for(
-            _assert_completes_in_ready_turns(approve), 10
+        await asyncio.wait_for(approve_response_written.wait(), 10)
+        # test-contract: seam real controller wire write precedes observer release
+        assert not release_observer.is_set(), (
+            "controller response required observer write completion"
+        )
+        release_controller_read.set()
+        controller_event = await await_or_fail(
+            approve, what="controller grant response after wire write"
         )
         release_observer.set()
         observer_event = await _event(observer_reader, "session_grants_changed")
@@ -770,8 +788,13 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
             )
         )
         await asyncio.wait_for(observer_blocked.wait(), 10)
-        revoke_frames = await asyncio.wait_for(
-            _assert_completes_in_ready_turns(revoke), 10
+        await asyncio.wait_for(revoke_response_written.wait(), 10)
+        # test-contract: seam real controller wire write precedes observer release
+        assert not release_observer.is_set(), (
+            "revoke response required observer write completion"
+        )
+        revoke_frames = await await_or_fail(
+            revoke, what="controller revoke response after wire write"
         )
         assert revoke_frames[-1]["result"]["removed"] == ["bash"]
         release_observer.set()
@@ -808,6 +831,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         assert snapshot["session_grants"] == []
     finally:
         release_observer.set()
+        release_controller_read.set()
         await close_serve(
             server,
             writer,
