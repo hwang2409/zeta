@@ -1349,6 +1349,7 @@ def test_parent_selection_table(
 
 def _stacked_merge(tmp_path: Path) -> tuple[Path, str, str]:
     """A merge commit that drops main's newer(); its explanation lives in the base PR."""
+    tmp_path.mkdir()
     r = repo(tmp_path)
     (r / "src").mkdir()
     (r / "src/a.py").write_text("def kept(): pass\n")
