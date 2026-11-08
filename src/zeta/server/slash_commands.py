@@ -18,6 +18,7 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
@@ -26,8 +27,6 @@ from ..core.slash import (
     SlashStatus,
     _format_status,
     create_slash_registry,
-    run_implement_command,
-    run_plan_command,
 )
 from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
 from ..mcp.prompt_commands import SlashPromptError
@@ -323,9 +322,7 @@ class ServerSlashSession:
             parts[0],
             child_run_id,
             parent_store=(
-                self._runtime.opened.store
-                if self._runtime.opened is not None
-                else None
+                self._runtime.opened.store if self._runtime.opened is not None else None
             ),
             memory_reconciler=(
                 self._runtime.loop.memory_reconciler
