@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -247,20 +246,23 @@ async def test_close_serve_cleanup_outcomes(
         for index in range(writer_count)
     ]
 
-    expected_error = (
-        "writer close failed" if writer_failure else "server close failed" if server_failure else ""
-    )
-    context = (
-        pytest.raises(RuntimeError, match=expected_error)
-        if expected_error
-        else nullcontext()
-    )
-    with context:
+    outcome: BaseException | None = None
+    try:
         await close_serve(server, *writers)
+    except RuntimeError as error:
+        outcome = error
 
     assert server.closed
     assert all(writer.closed for writer in writers)
     assert all(writer.wait_started_with_server_shutdown for writer in writers)
+    if writer_failure:
+        assert isinstance(outcome, RuntimeError)
+        assert str(outcome) == "writer close failed"
+    elif server_failure:
+        assert isinstance(outcome, RuntimeError)
+        assert str(outcome) == "server close failed"
+    else:
+        assert outcome is None
 
 
 @pytest.mark.asyncio
