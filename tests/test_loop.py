@@ -61,6 +61,65 @@ from zeta.tools import ToolRegistry, ToolStreamPublisher
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["refusal", "content_filter", "end_turn"])
+async def test_empty_completion_ends_with_classification(
+    tmp_path: Path, stop_reason: str
+) -> None:
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(stop_reason=stop_reason)]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("hello", origin=MessageOrigin.USER)
+    )
+
+    turn_end = next(event for event in events if event.type is StreamEventType.TURN_END)
+    assert turn_end.data["completion"] == (
+        stop_reason if stop_reason in {"refusal", "content_filter"} else "empty"
+    )
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    if stop_reason == "end_turn":
+        assert nudges
+    else:
+        assert not nudges
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turns",
+    [
+        [ScriptedTurn([TextContent("visible refusal")], stop_reason="refusal")],
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("call-1", "echo", {"text": "visible"})],
+                stop_reason="refusal",
+            ),
+            ScriptedTurn([TextContent("visible result")]),
+        ],
+    ],
+)
+async def test_refusal_with_visible_output_is_not_classified_as_empty(
+    tmp_path: Path, turns: list[ScriptedTurn]
+) -> None:
+    events = await collect(
+        AgentLoop(
+            FakeBackend(turns),
+            ConversationStore(tmp_path),
+            tools={"echo": lambda arguments: str(arguments["text"])},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("hello", origin=MessageOrigin.USER)
+    )
+
+    turn_end = next(event for event in events if event.type is StreamEventType.TURN_END)
+    assert "completion" not in turn_end.data
+
+
 def test_empty_turn_tool_error_reports_success_state() -> None:
     error = empty_turn_tool_error(
         ToolCall("ping-call", "ping", {}), ToolResult("ping-call", "pong")

@@ -682,6 +682,15 @@ def render_event(
     if event.type is StreamEventType.RETRY:
         text = event.data.get("text")
         return Text(text if type(text) is str else "retrying", style=theme.DIM)
+    if event.type is StreamEventType.TURN_END:
+        completion = event.data.get("completion")
+        if completion == "refusal":
+            return Text("model refused to answer", style=theme.WARNING)
+        if completion == "content_filter":
+            return Text("model response blocked by content filter", style=theme.WARNING)
+        # "empty" is not shown: user turns get the "no response" fallback and
+        # a silent notification turn is a valid "nothing to report".
+        return None
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         return render_agent_notification(event, identity_index)
     if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:

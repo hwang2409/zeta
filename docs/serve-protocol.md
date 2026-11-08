@@ -845,7 +845,9 @@ lowercase UUID hex string that identifies the whole served turn. Connections
 without that feature receive the previous `turn_start` shape. `data.turn`
 continues to number provider segments inside the served turn, so several
 `turn_start` events can have the same `turn_id`. `turn_end` data includes `turn`
-and `tool_calls`.
+and `tool_calls`. For a no-tool completion with no visible reply, it may also include
+`completion`: `"refusal"`, `"content_filter"`, or `"empty"`. These values describe the
+provider segment and are not durable `served_turn_end` outcomes.
 
 `assistant_delta` carries `delta` (a bounded string) and `kind` (`assistant`,
 `thinking`, or another content type). `assistant_message` carries `message`,

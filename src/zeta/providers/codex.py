@@ -1037,7 +1037,16 @@ def _decode_terminal_response(
                 f"Codex completed {invalid_item.kind} status "
                 f"{_format_provider_status(invalid_item.completion_status)} is invalid"
             )
-        stop_reason = "end_turn"
+        stop_reason = (
+            "refusal"
+            if any(
+                block.kind == "refusal"
+                for item in items.values()
+                for key in item.blocks
+                if (block := blocks.get(key)) is not None
+            )
+            else "end_turn"
+        )
 
     if isinstance(response, Mapping):
         response_data.update(
