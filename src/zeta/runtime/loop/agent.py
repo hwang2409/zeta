@@ -840,33 +840,37 @@ class AgentLoop(
                 ):
                     yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
                     await account_context.ensure_account_state(self)
-                if retrying_context or (
-                    self.context_assembler.needs_compaction()
-                    if not host_instruction
-                    else self.context_assembler.needs_compaction(
-                        system_append=host_instruction
-                    )
-                ):
-                    yield StreamEvent(
-                        StreamEventType.COMPACTION_START,
-                        data={"turn": turn_number},
-                    )
                 try:
-                    context_messages = await self.context_assembler.assemble(
+                    should_compact = await self.context_assembler.prepare_context(
                         backend=self.backend,
                         force=retrying_context,
-                        emergency=retrying_context,
                         system_append=host_instruction,
                     )
-                except BudgetExceeded:
-                    if not notification_turn:
-                        raise
-                    context_messages = await self.context_assembler.assemble(
-                        backend=self.backend,
-                        force=True,
-                        emergency=True,
-                        system_append=host_instruction,
-                    )
+                    if should_compact:
+                        yield StreamEvent(
+                            StreamEventType.COMPACTION_START,
+                            data={"turn": turn_number},
+                        )
+                    try:
+                        context_messages = await self.context_assembler.assemble(
+                            backend=self.backend,
+                            force=retrying_context,
+                            emergency=retrying_context,
+                            system_append=host_instruction,
+                        )
+                    except BudgetExceeded:
+                        if not notification_turn:
+                            raise
+                        context_messages = await self.context_assembler.assemble(
+                            backend=self.backend,
+                            force=True,
+                            emergency=True,
+                            system_append=host_instruction,
+                        )
+                finally:
+                    # A cancellation after preparation but before consumption
+                    # must not retain its message graph on the assembler.
+                    self.context_assembler.discard_prepared_context()
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
                 context_messages = self._account_safe_context(context_messages)

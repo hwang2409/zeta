@@ -135,6 +135,63 @@ def test_needs_compaction_uses_resident_branch_without_replay(
 
 
 @pytest.mark.asyncio
+async def test_prepared_context_is_consumed_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "hello"))
+    assembler = ContextAssembler(store, token_budget=10_000)
+    calls = 0
+    real_prepare = assembler._prepare_assembly
+
+    def observed_prepare(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(assembler, "_prepare_assembly", observed_prepare)
+    assert await assembler.prepare_context() is False
+    first = await assembler.assemble_context()
+    second = await assembler.assemble_context()
+
+    assert first.messages == second.messages
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_prepared_context_retries_after_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "before"))
+    assembler = ContextAssembler(store, token_budget=10_000)
+    calls = 0
+    real_prepare = assembler._prepare_assembly
+
+    def observed_prepare(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(assembler, "_prepare_assembly", observed_prepare)
+    await assembler.prepare_context()
+    store.append_message(text(MessageRole.USER, "after"))
+    assembled = await assembler.assemble_context()
+
+    assert calls == 2
+    assert assembled.messages[-1].content[0].text == "after"
+
+
+@pytest.mark.asyncio
+async def test_discard_prepared_context_releases_unconsumed_graph(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "large"))
+    assembler = ContextAssembler(store, token_budget=10_000)
+
+    await assembler.prepare_context()
+    assert assembler._prepared_assembly is not None
+    assembler.discard_prepared_context()
+
+    assert assembler._prepared_assembly is None
+
+
+@pytest.mark.asyncio
 async def test_context_assembly_does_not_hash_messages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

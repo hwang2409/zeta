@@ -158,6 +158,7 @@ class ContextAssembler(ContextMarkerMixin):
         self._session_usage = SessionUsage(
             sink=self.usage_sink, on_growth=self.on_token_growth
         )
+        self._prepared_assembly: tuple[tuple[Any, ...], tuple[ConversationEntry, ...], _AssemblyPreparation] | None = None
 
     def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
@@ -200,6 +201,7 @@ class ContextAssembler(ContextMarkerMixin):
             raise ValueError("token budget must be positive")
         self.token_budget = token_budget
         self._request_budget.update_provider_limit(token_budget)
+        self._invalidate_preparation()
 
     def update_backend(self, backend: CompletionBackend) -> None:
         """Replace the session backend without bypassing request admission."""
@@ -207,6 +209,7 @@ class ContextAssembler(ContextMarkerMixin):
         self.backend = backend
         self._request_admission.update_backend(backend)
         self.compaction_policy.backend = self._request_admission
+        self._invalidate_preparation()
 
     def estimate_messages(self, messages: Sequence[Message]) -> int:
         """Count messages with the production context estimator."""
@@ -362,6 +365,73 @@ class ContextAssembler(ContextMarkerMixin):
         )
         return list(context.messages)
 
+    def _invalidate_preparation(self) -> None:
+        self._prepared_assembly = None
+
+    def discard_prepared_context(self) -> None:
+        """Drop an unconsumed preparation, including its message graph."""
+        self._invalidate_preparation()
+
+    def _assembly_budget(self, reserved_estimator_tokens: int) -> int:
+        if reserved_estimator_tokens < 0:
+            raise ValueError("reserved estimator tokens must be non-negative")
+        return (
+            self.token_budget
+            if reserved_estimator_tokens == 0
+            else max(1, self.estimator_token_budget - reserved_estimator_tokens)
+        )
+
+    def _preparation_key(
+        self,
+        branch_id: str | None,
+        *,
+        force: bool,
+        assembly_budget: int,
+        system_append: str,
+    ) -> tuple[Any, ...]:
+        return (
+            branch_id,
+            force,
+            assembly_budget,
+            system_append,
+        )
+
+    async def prepare_context(
+        self,
+        *,
+        backend: CompletionBackend | None = None,
+        force: bool = False,
+        reserved_estimator_tokens: int = 0,
+        system_append: str = "",
+    ) -> bool:
+        """Prepare one context off-loop and return its compaction decision."""
+        assembly_budget = self._assembly_budget(reserved_estimator_tokens)
+        try:
+            while True:
+                branch = self.store.active_branch_snapshot()
+                branch_id = self._branch_id(branch)
+                key = self._preparation_key(
+                    branch_id,
+                    force=force,
+                    assembly_budget=assembly_budget,
+                    system_append=system_append,
+                )
+                preparation = await asyncio.to_thread(
+                    _cooperative_call,
+                    self._prepare_assembly,
+                    branch,
+                    force=force,
+                    assembly_budget=assembly_budget,
+                    system_append=system_append,
+                )
+                await asyncio.sleep(0)
+                if self.store.active_branch_head_id() == branch_id:
+                    self._prepared_assembly = (key, tuple(branch), preparation)
+                    return preparation.should_compact
+        except asyncio.CancelledError:
+            self._invalidate_preparation()
+            raise
+
     async def assemble_context(
         self,
         *,
@@ -379,14 +449,30 @@ class ContextAssembler(ContextMarkerMixin):
         deterministic eviction pass without switching to model summarization.
         """
 
-        if reserved_estimator_tokens < 0:
-            raise ValueError("reserved estimator tokens must be non-negative")
-        assembly_budget = (
-            self.token_budget
-            if reserved_estimator_tokens == 0
-            else max(1, self.estimator_token_budget - reserved_estimator_tokens)
+        assembly_budget = self._assembly_budget(reserved_estimator_tokens)
+        key = self._preparation_key(
+            self.store.active_branch_head_id(),
+            force=force,
+            assembly_budget=assembly_budget,
+            system_append=system_append,
         )
-        while True:
+        prepared = self._prepared_assembly
+        if prepared is not None and prepared[0] == key:
+            _, branch, preparation = prepared
+            branch_id = self._branch_id(branch)
+            if self.store.active_branch_head_id() != branch_id:
+                self._prepared_assembly = None
+                return await self.assemble_context(
+                    backend=backend,
+                    force=force,
+                    bypass_eviction_hysteresis=bypass_eviction_hysteresis,
+                    emergency=emergency,
+                    reserved_estimator_tokens=reserved_estimator_tokens,
+                    system_append=system_append,
+                )
+            self._prepared_assembly = None
+        else:
+            self._prepared_assembly = None
             branch = self.store.active_branch_snapshot()
             branch_id = self._branch_id(branch)
             preparation = await asyncio.to_thread(
@@ -397,11 +483,16 @@ class ContextAssembler(ContextMarkerMixin):
                 assembly_budget=assembly_budget,
                 system_append=system_append,
             )
-            # Cancellation is observed before accepting preparation derived
-            # from a branch that may have changed while the worker ran.
             await asyncio.sleep(0)
-            if self.store.active_branch_head_id() == branch_id:
-                break
+            if self.store.active_branch_head_id() != branch_id:
+                return await self.assemble_context(
+                    backend=backend,
+                    force=force,
+                    bypass_eviction_hysteresis=bypass_eviction_hysteresis,
+                    emergency=emergency,
+                    reserved_estimator_tokens=reserved_estimator_tokens,
+                    system_append=system_append,
+                )
         items = preparation.items
         result_seqs = preparation.result_seqs
         boundary = preparation.boundary
