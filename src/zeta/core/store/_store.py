@@ -72,7 +72,7 @@ from ._approval_display import (
     ApprovalAuditRequest,
     normalize_approval_requests,
 )
-from ._approval_history import ApprovalHistoryStoreMixin
+from ._approval_history import ApprovalHistoryStoreMixin, RecentRowsMixin
 from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
@@ -101,7 +101,6 @@ from ._validation import (
     NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
 )
-from .recent_rows import RecentRowsMixin
 
 
 class ConversationStore(
