@@ -181,6 +181,40 @@ def test_finish_gate_message_bounds_deep_generated_handles() -> None:
     assert len(text.encode()) < 5_000
 
 
+@pytest.mark.parametrize(
+    ("children", "tasks", "expected"),
+    [
+        pytest.param((("root:1", "worker"),), (), "root:1: worker", id="child-only"),
+        pytest.param((), (("task-1", "headline"),), "task-1: headline", id="task-only"),
+        pytest.param(
+            (("root:1", "worker"),), (("task-1", "headline"),),
+            "root:1: worker; 1 background tasks",
+            id="combined",
+        ),
+        pytest.param(
+            (("root:" + "child:" * 1_000, "worker"),),
+            (), "1 more sub-agents omitted; use agent_status",
+            id="entry-too-large",
+        ),
+        pytest.param(
+            (("root:1", "漢字🙂" * 20),), (("task-1", "headline"),),
+            "task-1: headline",
+            id="multibyte-details",
+        ),
+    ],
+)
+def test_finish_gate_message_detail_budget_table(
+    children: tuple[tuple[str, str], ...],
+    tasks: tuple[tuple[str, str], ...],
+    expected: str,
+) -> None:
+    text = finish_gate_message(children, tasks).content[0].text
+
+    assert len(text.encode()) < 5_000
+    assert expected in text
+    assert text == finish_gate_message(children, tasks).content[0].text
+
+
 def _harness_notice_conversation() -> list[Message]:
     call = ToolCall("call-1", "read", {"path": "README.md"})
     return [

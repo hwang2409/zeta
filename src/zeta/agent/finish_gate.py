@@ -21,6 +21,7 @@ FinishGateOutcome = Literal["completed", "handed_off", "task_safety_expired"]
 POST_CAP_CAUSAL_TURNS = 3
 _FINISH_GATE_DETAIL_CAP = 20
 _FINISH_GATE_DETAIL_BYTES = 64
+_FINISH_GATE_MESSAGE_BYTES = 5_000
 ConsumeEvents = Callable[
     [AsyncIterator[StreamEvent], "FinishGateControl | None"], Awaitable[None]
 ]
@@ -29,39 +30,65 @@ ConsumeEvents = Callable[
 def finish_gate_message(
     children: tuple[tuple[str, str], ...], tasks: tuple[tuple[str, str], ...]
 ) -> Message:
-    running: list[str] = []
-    if children:
-        child_list = ", ".join(
-            f"{handle}: {_truncate_finish_gate_detail(description)}"
-            for handle, description in children[:_FINISH_GATE_DETAIL_CAP]
-        )
-        omitted = len(children) - _FINISH_GATE_DETAIL_CAP
-        child_details = (
-            f"{child_list}; {omitted} more sub-agents omitted; use agent_status"
-            if omitted > 0
-            else child_list
-        )
-        running.append(
-            f"{len(children)} background sub-agents still running: {child_details}"
-        )
-    if tasks:
-        task_list = ", ".join(
-            f"{task_id}: {_truncate_finish_gate_detail(headline)}"
-            for task_id, headline in tasks[:_FINISH_GATE_DETAIL_CAP]
-        )
-        omitted = len(tasks) - _FINISH_GATE_DETAIL_CAP
-        task_details = (
-            f"{task_list}; {omitted} more tasks omitted; use task_list"
-            if omitted > 0
-            else task_list
-        )
-        running.append(f"{len(tasks)} background tasks still running: {task_details}")
     stop_choices = []
     if children:
         stop_choices.append("cancel sub-agents with agent_cancel")
     if tasks:
         stop_choices.append("stop tasks with task_kill")
-    text = (
+    running = _format_finish_gate_details(children, tasks, stop_choices)
+    text = _finish_gate_text(running, stop_choices)
+    return harness_notice("finish gate", text, event="agent_finish_gate")
+
+
+def _format_finish_gate_details(
+    children: tuple[tuple[str, str], ...],
+    tasks: tuple[tuple[str, str], ...],
+    stop_choices: list[str],
+) -> list[str]:
+    groups = [
+        (children, "background sub-agents", "more sub-agents", "agent_status"),
+        (tasks, "background tasks", "more tasks", "task_list"),
+    ]
+    selected = [0, 0]
+    limit = min(_FINISH_GATE_DETAIL_CAP, len(children)) + min(
+        _FINISH_GATE_DETAIL_CAP, len(tasks)
+    )
+    for _ in range(limit):
+        group_index = next(
+            (index for index, (items, *_rest) in enumerate(groups) if selected[index] < min(_FINISH_GATE_DETAIL_CAP, len(items))),
+            None,
+        )
+        if group_index is None:
+            break
+        selected[group_index] += 1
+        candidate = _render_finish_gate_details(groups, selected)
+        if len(_finish_gate_text(candidate, stop_choices).encode()) >= _FINISH_GATE_MESSAGE_BYTES:
+            selected[group_index] -= 1
+            break
+    return _render_finish_gate_details(groups, selected)
+
+
+def _render_finish_gate_details(groups: list[tuple[tuple[tuple[str, str], ...], str, str, str]], selected: list[int]) -> list[str]:
+    running = []
+    for (items, label, omitted_label, guidance), count in zip(groups, selected):
+        if not items:
+            continue
+        entries = ", ".join(
+            f"{identifier}: {_truncate_finish_gate_detail(detail)}"
+            for identifier, detail in items[:count]
+        )
+        omitted = len(items) - count
+        details = (
+            f"{entries}; {omitted} {omitted_label} omitted; use {guidance}"
+            if omitted
+            else entries
+        )
+        running.append(f"{len(items)} {label} still running: {details}")
+    return running
+
+
+def _finish_gate_text(running: list[str], stop_choices: list[str]) -> str:
+    return (
         f"You have {'; '.join(running)}. You cannot finish yet. Choose one: "
         "(a) wait: reply WAIT and end this turn; completions and task exits "
         "will wake you, with no polling; (b) "
@@ -72,7 +99,6 @@ def finish_gate_message(
         "agent completes; task output remains in this child session's task archive. "
         "A finish-gate safety bound applies if a task never exits."
     )
-    return harness_notice("finish gate", text, event="agent_finish_gate")
 
 
 def _truncate_finish_gate_detail(value: str) -> str:
