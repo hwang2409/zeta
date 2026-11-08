@@ -933,7 +933,7 @@ async def test_refresh_three_cas_losses_retains_pending_then_recovers(
         if not refresh.done():
             refresh.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await refresh
+                await asyncio.wait_for(refresh, 10)
     assert attempts == 3
     failure = transcript_index_refresh_failure(
         projects_root, PROJECT_A, source.session_id
@@ -1064,9 +1064,11 @@ def test_metadata_cleanup_precommit_failure_preserves_complete_state(
         def close(self) -> None:
             self.connection.close()
 
+    # test-contract: seam inject each sqlite cleanup failure point
     monkeypatch.setattr(index, "_connect", lambda: FailingConnection(original_connect()))
     with pytest.raises(index_module.TranscriptIndexError, match="injected"):
         index.append(bound)
+    # test-contract: seam restore the real sqlite connection factory
     monkeypatch.setattr(index, "_connect", original_connect)
 
     restarted = TranscriptIndex(tmp_path / "project", PROJECT_A)
@@ -1103,6 +1105,7 @@ def test_post_commit_nonready_status_is_durable_and_not_pending(
             ready, ready=False, detail="index is unreadable and requires rebuild: injected"
         )
 
+    # test-contract: seam inject the post-durable-commit status result
     monkeypatch.setattr(index, "_status", status_after_commit)
     status = index.append(bound)
 
@@ -1148,6 +1151,7 @@ async def test_refresh_clears_pending_after_durable_nonready_status(
             detail="index is unreadable and requires rebuild: injected",
         )
 
+    # test-contract: seam inject the coordinator's post-commit status result
     monkeypatch.setattr(index_module.TranscriptIndex, "_status", status_after_commit)
     await asyncio.wait_for(
         refresh_transcript_index(
@@ -1158,6 +1162,7 @@ async def test_refresh_clears_pending_after_durable_nonready_status(
     assert transcript_index_refresh_failure(
         projects_root, PROJECT_A, source.session_id
     ) is None
+    # test-contract: seam restore status before checking the durable database
     monkeypatch.setattr(index_module.TranscriptIndex, "_status", original_status)
     restarted = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
     assert restarted.status().cursors == {}
@@ -1200,6 +1205,7 @@ def test_missing_safe_open_flag_fails_closed_without_open(
     try:
         append.start()
         assert projection_entered.wait(10)
+        # test-contract: seam simulate one unavailable required platform flag
         monkeypatch.setattr(
             index_module,
             "_REQUIRED_SAFE_OPEN_NAMES",
@@ -1376,8 +1382,10 @@ def test_source_mutation_after_sql_before_commit_rolls_back_and_retries(
         def close(self) -> None:
             self.connection.close()
 
+    # test-contract: seam mutate the source after sql but before commit
     monkeypatch.setattr(index, "_connect", lambda: MutatingConnection(original_connect()))
     index.append(source)
+    # test-contract: seam restore the real sqlite connection factory
     monkeypatch.setattr(index, "_connect", original_connect)
 
     assert mutated
