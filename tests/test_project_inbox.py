@@ -7,6 +7,7 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -193,14 +194,14 @@ def test_read_missing_inbox_is_empty_without_creating_storage(tmp_path: Path) ->
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox_path = registry.root / project_b.project_id / "inbox"
 
-    assert not inbox_path.exists()
+    assert {path.name for path in inbox_path.iterdir()} == {".lock"}
     assert inbox.read(project_b.project_id) == {
         "new": [],
         "claimed": [],
         "done": [],
         "invalid": [],
     }
-    assert not inbox_path.exists()
+    assert {path.name for path in inbox_path.iterdir()} == {".lock"}
 
 
 def test_read_rejects_missing_required_inbox_directory(tmp_path: Path) -> None:
@@ -401,9 +402,9 @@ def _notice_loop(home, registry, project_id, session_id, wakes):
 
 @pytest.mark.asyncio
 async def test_one_message_wakes_exactly_one_of_two_peer_sessions(tmp_path: Path) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    inbox.send(
+    await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -428,7 +429,7 @@ async def test_one_message_wakes_exactly_one_of_two_peer_sessions(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_arrivals_coalesce_into_one_pending_notice(tmp_path: Path) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     wakes = []
     loop = _notice_loop(home, registry, project_b.project_id, "b" * 32, wakes)
@@ -436,7 +437,7 @@ async def test_arrivals_coalesce_into_one_pending_notice(tmp_path: Path) -> None
     try:
         for index in range(3):
             ids.append(
-                inbox.send(
+                await asyncio.to_thread(inbox.send,
                     from_project=project_a.project_id,
                     from_session="a" * 32,
                     to_project=project_b.project_id,
@@ -472,7 +473,7 @@ def test_unchanged_scanner_uses_no_locks_or_json_parses(
     assert scanner.scan() is not None
     locks = 0
     parses = 0
-    real_locked = registry._locked
+    real_locked = registry._project_lock
     real_read = scanner.inbox._read_record
 
     def counted_locked(*args, **kwargs):
@@ -485,7 +486,7 @@ def test_unchanged_scanner_uses_no_locks_or_json_parses(
         parses += 1
         return real_read(*args, **kwargs)
 
-    monkeypatch.setattr(registry, "_locked", counted_locked)
+    monkeypatch.setattr(registry, "_project_lock", counted_locked)
     monkeypatch.setattr(scanner.inbox, "_read_record", counted_read)
     assert [scanner.scan() for _ in range(5)] == [None] * 5
     assert locks == 0
@@ -494,7 +495,7 @@ def test_unchanged_scanner_uses_no_locks_or_json_parses(
 
 @pytest.mark.asyncio
 async def test_active_turn_skips_periodic_inbox_scan(tmp_path: Path) -> None:
-    _home, registry, _project_a, project_b = _projects(tmp_path)
+    _home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     scans = []
     loop = SimpleNamespace(
         tool_registry=SimpleNamespace(
@@ -512,9 +513,9 @@ async def test_active_turn_skips_periodic_inbox_scan(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Path) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -775,9 +776,9 @@ def test_invalid_message_is_logged_once_across_readers(
 
 @pytest.mark.asyncio
 async def test_inbox_watcher_ignores_stable_invalid_message(tmp_path: Path) -> None:
-    home, registry, _project_a, project_b = _projects(tmp_path)
+    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    inbox.list(project_b.project_id)
+    await asyncio.to_thread(inbox.list, project_b.project_id)
     invalid = registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
     invalid.write_text("{not json")
     wakes: list[str] = []
@@ -915,10 +916,10 @@ def _sent_status_notes(backend: FakeBackend) -> list:
 async def test_claim_injects_note_on_senders_next_turn_without_waking(
     tmp_path: Path,
 ) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -926,7 +927,7 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
         title="Can you review this?",
         body="Please review it.",
     )
-    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, "b" * 32) is not None
     loop, backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id
     )
@@ -942,7 +943,7 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
         assert notes[0].content[0].text.startswith("[zeta] inbox status:")
         assert (
             'inbox: your message "Can you review this?" to beta was claimed '
-            f"by session {'b' * 32} at {inbox.read(project_b.project_id)['claimed'][0]['claimed_at']}"
+            f"by session {'b' * 32} at {(await asyncio.to_thread(inbox.read, project_b.project_id))['claimed'][0]['claimed_at']}"
             in notes[0].content[0].text
         )
     finally:
@@ -952,7 +953,7 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
 
 @pytest.mark.asyncio
 async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     loop, backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id, turns=3
@@ -969,7 +970,7 @@ async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path)
         sessions_root=home / "sessions",
         sent_tracker=loop.tool_registry.sent_message_tracker,
     )
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -977,7 +978,7 @@ async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path)
         title="Only once across branches",
         body="body",
     )
-    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, "b" * 32) is not None
     await loop._check_project_inbox()
     await _collect_turn(loop, "deliver status")
     assert len(_sent_status_notes(backend)) == 1
@@ -999,10 +1000,10 @@ async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_claim_note_delivered_once_across_resume(tmp_path: Path) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1010,7 +1011,7 @@ async def test_claim_note_delivered_once_across_resume(tmp_path: Path) -> None:
         title="One time",
         body="body",
     )
-    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, "b" * 32) is not None
     loop, _backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id, turns=2
     )
@@ -1047,10 +1048,10 @@ async def test_claim_note_delivered_once_across_resume(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_done_with_reply_does_not_duplicate_signal(tmp_path: Path) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1059,8 +1060,8 @@ async def test_done_with_reply_does_not_duplicate_signal(tmp_path: Path) -> None
         body="body",
     )
     claimer = "b" * 32
-    assert inbox.claim(project_b.project_id, message_id, claimer) is not None
-    inbox.done(project_b.project_id, message_id, claimer, "answered", reply="done")
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, claimer) is not None
+    await asyncio.to_thread(inbox.done,project_b.project_id, message_id, claimer, "answered", reply="done")
     loop, backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id
     )
@@ -1078,10 +1079,10 @@ async def test_done_with_reply_does_not_duplicate_signal(tmp_path: Path) -> None
 async def test_claim_note_not_in_system_prompt_and_not_user_origin(
     tmp_path: Path,
 ) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1089,7 +1090,7 @@ async def test_claim_note_not_in_system_prompt_and_not_user_origin(
         title="Origin",
         body="body",
     )
-    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, "b" * 32) is not None
     loop, backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id
     )
@@ -1119,10 +1120,10 @@ async def test_claim_note_not_in_system_prompt_and_not_user_origin(
 async def test_claim_tracking_is_read_only_for_receiver(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1130,7 +1131,7 @@ async def test_claim_tracking_is_read_only_for_receiver(
         title="Read only",
         body="body",
     )
-    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, "b" * 32) is not None
     receiver_tree = registry.root / project_b.project_id / "inbox"
 
     def snapshot() -> dict[str, bytes]:
@@ -1142,28 +1143,30 @@ async def test_claim_tracking_is_read_only_for_receiver(
 
     before = snapshot()
     inbox_locks: list[bool] = []
-    real_handles = ProjectInbox._directory_handles
+    real_lock = ProjectInbox._lock
 
-    def counted_handles(self, *args, **kwargs):
-        inbox_locks.append(kwargs.get("lock", True))
-        return real_handles(self, *args, **kwargs)
+    @contextmanager
+    def counted_lock(self, project_id: str, *, exclusive: bool):
+        inbox_locks.append(exclusive)
+        with real_lock(self, project_id, exclusive=exclusive) as project_fd:
+            yield project_fd
 
-    monkeypatch.setattr(ProjectInbox, "_directory_handles", counted_handles)
+    monkeypatch.setattr(ProjectInbox, "_lock", counted_lock)
     scanner = ProjectInboxScanner(
         registry,
         project_a.project_id,
         sessions_root=home / "sessions",
         session_id=session_id,
     )
-    statuses = scanner.scan_sent()
+    statuses = await asyncio.to_thread(scanner.scan_sent)
 
     assert statuses is not None
     assert [(item["id"], item["status"]) for item in statuses] == [
         (message_id, "claimed")
     ]
     assert snapshot() == before
-    assert inbox_locks and not any(inbox_locks)
-    assert not list(receiver_tree.rglob("*.lock"))
+    assert inbox_locks == [False]
+    assert [path.name for path in receiver_tree.rglob("*.lock")] == [".lock"]
 
 
 def test_idle_tracker_does_no_filesystem_io(
@@ -1274,10 +1277,10 @@ def test_newest_record_with_lowest_id_survives_pruning(
 async def test_cancel_after_status_note_persisted_does_not_duplicate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1285,7 +1288,7 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
         title="Cancellation-safe receipt",
         body="body",
     )
-    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, "b" * 32) is not None
     loop, backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id, turns=1
     )
@@ -1334,10 +1337,10 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
 async def test_crash_between_note_append_and_receipt_does_not_duplicate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1345,7 +1348,7 @@ async def test_crash_between_note_append_and_receipt_does_not_duplicate(
         title="Crash-safe receipt",
         body="body",
     )
-    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, "b" * 32) is not None
     loop, _backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id
     )
@@ -1381,10 +1384,10 @@ async def test_crash_between_note_append_and_receipt_does_not_duplicate(
 
 @pytest.mark.asyncio
 async def test_done_without_reply_injects_completed_status(tmp_path: Path) -> None:
-    home, registry, project_a, project_b = _projects(tmp_path)
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(inbox.send,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1393,8 +1396,8 @@ async def test_done_without_reply_injects_completed_status(tmp_path: Path) -> No
         body="body",
     )
     claimer = "b" * 32
-    assert inbox.claim(project_b.project_id, message_id, claimer) is not None
-    completed = inbox.done(
+    assert await asyncio.to_thread(inbox.claim,project_b.project_id, message_id, claimer) is not None
+    completed = await asyncio.to_thread(inbox.done,
         project_b.project_id, message_id, claimer, "fixed without a reply"
     )
     loop, backend, store = _sender_loop(

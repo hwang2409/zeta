@@ -18,6 +18,7 @@ from ..core.transcript_recovery.runtime import (
     TranscriptRepairRequiresUpgrade,
     repair_transcript_for_runtime,
 )
+from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -102,7 +103,8 @@ class _UnixSocketListener:
         )
         try:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with socket_lock():
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise RuntimeError(f"a server is already listening on {path}") from exc
             cls._prepare_path(path)

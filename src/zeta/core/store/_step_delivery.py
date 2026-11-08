@@ -136,6 +136,9 @@ def _commit_delivery_input(
     data["kind"] = durable_kind
     data.setdefault("origin", MessageOrigin.NOTIFICATION.value)
     validate_notification_data(data)
+    result_entries: tuple[ConversationEntry, ...]
+    default_changed: bool
+    added = 0
     with store._append_lock(deadline=item.deadline):
         store.pending_prompt_queue._check_deadline(item.deadline)
         if (
@@ -149,10 +152,10 @@ def _commit_delivery_input(
                 store._append_row_unlocked(
                     "notification_tui_presented", {"notification_id": existing.id}
                 )
-            changed = _run_after_commit(item, default=False)
-            return ProducerResult((store._snapshot_entry(existing),), changed)
-        if kind == "inbox":
-            pending = next(
+            result_entries = (store._snapshot_entry(existing),)
+            default_changed = False
+        elif kind == "inbox" and (
+            pending := next(
                 (
                     entry
                     for entry in store._active_notifications.values()
@@ -161,23 +164,27 @@ def _commit_delivery_input(
                 ),
                 None,
             )
-            if pending is not None:
-                _ack, entry = store._append_many_unlocked(
-                    [
-                        ("notification_ack", {"notification_id": pending.id}),
-                        ("notification", data),
-                    ]
-                )
-                claimed = _run_after_commit(item, default=True)
-                return ProducerResult((store._snapshot_entry(entry),), claimed, 1)
-        entry = store._append_row_unlocked("notification", data)
-        if item.tui_presented:
-            store._append_row_unlocked(
-                "notification_tui_presented", {"notification_id": entry.id}
+        ) is not None:
+            _ack, entry = store._append_many_unlocked(
+                [
+                    ("notification_ack", {"notification_id": pending.id}),
+                    ("notification", data),
+                ]
             )
-        snapshot = store._snapshot_entry(entry)
-        claimed = _run_after_commit(item, default=True)
-        return ProducerResult((snapshot,), claimed, 1)
+            result_entries = (store._snapshot_entry(entry),)
+            default_changed = True
+            added = 1
+        else:
+            entry = store._append_row_unlocked("notification", data)
+            if item.tui_presented:
+                store._append_row_unlocked(
+                    "notification_tui_presented", {"notification_id": entry.id}
+                )
+            result_entries = (store._snapshot_entry(entry),)
+            default_changed = True
+            added = 1
+    changed = _run_after_commit(item, default=default_changed)
+    return ProducerResult(result_entries, changed, added)
 
 
 def _existing_notification(

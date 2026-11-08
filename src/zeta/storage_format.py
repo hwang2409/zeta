@@ -17,7 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 5
+from .locking import format_lock, shape_lock
+
+WRITER_EPOCH: Final = 6
+P06_FEATURE_EPOCH: Final = 6
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -466,7 +469,11 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
 
 def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
     """Retain a process-shared home lease after checking writer compatibility."""
+    with format_lock():
+        return _open_writer(home, capability=capability)
 
+
+def _open_writer(home: str | Path, *, capability: int) -> WriterLease:
     canonical = _canonical_home(home)
     with _REGISTRY_LOCK:
         registered = _REGISTRY.get(canonical)
@@ -733,7 +740,7 @@ class WriterLease:
     ) -> dict[str, Any]:
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        with _shape_lock(self._entry, self.home, directory_fd, name):
+        with shape_lock(), _shape_lock(self._entry, self.home, directory_fd, name):
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
@@ -767,7 +774,7 @@ class WriterLease:
 
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        with _shape_lock(self._entry, self.home, directory_fd, name):
+        with shape_lock(), _shape_lock(self._entry, self.home, directory_fd, name):
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
@@ -805,7 +812,7 @@ class WriterLease:
 
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        with _shape_lock(self._entry, self.home, directory_fd, name):
+        with shape_lock(), _shape_lock(self._entry, self.home, directory_fd, name):
             try:
                 os.unlink(name, dir_fd=directory_fd)
             except FileNotFoundError:

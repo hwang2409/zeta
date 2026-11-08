@@ -493,14 +493,15 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     def memory_snapshot(self, project_id: str) -> MemorySnapshot:
         """Read the complete bounded memory set and digest atomically."""
 
-        def read(root_fd: int) -> MemorySnapshot:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> MemorySnapshot:
+            directory_fd = os.dup(project_fd)
             try:
                 return self._snapshot_locked(directory_fd)
             finally:
                 os.close(directory_fd)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
     def memory_digest(self, project_id: str) -> str:
         return self.memory_snapshot(project_id).digest
@@ -508,8 +509,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     def _load_memory_view(
         self, project_id: str, byte_cap: int
     ) -> list[tuple[str, str]]:
-        def read(root_fd: int) -> list[tuple[str, str]]:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> list[tuple[str, str]]:
+            directory_fd = os.dup(project_fd)
             try:
                 pointer = self._pointer(directory_fd)
                 if pointer is None:
@@ -518,7 +519,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(directory_fd)
 
-        candidates = self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            candidates = read(project_fd)
         result: list[tuple[str, str]] = []
         remaining = byte_cap
         for name, content in candidates:
@@ -599,8 +601,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         """Load current memory with automatic provenance for safe prompt rendering."""
         if type(byte_cap) is not int or byte_cap < 0 or byte_cap > 1024 * 1024:
             raise ProjectRegistryError("invalid memory byte cap")
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 pointer = self._pointer(directory_fd)
                 if pointer is None:
@@ -726,7 +728,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             manifest_reader=self._manifest,
             transaction_step=self._memory_transaction_step,
             prune_versions=self._prune_versions,
-            home=self.root.parent,
+            storage_lease=self._writer_lease(),
         )
         self._refresh_memory_mirror(
             directory_fd,
@@ -765,13 +767,14 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     def export_memory(self, project_id: str) -> MemoryExport:
         """Export logical memory without exposing the version-store layout."""
 
-        def read(root_fd: int) -> MemoryExport:
-            return self._export_memory_locked(root_fd, project_id)
+        def read(project_fd: int) -> MemoryExport:
+            return self._export_memory_locked(project_fd, project_id)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
-    def _export_memory_locked(self, root_fd: int, project_id: str) -> MemoryExport:
-        directory_fd = self._project_dir(root_fd, project_id)
+    def _export_memory_locked(self, project_fd: int, project_id: str) -> MemoryExport:
+        directory_fd = os.dup(project_fd)
         try:
             snapshot = self._snapshot_locked(directory_fd)
             records = self._records_locked(directory_fd)
@@ -806,9 +809,9 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         provenance: Mapping[str, object] | None = None,
     ) -> MemoryCASResult:
         """CAS-import one logical snapshot as a version with its source history."""
-        with self._locked(write=True) as root_fd:
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             return self._import_memory_locked(
-                root_fd,
+                project_fd,
                 project_id,
                 exported,
                 expected_digest=expected_digest,
@@ -817,7 +820,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
 
     def _import_memory_locked(
         self,
-        root_fd: int,
+        project_fd: int,
         project_id: str,
         exported: MemoryExport,
         *,
@@ -848,7 +851,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         ):
             raise ProjectRegistryError("invalid memory export")
         source_history = [dict(item) for item in exported.versions]
-        directory_fd = self._project_dir(root_fd, project_id)
+        directory_fd = os.dup(project_fd)
         try:
             before = self._snapshot_locked(directory_fd)
             if before.digest != expected_digest:
@@ -890,8 +893,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     def memory_state(self, project_id: str) -> MemoryState:
         """Read the current authoritative snapshot and origin flags atomically."""
 
-        def read(root_fd: int) -> MemoryState:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> MemoryState:
+            directory_fd = os.dup(project_fd)
             try:
                 snapshot = self._snapshot_locked(directory_fd)
                 records = self._records_locked(directory_fd)
@@ -905,7 +908,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(directory_fd)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
     def memory_version_file(
         self, project_id: str, version: str, name: str
@@ -914,8 +918,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         if name not in PROJECT_MEMORY_FILES:
             raise ProjectRegistryError("invalid memory file name")
 
-        def read(root_fd: int) -> MemoryVersionFile:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> MemoryVersionFile:
+            directory_fd = os.dup(project_fd)
             try:
                 self._require_format_one(directory_fd)
                 root, blobs_fd, versions_fd = self._version_handles(
@@ -935,7 +939,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(directory_fd)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
     def memory_log(
         self, project_id: str, *, limit: int = 100
@@ -943,8 +948,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         if type(limit) is not int or limit < 1 or limit > 10_000:
             raise ProjectRegistryError("invalid memory history limit")
 
-        def read(root_fd: int) -> list[dict[str, object]]:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> list[dict[str, object]]:
+            directory_fd = os.dup(project_fd)
             try:
                 records = self._records_locked(directory_fd)
                 return [
@@ -955,7 +960,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(directory_fd)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
     def compare_and_swap_memory(
         self,
@@ -969,8 +975,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             raise ProjectRegistryError("invalid memory digest")
         self._validate_updates(updates)
         provenance_value = self._validate_provenance(provenance)
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 records = self._records_locked(directory_fd)
                 duplicate = next(
@@ -1020,8 +1026,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         self, project_id: str, updates: Mapping[str, str]
     ) -> list[tuple[str, str]]:
         self._validate_updates(updates)
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 snapshot = self._snapshot_locked(directory_fd)
                 contents = dict(snapshot.contents)
@@ -1042,8 +1048,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         """Mark one automatic memory file as trusted by explicit user action."""
         if name not in PROJECT_MEMORY_FILES:
             raise ProjectRegistryError("invalid memory file name")
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 snapshot = self._snapshot_locked(directory_fd)
                 self._publish_version(
@@ -1068,8 +1074,8 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         diagnosed_at: str | None = None,
     ) -> tuple[str, ...]:
         """List automatic versions that refer to rows removed by recovery."""
-        def read(root_fd: int) -> tuple[str, ...]:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> tuple[str, ...]:
+            directory_fd = os.dup(project_fd)
             try:
                 return _overlapping_automatic_versions(
                     self._records_locked(directory_fd),
@@ -1080,13 +1086,14 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(directory_fd)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
     def undo_memory(
         self, project_id: str, *, expected_current: str | None = None
     ) -> list[tuple[str, str]]:
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 records = self._records_locked(directory_fd)
                 undone = {

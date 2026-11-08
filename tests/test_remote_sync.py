@@ -822,11 +822,17 @@ def test_oversized_side_file_is_rejected_before_target_lock(
     original = list(project_path.rglob("*"))
 
     @contextmanager
-    def target_lock(_registry: ProjectRegistry, *, write: bool):
+    def target_lock(
+        _registry: ProjectRegistry,
+        project_id: str,
+        domain: str,
+        *,
+        exclusive: bool,
+    ):
         raise AssertionError("target lock was acquired before size validation")
         yield
 
-    monkeypatch.setattr(ProjectRegistry, "_locked", target_lock)
+    monkeypatch.setattr(ProjectRegistry, "_project_lock", target_lock)
 
     with pytest.raises(RemoteSyncError, match="side file is too large"):
         memory_module._publish_memory_snapshot(
@@ -1011,7 +1017,7 @@ def _legacy_project_digest(root: Path) -> str:
         if (
             not path.is_file()
             or path.is_symlink()
-            or path.name in {".lock", ".spill.lock"}
+            or path.name in {".lock", ".memory.lock", ".sessions.lock", ".spill.lock"}
             or has_version_store
             and path.parent == root / "memory"
             and path.name in memory_module.MEMORY_FILES

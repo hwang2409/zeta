@@ -7,7 +7,6 @@ corruption or archive bugs before publication.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import io
 import json
@@ -30,6 +29,7 @@ from ..memory_migration_plan import (
     legacy_memory_digest,
     reachable_version_pruning_plan,
 )
+from ..project_registry import ProjectRegistry
 from ..storage_format import reject_unknown_keys
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
@@ -158,10 +158,13 @@ def publish_local_project(
     projects = home / "projects"
     projects.mkdir(parents=True, exist_ok=True, mode=0o700)
     project = projects / project_id
-    lock_fd = os.open(projects / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    os.fchmod(lock_fd, 0o600)
-    with os.fdopen(lock_fd, "r+b") as registry_lock:
-        fcntl.flock(registry_lock.fileno(), fcntl.LOCK_EX)
+    registry = ProjectRegistry(projects)
+    authority = (
+        registry._identity_write()
+        if expected_digest == _MISSING
+        else registry._project_lock(project_id, "memory", exclusive=True)
+    )
+    with authority:
         _remove_incoming(projects, project_id)
         if project_digest(project) != expected_digest:
             raise ProjectPublicationError(

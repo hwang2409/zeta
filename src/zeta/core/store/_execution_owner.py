@@ -6,8 +6,9 @@ import fcntl
 import os
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
+from ...locking import execution_lock, shape_lock
 from ..session_files import open_session_file
 from ._pending_prompts import PendingPromptCommitTimeoutError
 
@@ -28,7 +29,8 @@ class ExecutionOwnerStoreMixin:
             raise ValueError("session store is closed")
         if not observer:
             self.assert_execution_owner()
-        with os.fdopen(
+        authority = nullcontext() if observer else execution_lock()
+        with authority, shape_lock(), os.fdopen(
             open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
         ) as handle:
             if deadline is None:

@@ -505,14 +505,14 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         if registry is None:
             return
         try:
+            durable_pending: dict[str, object] | None = None
             with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
-                pending: dict[str, object] | None = None
                 try:
                     value = json.loads(
                         read_session_file(directory_fd, "project_link_pending.json")
                     )
                     if valid_pending_link(value):
-                        pending = value
+                        durable_pending = value
                 except (
                     FileNotFoundError,
                     json.JSONDecodeError,
@@ -521,12 +521,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     SessionError,
                 ):
                     pass
-                # Immutable meta.json is the second source of truth.  This
-                # closes the gap where intent publication itself was torn,
-                # unwritable, or left semantically incomplete (e.g. ``{}``) but
-                # the session directory was durable.
-                if pending is None:
-                    metadata = self._read(session_id)
+                if durable_pending is None:
+                    metadata = self._read(session_id, directory_fd=directory_fd)
                     if metadata.project_id is None:
                         return
                     pending = {
@@ -535,18 +531,34 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         "parent_session_id": metadata.parent_session_id,
                         "transcript_path": str(self.sessions_dir / session_id),
                     }
-                registry.record_session(
-                    pending["project_id"],
-                    session_id=session_id,
-                    transcript_path=pending["transcript_path"],
-                    role=pending["role"],
-                    parent_session_id=pending.get("parent_session_id"),
-                )
+                else:
+                    pending = durable_pending
+            registry.record_session(
+                pending["project_id"],
+                session_id=session_id,
+                transcript_path=pending["transcript_path"],
+                role=pending["role"],
+                parent_session_id=pending.get("parent_session_id"),
+            )
+            if durable_pending is None:
+                return
+            with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
                 try:
-                    os.unlink("project_link_pending.json", dir_fd=directory_fd)
-                    os.fsync(directory_fd)
-                except FileNotFoundError:
-                    pass
+                    current = json.loads(
+                        read_session_file(directory_fd, "project_link_pending.json")
+                    )
+                except (
+                    FileNotFoundError,
+                    json.JSONDecodeError,
+                    UnicodeDecodeError,
+                    OSError,
+                    SessionError,
+                ):
+                    return
+                if current != durable_pending or not valid_pending_link(current):
+                    return
+                os.unlink("project_link_pending.json", dir_fd=directory_fd)
+                os.fsync(directory_fd)
         except (
             KeyError,
             ProjectRegistryError,
@@ -906,7 +918,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             with execution_lease.serialize_mutation():
                 yield execution_lease
             return
-        with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+        with session_directory(
+            self.sessions_dir, session_id, lifetime=True
+        ) as (_, directory_fd):
             lease = SessionExecutionLease.retain_resident(directory_fd)
             if lease is None:
                 lease = SessionExecutionLease.acquire(

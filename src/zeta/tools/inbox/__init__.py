@@ -189,7 +189,7 @@ async def _inbox(
         action = _validate_action(arguments)
         inbox, project_id, session_id = _bound(registry)
         if action == "projects":
-            known_projects = inbox.known_projects()
+            known_projects = await asyncio.to_thread(inbox.known_projects)
             return _result("projects", project_id, {"projects": known_projects})
         if action == "send":
             target_id = arguments["project"]
@@ -207,7 +207,9 @@ async def _inbox(
             return _result("send", project_id, {"id": message_id})
         if action == "list":
             status = arguments.get("status", "new")
-            state = inbox.list(project_id, session_id=session_id)
+            state = await asyncio.to_thread(
+                inbox.list, project_id, session_id=session_id
+            )
             messages = state[status]
             invalid = [item for item in state["invalid"] if item["status"] == status]
             return _result(
@@ -216,7 +218,8 @@ async def _inbox(
                 {"status": status, "messages": messages, "invalid": invalid},
             )
         if action == "sent":
-            page = inbox.sent(
+            page = await asyncio.to_thread(
+                inbox.sent,
                 project_id,
                 session_id=session_id,
                 offset=arguments.get("offset", 0),

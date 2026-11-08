@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import logging
@@ -597,10 +596,10 @@ class ProjectInbox:
         """Read inbox state without creating storage or recovering claims."""
         target = self._resolve_project(project)
 
-        def read(root_fd: int) -> dict[str, list[dict[str, Any]]]:
+        def read(project_fd: int) -> dict[str, list[dict[str, Any]]]:
             try:
                 with self._directory_handles(
-                    root_fd, target.project_id, create=False, lock=False
+                    project_fd, create=False
                 ) as dirs:
                     invalid: list[dict[str, str]] = []
                     result = {
@@ -621,7 +620,8 @@ class ProjectInbox:
             return result
 
         try:
-            return self.registry._read(read)
+            with self._lock(target.project_id, exclusive=False) as project_fd:
+                return read(project_fd)
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -634,10 +634,10 @@ class ProjectInbox:
     ) -> tuple[str, dict[str, Any]] | None:
         name = f"{_id(message_id)}.json"
 
-        def read(root_fd: int) -> tuple[str, dict[str, Any]] | None:
+        def read(project_fd: int) -> tuple[str, dict[str, Any]] | None:
             try:
                 with self._directory_handles(
-                    root_fd, target_project, create=False, lock=False
+                    project_fd, create=False
                 ) as dirs:
                     for index, status in enumerate(("new", "claimed", "done")):
                         try:
@@ -658,7 +658,8 @@ class ProjectInbox:
                 return None
 
         try:
-            return self.registry._read(read)
+            with self._lock(target_project, exclusive=False) as project_fd:
+                return read(project_fd)
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -849,10 +850,10 @@ class ProjectInbox:
 
     @contextmanager
     def _directory_handles(
-        self, root_fd: int, project_id: str, *, create: bool, lock: bool = True
+        self, project_fd: int, *, create: bool
     ) -> Iterator[tuple[int, int, int, int, int]]:
         with ExitStack() as stack:
-            project_fd = self.registry._project_dir(root_fd, project_id)
+            project_fd = os.dup(project_fd)
             stack.callback(os.close, project_fd)
             try:
                 inbox_fd = stack.enter_context(
@@ -862,14 +863,23 @@ class ProjectInbox:
                 if create:
                     raise
                 raise _InboxNotFound from exc
-            if lock:
-                fcntl.flock(inbox_fd, fcntl.LOCK_EX)
-                stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
-            fds = tuple(
-                stack.enter_context(child_directory(inbox_fd, name, create=create))
-                for name in ("new", "claimed", "done", "bodies", "wake")
-            )
+            try:
+                fds = tuple(
+                    stack.enter_context(child_directory(inbox_fd, name, create=create))
+                    for name in ("new", "claimed", "done", "bodies", "wake")
+                )
+            except FileNotFoundError as exc:
+                if create or set(os.listdir(inbox_fd)) != {".lock"}:
+                    raise
+                raise _InboxNotFound from exc
             yield fds  # type: ignore[misc]
+
+    @contextmanager
+    def _lock(self, project_id: str, *, exclusive: bool) -> Iterator[int]:
+        with self.registry._project_lock(
+            project_id, "inbox", exclusive=exclusive
+        ) as project_fd:
+            yield project_fd
 
     @contextmanager
     def _directories(
@@ -881,8 +891,8 @@ class ProjectInbox:
             )
         try:
             with (
-                self.registry._locked(write=True) as root_fd,
-                self._directory_handles(root_fd, project_id, create=True) as fds,
+                self._lock(project_id, exclusive=True) as project_fd,
+                self._directory_handles(project_fd, create=True) as fds,
             ):
                 yield fds
         except InboxError:
@@ -898,15 +908,14 @@ class ProjectInbox:
         *,
         delete: Iterable[str] = (),
     ) -> None:
-        with open_writer(self.registry.root.parent) as lease:
-            lease.publish_json(
-                directory_fd,
-                name,
-                mapping_mutations(record, delete=delete),
-                lambda fd, filename, data: atomic_publish_file(
-                    fd, filename, data, sync_directory=True
-                ),
-            )
+        self.registry._writer_lease().publish_json(
+            directory_fd,
+            name,
+            mapping_mutations(record, delete=delete),
+            lambda fd, filename, data: atomic_publish_file(
+                fd, filename, data, sync_directory=True
+            ),
+        )
 
     @staticmethod
     def _publish_once(directory_fd: int, name: str, data: bytes) -> None:

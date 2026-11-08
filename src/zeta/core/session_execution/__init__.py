@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
+from ...locking import execution_lock
 from ...storage_format import WriterLease
 from ..checkpoints import ConversationIntegrityError
 from ..fsio import write_all
@@ -204,7 +205,8 @@ class SessionExecutionLease:
             )
             os.set_inheritable(fd, False)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with execution_lock():
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 surface, pid, epoch = _read_owner_hint(fd)
                 os.close(fd)
@@ -306,7 +308,7 @@ class SessionExecutionLease:
         """Serialize mutations made through capabilities retained by this process."""
 
         self.assert_owned()
-        with self._owned.mutation_lock:
+        with execution_lock(), self._owned.mutation_lock:
             self.assert_owned()
             yield
 

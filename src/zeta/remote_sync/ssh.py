@@ -35,7 +35,7 @@ DEFAULT_MAX_ARCHIVE_BYTES = 1 << 30
 DEFAULT_MAX_ARCHIVE_MEMBERS = 200_000
 
 _FETCH_SCRIPT = r'''
-import fcntl, io, os, pathlib, sys, tarfile
+import fcntl, io, json, os, pathlib, sys, tarfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
 kind, ident = sys.argv[2], sys.argv[3]
 if kind not in {"sessions", "projects"} or pathlib.Path(ident).parts != (ident,): sys.exit(45)
@@ -45,9 +45,13 @@ root = parent / ident
 locks = []
 try:
     if kind == "projects":
-        fd = os.open(parent / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        manifest = json.loads((home / "storage-format.json").read_text())
+        epoch = manifest.get("epoch")
+        if type(epoch) is not int or epoch < 1 or epoch > 6: sys.exit(53)
+        lock_path = parent / ".lock" if epoch < 6 else root / ".memory.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         os.fchmod(fd, 0o600); handle = os.fdopen(fd, "r+b")
-        try: fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try: fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError: sys.exit(52)
         locks.append(handle)
     if not root.is_dir() or root.is_symlink(): sys.exit(44)
@@ -58,7 +62,7 @@ try:
         for path in [root, *sorted(root.rglob("*"))]:
             relative = path.relative_to(root)
             if path.is_symlink(): sys.exit(46)
-            if path.name in {".lock", ".spill.lock", "runtime.lease"}: continue
+            if path.name in {".lock", ".memory.lock", ".sessions.lock", ".spill.lock", "runtime.lease"}: continue
             if path.is_dir() or path.is_file():
                 archive.add(path, arcname=str(pathlib.Path("payload") / relative), recursive=False)
             else: sys.exit(46)
@@ -110,7 +114,11 @@ parent = home / kind; parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 destination = parent / ident
 registry_lease = None
 if kind == "projects":
-    fd = os.open(parent / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    manifest = json.loads((home / "storage-format.json").read_text())
+    epoch = manifest.get("epoch")
+    if type(epoch) is not int or epoch < 1 or epoch > 6: sys.exit(53)
+    lock_path = parent / ".lock" if epoch < 6 or expected == "missing" else destination / ".memory.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     os.fchmod(fd, 0o600); registry_lease = os.fdopen(fd, "r+b")
     fcntl.flock(registry_lease.fileno(), fcntl.LOCK_EX)
 lease = None
@@ -123,7 +131,7 @@ def digest(root):
     if not root.exists(): return "missing"
     for path in sorted(root.rglob("*")):
         if path.is_symlink(): sys.exit(46)
-        if path.is_file() and path.name not in {".lock", ".spill.lock", "runtime.lease"}:
+        if path.is_file() and path.name not in {".lock", ".memory.lock", ".sessions.lock", ".spill.lock", "runtime.lease"}:
             value.update(path.relative_to(root).as_posix().encode() + b"\0")
             with path.open("rb") as stream:
                 while chunk := stream.read(1024 * 1024): value.update(chunk)

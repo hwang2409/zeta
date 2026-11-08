@@ -281,13 +281,30 @@ def _reconcile_child_links_pass(
                 intents, more, failed = _collect_pending_intents(pending_fd, session_fd)
                 if failed:
                     return "failed"
-                if intents and not _publish_pending_intents(
-                    project_registry, pending_fd, intents
-                ):
-                    return "failed"
-                return "more" if more else "drained"
             finally:
                 os.close(pending_fd)
+        if intents and not _publish_pending_intents(project_registry, intents):
+            return "failed"
+        if intents:
+            with session_directory(sessions_dir, session_id) as (_, session_fd):
+                try:
+                    pending_fd = os.open(
+                        PENDING_CHILD_LINKS_DIRNAME,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=session_fd,
+                    )
+                except (FileNotFoundError, NotADirectoryError):
+                    return "drained"
+                try:
+                    for name, link in intents:
+                        status, current = _classify_pending_entry(pending_fd, name)
+                        if status != "publish" or current != link:
+                            continue
+                        if not _remove_entry(pending_fd, name):
+                            return "failed"
+                finally:
+                    os.close(pending_fd)
+        return "more" if more else "drained"
     except (SessionError, OSError):
         return "failed"
 
@@ -435,16 +452,14 @@ def _classify_pending_entry(
 
 def _record_child_lineage_batch(
     project_registry: ProjectRegistry,
-    project_id: str,
-    records: list[Mapping[str, object]],
+    records_by_project: Mapping[str, list[Mapping[str, object]]],
 ) -> None:
-    """Acquire today's registry lock through one seam for p06 conversion."""
-    project_registry.record_sessions(project_id, records)
+    """Acquire the complete sorted sessions authority before publication."""
+    project_registry._record_child_lineage_batch(records_by_project)
 
 
 def _publish_pending_intents(
     project_registry: ProjectRegistry,
-    pending_fd: int,
     intents: list[tuple[str, dict[str, object]]],
 ) -> bool:
     # Group by project so the registry's JSONL file is read exactly once per
@@ -452,8 +467,8 @@ def _publish_pending_intents(
     by_project: dict[str, list[tuple[str, dict[str, object]]]] = {}
     for name, link in intents:
         by_project.setdefault(str(link["project_id"]), []).append((name, link))
-    for project_id, group in by_project.items():
-        records = [
+    records_by_project = {
+        project_id: [
             {
                 "session_id": link["session_id"],
                 "transcript_path": link["transcript_path"],
@@ -462,18 +477,14 @@ def _publish_pending_intents(
             }
             for _name, link in group
         ]
-        try:
-            _record_child_lineage_batch(project_registry, project_id, records)
-        except (ProjectRegistryError, OSError, ValueError, KeyError, TypeError) as exc:
-            # Stop the pass; a failed append leaves the intents in place and the
-            # next open retries them (the registry dedupes on session id).
-            logger.warning("child project linkage remains pending: %s", exc)
-            return False
-        # The batch landed (or every id was already present). A failed cleanup
-        # defers the exact intent to durable recovery rather than declaring drained.
-        for name, _link in group:
-            if not _remove_entry(pending_fd, name):
-                return False
+        for project_id, group in by_project.items()
+    }
+    try:
+        _record_child_lineage_batch(project_registry, records_by_project)
+    except (ProjectRegistryError, OSError, ValueError, KeyError, TypeError) as exc:
+        # A partial write leaves every intent in place; exact upsert repairs it.
+        logger.warning("child project linkage remains pending: %s", exc)
+        return False
     return True
 
 
