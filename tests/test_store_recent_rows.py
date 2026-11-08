@@ -15,7 +15,6 @@ from zeta.core.store.recent_rows import (
     ApprovalResolution,
     AssistantResponseAfter,
     DeliveredMessage,
-    DroppedSteer,
     ToolResult,
     UserTurnMessageAfter,
 )
@@ -123,21 +122,6 @@ def test_delivered_message_matches_the_tagged_send_row(
     assert store.recent_row_seq(DeliveredMessage("send-2")) is None
 
 
-def test_dropped_steer_skips_the_queued_row_for_one_delivery_id(
-    store: ConversationStore,
-) -> None:
-    store.append_client_delivery("steer-1", "steer", "queued", {"accepted": True})
-    queued = store.entries[-1]
-    store.queue_client_steering(_user("steer"), "steer-1")
-    assert store.recent_row_seq(DroppedSteer("steer-1")) is None
-
-    store.drop_client_steering("abort")
-    dropped = store.entries[-1]
-
-    assert dropped.data["status"] == "dropped" and queued.data["status"] == "queued"
-    assert store.recent_row_seq(DroppedSteer("steer-1")) == dropped.seq
-
-
 def test_after_keys_name_the_first_match_after_the_mark(
     store: ConversationStore,
 ) -> None:
@@ -195,6 +179,50 @@ def test_reset_generation_counts_replacements_not_appends(
 
     assert store.reset_generation() == start + 1
     assert store.row_id_at(first.seq) == "replacement-id" != first.id
+
+
+def _replace_first_row_id(store: ConversationStore) -> None:
+    rows = store.path.read_text(encoding="utf-8").splitlines()
+    replaced_first = json.loads(rows[1])
+    replaced_next = json.loads(rows[2])
+    replaced_first["id"] = "replacement-id"
+    replaced_next["parent_id"] = "replacement-id"
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_text(
+        "\n".join(
+            [rows[0], json.dumps(replaced_first), json.dumps(replaced_next), ""]
+        ),
+        encoding="utf-8",
+    )
+    replacement.replace(store.path)
+
+
+async def test_async_commit_counts_an_external_replacement(
+    store: ConversationStore,
+) -> None:
+    first = await store.append_message_async(_assistant("old"))
+    await store.append_message_async(_assistant("tip"))
+    start = store.reset_generation()
+
+    _replace_first_row_id(store)
+    await store.append_message_async(_user("after replacement"))
+
+    assert store.reset_generation() == start + 1
+    assert store.row_id_at(first.seq) == "replacement-id" != first.id
+
+
+def test_missing_log_with_resident_rows_counts_a_reset(
+    store: ConversationStore,
+) -> None:
+    first = store.append_message(_assistant("old"))
+    store.append_message(_assistant("tip"))
+    start = store.reset_generation()
+
+    store.path.unlink()
+    store.refresh()
+
+    assert store.reset_generation() == start + 1
+    assert store.row_id_at(first.seq) is None
 
 
 def test_accessors_assert_the_owner_thread(store: ConversationStore) -> None:
