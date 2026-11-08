@@ -50,6 +50,7 @@ from .project_schema import (
     validate_project_text,
 )
 from .storage_format import (
+    WRITER_EPOCH,
     WriterLease,
     mapping_mutations,
     open_writer,
@@ -332,6 +333,9 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
         if not write:
             raise AssertionError("read operations must use _read")
         lease = open_writer(self.root.parent)
+        if lease.observed_epoch != WRITER_EPOCH:
+            lease.close()
+            raise ProjectRegistryError("project writes are unavailable before the writer epoch")
         self._ensure_root()
         try:
             with self._locked_home() as root_fd:

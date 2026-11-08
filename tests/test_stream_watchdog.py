@@ -21,6 +21,7 @@ import zeta.accounts.store as account_store
 from tests.support.completion import ManualDeadlineClock, completion_control
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.accounts import AccountCredentials
 from zeta.config.settings import Settings, load_settings, resolve
 from zeta.core.store import ConversationStore
@@ -424,7 +425,9 @@ async def test_provider_stalls_waiting_for_response_headers(
     async def no_headers(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         headers_waiting.set()
-        await asyncio.wait_for(asyncio.Event().wait(), 10)
+        await await_or_fail(
+            asyncio.Event().wait(), what="blocked response headers callback"
+        )
         raise AssertionError("unreachable")
 
     client = _mock_client(no_headers)
@@ -472,19 +475,30 @@ async def test_oauth_refresh_network_wait_is_bounded(
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
 
     async def no_refresh_response(_request: httpx.Request) -> httpx.Response:
-        await asyncio.wait_for(asyncio.Event().wait(), 10)
+        await await_or_fail(
+            asyncio.Event().wait(), what="blocked OAuth refresh callback"
+        )
         raise AssertionError("unreachable")
 
     async with _mock_client(no_refresh_response) as client:
         with pytest.raises(store.http_error_type, match="OAuth token refresh stalled"):
-            await asyncio.wait_for(getattr(store, method_name)(client), timeout=0.5)
+            await await_or_fail(
+                getattr(store, method_name)(client),
+                what="OAuth token refresh stall",
+            )
         assert json.loads(store.path.read_text())["access_token"] == "expired-access"
 
         async def recovered_refresh(_token: str, _client: httpx.AsyncClient) -> OAuthTokens:
             return OAuthTokens("fresh-access", "refresh-fixture", 4_000_000_000)
 
         monkeypatch.setattr(store, "refresh", recovered_refresh)
-        assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == "fresh-access"
+        assert (
+            await await_or_fail(
+                store.access_token(client),
+                what="recovered OAuth access token",
+            )
+            == "fresh-access"
+        )
 
 
 async def test_oauth_credential_lock_wait_is_bounded(
@@ -501,9 +515,16 @@ async def test_oauth_credential_lock_wait_is_bounded(
                     "lock; retry the turn"
                 ),
             ):
-                await asyncio.wait_for(store.access_token(client), timeout=0.5)
-        assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == (
-            _codex_access_token()
+                await await_or_fail(
+                    store.access_token(client),
+                    what="account credential lock stall",
+                )
+        assert (
+            await await_or_fail(
+                store.access_token(client),
+                what="access token after credential lock release",
+            )
+            == _codex_access_token()
         )
 
 

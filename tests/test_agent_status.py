@@ -3,6 +3,9 @@ import gc
 import json
 import os
 import random
+import select
+import subprocess
+import sys
 import threading
 import weakref
 from dataclasses import replace
@@ -24,6 +27,13 @@ from zeta.core.agent_progress import (
     publish_live_agent_lifecycle,
     remove_live_agent_lifecycle,
 )
+from zeta.core.agent_state import (
+    BrokenAgentLifecycle,
+    LoadedAgentLifecycle,
+    MissingAgentLifecycle,
+    read_agent_lifecycle_state,
+)
+from zeta.core.checkpoints import ConversationIntegrityError
 from zeta.core.store import ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
@@ -339,6 +349,54 @@ async def _collect(events):
     return [event async for event in events]
 
 
+def _start_child_owner(child: ConversationStore) -> subprocess.Popen[str]:
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from pathlib import Path
+from zeta.core.store import ConversationStore
+
+store = ConversationStore(Path(sys.argv[1]), session_id=sys.argv[2])
+print("ready", flush=True)
+sys.stdin.readline()
+store.close()
+""",
+            str(child.root_dir),
+            child.session_id,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        readable, _, _ = select.select([process.stdout], [], [], 10)
+        state = (
+            "running" if process.poll() is None else f"exit code {process.returncode}"
+        )
+        assert readable, f"timed out waiting for child owner readiness; process {state}"
+        assert process.stdout.readline() == "ready\n"
+        return process
+    except BaseException:
+        _kill_and_drain_child_owner(process)
+        raise
+
+
+def _kill_and_drain_child_owner(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.communicate(timeout=10)
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
+
+
 def _persist_finished_receipt(
     store: ConversationStore,
     child: ConversationStore,
@@ -417,8 +475,80 @@ def _new_live_child(
     return child, handle
 
 
+def test_agent_lifecycle_read_distinguishes_loaded_broken_and_missing(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, _ = _new_live_child(store, 1)
+
+    try:
+        loaded = read_agent_lifecycle_state(
+            child.directory_fd, child.agent_lifecycle_path
+        )
+        assert isinstance(loaded, LoadedAgentLifecycle)
+
+        child.agent_lifecycle_path.write_bytes(b"{")
+        broken = read_agent_lifecycle_state(
+            child.directory_fd, child.agent_lifecycle_path
+        )
+        assert broken == BrokenAgentLifecycle(
+            child.agent_lifecycle_path, "invalid lifecycle json"
+        )
+        with pytest.raises(ConversationIntegrityError):
+            child.finish_agent_lifecycle(
+                "failed", final_result="must not replace broken evidence"
+            )
+        assert child.agent_lifecycle_path.read_bytes() == b"{"
+
+        child.agent_lifecycle_path.unlink()
+        missing = read_agent_lifecycle_state(
+            child.directory_fd, child.agent_lifecycle_path
+        )
+        assert missing == MissingAgentLifecycle(child.agent_lifecycle_path)
+    finally:
+        child.close()
+        store.close()
+
+
 @pytest.mark.asyncio
-async def test_malformed_durable_lifecycle_keeps_valid_live_projection(
+async def test_agent_status_projects_running_lifecycle_after_owner_is_killed(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    child.close()
+    owner = _start_child_owner(child)
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+
+    try:
+        live = await _status(loop, handle)
+        assert live["structuredContent"]["children"][0]["state"] == "running"
+
+        owner.kill()
+        assert owner.wait(timeout=10) < 0
+
+        lost = await _status(loop, handle)
+        item = lost["structuredContent"]["children"][0]
+        assert item["state"] == "failed"
+        assert item["reason"] == "lost: owner process exited"
+
+        repeated = await _status(loop, handle)
+        assert repeated["structuredContent"]["children"][0] == item
+        preserved = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+        assert preserved["state"] == "running"
+        assert preserved["monotonic_pid"] == os.getpid()
+        assert "final_result" not in preserved
+    finally:
+        _kill_and_drain_child_owner(owner)
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_broken_durable_lifecycle_is_terminal_despite_live_projection(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -435,9 +565,9 @@ async def test_malformed_durable_lifecycle_keeps_valid_live_projection(
     )
     status = await _status(loop, handle)
     item = status["structuredContent"]["children"][0]
-    assert item["state"] == "running"
-    assert item["tool_calls"] == 3
-    assert item["current_step"] == "valid live work"
+    assert item["state"] == "failed"
+    assert item["reason"].startswith("unreadable:")
+    assert child.agent_lifecycle_path.read_text(encoding="utf-8") == "{"
 
     call = ToolCall(
         "agent-1", "agent", {"prompt": "inspect", "description": "child 1"}
@@ -473,13 +603,14 @@ async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
 
     loop_thread = threading.get_ident()
     read_threads: list[int] = []
-    original = agent_tools._read_child_file
+    original = agent_tools._read_child_lifecycle
 
     def tracked_read(*args: object, **kwargs: object) -> bytes:
         read_threads.append(threading.get_ident())
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(agent_tools, "_read_child_file", tracked_read)
+    # test-contract: seam tracks the off-loop lifecycle read
+    monkeypatch.setattr(agent_tools, "_read_child_lifecycle", tracked_read)
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
@@ -693,8 +824,8 @@ async def test_list_status_all_finished_reports_omission_summary(
 @pytest.mark.parametrize(
     ("damage", "reason"),
     [
-        ("missing", "could not read child state"),
-        ("invalid-json", "could not read child state"),
+        ("missing", "missing lifecycle record"),
+        ("invalid-json", "invalid lifecycle json"),
         ("non-dict", "lifecycle data is not an object"),
         ("terminal-without-finished-at", "terminal state has no finished_at"),
         ("finished-at-while-working", "non-terminal state has finished_at"),
@@ -734,15 +865,15 @@ async def test_list_status_keeps_damaged_children_visible(
     children = {child["handle"]: child for child in structured["children"]}
     assert structured["total"] == 2
     assert structured["truncated"] is False
-    assert children[damaged_handle]["state"] == "unknown"
-    assert children[damaged_handle]["finished_at"] is None
+    assert children[damaged_handle]["state"] == "failed"
+    assert children[damaged_handle]["finished_at"] is not None
     assert reason in children[damaged_handle]["reason"]
     assert children[healthy_handle]["state"] == "running"
-    assert f"child {damaged_handle}: state: unknown" in status["content"][0]["text"]
+    assert f"child {damaged_handle}: state: failed" in status["content"][0]["text"]
     if damage in {"missing", "invalid-json"}:
         explicit = await _status(loop, damaged_handle)
         assert explicit["isError"] is False
-        assert explicit["structuredContent"]["children"][0]["state"] == "unknown"
+        assert explicit["structuredContent"]["children"][0]["state"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -774,7 +905,7 @@ async def test_list_status_keeps_invalid_timestamps_visible(
     status = await _status(loop)
     structured = status["structuredContent"]
     item = structured["children"][0]
-    assert item["state"] == "unknown"
+    assert item["state"] == "failed"
     assert "invalid child timestamps" in item["reason"]
     assert "finished_omitted" not in structured
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
@@ -804,7 +935,7 @@ async def test_list_status_keeps_invalid_numeric_metadata_visible(
     )
     status = await _status(loop)
     item = status["structuredContent"]["children"][0]
-    assert item["state"] == "unknown"
+    assert item["state"] == "failed"
     assert f"invalid child metadata {field}" in item["reason"]
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
@@ -835,8 +966,8 @@ async def test_list_status_rejects_invalid_numeric_minimums(
     item = status["structuredContent"]["children"][0]
 
     assert status["isError"] is False
-    assert item["state"] == "unknown"
-    assert item["reason"] == f"invalid child metadata {field}"
+    assert item["state"] == "failed"
+    assert item["reason"] == f"unreadable: invalid child metadata {field}"
 
 
 @pytest.mark.asyncio
@@ -865,8 +996,8 @@ async def test_list_status_rejects_non_integer_numeric_metadata(
     item = status["structuredContent"]["children"][0]
 
     assert status["isError"] is False
-    assert item["state"] == "unknown"
-    assert item["reason"] == f"invalid child metadata {field}"
+    assert item["state"] == "failed"
+    assert item["reason"] == f"unreadable: invalid child metadata {field}"
 
 
 @pytest.mark.asyncio
@@ -888,7 +1019,7 @@ async def test_list_status_rejects_invalid_states(
     item = status["structuredContent"]["children"][0]
 
     assert status["isError"] is False
-    assert item["state"] == "unknown"
+    assert item["state"] == "failed"
     assert "invalid child" in item["reason"]
 
 
@@ -908,8 +1039,8 @@ async def test_list_status_rejects_missing_state(tmp_path: Path) -> None:
     item = status["structuredContent"]["children"][0]
 
     assert status["isError"] is False
-    assert item["state"] == "unknown"
-    assert item["reason"] == "invalid child metadata state"
+    assert item["state"] == "failed"
+    assert item["reason"] == "unreadable: invalid child metadata state"
 
 
 @pytest.mark.asyncio
@@ -940,8 +1071,8 @@ async def test_projection_exception_with_unprintable_reason_is_safe(
 
     assert status["isError"] is False
     assert item["handle"] == handle
-    assert item["state"] == "unknown"
-    assert item["reason"] == "child status unavailable"
+    assert item["state"] == "failed"
+    assert item["reason"] == "unreadable: child status unavailable"
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
@@ -1053,7 +1184,7 @@ async def test_list_status_keeps_oversized_timestamps_visible(
     status = await _status(loop, handle)
     item = status["structuredContent"]["children"][0]
     assert status["isError"] is False
-    assert item["state"] in {"completed", "unknown"}
+    assert item["state"] in {"completed", "failed"}
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
@@ -1075,7 +1206,7 @@ async def test_list_status_keeps_invalid_elapsed_visible(
     status = await _status(loop, handle)
     item = status["structuredContent"]["children"][0]
     assert status["isError"] is False
-    assert item["state"] in {"completed", "unknown"}
+    assert item["state"] in {"completed", "failed"}
     assert "finished_omitted" not in status["structuredContent"]
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
@@ -1097,7 +1228,7 @@ async def test_list_status_keeps_non_string_final_result_visible(
     )
     status = await _status(loop)
     item = status["structuredContent"]["children"][0]
-    assert item["state"] == "unknown"
+    assert item["state"] == "failed"
     assert "invalid child final_result" in item["reason"]
     assert "finished_omitted" not in status["structuredContent"]
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
@@ -1141,7 +1272,7 @@ async def test_list_status_closes_the_displayed_field_set(tmp_path: Path) -> Non
     )
     status = await _status(loop)
     structured = status["structuredContent"]
-    unknown = [child for child in structured["children"] if child["state"] == "unknown"]
+    unknown = [child for child in structured["children"] if child["state"] == "failed"]
     assert len(unknown) == 1
     assert unknown[0]["handle"]
     assert structured["finished_omitted"] == 1
@@ -1186,7 +1317,7 @@ async def test_projection_damage_keeps_the_child_visible(
 
     assert status["isError"] is False
     assert len(status["structuredContent"]["children"]) == 1
-    assert status["structuredContent"]["children"][0]["state"] == "unknown"
+    assert status["structuredContent"]["children"][0]["state"] == "failed"
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
@@ -1204,8 +1335,8 @@ async def test_projection_damage_keeps_generated_reason_visible(tmp_path: Path) 
     item = status["structuredContent"]["children"][0]
 
     assert status["isError"] is False
-    assert item["state"] == "unknown"
-    assert item["reason"] == "could not read child state"
+    assert item["state"] == "failed"
+    assert item["reason"].startswith("unreadable:")
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
@@ -1225,7 +1356,7 @@ async def test_large_turn_count_degrades_one_row(tmp_path: Path) -> None:
     item = status["structuredContent"]["children"][0]
 
     assert status["isError"] is False
-    assert item["state"] == "unknown"
+    assert item["state"] == "failed"
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
@@ -1250,7 +1381,7 @@ async def test_huge_monotonic_value_degrades_one_row(tmp_path: Path) -> None:
     item = status["structuredContent"]["children"][0]
 
     assert status["isError"] is False
-    assert item["state"] == "unknown"
+    assert item["state"] == "failed"
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
@@ -1414,9 +1545,9 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
         handle for handle, state in emitted_states.items() if state == "running"
     } == expected["live"]
     assert {
-        handle for handle, state in emitted_states.items() if state == "unknown"
+        handle for handle, state in emitted_states.items() if state == "failed"
     } == expected["unknown"]
-    assert emitted_states[deterministic_handle] == "unknown"
+    assert emitted_states[deterministic_handle] == "failed"
     assert set(emitted_states.values()) <= {
         "running",
         "completed",

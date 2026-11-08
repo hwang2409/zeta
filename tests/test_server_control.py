@@ -396,7 +396,7 @@ async def test_release_after_physical_write_reports_delivered() -> None:
 
 
 @pytest.mark.asyncio
-async def test_controller_release_completes_queued_frames_like_base() -> None:
+async def test_controller_release_fences_queued_frames() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop())
     connection = _ControllerConnection()
     registry.register(connection)
@@ -419,7 +419,7 @@ async def test_controller_release_completes_queued_frames_like_base() -> None:
     registry.release(connection)
     release_write.set()
 
-    assert await asyncio.wait_for(asyncio.gather(head, tail), 10) == [True, True]
+    assert await asyncio.wait_for(asyncio.gather(head, tail), 10) == [False, False]
 
 
 @pytest.mark.asyncio
@@ -600,6 +600,7 @@ async def _replace_registry_controller(
         replacement.features,
     )
     replacement.handshaken = True
+    server.connections.activate_controller(replacement)
     frame = replacement.codec.notification(
         EventDescriptor.ASSISTANT_DELTA, "session", delta="hello"
     )
@@ -836,27 +837,31 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
     client = server._client
     assert client is not None and server.connections is not None
-    released = asyncio.Event()
+    reference = weakref.ref(client)
+    cleanup_finished = asyncio.Event()
     original_release = server.connections.release
     client_id = id(client)
+    release_count = 0
+    loop = asyncio.get_running_loop()
 
     def release(connection: Any) -> None:
+        nonlocal release_count
         original_release(connection)
         if id(connection) == client_id:
-            released.set()
+            release_count += 1
+            if release_count == 2:
+                loop.call_soon(cleanup_finished.set)
 
+    # test-contract: seam observe the accept callback after early physical release
     server.connections.release = release  # type: ignore[method-assign]
-    reference = weakref.ref(client)
     writer.close()
     await writer.wait_closed()
-    await asyncio.wait_for(released.wait(), TIMEOUT)
+    await asyncio.wait_for(cleanup_finished.wait(), TIMEOUT)
+    await server.close()
     del client
     gc.collect()
 
-    try:
-        assert server.runtime._background_event_sink is not None
-        assert server.runtime._memory_notice_sink is not None
-        assert server.runtime._background_wake_sink is not None
-        assert reference() is None
-    finally:
-        await server.close()
+    assert server.runtime._background_event_sink is not None
+    assert server.runtime._memory_notice_sink is not None
+    assert server.runtime._background_wake_sink is not None
+    assert reference() is None
