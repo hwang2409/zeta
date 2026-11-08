@@ -56,6 +56,7 @@ class _Scope:
     ordinal: int
     records: int = 0
     bytes: int = 0
+    charges: list[int] = field(default_factory=list)
 
 
 class SessionReplay:
@@ -64,6 +65,7 @@ class SessionReplay:
     def __init__(self) -> None:
         self._subscriptions: dict[Any, _Subscription] = {}
         self._pending: dict[Any, PendingReplayJoin] = {}
+        self._next_sequences: dict[Any, int] = {}
         self._scopes: dict[ReplayScopeId, _Scope] = {}
         self._next_ordinal = 0
         self._records = 0
@@ -104,9 +106,14 @@ class SessionReplay:
 
     def _reserve(self, scope: ReplayScopeId, size: int) -> bool:
         owner = self._scope(scope)
-        if owner.records + 1 > REPLAY_SCOPE_MAX_RECORDS or owner.bytes + size > REPLAY_SCOPE_MAX_BYTES:
-            self._drop_scope(scope)
-            return False
+        while owner.records + 1 > REPLAY_SCOPE_MAX_RECORDS or owner.bytes + size > REPLAY_SCOPE_MAX_BYTES:
+            if not owner.charges:
+                return False
+            old = owner.charges.pop(0)
+            owner.records -= 1
+            owner.bytes -= old
+            self._records -= 1
+            self._bytes -= old
         while (
             self._records + 1 > REPLAY_MAX_RECORDS
             or self._bytes + size > REPLAY_MAX_BYTES
@@ -114,12 +121,18 @@ class SessionReplay:
             victim = self._largest_scope()
             if victim is None:
                 return False
-            self._drop_scope(victim)
-            if victim == scope:
+            victim_owner = self._scopes[victim]
+            if not victim_owner.charges:
                 return False
+            old = victim_owner.charges.pop(0)
+            victim_owner.records -= 1
+            victim_owner.bytes -= old
+            self._records -= 1
+            self._bytes -= old
         owner = self._scope(scope)
         owner.records += 1
         owner.bytes += size
+        owner.charges.append(size)
         self._records += 1
         self._bytes += size
         return True
@@ -131,6 +144,7 @@ class SessionReplay:
     def begin_join(self, connection: Any, scope: ReplayScopeId) -> PendingReplayJoin:
         self.connection_closed(connection)
         pending = PendingReplayJoin(connection, scope, secrets.token_urlsafe(9))
+        self._next_sequences[connection] = 1
         self._pending[connection] = pending
         return pending
 
@@ -157,9 +171,8 @@ class SessionReplay:
         target = subscription if subscription is not None else pending
         if target is None or target.scope != scope or not self._reserve(scope, frame_size):
             return None
-        seq = target.next_seq if isinstance(target, _Subscription) else len(target.frames) + 1
-        if isinstance(target, _Subscription):
-            target.next_seq += 1
+        seq = self._next_sequences.get(connection, 1)
+        self._next_sequences[connection] = seq + 1
         payload = {
             "stream_id": target.stream_id,
             "seq": seq,
@@ -176,6 +189,10 @@ class SessionReplay:
     def release(self, scope: ReplayScopeId, size: int) -> None:
         owner = self._scopes.get(scope)
         if owner is None:
+            return
+        try:
+            owner.charges.remove(size)
+        except ValueError:
             return
         owner.records -= 1
         owner.bytes -= size
@@ -194,6 +211,7 @@ class SessionReplay:
     def connection_closed(self, connection: Any) -> None:
         pending = self._pending.pop(connection, None)
         subscription = self._subscriptions.pop(connection, None)
+        self._next_sequences.pop(connection, None)
         for item in (pending, subscription):
             if item is None:
                 continue
