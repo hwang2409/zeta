@@ -1138,11 +1138,11 @@ async def test_serve_reports_no_progress_stop_and_accepts_next_message(
     )
     original_admit = DispatchProgress.admit
 
-    def repeated_admit(self, store, prepared, flow, retrying_context):
+    def repeated_admit(self, store, prepared, flow, retrying_context, **kwargs):
         # the real stop path: the same request admitted a third time in a row.
-        original_admit(self, store, prepared, flow, retrying_context)
-        original_admit(self, store, prepared, flow, retrying_context)
-        return original_admit(self, store, prepared, flow, retrying_context)
+        original_admit(self, store, prepared, flow, retrying_context, **kwargs)
+        original_admit(self, store, prepared, flow, retrying_context, **kwargs)
+        return original_admit(self, store, prepared, flow, retrying_context, **kwargs)
 
     monkeypatch.setattr(DispatchProgress, "admit", repeated_admit)
     reader, writer = await _ready(server, "1.1")
@@ -1155,7 +1155,7 @@ async def test_serve_reports_no_progress_stop_and_accepts_next_message(
         events = [frame["params"] for frame in frames if frame.get("method") == "event"]
         error = next(event for event in events if event["event"] == "error")
         assert error["error"]["code"] == "no_progress_loop"
-        assert "The input was not run; it is held and goes with the next message." in error["error"]["message"]
+        assert "Input not delivered: it is held and goes with the next message." in error["error"]["message"]
         assert not any(event["event"] == "assistant_message" for event in events)
 
         monkeypatch.setattr(DispatchProgress, "admit", original_admit)

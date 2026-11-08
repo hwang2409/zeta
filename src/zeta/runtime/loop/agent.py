@@ -894,7 +894,13 @@ class AgentLoop(
                     notice_sink=self._mcp_notice_sink,
                 )
                 if disposition == "dispatch":
-                    disposition = self._dispatch_progress.admit(self.store, prepared_delivery, step_delivery, retrying_context)
+                    disposition = self._dispatch_progress.admit(
+                        self.store,
+                        prepared_delivery,
+                        step_delivery,
+                        retrying_context,
+                        waits_for_input=self.agent_instance_id is None or self.explicit_finish,
+                    )
                 if disposition == "deferred":
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return

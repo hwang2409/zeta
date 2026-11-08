@@ -4303,7 +4303,7 @@ def test_render_event_error_is_visible() -> None:
 def test_no_progress_loop_renders_as_named_non_retryable_error() -> None:
     message = (
         "the model was called 2 times with the same request and nothing new was "
-        "saved; stopped to avoid repeat spend. The input was not run; it is held "
+        "saved; stopped to avoid repeat spend. Input not delivered: it is held "
         "and goes with the next message."
     )
     rendered = render_event(
@@ -5320,6 +5320,49 @@ def test_nested_stalled_idle_background_event_renders_last_message(
     rendered = output.getvalue()
     assert "nested verifier" in rendered
     assert "nested verifier is waiting for review" in rendered
+
+
+@pytest.mark.asyncio
+async def test_held_input_notice_renders_on_root_transcript(tmp_path: Path) -> None:
+    from zeta.runtime.loop.empty_turn import not_delivered_text
+
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path / "root"), output)
+    child_store = ConversationStore(tmp_path / "child")
+    child_store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="stopped worker",
+    )
+    child_loop = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        skill_catalog=SkillCatalog.empty(),
+        background_owner=app.loop._background_owner,
+        agent_instance_id="root:1",
+        agent_depth=1,
+    )
+    child_loop.set_background_event_sink(app.loop._publish_background_event)
+    text = not_delivered_text("budget used up", waits_for_input=False)
+    try:
+        await app.loop._ensure_step_delivery()
+        await app.loop._background_owner.conversation_channel.publish_not_delivered(
+            child_loop, text
+        )
+
+        rendered = output.getvalue()
+        assert "stopped worker" in rendered
+        assert "Input not delivered" in rendered
+        # display-only: the notice does not wake the root model.
+        assert not app.loop.step_delivery.has_pending_edge
+        (entry,) = app.loop.store.agent_notifications(pending_only=False)
+        assert entry.data["text"] == text
+    finally:
+        await await_or_fail(child_loop.close(), what="child loop close")
+        child_store.close()
+        await await_or_fail(app.loop.close(), what="root loop close")
 
 
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:

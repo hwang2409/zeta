@@ -163,7 +163,13 @@ class DispatchProgress:
         self._repeats = 0
 
     def admit(
-        self, store: Any, prepared: Any, flow: Any, retrying_context: bool
+        self,
+        store: Any,
+        prepared: Any,
+        flow: Any,
+        retrying_context: bool,
+        *,
+        waits_for_input: bool,
     ) -> str | ErrorInfo:
         """Return "dispatch", or stop with a typed error and keep the input pending."""
 
@@ -192,15 +198,25 @@ class DispatchProgress:
             not_delivered_text(
                 f"the model was called {MAX_REPEATED_DISPATCHES + 1} times with "
                 "the same request and nothing new was saved; stopped to avoid "
-                "repeat spend"
+                "repeat spend",
+                waits_for_input=waits_for_input,
             ),
         )
 
 
-def not_delivered_text(reason: str) -> str:
-    """Word every stop that holds input back (repeat bound, causal budget) alike."""
+def not_delivered_text(reason: str, *, waits_for_input: bool) -> str:
+    """Word every stop that holds input back (repeat bound, causal budget) alike.
 
-    return f"{reason}. Input not delivered: it is held and goes with the next message."
+    Only a loop that waits for more input (top level, or an explicit-finish
+    child) is sure to send the held input on; any other child may end first.
+    """
+
+    if waits_for_input:
+        return f"{reason}. Input not delivered: it is held and goes with the next message."
+    return (
+        f"{reason}. Input not delivered: it is held for the next message to this "
+        "agent and is lost if the agent ends first."
+    )
 
 
 def build_nudge_message() -> Message:

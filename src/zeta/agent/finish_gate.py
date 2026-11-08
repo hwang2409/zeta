@@ -518,7 +518,8 @@ async def _handle_pending_notification(
                     child_loop,
                     not_delivered_text(
                         f"the budget of {POST_CAP_CAUSAL_TURNS} automatic turns "
-                        "after the finish gate is used up"
+                        "after the finish gate is used up",
+                        waits_for_input=child_loop.explicit_finish,
                     ),
                 )
             return await state.wait_transition(child_loop, tasks_running=tasks_running)

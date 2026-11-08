@@ -758,6 +758,66 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
 
 
 @pytest.mark.asyncio
+async def test_held_input_notice_reaches_serve_as_display_only_child_idle(
+    tmp_path: Path,
+) -> None:
+    from zeta.runtime.loop.empty_turn import not_delivered_text
+
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    child_store = ConversationStore(tmp_path / "child")
+    child_loop: AgentLoop | None = None
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(reader, writer, 2, "new_session", {})
+        root_loop = server.runtime.loop
+        assert root_loop is not None
+        child_store.start_agent_lifecycle(
+            handle="root:1",
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=1,
+            agent_type="worker",
+            description="stopped worker",
+        )
+        child_loop = AgentLoop(
+            FakeBackend([]),
+            child_store,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+            background_owner=root_loop._background_owner,
+            agent_instance_id="root:1",
+            agent_depth=1,
+        )
+        child_loop.set_background_event_sink(root_loop._publish_background_event)
+        await await_or_fail(root_loop._ensure_step_delivery(), what="root flow")
+        text = not_delivered_text("budget used up", waits_for_input=False)
+        await await_or_fail(
+            root_loop._background_owner.conversation_channel.publish_not_delivered(
+                child_loop, text
+            ),
+            what="notice publication",
+        )
+
+        frame = json.loads(await _read_raw(reader))
+        assert frame["params"]["event"] == "child_idle"
+        assert frame["params"]["data"]["child_instance_id"] == "root:1"
+        assert frame["params"]["data"]["text"] == text
+        # the notice starts no root turn.
+        assert backend.calls == []
+    finally:
+        if child_loop is not None:
+            await await_or_fail(child_loop.close(), what="child loop close")
+        child_store.close()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_detached_turn_uses_current_controller_projection(tmp_path: Path) -> None:
     backend = _GatedBackend()
     server = ZetaServer(
