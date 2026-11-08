@@ -14,7 +14,7 @@ from ._pending_prompts import PendingPromptWriterReloadedError
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
-    from ._log import InstalledEntriesDelta, _DetachedLogState
+    from ._log import InstalledEntriesDelta, PersistedAppend, _DetachedLogState
     from ._store import ConversationStore
 
 
@@ -166,7 +166,7 @@ class AsyncDurableWritesMixin:
                 (len(writer._entries), writer._entry_prefix_digest)
                 == delta.expected_baseline
                 and (writer._log_identity, writer._log_offset) == delta.expected_log
-                and writer._accept_incremental_entries(delta.entries)
+                and self._accept_worker_alignment_delta(writer, delta.entries)
             )
             if not aligned:
                 break
@@ -181,6 +181,17 @@ class AsyncDurableWritesMixin:
         replacement = self._new_persistent_durable_writer()
         self._durable_writer = replacement
         return replacement
+
+    @staticmethod
+    def _accept_worker_alignment_delta(
+        writer: ConversationStore, entries: tuple[ConversationEntry, ...]
+    ) -> bool:
+        """Destructively advance a worker that will be discarded on rejection."""
+        for entry in entries:
+            if not writer._accept_incremental_entry(entry):
+                return False
+        writer._record_client_delivery_entries(entries)
+        return True
 
     def _new_persistent_durable_writer(self: ConversationStore) -> ConversationStore:
         with self._durable_write_condition:
@@ -197,7 +208,6 @@ class AsyncDurableWritesMixin:
             _storage_lease=self._storage_lease,
             _execution_lease=self.execution_lease,
         )
-        writer._discard_on_incremental_validation_failure = True
         return writer
 
     def _run_durable_write(
@@ -323,6 +333,52 @@ class AsyncDurableWritesMixin:
             previous = entry
         return True
 
+    def _proven_bounded_durable_delta(
+        self: ConversationStore,
+        method_name: str,
+        writer: ConversationStore,
+        receipts: tuple[PersistedAppend, ...] | None,
+        writer_baseline: tuple[int, bytes],
+        baseline: tuple[int, bytes],
+        owner_log: tuple[tuple[int, int, int], int],
+        reloaded: bool,
+    ) -> _DurableLogDelta | None:
+        owner_identity, owner_offset = owner_log
+        unchanged_read_proven = (
+            method_name in {"_stage_delivery_request", "_warm_step_delivery_writer"}
+            and receipts == ()
+            and not reloaded
+            and writer_baseline == baseline
+            and (len(writer._entries), writer._entry_prefix_digest) == writer_baseline
+            and (writer._log_identity, writer._log_offset) == owner_log
+            and writer._log_metadata_matches()
+        )
+        receipt_suffix_proven = bool(
+            not reloaded
+            and receipts
+            and receipts[0].start_offset == owner_offset
+            and (receipts[0].source_device, receipts[0].source_inode)
+            == owner_identity[:2]
+            and self._worker_prefix_matches_baseline(
+                writer._entries, writer_baseline, baseline
+            )
+        )
+        if not (unchanged_read_proven or receipt_suffix_proven):
+            return None
+
+        suffix = tuple(writer._entries[baseline[0] :])
+        if len(suffix) > 64 or not self._linear_suffix(writer._entries, baseline[0]):
+            return None
+        return _DurableLogDelta(
+            entries=self._owned_installed_delta(suffix),
+            installed_delta=self._owned_installed_delta(suffix),
+            entry_prefix_digest=writer._entry_prefix_digest,
+            log_identity=writer._log_identity,
+            log_offset=writer._log_offset,
+            log_mtime_ns=writer._log_mtime_ns,
+            log_prefix_fingerprint=writer._log_prefix_fingerprint,
+        )
+
     def _run_durable_write_with_delta(
         self: ConversationStore,
         method_name: str,
@@ -334,44 +390,17 @@ class AsyncDurableWritesMixin:
         result, writer, receipts, writer_baseline, reloaded = self._run_durable_write(
             method_name, args, kwargs
         )
-        owner_identity, owner_offset = owner_log
-        unchanged_read = (
-            method_name in {"_stage_delivery_request", "_warm_step_delivery_writer"}
-            and receipts == ()
-            and not reloaded
-            and writer_baseline == baseline
-            and (len(writer._entries), writer._entry_prefix_digest) == writer_baseline
-            and (writer._log_identity, writer._log_offset) == owner_log
-            and writer._log_metadata_matches()
+        delta = self._proven_bounded_durable_delta(
+            method_name,
+            writer,
+            receipts,
+            writer_baseline,
+            baseline,
+            owner_log,
+            reloaded,
         )
-        starts_at_owner_prefix = bool(
-            receipts
-            and receipts[0].start_offset == owner_offset
-            and (receipts[0].source_device, receipts[0].source_inode)
-            == owner_identity[:2]
-        )
-        if unchanged_read or (
-            not reloaded
-            and starts_at_owner_prefix
-            and self._worker_prefix_matches_baseline(
-                writer._entries, writer_baseline, baseline
-            )
-        ):
-            suffix = tuple(writer._entries[baseline[0] :])
-            if len(suffix) <= 64 and self._linear_suffix(writer._entries, baseline[0]):
-                return (
-                    result,
-                    _DurableLogDelta(
-                        entries=self._owned_installed_delta(suffix),
-                        installed_delta=self._owned_installed_delta(suffix),
-                        entry_prefix_digest=writer._entry_prefix_digest,
-                        log_identity=writer._log_identity,
-                        log_offset=writer._log_offset,
-                        log_mtime_ns=writer._log_mtime_ns,
-                        log_prefix_fingerprint=writer._log_prefix_fingerprint,
-                    ),
-                    receipts,
-                )
+        if delta is not None:
+            return result, delta, receipts
 
         state = writer._snapshot_log_state()
         delta = self._installed_delta_from_baseline(state.entries, baseline)
