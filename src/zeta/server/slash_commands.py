@@ -322,7 +322,9 @@ class ServerSlashSession:
             parts[0],
             child_run_id,
             parent_store=(
-                self._runtime.opened.store if self._runtime.opened is not None else None
+                self._runtime.opened.store
+                if self._runtime.opened is not None
+                else None
             ),
             memory_reconciler=(
                 self._runtime.loop.memory_reconciler
