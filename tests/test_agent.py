@@ -10619,8 +10619,9 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     await asyncio.sleep(0)
     assert not task.done()
     release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    result = await await_or_fail(task, what="committed agent_send result")
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("queued a follow-up")
 
     assert [
         entry.data["text"]
