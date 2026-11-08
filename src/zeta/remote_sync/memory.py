@@ -28,7 +28,7 @@ from ..memory.entry_sync import (
     select_resolution_choices,
 )
 from ..memory.entry_views import GENERATED_MIRROR_HEADER
-from ..project_errors import UnsupportedMemoryFormatError
+from ..project_errors import ProjectRegistryBusyError, UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from ..runtime.project_registry_state import project_registry
@@ -402,10 +402,12 @@ def fetch_local_project(
                 ):
                     raise RemoteSyncError(f"memory file {name} is too large")
             pinned = _pin_project_snapshot(project)
+    except ProjectRegistryBusyError as exc:
+        raise RemoteSyncError(f"project registry busy on {peer}; retry") from exc
     except ProjectRegistryError as exc:
         if isinstance(exc.__cause__, FileNotFoundError):
             return _MISSING
-        raise RemoteSyncError(f"project registry busy on {peer}; retry") from exc
+        raise RemoteSyncError(f"invalid project on {peer}: {exc}") from exc
 
     _copy_pinned_project_snapshot(pinned, destination)
     return project_digest(destination)

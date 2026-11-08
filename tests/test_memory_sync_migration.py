@@ -346,12 +346,15 @@ async def test_public_migration_end_to_end_with_real_content(
     first = tmp_path / "home"
     second = tmp_path / "second"
     workspace = tmp_path / "workspace"
-    registry, project_id, original_contents = _legacy_fixture(tmp_path)
+    registry, project_id, original_contents = await asyncio.to_thread(
+        _legacy_fixture, tmp_path
+    )
     monkey_home = os.environ.get("ZETA_HOME")
     os.environ["ZETA_HOME"] = str(first)
     try:
         assert (
-            project_cli.run(
+            await asyncio.to_thread(
+                project_cli.run,
                 _cli_args(project_id, remote="migrate"),
                 stdout=io.StringIO(),
                 stderr=io.StringIO(),
@@ -409,6 +412,31 @@ async def test_public_migration_end_to_end_with_real_content(
     runner.before_eviction(1, 1)
     await runner.drain()
     await runner.close()
+    # Each public surface below runs off the event loop in production.
+    await asyncio.to_thread(
+        _assert_migrated_public_surfaces, registry, project_id, first, workspace
+    )
+    pushed = await asyncio.to_thread(
+        push_project_memory,
+        first,
+        LocalTransport(second),
+        project_id=project_id,
+    )
+    assert pushed.conflicts == ()
+    second_registry = await asyncio.to_thread(ProjectRegistry, second / "projects")
+    assert await asyncio.to_thread(second_registry.memory_format, project_id) == 2
+
+    await asyncio.to_thread(registry.rollback_memory_migration, project_id)
+    assert await asyncio.to_thread(registry.memory_format, project_id) == 1
+    assert (
+        dict(await asyncio.to_thread(registry.load_memory, project_id))
+        == original_contents
+    )
+
+
+def _assert_migrated_public_surfaces(
+    registry: ProjectRegistry, project_id: str, first: Path, workspace: Path
+) -> None:
     entry_id = next(
         entry.id
         for entry in registry._entry_memory_state(project_id).state.entries.values()
@@ -454,18 +482,6 @@ async def test_public_migration_end_to_end_with_real_content(
         features=frozenset({"projects-memory-v2"}),
     )
     assert shown["memory"]["profile"] == "zeta"
-    pushed = await asyncio.to_thread(
-        push_project_memory,
-        first,
-        LocalTransport(second),
-        project_id=project_id,
-    )
-    assert pushed.conflicts == ()
-    assert ProjectRegistry(second / "projects").memory_format(project_id) == 2
-
-    registry.rollback_memory_migration(project_id)
-    assert registry.memory_format(project_id) == 1
-    assert dict(registry.load_memory(project_id)) == original_contents
 
 
 def test_messaging_profile_correction_completion_and_expiry_matrix() -> None:
@@ -579,6 +595,7 @@ def test_entry_sync_refuses_mixed_formats_without_mutation(tmp_path: Path) -> No
     target = second / "projects" / project_id
     target.mkdir(mode=0o700)
     (target / "project.json").write_bytes(source_record.read_bytes())
+    (target / "project.json").chmod(0o600)
     (target / "memory").mkdir(mode=0o700)
 
     local_before = _tree_snapshot(first / "projects" / project_id)
@@ -608,7 +625,7 @@ def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str
 async def test_inflight_format_one_reconciliation_during_migration(
     tmp_path: Path, retained_test_writers: None
 ) -> None:
-    registry, project_id, _ = _legacy_fixture(tmp_path)
+    registry, project_id, _ = await asyncio.to_thread(_legacy_fixture, tmp_path)
     home = tmp_path / "home"
     session_dir = home / "sessions" / ("b" * 32)
     session_dir.mkdir(parents=True)
@@ -668,16 +685,20 @@ async def test_inflight_format_one_reconciliation_during_migration(
     await drain
     await runner.close()
 
-    assert registry.memory_format(project_id) == 2
-    snapshot = registry._entry_memory_state(project_id)
+    assert await asyncio.to_thread(registry.memory_format, project_id) == 2
+    snapshot = await asyncio.to_thread(registry._entry_memory_state, project_id)
     assert snapshot.state.project_id == project_id
     assert "in-flight format one write" not in {
         entry.text
         for entry in snapshot.state.entries.values()
         if isinstance(entry, MemoryEntry)
     }
-    plan = registry._migrate_memory_for_test(
-        project_id, migrated_at="2026-10-10T00:00:00Z"
+    plan = await asyncio.to_thread(
+        partial(
+            registry._migrate_memory_for_test,
+            project_id,
+            migrated_at="2026-10-10T00:00:00Z",
+        )
     )
     assert snapshot.state == plan.state
     assert all(
@@ -871,6 +892,8 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
             path.read_bytes() if path.is_file() else b"",
         )
         for path in sorted(root.rglob("*"))
+        # Named project lock files carry no state; acquiring authority creates them.
+        if not (path.parent == root and path.name.endswith(".lock"))
     }
 
 
@@ -938,16 +961,30 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    registry = ProjectRegistry(home / "projects")
-    project = registry.create_project("test", "test", workspace)
-    registry.initialize_memory(project.project_id)
+    registry = await asyncio.to_thread(ProjectRegistry, home / "projects")
+    project = await asyncio.to_thread(
+        registry.create_project, "test", "test", workspace
+    )
+    await asyncio.to_thread(registry.initialize_memory, project.project_id)
     project_id = project.project_id
     remote = tmp_path / "remote"
     before = {
-        "local": _format_snapshot(home),
-        "remote": _format_snapshot(remote),
+        "local": await asyncio.to_thread(_format_snapshot, home),
+        "remote": await asyncio.to_thread(_format_snapshot, remote),
     }
     monkeypatch.setenv("ZETA_HOME", str(home))
+
+    def accept_automatic_fixture() -> None:
+        current = registry.memory_snapshot(project_id)
+        registry.compare_and_swap_memory(
+            project_id,
+            expected_digest=current.digest,
+            updates={"state.md": "# Current state\n\nautomatic\n"},
+            provenance={"session_id": "fixture", "seq_start": 1, "seq_end": 1},
+        )
+
+    def run_cli(args: argparse.Namespace) -> int:
+        return project_cli.run(args, stdout=io.StringIO(), stderr=io.StringIO())
 
     if entry_point.startswith("cli-"):
         args = _cli_args(project_id)
@@ -958,33 +995,21 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             source.write_text("# Current state\n\nfrom file\n")
             args.from_file = [["state.md", str(source)]]
         elif entry_point == "cli-accept":
-            current = registry.memory_snapshot(project_id)
-            registry.compare_and_swap_memory(
-                project_id,
-                expected_digest=current.digest,
-                updates={"state.md": "# Current state\n\nautomatic\n"},
-                provenance={"session_id": "fixture", "seq_start": 1, "seq_end": 1},
-            )
+            await asyncio.to_thread(accept_automatic_fixture)
             args = _cli_args("accept", remote="state.md", directory=str(workspace))
             monkeypatch.chdir(workspace)
         with patch.object(MemoryMutationAuthorization, "authorize", return_value=None):
-            assert (
-                project_cli.run(args, stdout=io.StringIO(), stderr=io.StringIO()) == 0
-            )
+            assert await asyncio.to_thread(run_cli, args) == 0
     elif entry_point.startswith(("tui-", "serve-")):
         action = entry_point.split("-", 1)[1]
         if action == "undo":
-            registry.update_memory(
-                project_id, {"state.md": "# Current state\n\nundo target\n"}
+            await asyncio.to_thread(
+                registry.update_memory,
+                project_id,
+                {"state.md": "# Current state\n\nundo target\n"},
             )
         elif action == "accept":
-            current = registry.memory_snapshot(project_id)
-            registry.compare_and_swap_memory(
-                project_id,
-                expected_digest=current.digest,
-                updates={"state.md": "# Current state\n\nautomatic\n"},
-                provenance={"session_id": "fixture", "seq_start": 1, "seq_end": 1},
-            )
+            await asyncio.to_thread(accept_automatic_fixture)
             action = "accept state.md"
         if entry_point.startswith("tui-"):
             tui = SimpleNamespace(
@@ -1021,8 +1046,11 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             LocalTransport(remote),
             project_id=project_id,
         )
-        ProjectRegistry(remote / "projects").update_memory(
-            project_id, {"state.md": "# Current state\n\nremote\n"}
+        remote_registry = await asyncio.to_thread(ProjectRegistry, remote / "projects")
+        await asyncio.to_thread(
+            remote_registry.update_memory,
+            project_id,
+            {"state.md": "# Current state\n\nremote\n"},
         )
         await asyncio.to_thread(
             pull_project_memory,
@@ -1038,7 +1066,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             scope="scope",
             canonical_integration_root=str(tmp_path / "created"),
         )
-        assert project_cli.run(args, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+        assert await asyncio.to_thread(run_cli, args) == 0
     elif entry_point == "project-init":
         new_workspace = tmp_path / "initialized"
         new_workspace.mkdir()
@@ -1049,7 +1077,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             name="initialized",
             scope="scope",
         )
-        assert project_cli.run(args, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+        assert await asyncio.to_thread(run_cli, args) == 0
     else:
         session_dir = home / "sessions" / ("a" * 32)
         session_dir.mkdir(parents=True)
@@ -1096,8 +1124,8 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
         await runner.close()
 
     after = {
-        "local": _format_snapshot(home),
-        "remote": _format_snapshot(remote),
+        "local": await asyncio.to_thread(_format_snapshot, home),
+        "remote": await asyncio.to_thread(_format_snapshot, remote),
     }
     assert set(before["local"]).issubset(after["local"])
     assert after["local"][project_id] == 1
@@ -1514,7 +1542,7 @@ def test_memory_sync_does_not_replace_project_directory(tmp_path: Path) -> None:
             super().publish_project(
                 project_id, snapshot, expected_digest=expected_digest
             )
-            concurrent.parent.mkdir()
+            concurrent.parent.mkdir(exist_ok=True)
             concurrent.write_text('{"kept": true}\n', encoding="utf-8")
 
     push_project_memory(first, ConcurrentWriter(second), project_id=project_id)
