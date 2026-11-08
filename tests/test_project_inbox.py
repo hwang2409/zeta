@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import io
 import json
+import multiprocessing
 import os
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -34,6 +36,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
+from zeta.tools.registry import ToolRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +46,26 @@ def _retain_async_test_writer(tmp_path: Path, request: pytest.FixtureRequest):
         return
     with open_writer(tmp_path / ".zeta"):
         yield
+
+
+def _stale_tracker_writer(
+    sessions_root: str,
+    session_id: str,
+    target_project: str,
+    connection,
+) -> None:
+    tracker = SentMessageTracker(Path(sessions_root), session_id)
+    connection.send("loaded")
+    connection.recv()
+    try:
+        tracker.record("d" * 32, target_project)
+        tracker.mark_reported((("a" * 32, "done"),))
+    except Exception as exc:  # noqa: BLE001 - process result is asserted by parent
+        connection.send(f"{type(exc).__name__}: {exc}")
+    else:
+        connection.send(tracker.health()["state"])
+    finally:
+        connection.close()
 
 
 def _projects(tmp_path: Path):
@@ -1517,3 +1540,125 @@ def test_broken_sent_ledger_transitions_to_loaded_and_missing(tmp_path: Path) ->
     ledger.unlink()
     assert tracker.health()["state"] == "healthy"
     assert tracker.records() == ()
+
+
+def test_stale_loaded_process_adopts_broken_ledger_without_republishing(
+    tmp_path: Path,
+) -> None:
+    home, _registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    ledger = home / "sessions" / session_id / "project-inbox-sent.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "id": "a" * 32,
+                        "target_project": project_a.project_id,
+                        "created_at": "2026-01-01T00:00:00.000000Z",
+                        "reported": [],
+                    }
+                ],
+            }
+        )
+    )
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(
+        target=_stale_tracker_writer,
+        args=(str(home / "sessions"), session_id, project_b.project_id, child),
+    )
+    process.start()
+    child.close()
+    corrupt = b'{"schema_version":1,"records":"broken"}'
+    try:
+        assert parent.poll(10), "stale writer did not load the healthy ledger"
+        assert parent.recv() == "loaded"
+        ledger.write_bytes(corrupt)
+        parent.send("write")
+        assert parent.poll(10), "stale writer did not finish"
+        result = parent.recv()
+        process.join(10)
+        assert process.exitcode == 0
+        assert result == "broken"
+        assert ledger.read_bytes() == corrupt
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(10)
+        parent.close()
+        process.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_activation_reads_broken_ledger_off_owner_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, projects, project_a, _project_b = _projects(tmp_path)
+    store = ConversationStore(
+        home / "sessions", session_id="a" * 32, cwd=tmp_path
+    )
+    ledger = store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project_a.project_id,
+        project_registry=projects,
+        inbox_enabled=True,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    tracker_module = sys.modules[SentMessageTracker.__module__]
+    real_read = tracker_module.read_session_file
+    read_entered = threading.Event()
+    release_read = threading.Event()
+    owner_progress = threading.Event()
+    progress_before_release: list[bool] = []
+
+    def gated_read(*args, **kwargs):
+        read_entered.set()
+        assert release_read.wait(timeout=10)
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(tracker_module, "read_session_file", gated_read)
+
+    def release_after_owner_progress() -> None:
+        assert read_entered.wait(timeout=10)
+        progressed = owner_progress.wait(timeout=5)
+        progress_before_release.append(progressed)
+        release_read.set()
+
+    releaser = threading.Thread(target=release_after_owner_progress)
+    releaser.start()
+    activation = asyncio.create_task(loop.activate())
+    try:
+        await asyncio.sleep(0)
+        owner_progress.set()
+        activation_error = None
+        try:
+            await asyncio.wait_for(activation, 10)
+        except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
+            activation_error = exc
+        await asyncio.to_thread(releaser.join, 10)
+        assert activation_error is None
+        assert not releaser.is_alive()
+        assert progress_before_release == [True]
+        assert loop._inbox_scanner is not None
+        assert loop._inbox_scanner.tracker.health()["state"] == "broken"
+    finally:
+        release_read.set()
+        if not activation.done():
+            activation.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(activation, return_exceptions=True), 10
+            )
+        await loop.close()
+        store.close()

@@ -14,7 +14,14 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as ollama_messages
@@ -477,6 +484,100 @@ async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
         assert done["outcome"] == "complete"
         assert done["reply_id"] is None
         assert "done_at" in done
+    finally:
+        await registry.close()
+        store.close()
+
+@pytest.mark.asyncio
+async def test_corrupt_sent_ledger_keeps_every_model_inbox_action_available(
+    tmp_path: Path,
+) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
+    incoming_id = inbox.send(
+        from_project=beta.project_id,
+        from_session="b" * 32,
+        to_project=registry.project_id or "",
+        kind="question",
+        title="incoming",
+        body="answer me",
+    )
+    ledger = store.session_dir / "project-inbox-sent.json"
+    corrupt = b'{"schema_version":1,"records":"broken"}'
+    ledger.write_bytes(corrupt)
+    send_id = "c" * 32
+    try:
+        projects_result = await _inbox(registry, {"action": "projects"})
+        list_result = await _inbox(registry, {"action": "list"})
+        send_result = await _inbox(
+            registry,
+            {
+                "action": "send",
+                "project": beta.project_id,
+                "kind": "info",
+                "title": "outgoing",
+                "body": "body",
+                "id": send_id,
+            },
+        )
+        claim_result = await _inbox(
+            registry, {"action": "claim", "id": incoming_id}
+        )
+        assert claim_result.get("isError") is not True
+        done_result = await _inbox(
+            registry,
+            {
+                "action": "done",
+                "id": incoming_id,
+                "outcome": "answered",
+                "reply": "reply body",
+            },
+        )
+        reply_id = done_result["structuredContent"]["message"]["reply_id"]
+        store.append_message(
+            Message(
+                MessageRole.USER,
+                [TextContent("status")],
+                metadata={
+                    "zeta_event": "project_inbox_sent_status",
+                    "zeta.origin": MessageOrigin.HARNESS_NUDGE.value,
+                    "sent_statuses": [
+                        {"message_id": send_id, "status": "claimed"}
+                    ],
+                },
+            )
+        )
+        sent_result = await _inbox(registry, {"action": "sent"})
+
+        for result in (
+            projects_result,
+            list_result,
+            send_result,
+            done_result,
+            sent_result,
+        ):
+            assert result.get("isError") is not True
+        assert [
+            item["id"] for item in list_result["structuredContent"]["messages"]
+        ] == [incoming_id]
+        assert ledger.read_bytes() == corrupt
+        for result in (send_result, done_result):
+            structured = result["structuredContent"]
+            assert structured["sent_health"]["state"] == "broken"
+            assert structured["sent_health"]["history_complete"] is False
+            assert structured["sent_health"]["reason"] == "invalid_records"
+            warning = structured["warning"]
+            assert "history is incomplete" in warning
+            assert "file was not changed" in warning
+            assert "unless the repaired ledger includes their IDs" in warning
+        sent = sent_result["structuredContent"]
+        assert sent["history_complete"] is False
+        assert {item["id"] for item in sent["messages"]} == {send_id, reply_id}
+        send_row = next(item for item in sent["messages"] if item["id"] == send_id)
+        assert send_row["reported"] == ["claimed"]
     finally:
         await registry.close()
         store.close()
