@@ -10693,7 +10693,10 @@ async def test_app_surfaces_compacting_state_before_provider_output(
         return messages
 
     assembler.assemble = compacted_assemble  # type: ignore[method-assign]
-    assembler.needs_compaction = lambda: True  # type: ignore[method-assign]
+    async def prepare_context(**kwargs: object) -> bool:
+        return True
+
+    assembler.prepare_context = prepare_context  # type: ignore[method-assign]
     app._invalidate_prompt = lambda: states.append(app._loop_state)
 
     await app._consume_turn("prompt")
