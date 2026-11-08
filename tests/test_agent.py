@@ -14361,6 +14361,151 @@ def test_finish_tool_description_and_child_prompt_say_finish_ends_the_run(
     assert "summary" in description
 
 
+class _ParentTaskExplicitFinishBackend(CompletionBackend):
+    def __init__(self, command: str) -> None:
+        self.command = command
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        prompt = _last_user_prompt(messages)
+        results = {
+            message.tool_result.tool_call_id
+            for message in messages
+            if message.tool_result is not None
+        }
+        if prompt == "root" and "lead" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "lead",
+                        "agent",
+                        {
+                            "prompt": "lead",
+                            "description": "parent lead",
+                            "preset": "nested-lead",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif prompt == "lead" and "parent-task" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "parent-task",
+                        "run_background",
+                        {"command": self.command},
+                    )
+                )
+            ]
+        elif prompt == "lead" and "child" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "child",
+                        "agent",
+                        {
+                            "prompt": "child",
+                            "description": "explicit finisher",
+                            "preset": "nested-finisher",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif prompt == "child" and "finish" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "finish",
+                        "finish",
+                        {"status": "done", "summary": "child done"},
+                    )
+                )
+            ]
+        else:
+            blocks = [TextContent(f"{prompt} remains available")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_ignores_parent_run_background_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _ParentTaskExplicitFinishBackend(_python("import sys; sys.stdin.read()"))
+    store = ConversationStore(tmp_path)
+    catalog = _nested_handler_catalog()
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
+    loop.explicit_finish = True
+    finish_seen = asyncio.Event()
+    child_finished = asyncio.Event()
+    child_registries: list[ToolRegistry] = []
+    finish_result: ToolResult | None = None
+    original_clone = ToolRegistry.clone_for_session
+    original_unregister = loop._background_owner.unregister
+
+    def observe_clone(
+        registry: ToolRegistry, *args: object, **kwargs: object
+    ) -> ToolRegistry:
+        clone = original_clone(registry, *args, **kwargs)
+        child_registries.append(clone)
+        return clone
+
+    def observe_unregister(instance_id: str) -> None:
+        if loop._background_owner._descriptions.get(instance_id) == "explicit finisher":
+            child_finished.set()
+        original_unregister(instance_id)
+
+    def collect_event(event: StreamEvent) -> None:
+        nonlocal finish_result
+        if (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "finish"
+        ):
+            finish_result = event.tool_result
+            finish_seen.set()
+
+    monkeypatch.setattr(ToolRegistry, "clone_for_session", observe_clone)
+    monkeypatch.setattr(loop._background_owner, "unregister", observe_unregister)
+    loop.set_background_event_sink(collect_event)
+    try:
+        await _collect(loop.run_turn("root", origin=MessageOrigin.USER))
+        await await_or_fail(finish_seen.wait(), what="explicit child finish result")
+        assert finish_result is not None
+        assert finish_result.content == "finish accepted; no more work or prose is needed"
+        await await_or_fail(child_finished.wait(), what="explicit child completion")
+        assert len(child_registries) == 2
+        lead_registry = child_registries[0]
+        assert any(task.running for task in lead_registry.background_tasks.snapshot())
+    finally:
+        await loop.close()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_explicit_finish_background_child_preserves_report_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
