@@ -1331,7 +1331,7 @@ async def test_missing_project_root_is_not_recreated_during_transaction(
         # test-contract: durability the project root must stay absent
         assert not project.exists()
         assert snapshot.entries == ()
-        with pytest.raises(MCPManagementError, match="project scope"):
+        with pytest.raises(MCPManagementError, match="project directory no longer exists"):
             await manager.add("missing", scope="project", command=sys.executable)
     finally:
         await manager.aclose()
@@ -1355,7 +1355,7 @@ async def test_transaction_refuses_project_recreated_after_lock_decision(
             raise AssertionError("transaction was not released")
         return result
 
-    # test-contract: recreate the root only after the first transaction skips its lock
+    # test-contract: seam recreate the root only after the first transaction skips its lock
     monkeypatch.setattr(manager, "_acquire_locks", pause_after_lock_decision)
     transaction = asyncio.create_task(
         manager.add("unlocked", scope="project", command=sys.executable)
@@ -1365,7 +1365,7 @@ async def test_transaction_refuses_project_recreated_after_lock_decision(
         project.mkdir()
         await writer.add("concurrent", scope="project", command=sys.executable)
         release.set()
-        with pytest.raises(MCPManagementError, match="project scope"):
+        with pytest.raises(MCPManagementError, match="project directory no longer exists"):
             await asyncio.wait_for(transaction, 10)
         assert (await writer.resolve("concurrent", scope="project")).name == "concurrent"
         with pytest.raises(MCPManagementError, match="unknown MCP server"):

@@ -241,6 +241,13 @@ class MCPManagementService:
         if self._closed.is_set():
             raise MCPManagementClosedError("MCP management service is closed")
 
+    def _no_project_error(self) -> MCPManagementError:
+        if self.project_dir is None:
+            return MCPManagementError("project scope requires a repository")
+        return MCPManagementError(
+            "project directory no longer exists; cannot write MCP config"
+        )
+
     def _project_root_for_path(self, path: Path) -> Path | None:
         if self.project_dir is None:
             return None
@@ -256,15 +263,11 @@ class MCPManagementService:
         project_root = self._project_root_for_path(path)
         if project_root is not None:
             if not project_root.is_dir():
-                raise MCPManagementError(
-                    "project directory no longer exists; cannot write MCP config"
-                )
+                raise self._no_project_error()
             try:
                 path.parent.mkdir(parents=False, exist_ok=True)
             except FileNotFoundError as exc:
-                raise MCPManagementError(
-                    "project directory no longer exists; cannot write MCP config"
-                ) from exc
+                raise self._no_project_error() from exc
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_open()
@@ -710,7 +713,7 @@ class MCPManagementService:
         ) -> None:
             path = project_path if scope == "project" else home_path
             if path is None:
-                raise MCPManagementError("project scope requires a repository")
+                raise self._no_project_error()
             document = self._read_object(path)
             servers = copy.deepcopy(self._servers(document, path))
             change(servers)
@@ -790,7 +793,7 @@ class MCPManagementService:
     async def set_trusted(self, name: str, *, trusted: bool) -> _MCPManagerView:
         def mutate(_home: Path, project_path: Path | None, trust_path: Path) -> None:
             if project_path is None:
-                raise MCPManagementError("project scope requires a repository")
+                raise self._no_project_error()
             project = self._servers(self._read_object(project_path), project_path)
             raw = project.get(name)
             if type(raw) is not dict:
