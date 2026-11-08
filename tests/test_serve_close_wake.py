@@ -56,7 +56,7 @@ class BlockedStream:
         try:
             yield StreamEvent(StreamEventType.MESSAGE_START)
             self.streaming.set()
-            await self.release.wait()
+            await asyncio.wait_for(self.release.wait(), 60)  # hang guard only
         finally:
             if not self.release.is_set():
                 self.ended.set()
@@ -75,7 +75,7 @@ class BlockedOllama(httpx.AsyncByteStream):
         line = {"message": {"role": "assistant", "content": "."}, "done": False}
         yield json.dumps(line).encode() + b"\n"
         self.streaming.set()
-        await self.release.wait()
+        await asyncio.wait_for(self.release.wait(), 60)  # hang guard only
 
     async def aclose(self) -> None:
         if not self.release.is_set():
