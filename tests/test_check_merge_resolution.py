@@ -1070,6 +1070,29 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     assert run(r, "--pr-body-file", str(body)).returncode == 1
 
 
+def test_pr_line_group_marker_uses_only_final_unresolved_rows(tmp_path: Path) -> None:
+    r = tmp_path / "partial_final_restore"
+    r.mkdir()
+    merge, final = _public_line_case(
+        r,
+        "def f():\n    one()\n",
+        "def f():\n    one()\n    emit()\n    emit()\n",
+        "def f():\n    one()\n",
+        "def f():\n    one()\n",
+        "def f():\n    one()\n    emit()\n",
+    )
+    result = run(r, merge, "--final", final)
+    printed = next(
+        line.removeprefix("suggested override: ")
+        for line in result.stdout.splitlines()
+        if line.startswith("suggested override: ")
+    )
+    body = tmp_path / "body"
+    body.write_text(f"{printed[:-8]}intentional partial restore\n")
+
+    assert run(r, merge, "--final", final, "--pr-body-file", str(body)).returncode == 0
+
+
 @pytest.mark.parametrize(
     ("shape", "expected", "refusal"),
     [

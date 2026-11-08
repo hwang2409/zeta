@@ -1210,9 +1210,9 @@ def main() -> int:
         _element_findings(old_items, main_items, branch_items, merge_items, unresolved)
     )
     findings.extend(line_findings)
-    findings = _filter_findings(findings, text)
     if final_revision:
         findings = _report_final_moves(findings, final_items, final_lines)
+    findings = _filter_findings(findings, text)
     if findings:
         for finding in findings:
             _render_finding(finding, main_items, branch_items, merge_items)
