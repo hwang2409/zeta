@@ -15972,6 +15972,7 @@ async def test_account_lock_exhaustion_keeps_child_alive_for_follow_up(
             error_message=str,
         )
     )
+    follow_up: asyncio.Task[bool] | None = None
     try:
         await await_or_fail(backend.exhausted.wait(), what="account retries exhausted")
         produced = await channel.produce_to(
@@ -15983,16 +15984,35 @@ async def test_account_lock_exhaustion_keeps_child_alive_for_follow_up(
             ),
         )
         assert produced is not None
-        await await_or_fail(
-            backend.follow_up_succeeded.wait(), what="successful child follow-up"
+        follow_up = asyncio.create_task(
+            await_or_fail(
+                backend.follow_up_succeeded.wait(), what="successful child follow-up"
+            )
         )
+        done, _ = await await_or_fail(
+            asyncio.wait(
+                {follow_up, run},
+                timeout=10,
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
+            what="child follow-up or terminal result",
+        )
+        assert follow_up in done, "child terminated before the follow-up succeeded"
+        assert follow_up.result() is True
         assert backend.calls == 6
         assert not run.done()
         assert store.agent_lifecycle()["state"] in {"running", "idle"}
     finally:
-        run.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await await_or_fail(run, what="cancelled child run")
+        if follow_up is not None and not follow_up.done():
+            follow_up.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(follow_up, what="cancelled follow-up waiter")
+        if not run.done():
+            run.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(run, what="cancelled child run")
+        elif not run.cancelled():
+            run.exception()
         channel.unregister_loop("root:1")
         await loop.close()
 
