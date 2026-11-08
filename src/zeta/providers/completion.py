@@ -247,6 +247,7 @@ class CompletionControl:
     abort: AbortSignal | None
     reset: ResetPolicy
     budget: CompletionRetryBudget
+    task_deadline: float | None
 
 
 class ProviderAttempt(Protocol):
@@ -265,6 +266,24 @@ class AuthCapableProviderAttempt(ProviderAttempt, Protocol):
 _ACTIVITY_REPORTER: ContextVar[Callable[[TransportActivity], None] | None] = (
     ContextVar("provider_activity_reporter", default=None)
 )
+_ACTIVE_TASK_DEADLINE: ContextVar[float | None | Callable[[], float | None]] = ContextVar(
+    "completion_task_deadline", default=None
+)
+
+
+def active_task_deadline() -> float | None:
+    deadline = _ACTIVE_TASK_DEADLINE.get()
+    return deadline() if callable(deadline) else deadline
+
+
+def set_active_task_deadline(
+    deadline: float | None | Callable[[], float | None],
+) -> object:
+    return _ACTIVE_TASK_DEADLINE.set(deadline)
+
+
+def reset_active_task_deadline(token: object) -> None:
+    _ACTIVE_TASK_DEADLINE.reset(token)  # type: ignore[arg-type]
 
 
 def report_transport_activity(
@@ -458,6 +477,10 @@ class CompletionCleanupError(RuntimeError):
     """Closing a successful provider attempt failed."""
 
 
+class TaskDeadlineExceeded(TimeoutError):
+    """The enclosing finish-gate task deadline expired."""
+
+
 class ProviderStallError(RuntimeError):
     retryable = True
     retry_reason = "stream_stall"
@@ -509,6 +532,13 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._maximum_progress_gap = 0.0
         self._retry_usage: dict[str, Any] | None = None
 
+    def _task_deadline(self) -> float | None:
+        return (
+            self._control.task_deadline
+            if self._control.task_deadline is not None
+            else active_task_deadline()
+        )
+
     def __aiter__(self) -> CompletionRun:
         return self
 
@@ -553,9 +583,17 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 raise error
             except BaseException as error:
                 if isinstance(error, asyncio.CancelledError):
+                    deadline = self._task_deadline()
+                    if deadline is not None and self._clock.now() >= deadline:
+                        current = asyncio.current_task()
+                        if current is not None:
+                            current.uncancel()
+                        error = TaskDeadlineExceeded(
+                            "finish-gate task safety bound expired"
+                        )
                     await self._finish_attempt(error)
                     self._closed = True
-                    raise
+                    raise error
                 context = getattr(error, "diagnostic_context", None)
                 if isinstance(context, dict):
                     context["max_progress_gap_s"] = self._maximum_progress_gap
@@ -619,7 +657,13 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._model_deadline = now + self._model_idle
 
     async def _read_signal(self, attempt: ProviderAttempt) -> AttemptSignal:
-        deadline = min(self._transport_deadline, self._model_deadline)
+        deadline = min(
+            self._transport_deadline,
+            self._model_deadline,
+            self._task_deadline()
+            if self._task_deadline() is not None
+            else float("inf"),
+        )
         read_task = asyncio.create_task(attempt.__anext__())
         timer_task = asyncio.create_task(self._clock.wait_until(deadline))
         try:
@@ -628,6 +672,12 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             )
             if read_task in done:
                 return read_task.result()
+            if (
+                self._task_deadline() is not None
+                and self._task_deadline() <= self._transport_deadline
+                and self._task_deadline() <= self._model_deadline
+            ):
+                raise TaskDeadlineExceeded("finish-gate task safety bound expired")
             kind = (
                 "model progress"
                 if self._model_deadline < self._transport_deadline
@@ -811,7 +861,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         if attempt is None:
             return
         try:
-            await attempt.aclose()
+            await self._close_attempt(attempt)
         except BaseException as cleanup_error:
             primary_error = primary if isinstance(primary, BaseException) else None
             producer_error = getattr(attempt, "_producer_error", None)
@@ -856,6 +906,27 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     }
                 )
             raise selected
+
+    async def _close_attempt(self, attempt: ProviderAttempt) -> None:
+        close_task = asyncio.create_task(attempt.aclose())
+        deadline = self._task_deadline()
+        if deadline is None:
+            await close_task
+            return
+        timer_task = asyncio.create_task(self._clock.wait_until(deadline))
+        try:
+            done, _ = await asyncio.wait(
+                (close_task, timer_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if timer_task in done and close_task not in done:
+                close_task.cancel()
+                await self._drain_preserving_cancellation(close_task)
+                raise TaskDeadlineExceeded("finish-gate task safety bound expired")
+            await close_task
+        finally:
+            if not timer_task.done():
+                timer_task.cancel()
+            await self._drain_preserving_cancellation(timer_task)
 
     async def aclose(self) -> None:
         if self._closed and self._attempt is None:

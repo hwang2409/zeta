@@ -78,6 +78,7 @@ from ...providers.completion import (
     CompletionRetryBudget,
     CompletionRun,
     ResetPolicy,
+    active_task_deadline,
 )
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
@@ -942,6 +943,7 @@ class AgentLoop(
                             else ResetPolicy.NO_RESET
                         ),
                         budget=provider_retry_budget,
+                        task_deadline=active_task_deadline(),
                     ),
                 )
                 has_active_delivery = prepared_delivery.has_active_delivery

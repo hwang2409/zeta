@@ -606,6 +606,7 @@ class CompactionPolicy:
                         abort=None,
                         reset=ResetPolicy.NO_RESET,
                         budget=CompletionRetryBudget(),
+                        task_deadline=None,
                     ),
                 )
                 async for event in completion:

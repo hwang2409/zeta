@@ -13,6 +13,7 @@ from ..protocol.types import (
     StreamEvent,
     harness_notice,
 )
+from ..providers.completion import reset_active_task_deadline, set_active_task_deadline
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -224,6 +225,7 @@ class FinishGateState:
             deadline = min(deadline, self._task_deadline())
         registry = owner.causal_episodes
         token = registry.enter(episode)
+        deadline_token = set_active_task_deadline(self._task_deadline)
         try:
             async with asyncio.timeout_at(deadline):
                 try:
@@ -231,8 +233,15 @@ class FinishGateState:
                 finally:
                     close = getattr(events, "aclose", None)
                     if close is not None:
-                        await close()
+                        close_task = asyncio.create_task(close())
+                        if loop.time() >= self._task_deadline():
+                            close_task.cancel()
+                            await asyncio.gather(close_task, return_exceptions=True)
+                        else:
+                            await close_task
         except TimeoutError:
+            if task_running_at_entry and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if flow is not None and (
                 await flow.admit_terminal("finish_gate_timeout")
@@ -247,6 +256,7 @@ class FinishGateState:
                 task_running=task_registry.running_count > 0,
             )
         finally:
+            reset_active_task_deadline(deadline_token)
             registry.leave(token)
         task_existed = (
             task_running_at_entry
@@ -281,6 +291,8 @@ class FinishGateState:
         loop = asyncio.get_running_loop()
         deadline = self._task_deadline() if tasks_running else self._child_deadline()
         if loop.time() >= deadline:
+            if tasks_running and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if flow is not None and (
                 await flow.admit_terminal("finish_gate_timeout")
@@ -293,6 +305,8 @@ class FinishGateState:
                     child_loop.agent_instance_id or ""
                 )
         except TimeoutError:
+            if tasks_running and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if flow is not None and (
                 await flow.admit_terminal("finish_gate_timeout")

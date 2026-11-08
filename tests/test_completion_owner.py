@@ -144,6 +144,7 @@ def _control(
         abort=None,
         reset=reset,
         budget=budget or CompletionRetryBudget(),
+        task_deadline=None,
     )
 
 
