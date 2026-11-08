@@ -1604,8 +1604,20 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
-async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
+async def test_bash_timeout_kills_and_reaps_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     child_pid = tmp_path / "timeout-child.pid"
+    timeout_ready = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def wait_for_readiness(delay: float) -> None:
+        if delay == 0.5:
+            await asyncio.wait_for(timeout_ready.wait(), 10)
+            return
+        await real_sleep(delay)
+
+    monkeypatch.setattr(bash_module.asyncio, "sleep", wait_for_readiness)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     async with _owned_descendant(child_pid):
@@ -1622,6 +1634,7 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
             )
         )
         child_pid_value = await read_pid_file(child_pid)
+        timeout_ready.set()
         result = await asyncio.wait_for(execution, 10)
         await wait_pid_exited(child_pid_value)
 
