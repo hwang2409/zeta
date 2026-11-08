@@ -66,6 +66,18 @@ async def await_or_fail[T](
         raise failure from timeout_error
 
 
+async def close_owned_app(app: TUIApp) -> None:
+    """Cancel an app's active task, then close the app."""
+    # test-contract: seam test cleanup owns the private active provider task.
+    if app._active_task is not None:
+        await _cancel_and_drain(
+            [app._active_task],
+            timeout=10,
+            what="owned app active task",
+        )
+    await app.close()
+
+
 class AppOwner:
     def __init__(self, app: TUIApp | None) -> None:
         self._apps = [app] if app is not None else []
@@ -104,21 +116,16 @@ class AppOwner:
         for release in self._release:
             await attempt(release)
 
-        tasks = list(self._tasks)
-        for app in self._apps:
-            # test-contract: seam test cleanup owns the private active provider task.
-            if app._active_task is not None:
-                tasks.append(app._active_task)
         await attempt(
             lambda: _cancel_and_drain(
-                tasks,
+                self._tasks,
                 timeout=10,
                 what="owned app tasks",
             )
         )
         await attempt(self._contexts.close)
         for app in reversed(self._apps):
-            await attempt(app.close)
+            await attempt(lambda app=app: close_owned_app(app))
 
         if first_error is not None:
             raise first_error

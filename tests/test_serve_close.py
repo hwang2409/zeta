@@ -75,6 +75,69 @@ async def test_leaked_server(tmp_path):
     assert (pytester.path / "closed").read_text() == "closed"
 
 
+def test_app_owner_closes_after_body_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_leaked_app(tmp_path):
+    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty())
+    app = TUIApp(loop, provider="codex", model="offline")
+    cancelled = asyncio.Event()
+    async def active():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+    app._active_task = asyncio.create_task(active())
+    original_close = app.close
+    async def close_and_prove():
+        await original_close()
+        assert cancelled.is_set()
+        Path("closed").write_text("closed")
+    app.close = close_and_prove
+    assert False, "original body failure"
+""",
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*AssertionError: original body failure*"])
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_app_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_explicit_close(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    await app.close()
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
 def test_server_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
     result = _run_owner_test(
         pytester,
