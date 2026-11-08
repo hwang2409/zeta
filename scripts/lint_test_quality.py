@@ -503,9 +503,13 @@ class _ImportResolver:
         self._parent_scope: dict[ast.AST, ast.AST | None] = {}
         self._bindings: dict[ast.AST, dict[str, str]] = {}
         self._symbols: dict[ast.AST, symtable.SymbolTable] = {}
-        self._module = symtable.symtable(source, "<source>", "exec")
+        try:
+            self._module = symtable.symtable(source, "<source>", "exec")
+        except SyntaxError:
+            self._module = None
         self._module_ast = tree
-        self._match_tables(tree, self._module)
+        if self._module is not None:
+            self._match_tables(tree, self._module)
         self._build(tree, tree, None)
 
     def _match_tables(self, node: ast.AST, table: symtable.SymbolTable) -> None:
@@ -547,8 +551,16 @@ class _ImportResolver:
         if not value:
             return value
         root, *parts = value.split('.')
-        scope = self._scope.get(node, self._module)
-        table = self._symbols.get(scope, self._module) if scope is not self._module else self._module
+        scope = self._scope.get(node, self._module_ast)
+        if self._module is None:
+            while scope is not None:
+                if not isinstance(scope, ast.ClassDef):
+                    binding = self._bindings.get(scope, {}).get(root)
+                    if binding is not None:
+                        return ".".join([binding, *parts])
+                scope = self._parent_scope.get(scope)
+            return value
+        table = self._symbols.get(scope, self._module) if scope is not self._module_ast else self._module
         if table.get_type() == "class":
             scope = self._parent_scope.get(scope)
             table = self._symbols.get(scope, self._module) if scope is not None else self._module
