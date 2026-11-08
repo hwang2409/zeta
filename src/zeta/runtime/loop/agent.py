@@ -221,7 +221,6 @@ class AgentLoop(
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
         self._children_recovered = False
-        self._pending_child_recovery: tuple[NotificationInput, ...] = ()
         self._closed = False
         self._turn_active = False
         self._abort_admitted = False
