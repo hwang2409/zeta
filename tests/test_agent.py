@@ -17521,10 +17521,11 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     try:
         call = ToolCall("cancel-1", "agent_cancel", {"handle": "root:1"})
         pending = asyncio.create_task(registry.execute(call))
-        await await_or_fail(wait_started.wait(), what="confirmation wait start")
+        # wait_for: await_or_fail uses the patched asyncio.wait.
+        await asyncio.wait_for(wait_started.wait(), 10)
         assert confirm_timeouts == [1.0]
         wait_gate.set()
-        unconfirmed = await await_or_fail(pending, what="first agent_cancel")
+        unconfirmed = await asyncio.wait_for(pending, 10)
         assert unconfirmed["isError"] is True
         assert unconfirmed["structuredContent"]["status"] == "cancellation_unconfirmed"
         assert "not confirmed" in unconfirmed["content"][0]["text"]
@@ -17566,9 +17567,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         wait_gate.set()
         owner.unregister("root:1")
         watcher.cancel()
-        await await_or_fail(
-            asyncio.gather(watcher, return_exceptions=True), what="watcher cleanup"
-        )
+        await asyncio.wait_for(asyncio.gather(watcher, return_exceptions=True), 10)
         await registry.close()
         child_store.close()
 
