@@ -317,6 +317,7 @@ def test_release_unlock_and_registry_removal_share_mutex(
 
     def pause_unlock(fd: int, operation: int) -> None:
         if fd == target_fd and operation == fcntl.LOCK_UN:
+            # test-contract: seam keeps the registry entry under the mutex until unlock.
             assert session_execution._REGISTRY_LOCK.locked()
             assert session_execution._REGISTRY.get(lease._owned.identity) is lease._owned
             unlock_started.set()
