@@ -500,10 +500,10 @@ async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
 async def _exercise_repair_after_guarded_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     bound = await _inbox(registry, {"action": "projects"})
     assert bound.get("isError") is not True
     ledger = store.session_dir / "project-inbox-sent.json"
@@ -583,10 +583,10 @@ async def _exercise_repair_after_guarded_failure(
 async def _exercise_concurrent_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     bound = await _inbox(registry, {"action": "projects"})
     assert bound.get("isError") is not True
     ledger = store.session_dir / "project-inbox-sent.json"
@@ -666,10 +666,10 @@ async def test_guarded_sent_operation_table(
     if scenario == "record-cancel":
         await _exercise_cancelled_send(tmp_path, monkeypatch)
         return
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     message_id = "d" * 32
     arguments = {
         "action": "send",
@@ -684,9 +684,14 @@ async def test_guarded_sent_operation_table(
         sent = await _inbox(registry, arguments)
         assert sent.get("isError") is not True
     if scenario == "mark-ledger":
-        ProjectInbox(
-            projects, sessions_root=projects.root.parent / "sessions"
-        ).claim(beta.project_id, message_id, "b" * 32)
+        await asyncio.to_thread(
+            ProjectInbox(
+                projects, sessions_root=projects.root.parent / "sessions"
+            ).claim,
+            beta.project_id,
+            message_id,
+            "b" * 32,
+        )
         assert registry.sent_message_tracker is not None
         scanner = ProjectInboxScanner(
             projects,
@@ -755,10 +760,10 @@ async def test_guarded_sent_operation_table(
 async def _exercise_cancelled_send(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     bound = await _inbox(registry, {"action": "projects"})
     assert bound.get("isError") is not True
     ledger = store.session_dir / "project-inbox-sent.json"
@@ -819,9 +824,12 @@ async def _exercise_cancelled_send(
         assert await asyncio.wait_for(
             asyncio.to_thread(tracker_read.wait, 10), 11
         )
-        listed = ProjectInbox(
-            projects, sessions_root=projects.root.parent / "sessions"
-        ).list(beta.project_id)
+        listed = await asyncio.to_thread(
+            ProjectInbox(
+                projects, sessions_root=projects.root.parent / "sessions"
+            ).list,
+            beta.project_id,
+        )
         assert [item["id"] for item in listed["new"]] == [message_id]
         sent = await _inbox(registry, {"action": "sent"})
         assert sent.get("isError") is not True
@@ -844,12 +852,13 @@ async def _exercise_cancelled_send(
 async def test_corrupt_sent_ledger_keeps_every_model_inbox_action_available(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
-    incoming_id = inbox.send(
+    incoming_id = await asyncio.to_thread(
+        inbox.send,
         from_project=beta.project_id,
         from_session="b" * 32,
         to_project=registry.project_id or "",
