@@ -510,7 +510,7 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
     out["subprocess_stub_requests"] = len(box.stub.requests) - seen
 
     from zeta.server import ZetaServer
-    from zeta.server.handlers import history as ergonomics
+    from zeta.server.handlers import history_projection
 
     async def in_process() -> dict[str, Any]:
         server = await asyncio.to_thread(
@@ -556,7 +556,7 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
             store.append_message(user_message("profile append"))
             result["history_projection_profile"] = profile(
                 f"serve-history-projection-{args.session}",
-                lambda: ergonomics.history_projection(
+                lambda: history_projection.history_projection(
                     store, fidelity=True, served_turn_end=True
                 ),
             )

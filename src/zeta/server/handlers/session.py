@@ -1,15 +1,20 @@
-"""Session transcript request bodies."""
+"""Session mutation, tree, and transcript repair request bodies."""
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
+from ...core.checkpoints import list_branches_from_entries
 from ...core.session import SessionError
 from ...core.transcript_recovery.runtime import (
     TranscriptRepairRequiresUpgrade,
     repair_transcript_for_runtime,
 )
 from ..protocol import ErrorDescriptor, ProtocolError
+from ..runtime import ServerRuntime
+from ..session_mutation import rename_session
 from . import validation
 
 
@@ -53,4 +58,52 @@ async def repair_transcript(self, params: dict[str, Any]) -> dict[str, object]:
         "retained_last_sequence": result.retained_last_sequence,
         "memory_review_required": result.memory_review_required,
         "overlapping_memory_versions": list(result.overlapping_memory_versions),
+    }
+
+
+async def mutate_session(
+    runtime: ServerRuntime,
+    method: str,
+    session_id: str,
+    name: object,
+    require_idle: Callable[[], Awaitable[None]],
+) -> dict[str, object]:
+    session_id = await asyncio.to_thread(runtime.manager.resolve_id, session_id)
+    if method == "delete_session":
+        await require_idle()
+        if runtime.opened is not None and session_id == runtime.session_id:
+            raise ProtocolError(
+                ErrorDescriptor.ACTIVE_SESSION,
+                "select another session before deleting this session",
+            )
+        await asyncio.to_thread(runtime.manager.delete, session_id)
+        return {"session_id": session_id}
+    if not isinstance(name, str):
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "name must be a string")
+    metadata = await rename_session(runtime, session_id, name)
+    return {"session": metadata.to_dict()}
+
+
+def tree(runtime: ServerRuntime) -> dict:
+    store = runtime.opened.store
+    entries = store.entries
+    children: dict[str, int] = {}
+    for entry in entries:
+        if entry.parent_id:
+            children[entry.parent_id] = children.get(entry.parent_id, 0) + 1
+    depths: dict[str, int] = {}
+    for entry in entries:
+        depths[entry.id] = depths.get(entry.parent_id, 0) + (
+            children.get(entry.parent_id, 0) > 1
+        )
+    return {
+        "branches": [
+            {
+                "id": branch.head.id,
+                "label": branch.preview,
+                "depth": depths[branch.head.id],
+                "current": branch.is_current,
+            }
+            for branch in list_branches_from_entries(entries)
+        ]
     }

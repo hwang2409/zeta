@@ -44,7 +44,7 @@ from ..runtime.status import (
     capture_slash_status,
 )
 from . import accounts
-from .handlers import history as ergonomics
+from .handlers import validation
 from .model_selection import apply as apply_settings
 from .protocol import (
     ErrorDescriptor,
@@ -572,7 +572,7 @@ async def run_command(
         and command.serve is not None
         and command.serve.mutates(tail)
     ):
-        ergonomics.require_mutable(
+        validation.require_mutable(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
         )

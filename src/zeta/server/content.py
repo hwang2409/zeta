@@ -7,7 +7,7 @@ import binascii
 from pathlib import Path
 from typing import Any
 
-from .handlers.history import history_projection
+from .handlers.history_projection import history_projection
 from .protocol import ErrorDescriptor, ProtocolError, bounded
 
 MAX_CONTENT_READ = 524_288

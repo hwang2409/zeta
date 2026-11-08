@@ -17,7 +17,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.server import content
-from zeta.server.handlers import history as ergonomics
+from zeta.server.handlers import history_projection
 from zeta.server.protocol import ProtocolError
 
 _PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
@@ -386,7 +386,7 @@ def test_history_stubs_for_user_and_tool_images_read_original_bytes(monkeypatch:
     projection = SimpleNamespace(entry_index={entry.id: entry for entry in entries})
     monkeypatch.setattr(content, "history_projection", lambda store: projection)
     for entry, field, expected in ((entries[0], "message.content", user_raw), (entries[1], "message.tool_result.content_blocks", tool_raw)):
-        rows = ergonomics._history_entry_rows(entry, {}, fidelity=True, content_read=True)
+        rows = history_projection._history_entry_rows(entry, {}, fidelity=True, content_read=True)
         block = rows[0]["content"][0] if field == "message.content" else rows[0]["tool_result"]["content_blocks"][0]
         assert block["handle"]
         assert base64.b64decode(content.read(object(), block["handle"], limit=3)["data"]) == expected[:3]

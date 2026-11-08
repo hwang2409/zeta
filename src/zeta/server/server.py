@@ -25,8 +25,7 @@ from . import (
 from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
-from .handlers import history as ergonomics
-from .handlers import lifecycle, session, validation
+from .handlers import lifecycle, session, settings, validation
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
@@ -751,7 +750,7 @@ class _Client:
             MethodDescriptor.DELETE_SESSION,
         }:
 
-            return await ergonomics.mutate_session(
+            return await session.mutate_session(
                 runtime,
                 method,
                 validation.required_string(params, "session_id"),
@@ -773,14 +772,14 @@ class _Client:
             assert self.server.connections is not None
             return await self.server.connections.read_session(self, method, params)
         if descriptor is MethodDescriptor.MODEL_CATALOG:
-            return ergonomics.catalog(runtime)
-        store = ergonomics.active(runtime, params)
+            return settings.catalog(runtime)
+        store = validation.active(runtime, params)
         if descriptor is MethodDescriptor.SEND_IMAGES:
             return await self.server.control.deliveries.send_images(
                 params, self.features
             )
         if descriptor is MethodDescriptor.SESSION_SETTINGS:
-            return ergonomics.settings(runtime, include_plan_mode=True)
+            return settings.settings(runtime, include_plan_mode=True)
         if descriptor in {
             MethodDescriptor.ACCOUNT_LIST,
             MethodDescriptor.ACCOUNT_LOGOUT,
@@ -808,13 +807,13 @@ class _Client:
                 busy=self.server.control.turn_busy(),
             )
         await self.server.control.require_idle()
-        ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
+        validation.require_mutable(runtime, self.server.control.has_pending_approvals())
         if descriptor is MethodDescriptor.SET_SETTINGS:
             model = validation.required_string(params, "model")
             mode = validation.required_string(params, "approval_mode")
             model_selection.validate(model, mode)
             await model_selection.apply_rpc(runtime, model, mode)
-            return ergonomics.settings(runtime)
+            return settings.settings(runtime)
         if descriptor is MethodDescriptor.SET_COMPACTION:
             validation.required_string(params, "mode")
             raise ProtocolError(
@@ -828,7 +827,7 @@ class _Client:
             current = store.replay()
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
-        return ergonomics.tree(runtime)
+        return session.tree(runtime)
 
     async def _write(self, payload: _Frame) -> bool:
         written = await self.connections.send(self, payload)

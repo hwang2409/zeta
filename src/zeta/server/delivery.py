@@ -120,8 +120,7 @@ class DeliveryRequests:
     async def send_images(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
-        from .handlers import history as ergonomics
-        from .handlers import send_images as image_delivery
+        from .handlers import send_images, validation
 
         control = self._control
         runtime = control.server.runtime
@@ -136,9 +135,9 @@ class DeliveryRequests:
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
-        ergonomics.require_mutable(runtime, control.has_pending_approvals())
+        validation.require_mutable(runtime, control.has_pending_approvals())
         worker = asyncio.create_task(
-            asyncio.to_thread(image_delivery.prepare_image_delivery, runtime, params)
+            asyncio.to_thread(send_images.prepare_image_delivery, runtime, params)
         )
         try:
             prepared = await asyncio.shield(worker)
@@ -151,12 +150,12 @@ class DeliveryRequests:
             )
         except ProtocolError:
             await asyncio.to_thread(
-                image_delivery.cleanup_image_delivery, runtime, prepared
+                send_images.cleanup_image_delivery, runtime, prepared
             )
             raise
         if duplicate is not None:
             await asyncio.to_thread(
-                image_delivery.cleanup_image_delivery, runtime, prepared
+                send_images.cleanup_image_delivery, runtime, prepared
             )
             return duplicate
         message = prepared.message
@@ -167,7 +166,7 @@ class DeliveryRequests:
                 await control.user_message(text, "send", features, prepared.attachments)
             except asyncio.CancelledError:
                 await asyncio.to_thread(
-                    image_delivery.cleanup_image_delivery, runtime, prepared
+                    send_images.cleanup_image_delivery, runtime, prepared
                 )
                 raise
             control.start_turn(text, message)
@@ -190,7 +189,7 @@ class DeliveryRequests:
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
                 await asyncio.to_thread(
-                    image_delivery.cleanup_image_delivery, runtime, prepared
+                    send_images.cleanup_image_delivery, runtime, prepared
                 )
                 raise
             canceled_after_commit = True
@@ -406,7 +405,7 @@ class DeliveryRequests:
 async def _cleanup_canceled_image_delivery(
     worker: asyncio.Task[Any], runtime: Any
 ) -> None:
-    from .handlers import send_images as image_delivery
+    from .handlers import send_images
 
     settled = asyncio.Event()
     worker.add_done_callback(lambda _: settled.set())
@@ -419,7 +418,7 @@ async def _cleanup_canceled_image_delivery(
         return
     cleanup = asyncio.create_task(
         asyncio.to_thread(
-            image_delivery.cleanup_image_delivery, runtime, worker.result()
+            send_images.cleanup_image_delivery, runtime, worker.result()
         )
     )
     while not cleanup.done():

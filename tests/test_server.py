@@ -31,7 +31,7 @@ from websockets.asyncio.client import connect
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
-import zeta.server.handlers.history as ergonomics_module
+import zeta.server.handlers.history as history_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
@@ -1469,7 +1469,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
             raise AssertionError("session_history must not read store.messages()")
 
     runtime = SimpleNamespace(opened=SimpleNamespace(store=Store()))
-    result = ergonomics_module.history(runtime, {}, include_delivery_id=False)
+    result = history_module.history(runtime, {}, include_delivery_id=False)
 
     assert [row["id"] for row in result["messages"]] == ["message-1", "message-2"]
     assert calls == 1
@@ -1480,7 +1480,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
 async def test_session_history_keeps_main_durable_entry_cursor_space(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
+    monkeypatch.setattr(history_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     target = tmp_path / "input.txt"
     target.write_text("approved")
     call = ToolCall("call-1", "read", {"path": str(target)})
@@ -1616,7 +1616,7 @@ async def test_session_history_never_splits_approval_anchor_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, page_limit: int
 ) -> None:
     monkeypatch.setattr(
-        ergonomics_module, "HISTORY_PAGE_ENTRIES", page_limit, raising=False
+        history_module, "HISTORY_PAGE_ENTRIES", page_limit, raising=False
     )
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend(
@@ -5038,7 +5038,7 @@ async def test_session_history_shows_zeta_notice_as_system_message(
 ) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
-    monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
+    monkeypatch.setattr(history_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:

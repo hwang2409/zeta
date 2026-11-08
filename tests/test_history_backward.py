@@ -19,7 +19,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.server import ZetaServer, protocol
-from zeta.server.handlers import history as ergonomics
+from zeta.server.handlers import history, history_projection
 from zeta.server.protocol import FrameCodec, ProtocolError
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -47,7 +47,7 @@ def _runtime(store: object) -> SimpleNamespace:
 
 
 def _backward_history(store: _HistoryStore, params: dict[str, object]) -> dict[str, object]:
-    return ergonomics.history(_runtime(store), params, backward_enabled=True)
+    return history.history(_runtime(store), params, backward_enabled=True)
 
 
 @contextlib.asynccontextmanager
@@ -91,7 +91,7 @@ async def _history_request(reader: object, writer: object, request_id: int, sess
 
 @pytest.mark.asyncio
 async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path) as (reader, writer, session_id, _server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
         first_ids = [row["content"][0]["text"] for row in first["messages"] if row["role"] != "system"]
@@ -120,7 +120,7 @@ async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeyp
 
 @pytest.mark.asyncio
 async def test_real_socket_backward_continuation_survives_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
         assert [row["id"] for row in first["messages"] if row["role"] != "system"]
@@ -138,7 +138,7 @@ async def test_real_socket_backward_continuation_survives_append(tmp_path: Path,
 
 @pytest.mark.asyncio
 async def test_real_socket_backward_fork_is_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
         assert first["messages"][0]["content"][0]["text"].startswith("message-")
@@ -153,7 +153,7 @@ async def test_real_socket_backward_fork_is_stale(tmp_path: Path, monkeypatch: p
 
 
 def test_newest_page_then_full_backward_walk_has_no_gaps(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
     first = _backward_history(store, {"before": None})
     validator = first["history_validator"]
@@ -169,7 +169,7 @@ def test_newest_page_then_full_backward_walk_has_no_gaps(monkeypatch: pytest.Mon
 
 
 def test_backward_continuation_survives_append(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
     first = _backward_history(store, {"before": None})
     store.entries.append(_entry(220))
@@ -183,7 +183,7 @@ def test_backward_continuation_survives_append(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_backward_continuation_is_stale_after_prefix_change(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
     first = _backward_history(store, {"before": None})
     store.entries[:] = store.entries[:5] + [_entry(99)]
@@ -201,7 +201,7 @@ def test_backward_continuation_is_stale_after_prefix_change(monkeypatch: pytest.
 def test_backward_params_require_negotiation() -> None:
     store = _HistoryStore([_entry(1)])
     with pytest.raises(ProtocolError) as error:
-        ergonomics.history(_runtime(store), {"before": None})
+        history.history(_runtime(store), {"before": None})
     assert error.value.code == -32602
 
 
@@ -251,7 +251,7 @@ def test_backward_zero_is_empty_and_malformed_params_are_rejected() -> None:
 
 
 def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 4_000)
     group = SimpleNamespace(
         id="approval",
@@ -263,14 +263,14 @@ def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.Mon
     payload = FrameCodec().response("id", first)
     assert b'"error"' not in payload
     assert len(payload) <= protocol.MAX_FRAME_BYTES
-    assert any(row.get("content", [{}])[0].get("text") == ergonomics.HISTORY_GROUP_TRUNCATED for row in first["messages"])
+    assert any(row.get("content", [{}])[0].get("text") == history_projection.HISTORY_GROUP_TRUNCATED for row in first["messages"])
     if first["next_before"] is not None:
         next_page = _backward_history(store, {"before": first["next_before"], "history_validator": first["history_validator"]})
         assert not ({row.get("id") for row in first["messages"]} & {row.get("id") for row in next_page["messages"]})
 
 
 def test_backward_near_limit_continuation_keeps_atomic_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 1_400)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 1_400)
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 1_400)
     atomic = SimpleNamespace(
         id="atomic",
@@ -305,11 +305,11 @@ def test_backward_near_limit_continuation_keeps_atomic_group(monkeypatch: pytest
 def test_backward_does_not_replace_forward_cache_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
-    before = ergonomics.history(_runtime(store), {"offset": 0})
+    before = history.history(_runtime(store), {"offset": 0})
     backward = _backward_history(store, {"before": None})
-    after = ergonomics.history(_runtime(store), {"offset": 0})
+    after = history.history(_runtime(store), {"offset": 0})
     assert before == after
     assert backward["history_validator"]["end"] == 220
 
@@ -322,7 +322,7 @@ async def test_real_socket_backward_near_limit_groups_never_overflow_frame(
     must come back as a marker, not as the raw forward projection."""
     limit = 8_000
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", limit)
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", limit)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", limit)
     # group sizes step through the forward/backward envelope difference, so
     # some group fits forward raw but needs a marker backward.
     sizes = range(6_000, 7_600, 10)
@@ -356,7 +356,7 @@ async def test_real_socket_backward_near_limit_groups_never_overflow_frame(
             result = frame["result"]
             for row in result["messages"]:
                 text = row["content"][0]["text"] if row.get("content") else ""
-                seen.append("marker" if text == ergonomics.HISTORY_GROUP_TRUNCATED else text[:4])
+                seen.append("marker" if text == history_projection.HISTORY_GROUP_TRUNCATED else text[:4])
             if result["next_before"] is None:
                 break
             params = {"before": result["next_before"], "history_validator": result["history_validator"]}
@@ -386,7 +386,7 @@ async def test_real_socket_backward_after_forward_cache_never_drops_history(
     real backward cursor, so it comes back raw or as a marker, never dropped."""
     limit = 8_000
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", limit)
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", limit)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", limit)
     fillers = 100
     big_request_id = "\x00" * protocol.MAX_REQUEST_ID_BYTES
     async with _real_history_server(tmp_path, count=0) as (reader, writer, _first, server):
@@ -426,7 +426,7 @@ async def test_real_socket_backward_after_forward_cache_never_drops_history(
                     assert result["next_before"] is None, result
                 for row in result["messages"]:
                     text = row["content"][0]["text"]
-                    seen.append("marker" if text == ergonomics.HISTORY_GROUP_TRUNCATED else text[:4])
+                    seen.append("marker" if text == history_projection.HISTORY_GROUP_TRUNCATED else text[:4])
                 if result["next_before"] is None:
                     return seen
                 params = {"before": result["next_before"], "history_validator": result["history_validator"]}
@@ -452,7 +452,7 @@ def test_backward_after_forward_cache_reprojects_for_real_cursor(
 ) -> None:
     """a newest group cached raw by a forward read, a few bytes too large for
     the backward envelope, comes back as a marker, not as an empty page."""
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 8_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 8_000)
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 8_000)
     for size in range(6_700, 7_300):
         big = SimpleNamespace(
@@ -465,7 +465,7 @@ def test_backward_after_forward_cache_reprojects_for_real_cursor(
         offset: int | None = 0
         forward_ids: list[str] = []
         while offset is not None:
-            page = ergonomics.history(_runtime(store), {"offset": offset})
+            page = history.history(_runtime(store), {"offset": offset})
             assert page["messages"] or page["next_offset"] is None, (size, offset)
             forward_ids.extend(row["id"] for row in page["messages"])
             offset = page["next_offset"]
@@ -487,7 +487,7 @@ def test_forward_walk_progresses_when_last_group_is_near_limit(
 ) -> None:
     """the last page's next_offset is null, wider than the cursor the group was
     projected for; the group must still come back instead of an empty page."""
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 8_000)
+    monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 8_000)
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 8_000)
     for size in range(6_700, 7_300):
         big = SimpleNamespace(
@@ -498,7 +498,7 @@ def test_forward_walk_progresses_when_last_group_is_near_limit(
         offset: int | None = 0
         seen: list[str] = []
         while offset is not None:
-            page = ergonomics.history(_runtime(store), {"offset": offset})
+            page = history.history(_runtime(store), {"offset": offset})
             assert page["messages"] or page["next_offset"] is None, (size, offset)
             payload = FrameCodec().response("\x00" * protocol.MAX_REQUEST_ID_BYTES, page)
             assert b'"error"' not in payload and len(payload) <= 8_000, size
