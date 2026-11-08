@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts.check_merge_resolution import Item, _item_in, item_key
+
 SCRIPT = Path(
     os.environ.get(
         "SCRIPT", Path(__file__).parents[1] / "scripts/check_merge_resolution.py"
@@ -34,6 +36,21 @@ def repo(tmp_path: Path) -> Path:
 def commit(r: Path, message: str) -> None:
     subprocess.run(["git", "add", "."], cwd=r, check=True)
     subprocess.run(["git", "commit", "-qm", message], cwd=r, check=True)
+
+
+def test_item_in_uses_keyed_lookup_without_iterating_values():
+    class ValuesCountingDict(dict):
+        values_calls = 0
+
+        def values(self):
+            self.values_calls += 1
+            return super().values()
+
+    item = Item("src/a.py", "def", "check", 1)
+    items = ValuesCountingDict({item_key(item): item})
+
+    assert _item_in(items, item)
+    assert items.values_calls == 0
 
 
 def test_dropped_membership_element_flagged(tmp_path: Path):

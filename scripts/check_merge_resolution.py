@@ -34,7 +34,7 @@ def same_item(left: Item, right: Item) -> bool:
 
 
 def _item_in(items: dict, item: Item) -> bool:
-    return any(same_item(item, candidate) for candidate in items.values())
+    return item_key(item) in items
 
 
 def _definition_fingerprint(

@@ -37,7 +37,9 @@ def _run_guarded_subprocess(source: str) -> subprocess.CompletedProcess[str]:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        pytest.fail("owned thread call did not complete within the hang guard", pytrace=False)
+        pytest.fail(
+            "owned thread call did not complete within the hang guard", pytrace=False
+        )
 
 
 def test_owned_thread_call_propagates_worker_cancelled_error_once() -> None:
@@ -73,7 +75,7 @@ asyncio.run(main())
     assert completed.returncode == 0, completed.stderr
 
 
-def test_owned_thread_call_adopts_result_during_asyncio_run_shutdown(
+def test_owned_thread_call_closes_result_during_asyncio_run_shutdown(
     tmp_path: Path,
 ) -> None:
     owned_path = tmp_path / "shutdown-owned"
@@ -139,11 +141,12 @@ else:
 
 
 @pytest.mark.asyncio
-async def test_owned_thread_call_adopts_once_after_repeated_cancellation(
+async def test_owned_thread_call_closes_once_after_repeated_cancellation(
     tmp_path: Path,
 ) -> None:
     started = threading.Event()
     release = threading.Event()
+    closed = threading.Event()
     descriptors: list[int] = []
     adopted: list[int] = []
 
@@ -157,6 +160,7 @@ async def test_owned_thread_call_adopts_once_after_repeated_cancellation(
     def adopt(descriptor: int) -> None:
         adopted.append(descriptor)
         os.close(descriptor)
+        closed.set()
 
     task = asyncio.create_task(run_owned_thread_call(acquire, adopt))
     try:
@@ -168,6 +172,7 @@ async def test_owned_thread_call_adopts_once_after_repeated_cancellation(
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=10)
+        assert await asyncio.to_thread(closed.wait, 10)
 
         assert adopted == descriptors
         with pytest.raises(OSError) as error:
@@ -183,7 +188,7 @@ async def test_owned_thread_call_adopts_once_after_repeated_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_owned_thread_call_keeps_worker_failure_after_cancellation(
+async def test_owned_thread_call_consumes_worker_failure_after_cancellation(
     tmp_path: Path,
 ) -> None:
     class WorkerFailure(Exception):
@@ -191,6 +196,7 @@ async def test_owned_thread_call_keeps_worker_failure_after_cancellation(
 
     started = threading.Event()
     release = threading.Event()
+    finished = threading.Event()
     descriptors: list[int] = []
     adopted: list[int] = []
 
@@ -203,6 +209,7 @@ async def test_owned_thread_call_keeps_worker_failure_after_cancellation(
             raise WorkerFailure("worker failed")
         finally:
             os.close(descriptor)
+            finished.set()
 
     task = asyncio.create_task(run_owned_thread_call(fail, adopted.append))
     try:
@@ -210,8 +217,9 @@ async def test_owned_thread_call_keeps_worker_failure_after_cancellation(
         task.cancel()
         await _next_loop_turn()
         release.set()
-        with pytest.raises(WorkerFailure, match="worker failed"):
+        with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=10)
+        assert await asyncio.to_thread(finished.wait, 10)
 
         assert adopted == []
         with pytest.raises(OSError) as error:
