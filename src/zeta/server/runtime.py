@@ -456,9 +456,14 @@ class ServerRuntime:
     ) -> SessionMetadata:
         if self._state is not None and self._state.session_id == session_id:
             if not force:
-                return self.metadata
-            await self.close()
-        metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
+                metadata = self.metadata
+            else:
+                await self.close()
+                metadata = await asyncio.to_thread(
+                    self.manager.read_metadata, session_id
+                )
+        else:
+            metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
         session_cwd = Path(metadata.cwd)

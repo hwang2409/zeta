@@ -288,6 +288,37 @@ async def test_resume_rejects_a_session_whose_cwd_was_removed(
         await close_serve(server, writer)
 
 
+@pytest.mark.asyncio
+async def test_active_resume_rejects_a_session_whose_cwd_was_removed(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original"
+    original.mkdir()
+    server = _server(tmp_path, None, original)
+    reader, writer = await _connect(server)
+    try:
+        await _legacy_hello(reader, writer)
+        created = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]
+        session_id = created["session"]["session_id"]
+        shutil.rmtree(original)
+
+        resumed = await _request(
+            reader, writer, 3, "resume", {"session_id": session_id}
+        )
+
+        assert resumed[-1]["error"] == {
+            "code": -32602,
+            "message": (
+                "session working directory no longer exists: "
+                f"{original.resolve()}"
+            ),
+        }
+        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+        assert status["session"]["session_id"] == session_id
+    finally:
+        await close_serve(server, writer)
+
+
 # Feature negotiation for the gamma extensions.
 
 
