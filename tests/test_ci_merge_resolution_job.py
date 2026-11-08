@@ -131,6 +131,7 @@ def test_pull_request_checks_only_first_parent_merges(tmp_path: Path) -> None:
     commit(repo, "train merge")
     train_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10).strip()
     git(repo, "update-ref", "refs/heads/perf/integration", train_parent_sha)
+    git(repo, "update-ref", "-d", "refs/heads/main")
     git(repo, "update-ref", "refs/remotes/origin/main", main_sha)
     git(repo, "update-ref", "refs/remotes/origin/perf/integration", train_parent_sha)
     (repo / "expected").write_text(train_sha)
