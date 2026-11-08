@@ -307,4 +307,3 @@ class ProjectLockingMixin:
                 os.close(root_fd)
             time.sleep(0.001)
         raise ProjectRegistryError("cannot open registry lock")
-
