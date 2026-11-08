@@ -128,15 +128,20 @@ class AttentionReplies:
     def _recover_locked(self) -> ReplyOutcome:
         recovered_ids: list[str] = []
         journals = sorted(self.attention_dir.glob("sending-*-*"))
+        recoverable = []
         for journal in journals:
-            self._validate_journal(journal)
-        for journal in journals:
+            if self._validate_journal(journal) is not None:
+                # A broken record can become readable later, so retain its journal.
+                continue
+            recoverable.append(journal)
+        for journal in recoverable:
+            if self._try_send_journal(journal) is not None:
+                continue
             recovered_ids.extend(
                 path.name
                 for path in journal.iterdir()
                 if path.is_file() and not path.name.startswith(".")
             )
-            self._send_journal(journal)
             self._finish_journal_locked(journal)
         for path in self.attention_dir.glob("done-*"):
             if path.is_dir():
@@ -393,7 +398,7 @@ class AttentionReplies:
         if isinstance(state, Broken):
             raise ReplyConflict(broken_record_refusal(state))
         if isinstance(state, Missing):
-            raise ReplyConflict(f"attention record {attention_id} is missing")
+            raise FileNotFoundError(attention_id)
         return state.value
 
     def _check_session(self, record: AttentionRecord) -> None:
@@ -520,12 +525,18 @@ class AttentionReplies:
             if not path.name.startswith(".")
         ]
 
-    def _validate_journal(self, journal: Path) -> None:
+    def _validate_journal(self, journal: Path) -> Broken | None:
         pairs = self._journal_pairs(journal)
         if not pairs:
             raise ValueError("attention journal is empty")
+        store = AttentionStore(self.session_dir)
         for item_id, reply in pairs:
-            record = self._record(item_id)
+            state = store.record_state(item_id)
+            if isinstance(state, Broken):
+                return state
+            if isinstance(state, Missing):
+                raise FileNotFoundError(item_id)
+            record = state.value
             if record.status == "resolved" and record.decision != reply:
                 raise ValueError(
                     "attention journal conflicts with an already resolved reply"
@@ -534,9 +545,17 @@ class AttentionReplies:
                 raise ValueError(
                     "attention journal contains an invalid terminal record"
                 )
+        return None
 
     def _send_journal(self, journal: Path) -> None:
-        self._validate_journal(journal)
+        broken = self._try_send_journal(journal)
+        if broken is not None:
+            raise ReplyConflict(broken_record_refusal(broken))
+
+    def _try_send_journal(self, journal: Path) -> Broken | None:
+        broken = self._validate_journal(journal)
+        if broken is not None:
+            return broken
         pairs = self._journal_pairs(journal)
         if not pairs:
             raise ValueError("attention journal is empty")
@@ -581,6 +600,7 @@ class AttentionReplies:
                         current, status="resolved", resolved_at=_now(), decision=reply
                     )
                 )
+        return None
 
     @staticmethod
     def _message_id(pairs: list[tuple[str, str]]) -> str:

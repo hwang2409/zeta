@@ -38,6 +38,26 @@ def _project_names(registry: ProjectRegistry | None) -> dict[str, str]:
     return {project.project_id: project.name for project in projects}
 
 
+def _decision_item(
+    session_id: str, record: AttentionRecord | Broken, names: dict[str, str]
+) -> DecisionItem:
+    if isinstance(record, Broken):
+        return DecisionItem(session_id, None, "Unassigned", record)
+    return DecisionItem(
+        session_id,
+        record.project_id,
+        names.get(record.project_id or "", "Unassigned"),
+        record,
+    )
+
+
+def _decision_sort_key(item: DecisionItem) -> tuple[bool, str]:
+    record = item.record
+    if isinstance(record, Broken):
+        return True, record.path
+    return record.kind != "decision", record.created_at
+
+
 def open_decisions(
     home: Path,
     session_id: str,
@@ -55,32 +75,12 @@ def open_decisions(
         return ()
     state = registry_state or available_project_registry(home / "projects")
     names = _project_names(state.registry)
-    items = [
-        DecisionItem(
-            session_id=session_id,
-            project_id=record.project_id
-            if isinstance(record, AttentionRecord)
-            else None,
-            project_name=names.get(record.project_id or "", "Unassigned")
-            if isinstance(record, AttentionRecord)
-            else "Unassigned",
-            record=record,
-        )
+    items = (
+        _decision_item(session_id, record, names)
         for record in AttentionStore(session_dir).list()
         if isinstance(record, Broken) or record.status == "open"
-    ]
-    return tuple(
-        sorted(
-            items,
-            key=lambda item: (
-                not isinstance(item.record, AttentionRecord)
-                or item.record.kind != "decision",
-                item.record.created_at
-                if isinstance(item.record, AttentionRecord)
-                else item.record.path,
-            ),
-        )
     )
+    return tuple(sorted(items, key=_decision_sort_key))
 
 
 __all__ = ["DecisionItem", "open_decisions"]

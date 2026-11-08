@@ -148,28 +148,57 @@ async def test_tui_renders_broken_attention_without_request_body(
 
 
 @pytest.mark.asyncio
-async def test_tui_broken_row_refuses_actions_and_does_not_block_good_batch(
-    tmp_path: Path,
-) -> None:
+async def test_tui_broken_row_refuses_actions(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "alpha", "git"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    broken_id = "f" * 32
+    broken_path = owner.store.session_dir / "attention" / f"{broken_id}.json"
+    broken_bytes = b'{"why":"do not expose"'
+    broken_path.parent.mkdir()
+    broken_path.write_bytes(broken_bytes)
+    app = await _make_app(tmp_path, owner, owner.store.session_id)
+    try:
+        expected = (
+            f"attention record {broken_id} is broken (invalid_json); "
+            f"repair attention/{broken_id}.json before replying"
+        )
+        results: list[object] = []
+        for command in (f"reply {broken_id} yes", f"dismiss {broken_id}"):
+            try:
+                results.append(await app.slash_decisions(command))
+            except AttributeError as exc:  # old behavior is asserted below
+                results.append(exc)
+        assert results == [expected, expected]
+
+        try:
+            _press(app, "1")
+            key_error = None
+        except AttributeError as exc:  # old behavior is asserted below
+            key_error = exc
+        assert key_error is None, f"broken-row key action raised {key_error!r}"
+        assert broken_path.read_bytes() == broken_bytes
+    finally:
+        owner.store.close()
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_broken_row_does_not_block_good_batch(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = await asyncio.to_thread(
         manager.project_registry.create_project, "alpha", "git"
     )
     owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
     good = await asyncio.to_thread(_request, owner, project.project_id, "good")
-    # use a valid filename-derived id for the broken row
     broken_id = "f" * 32
     broken_path = owner.store.session_dir / "attention" / f"{broken_id}.json"
     broken_bytes = b'{"why":"do not expose"'
     broken_path.write_bytes(broken_bytes)
     app = await _make_app(tmp_path, owner, owner.store.session_id)
     try:
-        refusal = await app.slash_decisions(f"reply {broken_id} yes")
-        assert refusal == (
-            f"attention record {broken_id} is broken (invalid_json); "
-            f"repair attention/{broken_id}.json before replying"
-        )
-        assert await app.slash_decisions(f"dismiss {broken_id}") == refusal
         _press(app, "1")
         await asyncio.sleep(0)
         await asyncio.wait_for(
@@ -187,9 +216,6 @@ async def test_tui_broken_row_refuses_actions_and_does_not_block_good_batch(
             )
             == 1
         )
-        _press(app, "1")
-        await asyncio.sleep(0)
-        assert broken_path.read_bytes() == broken_bytes
     finally:
         owner.store.close()
         await app.loop.close()

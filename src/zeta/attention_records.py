@@ -199,6 +199,15 @@ class AttentionStore:
         self.replace(record, create_directory=True)
         return record
 
+    def _broken(self, path: Path, reason: str, raw: bytes = b"") -> Broken:
+        return Broken(
+            path.stem,
+            self._relative_path(path),
+            reason,
+            "manual repair",
+            raw,
+        )
+
     def record_state(self, attention_id: str) -> RecordState:
         if len(attention_id) != 32 or any(
             character not in "0123456789abcdef" for character in attention_id
@@ -210,34 +219,16 @@ class AttentionStore:
         except FileNotFoundError:
             return Missing()
         except OSError:
-            return Broken(
-                attention_id,
-                self._relative_path(path),
-                "unreadable",
-                "manual repair",
-                b"",
-            )
+            return self._broken(path, "unreadable")
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 os.close(fd)
-                return Broken(
-                    attention_id,
-                    self._relative_path(path),
-                    "unreadable",
-                    "manual repair",
-                    b"",
-                )
+                return self._broken(path, "unreadable")
             with os.fdopen(fd, "rb") as stream:
                 raw = stream.read(_MAX_RECORD_BYTES + 1)
         except OSError:
-            return Broken(
-                attention_id,
-                self._relative_path(path),
-                "unreadable",
-                "manual repair",
-                b"",
-            )
+            return self._broken(path, "unreadable")
         try:
             if len(raw) > _MAX_RECORD_BYTES:
                 raise ValueError("too large")
@@ -256,9 +247,7 @@ class AttentionStore:
             reason = "id_mismatch"
         except ValueError as exc:
             reason = "too_large" if str(exc) == "too large" else "invalid_schema"
-        return Broken(
-            attention_id, self._relative_path(path), reason, "manual repair", raw
-        )
+        return self._broken(path, reason, raw)
 
     def _relative_path(self, path: Path) -> str:
         return path.relative_to(self.session_dir).as_posix()
@@ -276,7 +265,7 @@ class AttentionStore:
             paths = tuple(self.directory.iterdir())
         except (FileNotFoundError, NotADirectoryError, PermissionError):
             return ()
-        records: list[AttentionRecord] = []
+        records: list[AttentionRecord | Broken] = []
         for path in paths:
             if path.suffix != ".json":
                 continue

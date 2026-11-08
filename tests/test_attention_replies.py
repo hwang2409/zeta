@@ -12,13 +12,18 @@ from typing import Any
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta import attention_replies
 from zeta.attention_records import AttentionRecord, AttentionStore, Broken
-from zeta.attention_replies import AttentionReplies
+from zeta.attention_replies import AttentionReplies, ReplyOutcome
 from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox, SentMessageTracker
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
+from zeta.server import ZetaServer
+from zeta.skills import SkillCatalog
 
 
 @dataclass
@@ -107,6 +112,80 @@ def test_broken_attention_is_listed_and_cannot_be_replied_or_deleted(
     assert original != path.read_bytes()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["agent", "serve"])
+async def test_broken_sealed_journal_does_not_discard_loaded_session(
+    surface: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = await asyncio.to_thread(_fixture, tmp_path, 1)
+    journal = (
+        await asyncio.to_thread(
+            _leave_sealed_journals,
+            fixture,
+            fixture.replies,
+            monkeypatch,
+            [(fixture.records[0], "answer")],
+        )
+    )[0]
+    record_path = fixture.attention_dir / f"{fixture.records[0].id}.json"
+    await asyncio.to_thread(record_path.write_bytes, b"{")
+    failure: attention_replies.ReplyConflict | None = None
+
+    if surface == "agent":
+        store = await asyncio.to_thread(
+            ConversationStore,
+            fixture.home / "sessions",
+            session_id=fixture.session_id,
+        )
+        loop = AgentLoop(
+            FakeBackend([]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        )
+        try:
+            try:
+                await loop.activate()
+            # Capture the old failure so fail-first reaches the behavior assertion.
+            except attention_replies.ReplyConflict as exc:
+                failure = exc
+            assert failure is None, f"agent activation discarded session: {failure!r}"
+            assert loop.store.session_id == fixture.session_id
+        finally:
+            await loop.close()
+            store.close()
+    else:
+        server = ZetaServer(
+            provider="codex",
+            home=fixture.home,
+            cwd=fixture.home,
+            socket_path=tmp_path / "zeta.sock",
+            backend_factory=lambda provider, model, home: (
+                FakeBackend([]),
+                model or "offline",
+            ),
+        )
+        try:
+            try:
+                await server.runtime.resume_session(fixture.session_id)
+            # Capture the old failure so fail-first reaches the behavior assertion.
+            except attention_replies.ReplyConflict as exc:
+                failure = exc
+            assert failure is None, f"serve load discarded session: {failure!r}"
+            assert server.runtime.opened is not None
+            assert server.runtime.opened.metadata.session_id == fixture.session_id
+        finally:
+            await server.close()
+
+    listed = AttentionStore(fixture.home / "sessions" / fixture.session_id).list()
+    assert any(
+        isinstance(record, Broken) and record.id == fixture.records[0].id
+        for record in listed
+    )
+    assert journal.is_dir()
+    assert record_path.read_bytes() == b"{"
+
+
 def _make_information_item(fixture: ReplyFixture, record: AttentionRecord) -> None:
     path = fixture.attention_dir / f"{record.id}.json"
     value = path.read_text(encoding="utf-8").replace(
@@ -132,6 +211,38 @@ def _assert_no_live_journal(fixture: ReplyFixture) -> None:
     assert not list(fixture.attention_dir.glob("sending-*-*"))
     assert not list(fixture.attention_dir.glob("done-*-*"))
     assert not list(fixture.attention_dir.glob(".batch-*"))
+
+
+def _leave_sealed_journals(
+    fixture: ReplyFixture,
+    replies: AttentionReplies,
+    monkeypatch: pytest.MonkeyPatch,
+    pairs: list[tuple[AttentionRecord, str]],
+) -> tuple[Path, ...]:
+    held: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def hold_seal(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
+        destination_path = Path(destination)
+        if destination_path.name.startswith("sending-"):
+            held_path = fixture.attention_dir / f"held-{len(held) + 1}"
+            real_replace(source, held_path, *args, **kwargs)
+            held.append((held_path, destination_path))
+            raise RuntimeError("leave journal sealed")
+        real_replace(source, destination, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", hold_seal)
+        for record, reply in pairs:
+            with pytest.raises(RuntimeError, match="leave journal sealed"):
+                replies.stage_and_flush(
+                    [(record.id, reply)], fixture.answerer_session_id
+                )
+    for held_path, destination in held:
+        held_path.rename(destination)
+    return tuple(destination for _held_path, destination in held)
 
 
 def _fail_once(kind: str) -> BaseException:
@@ -292,6 +403,7 @@ _FAULT_ROWS = [
         "duplicates",
         "same-id-conflicts",
         "multiple-journals",
+        "broken-journal-recovery",
         "dismiss-information",
     ],
 )
@@ -730,6 +842,58 @@ def test_attention_replies_public_table(
             == "open"
         )
         assert len(fixture.inbox_messages()) == 1
+        return
+
+    if case == "broken-journal-recovery":
+        broken, unrelated = fixture.records[:2]
+        journals = _leave_sealed_journals(
+            fixture,
+            replies,
+            monkeypatch,
+            [(broken, "broken answer"), (unrelated, "unrelated answer")],
+        )
+        broken_path = fixture.attention_dir / f"{broken.id}.json"
+        readable_bytes = broken_path.read_bytes()
+        broken_path.write_bytes(b"{")
+        retained_bytes = {
+            path.relative_to(journals[0]): path.read_bytes()
+            for path in journals[0].iterdir()
+            if path.is_file()
+        }
+
+        try:
+            outcome: ReplyOutcome | attention_replies.ReplyConflict = replies.recover()
+        except attention_replies.ReplyConflict as exc:  # old behavior asserted below
+            outcome = exc
+        assert not isinstance(outcome, attention_replies.ReplyConflict), (
+            f"broken journal stopped unrelated recovery: {outcome!r}"
+        )
+        assert [item.attention_id for item in outcome.items] == [unrelated.id]
+        assert journals[0].is_dir()
+        assert not journals[1].exists()
+        assert broken_path.read_bytes() == b"{"
+        assert {
+            path.relative_to(journals[0]): path.read_bytes()
+            for path in journals[0].iterdir()
+            if path.is_file()
+        } == retained_bytes
+        assert (
+            AttentionStore(fixture.home / "sessions" / fixture.session_id)
+            .get(unrelated.id)
+            .decision
+            == "unrelated answer"
+        )
+        assert len(fixture.inbox_messages()) == 1
+
+        assert replies.recover().items == ()
+        assert journals[0].is_dir()
+        assert len(fixture.inbox_messages()) == 1
+
+        broken_path.write_bytes(readable_bytes)
+        repaired = replies.recover()
+        assert [item.attention_id for item in repaired.items] == [broken.id]
+        assert not journals[0].exists()
+        assert len(fixture.inbox_messages()) == 2
         return
 
     if case == "multiple-journals":
