@@ -226,15 +226,24 @@ class MCPManagementService:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     @staticmethod
-    def _read_object(path: Path) -> dict[str, object]:
+    def _invalid_json_error(path: Path) -> MCPManagementError:
+        if path.name == "mcp-trust.json":
+            return MCPManagementError(
+                f"mcp-trust.json is not valid: {path}; move it aside to a backup, "
+                "then re-approve the servers or restore it from a backup"
+            )
+        return MCPManagementError(f"invalid JSON file: {path}")
+
+    @classmethod
+    def _read_object(cls, path: Path) -> dict[str, object]:
         if not path.exists():
             return {}
         try:
             value = json.loads(path.read_text())
         except (OSError, ValueError) as exc:
-            raise MCPManagementError(f"invalid JSON file: {path}") from exc
+            raise cls._invalid_json_error(path) from exc
         if type(value) is not dict:
-            raise MCPManagementError(f"JSON document must be an object: {path}")
+            raise cls._invalid_json_error(path)
         return value
 
     def _ensure_open(self) -> None:
