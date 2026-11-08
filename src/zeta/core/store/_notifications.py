@@ -456,6 +456,7 @@ class NotificationStateMixin:
                 "notification_ack",
                 "notification_tui_presented",
                 "turn_end",
+                "warning",
             }:
                 data = copy.deepcopy(entry.data)
             else:

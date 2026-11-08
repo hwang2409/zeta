@@ -8961,6 +8961,27 @@ def test_rebuild_renders_closed_turn_end_reasons(
     assert "completed" not in rendered
 
 
+def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions)
+    with store.path.open("ab") as stream:
+        stream.write(b'{"torn"')
+    with pytest.warns(RuntimeWarning, match="torn"):
+        recovered = ConversationStore(sessions, session_id=store.session_id)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), recovered, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "transcript recovered; preserved corrupt bytes in quarantine" in rendered
+    assert recovered.entries[-1].data["quarantine_id"] in rendered
+
+
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
