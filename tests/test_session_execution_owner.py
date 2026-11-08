@@ -318,6 +318,7 @@ def test_release_unlock_and_registry_removal_share_mutex(
     def pause_unlock(fd: int, operation: int) -> None:
         if fd == target_fd and operation == fcntl.LOCK_UN:
             assert session_execution._REGISTRY_LOCK.locked()
+            assert session_execution._REGISTRY.get(lease._owned.identity) is lease._owned
             unlock_started.set()
             if not release_unlock.wait(_WAIT_TIMEOUT_SECONDS):
                 raise AssertionError("timed out waiting to release the lock seam")
