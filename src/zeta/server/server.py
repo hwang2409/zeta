@@ -11,13 +11,9 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from ..core.session import SessionError, SessionNotFoundError
-from ..core.session_execution import SessionOwnedError
+from ..core.session import SessionError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
-from ..core.transcript_recovery.runtime import (
-    TranscriptRepairRequiresUpgrade,
-    repair_transcript_for_runtime,
-)
+from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -30,12 +26,12 @@ from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .handlers import history as ergonomics
+from .handlers import lifecycle, session, validation
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
     project_request_error,
 )
-from .host_commands import SessionHostCommands
 from .protocol import (
     _ERGONOMICS_METHODS,
     _LOGIN_METHODS,
@@ -615,101 +611,13 @@ class _Client:
             )
         if descriptor is MethodDescriptor.LIST_SESSIONS:
             result, _page_ids = await self.connections.run_read(
-                self, lambda: self._list_sessions(request_id, params)
+                self, lambda: lifecycle.list_sessions(self, request_id, params)
             )
             return result
         if descriptor is MethodDescriptor.NEW_SESSION:
-            try:
-                initial_model = _optional_string(params, "model")
-                initial_mode = _optional_string(params, "approval_mode")
-                if initial_mode is not None:
-                    self._require_feature("new_session_settings", "approval_mode")
-                    if initial_model is None:
-                        initial_model = _required_string(params, "model")
-                    model_selection.validate(initial_model, initial_mode)
-                candidate = self._host_commands(params)
-                with self.server.control.reserve_session_swap():
-                    cwd = None
-                    if "cwd" in params:
-                        self._require_feature("session_cwd", "cwd")
-                        cwd = _directory(params, "cwd")
-                    await self.server.control._terminate_pending_approvals()
-                    await self.server.runtime.create_session(
-                        provider=_optional_string(params, "provider"),
-                        model=initial_model,
-                        cwd=cwd,
-                    )
-                    if initial_model is not None and initial_mode is not None:
-                        await model_selection.apply_rpc(
-                            self.server.runtime, initial_model, initial_mode
-                        )
-                    self.server.control._active_host_commands = candidate
-                    self.server.control._host_binding_required = (
-                        "session_host_commands" in self.features
-                    )
-                    self.server.control.session_replaced()
-                    self.server.control.clear_approvals()
-                    await self.server.control.controller_ready()
-                    await self.server.control.publish_session_grant_reset()
-                    return {"session": self._session_snapshot()}
-            except BaseException:
-                if self.server.runtime.state is None:
-                    self.server.control._active_host_commands = None
-                    self.server.control._host_binding_required = False
-                raise
+            return await lifecycle.new_session(self, params)
         if descriptor is MethodDescriptor.RESUME:
-            try:
-                candidate = self._host_commands(params)
-                with self.server.control.reserve_session_swap():
-                    session_id = _required_string(params, "session_id")
-                    unhealthy_same_session = (
-                        self.server.control.unhealthy()
-                        and self.server.runtime.session_id == session_id
-                    )
-                    await self.server.control._terminate_pending_approvals()
-                    if unhealthy_same_session:
-                        try:
-                            await self.server.runtime.resume_session(
-                                session_id, force=True
-                            )
-                        except SessionNotFoundError as exc:
-                            raise ProtocolError(
-                                ErrorDescriptor.SESSION_NOT_FOUND,
-                                str(exc),
-                                {"session_id": session_id},
-                            ) from exc
-                        except SessionOwnedError as exc:
-                            raise _session_owned_protocol_error(exc) from exc
-                        except Exception as exc:
-                            raise ProtocolError(
-                                ErrorDescriptor.INTERNAL_ERROR,
-                                "approval persistence failed",
-                            ) from exc
-                    else:
-                        try:
-                            await self.server.runtime.resume_session(session_id)
-                        except SessionNotFoundError as exc:
-                            raise ProtocolError(
-                                ErrorDescriptor.SESSION_NOT_FOUND,
-                                str(exc),
-                                {"session_id": session_id},
-                            ) from exc
-                        except SessionOwnedError as exc:
-                            raise _session_owned_protocol_error(exc) from exc
-                    self.server.control._active_host_commands = candidate
-                    self.server.control._host_binding_required = (
-                        "session_host_commands" in self.features
-                    )
-                    self.server.control.session_replaced()
-                    self.server.control.clear_approvals()
-                    await self.server.control.controller_ready()
-                    await self.server.control.publish_session_grant_reset()
-                    return {"session": self._session_snapshot()}
-            except BaseException:
-                if self.server.runtime.state is None:
-                    self.server.control._active_host_commands = None
-                    self.server.control._host_binding_required = False
-                raise
+            return await lifecycle.resume(self, params)
         if descriptor in {
             MethodDescriptor.SESSION_GRANTS,
             MethodDescriptor.REVOKE_SESSION_GRANTS,
@@ -743,7 +651,7 @@ class _Client:
                 else ApprovalDecision.DENY
             )
             return await self.server.control.resolve_approval(
-                decision, _required_string(params, "request_id"), scope
+                decision, validation.required_string(params, "request_id"), scope
             )
         if descriptor is MethodDescriptor.ABORT:
             return await self.server.control.abort(
@@ -758,7 +666,8 @@ class _Client:
             )
             return await self.server.connections.read_status(
                 self,
-                await self._status(
+                await lifecycle.status(
+                    self,
                     include_connection_setup_counts=(
                         params.get("include_connection_setup_counts") is True
                     )
@@ -824,61 +733,6 @@ class _Client:
             notices.extend(self.server._account_warnings)
         return result
 
-    def _host_commands(self, params: dict[str, Any]) -> SessionHostCommands:
-        if "host_commands" not in params:
-            return SessionHostCommands.parse([])
-        self._require_feature("session_host_commands", "host_commands")
-        return SessionHostCommands.parse(params["host_commands"])
-
-    def _require_feature(self, feature: str, param: str) -> None:
-        if feature not in self.features:
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS,
-                f"{param} requires the negotiated {feature} feature",
-            )
-
-    async def _repair_transcript(self, params: dict[str, Any]) -> dict[str, object]:
-        runtime = self.server.runtime
-        await self.server.control.require_idle()
-        if params.get("confirm") is not True:
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS,
-                "repair_transcript requires confirm=true",
-            )
-        session_id = _required_string(params, "session_id")
-        child_run_id = params.get("child_run_id")
-        if child_run_id is not None and not isinstance(child_run_id, str):
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS,
-                "child_run_id must be a string",
-            )
-        try:
-            result = await repair_transcript_for_runtime(
-                runtime.manager,
-                session_id,
-                child_run_id,
-                parent_store=(
-                    runtime.opened.store if runtime.opened is not None else None
-                ),
-                memory_reconciler=(
-                    runtime.loop.memory_reconciler
-                    if runtime.loop is not None
-                    else None
-                ),
-            )
-        except TranscriptRepairRequiresUpgrade:
-            raise
-        except (ValueError, SessionError) as exc:
-            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
-        return {
-            "session_id": session_id,
-            "child_run_id": child_run_id,
-            "quarantine_id": result.quarantine_id,
-            "retained_last_sequence": result.retained_last_sequence,
-            "memory_review_required": result.memory_review_required,
-            "overlapping_memory_versions": list(result.overlapping_memory_versions),
-        }
-
     async def _ergonomics(
         self, descriptor: MethodDescriptor, params: dict[str, Any]
     ) -> object:
@@ -891,7 +745,7 @@ class _Client:
         runtime = self.server.runtime
         method = descriptor.wire
         if descriptor is MethodDescriptor.REPAIR_TRANSCRIPT:
-            return await self._repair_transcript(params)
+            return await session.repair_transcript(self, params)
         if descriptor in {
             MethodDescriptor.RENAME_SESSION,
             MethodDescriptor.DELETE_SESSION,
@@ -900,7 +754,7 @@ class _Client:
             return await ergonomics.mutate_session(
                 runtime,
                 method,
-                _required_string(params, "session_id"),
+                validation.required_string(params, "session_id"),
                 params.get("name"),
                 self.server.control.require_idle,
             )
@@ -938,7 +792,7 @@ class _Client:
                 method, runtime, self.server.control.require_idle, params, self
             )
         if descriptor is MethodDescriptor.SLASH_RUN:
-            text = _required_string(params, "text")
+            text = validation.required_string(params, "text")
             if (
                 self.server.control.turn_busy()
                 and not await slash_commands.can_run_while_busy(runtime, text)
@@ -956,182 +810,25 @@ class _Client:
         await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if descriptor is MethodDescriptor.SET_SETTINGS:
-            model = _required_string(params, "model")
-            mode = _required_string(params, "approval_mode")
+            model = validation.required_string(params, "model")
+            mode = validation.required_string(params, "approval_mode")
             model_selection.validate(model, mode)
             await model_selection.apply_rpc(runtime, model, mode)
             return ergonomics.settings(runtime)
         if descriptor is MethodDescriptor.SET_COMPACTION:
-            _required_string(params, "mode")
+            validation.required_string(params, "mode")
             raise ProtocolError(
                 ErrorDescriptor.INVALID_PARAMS,
                 "compaction mode selection was removed; eviction is always used",
             )
         if descriptor is MethodDescriptor.FORK_MESSAGE:
-            store.append_message_fork(_required_string(params, "message_id"))
+            store.append_message_fork(validation.required_string(params, "message_id"))
         elif descriptor is MethodDescriptor.SWITCH_BRANCH:
-            head = _required_string(params, "head_id")
+            head = validation.required_string(params, "head_id")
             current = store.replay()
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-
-    def _session_snapshot(self) -> dict[str, object] | None:
-        runtime = self.server.runtime
-        if runtime.opened is None:
-            return None
-        snapshot = runtime.metadata.to_dict()
-        if runtime.policy is not None:
-            snapshot["approval_mode"] = runtime.policy.default.value
-        return snapshot
-
-    async def _status(
-        self, *, include_connection_setup_counts: bool = False
-    ) -> dict[str, object]:
-        runtime = self.server.runtime
-        session = self._session_snapshot()
-        reconnect = "approval_reconnect" in self.features and self.role != "observer"
-        if reconnect:
-            pending, truncated = self.server.control.pending_approvals_now(
-                reconnect=True, include_truncated=True
-            )
-        else:
-            pending = (
-                await self.server.control.pending_approvals()
-                if self.role != "observer"
-                else []
-            )
-            truncated = False
-        loop = runtime.loop
-        fallback_config = (
-            await asyncio.to_thread(runtime._config, None, None)
-            if loop is None
-            else None
-        )
-        project_context_health = (
-            (
-                loop.project_context_health.summary
-                if loop is not None and loop.project_context_health is not None
-                else "healthy"
-            )
-            if self.protocol_version != "1.0"
-            else None
-        )
-        transcript_index_failure = (
-            loop.transcript_index_failure(runtime.session_id)
-            if self.protocol_version != "1.0" and loop is not None
-            else None
-        )
-        status = {
-            "session": session,
-            "state": (
-                "idle"
-                if self.server.control.unhealthy() or runtime.state is None
-                else runtime.state.status
-            ),
-            "explicit_finish": (
-                loop.explicit_finish
-                if loop is not None
-                else fallback_config.agents_explicit_finish
-            ),
-        }
-        if self.protocol_version != "1.0":
-            status["max_agent_depth"] = (
-                loop.max_agent_depth
-                if loop is not None
-                else fallback_config.agents_max_depth
-            )
-        suffix = {
-            "pending_approvals": pending,
-            **({"pending_approvals_truncated": truncated} if reconnect else {}),
-            "usage": dict(runtime.usage),
-            **(
-                {
-                    "connection_setup_counts": (
-                        runtime.loop.connection_setup_counts()
-                        if runtime.loop is not None
-                        else ()
-                    )
-                }
-                if include_connection_setup_counts
-                else {}
-            ),
-            **(
-                {"transcript_index_failure": transcript_index_failure}
-                if transcript_index_failure is not None
-                else {}
-            ),
-            **(
-                {"project_context_health": project_context_health}
-                if project_context_health is not None
-                else {}
-            ),
-            "store": runtime.opened.store if runtime.opened is not None else None,
-        }
-        status.update(suffix)
-        return status
-
-    def _list_sessions(
-        self, request_id: str | int, params: dict[str, Any]
-    ) -> tuple[dict[str, object], list[str]]:
-        paging = "list_sessions_paging" in self.features
-        for name in ("offset", "limit"):
-            if name in params:
-                self._require_feature("list_sessions_paging", name)
-        offset = _integer(params, "offset", 0, minimum=0)
-        limit = _integer(params, "limit", None, minimum=1)
-        if "project_id" in params:
-            self._require_feature("projects", "project_id")
-            assert self.projects is not None
-            available = self.projects.project_sessions(params["project_id"])
-        else:
-            available = self.server.runtime.list_sessions()
-        metadata = available[offset : None if limit is None else offset + limit]
-        previews = {
-            item.session_id: item
-            for item in self.server.runtime.manager.list_session_previews(
-                limit=len(metadata), sessions=metadata
-            )
-        }
-        sessions = []
-        for item in metadata:
-            preview = previews[item.session_id]
-            sessions.append(
-                {
-                    **item.to_catalog_dict(),
-                    "first_message_preview": preview.preview,
-                    "in_use": preview.in_use,
-                    **(
-                        {"owner_pid": preview.owner_pid}
-                        if preview.owner_pid is not None
-                        else {}
-                    ),
-                }
-            )
-        if self.protocol_version == "1.0":
-            for item in sessions:
-                item.pop("name", None)
-        page: list[dict[str, Any]] = []
-        for index, item in enumerate(sessions):
-            candidate = [*page, item]
-            if not self.codec.response_fits(request_id, {"sessions": candidate}) or (
-                len(self.codec.response(request_id, {"sessions": candidate}))
-                > MAX_FRAME_BYTES - 128
-            ):
-                return {
-                    "sessions": page,
-                    "truncated": True,
-                    "next_offset": offset + index,
-                }, [item["session_id"] for item in page]
-            page = candidate
-        page_ids = [item["session_id"] for item in page]
-        if not paging:
-            return {"sessions": page}, page_ids
-        end = offset + len(page)
-        return {
-            "sessions": page,
-            "next_offset": end if end < len(available) else None,
-        }, page_ids
 
     async def _write(self, payload: _Frame) -> bool:
         written = await self.connections.send(self, payload)
@@ -1148,75 +845,6 @@ def _home() -> Path:
     from ..core.session import env_home
 
     return env_home().expanduser().resolve()
-
-
-def _session_owned_protocol_error(exc: SessionOwnedError) -> ProtocolError:
-    data: dict[str, Any] = {
-        "code": "session_owned",
-        "session_id": exc.session_id,
-    }
-    owner = {
-        key: value
-        for key, value in {
-            "surface": exc.owner_surface,
-            "pid": exc.owner_pid,
-        }.items()
-        if value is not None
-    }
-    if owner:
-        data["owner"] = owner
-    return ProtocolError(
-        ErrorDescriptor.OPERATION_BUSY,
-        "session is active in another zeta process",
-        data,
-    )
-
-
-def _required_string(params: dict[str, Any], name: str) -> str:
-    value = params.get(name)
-    if not isinstance(value, str) or not value:
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string"
-        )
-    return value
-
-
-def _integer(
-    params: dict[str, Any], name: str, default: int | None, *, minimum: int
-) -> int | None:
-    if name not in params:
-        return default
-    value = params[name]
-    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS,
-            f"{name} must be an integer of at least {minimum}",
-        )
-    return value
-
-
-def _directory(params: dict[str, Any], name: str) -> Path:
-    value = params.get(name)
-    if not isinstance(value, str) or not value or not os.path.isabs(value):
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS, f"{name} must be an absolute directory path"
-        )
-    path = Path(value).resolve()
-    if not path.is_dir():
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS,
-            f"{name} is not an existing directory: {value}",
-        )
-    return path
-
-
-def _optional_string(params: dict[str, Any], name: str) -> str | None:
-    value = params.get(name)
-    if value is not None and (not isinstance(value, str) or not value):
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string"
-        )
-    return value
 
 
 __all__ = ["ZetaServer"]

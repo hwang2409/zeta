@@ -39,6 +39,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.server import ZetaServer
+from zeta.server.handlers import lifecycle
 from zeta.server.protocol import EventDescriptor, ProtocolError
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
@@ -1393,7 +1394,7 @@ async def test_legacy_status_bytes_match_main_from_resident_state(
         await _read_raw(reader)
         assert server._client is not None
         monkeypatch.setattr(
-            server._client, "_session_snapshot", lambda: {"session_id": "fixed"}
+            lifecycle, "session_snapshot", lambda client: {"session_id": "fixed"}
         )
         expected = (
             Path(__file__).parent

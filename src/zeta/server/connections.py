@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from . import content
 from .handlers import history as ergonomics
+from .handlers import lifecycle
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -886,7 +887,7 @@ class ConnectionRegistry:
             )
         if method == "list_sessions":
             result, _ = await self.run_read(
-                connection, lambda: connection._list_sessions(request_id, params)
+                connection, lambda: lifecycle.list_sessions(connection, request_id, params)
             )
             return True, result
         fallback_config = None
@@ -948,7 +949,7 @@ def _active_status_parts(
         else None
     )
     status = {
-        "session": client._session_snapshot(),
+        "session": lifecycle.session_snapshot(client),
         "state": (
             "idle"
             if client.server.control.unhealthy() or runtime.state is None
