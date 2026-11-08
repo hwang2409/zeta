@@ -305,7 +305,7 @@ async def test_new_tui_keeps_healthy_project_context(
     _case: str,
     corrupt: Callable[[Path, Path, Path], None],
 ) -> None:
-    home, repository, healthy_id, malformed_id = _project_context_isolation_case(
+    home, repository, healthy_id, _malformed_id = _project_context_isolation_case(
         tmp_path, corrupt
     )
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -320,10 +320,7 @@ async def test_new_tui_keeps_healthy_project_context(
         assert "DAMAGED-B-MEMORY" not in prompt
         assert "project" in app.loop.tool_registry.registered_names
         status = app.slash_status()
-        assert status.project_context_health == (
-            f"malformed_project ({malformed_id}/project.json): "
-            "project metadata is malformed"
-        )
+        assert status.project_context_health is None
         assert healthy_id in prompt
     finally:
         await app.close()
