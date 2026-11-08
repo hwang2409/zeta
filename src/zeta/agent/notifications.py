@@ -23,6 +23,7 @@ from .pending_delivery import (
     complete_delivery,
     delivery_preview,
 )
+from .turn_limit import project_notification_data
 
 WakeState = Literal["idle", "scheduled", "running"]
 
@@ -82,7 +83,7 @@ class AgentNotificationMixin:
                 StreamEventType.AGENT_NOTIFICATION,
                 data={
                     "notification_id": notification.id,
-                    **notification.data,
+                    **project_notification_data(notification.data),
                     "kind": notification.data.get("kind", "agent_completion"),
                     "tui_presented": self.store.is_agent_notification_presented_to_tui(
                         notification.id
@@ -231,6 +232,8 @@ class AgentNotificationMixin:
                 yield event
         finally:
             await close_completion(stream)
+            if self.child_turn_control is not None:
+                self.child_turn_control.abandon_completion()
             self._turn_active = False
             self._delivering_prompt_id = None
             flow = self.step_delivery

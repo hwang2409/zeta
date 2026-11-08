@@ -34,6 +34,7 @@ from .receipt import (
 )
 from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
 from .terminal_fence import TerminalTransitionFence
+from .turn_limit import build_turn_limit_result, fallback_handoff, project_payload
 
 _AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
 
@@ -1078,8 +1079,29 @@ async def finish_background_child(
                     if explicit_finish_report["status"] == "failed"
                     else "completed"
                 )
-        result_structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
+        result_structured = (
+            result.get("structuredContent", {}) if isinstance(result, dict) else {}
+        )
+        turn_control = getattr(child_loop, "child_turn_control", None)
+        turn_limited = turn_control is not None and turn_control.exhausted
         turns_used = max(child_turns(), int(result_structured.get("turns_used", 0)))
+        turn_limit_handoff: bytes | None = None
+        if turn_limited:
+            assert turn_control is not None
+            owned_children = background_owner.owned_running(child_instance_id)
+            owned_tasks = tuple(
+                (task.task_id, task.headline)
+                for task in child_loop.tool_registry.background_tasks.snapshot()
+                if task.running
+            )
+            turn_limit_handoff = fallback_handoff(
+                control=turn_control,
+                child_instance_id=child_instance_id,
+                child_session_path=child_path,
+                final_text=notification_text,
+                children=owned_children,
+                tasks=owned_tasks,
+            )
         if (
             child_loop is not None
             and status != "canceled"
@@ -1182,11 +1204,20 @@ async def finish_background_child(
                 if key in payload_structured:
                     notification_report[key] = payload_structured[key]
 
+        if turn_limited:
+            terminal_payload = project_payload(terminal_payload, child_path)
+
         async def commit_adopt_publish() -> ConversationEntry:
+            persisted_text = notification_text
+            if turn_limit_handoff is not None:
+                await child_store._to_thread_agent_state(
+                    child_store.ensure_turn_limit_handoff, turn_limit_handoff
+                )
+                persisted_text = build_turn_limit_result(notification_text, child_path)
             transferred = await child_store.finalize_background_agent(
                 parent_store=effective_parent_store,
                 terminal_state=lifecycle_state,
-                final_result=notification_text,
+                final_result=persisted_text,
                 turns_used=turns_used,
                 killed_task_ids=killed_task_metadata or None,
                 killed_task_count=killed_task_count or None,
@@ -1211,7 +1242,7 @@ async def finish_background_child(
                 child_session_path=child_path,
                 description=description,
                 status=status,
-                text=notification_text,
+                text=persisted_text,
                 stats=terminal_stats,
                 killed_task_ids=killed_task_metadata or None,
                 killed_task_count=killed_task_count or None,

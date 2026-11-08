@@ -63,6 +63,12 @@ from .presets import (
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
 from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
+from .turn_limit import (
+    ChildTurnControl,
+    build_turn_limit_result,
+    fallback_handoff,
+    project_payload,
+)
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
@@ -91,9 +97,13 @@ async def consume_child(
     finish_gate_state: FinishGateState | None = None,
     delivering_prompt_id: str | None = None,
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
+    child_store: ConversationStore | None = None,
+    background: bool = False,
+    finish_turn_limit: Callable[[str], dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
+    last_message: Message | None = None
     failure_message: str | None = None
     tool_calls = 0
     explicit_report: dict[str, object] | None = None
@@ -118,7 +128,7 @@ async def consume_child(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
     ) -> None:
-        nonlocal failure_message, final_message, tool_calls, explicit_report
+        nonlocal failure_message, final_message, last_message, tool_calls, explicit_report
         final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
@@ -173,6 +183,7 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TURN_END:
+                last_message = event.message
                 turns = child_turns() + 1
                 update_turns(turns)
                 if event.data.get("tool_calls") == 0 and event.message is not None:
@@ -210,6 +221,33 @@ async def consume_child(
             await consume_events(events)
         finally:
             await events.aclose()
+        turn_control = getattr(child_loop, "child_turn_control", None)
+        if turn_control is not None and turn_control.exhausted:
+            text = assistant_text(last_message) if last_message is not None else ""
+            readable_text = text.strip() or "no final assistant text"
+            if record_report is not None and text.strip():
+                record_report(text)
+            if not background:
+                if child_store is None:
+                    raise RuntimeError("limited child has no session store")
+                content = fallback_handoff(
+                    control=turn_control,
+                    child_instance_id=child_loop.agent_instance_id or "unknown",
+                    child_session_path=child_path,
+                    final_text=text,
+                    children=owned_children(),
+                    tasks=owned_tasks(),
+                )
+                await child_store._to_thread_agent_state(
+                    child_store.ensure_turn_limit_handoff, content
+                )
+            if background:
+                result = terminal_result(state="completed", text=readable_text)
+            else:
+                if finish_turn_limit is None:
+                    raise RuntimeError("limited child has no terminal commit")
+                result = finish_turn_limit(readable_text)
+            return project_payload(result, child_path)
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]
@@ -369,6 +407,7 @@ async def _build_child_loop(
     follow_up_loop: bool,
     description: str,
     child_account_context: Any,
+    child_turn_control: ChildTurnControl | None,
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
@@ -487,6 +526,7 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            child_turn_control=child_turn_control,
         )
 
         def prepare_child_project_context(
@@ -605,6 +645,15 @@ async def run_agent_tool(
             tool_call.id,
             "agent error: general agents are unavailable in plan mode; "
             "use agent_type 'explore' or 'plan'",
+            state="failed",
+        )
+    requested_max_turns = arguments.get("max_turns", preset.max_turns)
+    if requested_max_turns is not None and (
+        type(requested_max_turns) is not int or requested_max_turns < 1
+    ):
+        return loop._child_result_payload(
+            tool_call.id,
+            "agent error: max_turns must be a positive integer",
             state="failed",
         )
     effective_model = model if model is not None else preset.model
@@ -807,6 +856,11 @@ async def run_agent_tool(
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}
             )
+        child_turn_control = (
+            ChildTurnControl(requested_max_turns, child_path)
+            if requested_max_turns is not None
+            else None
+        )
         child_loop, child_policy = await _build_child_loop(
             loop,
             child_backend=child_backend,
@@ -819,6 +873,7 @@ async def run_agent_tool(
             follow_up_loop=follow_up_loop,
             description=description,
             child_account_context=child_account_pins,
+            child_turn_control=child_turn_control,
         )
         loop._background_owner.project_context_loops[child_store.session_id] = (
             child_loop
@@ -905,6 +960,7 @@ async def run_agent_tool(
         notice: str | None = None,
         notice_items: Sequence[str] | None = None,
         max_bytes: int | None = None,
+        persist_receipt: bool = True,
     ) -> dict[str, object]:
         payload = loop._child_result_payload(
             tool_call.id,
@@ -923,7 +979,7 @@ async def run_agent_tool(
             notice_items=notice_items,
             max_bytes=max_bytes,
         )
-        if not background and state is not None:
+        if not background and state is not None and persist_receipt:
             content = payload.get("content")
             if (
                 isinstance(content, list)
@@ -934,6 +990,24 @@ async def run_agent_tool(
                 child_store.update_agent_lifecycle_result(
                     content[0]["text"], canonical_receipt=True
                 )
+        return payload
+
+    def finish_turn_limit(readable_text: str) -> dict[str, object]:
+        turns_used = child_turns()
+        stats = agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
+        payload = child_result(
+            readable_text,
+            state="completed",
+            stats=stats,
+            persist_receipt=False,
+        )
+        receipt = payload["content"][0]["text"]
+        child_store.finish_agent_lifecycle(
+            "completed",
+            final_result=build_turn_limit_result(receipt, child_path),
+            turns_used=turns_used,
+            canonical_receipt=True,
+        )
         return payload
 
     def publish_lifecycle(
@@ -990,6 +1064,8 @@ async def run_agent_tool(
             ),
             "receipt_components": receipt_components,
             "finish_gate_state": finish_gate_state,
+            "background": True,
+            "finish_turn_limit": finish_turn_limit,
             "explicit_finish_metadata": {
                 "child_instance_id": child_instance_id,
                 "description": description,
@@ -1004,6 +1080,9 @@ async def run_agent_tool(
                 "report", report
             ),
             "finish_gate_state": finish_gate_state,
+            "child_store": child_store,
+            "background": False,
+            "finish_turn_limit": finish_turn_limit,
         }
     )
     child_task = loop._create_task(

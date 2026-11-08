@@ -40,6 +40,7 @@ from ...agent.plan_mode import (
 from ...agent.result_payload import ChildResultPayloadMixin
 from ...agent.runner import run_agent_tool
 from ...agent.tool_results import validated_tool_result as _validated_tool_result
+from ...agent.turn_limit import ChildTurnControl
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import BudgetExceeded, ContextAssembler
@@ -178,6 +179,7 @@ class AgentLoop(
         skill_home: Path | None = None,
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
+        child_turn_control: ChildTurnControl | None = None,
     ) -> None:
         if (
             type(max_agent_depth) is not int
@@ -197,6 +199,7 @@ class AgentLoop(
         self.agent_depth = agent_depth
         self.max_agent_depth = max_agent_depth
         self.agent_instance_id = agent_instance_id
+        self.child_turn_control = child_turn_control
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
         # Nested loops publish lineage through the root session directory.
@@ -802,6 +805,12 @@ class AgentLoop(
             or recovering_tool_limit
         ):
             if not retrying_context and not retrying_provider:
+                if self.child_turn_control is not None:
+                    warning = self.child_turn_control.begin_completion()
+                    if not self.child_turn_control.reserved:
+                        break
+                    if warning is not None:
+                        await self._append_turn_message(warning)
                 provider_retry_budget = None
                 self._turn_provider_retry_records = []
                 iteration_consuming_notifications = consuming_notifications
@@ -1162,11 +1171,19 @@ class AgentLoop(
                         ),
                     },
                 )
+                exhausted = (
+                    self.child_turn_control.finish_completion()
+                    if self.child_turn_control is not None
+                    else False
+                )
                 yield StreamEvent(
                     StreamEventType.TURN_END,
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
+                if exhausted:
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
                 recovering_tool_limit = True
                 continue
             recovering_tool_limit = False
@@ -1196,8 +1213,19 @@ class AgentLoop(
                     admit_terminal=step_delivery.admit_terminal,
                     schedule_index=self._schedule_transcript_index,
                 )
+                hard_limit_reached = False
                 for event in events:
+                    if (
+                        event.type is StreamEventType.TURN_END
+                        and self.child_turn_control is not None
+                    ):
+                        hard_limit_reached = (
+                            self.child_turn_control.finish_completion()
+                        )
                     yield event
+                if hard_limit_reached:
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
                 consuming_notifications = transition.consuming_notifications
                 if done:
                     return
@@ -1224,6 +1252,8 @@ class AgentLoop(
                 await dispatch.aclose()
                 await self._background_owner.wait_for_store_closes()
             if self._explicit_finish_report is not None:
+                if self.child_turn_control is not None:
+                    self.child_turn_control.finish_completion()
                 yield StreamEvent(
                     StreamEventType.TURN_END,
                     message=assistant_message,
@@ -1233,11 +1263,19 @@ class AgentLoop(
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             await self._check_project_inbox()
+            exhausted = (
+                self.child_turn_control.finish_completion()
+                if self.child_turn_control is not None
+                else False
+            )
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,
                 data={"turn": turn_number, "tool_calls": len(calls)},
             )
+            if exhausted:
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
         yield StreamEvent(
             StreamEventType.ERROR,
             error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),

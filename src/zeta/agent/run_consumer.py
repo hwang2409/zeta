@@ -160,6 +160,8 @@ async def consume_run(
     segment_reports: list[str] = []
     ordinary_idle_presented = False
     kwargs["record_report"] = segment_reports.append
+    kwargs["child_store"] = child_store
+    kwargs.setdefault("background", True)
     kwargs.setdefault("finish_gate_state", FinishGateState())
 
     safety_started: float | None = None

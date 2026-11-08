@@ -30,6 +30,7 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
+from ...agent.turn_limit import parse_turn_limit_result
 from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import (
     ConversationEntry,
@@ -67,9 +68,12 @@ from ..registry import (
 from .approval import ChildApprovalPolicy  # noqa: F401
 
 _TRUNCATION_NOTE = "\n[truncated]"
-_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
+_TERMINAL_AGENT_STATES = frozenset(
+    {"completed", "failed", "canceled", "turn_limit"}
+)
+_DURABLE_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 _NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
-_VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _TERMINAL_AGENT_STATES
+_VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _DURABLE_TERMINAL_AGENT_STATES
 _STATUS_REASON_FALLBACK = "child status unavailable"
 _STATUS_REASON_MAX_BYTES = MAX_AGENT_RESULT_BYTES
 _STATUS_ROW_STRING_FIELDS = (
@@ -440,7 +444,7 @@ def _project_agent_status(
     state = _status_text(lifecycle.get("state", _MISSING), "state", "unknown")
     if state not in _VALID_AGENT_STATES:
         raise ValueError("invalid child metadata state")
-    if state in _TERMINAL_AGENT_STATES and finished_at is None:
+    if state in _DURABLE_TERMINAL_AGENT_STATES and finished_at is None:
         raise ValueError("terminal state has no finished_at")
     if state in _NONTERMINAL_AGENT_STATES and finished_at is not None:
         raise ValueError("non-terminal state has finished_at")
@@ -463,6 +467,13 @@ def _project_agent_status(
     )
     description = _status_text(lifecycle.get("description", _MISSING), "description")
     cwd = _status_text(lifecycle.get("cwd", _MISSING), "cwd", "")
+    projection = (
+        parse_turn_limit_result(lifecycle.get("final_result"), child_path)
+        if state == "completed"
+        else None
+    )
+    if projection is not None:
+        state = projection.status
     item: dict[str, StructuredContentValue] = {
         "handle": handle,
         "state": state,
@@ -477,6 +488,9 @@ def _project_agent_status(
         "description": description,
         "cwd": cwd,
     }
+    if projection is not None:
+        item["handoff_path"] = projection.handoff_path
+        item["final_result"] = projection.readable_text
     if state == "idle":
         idle_since = lifecycle.get("idle_since")
         if type(idle_since) is str:
@@ -498,7 +512,9 @@ def _project_agent_status(
         else ""
     )
     if finished_at is not None and requested_handle is not None:
-        item["final_result"] = final_result
+        item["final_result"] = (
+            projection.readable_text if projection is not None else final_result
+        )
     return item
 
 
@@ -1065,6 +1081,11 @@ def register(registry: ToolRegistry) -> None:
                 "background": {
                     "type": "boolean",
                     "description": "Keep the child running across parent turns and return a handle.",
+                },
+                "max_turns": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum model completions across the child's lifetime.",
                 },
             },
             "required": ["prompt", "description"],

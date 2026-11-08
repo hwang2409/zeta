@@ -558,7 +558,7 @@ def _completion_state(data: Mapping[str, Any]) -> tuple[str, bool]:
     status = data.get("status")
     if not isinstance(status, str):
         raise TypeError
-    state = terminal_state(status=status)
+    state = "turn_limit" if status == "turn_limit" else terminal_state(status=status)
     stats = data.get("stats")
     if not isinstance(stats, Mapping) or not ({"error", "canceled"} & stats.keys()):
         return state, False
@@ -604,6 +604,9 @@ def _render_child_completion(
             lines.append(f"summary: {summary}")
         elif isinstance(text, str) and text:
             lines.append(text)
+        handoff_path = event.data.get("handoff_path")
+        if state == "turn_limit" and isinstance(handoff_path, str):
+            lines.append(f"handoff: {handoff_path}")
         body = "\n".join(lines) or None
     return render_agent_message(header, body=body, state=state)
 

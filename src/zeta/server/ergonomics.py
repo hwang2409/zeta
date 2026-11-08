@@ -10,6 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from ..agent.turn_limit import project_notification_data
 from ..core.checkpoints import list_branches_from_entries
 from ..core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ..models.catalog import PROVIDER_MODELS, known_model_names
@@ -500,7 +501,7 @@ def _history_entry_rows(
         )
         return [{"id": entry.id, "role": "system", "event": "approval_end", **payload}]
     if entry_type == "notification":
-        data = entry.data
+        data = project_notification_data(entry.data)
         kind = data.get("kind", "agent_completion")
         if kind == "task_exited":
             text = (

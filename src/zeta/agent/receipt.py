@@ -719,6 +719,12 @@ def finalize_agent_results(
                     ),
                 ),
             )
+            if metadata.get("status") == "turn_limit":
+                from .turn_limit import project_payload
+
+                projected_path = metadata.get("child_session_path")
+                if type(projected_path) is str:
+                    payload = project_payload(payload, projected_path)
             result = replace(
                 receipt_tool_result(call.id, payload),
                 lifecycle_projection=candidate.lifecycle_projection or {},
