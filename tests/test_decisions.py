@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
+from threading import Event as ThreadEvent
 from types import SimpleNamespace
 
 import pytest
@@ -116,6 +118,12 @@ def _rendered_decisions_status(app: TUIApp) -> str:
     return "".join(text for _style, text in status_toolbar(app, 160))
 
 
+async def _stop_decisions(app: TUIApp) -> None:
+    stopped = app.stop_decisions_poll()
+    if inspect.isawaitable(stopped):
+        await asyncio.wait_for(stopped, 10)
+
+
 def _resolved_event(*, child: bool = False) -> StreamEvent:
     call = ToolCall("resolve-1", "resolve_attention", {})
     return StreamEvent(
@@ -209,25 +217,27 @@ async def test_resolve_attention_event_refreshes_rendered_count_immediately(
         _request, current, project.project_id, "Current", "This one."
     )
     app = _decisions_app(tmp_path, current)
+    refreshed = asyncio.Event()
     try:
         await app._decisions_tick()
         assert "1 decision" in _rendered_decisions_status(app)
+        app._invalidate_prompt = lambda: (
+            refreshed.set() if "● " not in _rendered_decisions_status(app) else None
+        )
         result = await app.loop.tool_registry.definitions_by_name[
             "resolve_attention"
         ].handler({"attention_id": record.id, "decision": "done"})
         assert result["isError"] is False
 
         app._handle_tool_event(_resolved_event())
-        tick_task = getattr(app, "_decisions_tick_task", None)
-        assert tick_task is not None
-        await await_or_fail(
-            asyncio.shield(tick_task),
-            what="immediate decision count refresh",
-        )
+        try:
+            await asyncio.wait_for(refreshed.wait(), 10)
+        except TimeoutError:
+            pass
 
         assert "● " not in _rendered_decisions_status(app)
     finally:
-        app.stop_decisions_poll()
+        await _stop_decisions(app)
         await app.loop.tool_registry.close()
         current.store.close()
 
@@ -249,26 +259,28 @@ async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
     real_open = decisions_module.open_decisions
     failed = asyncio.Event()
     recovered = asyncio.Event()
+    release_failure = ThreadEvent()
     calls = 0
     loop = asyncio.get_running_loop()
-    app._invalidate_prompt = lambda: (
-        recovered.set()
-        if app.decisions_count == 0 and getattr(app, "decisions_error", None) is None
-        else None
-    )
 
     def flaky_open(*args, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
             loop.call_soon_threadsafe(failed.set)
+            release_failure.wait(timeout=10)
             raise ValueError("bad projection")
         return real_open(*args, **kwargs)
 
-    monkeypatch.setattr(decisions_module, "open_decisions", flaky_open)
-    # test-contract: seam retry delay is private; result uses the real status render
-    monkeypatch.setattr(panel_module, "_POLL_RESTART_BASE", 0, raising=False)
     try:
+        await app._decisions_tick()
+        assert "1 decision" in _rendered_decisions_status(app)
+        app._invalidate_prompt = lambda: (
+            recovered.set() if "● " not in _rendered_decisions_status(app) else None
+        )
+        monkeypatch.setattr(decisions_module, "open_decisions", flaky_open)
+        # test-contract: seam backoff is shortened; the toolbar render is unchanged
+        monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
         app.start_decisions_poll()
         await await_or_fail(failed.wait(), what="failing decision poll")
         await asyncio.to_thread(
@@ -277,12 +289,16 @@ async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
             session_id=current.store.session_id,
             decision="done",
         )
-        await await_or_fail(recovered.wait(), what="restarted decision poll")
+        release_failure.set()
+        try:
+            await asyncio.wait_for(recovered.wait(), 10)
+        except TimeoutError:
+            pass
 
         assert "● " not in _rendered_decisions_status(app)
-        assert calls >= 2
     finally:
-        app.stop_decisions_poll()
+        release_failure.set()
+        await _stop_decisions(app)
         await app.loop.tool_registry.close()
         current.store.close()
 
@@ -297,47 +313,47 @@ async def test_persistent_decisions_failure_renders_unavailable_then_recovers(
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    record = await asyncio.to_thread(
+        _request, current, project.project_id, "Current", "This one."
+    )
     app = _decisions_app(tmp_path, current)
     real_open = decisions_module.open_decisions
-    failed = asyncio.Event()
-    recovered = asyncio.Event()
     unavailable = asyncio.Event()
-    loop = asyncio.get_running_loop()
+    recovered = asyncio.Event()
     app._invalidate_prompt = lambda: (
-        unavailable.set()
-        if getattr(app, "decisions_error", None) is not None
-        else recovered.set()
+        unavailable.set() if app.decisions_error is not None else recovered.set()
     )
 
     def broken_open(*_args, **_kwargs):
-        loop.call_soon_threadsafe(failed.set)
         raise RuntimeError("projection failed")
 
     monkeypatch.setattr(decisions_module, "open_decisions", broken_open)
-    # test-contract: seam retry delay is private; result uses the real status render
-    monkeypatch.setattr(panel_module, "_POLL_RESTART_BASE", 0, raising=False)
+    # test-contract: seam backoff is shortened; the toolbar render is unchanged
+    monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
     try:
         app.start_decisions_poll()
-        await await_or_fail(failed.wait(), what="persistent decision poll failure")
-        await await_or_fail(unavailable.wait(), what="unavailable decision render")
+        try:
+            await asyncio.wait_for(unavailable.wait(), 10)
+        except TimeoutError:
+            pass
         assert "decisions unavailable: projection failed" in _rendered_decisions_status(app)
 
-        def healthy_open(*args, **kwargs):
-            return real_open(*args, **kwargs)
-
-        monkeypatch.setattr(decisions_module, "open_decisions", healthy_open)
-        app.request_decisions_refresh()
-        await await_or_fail(recovered.wait(), what="recovered decision refresh")
-        tick_task = getattr(app, "_decisions_tick_task", None)
-        assert tick_task is not None
-        await await_or_fail(
-            asyncio.shield(tick_task),
-            what="recovered decision render",
+        monkeypatch.setattr(decisions_module, "open_decisions", real_open)
+        await asyncio.to_thread(
+            AttentionStore(current.store.session_dir).resolve,
+            record.id,
+            session_id=current.store.session_id,
+            decision="done",
         )
+        app.request_decisions_refresh()
+        try:
+            await asyncio.wait_for(recovered.wait(), 10)
+        except TimeoutError:
+            pass
 
         assert "decisions unavailable" not in _rendered_decisions_status(app)
     finally:
-        app.stop_decisions_poll()
+        await _stop_decisions(app)
         await app.loop.tool_registry.close()
         current.store.close()
 
@@ -364,9 +380,13 @@ async def test_child_resolution_event_refreshes_rendered_count(
     app = _decisions_app(tmp_path, current)
     fork = None
     registry = None
+    refreshed = asyncio.Event()
     try:
         await app._decisions_tick()
         assert "1 decision" in _rendered_decisions_status(app)
+        app._invalidate_prompt = lambda: (
+            refreshed.set() if "● " not in _rendered_decisions_status(app) else None
+        )
         fork_id = await asyncio.to_thread(
             create_discussion_fork, tmp_path, current.store.session_id, record.id
         )
@@ -386,20 +406,101 @@ async def test_child_resolution_event_refreshes_rendered_count(
         assert result["isError"] is False
 
         app._handle_background_event_now(_resolved_event(child=True))
-        tick_task = getattr(app, "_decisions_tick_task", None)
-        assert tick_task is not None
-        await await_or_fail(
-            asyncio.shield(tick_task),
-            what="child decision count refresh",
-        )
+        try:
+            await asyncio.wait_for(refreshed.wait(), 10)
+        except TimeoutError:
+            pass
 
         assert "● " not in _rendered_decisions_status(app)
     finally:
-        app.stop_decisions_poll()
+        await _stop_decisions(app)
         if registry is not None:
             await registry.close()
         if fork is not None:
             fork.store.close()
+        await app.loop.tool_registry.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
+async def test_hung_decisions_scan_renders_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.attention_decisions as decisions_module
+    import zeta.tui.slash_handlers.decisions_panel as panel_module
+
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    await asyncio.to_thread(_request, current, project.project_id, "Current", "This one.")
+    app = _decisions_app(tmp_path, current)
+    release = ThreadEvent()
+    unavailable = asyncio.Event()
+
+    def hung_open(*_args, **_kwargs):
+        release.wait(timeout=10)
+        return ()
+
+    try:
+        await app._decisions_tick()
+        assert "1 decision" in _rendered_decisions_status(app)
+        app._invalidate_prompt = lambda: (
+            unavailable.set() if app.decisions_error is not None else None
+        )
+        monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
+        monkeypatch.setattr(panel_module, "_SCAN_TIMEOUT", 0.01, raising=False)
+        monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
+        app.start_decisions_poll()
+        try:
+            await asyncio.wait_for(unavailable.wait(), 10)
+        except TimeoutError:
+            pass
+
+        rendered = _rendered_decisions_status(app)
+        assert "decisions unavailable: TimeoutError" in rendered and "1 decision" not in rendered
+    finally:
+        release.set()
+        await _stop_decisions(app)
+        await app.loop.tool_registry.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
+async def test_stopping_decisions_scan_drains_owner_without_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.attention_decisions as decisions_module
+
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    app = _decisions_app(tmp_path, current)
+    entered = asyncio.Event()
+    release = ThreadEvent()
+    loop = asyncio.get_running_loop()
+
+    def hung_open(*_args, **_kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(timeout=10)
+        return ()
+
+    monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
+    try:
+        app.start_decisions_poll()
+        await await_or_fail(entered.wait(), what="started decision scan")
+        await _stop_decisions(app)
+        live = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and "decisions" in repr(task.get_coro())
+        ]
+        rendered = _rendered_decisions_status(app)
+        assert not live and "decisions unavailable" not in rendered
+    finally:
+        release.set()
+        await _stop_decisions(app)
         await app.loop.tool_registry.close()
         current.store.close()
 
