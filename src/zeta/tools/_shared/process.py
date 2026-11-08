@@ -26,6 +26,7 @@ from ...core.session_files import (
     session_root,
     write_session_file,
 )
+from ...core.thread_call import run_owned_thread_call
 from ...storage_format import WriterLease
 from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
