@@ -572,7 +572,7 @@ class AccountStore:
                     if state is _Registry.BROKEN:
                         return tuple(warnings)
                 for provider in ("anthropic", "codex"):
-                    self._migrate_provider(home_fd, provider)
+                    self._migrate_provider(home_fd, provider, warnings)
         return tuple(warnings)
 
     def _list_orphan_directories(
@@ -695,7 +695,9 @@ class AccountStore:
                 f"and {len(refused) - _MAX_SWEEP_WARNING_PATHS} more account directories could not be cleaned up"
             )
 
-    def _migrate_provider(self, home_fd: int, provider: str) -> None:
+    def _migrate_provider(
+        self, home_fd: int, provider: str, warnings: list[str]
+    ) -> None:
         account = AccountId(provider, "default")
         legacy_name = f"{provider}-oauth.json"
         legacy_path = self.home / legacy_name
@@ -725,6 +727,15 @@ class AccountStore:
                 return
             tokens = _read_tokens(home_fd, legacy_name)
             with _account_directory(home_fd, account) as account_fd:
+                # fill only: a copied or restored home has unreliable mtimes, so
+                # an existing token that differs may be the newer rotated one
+                if _holds_other_tokens(account_fd, tokens):
+                    warnings.append(
+                        f"kept accounts/{provider}/default/oauth.json; "
+                        f"legacy {legacy_name} was not imported"
+                    )
+                    logger.warning("%s", warnings[-1])
+                    return
                 self._stage_account_tokens(account_fd, account, tokens)
             self._register_account(home_fd, account, value)
             with _open_account_directory(home_fd, account) as account_fd:
@@ -1277,6 +1288,16 @@ def _read_tokens(directory_fd: int, name: str) -> OAuthTokens:
         raise
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise AccountError("OAuth credentials are invalid; login required") from exc
+
+
+def _holds_other_tokens(directory_fd: int, tokens: OAuthTokens) -> bool:
+    """An existing oauth.json that is unreadable or differs from tokens."""
+
+    try:
+        current = _read_optional_tokens(directory_fd)
+    except AccountError:
+        return True
+    return current is not None and current != tokens
 
 
 def _read_optional_tokens(directory_fd: int) -> OAuthTokens | None:

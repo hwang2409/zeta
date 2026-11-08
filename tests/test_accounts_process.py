@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -11,7 +12,8 @@ import pytest
 
 from tests.support.account_homes import build_account_home
 from tests.support.server_client import request
-from zeta.accounts import AccountId
+from zeta.accounts import AccountId, AccountStore
+from zeta.oauth import OAuthTokens
 
 _PROCESS_TIMEOUT = 30
 
@@ -302,3 +304,78 @@ def test_start_with_a_loaded_registry_still_sweeps_an_orphan_directory(
 
     assert not orphan.exists(), result.stderr
     assert _account_files(tmp_path) == kept
+
+
+_LEGACY_TOKENS = OAuthTokens("legacy-access", "legacy-refresh", 9_999_999_999)
+
+
+def _legacy_and_account_files(
+    home: Path, *, registry: bool, account_file: bool, legacy_newer: bool
+) -> tuple[Path, Path]:
+    account = AccountId("codex", "default")
+    store = build_account_home(
+        home,
+        (account,),
+        available=(account,) if account_file else (),
+        defaults=(account,),
+    )
+    if not registry:
+        store.registry.unlink()
+    legacy = home / "codex-oauth.json"
+    legacy.write_text(json.dumps(_LEGACY_TOKENS.to_dict()))
+    destination = store.credential_path(account)
+    base = 1_700_000_000_000_000_000
+    legacy_mtime, account_mtime = (base + 10**9, base) if legacy_newer else (base, base + 10**9)
+    os.utime(legacy, ns=(legacy_mtime, legacy_mtime))
+    if account_file:
+        os.utime(destination, ns=(account_mtime, account_mtime))
+    return legacy, destination
+
+
+@pytest.mark.parametrize("legacy_newer", [False, True], ids=("legacy-older", "legacy-newer"))
+def test_start_without_registry_never_replaces_an_existing_account_token(
+    tmp_path: Path, legacy_newer: bool
+) -> None:
+    legacy, destination = _legacy_and_account_files(
+        tmp_path, registry=False, account_file=True, legacy_newer=legacy_newer
+    )
+    kept, legacy_bytes = destination.read_bytes(), legacy.read_bytes()
+
+    result = _headless_start(tmp_path)
+
+    assert destination.read_bytes() == kept, result.stderr
+    assert legacy.read_bytes() == legacy_bytes
+    warning = "kept accounts/codex/default/oauth.json; legacy codex-oauth.json was not imported"
+    assert result.stderr.count(warning) == 1, result.stderr
+
+
+def test_start_without_registry_imports_legacy_token_into_missing_account_file(
+    tmp_path: Path,
+) -> None:
+    legacy, destination = _legacy_and_account_files(
+        tmp_path, registry=False, account_file=False, legacy_newer=True
+    )
+
+    result = _headless_start(tmp_path)
+
+    assert json.loads(destination.read_text()) == _LEGACY_TOKENS.to_dict(), result.stderr
+    assert not legacy.exists()
+    assert AccountStore(tmp_path).default("codex") == AccountId("codex", "default")
+
+
+@pytest.mark.parametrize("legacy_newer", [False, True], ids=("legacy-older", "legacy-newer"))
+def test_start_with_registry_keeps_the_newer_of_legacy_and_account_token(
+    tmp_path: Path, legacy_newer: bool
+) -> None:
+    legacy, destination = _legacy_and_account_files(
+        tmp_path, registry=True, account_file=True, legacy_newer=legacy_newer
+    )
+    kept = destination.read_bytes()
+
+    result = _headless_start(tmp_path)
+
+    if legacy_newer:
+        assert json.loads(destination.read_text()) == _LEGACY_TOKENS.to_dict(), result.stderr
+    else:
+        assert destination.read_bytes() == kept, result.stderr
+    assert not legacy.exists()
