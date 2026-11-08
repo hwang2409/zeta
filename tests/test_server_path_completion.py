@@ -161,6 +161,16 @@ async def test_path_complete_uses_tui_projection_over_real_unix_transport(
             )
         )[-1]
         assert oversized["error"]["code"] == -32602
+        invalid_unicode = (
+            await _request(
+                reader,
+                writer,
+                "invalid-unicode",
+                "path_complete",
+                {"session_id": session_id, "text_before_cursor": "\ud800"},
+            )
+        )[-1]
+        assert invalid_unicode["error"]["code"] == -32602
         inactive = (
             await _request(
                 reader,

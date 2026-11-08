@@ -24,7 +24,14 @@ async def request(
             ErrorDescriptor.INVALID_PARAMS,
             "text_before_cursor must be a string",
         )
-    if len(text.encode("utf-8")) > MAX_TEXT_BEFORE_CURSOR_BYTES:
+    try:
+        encoded_size = len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            "text_before_cursor must be valid Unicode",
+        ) from exc
+    if encoded_size > MAX_TEXT_BEFORE_CURSOR_BYTES:
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS,
             "text_before_cursor must be at most 4096 UTF-8 bytes",
