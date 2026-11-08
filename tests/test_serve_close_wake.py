@@ -1,4 +1,10 @@
-"""Serve close while a resume's wake turn is still streaming (bench serve probe order)."""
+"""Serve close while a resume's wake turn is still streaming (bench serve probe order).
+
+scripts/bench/bench.py's serve probe resumes a session with an undelivered child
+notification, so resume starts a wake turn, and then closes the server. These
+tests hold that wake turn mid-stream and prove close still returns, ends the
+turn's stream, and frees the session for the next owner.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +12,11 @@ import asyncio
 import fcntl
 import json
 import os
+import threading
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
+import httpx
 import pytest
 
 from tests.support.owned import await_or_fail
@@ -16,24 +24,29 @@ from tests.support.sockets import short_socket_path
 from zeta.core.session import SessionManager
 from zeta.core.session_execution import RUNTIME_LEASE_NAME
 from zeta.protocol.types import (
+    CompletionBackend,
     Message,
     StreamEvent,
     StreamEventType,
     ToolSchema,
 )
 from zeta.providers.completion import owned_completion
+from zeta.providers.ollama import OllamaBackend
 from zeta.server import ZetaServer
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
 
 class BlockedStream:
-    """Starts a stream, then waits for a release that never comes."""
+    """A scripted backend whose stream starts and then waits for a release."""
 
     def __init__(self) -> None:
-        self.streaming = asyncio.Event()
+        self.streaming = threading.Event()
+        self.ended = threading.Event()  # the stream ended without a release
         self.release = asyncio.Event()
-        self.ended: str | None = None
+
+    def backend(self) -> CompletionBackend:
+        return self  # type: ignore[return-value]
 
     @owned_completion
     async def complete(
@@ -43,18 +56,44 @@ class BlockedStream:
             yield StreamEvent(StreamEventType.MESSAGE_START)
             self.streaming.set()
             await self.release.wait()
-            self.ended = "released"
-        except asyncio.CancelledError:
-            self.ended = "cancelled"
-            raise
-        except GeneratorExit:
-            self.ended = "closed"
-            raise
+        finally:
+            if not self.release.is_set():
+                self.ended.set()
+
+
+class BlockedOllama(httpx.AsyncByteStream):
+    """The production Ollama client on a transport whose chat stream sends one
+    line and then waits for a release."""
+
+    def __init__(self) -> None:
+        self.streaming = threading.Event()
+        self.ended = threading.Event()  # the client closed the stream unreleased
+        self.release = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        line = {"message": {"role": "assistant", "content": "."}, "done": False}
+        yield json.dumps(line).encode() + b"\n"
+        self.streaming.set()
+        await self.release.wait()
+
+    async def aclose(self) -> None:
+        if not self.release.is_set():
+            self.ended.set()
+
+    def backend(self) -> CompletionBackend:
+        def reply(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/api/chat", request.url
+            return httpx.Response(
+                200, headers={"Content-Type": "application/x-ndjson"}, stream=self
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(reply))
+        return OllamaBackend(model="stub", base_url="http://ollama.test", client=client)
 
 
 def _session_with_undelivered_notification(home: Path) -> str:
     opened = SessionManager(home).create(
-        provider="codex", model="offline", cwd=home, auto_project=False
+        provider="codex", model="stub", cwd=home, auto_project=False
     )
     try:
         opened.store.append_agent_notification(
@@ -74,7 +113,8 @@ def _reopen(home: Path, sid: str) -> None:
 
 
 async def _request(reader, writer, ident: int, method: str, params: dict) -> dict:
-    writer.write((json.dumps({"jsonrpc": "2.0", "id": ident, "method": method, "params": params}) + "\n").encode())
+    line = {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
+    writer.write((json.dumps(line) + "\n").encode())
     await writer.drain()
     while True:
         raw = await await_or_fail(reader.readline(), what=f"{method} reply")
@@ -87,19 +127,21 @@ async def _request(reader, writer, ident: int, method: str, params: dict) -> dic
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client", ["connected", "disconnected_first"])
-async def test_close_during_resume_wake_turn_cancels_turn_and_releases_session(
-    tmp_path: Path, client: str
+@pytest.mark.parametrize("stream", [BlockedStream, BlockedOllama])
+async def test_close_during_resume_wake_turn_ends_turn_and_releases_session(
+    tmp_path: Path, client: str, stream: type[BlockedStream | BlockedOllama]
 ) -> None:
+    blocked = stream()
+    backend = blocked.backend()
     sid = await await_or_fail(
         asyncio.to_thread(_session_with_undelivered_notification, tmp_path),
         what="session setup",
     )
-    backend = BlockedStream()
     server = ZetaServer(
         provider="codex",
         home=tmp_path,
         socket_path=short_socket_path(tmp_path),
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+        backend_factory=lambda provider, model, home: (backend, model or "stub"),
         auto_memory=False,
         approval_reconnect_grace=0,
     )
@@ -123,15 +165,16 @@ async def test_close_during_resume_wake_turn_cancels_turn_and_releases_session(
             },
         )
         await _request(reader, writer, 2, "resume", {"session_id": sid})
-        await await_or_fail(backend.streaming.wait(), what="wake turn stream start")
-        if client == "disconnected_first":
+        assert await asyncio.to_thread(blocked.streaming.wait, 30), "no wake turn"
+        if client == "disconnected_first":  # the bench order
             writer.close()
             await await_or_fail(writer.wait_closed(), what="client close")
 
         await await_or_fail(server.close(), timeout=30, what="serve close")
         closed = True
 
-        assert backend.ended in {"cancelled", "closed"}
+        # Close ended the wake turn's stream instead of leaving it running.
+        assert await asyncio.to_thread(blocked.ended.wait, 30), "stream still open"
         lease = os.open(tmp_path / "sessions" / sid / RUNTIME_LEASE_NAME, os.O_RDWR)
         try:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if still held
@@ -139,7 +182,7 @@ async def test_close_during_resume_wake_turn_cancels_turn_and_releases_session(
             os.close(lease)
         await await_or_fail(asyncio.to_thread(_reopen, tmp_path, sid), what="reopen")
     finally:
-        backend.release.set()
+        blocked.release.set()
         if writer is not None:
             writer.close()
         if not closed:
