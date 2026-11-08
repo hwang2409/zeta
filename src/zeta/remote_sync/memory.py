@@ -34,6 +34,7 @@ from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from ..runtime.project_registry_state import project_registry
+from ..storage_format import reject_unknown_keys
 from .errors import RemoteSyncError
 from .project_publish import (
     MAX_SYNC_STATE_SIZE,
@@ -888,12 +889,13 @@ def _read_state(
 def _valid_state(value: object, project_id: str) -> bool:
     if isinstance(value, dict) and value.get("schema") == 3:
         return _valid_entry_sync_state(value, project_id)
-    if not isinstance(value, dict) or set(value) != {
-        "schema",
-        "project_id",
-        "files",
-        "conflicts",
-    }:
+    if not isinstance(value, dict):
+        return False
+    try:
+        reject_unknown_keys(value, "remote_memory_sync_state")
+    except ValueError:
+        return False
+    if set(value) != {"schema", "project_id", "files", "conflicts"}:
         return False
     files = value.get("files")
     conflicts = value.get("conflicts")
@@ -909,7 +911,13 @@ def _valid_state(value: object, project_id: str) -> bool:
     if any(not _valid_digest(digest) for digest in files.values()):
         return False
     for conflict in conflicts.values():
-        if not isinstance(conflict, dict) or set(conflict) != {"digests"}:
+        if not isinstance(conflict, dict):
+            return False
+        try:
+            reject_unknown_keys(conflict, "remote_memory_sync_conflict")
+        except ValueError:
+            return False
+        if set(conflict) != {"digests"}:
             return False
         digests = conflict.get("digests")
         if (
@@ -923,6 +931,10 @@ def _valid_state(value: object, project_id: str) -> bool:
 
 
 def _valid_entry_sync_state(value: dict[str, object], project_id: str) -> bool:
+    try:
+        reject_unknown_keys(value, "entry_sync_state")
+    except ValueError:
+        return False
     required = {
         "schema",
         "project_id",
@@ -973,9 +985,17 @@ def _valid_entry_sync_state(value: dict[str, object], project_id: str) -> bool:
         ):
             return False
         if kind == "schema":
+            try:
+                reject_unknown_keys(conflict, "entry_sync_schema_conflict")
+            except ValueError:
+                return False
             if key != "schema" or set(conflict) != {"kind", "digests"}:
                 return False
             continue
+        try:
+            reject_unknown_keys(conflict, "entry_sync_entry_conflict")
+        except ValueError:
+            return False
         entry_ids = conflict.get("entry_ids")
         if (
             set(conflict) != {"kind", "entry_ids", "digests"}
@@ -996,12 +1016,13 @@ def _valid_entry_sync_state(value: dict[str, object], project_id: str) -> bool:
 
 
 def _valid_entry_transition(value: object) -> bool:
-    if not isinstance(value, dict) or set(value) != {
-        "id",
-        "previous_state",
-        "resolutions",
-        "candidates",
-    }:
+    if not isinstance(value, dict):
+        return False
+    try:
+        reject_unknown_keys(value, "entry_sync_transition")
+    except ValueError:
+        return False
+    if set(value) != {"id", "previous_state", "resolutions", "candidates"}:
         return False
     transition_id = value.get("id")
     resolutions = value.get("resolutions")
