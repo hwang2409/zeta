@@ -79,29 +79,24 @@ def started_child_run_row(
     )
 
 
-def child_run_row(session_dir: Path, session_id: str, run_id: str) -> dict[str, object] | None:
-    """Return the row for one run of the top session at ``session_dir``, or None.
+def child_run_row(parent_dir: Path, run_id: str) -> dict[str, object] | None:
+    """Return the row for ``run_id``, a child of the store at ``parent_dir``, or None.
 
     Reads files: call it off the serve loop.
     """
     from .agent_progress import live_child_store, read_agent_lifecycle
-    from .store._child_runs import child_run_segments
 
-    try:
-        segments = child_run_segments(session_id, run_id)
-    except ValueError:
+    leaf = run_id.rpartition(":")[2]
+    if not leaf.isdigit():
         return None
-    path = session_dir
-    for segment in segments:
-        path = path / "agents" / str(segment)
     try:
-        lifecycle = read_agent_lifecycle(path / "agent_lifecycle.json")
+        lifecycle = read_agent_lifecycle(parent_dir / "agents" / leaf / "agent_lifecycle.json")
     except (OSError, ValueError):
         return None
     if not isinstance(lifecycle, dict) or lifecycle.get("handle") != run_id:
         return None
     store = live_child_store(run_id)
-    follow_ups = bool(getattr(store, "accepts_follow_ups", False)) and (
+    follow_ups = store is not None and store.accepts_follow_ups and (
         lifecycle.get("finished_at") is None
     )
     return project_child_run_row(lifecycle, accepts_follow_ups=follow_ups)
