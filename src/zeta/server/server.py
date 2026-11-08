@@ -289,7 +289,7 @@ class ZetaServer:
     async def close(self) -> None:
         try:
             if self._client is not None:
-                await self._client.close()
+                await self._client.close(graceful=True)
         finally:
             self._client = None
             self._client_active = False
@@ -360,6 +360,7 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
@@ -367,10 +368,12 @@ class _Client:
         )
 
     async def run(self) -> None:
+        graceful = True
         try:
             while True:
                 line = await self._read_frame()
                 if not line:
+                    graceful = False
                     break
                 await self.connections.wait_until_settled(self)
                 try:
@@ -453,7 +456,7 @@ class _Client:
                 if not self.handshaken:
                     break
         finally:
-            await self.close()
+            await self.close(graceful=graceful and not self._transport_failed)
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -493,7 +496,7 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
-    async def close(self) -> None:
+    async def close(self, *, graceful: bool = False) -> None:
         async with self._close_lock:
             if self._closed:
                 return
@@ -503,6 +506,8 @@ class _Client:
                 )
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
+            if graceful:
+                await self.connections.flush(self)
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
@@ -1059,7 +1064,10 @@ class _Client:
         }, page_ids
 
     async def _write(self, payload: _Frame) -> bool:
-        return await self.connections.send(self, payload)
+        written = await self.connections.send(self, payload)
+        if not written:
+            self._transport_failed = True
+        return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
         async with self._write_lock:
