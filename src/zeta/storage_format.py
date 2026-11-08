@@ -100,6 +100,37 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     'tool_result_annotations': frozenset({'audience', 'lastModified', 'priority'}),
     'attention_record': frozenset({'created_at', 'decision', 'entry_id', 'entry_seq', 'fork_session_id', 'id', 'lane', 'options', 'project_id', 'recommendation', 'resolved_at', 'session_id', 'status', 'title', 'why'}),
     'attention_fork_meta': frozenset({'attention_id', 'forked_at_entry', 'forked_from_session'}),
+    "transcript_recovery.evidence": frozenset(
+        {
+            "schema",
+            "quarantine_id",
+            "target",
+            "source_digest",
+            "source_size",
+            "first_bad_row",
+            "first_bad_offset",
+            "valid_prefix_end",
+            "retained_last_sequence",
+            "repaired_digest",
+            "diagnosed_at",
+            "payload_digest",
+            "payload_size",
+        }
+    ),
+    "transcript_recovery.state": frozenset(
+        {
+            "schema",
+            "quarantine_id",
+            "target",
+            "state",
+            "expected_source_digest",
+            "repaired_digest",
+            "cutoff_sequence",
+            "diagnosis_timestamp",
+            "memory_step",
+        }
+    ),
+    "transcript_recovery.target": frozenset({"root_session_id", "child_run_id"}),
 }
 
 
@@ -151,22 +182,6 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "warning.transcript_recovery.kind": frozenset({"transcript_recovery"}),
 }
 
-STRICT_PAYLOAD_KEYS: Final[dict[str, frozenset[str]]] = {
-    "transcript_recovery.evidence": frozenset(
-        {
-            "schema", "quarantine_id", "target", "source_digest", "source_size",
-            "first_bad_row", "first_bad_offset", "valid_prefix_end",
-            "retained_last_sequence", "repaired_digest", "diagnosed_at",
-            "payload_digest", "payload_size",
-        }
-    ),
-    "transcript_recovery.state": frozenset(
-        {
-            "schema", "quarantine_id", "target", "state", "expected_source_digest",
-            "repaired_digest", "cutoff_sequence", "diagnosis_timestamp", "memory_step",
-        }
-    ),
-}
 RECOVERY_STATE_MEMORY_PAIRS: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("pending", "not_required"),
