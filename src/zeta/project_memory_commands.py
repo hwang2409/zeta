@@ -82,7 +82,7 @@ def _run_retry_command(
     ]
     if len(matches) != 1:
         return "memory retry: receipt not found or prefix is ambiguous"
-    scanner_failure = reconciler.scanner_failure
+    scanner_failure = getattr(reconciler, "scanner_failure", None)
     if scanner_failure is not None:
         seq, cause = scanner_failure
         return (
