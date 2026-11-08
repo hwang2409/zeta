@@ -9,6 +9,7 @@ import io
 import json
 import multiprocessing
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -1337,6 +1338,16 @@ def _pointerless_project_snapshot(tmp_path: Path) -> tuple[Path, str]:
     return source / "projects" / project.project_id, project.project_id
 
 
+def _two_format_two_projects(tmp_path: Path) -> tuple[Path, str, str]:
+    source = initialize_storage_home(tmp_path / "source")
+    registry = ProjectRegistry(source / "projects")
+    first = registry.create_project("first", "test")
+    second = registry.create_project("second", "test")
+    for project in (first, second):
+        registry._create_entry_memory_for_test(project.project_id, memory_profile("zeta"))
+    return source, first.project_id, second.project_id
+
+
 def _format_two_project_snapshot(
     tmp_path: Path, *, invalid: bool = False
 ) -> tuple[Path, str]:
@@ -1366,6 +1377,107 @@ def _format_two_project_snapshot(
                 manifest[field] = new_digest
         manifest_path.write_text(json.dumps(manifest, sort_keys=True))
     return snapshot, project.project_id
+
+
+def test_p06_3_generated_project_fetch_uses_one_memory_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, held_project_id, fetched_project_id = _two_format_two_projects(tmp_path)
+    remote = initialize_storage_home(tmp_path / "remote")
+    for project_id in (held_project_id, fetched_project_id):
+        shutil.copytree(
+            source / "projects" / project_id,
+            remote / "projects" / project_id,
+        )
+    (remote / "storage-format.json").write_text('{"writer_epoch":6}\n')
+    _install_ssh_shim(tmp_path, monkeypatch)
+    destination = tmp_path / "fetched"
+
+    held_lock = remote / "projects" / held_project_id / ".memory.lock"
+    legacy_root_lock = remote / "projects" / ".lock"
+    held_lock.touch(mode=0o600)
+    legacy_root_lock.touch(mode=0o600)
+    with held_lock.open("r+b") as handle, legacy_root_lock.open("r+b") as root_handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        fcntl.flock(root_handle, fcntl.LOCK_EX)
+        try:
+            SshTransport("fake", str(remote), name="cloud").fetch_project(
+                fetched_project_id, destination
+            )
+            outcome = "fetched"
+        except RemoteSyncError as exc:
+            outcome = str(exc)
+
+    assert outcome == "fetched", "generated project fetch did not use project memory authority"
+    assert project_digest(destination) == project_digest(
+        source / "projects" / fetched_project_id
+    )
+
+    (remote / "storage-format.json").write_text('{"writer_epoch":5}\n')
+    with legacy_root_lock.open("r+b") as root_handle:
+        fcntl.flock(root_handle, fcntl.LOCK_EX)
+        with pytest.raises(RemoteSyncError, match="project registry busy"):
+            SshTransport("fake", str(remote), name="cloud").fetch_project(
+                fetched_project_id, tmp_path / "legacy-fetch"
+            )
+
+
+def test_p06_3_generated_project_install_uses_one_project_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, held_project_id, installed_project_id = _two_format_two_projects(tmp_path)
+    remote = initialize_storage_home(tmp_path / "remote")
+    for project_id in (held_project_id, installed_project_id):
+        shutil.copytree(
+            source / "projects" / project_id,
+            remote / "projects" / project_id,
+        )
+    sync_file = source / "projects" / installed_project_id / "sync" / "new.json"
+    sync_file.parent.mkdir()
+    sync_file.write_text("{}\n")
+    expected = project_digest(remote / "projects" / installed_project_id)
+    (remote / "storage-format.json").write_text('{"writer_epoch":6}\n')
+    _install_ssh_shim(tmp_path, monkeypatch)
+    transport = SshTransport("fake", str(remote), name="cloud")
+
+    def publish() -> str:
+        try:
+            transport.publish_project(
+                installed_project_id,
+                source / "projects" / installed_project_id,
+                expected_digest=expected,
+            )
+            return "installed"
+        except RemoteSyncError as exc:
+            return str(exc)
+
+    held_lock = remote / "projects" / held_project_id / ".memory.lock"
+    legacy_root_lock = remote / "projects" / ".lock"
+    held_lock.touch(mode=0o600)
+    legacy_root_lock.touch(mode=0o600)
+    handle = held_lock.open("r+b")
+    root_handle = legacy_root_lock.open("r+b")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        fcntl.flock(root_handle, fcntl.LOCK_EX)
+        future = executor.submit(publish)
+        try:
+            outcome = future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
+            outcome = "blocked by unrelated project authority"
+    finally:
+        fcntl.flock(root_handle, fcntl.LOCK_UN)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        root_handle.close()
+        handle.close()
+        if future is not None:
+            future.result(timeout=10)
+        executor.shutdown(wait=True)
+
+    assert outcome == "installed", "generated project install did not use one project authority"
+    assert (remote / "projects" / installed_project_id / "sync" / "new.json").read_text() == "{}\n"
 
 
 def _publish_initial_project(
