@@ -22,7 +22,7 @@ from .approval_settlement.approval_grants import (
     finish_grant,
 )
 from .connections import Admission
-from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
+from .protocol import ApprovalDecision, ErrorDescriptor, EventDescriptor, ProtocolError
 
 Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
@@ -64,7 +64,7 @@ class Start:
 
 @dataclass(frozen=True, slots=True)
 class Decide:
-    method: str
+    method: ApprovalDecision
     request_id: str
     scope: str = "once"
 
@@ -684,7 +684,7 @@ class ApprovalLifecycle:
                     ErrorDescriptor.INVALID_PARAMS,
                     f"cannot always allow approval request: {exc}",
                 ) from exc
-        decision = "allow" if method == "approve" else "deny"
+        decision = "allow" if method is ApprovalDecision.APPROVE else "deny"
         record = self._reserve(record, decision)
         if record is None:
             raise ProtocolError(
