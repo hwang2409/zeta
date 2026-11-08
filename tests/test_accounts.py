@@ -1610,7 +1610,7 @@ def test_every_backend_path_uses_session_resolver(
         return websearch_codex.CodexSearchResult("answer", [])
 
     monkeypatch.setattr(websearch.codex, "search", capture)
-    registry = SimpleNamespace(account_context=resolver)
+    registry = SimpleNamespace(account_context=resolver, web_clients=object())
     asyncio.run(
         websearch._websearch(
             registry,

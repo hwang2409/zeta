@@ -477,7 +477,10 @@ async def test_registry_close_drains_in_flight_web_request(
         response_gate.set()
         if not request.done():
             request.cancel()
-            await asyncio.gather(request, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(request, return_exceptions=True),
+                what="cancelled in-flight fetch cleanup",
+            )
         if close_task is not None and not close_task.done():
             await await_or_fail(close_task, what="registry close cleanup")
         await server.close()
