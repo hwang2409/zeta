@@ -8702,9 +8702,8 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
                     time.sleep(0.01)
             return bool(should_stop and should_stop())
 
-        deliveries = recover_agent_children(loop, should_stop=observed_stop)
+        recover_agent_children(loop, should_stop=observed_stop)
         recovery_steps += children_before - len(loop.store.agent_children())
-        return deliveries
 
     monkeypatch.setattr(background, "_recover_agent_children", gated_recovery)
     app = TUIApp(
@@ -8724,10 +8723,19 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         assert app._input_loop_active, (
             "TUI input did not start during activation recovery"
         )
-        app.request_exit()
-        await activation_cancelled.wait()
-        recovery_release.set()
-        await run_task
+        try:
+            app.request_exit()
+            await asyncio.wait_for(activation_cancelled.wait(), 10)
+            recovery_release.set()
+            await asyncio.wait_for(run_task, 10)
+        finally:
+            recovery_release.set()
+            if not run_task.done():
+                run_task.cancel()
+            try:
+                await asyncio.wait_for(run_task, 10)
+            except asyncio.CancelledError:
+                pass
 
     interrupted_store = ConversationStore(
         tmp_path / "sessions", session_id=root.session_id
