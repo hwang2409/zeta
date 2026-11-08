@@ -2,7 +2,9 @@
 import asyncio
 import base64
 import json
+import threading
 import time
+import traceback
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -991,11 +993,12 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
     call = ToolCall("burst-1", "stream", {})
     chunks = [f"chunk-{index}\n" for index in range(200)]
     final_text = "".join(chunks)
+    loop_thread_id = threading.get_ident()
+    original_sleep = time.sleep
     nonblocking_updates = 0
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn(content=[TextContent("done")])]
     )
-    original_put = asyncio.Queue.put
     original_put_nowait = asyncio.Queue.put_nowait
 
     def put_nowait(queue: asyncio.Queue[object], item: object) -> None:
@@ -1008,19 +1011,33 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
             nonblocking_updates += 1
         original_put_nowait(queue, item)
 
-    async def fail_blocking_call(
+    monkeypatch.setattr(asyncio.Queue, "put_nowait", put_nowait)
+
+    original_put = asyncio.Queue.put
+
+    def guard_stream_put(
         queue: asyncio.Queue[object], item: object
-    ) -> None:
+    ):
         if (
             isinstance(item, StreamEvent)
             and item.type is StreamEventType.TOOL_EXECUTION_UPDATE
+            and item.tool_call == call
         ):
             raise AssertionError("stream publication used a blocking operation")
-        await original_put(queue, item)
+        return original_put(queue, item)
 
-    monkeypatch.setattr(asyncio.Queue, "put_nowait", put_nowait)
-    monkeypatch.setattr(asyncio.Queue, "put", fail_blocking_call)
-    monkeypatch.setattr(time, "sleep", fail_blocking_call)
+    monkeypatch.setattr(asyncio.Queue, "put", guard_stream_put)
+
+    def guard_loop_thread_sleep(seconds: float) -> None:
+        if threading.get_ident() == loop_thread_id:
+            caller = "".join(traceback.format_stack(limit=8))
+            raise AssertionError(
+                "stream turn called time.sleep on the event loop thread; "
+                f"seconds={seconds!r}\n{caller}"
+            )
+        original_sleep(seconds)
+
+    monkeypatch.setattr(time, "sleep", guard_loop_thread_sleep)
 
     async def stream(
         arguments: dict[str, object],
@@ -1043,6 +1060,7 @@ skill_catalog=SkillCatalog.empty(),
     async for event in loop.run_turn("start", origin=MessageOrigin.USER):
         events.append(event)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            # test-contract: latency preserve the consumer pacing that exercises queue retention
             await asyncio.sleep(0.001)
 
     updates = [
@@ -1050,11 +1068,22 @@ skill_catalog=SkillCatalog.empty(),
         for event in events
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE
     ]
-    end = next(
+    end_events = [
         event
         for event in events
         if event.type is StreamEventType.TOOL_EXECUTION_END
+    ]
+    error_events = [
+        event
+        for event in events
+        if event.type is StreamEventType.ERROR
+    ]
+    assert end_events, (
+        "tool execution did not publish an end event; "
+        f"events={[event.type.value for event in events]}, "
+        f"errors={error_events}"
     )
+    end = end_events[0]
     assert nonblocking_updates >= len(chunks)
     assert len(updates) == 128
     assert updates[0].delta == "chunk-72\n"
