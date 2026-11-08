@@ -35,6 +35,7 @@ from ...core.slash import (
     run_implement_command,
     run_plan_command,
 )
+from ...core.transcript_recovery.runtime import repair_transcript_for_runtime
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox

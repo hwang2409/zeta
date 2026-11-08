@@ -697,7 +697,9 @@ class SlashSession(Protocol):
 
     def slash_project(self, args: str) -> str: ...
 
-    def slash_memory(self, args: str) -> str: ...
+    def slash_memory(self, args: str) -> str | Awaitable[str]: ...
+
+    def slash_repair_transcript(self, args: str) -> str | Awaitable[str]: ...
 
     def slash_inbox(self, args: str) -> str: ...
 
@@ -951,8 +953,12 @@ def _run_project(session: SlashSession, args: str) -> str:
     return session.slash_project(args)
 
 
-def _run_memory(session: SlashSession, args: str) -> str:
+def _run_memory(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_memory(args)
+
+
+def _run_repair_transcript(session: SlashSession, args: str) -> str | Awaitable[str]:
+    return session.slash_repair_transcript(args)
 
 
 def _run_inbox(session: SlashSession, args: str) -> str:
@@ -1185,6 +1191,14 @@ def create_slash_registry(
             _run_memory,
             "show, retry, or undo automatic memory updates",
             ServeSlash(mutates=_memory_mutates, runs_while_busy=_memory_read_only),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "repair-transcript",
+            _run_repair_transcript,
+            "repair one corrupt transcript: /repair-transcript <session> confirm",
+            ServeSlash(mutates=lambda _args: True),
         )
     )
     registry.register(
