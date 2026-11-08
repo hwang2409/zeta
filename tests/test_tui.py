@@ -14610,9 +14610,13 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     assert not holder.is_alive()
     assert not publisher.is_alive()
     assert publisher_errors == []
-    assert await asyncio.to_thread(
-        named_account_credentials(home, "codex", "work").read
-    ) == published_tokens
+    assert (
+        await asyncio.wait_for(
+            asyncio.to_thread(named_account_credentials(home, "codex", "work").read),
+            10,
+        )
+        == published_tokens
+    )
 
 
 def test_accounts_panel_labels_codex_primary_as_seven_day() -> None:
