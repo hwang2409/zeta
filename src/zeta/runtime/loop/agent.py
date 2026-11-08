@@ -532,6 +532,7 @@ class AgentLoop(
             if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
                 self._mcp_mount_task.cancel()
                 await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
+            await self.close_mcp_management()
             if self._mcp_mount is not None:
                 await self._mcp_mount.close()
                 self._mcp_mount = None

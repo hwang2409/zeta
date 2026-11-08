@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.protocol.types import (
@@ -76,9 +77,7 @@ async def _real_history_server(tmp_path: Path, count: int = 220) -> AsyncIterato
             )
         yield reader, writer, session["session_id"], server
     finally:
-        writer.close()
-        await writer.wait_closed()
-        await server.close()
+        await close_serve(server, writer)
 
 
 async def _history_request(reader: object, writer: object, request_id: int, session_id: str, params: dict[str, object]) -> dict[str, object]:
