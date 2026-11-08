@@ -72,6 +72,8 @@ class _OutputFrame:
     payload: _Frame
     future: asyncio.Future[bool] | None = None
     replay_stream_id: str | None = None
+    replay_scope: ReplayScopeId | None = None
+    replay_size: int = 0
 
 
 @dataclass
@@ -337,6 +339,8 @@ class ConnectionRegistry:
         if published is None:
             return False
         payload = {"stream_id": published.stream_id, "seq": published.seq, **fields}
+        replay_scope = payload.pop("_replay_scope", None)
+        replay_size = payload.pop("_replay_size", 0)
         payload.pop("_session_id", None)
         frame = state.connection.codec.notification(event, session_id, **payload)
         if frame is None or state.output is None:
@@ -350,7 +354,12 @@ class ConnectionRegistry:
             return False
         self._enqueue(
             state.output,
-            _OutputFrame(frame, replay_stream_id=published.stream_id),
+            _OutputFrame(
+                frame,
+                replay_stream_id=published.stream_id,
+                replay_scope=replay_scope,
+                replay_size=replay_size,
+            ),
         )
         return True
 
@@ -360,13 +369,20 @@ class ConnectionRegistry:
             return
         for event, fields in self.replay.response_written(connection):
             session_id = fields.pop("_session_id", None)
+            replay_scope = fields.pop("_replay_scope", None)
+            replay_size = fields.pop("_replay_size", 0)
             frame = connection.codec.notification(event, session_id, **fields)
             if frame is None or not self._admit(state, frame):
                 self.replay.connection_closed(connection)
                 return
             self._enqueue(
                 state.output,
-                _OutputFrame(frame, replay_stream_id=fields.get("stream_id")),
+                _OutputFrame(
+                    frame,
+                    replay_stream_id=fields.get("stream_id"),
+                    replay_scope=replay_scope,
+                    replay_size=replay_size,
+                ),
             )
 
     async def publish_controller(
@@ -750,12 +766,15 @@ class ConnectionRegistry:
         output.retained_bytes += len(item.payload)
         output.retained_frames += 1
 
-    @staticmethod
-    def _finish_frame_accounting(output: _OutputState, item: _OutputFrame) -> None:
+    def _finish_frame_accounting(
+        self, output: _OutputState, item: _OutputFrame
+    ) -> None:
         output.retained_bytes -= len(item.payload)
         output.retained_frames -= 1
         assert output.retained_bytes >= 0
         assert output.retained_frames >= 0
+        if item.replay_scope is not None and item.replay_size:
+            self.replay.release(item.replay_scope, item.replay_size)
 
     @staticmethod
     def _assert_retained_accounting(output: _OutputState) -> None:
@@ -765,9 +784,8 @@ class ConnectionRegistry:
         assert output.retained_bytes == sum(len(item.payload) for item in frames)
         assert output.retained_frames == len(frames)
 
-    @staticmethod
     async def _cancel_frame(
-        output: _OutputState, item: _OutputFrame
+        self, output: _OutputState, item: _OutputFrame
     ) -> tuple[bool | None, FrameWriteCancelled | None]:
         if output.current_frame is item:
             if output.current_write is not None:
@@ -782,7 +800,7 @@ class ConnectionRegistry:
             output.queue.remove(item)
         except ValueError:
             return None, None
-        ConnectionRegistry._finish_frame_accounting(output, item)
+        self._finish_frame_accounting(output, item)
         if item.future is not None and not item.future.done():
             item.future.cancel()
         return None, None
@@ -828,11 +846,10 @@ class ConnectionRegistry:
             task.cancel()
         output.overflow_deadline_task = None
 
-    @staticmethod
-    def _clear_output(output: _OutputState, *, result: bool | None = None) -> None:
+    def _clear_output(self, output: _OutputState, *, result: bool | None = None) -> None:
         while output.queue:
             item = output.queue.popleft()
-            ConnectionRegistry._finish_frame_accounting(output, item)
+            self._finish_frame_accounting(output, item)
             if item.future is None or item.future.done():
                 continue
             if result is None:

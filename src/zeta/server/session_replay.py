@@ -160,12 +160,29 @@ class SessionReplay:
         seq = target.next_seq if isinstance(target, _Subscription) else len(target.frames) + 1
         if isinstance(target, _Subscription):
             target.next_seq += 1
-        payload = {"stream_id": target.stream_id, "seq": seq, **fields}
+        payload = {
+            "stream_id": target.stream_id,
+            "seq": seq,
+            "_replay_scope": scope,
+            "_replay_size": frame_size,
+            **fields,
+        }
         if pending is not None and subscription is None:
             pending.frames.append((event, payload))
         else:
             target.held.append((event, payload))
         return PublishedSessionEvent(target.stream_id, seq)
+
+    def release(self, scope: ReplayScopeId, size: int) -> None:
+        owner = self._scopes.get(scope)
+        if owner is None:
+            return
+        owner.records -= 1
+        owner.bytes -= size
+        self._records -= 1
+        self._bytes -= size
+        if owner.records <= 0:
+            self._scopes.pop(scope, None)
 
     def drain_for_connection(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
         subscription = self._subscriptions.get(connection)
@@ -177,7 +194,13 @@ class SessionReplay:
     def connection_closed(self, connection: Any) -> None:
         pending = self._pending.pop(connection, None)
         subscription = self._subscriptions.pop(connection, None)
-        del pending, subscription
+        for item in (pending, subscription):
+            if item is None:
+                continue
+            for _, fields in item.frames if pending is item else item.held:
+                self.release(
+                    fields["_replay_scope"], fields["_replay_size"]
+                )
 
     def session_replaced(self) -> None:
         for pending in self._pending.values():
