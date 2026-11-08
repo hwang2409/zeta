@@ -1037,6 +1037,8 @@ def perform_child_history_read(
         {"session_id": target[0], "opened": type("Opened", (), {"store": reader})()},
     )()
     history_params = {key: value for key, value in params.items() if key != "run_id"}
+    if "before" not in history_params:
+        history_params["before"] = None
     return ergonomics.history(
         runtime,
         history_params,

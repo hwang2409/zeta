@@ -91,11 +91,13 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
         agent_type="worker",
         description="child",
     )
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("one")]))
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("two")]))
+    for index in range(130):
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"message-{index}")])
+        )
     child.close()
     try:
-        newest = (
+        newest_reply = (
             await request(
                 reader,
                 writer,
@@ -103,11 +105,28 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
                 "child_run_history",
                 {"session_id": session_id, "run_id": f"{session_id}:1"},
             )
-        )[-1]["result"]
-        assert [row["content"][0]["text"] for row in newest["messages"]] == [
-            "one",
-            "two",
-        ]
+        )[-1]
+        assert "result" in newest_reply, newest_reply
+        newest = newest_reply["result"]
+        assert len(newest["messages"]) == 130
+        assert newest["messages"][0]["content"][0]["text"] == "message-0"
+        assert newest["messages"][-1]["content"][0]["text"] == "message-129"
         assert newest.get("next_before") is None
+        continuation = (
+            await request(
+                reader,
+                writer,
+                4,
+                "child_run_history",
+                {
+                    "session_id": session_id,
+                    "run_id": f"{session_id}:1",
+                    "before": 65,
+                    "history_validator": newest["history_validator"],
+                },
+            )
+        )[-1]["result"]
+        assert continuation["messages"][0]["content"][0]["text"] == "message-0"
+        assert continuation["messages"][-1]["content"][0]["text"] == "message-64"
     finally:
         await close_serve(server, writer)
