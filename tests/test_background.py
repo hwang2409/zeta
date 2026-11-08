@@ -481,16 +481,49 @@ async def _cancel_writer_close(registry, owner, monkeypatch) -> None:
 
 
 async def _cancel_archive(registry, owner, monkeypatch) -> None:
-    original = owner._archive
+    tasks = registry.background_tasks
+    archive = tasks._archive
+    assert archive is not None
+    original_append = archive.append
+    append_entered = asyncio.Event()
+    release_append = threading.Event()
+    loop = asyncio.get_running_loop()
+    source_fds: list[int] = []
 
-    async def install(hold):
-        async def archive():
-            await hold()
-            return await original()
-        # test-contract: seam this row installs the named archive cancellation seam.
-        monkeypatch.setattr(owner, "_archive", archive)
+    def append(task_id: str, source_fd: int, length: int) -> None:
+        source_fds.append(source_fd)
+        loop.call_soon_threadsafe(append_entered.set)
+        assert release_append.wait(timeout=10)
+        original_append(task_id, source_fd, length)
 
-    await _cancel_at_gate(owner, install, name="archive")
+    # test-contract: seam cancel the real cleanup task inside the real archive append.
+    monkeypatch.setattr(archive, "append", append)
+    try:
+        await await_or_fail(append_entered.wait(), what="archive append entered")
+        lifecycle = owner.lifecycle
+        assert lifecycle is not None
+        cleanup = lifecycle.get_stack()[-1].f_locals["cleanup"]
+        cleanup.cancel()
+        cancellation_delivered = asyncio.Event()
+        loop.call_soon(cancellation_delivered.set)
+        await await_or_fail(
+            cancellation_delivered.wait(), what="archive cancellation delivered"
+        )
+
+        os.fstat(source_fds[0])
+        assert not owner.terminal_durable.is_set()
+        assert archive.pread(owner.record.task_id, 0, owner.record.total_bytes) == b""
+
+        release_append.set()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(owner.wait(), what="archive cancellation completion")
+
+        assert owner.terminal_durable.is_set()
+        assert archive.pread(
+            owner.record.task_id, 0, owner.record.total_bytes
+        ) == bytes(owner.record.output)
+    finally:
+        release_append.set()
 
 
 async def _cancel_persist(registry, owner, monkeypatch) -> None:
