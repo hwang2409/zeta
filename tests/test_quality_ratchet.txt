@@ -2,6 +2,7 @@ tests/support/processes.py::_finish_child_process_cleanup
 tests/support/processes.py::reap_process
 tests/support/serve_contract.py::_run_cleanup
 tests/support/server_backend.py::complete
+tests/support/storage_homes.py::initialize_storage_home
 tests/test_account_home.py::test_refresh_writes_token_and_lock_to_account_home
 tests/test_accounts.py::_hold_lifecycle_lock
 tests/test_accounts.py::_hold_registry_lock
@@ -10,6 +11,7 @@ tests/test_accounts.py::_migration_worker
 tests/test_accounts.py::blocked_refresh
 tests/test_accounts.py::race
 tests/test_accounts.py::test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_block_loop
+tests/test_accounts.py::ticker
 tests/test_accounts_exhaustion.py::recover
 tests/test_accounts_exhaustion.py::run
 tests/test_accounts_exhaustion.py::test_account_switch_never_replays_transcript
@@ -28,6 +30,7 @@ tests/test_agent.py::complete
 tests/test_agent.py::confirm
 tests/test_agent.py::controlled_wait
 tests/test_agent.py::delayed_send
+tests/test_agent.py::delayed_setup
 tests/test_agent.py::events
 tests/test_agent.py::fail_confirmation
 tests/test_agent.py::fake_consume
@@ -76,7 +79,14 @@ tests/test_agent.py::test_explicit_finish_child_ending_with_text_gets_one_immedi
 tests/test_agent.py::test_explicit_finish_never_enters_run_finish_gate
 tests/test_agent.py::test_explicit_finish_refuses_owned_work_until_clear
 tests/test_agent.py::test_finish_gate_cycles_cannot_bypass_model_cap
+tests/test_agent.py::test_finish_gate_follow_up_keeps_original_task_deadline
+tests/test_agent.py::test_finish_gate_model_timeout_defers_task_exit_during_cancellation
+tests/test_agent.py::test_finish_gate_ollama_stream_close_obeys_task_deadline
+tests/test_agent.py::test_finish_gate_real_transport_close_obeys_task_deadline
 tests/test_agent.py::test_finish_gate_real_transport_close_propagates_caller_cancellation
+tests/test_agent.py::test_finish_gate_task_deadline_bounds_stream_close
+tests/test_agent.py::test_finish_gate_task_deadline_starts_when_gate_starts
+tests/test_agent.py::test_finish_gate_task_with_pending_subagent_keeps_task_past_model_bound
 tests/test_agent.py::test_finish_gate_turn_cap_defers_task_exit_during_stream_close
 tests/test_agent.py::test_finish_gate_turn_cap_does_not_kill_running_task
 tests/test_agent.py::test_finish_gate_wait_outlives_default_bound_for_running_task
@@ -94,6 +104,8 @@ tests/test_agent.py::test_no_immediate_reminder_while_child_owns_running_task_or
 tests/test_agent.py::test_notification_producer_races_step_snapshot_once
 tests/test_agent.py::test_notification_producer_races_turn_end_once
 tests/test_agent.py::test_notification_wake_waits_for_resumed_durable_tool
+tests/test_agent.py::test_parallel_agent_calls_overlap_and_keep_child_results
+tests/test_agent.py::test_parallel_delegated_approvals_resolve_by_child_instance
 tests/test_agent.py::test_parent_abort_cancels_child
 tests/test_agent.py::test_pending_follow_up_is_processed_before_finish_gate_timeout
 tests/test_agent.py::test_post_cap_question_answer_completion_uses_three_causal_turns
@@ -112,6 +124,7 @@ tests/test_agent.py::test_typed_child_type_survives_cancellation_and_reopen
 tests/test_agent.py::test_user_submission_waits_behind_notification_wake
 tests/test_agent.py::test_wait_with_running_task_wakes_parent_then_accepts_approval
 tests/test_agent.py::wait_for_cancel
+tests/test_agent.py::wait_for_new_idle
 tests/test_agent.py::wait_forever
 tests/test_agent.py::wait_idle
 tests/test_agent.py::wait_tool
@@ -178,6 +191,7 @@ tests/test_attention_delivery.py::race
 tests/test_auto_memory.py::invoke
 tests/test_auto_memory.py::test_background_reconcile_does_not_block_event_loop
 tests/test_auto_memory.py::test_close_cancels_inflight_request_quietly
+tests/test_auto_memory.py::test_close_stops_retrying_persistent_cas_conflicts
 tests/test_auto_memory.py::test_transcript_scanner_reads_every_row_written_by_history_fidelity
 tests/test_auto_memory.py::test_worker_coalesces_activity_while_provider_is_running
 tests/test_auto_memory.py::wait
@@ -193,12 +207,14 @@ tests/test_background.py::test_output_beyond_ring_recoverable_active_and_finishe
 tests/test_background.py::test_shutdown_snapshot_does_not_block_live_loop
 tests/test_background.py::test_unobserved_failed_store_close_is_not_retried
 tests/test_background.py::test_wait_publishes_terminal_state_only_after_archive_commit
+tests/test_background.py::ticker
 tests/test_background.py::wait_after_close_is_released
 tests/test_background.py::wait_for_terminal
 tests/test_background_start_shutdown.py::test_cancelled_start_waits_for_persist_and_commits_reaped_state
 tests/test_background_tools.py::_output
 tests/test_bash_cwd.py::test_delegated_shell_approval_uses_persisted_bash_cwd
 tests/test_bash_cwd.py::test_run_background_relative_cwd_uses_persisted_bash_cwd
+tests/test_child_run_events_slice1.py::run
 tests/test_codex.py::__aexit__
 tests/test_codex.py::__aiter__
 tests/test_codex.py::_refresh_process
@@ -309,6 +325,7 @@ tests/test_mcp.py::test_stdio_write_after_server_exit_preserves_protocol_error
 tests/test_mcp.py::wait_for_deadline
 tests/test_mcp_envelope.py::cancellation_resistant_call
 tests/test_mcp_envelope.py::handler
+tests/test_mcp_envelope.py::heartbeat
 tests/test_mcp_envelope.py::test_http_deadline_retains_cancellation_resistant_call_until_shutdown
 tests/test_mcp_envelope.py::test_large_http_parse_stays_off_loop
 tests/test_mcp_envelope.py::test_spill_reservation_does_not_wait_for_spill_write
@@ -344,7 +361,10 @@ tests/test_mcp_stdio_envelope.py::test_stdio_valid_frames_charge_only_the_matchi
 tests/test_mcp_stdio_envelope.py::wait_for_notification_deadline
 tests/test_mcp_tool_filter.py::handler
 tests/test_mcp_tool_filter.py::list_tools
+tests/test_memory_structured_updater.py::observed
 tests/test_memory_structured_updater.py::test_continuous_turns_fire_by_default_max_wait_and_repeat
+tests/test_memory_structured_updater.py::test_restart_does_not_retrigger_consumed_user_turn
+tests/test_memory_structured_updater.py::wait
 tests/test_memory_sync_migration.py::invoke
 tests/test_memory_sync_migration.py::test_inflight_format_one_reconciliation_during_migration
 tests/test_message_finder_tui.py::test_child_view_finder_stays_in_child_transcript
@@ -353,6 +373,8 @@ tests/test_message_finder_tui.py::test_history_finder_ranks_multiple_batches_wit
 tests/test_message_finder_tui.py::test_newest_candidates_publish_before_older_render_finishes
 tests/test_message_finder_tui.py::test_open_yields_within_the_candidate_work_budget
 tests/test_message_finder_tui.py::test_pathological_query_ranks_off_the_ui_thread
+tests/test_message_finder_tui.py::test_removed_virtual_search_anchor_keeps_navigation_working
+tests/test_message_finder_tui.py::test_virtual_accept_stays_on_target_while_search_index_builds
 tests/test_message_origins.py::_audit_server_row
 tests/test_message_origins.py::_audit_tui_row
 tests/test_model_picker.py::test_picker_does_not_open_while_a_turn_is_active
@@ -376,6 +398,7 @@ tests/test_project_memory.py::test_real_child_spawns_repeat_stable_overflow_at_p
 tests/test_read_images.py::communicate
 tests/test_read_images.py::test_canceling_image_normalization_kills_worker
 tests/test_read_images.py::wait
+tests/test_restart.py::run_prompt_toolkit
 tests/test_resume_notification_perf.py::test_async_tui_replay_persists_rendered_notifications_when_cancelled
 tests/test_resume_recovery_bootstrap.py::gated_produce
 tests/test_resume_recovery_bootstrap.py::test_resume_recovery_cancel_during_notification_publication_is_safe
@@ -391,19 +414,28 @@ tests/test_server.py::gated_send
 tests/test_server.py::hold_lifecycle_lock
 tests/test_server.py::interleaved_unlink
 tests/test_server.py::pause_approval_end
+tests/test_server.py::test_abort_captures_turn_before_approval_end_write
 tests/test_server.py::test_account_switch_does_not_block_loop_while_registry_lock_held
+tests/test_server.py::test_canceled_write_to_stalled_client_aborts_within_grace
 tests/test_server.py::test_child_cancel_while_approval_pending_emits_one_matching_approval_end
 tests/test_server.py::test_client_close_emits_approval_end_once
 tests/test_server.py::test_delegated_approval_history_and_live_end_keep_durable_identity
+tests/test_server.py::test_disconnected_wake_turn_reuses_durable_notification_input
+tests/test_server.py::test_failed_wake_turn_keeps_durable_notification_input
+tests/test_server.py::test_foreground_abort_retries_interrupted_notification_turn
+tests/test_server.py::test_foreground_aborts_after_notification_retry_report_idle
 tests/test_server.py::test_notification_presentation_retries_after_cancel_before_write
+tests/test_server.py::test_reconnect_runs_pending_notification_turn_once
 tests/test_server.py::test_resumed_approval_finishes_idle_after_terminal_event
 tests/test_server.py::test_runtime_failure_releases_all_session_leases
+tests/test_server.py::test_send_immediately_after_reconnect_does_not_steal_wake_turn
 tests/test_server.py::test_serve_account_refresh_reports_busy_lifecycle_lock
 tests/test_server.py::test_serve_accounts_panel_does_not_block_on_held_lifecycle_lock
 tests/test_server.py::test_serve_shutdown_with_switch_lock_held_exits_bounded
 tests/test_server.py::test_server_shutdown_emits_approval_end_once
 tests/test_server.py::test_sigterm_cleans_socket_after_streaming_delta
 tests/test_server.py::test_slash_status_worker_ignores_completion_after_serve_loop_closes
+tests/test_server.py::ticker
 tests/test_server_approval_reservation.py::gated_close
 tests/test_server_approval_reservation.py::test_always_tool_grant_waits_for_durable_approval
 tests/test_server_approval_reservation.py::test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_first
@@ -413,6 +445,7 @@ tests/test_server_approval_reservation.py::test_confirmed_durable_outcome_contro
 tests/test_server_approval_reservation.py::test_delegated_cleanup_during_request_history_write_publishes_no_ghost
 tests/test_server_approval_reservation.py::test_delegated_cleanup_overlaps_worker_resolve_exact_target
 tests/test_server_approval_reservation.py::test_failed_delegated_request_write_settles_cleanup_owner
+tests/test_server_approval_reservation.py::test_failed_settlement_cancellation_recovery_balances_publication
 tests/test_server_approval_reservation.py::test_forced_resume_cancel_during_close_finishes_cleanup
 tests/test_server_approval_reservation.py::test_legacy_disconnect_abort_is_off_loop_and_byte_identical
 tests/test_server_approval_reservation.py::test_same_tick_approval_reservation_winner
@@ -452,6 +485,7 @@ tests/test_server_observers.py::test_observer_outbound_limits_count_and_bytes
 tests/test_server_observers.py::test_session_tree_uses_one_store_snapshot
 tests/test_server_output.py::controlled_deadline
 tests/test_server_output.py::test_overflow_deadline_closes_without_promising_error_frame
+tests/test_server_process.py::_connect_ready
 tests/test_server_projects.py::test_serve_project_instructions_does_not_block_loop_tick
 tests/test_server_projects.py::test_serve_resume_cancel_closes_store_after_preparation_finishes
 tests/test_server_projects.py::test_serve_resume_cancel_reaper_waits_for_composition_before_closing_store
@@ -464,10 +498,14 @@ tests/test_server_session_grants.py::test_observer_write_failure_does_not_block_
 tests/test_server_session_grants.py::test_observer_write_failure_does_not_turn_revoke_into_error
 tests/test_server_session_grants.py::test_replacement_controller_discards_cache_and_reads_current_snapshot
 tests/test_server_session_grants.py::test_slow_observer_does_not_delay_grant_or_revoke_response
+tests/test_server_turn_context.py::_notify
 tests/test_server_turn_context.py::claim
 tests/test_server_turn_context.py::test_cancel_after_durable_notification_append_does_not_duplicate_retry
+tests/test_server_turn_context.py::test_failed_persistence_releases_context_for_exactly_one_retry
 tests/test_server_turn_context.py::test_persisted_notification_retry_attaches_new_context_once
 tests/test_server_turn_context.py::test_racing_notification_claims_consume_context_once
+tests/test_server_turn_context.py::test_reconnect_keeps_context_released_after_persistence_failure
+tests/test_server_turn_context.py::test_session_switch_keeps_pending_contexts_separate
 tests/test_session.py::block
 tests/test_session.py::override
 tests/test_session.py::test_cancel_then_approve_does_not_resume_tool
@@ -558,6 +596,7 @@ tests/test_tui.py::stream
 tests/test_tui.py::test_aborted_turn_does_not_reorder_the_next_reply
 tests/test_tui.py::test_account_limit_event_lists_accounts_off_loop
 tests/test_tui.py::test_accounts_panel_does_not_block_on_held_lifecycle_lock
+tests/test_tui.py::test_accounts_panel_renders_usage_and_refresh_results
 tests/test_tui.py::test_accounts_refresh_renders_busy_lifecycle_lock
 tests/test_tui.py::test_app_abort_enters_interrupted_state
 tests/test_tui.py::test_approval_shortcuts_only_fire_on_an_empty_composer
@@ -600,6 +639,7 @@ tests/test_tui.py::test_run_abort_persists_cancelled_tool_result
 tests/test_tui.py::test_run_delivers_queued_follow_up_after_current_turn
 tests/test_tui.py::test_run_keeps_empty_resumed_transcript_blank
 tests/test_tui.py::test_run_replays_resumed_transcript_before_prompt
+tests/test_tui.py::test_runtime_close_draft_writer_owns_its_directory_fd
 tests/test_tui.py::test_spinner_pulses_on_timer
 tests/test_tui.py::test_spinner_restarts_for_completion_after_tool
 tests/test_tui.py::test_startup_failure_restores_accepted_input_to_draft
@@ -630,6 +670,7 @@ tests/test_tui.py::test_vi_composer_normal_enter_submits_without_losing_buffer
 tests/test_tui.py::test_vi_composer_paced_dd_and_gg_commands
 tests/test_tui.py::test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
 tests/test_tui.py::test_writer_processes_submission_racing_retirement_once_in_order
+tests/test_tui.py::ticker
 tests/test_tui.py::type_then_crash
 tests/test_tui.py::type_then_exit
 tests/test_tui.py::waiting_prompt
@@ -638,6 +679,8 @@ tests/test_tui_stall_watchdog.py::test_watchdog_close_leaves_no_default_executor
 tests/test_tui_transcript_perf.py::test_failing_agent_source_does_not_stop_batch_or_spinner
 tests/test_tui_transcript_perf.py::test_finished_agent_cards_release_transcript_sources
 tests/test_tui_transcript_perf.py::test_progressive_search_discards_revised_unit_result
+tests/test_tui_transcript_perf.py::test_progressive_search_survives_updates_and_resizes
+tests/test_tui_transcript_perf.py::test_uncached_search_index_builds_in_bounded_batches
 tests/test_websearch_codex.py::__aiter__
 tests/test_websearch_codex.py::access_token
 tests/test_websearch_codex.py::advance

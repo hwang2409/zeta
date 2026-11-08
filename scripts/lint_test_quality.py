@@ -186,6 +186,8 @@ def _contains_timing_reference(node: ast.AST) -> bool:
             "time.perf_counter",
             "monotonic",
             "perf_counter",
+            "loop.time",
+            "self.loop.time",
         }:
             return True
         if isinstance(child, (ast.Name, ast.Attribute)):
@@ -440,6 +442,69 @@ def _enclosing_function_touches_added_line(
     )
 
 
+def _contains_async_sleep(node: ast.AST) -> bool:
+    return any(
+        isinstance(child, ast.Await)
+        and isinstance(child.value, ast.Call)
+        and _name(child.value.func) == "asyncio.sleep"
+        for child in ast.walk(node)
+    )
+
+
+def _contains_failure(node: ast.AST) -> bool:
+    return any(
+        isinstance(child, (ast.Assert, ast.Raise))
+        or (
+            isinstance(child, ast.Call)
+            and _name(child.func) in {"pytest.fail", "fail"}
+        )
+        for child in ast.walk(node)
+    )
+
+
+def _counter_bound_fails(node: ast.While, parents: dict[ast.AST, ast.AST]) -> bool:
+    counter_names = {
+        compare.left.id
+        for compare in ast.walk(node.test)
+        if isinstance(compare, ast.Compare)
+        and isinstance(compare.left, ast.Name)
+        and any(isinstance(op, (ast.Lt, ast.LtE)) for op in compare.ops)
+        and any(
+            isinstance(value, ast.Constant) and isinstance(value.value, int)
+            for value in compare.comparators
+        )
+    }
+    if not counter_names or not any(
+        isinstance(child, ast.AugAssign)
+        and isinstance(child.target, ast.Name)
+        and child.target.id in counter_names
+        for child in ast.walk(node)
+    ):
+        return False
+    if _contains_failure(node):
+        return True
+    child = node
+    while child in parents:
+        parent = parents[child]
+        body = getattr(parent, "body", None)
+        if isinstance(body, list) and node in body:
+            return any(_contains_failure(sibling) for sibling in body[body.index(node) + 1 :])
+        child = parent
+    return False
+
+
+def _is_unbounded_polling_loop(
+    node: ast.While, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    if not _contains_async_sleep(node):
+        return False
+    if _inside_timeout_context(node, parents) or _inside_deadline_argument(node, parents):
+        return False
+    if _contains_timing_reference(node.test) or _contains_timing_reference(node):
+        return False
+    return not _counter_bound_fails(node, parents)
+
+
 def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     return (
         isinstance(node, ast.Call)
@@ -525,6 +590,17 @@ def _deadline_findings(
     lines: list[str],
     parents: dict[ast.AST, ast.AST],
 ) -> list[Finding]:
+    if isinstance(node, ast.While) and _is_unbounded_polling_loop(node, parents):
+        return [
+            Finding(
+                path,
+                node.lineno,
+                node.col_offset + 1,
+                AWAIT_DEADLINE_CODE,
+                "polling loop without a deadline: wrap it in await_or_fail(...) / "
+                "asyncio.timeout(...) or wait on an event",
+            )
+        ]
     if _is_unbounded_sync_wait(node, parents):
         return (
             []

@@ -136,6 +136,65 @@ def test_await_deadline_rule_rejects_unbounded_waits(
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            """async def test_spin():
+    while not ready:
+        await asyncio.sleep(0)
+""",
+            [("TQ004", 2)],
+        ),
+        (
+            """async def test_spin():
+    async with asyncio.timeout(10):
+        while not ready:
+            await asyncio.sleep(0)
+""",
+            [],
+        ),
+        (
+            """async def test_spin():
+    deadline = time.monotonic() + 10
+    while not ready and time.monotonic() < deadline:
+        await asyncio.sleep(0)
+    assert ready
+""",
+            [],
+        ),
+        (
+            """async def test_spin():
+    attempts = 0
+    while not ready and attempts < 3:
+        attempts += 1
+        await asyncio.sleep(0)
+    pytest.fail("ready did not arrive")
+""",
+            [],
+        ),
+        (
+            """async def test_spin():
+    while not ready:
+        # test-contract: latency exercise a short polling interval
+        await asyncio.sleep(0.01)
+""",
+            [("TQ004", 2)],
+        ),
+    ],
+)
+def test_polling_spin_requires_a_deadline(
+    tmp_path: Path, source: str, expected: list[tuple[str, int]]
+) -> None:
+    findings = _lint(tmp_path, source)
+    assert [(finding.code, finding.line) for finding in findings] == expected
+    if expected:
+        assert findings[0].message == (
+            "polling loop without a deadline: wrap it in await_or_fail(...) / "
+            "asyncio.timeout(...) or wait on an event"
+        )
+
+
 def test_await_deadline_rule_catches_pr_765_original_bare_task_await(
     tmp_path: Path,
 ) -> None:
