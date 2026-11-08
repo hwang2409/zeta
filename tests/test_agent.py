@@ -14639,21 +14639,29 @@ async def _run_until_idle_wait(
     monkeypatch: pytest.MonkeyPatch,
     *,
     replies: list[str] | None = None,
+    result_texts: list[str] | None = None,
     wait_for_idle: bool = True,
     child_instance_id: str = "root:1",
 ) -> tuple[asyncio.Task[dict[str, object]], asyncio.Event, list[str]]:
     idle_waiting = asyncio.Event()
     prompts: list[str] = []
     reply_texts = iter(replies or ["last child message"])
+    rendered_texts = iter(result_texts) if result_texts is not None else None
 
     async def consume(_loop, prompt, **kwargs):
         await _ack_fake_delivery(child, kwargs)
         prompts.append(prompt)
+        reply = next(reply_texts, "later child message")
+        record_report = kwargs.get("record_report")
+        if callable(record_report):
+            record_report(reply)
         return {
             "content": [
                 {
                     "type": "text",
-                    "text": next(reply_texts, "later child message"),
+                    "text": next(rendered_texts, reply)
+                    if rendered_texts is not None
+                    else reply,
                 }
             ],
             "isError": False,
@@ -14866,6 +14874,34 @@ async def test_empty_idle_notifies_parent_once_with_last_message(
         assert len(notices) == 1
         assert notices[0].data["text"] == "final useful status"
         assert wakes == ["notification"]
+    finally:
+        await _cancel_idle_fixture(run, registry, parent, child)
+
+
+@pytest.mark.asyncio
+async def test_idle_notice_uses_retained_last_message_after_eviction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, child, registry, loop, _parent_flow, _wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    run, _idle_waiting, prompts = await _run_until_idle_wait(
+        loop,
+        child,
+        monkeypatch,
+        replies=["real retained child report", "reminder did no work"],
+        result_texts=["[assistant text evicted · seq 851]", "[assistant text evicted · seq 857]"],
+    )
+    try:
+        notices = [
+            entry
+            for entry in parent.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "child_idle"
+        ]
+        assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
+        assert len(notices) == 1
+        assert notices[0].data["text"] == "real retained child report"
+        assert "assistant text evicted" not in notices[0].data["text"]
     finally:
         await _cancel_idle_fixture(run, registry, parent, child)
 

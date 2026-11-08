@@ -203,8 +203,8 @@ async def consume_run(
             if idle:
                 _transition_idle(child_store)
                 content = result.get("content")
-                text = "child is idle"
-                if (
+                text = segment_reports[-1] if segment_reports else "child is idle"
+                if not segment_reports and (
                     isinstance(content, list)
                     and content
                     and isinstance(content[0], dict)
