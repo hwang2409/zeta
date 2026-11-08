@@ -19,6 +19,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.raw_frames import assert_raw_frames_preserved
 from tests.support.serve_close import close_serve
+from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
@@ -534,45 +535,21 @@ async def _capture_direct_raw_stream(
     reader, writer = await _connect(server)
     frames: list[bytes] = []
 
-    async def send(request_id: int, method: str, params: dict[str, object]) -> None:
-        writer.write(
-            (
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n"
-            ).encode()
+    async def call(request_id: int, method: str, params: dict[str, object]) -> bytes:
+        await send(reader, writer, request_id, method, params)
+        replies = await read_until(
+            reader, lambda frame: frame.get("id") == request_id, what=method
         )
-        await writer.drain()
-
-    async def read_until(request_id: int, *, record: bool = True) -> None:
-        while True:
-            frame = await _read_raw(reader)
-            if record:
-                frames.append(frame)
-            if json.loads(frame).get("id") == request_id:
-                return
+        return b"".join(frame.raw for frame in replies)
 
     try:
-        await send(1, "hello", {"protocol_version": "1.2"})
-        await read_until(1)
-        await send(2, "status", {})
-        await read_until(2)
-        await send(3, "missing_method", {})
-        await read_until(3)
-        await send(4, "new_session", {"provider": "codex"})
-        await read_until(4, record=False)
-        await send(5, "send", {"text": "wait"})
-        await read_until(5)
-        await backend.entered.wait()
-        await send(6, "abort", {})
-        await read_until(6)
+        frames.append(await call(1, "hello", {"protocol_version": "1.2"}))
+        frames.append(await call(2, "status", {}))
+        frames.append(await call(3, "missing_method", {}))
+        await call(4, "new_session", {"provider": "codex"})
+        frames.append(await call(5, "send", {"text": "wait"}))
+        await asyncio.wait_for(backend.entered.wait(), 10)
+        frames.append(await call(6, "abort", {}))
         writer.close()
         await writer.wait_closed()
         assert await reader.read() == b""

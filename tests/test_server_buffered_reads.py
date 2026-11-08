@@ -12,8 +12,10 @@ from tests.support.server_client import (
     assert_event_order,
     event_owner,
     frames_for_call,
+    frames_until_event,
     read_until,
     request,
+    send,
 )
 from tests.support.server_client import read as buffered_read
 
@@ -169,6 +171,38 @@ async def test_read_until_timeout_lists_skipped_frames() -> None:
             lambda frame: event_owner(frame) == ("tool_end", "child", "child-call"),
             what="child tool_end",
         )
+
+
+def _is_turn_end(frame: dict[str, object]) -> bool:
+    return event_owner(frame) == ("turn_end", "parent", 1)
+
+
+@pytest.mark.asyncio
+async def test_read_until_keeps_reading_for_a_response_after_the_event() -> None:
+    reader = _Reader(_event_frame("turn_end", 1), {"id": 4, "result": {}})
+    await send(reader, _Writer(), 4, "deny")
+
+    frames = await read_until(reader, _is_turn_end, what="turn_end")
+
+    assert [frame.get("id") for frame in frames] == [None, 4]
+    assert frames[1].raw == b'{"id": 4, "result": {}}\n'
+
+
+@pytest.mark.parametrize("helper", ["read_until", "frames_until_event"])
+@pytest.mark.asyncio
+async def test_event_reads_fail_when_a_sent_request_gets_no_response(
+    helper: str,
+) -> None:
+    reader = _Reader(_event_frame("turn_end", 1))
+    await send(reader, _Writer(), 4, "deny")
+
+    with pytest.raises(
+        AssertionError, match=r"request id 4 has no response; frames read: .*turn_end"
+    ):
+        if helper == "read_until":
+            await read_until(reader, _is_turn_end, what="turn_end")
+        else:
+            await frames_until_event(reader, "turn_end")
 
 
 @pytest.mark.asyncio

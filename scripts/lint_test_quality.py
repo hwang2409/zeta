@@ -89,6 +89,14 @@ AWAIT_DEADLINE_ERROR = (
 SYNC_DEADLINE_ERROR = "blocking wait without a deadline: pass timeout=10"
 AWAIT_DEADLINE_CODE = "TQ004"
 RATCHET_PATH = Path("tests/test_quality_ratchet.txt")
+RAW_SERVE_READ_CODE = "TQ008"
+RAW_SERVE_READ_ERROR = (
+    "raw serve-socket read bypasses the shared client: use "
+    "tests/support/server_client.py read helpers (send + read_until), which keep "
+    "reading until every sent request has its response"
+)
+RAW_SERVE_READ_METHODS = {"readline", "readuntil", "readexactly"}
+SERVE_CLIENT_MODULE = Path("tests/support/server_client.py")
 GLOBAL_BOOTSTRAP_ALLOWLIST = {
     "ZETA_TEST_PARENT_PID",  # harness identity for child-process ownership checks
     "ZETA_STALL_WATCHDOG",  # disables an unrelated watchdog during test setup
@@ -737,7 +745,31 @@ def _scan_added_nodes(
         findings.extend(_timing_findings(path, node, lines))
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
         findings.extend(_contract_findings(path, node, lines, new_private_patches))
+        findings.extend(_raw_serve_read_findings(path, node))
     return findings
+
+
+def _raw_serve_read_findings(path: Path, node: ast.AST) -> list[Finding]:
+    """Flag frame reads on a stream reader named like a serve socket reader."""
+    if (
+        path == SERVE_CLIENT_MODULE
+        or not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Attribute)
+        or node.func.attr not in RAW_SERVE_READ_METHODS
+    ):
+        return []
+    receiver = _name(node.func.value).rsplit(".", 1)[-1]
+    if receiver != "reader" and not receiver.endswith("_reader"):
+        return []
+    return [
+        Finding(
+            path,
+            node.lineno,
+            node.col_offset + 1,
+            RAW_SERVE_READ_CODE,
+            RAW_SERVE_READ_ERROR,
+        )
+    ]
 
 
 def _scan_deadline_nodes(
