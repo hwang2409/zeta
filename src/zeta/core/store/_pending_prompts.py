@@ -117,11 +117,14 @@ class PendingPromptQueue:
         *,
         origin: MessageOrigin = MessageOrigin.UNKNOWN,
         deadline: float | None = None,
+        starts_new_episode: bool = False,
     ) -> ConversationEntry:
         if type(text) is not str or not text.strip():
             raise ValueError("pending prompt text must be a nonempty string")
         if len(text) > MAX_PENDING_PROMPT_TEXT:
             raise ValueError("pending prompt text is too long")
+        if type(starts_new_episode) is not bool:
+            raise TypeError("starts_new_episode must be a bool")
         reload_started = time.monotonic()
         with self._lock(deadline=deadline):
             if (
@@ -130,7 +133,9 @@ class PendingPromptQueue:
             ):
                 raise PendingPromptWriterReloadedError
             self._check_deadline(deadline)
-            if self._queue_closed_unlocked():
+            if self._queue_closed_unlocked() and (
+                not starts_new_episode or self._terminal_transition_unlocked() is not None
+            ):
                 raise PendingPromptsClosedError("pending prompt queue is closed")
             entry = self._store._append_row_unlocked(
                 "pending_prompt",
