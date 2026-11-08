@@ -138,6 +138,86 @@ async def test_resume_activation_and_stage_reads_do_not_encode_history(
 
 
 @pytest.mark.asyncio
+async def test_real_tool_turn_keeps_retained_writer_aligned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="tool-turn-delivery")
+    for index in range(200):
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"historical-{index}")]),
+                MessageOrigin.USER,
+            )
+        )
+    historical_ids = {entry.id for entry in store.entries}
+    store._prepare_durable_writer_snapshot()
+    historical_encodes = 0
+    append_order: list[tuple[str, MessageRole]] = []
+    original_encode = ConversationStore._encoded_entry_line
+    original_sync = ConversationStore.append_message
+    original_async = ConversationStore.append_message_async
+
+    def count_historical(entry):
+        nonlocal historical_encodes
+        if entry.id in historical_ids:
+            historical_encodes += 1
+        return original_encode(entry)
+
+    def sync_append(candidate, message, *args, **kwargs):
+        append_order.append(("sync", message.role))
+        return original_sync(candidate, message, *args, **kwargs)
+
+    async def async_append(candidate, message, *args, **kwargs):
+        append_order.append(("async", message.role))
+        return await original_async(candidate, message, *args, **kwargs)
+
+    backend_counts: list[int] = []
+
+    def serialize(_messages, _tool_schemas) -> bytes:
+        backend_counts.append(historical_encodes)
+        return b"request"
+
+    sync_append.__name__ = "append_message"
+    async_append.__name__ = "append_message_async"
+    monkeypatch.setattr(
+        ConversationStore, "_encoded_entry_line", staticmethod(count_historical)
+    )
+    monkeypatch.setattr(ConversationStore, "append_message", sync_append)
+    monkeypatch.setattr(ConversationStore, "append_message_async", async_append)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("tool-1", "echo", {"value": "x"})]),
+            ScriptedTurn([TextContent("complete")]),
+        ],
+        request_serializer=serialize,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        tools={"echo": lambda arguments: {"echo": arguments}},
+        skill_catalog=SkillCatalog.empty(),
+        max_turns=2,
+        skip_mcp_mount=True,
+    )
+    try:
+        await loop.activate()
+        activation_encodes = historical_encodes
+        async for _event in loop.run_turn("use echo", origin=MessageOrigin.USER):
+            pass
+    finally:
+        await loop.close(background_task_cause="test cleanup")
+
+    assert append_order == [
+        ("async", MessageRole.USER),
+        ("sync", MessageRole.USER),
+        ("sync", MessageRole.TOOL_RESULT),
+    ]
+    assert (activation_encodes, backend_counts) == (0, [0, 0]), (
+        "real tool delivery staging encoded historical rows"
+    )
+
+
+@pytest.mark.asyncio
 async def test_resume_warm_writer_does_not_reload_root(
     tmp_path: Path,
 ) -> None:
@@ -232,6 +312,48 @@ def _opened_store_with_writer_snapshot(
     resident = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
     resident._prepare_durable_writer_snapshot()
     return resident
+
+
+@pytest.mark.asyncio
+async def test_owner_sync_delta_falls_back_if_external_writer_follows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resident = _opened_store_with_writer_snapshot(tmp_path, "owner-then-external")
+    flow = StepDeliveryFlow(resident)
+    await flow.initialize()
+    resident.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("owner")]), MessageOrigin.USER
+        )
+    )
+    external = ConversationStore(
+        tmp_path, session_id=resident.session_id, _must_exist=True
+    )
+    external.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("external")]), MessageOrigin.USER
+        )
+    )
+    external.close()
+    reloads = 0
+    original_load = ConversationStore._load_full
+
+    def count_reloads(store: ConversationStore) -> None:
+        nonlocal reloads
+        reloads += 1
+        original_load(store)
+
+    monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
+    try:
+        await flow.prepare_request("idle_start", [], None)
+        reopened = ConversationStore(tmp_path, session_id=resident.session_id)
+        try:
+            assert reloads >= 1
+            assert resident.entries == reopened.entries
+        finally:
+            reopened.close()
+    finally:
+        resident.close()
 
 
 @pytest.mark.asyncio

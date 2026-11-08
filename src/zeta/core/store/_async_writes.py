@@ -7,6 +7,7 @@ import copy
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any
 
 from ._pending_prompts import PendingPromptWriterReloadedError
@@ -15,6 +16,18 @@ if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
     from ._log import InstalledEntriesDelta, _DetachedLogState
     from ._store import ConversationStore
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnerSyncDelta:
+    expected_baseline: tuple[int, bytes]
+    expected_log: tuple[tuple[int, int, int], int]
+    entries: tuple[ConversationEntry, ...]
+    entry_prefix_digest: bytes
+    log_identity: tuple[int, int, int]
+    log_offset: int
+    log_mtime_ns: int
+    log_prefix_fingerprint: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +76,8 @@ class AsyncDurableWritesMixin:
         self._durable_writes_in_flight = 0
         self._durable_writer: ConversationStore | None = None
         self._durable_writer_snapshot: tuple[int, _DetachedLogState] | None = None
+        self._durable_writer_owner_deltas: list[_OwnerSyncDelta] = []
+        self._durable_writer_alignment_invalid = False
 
     def _drain_durable_writes_for_close(self: ConversationStore) -> bool:
         with self._durable_write_condition:
@@ -75,6 +90,8 @@ class AsyncDurableWritesMixin:
             writer = self._durable_writer
             self._durable_writer = None
             self._durable_writer_snapshot = None
+            self._durable_writer_owner_deltas.clear()
+            self._durable_writer_alignment_invalid = False
         if writer is not None:
             writer.close()
         return True
@@ -89,6 +106,81 @@ class AsyncDurableWritesMixin:
                 self._transcript_generation,
                 snapshot,
             )
+
+    def _queue_owner_sync_delta(
+        self: ConversationStore,
+        entries: tuple[ConversationEntry, ...],
+        expected_baseline: tuple[int, bytes],
+        expected_log: tuple[tuple[int, int, int], int],
+    ) -> None:
+        """Let the worker apply one owner-committed row before its next operation."""
+        if not entries:
+            return
+        prior_id = self._entries[-len(entries) - 1].id if expected_baseline[0] else None
+        linear = entries[0].parent_id == prior_id and all(
+            entry.parent_id == previous.id
+            for previous, entry in pairwise(entries)
+        )
+        with self._durable_write_condition:
+            if self._closing or self._closed:
+                return
+            if self._durable_writes_in_flight or not linear:
+                self._durable_writer_owner_deltas.clear()
+                self._durable_writer_snapshot = None
+                self._durable_writer_alignment_invalid = True
+                return
+            if self._durable_writer is None and self._durable_writer_snapshot is None:
+                return
+            if len(self._durable_writer_owner_deltas) >= 64:
+                self._durable_writer_owner_deltas.clear()
+                self._durable_writer_snapshot = None
+                self._durable_writer_alignment_invalid = True
+                return
+            self._durable_writer_owner_deltas.append(
+                _OwnerSyncDelta(
+                    expected_baseline=expected_baseline,
+                    expected_log=expected_log,
+                    entries=copy.deepcopy(entries),
+                    entry_prefix_digest=self._entry_prefix_digest,
+                    log_identity=self._log_identity,
+                    log_offset=self._log_offset,
+                    log_mtime_ns=self._log_mtime_ns,
+                    log_prefix_fingerprint=self._log_prefix_fingerprint,
+                )
+            )
+            if self._durable_writer_snapshot is not None:
+                _, snapshot = self._durable_writer_snapshot
+                self._durable_writer_snapshot = self._transcript_generation, snapshot
+
+    def _align_persistent_durable_writer(
+        self: ConversationStore, writer: ConversationStore
+    ) -> ConversationStore:
+        with self._durable_write_condition:
+            invalid = self._durable_writer_alignment_invalid
+            deltas = tuple(self._durable_writer_owner_deltas)
+            self._durable_writer_alignment_invalid = False
+            self._durable_writer_owner_deltas.clear()
+        aligned = not invalid
+        for delta in deltas:
+            aligned &= (
+                (len(writer._entries), writer._entry_prefix_digest)
+                == delta.expected_baseline
+                and (writer._log_identity, writer._log_offset) == delta.expected_log
+                and writer._accept_incremental_entries(delta.entries)
+            )
+            if not aligned:
+                break
+            writer._entry_prefix_digest = delta.entry_prefix_digest
+            writer._log_identity = delta.log_identity
+            writer._log_offset = delta.log_offset
+            writer._log_mtime_ns = delta.log_mtime_ns
+            writer._log_prefix_fingerprint = delta.log_prefix_fingerprint
+        if aligned and writer._log_metadata_matches():
+            return writer
+        writer.close()
+        replacement = self._new_persistent_durable_writer()
+        self._durable_writer = replacement
+        return replacement
 
     def _new_persistent_durable_writer(self: ConversationStore) -> ConversationStore:
         with self._durable_write_condition:
@@ -121,6 +213,7 @@ class AsyncDurableWritesMixin:
             if writer is None:
                 writer = self._new_persistent_durable_writer()
                 self._durable_writer = writer
+            writer = self._align_persistent_durable_writer(writer)
             writer_baseline = (
                 len(writer._entries),
                 writer._entry_prefix_digest,

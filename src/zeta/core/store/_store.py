@@ -651,6 +651,8 @@ class ConversationStore(
     def _append_many_unlocked(
         self, rows: list[tuple[str, dict[str, Any]]]
     ) -> list[ConversationEntry]:
+        baseline = len(self._entries), self._entry_prefix_digest
+        owner_log = self._log_identity, self._log_offset
         prior_ids = set(self._entry_ids)
         parent_id = self._entries[-1].id if self._entries else None
         next_seq = self._entries[-1].seq + 1 if self._entries else 1
@@ -698,9 +700,11 @@ class ConversationStore(
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
         self._record_client_delivery_entries(entries)
+        installed = tuple(entries)
+        self._queue_owner_sync_delta(installed, baseline, owner_log)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entries[-1].seq)
-        self._publish_entries_installed(tuple(entries))
+        self._publish_entries_installed(installed)
         return entries
 
     def _append_row_unlocked(
@@ -713,6 +717,8 @@ class ConversationStore(
         copy_data: bool = True,
     ) -> ConversationEntry:
         self._assert_owner_thread()
+        baseline = len(self._entries), self._entry_prefix_digest
+        owner_log = self._log_identity, self._log_offset
         self._validate_notification_write(entry_type, data)
         prior_ids = self._entry_ids
         if parent_id is not None and parent_id not in prior_ids:
@@ -753,6 +759,7 @@ class ConversationStore(
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries()
             self._rebuild_incremental_validation_state()
+        self._queue_owner_sync_delta((entry,), baseline, owner_log)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         if (
