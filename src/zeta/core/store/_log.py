@@ -782,7 +782,7 @@ class ConversationLogMixin:
         self._publish_entries_installed(delta)
 
     def _observer_append_active(self: ConversationStore) -> bool:
-        fd = open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT)
+        fd = open_session_file(self.directory_fd, ".lock", os.O_RDWR)
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
