@@ -801,8 +801,11 @@ class ConnectionRegistry:
     async def read_child_run_history(
         self, connection: Any, params: dict[str, Any]
     ) -> object:
-        target = capture_read(connection, "child_run_history", params)
+        runtime = connection.server.runtime
+        if runtime.opened is None or params.get("session_id") != runtime.session_id:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
+        target = (runtime.session_id, runtime.opened.store)
         return await self.run_read(
             connection,
             lambda: perform_child_history_read(
@@ -811,7 +814,7 @@ class ConnectionRegistry:
                 registry=self,
                 fidelity="session_history_fidelity" in features,
             ),
-            session_id=target[0],
+            session_id=runtime.session_id,
         )
 
     def _child_reader_for(
