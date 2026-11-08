@@ -103,6 +103,8 @@ async def _capacity_returns(server: ZetaServer, client: ReplayClient, session_id
     stream_id = joined["result"]["replay"]["stream_id"]
     for sequence in range(1, 301):
         await _publish(server, session_id)
+        assert server.connections is not None and server._client is not None
+        assert server.connections.replay.scope_for(server._client) is not None
         event = await client.event("turn_start")
         assert event["stream_id"] == stream_id
         assert event["seq"] == sequence
@@ -165,10 +167,14 @@ async def _physical_response_gate(tmp_path: Path, transport: Transport, monkeypa
             await await_or_fail(release.wait(), what="release physical join response")
         return await original(owner, payload)
 
+    # test-contract: seam gate the real transport write after output admission
     monkeypatch.setattr(_Client, "_write_physical", gated)
     try:
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(entered.wait(), what="physical join response entered")
+        assert server.connections is not None and server._client is not None
+        assert server._client in server.connections.replay._subscriptions
+        assert server._client not in server.connections.replay._pending
         await _publish(server, session_id, 3)
         release.set()
         response = await client.response(3)
@@ -189,6 +195,16 @@ async def _response_admission_failure(
 ) -> None:
     server, client, session_id = await _started(tmp_path, transport)
     monkeypatch.setattr(connection_module, "OUTPUT_MAX_FRAMES", 1)
+    assert server.connections is not None
+    activated = False
+    original_activate = server.connections.replay.activate_join
+
+    def activate(connection: Any) -> None:
+        nonlocal activated
+        activated = True
+        original_activate(connection)
+
+    monkeypatch.setattr(server.connections.replay, "activate_join", activate)
     try:
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         failure = await client.read()
@@ -200,7 +216,7 @@ async def _response_admission_failure(
                 "message": "controller output overflow",
             },
         }
-        assert server.connections is not None
+        assert not activated, "pending tail was released before response admission"
         assert server.connections.replay.scope_for(server._client) is None
     finally:
         await client.close()
@@ -221,6 +237,7 @@ async def _response_write_failure(
             return False
         return await original(owner, payload)
 
+    # test-contract: seam force the real transport write to report failure
     monkeypatch.setattr(_Client, "_write_physical", fail_write)
     try:
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
@@ -260,6 +277,7 @@ async def _same_connection_rejoin(
             await await_or_fail(release.wait(), what="release old rejoin frame")
         return await original(owner, payload)
 
+    # test-contract: seam hold one old physical frame across replacement admission
     monkeypatch.setattr(_Client, "_write_physical", gated)
     assert server.connections is not None
     original_activate = server.connections.replay.activate_join
@@ -334,6 +352,7 @@ async def _scope_cap(
             await await_or_fail(release.wait(), what="release scope-cap frame")
         return await original_write(owner, payload)
 
+    # test-contract: seam retain real wire frames until the scope limit is crossed
     monkeypatch.setattr(_Client, "_write_physical", gated)
     monkeypatch.setattr("zeta.server.session_replay.REPLAY_SCOPE_MAX_RECORDS", 2)
     unrelated = _scope("unrelated")
@@ -381,6 +400,7 @@ async def _global_cap(
             for _ in range(4):
                 assert replay.reserve(scope, 1) is None
     await _publish(server, session_id)
+    assert replay.scope_for(server._client) is not None, "requesting scope was evicted"
     event = await client.event("turn_start")
     assert event["stream_id"] == joined["result"]["replay"]["stream_id"]
     assert event["seq"] == 1
@@ -420,6 +440,7 @@ async def _active_admission_failure(
             return False
         return original(state, frame)
 
+    # test-contract: seam force output-owner admission to reject one active frame
     monkeypatch.setattr(server.connections, "_admit", reject_once)
     try:
         await _publish(server, session_id)
