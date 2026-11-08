@@ -4522,6 +4522,81 @@ async def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "optional_fields",
+    [{}, {"turns_used": "invalid"}, {"turns_used": None}, {"turns_used": True}],
+)
+async def test_child_marker_registration_defaults_match_transfer_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    optional_fields: dict[str, object],
+) -> None:
+    registrations = []
+    for path in ("adoption", "finalize"):
+        parent = ConversationStore(tmp_path / path / "parent")
+        child = ConversationStore(tmp_path / path / "child")
+        call = ToolCall("call", "agent", {"prompt": "work"})
+        marker = {
+            "tool_call": call.to_dict(),
+            "child_session_path": str(child.session_dir),
+            "description": "work",
+            **optional_fields,
+        }
+        if path == "finalize":
+            child.mark_agent_parent(call.id)
+            child.start_agent_lifecycle(
+                handle="child",
+                started_at="2026-01-01T00:00:00+00:00",
+                depth=1,
+                agent_type="worker",
+                description="work",
+            )
+        monkeypatch.setattr(
+            child, "agent_children", lambda marker=marker: {"marker": marker}
+        )
+        try:
+            if path == "adoption":
+                adopt_agent_children(child, parent)
+            else:
+                await child.finalize_background_agent(
+                    parent_store=parent,
+                    terminal_state="completed",
+                    final_result="done",
+                    turns_used=1,
+                    killed_task_ids=None,
+                    killed_task_count=None,
+                    killed_task_ids_truncated=False,
+                )
+            registration = next(iter(parent.agent_children().values())).copy()
+            registration.pop("child_session_path")
+            registrations.append(registration)
+        finally:
+            child.close()
+            parent.close()
+
+    assert registrations[0] == registrations[1]
+
+
+@pytest.mark.asyncio
+async def test_child_marker_registration_all_fields_match_transfer_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await test_child_marker_registration_defaults_match_transfer_paths(
+        tmp_path,
+        monkeypatch,
+        {
+            "agent_type": "worker",
+            "background": True,
+            "child_instance_id": "child-1",
+            "accepts_follow_ups": True,
+            "explicit_finish": True,
+            "turns_used": 7,
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_resume_keeps_same_id_adopted_background_grandchildren_separate(
     tmp_path: Path,
 ) -> None:
