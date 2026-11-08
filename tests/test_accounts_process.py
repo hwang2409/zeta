@@ -319,6 +319,8 @@ _TOKEN_CHOICES = {
     # a missing expires_at reads as 0; on the legacy side, so no start refreshes it
     "legacy-expiry-missing": (_NEW, _OLD | {"expires_at": 9e9}, "both"),
     "account-unparseable": (_NEW | {"expires_at": 9.5e9}, "{not json", "both"),
+    "both-unparseable": ("{also not json", "{not json", "both"),
+    "same-tokens": (_NEW | {"expires_at": 9.5e9}, _NEW | {"expires_at": 9.5e9}, "account"),
 }
 
 
@@ -338,7 +340,7 @@ def test_start_keeps_the_login_that_expires_later_and_never_trusts_mtime(
         store.registry.unlink()
     destination = store.credential_path(account)
     legacy = tmp_path / "codex-oauth.json"
-    legacy.write_text(json.dumps(legacy_value))
+    legacy.write_text(legacy_value if isinstance(legacy_value, str) else json.dumps(legacy_value))
     if isinstance(account_value, dict):
         destination.write_text(json.dumps(account_value))
     elif account_value is not None:

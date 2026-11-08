@@ -1321,10 +1321,11 @@ def _keep_token(
 
     if account is None:
         return _Keep.LEGACY
-    if account == legacy:
-        return _Keep.ACCOUNT
+    # compare parsed tokens only: two unreadable files are equal sentinels
     if not isinstance(account, OAuthTokens) or not isinstance(legacy, OAuthTokens):
         return _Keep.BOTH
+    if account == legacy:
+        return _Keep.ACCOUNT
     if not min(account.expires_at, legacy.expires_at) > 0:
         return _Keep.BOTH
     if legacy.expires_at > account.expires_at:
