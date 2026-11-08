@@ -15178,17 +15178,23 @@ async def test_last_owned_source_exit_publishes_stall_without_polling(
         await _cancel_idle_fixture(run, registry, parent, child)
 
 
+@pytest.mark.parametrize("extra_idle_wake", [False, True])
 @pytest.mark.asyncio
 async def test_question_answer_then_later_stall_starts_new_notice_episode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_idle_wake: bool
 ) -> None:
     parent, child, registry, loop, parent_flow, _wakes = await _idle_notice_fixture(
         tmp_path
     )
     idle_entries: asyncio.Queue[None] = asyncio.Queue()
+    forced_extra_idle = asyncio.Event()
+    answer_idle_entered = asyncio.Event()
+    force_extra_idle = False
+    answer_consumed = False
     prompts: list[str] = []
 
     async def consume(_loop, prompt, **kwargs):
+        nonlocal answer_consumed
         await _ack_fake_delivery(child, kwargs)
         if not prompt and loop.step_delivery.has_prompt_edge:
             prepared = await loop.step_delivery.prepare_request(
@@ -15198,6 +15204,8 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             prompt = prepared.messages[-1].content[0].text
             await loop.step_delivery.acknowledge_active()
         prompts.append(prompt)
+        if prompt == "Re q-reset: approved":
+            answer_consumed = True
         if prompt == "ask now":
             await loop._background_owner.conversation_channel.publish_question(
                 child_instance_id="root:1",
@@ -15213,7 +15221,11 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
 
     async def wait_idle(wake, _timeout):
         idle_entries.put_nowait(None)
-        await wake()
+        if force_extra_idle and not answer_consumed:
+            forced_extra_idle.set()
+        if answer_consumed:
+            answer_idle_entered.set()
+        await asyncio.wait_for(wake(), 10)
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
@@ -15256,6 +15268,10 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         prepared = await parent_flow.prepare_request("idle_start", [], None)
         assert prepared.notification_ids
         await parent_flow.acknowledge_active()
+        if extra_idle_wake:
+            force_extra_idle = True
+            loop._background_owner.conversation_channel.wake("root:1")
+            await asyncio.wait_for(forced_extra_idle.wait(), 10)
         assert (
             await send_to_run(
                 parent,
@@ -15265,7 +15281,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             )
             is None
         )
-        await asyncio.wait_for(idle_entries.get(), 10)
+        await asyncio.wait_for(answer_idle_entered.wait(), 10)
         notices = [
             entry
             for entry in parent.agent_notifications(pending_only=False)
