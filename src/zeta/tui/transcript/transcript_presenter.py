@@ -14,6 +14,7 @@ from ...protocol.types import StreamEvent, StreamEventType
 from .. import theme
 from ..cards.agent_message import AgentIdentityIndex
 from ..cards.agent_sync import refresh_agent_cards
+from ..cards.markdown import MarkdownDocument, render_markdown_units
 from ..layout import CONTENT_MARGIN
 from ..render import render_event
 from .transcript import (
@@ -179,29 +180,44 @@ class TranscriptPresenter:
         *,
         preserve_inline: bool = False,
     ) -> None:
-        """Commit the completed assistant message into its existing unit."""
+        """Commit the completed assistant message into bounded units."""
 
+        parts = (
+            render_markdown_units(rendered.source)
+            if isinstance(rendered, MarkdownDocument)
+            else (rendered,)
+        )
         if self._full_screen_active():
             if self._assistant_unit is None:
-                self._assistant_unit = self.print_unit(rendered)
+                self._assistant_unit = self.print_unit(parts[0])
             else:
                 self._assistant_unit = self.transcript.replace(
-                    self._assistant_unit, rendered
+                    self._assistant_unit, parts[0]
                 )
+            for part in parts[1:]:
+                self.print(part)
+                if self.transcript._units:
+                    self._assistant_message_units.append(self.transcript._units[-1])
         else:
             if self._assistant_live is not None:
                 self._assistant_live.stop()
                 self._assistant_live = None
             if preserve_inline:
-                self.print_unit(rendered)
+                for part in parts:
+                    self.print_unit(part)
         self._assistant_unit = None
         self._assistant_stream = None
 
     def finish_assistant_message(self, rendered: RenderableType | None) -> None:
-        """Render the complete assistant message in one transcript unit."""
+        """Render the complete assistant message in bounded transcript units."""
 
+        parts = (
+            render_markdown_units(rendered.source)
+            if isinstance(rendered, MarkdownDocument)
+            else ((rendered,) if rendered is not None else ())
+        )
         if self._full_screen_active():
-            if rendered is not None:
+            if parts:
                 unit = next(
                     (
                         candidate
@@ -211,12 +227,17 @@ class TranscriptPresenter:
                     None,
                 )
                 if unit is None:
-                    unit = self.print_unit(rendered)
+                    unit = self.print_unit(parts[0])
                 else:
-                    unit = self.transcript.replace(unit, rendered)
+                    unit = self.transcript.replace(unit, parts[0])
                 for candidate in self._assistant_message_units:
                     if candidate is not unit:
                         self.transcript.remove(candidate)
+                self._assistant_message_units = [unit]
+                for part in parts[1:]:
+                    self.print(part)
+                    if self.transcript._units:
+                        self._assistant_message_units.append(self.transcript._units[-1])
             else:
                 for candidate in self._assistant_message_region:
                     self.transcript.remove(candidate)
@@ -224,8 +245,8 @@ class TranscriptPresenter:
             if self._assistant_live is not None:
                 self._assistant_live.stop()
                 self._assistant_live = None
-            if rendered is not None:
-                self.print_unit(rendered)
+            for part in parts:
+                self.print_unit(part)
         self._assistant_message_units.clear()
         self._assistant_message_region.clear()
         self._assistant_unit = None

@@ -24,6 +24,7 @@ _MARKDOWN = (
 )
 _MAX_MARKDOWN_SECONDS = 1.0
 _MAX_MARKDOWN_TABLE_ROWS = 1_000
+_MARKDOWN_UNIT_SOURCE_BUDGET = 24 * 1024
 
 
 @dataclass(slots=True)
@@ -393,3 +394,55 @@ def render_markdown(value: str) -> MarkdownDocument:
     """Return a width-independent document that parses on its first paint."""
 
     return MarkdownDocument(value)
+
+
+def render_markdown_units(value: str) -> tuple[RenderableType, ...]:
+    """Split completed markdown only between top-level blocks."""
+
+    if len(value) <= _MARKDOWN_UNIT_SOURCE_BUDGET:
+        return (render_markdown(value),)
+    try:
+        roots = _token_tree(_MARKDOWN.parse(value))
+    except Exception:  # noqa: BLE001 - preserve the plain-text fallback
+        roots = []
+    spans = [
+        node.token.map
+        for node in roots
+        if node.token.map is not None and len(node.token.map) == 2
+    ]
+    if not spans:
+        return tuple(
+            Text(value[index : index + _MARKDOWN_UNIT_SOURCE_BUDGET], style=theme.BODY)
+            for index in range(0, len(value), _MARKDOWN_UNIT_SOURCE_BUDGET)
+        )
+    lines = value.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    parts: list[RenderableType] = []
+    chunk_start = 0
+    chunk_end = 0
+    for start_line, end_line in spans:
+        start = offsets[start_line]
+        end = offsets[min(end_line, len(lines))]
+        if end - start > _MARKDOWN_UNIT_SOURCE_BUDGET:
+            if chunk_start < start:
+                parts.append(render_markdown(value[chunk_start:start]))
+            parts.extend(
+                Text(value[index : index + _MARKDOWN_UNIT_SOURCE_BUDGET], style=theme.BODY)
+                for index in range(start, end, _MARKDOWN_UNIT_SOURCE_BUDGET)
+            )
+            chunk_start = end
+            chunk_end = end
+            continue
+        if chunk_start == chunk_end:
+            chunk_end = end
+        elif end - chunk_start > _MARKDOWN_UNIT_SOURCE_BUDGET:
+            parts.append(render_markdown(value[chunk_start:chunk_end]))
+            parts.append(Text(""))
+            chunk_start, chunk_end = chunk_end, end
+        else:
+            chunk_end = end
+    if chunk_start < len(value):
+        parts.append(render_markdown(value[chunk_start:]))
+    return tuple(parts) or (render_markdown(value),)

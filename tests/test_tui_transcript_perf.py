@@ -47,10 +47,58 @@ from zeta.tui.app import TUIApp
 from zeta.tui.cards import agent_sync as agent_sync_module
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.key_bindings import FullScreenPromptSession
-from zeta.tui.render import render_markdown, render_thought_live
+from zeta.tui.render import (
+    render_markdown,
+    render_markdown_units,
+    render_thought_live,
+)
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.tui.transcript.streaming_text import StreamingText
 from zeta.tui.transcript.transcript_search import find_matches
+
+
+def _rendered_lines(renderable: object, width: int = 80) -> list[list[tuple[str, str]]]:
+    console = Console(width=width, color_system=None, force_terminal=False)
+    return [
+        [(segment.style or "", segment.text) for segment in line]
+        for line in console.render_lines(renderable, console.options)
+    ]
+
+
+def test_completed_markdown_is_split_without_changing_rendered_output() -> None:
+    source = "\n\n".join(
+        [
+            "# title\n\n" + "\n\n".join(
+                f"paragraph {i} **text** with a stable boundary" for i in range(700)
+            ),
+            "```python\n" + ("print('line')\n" * 100) + "```",
+            "| left | right |\n| --- | --- |\n| one | two |\n" * 20,
+            "\n\n".join(f"- item {i}\n  - nested {i}" for i in range(30)),
+        ]
+    )
+    parts = render_markdown_units(source)
+    assert len(parts) > 1
+    assert "".join(
+        getattr(part, "plain", "") for part in parts
+    ) == source
+
+    whole = _rendered_lines(render_markdown(source))
+    split = []
+    for part in parts:
+        split.extend(_rendered_lines(part))
+    assert split == whole
+
+
+def test_completed_markdown_paint_is_bounded_in_transcript_units() -> None:
+    source = ("paragraph **text** with a stable boundary.\n\n" * 20_000).strip()
+    transcript, presenter = _streaming_transcript()
+    presenter.finish_assistant_message(render_markdown(source))
+    units = [
+        unit for unit in transcript._units if unit is not None and unit.value is not None
+    ]
+    assert len(units) > 1
+    assert max(len(getattr(unit.value, "plain", "")) for unit in units) <= 24 * 1024
+    assert "".join(unit.value.plain for unit in units) == source
 
 
 def _streaming_transcript() -> tuple[TranscriptWidget, TranscriptPresenter]:

@@ -46,7 +46,7 @@ from .cards.base import strip_terminal_controls
 from .render import (
     is_retryable_error,
     render_event,
-    render_markdown,
+    render_markdown_units,
     render_thought,
 )
 from .user import displayed_user_text
@@ -786,7 +786,10 @@ def render_replayed_message(
                     print_unit(render_thought("redacted", provider=provider))
         text = assistant_text(message)
         if text:
-            print_unit(render_markdown(text))
+            for unit in render_markdown_units(text):
+                if getattr(unit, "plain", None) == "":
+                    continue
+                print_unit(unit)
         for block in message.content:
             if isinstance(block, ToolUseContent):
                 tool_calls[block.tool_call.id] = block.tool_call

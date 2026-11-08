@@ -67,6 +67,7 @@ from .cards.markdown import (  # noqa: F401
     render_code,
     render_line,
     render_markdown,
+    render_markdown_units,
 )
 from .cards.shared import (
     BoundedToolOutput as _BoundedToolOutput,
