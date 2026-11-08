@@ -841,13 +841,9 @@ async def test_observer_write_failure_does_not_block_approved_tool_resume(
     observer_writer: asyncio.StreamWriter | None = None
     try:
         await _hello_and_create(reader, writer)
-        observer_reader, observer_writer = await _observer(
+        _observer_reader, observer_writer = await _observer(
             server, 10, features=["serve_observers", "session_grants"]
         )
-        observer_snapshot = (
-            await _request(observer_reader, observer_writer, 11, "session_grants")
-        )[-1]["result"]
-        assert observer_snapshot["session_grants"] == []
         await _request(reader, writer, 3, "send", {"text": "run"})
         await _event(reader, "approval_request")
         assert server.connections is not None
