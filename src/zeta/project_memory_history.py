@@ -25,6 +25,7 @@ from .memory.version_store import (
 from .memory_migration_plan import reachable_version_pruning_plan
 from .project_errors import ProjectRegistryError
 from .project_schema import MAX_MEMORY_FILE_SIZE
+from .storage_format import reject_unknown_keys
 
 MAX_RETAINED_VERSIONS = 128
 PROJECT_MEMORY_FILES = (
@@ -345,7 +346,13 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         self, blobs_fd: int, manifest: Mapping[str, object], key: str = "snapshot"
     ) -> dict[str, str]:
         files = manifest.get(key)
-        if not isinstance(files, dict) or set(files) != set(PROJECT_MEMORY_FILES):
+        if not isinstance(files, dict):
+            raise ProjectRegistryError("project memory version is malformed")
+        try:
+            reject_unknown_keys(files, "legacy_memory_snapshot")
+        except ValueError as exc:
+            raise ProjectRegistryError("project memory version is malformed") from exc
+        if set(files) != set(PROJECT_MEMORY_FILES):
             raise ProjectRegistryError("project memory version is malformed")
         result: dict[str, str] = {}
         for name in PROJECT_MEMORY_FILES:
@@ -642,16 +649,10 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         value = dict(provenance or {})
         if provenance is None:
             return value
-        if set(value) - {
-            "session_id",
-            "seq_start",
-            "seq_end",
-            "fragment_start",
-            "fragment_end",
-            "model",
-            "usage",
-        }:
-            raise ProjectRegistryError("invalid memory provenance")
+        try:
+            reject_unknown_keys(value, "memory_history_provenance")
+        except ValueError as exc:
+            raise ProjectRegistryError("invalid memory provenance") from exc
         session_id, start, end = (
             value.get("session_id"),
             value.get("seq_start"),

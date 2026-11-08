@@ -3,14 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import os
+import queue
 import sqlite3
 import threading
+import time
+import traceback
 from pathlib import Path
 
 import pytest
 
 import zeta.transcript_search.index as index_module
 import zeta.transcript_search.refresh as refresh_module
+from tests.support.processes import reap_process
 from zeta.cli.main import build_parser
 from zeta.cli.project import run as run_project
 from zeta.project_registry import ProjectRegistry
@@ -68,19 +73,80 @@ def _write_rows(source: TranscriptSource, rows: list[dict]) -> None:
     )
 
 
-def _construct_index_process(project_dir: str, start, results) -> None:
-    start.wait()
-    TranscriptIndex(Path(project_dir), PROJECT_A)
-    results.put(None)
+def _construct_index_process(child_index: int, project_dir: str, start, results) -> None:
+    results.put((child_index, "ready", None))
+    try:
+        assert start.wait(60), "timed out waiting 60s for the parent start signal"
+        TranscriptIndex(Path(project_dir), PROJECT_A)
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put((child_index, "error", traceback.format_exc()))
+    else:
+        results.put((child_index, "ok", None))
 
 
 def _append_index_process(
-    project_dir: str, session_dir: str, session_id: str, start, results
+    child_index: int,
+    project_dir: str,
+    session_dir: str,
+    session_id: str,
+    start,
+    results,
 ) -> None:
-    start.wait()
-    index = TranscriptIndex(Path(project_dir), PROJECT_A)
-    index.append(TranscriptSource(session_id, Path(session_dir)))
-    results.put(None)
+    results.put((child_index, "ready", None))
+    try:
+        assert start.wait(60), "timed out waiting 60s for the parent start signal"
+        index = TranscriptIndex(Path(project_dir), PROJECT_A)
+        index.append(TranscriptSource(session_id, Path(session_dir)))
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put((child_index, "error", traceback.format_exc()))
+    else:
+        results.put((child_index, "ok", None))
+
+
+def _await_phase(children, results, phase: str, deadline: float) -> dict[int, tuple[str, object]]:
+    messages: dict[int, tuple[str, object]] = {}
+    while len(messages) < len(children):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return messages
+        try:
+            child_index, message_phase, payload = results.get(
+                timeout=min(0.1, remaining)
+            )
+        except queue.Empty:
+            for child_index, child in enumerate(children):
+                child.is_alive()
+                if child_index not in messages and child.exitcode not in (None, 0):
+                    raise AssertionError(
+                        f"child {child_index} exited before {phase}: "
+                        f"exitcode={child.exitcode}"
+                    )
+            continue
+        assert message_phase == phase or (
+            phase == "ok" and message_phase == "error"
+        ), f"child {child_index} reported {message_phase!r}, expected {phase!r}"
+        messages[child_index] = (message_phase, payload)
+    return messages
+
+
+def _diagnostic_process(child_index: int, start, results) -> None:
+    results.put((child_index, "ready", None))
+    start.wait(60)
+    try:
+        if child_index == 3:
+            raise RuntimeError("child 3 mutation")
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put((child_index, "error", traceback.format_exc()))
+    else:
+        results.put((child_index, "ok", None))
+
+
+def _exit_before_ready_process(child_index: int, start, results) -> None:
+    if child_index == 2:
+        os._exit(7)
+    results.put((child_index, "ready", None))
+    start.wait(60)
+    results.put((child_index, "ok", None))
 
 
 def _run_index_processes(target, arguments: list[tuple]) -> list[str | None]:
@@ -88,16 +154,67 @@ def _run_index_processes(target, arguments: list[tuple]) -> list[str | None]:
     start = context.Event()
     results = context.Queue()
     processes = [
-        context.Process(target=target, args=(*items, start, results))
-        for items in arguments
+        context.Process(target=target, args=(index, *items, start, results))
+        for index, items in enumerate(arguments)
     ]
-    for process in processes:
-        process.start()
-    start.set()
-    for process in processes:
-        process.join(10)
-    assert all(process.exitcode == 0 for process in processes)
-    return [results.get(timeout=2) for _ in processes]
+    messages: dict[int, tuple[str, object]] = {}
+
+    def diagnostics() -> str:
+        return "\n".join(
+            f"child {number}: exitcode={process.exitcode}, "
+            f"last_phase={messages.get(number, (None, None))[0]!r}, "
+            f"traceback={messages.get(number, (None, None))[1]!r}"
+            for number, process in enumerate(processes)
+        )
+
+    try:
+        for process in processes:
+            process.start()
+
+        messages.update(
+            _await_phase(
+                processes,
+                results,
+                "ready",
+                time.monotonic() + 60,
+            )
+        )
+        assert len(messages) == len(processes), (
+            "timed out waiting 60s for all children to report ready;\n"
+            + diagnostics()
+        )
+        start.set()
+
+        messages.update(
+            _await_phase(
+                processes,
+                results,
+                "ok",
+                time.monotonic() + 60,
+            )
+        )
+        assert len(messages) == len(processes), (
+            "timed out waiting 60s for all children to finish;\n" + diagnostics()
+        )
+        for process in processes:
+            process.join(60)
+        assert all(message[0] == "ok" for message in messages.values()), diagnostics()
+        assert all(process.exitcode == 0 for process in processes), diagnostics()
+        return [None] * len(processes)
+    finally:
+        start.set()
+        for process in processes:
+            reap_process(process, timeout=60)
+
+
+def test_process_diagnostics_keep_child_identity_and_traceback() -> None:
+    with pytest.raises(AssertionError, match=r"child 3:.*child 3 mutation"):
+        _run_index_processes(_diagnostic_process, [()] * 8)
+
+
+def test_process_exit_before_ready_reports_exitcode() -> None:
+    with pytest.raises(AssertionError, match=r"child 2 exited before ready: exitcode=7"):
+        _run_index_processes(_exit_before_ready_process, [()] * 8)
 
 
 def test_concurrent_processes_initialize_one_valid_database(tmp_path: Path) -> None:
