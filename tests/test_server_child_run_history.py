@@ -41,6 +41,31 @@ async def _open(tmp_path: Path, features: list[str]):
 
 
 @pytest.mark.asyncio
+async def test_child_history_is_advertised_to_negotiated_observer(tmp_path: Path) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=short_socket_path(tmp_path),
+        approval_reconnect_grace=0,
+    )
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        hello = (
+            await request(
+                reader,
+                writer,
+                1,
+                "hello",
+                {"protocol_version": "1.2", "features": ["child_run_history"]},
+            )
+        )[-1]
+        assert "child_run_history" in hello["result"]["capabilities"]["features"]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_child_history_requires_negotiated_feature_and_valid_run_id(
     tmp_path: Path,
 ) -> None:
