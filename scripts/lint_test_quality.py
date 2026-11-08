@@ -6,6 +6,7 @@ import ast
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -172,6 +173,54 @@ def _added_lines(diff: str) -> dict[Path, set[int]]:
             else:
                 changed[changed_path].add(line_number)
     return changed
+
+
+def _file_diff_lines(diff: str, path: Path) -> list[str] | None:
+    selected: list[str] | None = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if selected is not None:
+                break
+            continue
+        if line.startswith("+++ "):
+            selected = [] if _diff_header_path(line[4:]) == path else None
+        elif selected is not None:
+            selected.append(line)
+    return selected
+
+
+def _destination_cursor(match: re.Match[str]) -> int:
+    start = int(match.group(1))
+    count = int(match.group(2) or 1)
+    return start if count == 0 else start - 1
+
+
+def _base_source(diff: str, path: Path, source: str) -> str | None:
+    file_diff = _file_diff_lines(diff, path)
+    if file_diff is None:
+        return None
+
+    current = source.splitlines()
+    previous: list[str] = []
+    cursor = 0
+    in_hunk = False
+    hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+    for line in file_diff:
+        if match := hunk.match(line):
+            next_cursor = _destination_cursor(match)
+            previous.extend(current[cursor:next_cursor])
+            cursor = next_cursor
+            in_hunk = True
+        elif in_hunk and line.startswith(" "):
+            previous.append(current[cursor])
+            cursor += 1
+        elif in_hunk and line.startswith("+"):
+            cursor += 1
+        elif in_hunk and line.startswith("-"):
+            previous.append(line[1:])
+    previous.extend(current[cursor:])
+    ending = "\n" if previous and source.endswith("\n") else ""
+    return "\n".join(previous) + ending
 
 
 def _is_test_path(path: Path) -> bool:
@@ -430,12 +479,53 @@ def _digest_findings(
     return [Finding(path, node.lineno, node.col_offset + 1, "TQ002", DIGEST_ERROR)]
 
 
-def _contract_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Finding]:
-    violates = (isinstance(node, ast.Call) and _private_patch(node)) or (
-        _mock_contract_assertion(node)
+def _private_patch_identity(node: ast.Call) -> str:
+    return ast.dump(node, include_attributes=False)
+
+
+def _private_patch_counts(source: str | None) -> Counter[str]:
+    if source is None:
+        return Counter()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return Counter()
+    return Counter(
+        _private_patch_identity(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _private_patch(node)
     )
-    if not violates or _has_marker(
-        lines, node.lineno, {"complexity", "durability", "seam"}
+
+
+def _new_private_patch_nodes(tree: ast.AST, base_source: str | None) -> set[int]:
+    previous = _private_patch_counts(base_source)
+    new_nodes: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not _private_patch(node):
+            continue
+        identity = _private_patch_identity(node)
+        if previous[identity]:
+            previous[identity] -= 1
+        else:
+            new_nodes.add(id(node))
+    return new_nodes
+
+
+def _node_has_marker(lines: list[str], node: ast.AST, contracts: set[str]) -> bool:
+    end = getattr(node, "end_lineno", node.lineno)
+    return any(_has_marker(lines, line, contracts) for line in range(node.lineno, end + 1))
+
+
+def _contract_findings(
+    path: Path, node: ast.AST, lines: list[str], new_private_patches: set[int]
+) -> list[Finding]:
+    violates = (
+        isinstance(node, ast.Call)
+        and _private_patch(node)
+        and id(node) in new_private_patches
+    ) or _mock_contract_assertion(node)
+    if not violates or _node_has_marker(
+        lines, node, {"complexity", "durability", "seam"}
     ):
         return []
     return [Finding(path, node.lineno, node.col_offset + 1, "TQ003", CONTRACT_ERROR)]
@@ -631,12 +721,13 @@ def _scan_added_nodes(
     lines: list[str],
     literal_names: set[str],
     serialized_names: set[str],
+    new_private_patches: set[int],
 ) -> list[Finding]:
     findings: list[Finding] = []
     for node in nodes:
         findings.extend(_timing_findings(path, node, lines))
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
-        findings.extend(_contract_findings(path, node, lines))
+        findings.extend(_contract_findings(path, node, lines, new_private_patches))
     return findings
 
 
@@ -1007,7 +1098,9 @@ def _async_blocking_findings(
     return findings
 
 
-def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
+def lint_source(
+    path: Path, source: str, added: set[int], base_source: str | None = None
+) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
@@ -1024,6 +1117,7 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     lines = source.splitlines()
     literal_names = _literal_names(tree)
     serialized_names = _serialized_names(tree)
+    new_private_patches = _new_private_patch_nodes(tree, base_source)
     parents = {
         child: parent
         for parent in ast.walk(tree)
@@ -1033,7 +1127,14 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     added_nodes = [node for node in nodes if _touches_added_line(node, added)]
     deadline_nodes = _deadline_nodes(nodes, added_nodes, added, parents)
     findings = (
-        _scan_added_nodes(path, added_nodes, lines, literal_names, serialized_names)
+        _scan_added_nodes(
+            path,
+            added_nodes,
+            lines,
+            literal_names,
+            serialized_names,
+            new_private_patches,
+        )
         if _is_test_path(path)
         else []
     )
@@ -1057,7 +1158,12 @@ def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
         source_path = root / path
         if source_path.is_file():
             findings.extend(
-                lint_source(path, source_path.read_text(encoding="utf-8"), added)
+                lint_source(
+                    path,
+                    source := source_path.read_text(encoding="utf-8"),
+                    added,
+                    _base_source(diff, path, source),
+                )
             )
     return sorted(
         findings, key=lambda item: (str(item.path), item.line, item.column, item.code)
