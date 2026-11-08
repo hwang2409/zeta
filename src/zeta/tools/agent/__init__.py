@@ -457,6 +457,7 @@ def _lost_agent_status(
 def _project_agent_status(
     lifecycle: object,
     handle: str,
+    child_path: Path,
     *,
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
@@ -810,6 +811,7 @@ def _read_agent_status(
                 item = _project_agent_status(
                     lifecycle,
                     handle,
+                    child_path,
                     notifications=notifications,
                     requested_handle=requested_handle,
                 )
