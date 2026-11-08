@@ -388,6 +388,7 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
     started = threading.Event()
     release = threading.Event()
     entered = threading.Event()
+    closed = threading.Event()
     descriptors: list[int] = []
     handles: list[io.FileIO] = []
     exit_calls = 0
@@ -416,6 +417,7 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
             exit_calls += 1
             handles[0].close()
             os.close(descriptors[0])
+            closed.set()
 
     class Spills:
         def temporary_file(self) -> GatedTemporaryFile:
@@ -441,6 +443,7 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
         assert await asyncio.to_thread(entered.wait, 10)
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=10)
+        assert await asyncio.to_thread(closed.wait, 10)
 
         assert exit_calls == 1
         with pytest.raises(OSError) as error:
