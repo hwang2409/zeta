@@ -31,6 +31,8 @@ ROWS = (
     "physical_response_gate",
     "response_admission_failure",
     "response_write_failure",
+    "active_write_failure",
+    "active_admission_failure",
     "scope_cap",
     "global_record_cap",
     "global_byte_cap",
@@ -104,7 +106,7 @@ async def _capacity_returns(server: ZetaServer, client: ReplayClient, session_id
     for sequence in range(1, 301):
         await _publish(server, session_id)
         assert server.connections is not None and server._client is not None
-        assert server.connections.replay.scope_for(server._client) is not None
+        assert server.connections.replay.stream_id(server._client) is not None
         event = await client.event("turn_start")
         assert event["stream_id"] == stream_id
         assert event["seq"] == sequence
@@ -217,7 +219,7 @@ async def _response_admission_failure(
             },
         }
         assert not activated, "pending tail was released before response admission"
-        assert server.connections.replay.scope_for(server._client) is None
+        assert server.connections.replay.stream_id(server._client) is None
     finally:
         await client.close()
         await server.close()
@@ -243,7 +245,7 @@ async def _response_write_failure(
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(failed.wait(), what="join response write failure")
         assert server.connections is not None and server._client is not None
-        assert server.connections.replay.scope_for(server._client) is None
+        assert server.connections.replay.stream_id(server._client) is None
         assert not any(
             item.replay_scope is not None
             for item in server.connections._connections[server._client].output.queue
@@ -253,12 +255,38 @@ async def _response_write_failure(
         fail_active = True
         await _publish(server, session_id)
         await await_or_fail(failed.wait(), what="active replay write failure")
-        assert server.connections.replay.scope_for(server._client) is None
+        assert server.connections.replay.stream_id(server._client) is None
         fail_active = False
         fresh = await _join(client, session_id, 5)
         assert fresh["result"]["replay"]["stream_id"] != joined["result"]["replay"]["stream_id"]
         await _publish(server, session_id)
         await _assert_events(client, fresh["result"]["replay"]["stream_id"], 1)
+    finally:
+        await client.close()
+        await server.close()
+
+
+async def _active_write_failure(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, client, session_id = await _started(tmp_path, transport)
+    await _join(client, session_id)
+    failed = asyncio.Event()
+    original = _Client._write_physical
+
+    async def fail_active(owner: _Client, payload: bytes) -> bool:
+        if b'"seq":1' in payload:
+            failed.set()
+            return False
+        return await original(owner, payload)
+
+    # test-contract: seam force one active replay frame to fail physically
+    monkeypatch.setattr(_Client, "_write_physical", fail_active)
+    try:
+        await _publish(server, session_id)
+        await await_or_fail(failed.wait(), what="active replay write failure")
+        assert server.connections is not None and server._client is not None
+        assert server.connections.replay.stream_id(server._client) is None
     finally:
         await client.close()
         await server.close()
@@ -320,12 +348,28 @@ async def _same_connection_rejoin(
 async def _connection_close(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    del monkeypatch
     server, client, session_id = await _started(tmp_path, transport)
     await _join(client, session_id)
+    assert server.connections is not None and server._client is not None
+    closed_connection = server._client
+    released = asyncio.Event()
+    release_errors: list[BaseException] = []
+    original_release = server.connections.release
+
+    def release(connection: Any) -> None:
+        try:
+            original_release(connection)
+        except BaseException as exc:
+            release_errors.append(exc)
+        finally:
+            released.set()
+
+    # test-contract: seam observe connection release after the real transport closes
+    monkeypatch.setattr(server.connections, "release", release)
     await client.close()
-    assert server.connections is not None
-    await await_or_fail(server.connections.run_blocking(lambda: None), what="connection release turn")
+    await await_or_fail(released.wait(), what="connection replay release")
+    assert not release_errors, f"connection release failed: {release_errors!r}"
+    assert server.connections.replay.stream_id(closed_connection) is None
     assert not server.connections.replay._subscriptions
     assert server.connections.replay._records == 0
     replacement = await connect_replay(server, transport)
@@ -691,6 +735,8 @@ SCENARIOS.update(
     physical_response_gate=_physical_response_gate,
     response_admission_failure=_response_admission_failure,
     response_write_failure=_response_write_failure,
+    active_write_failure=_active_write_failure,
+    active_admission_failure=_active_admission_failure,
     scope_cap=_scope_cap,
     global_record_cap=_global_record_cap,
     global_byte_cap=_global_byte_cap,
