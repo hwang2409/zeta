@@ -2333,17 +2333,20 @@ async def test_status_reads_delegated_approval_from_resident_indexes(
     try:
         await _request(reader, writer, 3, "send", {"text": "delegate"})
         approval = await _event(reader, "approval_request")
-        original = ConversationEntry.from_dict
-
         def fail_parse(
             cls: type[ConversationEntry], value: dict[str, Any]
         ) -> ConversationEntry:
             raise AssertionError(f"status parsed log row: {value!r}")
 
-        monkeypatch.setattr(ConversationEntry, "from_dict", classmethod(fail_parse))
-        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
-        assert status["pending_approvals"][0]["request_id"] == approval["request_id"]
-        monkeypatch.setattr(ConversationEntry, "from_dict", classmethod(original))
+        with monkeypatch.context() as parse_patch:
+            parse_patch.setattr(
+                ConversationEntry, "from_dict", classmethod(fail_parse)
+            )
+            status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+            assert (
+                status["pending_approvals"][0]["request_id"]
+                == approval["request_id"]
+            )
     finally:
         await close_serve(server, writer)
 

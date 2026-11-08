@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import os
 import re
@@ -1571,6 +1572,107 @@ class IdleParentRoutingBackend(CompletionBackend):
             blocks = self._lead_blocks(call, messages)
         else:
             blocks = await self._worker_blocks(call)
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class CancelIdleTreeBackend(CompletionBackend):
+    def __init__(self, *, with_grandchild: bool) -> None:
+        self.with_grandchild = with_grandchild
+        self.calls = {"root": 0, "child": 0, "grandchild": 0}
+        self.child_idle = asyncio.Event()
+        self.question_seen = asyncio.Event()
+        self.follow_up_seen = asyncio.Event()
+
+    @staticmethod
+    def _actor(messages: Sequence[Message]) -> str:
+        prompts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        if "grandchild prompt" in prompts:
+            return "grandchild"
+        if "child prompt" in prompts:
+            return "child"
+        return "root"
+
+    @staticmethod
+    def _start_agent(call_id: str, prompt: str, description: str) -> ToolUseContent:
+        return ToolUseContent(
+            ToolCall(
+                call_id,
+                "agent",
+                {
+                    "prompt": prompt,
+                    "description": description,
+                    "agent_type": "run",
+                    "background": True,
+                },
+            )
+        )
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        actor = self._actor(messages)
+        self.calls[actor] += 1
+        call = self.calls[actor]
+        blocks: list[TextContent | ToolUseContent]
+        if actor == "root":
+            blocks = (
+                [self._start_agent("start-child", "child prompt", "child")]
+                if call == 1
+                else []
+            )
+        elif actor == "child":
+            if self.with_grandchild and call == 1:
+                blocks = [
+                    self._start_agent(
+                        "start-grandchild", "grandchild prompt", "grandchild"
+                    )
+                ]
+            else:
+                if any(
+                    isinstance(block, TextContent) and block.text == "wake child"
+                    for message in messages
+                    if message.role is MessageRole.USER
+                    for block in message.content
+                ):
+                    self.follow_up_seen.set()
+                if any(
+                    message.metadata.get("zeta_event") == "agent_notifications"
+                    and any(
+                        isinstance(block, TextContent)
+                        and "grandchild needs parent" in block.text
+                        for block in message.content
+                    )
+                    for message in messages
+                ):
+                    self.question_seen.set()
+                blocks = [TextContent("WAIT")]
+        elif call == 1:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "ask-child",
+                        "ask_parent",
+                        {"question": "grandchild needs parent"},
+                    )
+                )
+            ]
+        else:
+            blocks = [TextContent("WAIT")]
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
@@ -13422,8 +13524,10 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     child_registry: ToolRegistry | None = None
     child_execute_entered = asyncio.Event()
     release_child_execute = asyncio.Event()
+    child_abort_signaled = asyncio.Event()
     child_abort_entered = asyncio.Event()
     original_execute = ToolRegistry.execute
+    original_abort = ToolRegistry.abort
     original_abort_approval = ToolRegistry.abort_approval
 
     async def pause_child_before_execute(
@@ -13436,8 +13540,13 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
             assert isinstance(registry.approval_policy, ChildApprovalPolicy)
             child_registry = registry
             child_execute_entered.set()
-            await release_child_execute.wait()
+            await asyncio.wait_for(release_child_execute.wait(), timeout=10)
         return await original_execute(registry, tool_call, **kwargs)
+
+    def observe_child_abort(registry: ToolRegistry) -> None:
+        if registry is child_registry:
+            child_abort_signaled.set()
+        original_abort(registry)
 
     def record_child_abort_error(
         registry: ToolRegistry,
@@ -13456,6 +13565,8 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
             raise
 
     monkeypatch.setattr(ToolRegistry, "execute", pause_child_before_execute)
+    # test-contract: seam observe the child abort signal before releasing its tool.
+    monkeypatch.setattr(ToolRegistry, "abort", observe_child_abort)
     monkeypatch.setattr(ToolRegistry, "abort_approval", record_child_abort_error)
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -13477,7 +13588,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     )
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(child_execute_entered.wait(), timeout=5)
+    await asyncio.wait_for(child_execute_entered.wait(), timeout=10)
     child_store = _child_store_for(store)
     assert any(
         message.role is MessageRole.ASSISTANT
@@ -13488,23 +13599,30 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
         for message in child_store.messages()
     )
 
-    loop.abort()
-    release_child_execute.set()
-    await asyncio.wait_for(child_abort_entered.wait(), timeout=5)
-    assert child_abort_calls > 0
-    assert abort_errors == []
-    await wait_background_owner(loop)
-    notification = store.agent_notifications(pending_only=False)[-1]
-    assert notification.data["status"] == "canceled"
+    try:
+        loop.abort()
+        await asyncio.wait_for(child_abort_signaled.wait(), timeout=10)
+        release_child_execute.set()
+        await asyncio.wait_for(child_abort_entered.wait(), timeout=10)
+        assert child_abort_calls > 0
+        assert abort_errors == []
+        await wait_background_owner(loop)
+        notification = store.agent_notifications(pending_only=False)[-1]
+        assert notification.data["status"] == "canceled"
 
-    assert notification.data["killed_task_count"] == 1
-    assert "abort_or_winner" not in notification.data["text"]
-    refreshed_child = ConversationStore(
-        child_store.root_dir,
-        session_id=child_store.session_id,
-    )
-    assert refreshed_child.agent_lifecycle()["state"] == "canceled"
-    await loop.close()
+        assert notification.data["killed_task_count"] == 1
+        assert "abort_or_winner" not in notification.data["text"]
+        refreshed_child = ConversationStore(
+            child_store.root_dir,
+            session_id=child_store.session_id,
+        )
+        try:
+            assert refreshed_child.agent_lifecycle()["state"] == "canceled"
+        finally:
+            refreshed_child.close()
+    finally:
+        release_child_execute.set()
+        await loop.close()
 
 
 @pytest.mark.asyncio
@@ -17665,6 +17783,391 @@ def test_child_idle_then_terminal_receipt_is_appended_and_delivered_once(
         "child_idle",
         "agent_completion",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("with_grandchild", "wake_before_cancel"),
+    [(False, False), (True, False), (True, True)],
+    ids=["no-grandchild", "live-grandchild", "after-agent-send"],
+)
+async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_grandchild: bool,
+    wake_before_cancel: bool,
+) -> None:
+    backend = CancelIdleTreeBackend(with_grandchild=with_grandchild)
+    loop_thread = threading.get_ident()
+    cancellation_write_threads: list[int] = []
+    mark_agent_canceled = ConversationStore.mark_agent_canceled
+
+    @wraps(mark_agent_canceled)
+    def observe_cancellation_write(
+        child_store: ConversationStore, parent_tool_call_id: str
+    ) -> None:
+        if parent_tool_call_id == "start-child":
+            cancellation_write_threads.append(threading.get_ident())
+        mark_agent_canceled(child_store, parent_tool_call_id)
+
+    monkeypatch.setattr(
+        ConversationStore, "mark_agent_canceled", observe_cancellation_write
+    )
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    transition_idle = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        transition_idle(child_store)
+        lifecycle = child_store.agent_lifecycle() or {}
+        handle = lifecycle.get("handle")
+        if isinstance(handle, str) and handle.count(":") == 1:
+            backend.child_idle.set()
+
+    # test-contract: seam observes the exact idle transition without a sleep
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        max_agent_depth=3,
+    )
+    loop.explicit_finish = True
+    child_store: ConversationStore | None = None
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_idle.wait(), 10)
+        child_handle = _run_handle_from_receipt(store)
+        child_path = Path(store.agent_children()[child_handle]["child_session_path"])
+        grandchild_handle: str | None = None
+        grandchild_path: Path | None = None
+        if with_grandchild:
+            await asyncio.wait_for(backend.question_seen.wait(), 10)
+            child_store = ConversationStore(
+                child_path.parent, session_id=child_path.name, _read_only=True
+            )
+            grandchild_handle = next(iter(child_store.agent_children()))
+            assert grandchild_handle.startswith(f"{child_handle}:")
+            grandchild_path = Path(
+                child_store.agent_children()[grandchild_handle]["child_session_path"]
+            )
+            assert any(
+                entry.type == "notification"
+                and entry.data.get("kind") == "child_question"
+                and entry.data.get("status") == "pending"
+                for entry in child_store.replay()
+            )
+        if child_store is not None:
+            child_store.close()
+            child_store = None
+
+        if wake_before_cancel:
+            backend.child_idle.clear()
+            sent = await loop.tool_registry.execute(
+                ToolCall(
+                    "wake-before-cancel",
+                    "agent_send",
+                    {"child_instance_id": child_handle, "message": "wake child"},
+                )
+            )
+            assert sent["isError"] is False
+            await asyncio.wait_for(backend.follow_up_seen.wait(), 10)
+            await asyncio.wait_for(backend.child_idle.wait(), 10)
+
+        canceled = await loop.tool_registry.execute(
+            ToolCall("cancel-idle-child", "agent_cancel", {"handle": child_handle})
+        )
+        assert canceled["structuredContent"]["status"] == "cancellation_confirmed"
+        status = await loop.tool_registry.execute(
+            ToolCall("canceled-idle-status", "agent_status", {"handle": child_handle})
+        )
+        child_status = status["structuredContent"]["children"][0]
+        assert child_status["state"] == "canceled"
+        assert child_status["finished_at"] is not None
+        assert cancellation_write_threads
+        assert all(thread != loop_thread for thread in cancellation_write_threads)
+
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        if grandchild_path is not None:
+            grandchild_store = ConversationStore(
+                grandchild_path.parent,
+                session_id=grandchild_path.name,
+                _read_only=True,
+            )
+            try:
+                descendant = grandchild_store.agent_lifecycle() or {}
+                assert descendant["state"] == "canceled"
+                assert descendant["finished_at"] is not None
+            finally:
+                grandchild_store.close()
+    finally:
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        if child_store is not None:
+            child_store.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_retries_lifecycle_write_after_terminal_fence_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CancelIdleTreeBackend(with_grandchild=True)
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    transition_idle = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        transition_idle(child_store)
+        lifecycle = child_store.agent_lifecycle() or {}
+        handle = lifecycle.get("handle")
+        if isinstance(handle, str) and handle.count(":") == 1:
+            backend.child_idle.set()
+
+    # test-contract: seam observe the target child's exact idle transition
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    mark_agent_canceled = ConversationStore.mark_agent_canceled
+    admit_abort = AgentLoop.admit_abort
+    child_handle: str | None = None
+    write_attempts = 0
+    cleanup_calls = 0
+
+    @wraps(mark_agent_canceled)
+    def fail_first_lifecycle_write(
+        child_store: ConversationStore, parent_tool_call_id: str
+    ) -> None:
+        nonlocal write_attempts
+        lifecycle = child_store.agent_lifecycle() or {}
+        if lifecycle.get("handle") == child_handle:
+            write_attempts += 1
+            if write_attempts == 1:
+                raise OSError("durable lifecycle write failed")
+        mark_agent_canceled(child_store, parent_tool_call_id)
+
+    def count_child_cleanup(child_loop: AgentLoop) -> None:
+        nonlocal cleanup_calls
+        lifecycle = child_loop.store.agent_lifecycle() or {}
+        if lifecycle.get("handle") == child_handle:
+            cleanup_calls += 1
+        admit_abort(child_loop)
+
+    monkeypatch.setattr(
+        ConversationStore, "mark_agent_canceled", fail_first_lifecycle_write
+    )
+    monkeypatch.setattr(AgentLoop, "admit_abort", count_child_cleanup)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        max_agent_depth=3,
+    )
+    loop.explicit_finish = True
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_idle.wait(), 10)
+        await asyncio.wait_for(backend.question_seen.wait(), 10)
+        child_handle = _run_handle_from_receipt(store)
+        child_path = Path(store.agent_children()[child_handle]["child_session_path"])
+        child_store = ConversationStore(
+            child_path.parent, session_id=child_path.name, _read_only=True
+        )
+        try:
+            grandchild_handle = next(iter(child_store.agent_children()))
+        finally:
+            child_store.close()
+
+        first = await loop.tool_registry.execute(
+            ToolCall("cancel-fails", "agent_cancel", {"handle": child_handle})
+        )
+        assert first["structuredContent"]["status"] == "cancellation_failed"
+        assert first["structuredContent"]["confirmation_error"] == (
+            "durable lifecycle write failed"
+        )
+        assert write_attempts == 1
+        assert cleanup_calls == 0
+
+        second = await loop.tool_registry.execute(
+            ToolCall("cancel-retries", "agent_cancel", {"handle": child_handle})
+        )
+        assert second["structuredContent"]["status"] == "cancellation_confirmed"
+        assert write_attempts == 2
+        status = await loop.tool_registry.execute(
+            ToolCall("status-after-retry", "agent_status", {"handle": child_handle})
+        )
+        assert status["structuredContent"]["children"][0]["state"] == "canceled"
+
+        try:
+            await asyncio.wait_for(loop._background_owner.wait(), 10)
+        except TimeoutError:
+            pytest.fail(
+                "canceled subtree did not drain: "
+                f"{loop._background_owner.active_instance_ids}"
+            )
+        assert cleanup_calls == 1
+        assert child_handle not in loop._background_owner.active_instance_ids
+        assert grandchild_handle not in loop._background_owner.active_instance_ids
+        third = await loop.tool_registry.execute(
+            ToolCall("cancel-again", "agent_cancel", {"handle": child_handle})
+        )
+        assert third["structuredContent"]["status"] == "already_finished"
+        assert cleanup_calls == 1
+    finally:
+        loop._background_owner.cancel_all()
+        try:
+            await asyncio.wait_for(loop._background_owner.wait(), 10)
+        except TimeoutError:
+            # test-contract: seam drain old code that cannot retry cancellation
+            watchers = tuple(loop._background_owner._watchers.values())
+            for watcher in watchers:
+                watcher.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(*watchers, return_exceptions=True), 10
+            )
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_write_fails", [False, True], ids=["writes", "fails"])
+async def test_concurrent_cancel_requests_write_once_and_retry_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_write_fails: bool,
+) -> None:
+    backend = NestedBlockingBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    event_loop = asyncio.get_running_loop()
+    previous_handler = event_loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+    event_loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    writes: list[str] = []
+    first_write_entered = asyncio.Event()
+    second_write_entered = asyncio.Event()
+    release_first_write = asyncio.Event()
+    target_id: str | None = None
+    cleanup_calls = 0
+    original_write = ConversationStore._to_thread_agent_state
+    admit_abort = AgentLoop.admit_abort
+
+    async def hold_first_cancel_write(
+        child_store: ConversationStore,
+        function: Callable[..., None],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if function.__name__ != "mark_agent_canceled" or args != ("grandchild",):
+            return await original_write(child_store, function, *args, **kwargs)
+        writes.append(function.__name__)
+        if len(writes) == 1:
+            first_write_entered.set()
+            await asyncio.wait_for(release_first_write.wait(), 10)
+            if first_write_fails:
+                raise OSError("durable lifecycle write failed")
+        else:
+            second_write_entered.set()
+        return await original_write(child_store, function, *args, **kwargs)
+
+    def count_cleanup(child_loop: AgentLoop) -> None:
+        nonlocal cleanup_calls
+        if child_loop.agent_instance_id == target_id:
+            cleanup_calls += 1
+        admit_abort(child_loop)
+
+    # test-contract: seam hold the grandchild's durable cancel write at its await
+    monkeypatch.setattr(
+        ConversationStore, "_to_thread_agent_state", hold_first_cancel_write
+    )
+    monkeypatch.setattr(AgentLoop, "admit_abort", count_cleanup)
+    task = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await asyncio.wait_for(backend.grandchild_started.wait(), 10)
+        owner = loop._background_owner
+        target_id = next(
+            instance_id
+            for instance_id, parent_id in owner._parent_ids.items()
+            if parent_id in owner._cancellers
+        )
+        request_child_cancel = owner._cancellers[target_id]
+        # The parent's cleanup route, then the child's own abort route.
+        (first,) = owner.cancel_subtree(target_id)
+        await asyncio.wait_for(first_write_entered.wait(), 10)
+        second = request_child_cancel()
+        second_write = asyncio.create_task(
+            asyncio.wait_for(second_write_entered.wait(), 10)
+        )
+        try:
+            await asyncio.wait(
+                (second.confirmation, second_write),
+                timeout=10,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            second_write.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(second_write, return_exceptions=True), 10
+            )
+        assert writes == ["mark_agent_canceled"], "second request wrote again"
+        assert await asyncio.wait_for(second.confirmation, 10) is False
+        await asyncio.wait_for(second.cleanup, 10)
+        assert cleanup_calls == 0
+
+        release_first_write.set()
+        if first_write_fails:
+            with pytest.raises(OSError, match="durable lifecycle write failed"):
+                await asyncio.wait_for(first.task, 10)
+            assert cleanup_calls == 0
+            retry = request_child_cancel()
+            assert await asyncio.wait_for(retry.confirmation, 10) is True
+            await asyncio.wait_for(retry.cleanup, 10)
+            assert writes == ["mark_agent_canceled"] * 2
+        else:
+            assert await asyncio.wait_for(first.task, 10) is True
+            assert writes == ["mark_agent_canceled"]
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(owner._cancellation_tasks), return_exceptions=True),
+            10,
+        )
+        assert cleanup_calls == 1
+        child_store = ConversationStore(
+            store.session_dir / "agents", session_id="1", _read_only=True
+        )
+        grandchild_store = ConversationStore(
+            child_store.session_dir / "agents", session_id="1", _read_only=True
+        )
+        try:
+            assert grandchild_store.agent_canceled() == {
+                "tool_call_id": "grandchild",
+                "content": "tool execution canceled",
+            }
+        finally:
+            grandchild_store.close()
+            child_store.close()
+        loop.abort()
+        await asyncio.wait_for(task, 10)
+        gc.collect()
+        assert loop_errors == []
+    finally:
+        release_first_write.set()
+        backend.release_grandchild.set()
+        loop.abort()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        try:
+            await loop.close()
+        finally:
+            store.close()
+            event_loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio

@@ -1032,15 +1032,33 @@ async def run_agent_tool(
         nonlocal child_canceled
         if child_canceled:
             return False
-        if terminal_fence is not None and not await terminal_fence.cancel():
-            return False
+        # Claim before any await: concurrent requests (owner cleanup and the
+        # child's own abort path) must not both write; a failed write releases it.
         child_canceled = True
+        try:
+            if terminal_fence is not None and not await terminal_fence.cancel():
+                transition = await child_store._to_thread_durable(
+                    child_store._terminal_transition
+                )
+                lifecycle = child_store.agent_lifecycle() or {}
+                if transition != "cancel" or lifecycle.get("state") == "canceled":
+                    return False
+            await child_store._to_thread_agent_state(
+                child_store.mark_agent_canceled, tool_call.id
+            )
+        except BaseException:
+            child_canceled = False
+            raise
         return True
 
     async def cleanup_canceled_child(
         confirmation: asyncio.Task[bool],
     ) -> None:
-        if not await confirmation:
+        try:
+            confirmed = await confirmation
+        except Exception:  # noqa: BLE001 - the caller reports confirmation failures
+            return
+        if not confirmed:
             return
         child_loop.admit_abort()
         child_loop.tool_registry.abort()
@@ -1050,7 +1068,6 @@ async def run_agent_tool(
             child_task.cancel()
         await loop._background_owner.wait_for_descendant_watchers(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
-        child_store.mark_agent_canceled(tool_call.id)
 
     def request_child_cancel() -> CancellationRequest:
         """Start durable cancellation and tree-owned cleanup."""
