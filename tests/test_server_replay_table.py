@@ -688,7 +688,7 @@ async def _publication_routes(
         data={"route": "grants"},
     )
     observed.append(await client.event(EventDescriptor.SESSION_GRANTS_CHANGED.value))
-    assert [event["stream_id"] for event in observed] == [stream_id] * len(observed)
+    assert [event.get("stream_id") for event in observed] == [stream_id] * len(observed)
     assert [event["seq"] for event in observed] == list(range(1, len(observed) + 1))
     await client.close()
     await server.close()
