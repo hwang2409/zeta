@@ -484,6 +484,35 @@ running. With the `user_message_event` feature, a `user_message` event with
 {"jsonrpc":"2.0","id":6,"result":{"accepted":true}}
 ```
 
+### delivery session guard (`delivery_session_guard` feature)
+
+`send`, `steer`, and `send_images` accept an optional `session_id`: the session
+the client means to deliver to. `send_images` already requires it. If it is not
+the attached session, the request returns `-32003` with message
+`session is not active` and data
+`{"code":"session_mismatch","attached_session_id":"<attached>","session_id":"<requested>"}`
+and delivers nothing: no transcript row, no `user_message` echo, no turn or
+steering, and no `delivery_id` record. The check runs before the `delivery_id`
+lookup, so a mismatched retry of an ID already delivered on the attached
+session returns this error, not `duplicate: true`. A `session_id` that is not a
+non-empty string returns `-32602`. With no `session_id`, `send` and `steer`
+behave as before. With no attached session, the existing `-32003` errors apply.
+
+The server enforces the guard whether or not the client negotiated the
+feature. The feature only tells the client the guard exists: a server that
+does not echo `delivery_session_guard` ignores `session_id` on `send` and
+`steer` and delivers to its attached session. Servers before this feature
+rejected a mismatched `send_images` with the same code and message but no
+`data`.
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"send","params":{"text":"hello","session_id":"old123"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":7,"error":{"code":-32003,"message":"session is not active","data":{"code":"session_mismatch","attached_session_id":"abc123","session_id":"old123"}}}
+```
+
 ### client delivery IDs (`delivery_id` feature)
 
 A negotiated client can add `delivery_id` to `send` or `steer`. A client that
@@ -1040,6 +1069,7 @@ Error descriptors are:
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
 | `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
+| `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A new `send` or `send_images` turn on a detached session that
@@ -1422,7 +1452,8 @@ error code and message. Provider status and origin remain internal.
   error. All modes, including `summary`, return `-32602` with
   `compaction mode selection was removed; eviction is always used`. New clients
   must not advertise or send this request.
-- `send_images`: takes `text` (possibly empty) and `images`, a list of one to four
+- `send_images`: takes a required `session_id` (the attached session; see
+  "delivery session guard"), `text` (possibly empty), and `images`, a list of one to four
   objects with `name`, `mime_type`, and base64 `data`. With both `delivery_id`
   and `send_images_delivery_id` negotiated, it also accepts `delivery_id` with
   the validation, idempotency, status, echo, and history behavior described
@@ -1586,6 +1617,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
+| `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
