@@ -3059,7 +3059,7 @@ def test_loop_teardown_cancels_owner_before_detached_leader_exits(
     )
 
     async def leave_owner_for_loop_teardown() -> None:
-        child = "import os,time; print(os.getpid(), flush=True); time.sleep(300)"
+        child = "import os,signal; print(os.getpid(), flush=True); signal.pause()"
         leader = (
             "import pathlib,signal,subprocess,sys\n"
             "released = False\n"
