@@ -869,7 +869,6 @@ async def test_resolve_attention_does_not_open_registry(
         "reply",
         lambda *_args, **_kwargs: ReplyOutcome(
             items=(ReplyItemOutcome(record.id, "applied"),),
-            published=True,
             message_id="message-id",
         ),
     )
