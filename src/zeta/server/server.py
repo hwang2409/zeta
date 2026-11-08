@@ -959,7 +959,7 @@ class _Client:
                 params, self.features
             )
         if descriptor is MethodDescriptor.SESSION_SETTINGS:
-            return ergonomics.settings(runtime)
+            return ergonomics.settings(runtime, include_plan_mode=True)
         if descriptor in {
             MethodDescriptor.ACCOUNT_LIST,
             MethodDescriptor.ACCOUNT_LOGOUT,

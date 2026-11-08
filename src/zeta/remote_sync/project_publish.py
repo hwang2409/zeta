@@ -30,6 +30,7 @@ from ..memory_migration_plan import (
     legacy_memory_digest,
     reachable_version_pruning_plan,
 )
+from ..storage_format import reject_unknown_keys
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
 # Atomic mirror temporaries written by _publish_mirror_file for any schema kind:
@@ -601,12 +602,24 @@ def _manifest_payloads(
     if memory_format == 2 and isinstance(value, str):
         values = {"state": value}
         scalar = True
-    elif isinstance(value, dict) and (
-        (memory_format == 2 and set(value) == {"state"})
-        or (
-            (memory_format == 1 or migration_source) and set(value) == set(MEMORY_FILES)
-        )
-    ):
+    elif isinstance(value, dict):
+        try:
+            if memory_format == 1 or migration_source:
+                reject_unknown_keys(value, "legacy_memory_snapshot")
+                required = set(MEMORY_FILES)
+            elif memory_format == 2:
+                reject_unknown_keys(value, "entry_memory_snapshot_reference")
+                required = {"state"}
+            else:
+                raise ProjectPublicationError(
+                    "invalid project memory manifest payload"
+                )
+        except ValueError as exc:
+            raise ProjectPublicationError(
+                "invalid project memory manifest payload"
+            ) from exc
+        if set(value) != required:
+            raise ProjectPublicationError("invalid project memory manifest payload")
         values = value
         scalar = False
     else:
@@ -706,7 +719,13 @@ def _validate_format_two_payload(payload: bytes) -> None:
         "entries",
         "compacted_through_version",
     }
-    if not isinstance(value, dict) or set(value) != fields or value.get("format") != 2:
+    if not isinstance(value, dict):
+        raise ProjectPublicationError("invalid format-2 memory state")
+    try:
+        reject_unknown_keys(value, "memory_state_root")
+    except ValueError as exc:
+        raise ProjectPublicationError("invalid format-2 memory state") from exc
+    if set(value) != fields or value.get("format") != 2:
         raise ProjectPublicationError("invalid format-2 memory state")
     if not isinstance(value.get("schema"), dict) or not isinstance(
         value.get("entries"), dict

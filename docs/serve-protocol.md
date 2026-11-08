@@ -1380,7 +1380,7 @@ error code and message. Provider status and origin remain internal.
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
-- `session_settings`: returns `model` and `approval_mode`.
+- `session_settings`: returns `model`, `approval_mode`, and `plan_mode`.
 - `account_list`: takes `session_id` and returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
@@ -1491,8 +1491,8 @@ The shared slash registry has this order and surface availability:
 | `mcp` | yes | show MCP server status |
 | `model` | yes | pick a model or switch to one: `/model [name]` |
 | `vim` | yes | show or change vim mode |
-| `plan` | no | show or change plan mode |
-| `implement` | no | implement the proposed plan |
+| `plan` | yes | show or change plan mode |
+| `implement` | yes | implement the proposed plan |
 | `project-instructions` | yes | open or create private project instructions in your editor |
 | `init` | yes | generate or improve project instructions |
 | `paste` | no | paste an image |
@@ -1523,8 +1523,8 @@ The shared slash registry has this order and surface availability:
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/project`,
-`/project-instructions`, `/status`, and `/vim`. `/project` shows the current
+`/implement`, `/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/plan`,
+`/project`, `/project-instructions`, `/status`, and `/vim`. `/project` shows the current
 association, and `/project init` discovers the working directory and associates
 this session. The mutating
 form is rejected while a turn, child, or approval is active. Runnable user
