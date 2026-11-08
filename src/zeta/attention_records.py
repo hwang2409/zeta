@@ -27,6 +27,7 @@ from .core.session_files import (
 from .storage_format import reject_unknown_keys
 
 _MAX_RECORD_BYTES = 256 * 1024
+ATTENTION_KIND_EPOCH = 5
 
 
 def _now() -> str:
@@ -125,11 +126,11 @@ class AttentionStore:
         kind: AttentionKind = "decision",
     ) -> AttentionRecord:
         require_closed_variant("attention.kind", kind)
-        if kind != "decision" and self.writer_epoch < WRITER_EPOCH:
+        if kind != "decision" and self.writer_epoch < ATTENTION_KIND_EPOCH:
             raise ValueError(
                 "non-decision attention kinds require the one-way shared cutover: "
                 f"zeta storage-format advance --expected-epoch {self.writer_epoch} "
-                f"--target-epoch {WRITER_EPOCH}"
+                f"--target-epoch {ATTENTION_KIND_EPOCH}"
             )
         if kind != "decision" and (options or recommendation is not None):
             raise ValueError(

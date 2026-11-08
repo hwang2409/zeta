@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_attention import _session
-from zeta import storage_format
+from zeta import attention_records, storage_format
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
 from zeta.skills import SkillCatalog
@@ -68,6 +68,19 @@ def test_attention_kinds_sort_decisions_first(tmp_path: Path) -> None:
     assert [item.record.kind for item in items] == ["decision", "answer"]
     assert decision.id != answer.id
     opened.store.close()
+
+
+def test_attention_kind_epoch_is_independent_of_writer_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(attention_records, "WRITER_EPOCH", 6)
+    opened = _session(tmp_path)
+    try:
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
+        record = _record(store, kind="answer", session_id=opened.store.session_id)
+        assert record.kind == "answer"
+    finally:
+        opened.store.close()
 
 
 def test_information_item_dismisses_without_reply(tmp_path: Path) -> None:
