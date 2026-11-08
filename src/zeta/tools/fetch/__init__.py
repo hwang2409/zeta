@@ -73,19 +73,10 @@ async def _run_worker(
 @asynccontextmanager
 async def _temporary_file(spills: Any) -> AsyncIterator[BinaryIO]:
     manager = spills.temporary_file()
-    handle: BinaryIO | None = None
-
-    def adopt(acquired: BinaryIO) -> None:
-        nonlocal handle
-        handle = acquired
-
-    try:
-        await run_owned_thread_call(manager.__enter__, adopt)
-    except asyncio.CancelledError:
-        await _run_worker(manager.__exit__, None, None, None)
-        raise
-    if handle is None:
-        raise RuntimeError("temporary file context did not return a handle")
+    handle = await run_owned_thread_call(
+        manager.__enter__,
+        lambda _handle: manager.__exit__(None, None, None),
+    )
     try:
         yield handle
     finally:
