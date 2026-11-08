@@ -18,6 +18,7 @@ import pytest
 import zeta.core.session as session_module
 import zeta.core.store._async_writes as async_writes_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
@@ -39,7 +40,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.server import ZetaServer
-from zeta.server.protocol import ProtocolError
+from zeta.server.protocol import EventDescriptor, ProtocolError
 from zeta.server.server import LOADED_SESSION_MUTATIONS
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
@@ -348,13 +349,14 @@ async def test_same_tick_approval_reservation_winner(
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
     events: list[str] = []
-    original_notify = server.control._notify
+    original_admit = server.control._admit_controller
 
-    async def record(event: str, *args: object, **kwargs: object) -> bool:
+    def record(event: str, *args: object, **kwargs: object) -> object:
         events.append(event)
-        return await original_notify(event, *args, **kwargs)
+        return original_admit(event, *args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_notify", record)
+    # test-contract: seam observe approval admission through the single publication route
+    monkeypatch.setattr(server.control, "_admit_controller", record)
     try:
         await server.control._event(_start_event(call))
         store = server.runtime.opened.store
@@ -367,7 +369,7 @@ async def test_same_tick_approval_reservation_winner(
                 await server.control.resolve_approval("approve", call.id)
             assert loser.value.code == -32006
             gate.release.set()
-            await asyncio.wait_for(abort, 10)
+            await await_or_fail(abort, what="abort-first terminate_pending_approvals")
         else:
             approve = asyncio.create_task(
                 server.control.resolve_approval("approve", call.id)
@@ -376,8 +378,8 @@ async def test_same_tick_approval_reservation_winner(
             abort = asyncio.create_task(server.control._terminate_pending_approvals())
             assert not abort.done()
             gate.release.set()
-            result = await asyncio.wait_for(approve, 10)
-            await asyncio.wait_for(abort, 10)
+            result = await await_or_fail(approve, what="resolve_approval approve")
+            await await_or_fail(abort, what="terminate_pending_approvals")
             assert result["decision"] == "approve"
         assert gate.thread_ids != [threading.get_ident()]
         rows = [
@@ -389,6 +391,90 @@ async def test_same_tick_approval_reservation_winner(
         assert events.count("approval_end") == 1
     finally:
         gate.release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_before_durable_commit_retries_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation with no committed decision resets to pending; abort retries."""
+    server, _reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await server.control._event(_start_event(call))
+        store = server.runtime.opened.store
+        entered_helper = asyncio.Event()
+        original_durable = store._to_thread_durable
+
+        async def observe_durable(*args: object, **kwargs: object) -> object:
+            # Signal real-helper entry without blocking, so cancellation lands
+            # inside the real durable helper (parked on the held write lock).
+            entered_helper.set()
+            return await original_durable(*args, **kwargs)
+
+        # test-contract: seam observe the real durable helper without replacing it
+        monkeypatch.setattr(store, "_to_thread_durable", observe_durable)
+        # Hold the write lock so the settlement parks before it can commit.
+        await store._async_write_lock.acquire()
+        settlement = asyncio.create_task(
+            server.control.resolve_approval("approve", call.id)
+        )
+        try:
+            async with asyncio.timeout(10):
+                await entered_helper.wait()
+            settlement.cancel()
+        finally:
+            store._async_write_lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(settlement, what="cancelled settlement before commit")
+        assert store.approval_resolution_data(call.id) is None
+        retry = server.control._terminate_pending_approvals()
+        assert retry is not None
+        async with asyncio.timeout(10):
+            await retry
+        assert store.approval_resolution_data(call.id)["decision"] == "abort"
+        assert call.id not in server.control._approvals.state.records
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_after_durable_commit_keeps_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deferred cancellation after the commit keeps the durable decision."""
+    server, _reader, writer, call = await _approval_server(tmp_path)
+    gate: _StoreGate | None = None
+    try:
+        await server.control._event(_start_event(call))
+        store = server.runtime.opened.store
+        ends: list[object] = []
+        original_admit = server.control._admit_controller
+
+        def record_admit(event: object, *args: object, **kwargs: object) -> object:
+            if event == EventDescriptor.APPROVAL_END:
+                ends.append(event)
+            return original_admit(event, *args, **kwargs)
+
+        # test-contract: seam observe approval admission through the single route
+        monkeypatch.setattr(server.control, "_admit_controller", record_admit)
+        gate = _StoreGate(store, "resolve_approval")
+        gate.install(monkeypatch)
+        settlement = asyncio.create_task(
+            server.control.resolve_approval("approve", call.id)
+        )
+        await _wait_thread_gate(gate)
+        settlement.cancel()
+        gate.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(settlement, what="cancelled settlement after commit")
+        resolution = store.approval_resolution_data(call.id)
+        assert resolution is not None and resolution["decision"] == "allow"
+        assert call.id not in server.control._approvals.state.records
+        assert ends.count(EventDescriptor.APPROVAL_END) == 1
+    finally:
+        if gate is not None:
+            gate.release.set()
         await close_serve(server, writer)
 
 
@@ -554,7 +640,7 @@ async def test_serve_bound_approval_writes_only_through_settlement(
         await server.control.wait_for_approval_settlement()
 
         assert writers
-        assert all("persist" in caller for caller in writers)
+        assert all("persist_durably" in caller for caller in writers)
     finally:
         await close_serve(server, writer)
         if child is not None:
@@ -569,13 +655,14 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
     server, _reader, writer, foreground = await _approval_server(tmp_path)
     child: ConversationStore | None = None
     notifications: list[str] = []
-    original_notify = server.control._notify
+    original_admit = server.control._admit_controller
 
-    async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+    def record_admit(event: str, *args: object, **kwargs: object) -> object:
         notifications.append(event)
-        return await original_notify(event, *args, **kwargs)
+        return original_admit(event, *args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_notify", record_notify)
+    # test-contract: seam observe approval admission through the single publication route
+    monkeypatch.setattr(server.control, "_admit_controller", record_admit)
     try:
         policy = server.runtime.policy
         assert policy is not None and server.runtime.loop is not None
@@ -1186,15 +1273,16 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         await server.control._event(_start_event(call))
         events: list[tuple[str, str | None]] = []
         aborted: list[bool] = []
-        original_notify = server.control._notify
+        original_admit = server.control._admit_controller
 
-        async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+        def record_admit(event: str, *args: object, **kwargs: object) -> object:
             error = kwargs.get("error")
             code = error.get("code") if isinstance(error, dict) else None
             events.append((event, code))
-            return await original_notify(event, *args, **kwargs)
+            return original_admit(event, *args, **kwargs)
 
-        monkeypatch.setattr(server.control, "_notify", record_notify)
+        # test-contract: seam observe approval admission through the single publication route
+        monkeypatch.setattr(server.control, "_admit_controller", record_admit)
         assert server.runtime.loop is not None
         monkeypatch.setattr(
             server.runtime.loop,
@@ -1239,13 +1327,14 @@ async def test_persistent_failure_removes_many_live_child_approvals(
     server, _reader, writer, _call = await _approval_server(tmp_path)
     stores: list[ConversationStore] = []
     events: list[str] = []
-    original_notify = server.control._notify
+    original_admit = server.control._admit_controller
 
-    async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+    def record_admit(event: str, *args: object, **kwargs: object) -> object:
         events.append(event)
-        return await original_notify(event, *args, **kwargs)
+        return original_admit(event, *args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_notify", record_notify)
+    # test-contract: seam observe approval admission through the single publication route
+    monkeypatch.setattr(server.control, "_admit_controller", record_admit)
     assert server.runtime.loop is not None
     monkeypatch.setattr(server.runtime.loop, "abort", lambda **kwargs: None)
     policy = server.runtime.policy
@@ -1953,16 +2042,17 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
         tmp_path, protocol_version="1.2", features=["approval_reconnect"]
     )
     events: list[tuple[str, str | None]] = []
-    original = server.control._notify
+    original_admit = server.control._admit_controller
 
-    async def record(
+    def record(
         event: str, session_id: str | None = None, **fields: object
-    ) -> bool:
+    ) -> object:
         request_id = fields.get("request_id")
         events.append((event, request_id if isinstance(request_id, str) else None))
-        return await original(event, session_id, **fields)
+        return original_admit(event, session_id, **fields)
 
-    monkeypatch.setattr(server.control, "_notify", record)
+    # test-contract: seam observe approval admission through the single publication route
+    monkeypatch.setattr(server.control, "_admit_controller", record)
     try:
         await server.control._event(_start_event(call))
         await server.control.controller_released(reconnect=True)
