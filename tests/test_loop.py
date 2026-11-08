@@ -172,7 +172,14 @@ def test_finish_gate_message_bounds_long_details_by_utf8_bytes(detail: str) -> N
 
 def test_finish_gate_message_bounds_deep_generated_handles() -> None:
     children = tuple(
-        ("root:" + ":".join(f"child-{depth}" for depth in range(100)), "worker")
+        (
+            "root:"
+            + ":".join(
+                f"child-{depth:08x}-0000-0000-0000-000000000000"
+                for depth in range(100)
+            ),
+            "worker",
+        )
         for _ in range(20)
     )
 
