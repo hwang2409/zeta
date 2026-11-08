@@ -148,6 +148,174 @@ def test_await_deadline_rule_rejects_unbounded_waits(
     )
 
 
+@pytest.mark.parametrize(
+    ("case", "source", "expected_lines"),
+    [
+        (
+            "direct asyncio",
+            "import asyncio\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [3],
+        ),
+        (
+            "direct anyio",
+            "import anyio\nasync def test_spin():\n    while not ready:\n        await anyio.sleep(0)\n",
+            [3],
+        ),
+        (
+            "unenforced clock assignment",
+            "import asyncio\nasync def test_spin():\n    deadline = clock() + 10\n    while not ready:\n        now = clock()\n        await asyncio.sleep(0)\n",
+            [4],
+        ),
+        (
+            "clock comparison does not exit",
+            "import asyncio\nasync def test_spin():\n    while not ready:\n        if clock() > deadline:\n            ignored = True\n        await asyncio.sleep(0)\n",
+            [3],
+        ),
+        (
+            "timeout none",
+            "import asyncio\nasync def test_spin():\n    async with asyncio.timeout(None):\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [4],
+        ),
+        (
+            "finite timeout",
+            "import asyncio\nasync def test_spin():\n    async with asyncio.timeout(10):\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "finite timeout at",
+            "import asyncio\nasync def test_spin():\n    async with asyncio.timeout_at(deadline):\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "finite wait for",
+            "import asyncio\nasync def test_spin():\n    await asyncio.wait_for(loop(), 10)\n",
+            [],
+        ),
+        (
+            "await or fail",
+            "import asyncio\nasync def test_spin():\n    await await_or_fail(loop())\n",
+            [],
+        ),
+        (
+            "from import sleep",
+            "from asyncio import sleep\nasync def test_spin():\n    while not ready:\n        await sleep(0)\n",
+            [],
+        ),
+        (
+            "module alias",
+            "import asyncio as aio\nasync def test_spin():\n    while not ready:\n        await aio.sleep(0)\n",
+            [],
+        ),
+        (
+            "from alias",
+            "from asyncio import sleep as tick\nasync def test_spin():\n    while not ready:\n        await tick(0)\n",
+            [],
+        ),
+        (
+            "itertools count",
+            "import asyncio, itertools\nasync def test_spin():\n    for _ in itertools.count():\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "itertools cycle",
+            "import asyncio, itertools\nasync def test_spin():\n    for _ in itertools.cycle(items):\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "two argument iter",
+            "import asyncio\nasync def test_spin():\n    for _ in iter(read, stop):\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "executor polling",
+            "import asyncio\nasync def test_spin():\n    for item in executor.map(work, items):\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "finite one argument iter",
+            "import asyncio\nasync def test_spin():\n    for _ in iter([1, 2]):\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "sleep only in nested definition",
+            "import asyncio\nasync def test_outer():\n    while ready:\n        async def nested():\n            await asyncio.sleep(0)\n        break\n",
+            [],
+        ),
+        (
+            "nested direct loop checked independently",
+            "import asyncio\nasync def test_outer():\n    while ready:\n        async def nested():\n            while not ready:\n                await asyncio.sleep(0)\n        break\n",
+            [5],
+        ),
+        (
+            "class local shadow",
+            "import asyncio\nclass Tests:\n    asyncio = fake\n    async def test_spin(self):\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "dotted import only",
+            "import asyncio.tasks\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "parameter rebound",
+            "import asyncio\nasync def test_spin(asyncio):\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "local rebound",
+            "import asyncio\nasync def test_spin():\n    asyncio = fake\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "definition rebound",
+            "import asyncio\ndef asyncio():\n    pass\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "another import rebound",
+            "import asyncio\nimport json as asyncio\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "nested free variable owned by parameter",
+            "import asyncio\nasync def outer(asyncio):\n    async def test_spin():\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "ast parse only syntax",
+            "import asyncio\ndef test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "nonzero sleep and new exact spin",
+            "import asyncio\nasync def test_allowlisted():\n    while first:\n        await asyncio.sleep(1)\n    while second:\n        await asyncio.sleep(0)\n",
+            [5],
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) and "\n" not in value else None,
+)
+def test_polling_spin_rule_acceptance_table(
+    tmp_path: Path, case: str, source: str, expected_lines: list[int]
+) -> None:
+    del case
+
+    findings = [
+        finding
+        for finding in _lint(tmp_path, source)
+        if finding.message.startswith("polling loop without a deadline:")
+    ]
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ004", line) for line in expected_lines
+    ]
+    for finding in findings:
+        assert finding.message == (
+            "polling loop without a deadline: wrap the wait in await_or_fail "
+            "(tests/support/owned.py) or give it an explicit deadline "
+            "(asyncio.timeout(N)), or wait on an event set by the producer"
+        )
+
+
 def test_await_deadline_rule_catches_pr_765_original_bare_task_await(
     tmp_path: Path,
 ) -> None:
@@ -1069,6 +1237,64 @@ async def test_new_wait():
     findings = quality.lint_all(tmp_path)
 
     assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 5)]
+
+
+def test_polling_spin_allowlist_rejects_a_new_site_in_an_allowlisted_function(
+    tmp_path: Path,
+) -> None:
+    source = """import asyncio
+async def test_existing_wait():
+    while first:
+        await asyncio.sleep(0)
+    while second:
+        await asyncio.sleep(0)
+"""
+    target = tmp_path / "tests/test_example.py"
+    target.parent.mkdir()
+    target.write_text(source)
+    (tmp_path / quality.RATCHET_PATH).write_text(
+        "tests/test_example.py::test_existing_wait\n"
+    )
+    (tmp_path / quality.POLLING_SPIN_RATCHET_PATH).write_text(
+        "tests/test_example.py::test_existing_wait::1\n"
+    )
+
+    findings = quality.lint_polling_spins(tmp_path)
+
+    assert [(finding.code, finding.line, finding.message) for finding in findings] == [
+        ("TQ004", 5, quality.POLLING_SPIN_ERROR)
+    ]
+
+
+def test_polling_spin_allowlist_rejects_a_stale_site(tmp_path: Path) -> None:
+    source = """import asyncio
+async def test_existing_wait():
+    while first:
+        await asyncio.sleep(0)
+"""
+    target = tmp_path / "tests/test_example.py"
+    target.parent.mkdir()
+    target.write_text(source)
+    (tmp_path / quality.RATCHET_PATH).write_text(
+        "tests/test_example.py::test_existing_wait\n"
+    )
+    (tmp_path / quality.POLLING_SPIN_RATCHET_PATH).write_text(
+        "tests/test_example.py::test_existing_wait::1\n"
+        "tests/test_example.py::test_existing_wait::2\n"
+    )
+
+    findings = quality.lint_polling_spins(tmp_path)
+
+    assert [(finding.code, finding.line, finding.message) for finding in findings] == [
+        (
+            "TQ004",
+            1,
+            (
+                "stale polling-spin allowlist entry "
+                "tests/test_example.py::test_existing_wait::2; delete it"
+            ),
+        )
+    ]
 
 
 def test_write_ratchet_command_records_each_function_once(
