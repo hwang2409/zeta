@@ -530,6 +530,7 @@ async def test_child_history_writer_after_idle_probe_does_not_offer_repair(
     prefix_written = threading.Event()
     release_append = threading.Event()
     append_errors: list[BaseException] = []
+    prefix_bytes: list[bytes] = []
     original_probe = ConversationStore._observer_append_active
     original_write_bytes = ConversationStore._write_bytes
 
@@ -545,6 +546,7 @@ async def test_child_history_writer_after_idle_probe_does_not_offer_repair(
             original_write_bytes(target, data)
             return
         original_write_bytes(target, data[:-1])
+        prefix_bytes.append((target.session_dir / "conversation.jsonl").read_bytes())
         prefix_written.set()
         assert release_append.wait(10)
         original_write_bytes(target, data[-1:])
@@ -575,6 +577,7 @@ async def test_child_history_writer_after_idle_probe_does_not_offer_repair(
             assert during.get("error", {}).get("data") == {
                 "code": "stale_history_snapshot"
             }, during
+            assert prefix_bytes and transcript.read_bytes() == prefix_bytes[0]
         finally:
             release_append.set()
             await await_or_fail(
