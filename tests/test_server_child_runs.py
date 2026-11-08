@@ -207,7 +207,6 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
             "hello",
             {"protocol_version": "1.2", "features": ["child_runs"]},
         )
-        assert hello["result"]["capabilities"]["features"] == ["child_runs"]
         created = await client.request(
             "new", "new_session", {"provider": "codex"}
         )
@@ -225,6 +224,16 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
             "child_run_list",
             {"session_id": session_id},
         )
+        sent = await client.request(
+            "send-child",
+            "child_run_send",
+            {"session_id": session_id, "run_id": run_id, "text": "continue"},
+        )
+        assert "result" in listed and "result" in sent, {
+            "list": listed,
+            "send": sent,
+        }
+        assert hello["result"]["capabilities"]["features"] == ["child_runs"]
         [before] = listed["result"]["runs"]
         assert before["run_id"] == run_id
         assert before["session_id"] == session_id
@@ -232,11 +241,6 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
         assert before["accepts_follow_ups"] is True
         assert "handle" not in before
 
-        sent = await client.request(
-            "send-child",
-            "child_run_send",
-            {"session_id": session_id, "run_id": run_id, "text": "continue"},
-        )
         assert sent["result"] == {"accepted": True, "run_id": run_id}
         backend.release_children.set()
         await await_or_fail(
