@@ -2988,24 +2988,43 @@ async def test_background_output_caps_at_utf8_boundary(tmp_path: Path) -> None:
 async def test_background_task_stays_running_for_detached_group_member(
     tmp_path: Path,
 ) -> None:
+    ready = tmp_path / "detached-ready"
+    terminated = tmp_path / "detached-terminated"
+    child = (
+        "import os,pathlib,signal,time; "
+        f"ready=pathlib.Path({str(ready)!r}); "
+        f"terminated=pathlib.Path({str(terminated)!r}); "
+        "signal.signal(signal.SIGTERM, lambda *_: "
+        "(terminated.write_text(str(os.getpid())), exit())[1]); "
+        "ready.write_text(str(os.getpid())); "
+        "time.sleep(300)"
+    )
     tasks = BackgroundTaskRegistry()
     task_id, pid = await tasks.start(
         _python(
             "import subprocess,sys; "
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}], "
             "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
         ),
         tmp_path,
     )
-    # test-contract: latency allow the detached child to enter the process group.
+    child_pid = await read_pid_file(ready)
+    # test-contract: latency allow the detached child to outlive the group leader.
     await asyncio.sleep(0.1)
     assert (await tasks.output(task_id))["running"] is True
     assert _group_exists(pid)
 
-    result = await tasks.kill(task_id, cause="test requested task stop")
-    assert result["running"] is False
-    assert not _group_exists(pid)
-    await tasks.close()
+    killing = asyncio.create_task(tasks.kill(task_id, cause="test requested task stop"))
+    try:
+        assert await read_pid_file(terminated) == child_pid
+        result = await await_or_fail(killing, what="detached group kill completion")
+        assert result["running"] is False
+        assert not _group_exists(pid)
+    finally:
+        if not killing.done():
+            os.kill(child_pid, signal.SIGKILL)
+        await asyncio.gather(killing, return_exceptions=True)
+        await tasks.close()
 
 
 @pytest.mark.asyncio

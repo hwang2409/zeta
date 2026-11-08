@@ -287,7 +287,6 @@ class _BackgroundTaskOwner:
             process = self.process
             if (
                 process is None
-                or process.returncode is not None
                 or not self.record.running
                 or self.kill_cause is not None
             ):
