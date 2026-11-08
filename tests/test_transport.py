@@ -94,13 +94,8 @@ async def test_encode_json_payload_yields_repeatedly_during_one_large_scalar(
 
 
 @pytest.mark.asyncio
-async def test_encode_json_payload_preserves_non_ascii_at_chunk_boundaries(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from zeta.providers import transport
-
-    monkeypatch.setattr(transport, "_JSON_YIELD_BYTES", 5)
-    payload = {"text": "é界🙂" * 20}
+async def test_encode_json_payload_preserves_non_ascii_at_chunk_boundaries() -> None:
+    payload = {"text": "é界🙂" * 100_000}
     encoded = await encode_json_payload(payload, ensure_ascii=False)
     assert encoded == json.dumps(payload, ensure_ascii=False).encode()
 
