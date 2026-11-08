@@ -2238,7 +2238,17 @@ async def test_tui_accounts_login_renders_the_missing_registry_refusal(
     )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
-    output = StringIO()
+    running = asyncio.get_running_loop()
+    login_rendered = asyncio.Event()
+
+    class Output(StringIO):
+        def write(self, text: str) -> int:
+            written = super().write(text)
+            if "login failed" in self.getvalue():
+                running.call_soon_threadsafe(login_rendered.set)
+            return written
+
+    output = Output()
     app = TUIApp(
         loop,
         provider="codex",
@@ -2247,14 +2257,10 @@ async def test_tui_accounts_login_renders_the_missing_registry_refusal(
         console=Console(file=output, force_terminal=False, width=240),
     )
 
-    async def login_rendered() -> None:
-        while "login failed" not in output.getvalue():
-            await asyncio.sleep(0.01)
-
     try:
         app._submissions.wake()
         app._submissions.submit("/accounts login anthropic new", steer=False)
-        await asyncio.wait_for(login_rendered(), 10)
+        await asyncio.wait_for(login_rendered.wait(), 10)
 
         rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
         assert f"login failed: {_MISSING_REGISTRY_REFUSAL}" in rendered
