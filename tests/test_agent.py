@@ -13902,6 +13902,7 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
         session_project=parent_project,
         cwd_project=registry.show_project(child_project.project_id),
         inbox_enabled=False,
+        registry=registry,
     )
     assert any("repository AGENTS.md" in notice for notice in context.notices) is (
         ignored_project == "project-b"
@@ -13931,6 +13932,7 @@ async def test_same_cwd_child_starts_with_owned_project_memory(
         session_project=project,
         cwd_project=project,
         inbox_enabled=False,
+        registry=registry,
     )
     assert "project_memory" in context.prompt_components
     store = ConversationStore(tmp_path / "sessions", cwd=workspace)

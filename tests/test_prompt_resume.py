@@ -8,22 +8,34 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.core.project_context import ProjectContext
+from zeta.core.project_context import ProjectContext, load_project_context
 from zeta.core.session import SessionManager
 from zeta.core.session_execution import SessionOwnedError
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.runtime.prompt_resume import ResumedPrompt, resume_prompt
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
+from zeta.storage_format import advance
 from zeta.tools import ToolRegistry
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
+
+
+class _UnavailableRegistry(ProjectRegistryState):
+    def __bool__(self) -> bool:
+        return False
 
 
 def _manager_with_prompt(
@@ -91,6 +103,7 @@ def _resume(
             repo_root=cwd,
             inbox_enabled=False,
             context_loader=context_loader,
+            registry=manager.project_registry_state,
         )
     except BaseException:
         opened.store.close()
@@ -314,6 +327,7 @@ async def test_concurrent_resume_child_uses_one_fresh_profile_generation(
             home=home,
             repo_root=tmp_path,
             inbox_enabled=False,
+            registry=manager.project_registry_state,
         )
         assert first.agent_catalog.find("specialist").prompt_suffix == "v1 body"
 
@@ -331,6 +345,7 @@ async def test_concurrent_resume_child_uses_one_fresh_profile_generation(
             home=home,
             repo_root=tmp_path,
             inbox_enabled=False,
+            registry=manager.project_registry_state,
         )
         profile.unlink()
 
@@ -467,45 +482,6 @@ def test_staggered_recipe_less_empty_resumes_adopt_live_runtime(
     assert manager.read_metadata(session_id).prompt_recipe == "default"
 
 
-def test_staggered_memory_span_resumes_adopt_live_runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    prefix = "prefix "
-    memory = "old memory"
-    prompt = f"{prefix}{memory} suffix"
-    offset = len(prefix)
-    manager, session_id = _manager_with_prompt(
-        tmp_path / "home",
-        tmp_path,
-        system_prompt=prompt,
-        prompt_recipe=None,
-        project_memory_offset=offset,
-        project_memory_length=len(memory),
-        project_memory_digest=hashlib.sha256(memory.encode()).hexdigest(),
-    )
-    calls: list[int] = []
-
-    def refresh(stored_prompt: str, **kwargs: object) -> str:
-        del stored_prompt, kwargs
-        calls.append(len(calls) + 1)
-        return f"{prefix}new memory {calls[-1]} suffix"
-
-    monkeypatch.setattr("zeta.runtime.prompt_resume.refresh_project_memory", refresh)
-    results = _staggered_resumes(
-        manager,
-        session_id,
-        tmp_path / "home",
-        tmp_path,
-        context_loader=lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError(f"unexpected default rebuild: {kwargs}")
-        ),
-        monkeypatch=monkeypatch,
-    )
-
-    _assert_one_persisted_prompt(manager, session_id, results)
-    assert calls == [1]
-
-
 def test_custom_prompt_without_owned_skill_span_stays_unchanged_and_notices_restart(
     tmp_path: Path,
 ) -> None:
@@ -626,7 +602,7 @@ home = Path({str(home)!r})
 cwd = Path({str(cwd)!r})
 manager = SessionManager(home)
 opened = manager.open({session_id!r})
-resume_prompt(opened.metadata, manager=manager, store=opened.store, home=home, repo_root=cwd, inbox_enabled=False, context_loader=lambda **kwargs: ProjectContext("child runtime", (), prompt_recipe="default"))
+resume_prompt(opened.metadata, manager=manager, store=opened.store, home=home, repo_root=cwd, inbox_enabled=False, context_loader=lambda **kwargs: ProjectContext("child runtime", (), prompt_recipe="default"), registry=manager.project_registry_state)
 {close}
 Path({str(ready)!r}).write_text("ready")
 owner_pid = {os.getpid()}
@@ -757,65 +733,116 @@ def test_transfer_excludes_runtime_lease_and_destination_rebuilds(
             store.close()
 
 
-def test_project_refresh_does_not_hold_session_shape_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("recipe", ["custom", "default"])
+def test_resume_uses_project_snapshot_captured_before_execution(
+    tmp_path: Path, recipe: str
 ) -> None:
-    memory = "old memory"
-    manager, session_id = _manager_with_prompt(
-        tmp_path / "home",
-        tmp_path,
-        system_prompt=memory,
-        prompt_recipe=None,
-        project_memory_offset=0,
-        project_memory_length=len(memory),
-        project_memory_digest=hashlib.sha256(memory.encode()).hexdigest(),
+    home = tmp_path / "home"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    advance(home, expected_epoch=0)
+    manager = SessionManager(home)
+    registry = manager.project_registry
+    assert registry is not None
+    project = registry.create_project("demo", "scope", repository)
+    registry.initialize_memory(project.project_id)
+    initial = registry.memory_snapshot(project.project_id)
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=initial.digest,
+        updates={"brief.md": "old memory"},
     )
-    refresh_started = threading.Event()
-    metadata_updated = threading.Event()
-    errors: list[BaseException] = []
-    calls = 0
+    old_projection = registry.project_context_projection(project.project_id)
+    old_context = load_project_context(
+        cwd=repository,
+        repo_root=repository,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
+        registry=registry,
+        project_projection=old_projection,
+    )
+    prompt = old_context.system_prompt
+    offset = old_context.memory_offset
+    length = old_context.memory_length
+    digest = old_context.memory_digest
+    assert offset is not None and length is not None and digest is not None
+    components = {
+        "project_memory": {
+            "offset": offset,
+            "length": length,
+            "digest": digest,
+        }
+    }
+    if recipe == "custom":
+        prefix = "unknown-prefix\n"
+        suffix = "\nunknown-suffix"
+        prompt = prefix + prompt + suffix
+        offset += len(prefix)
+        components["project_memory"]["offset"] = offset
+    opened = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=repository,
+        project_id=project.project_id,
+        system_prompt=prompt,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        project_memory_offset=offset,
+        project_memory_length=length,
+        project_memory_digest=digest,
+        prompt_recipe=recipe,
+        prompt_components=components,
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    before_update = registry.memory_snapshot(project.project_id)
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=before_update.digest,
+        updates={"brief.md": "current memory"},
+    )
+    projection = registry.project_context_projection(project.project_id)
+    expected = load_project_context(
+        cwd=repository,
+        repo_root=repository,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
+        registry=registry,
+        project_projection=projection,
+    )
 
-    def refresh(stored_prompt: str, **kwargs: object) -> str:
-        nonlocal calls
-        del kwargs
-        calls += 1
-        if calls == 1:
-            refresh_started.set()
-            assert metadata_updated.wait(10), (
-                "session metadata remained locked during project memory refresh"
-            )
-        return stored_prompt.replace("old memory", "new memory")
-
-    def update_metadata() -> None:
-        try:
-            assert refresh_started.wait(10), "project memory refresh did not start"
-            with manager._metadata_lock(session_id) as directory_fd:
-                metadata = manager._read(session_id, directory_fd=directory_fd)
-                metadata.name = "concurrent name"
-                manager._write_unlocked(metadata, directory_fd=directory_fd)
-            metadata_updated.set()
-        except BaseException as exc:  # noqa: BLE001 - joined below
-            errors.append(exc)
-            metadata_updated.set()
-
-    monkeypatch.setattr("zeta.runtime.prompt_resume.refresh_project_memory", refresh)
-    updater = threading.Thread(target=update_metadata)
-    updater.start()
+    resume_registry = registry if recipe == "custom" else _UnavailableRegistry(None)
+    resumed = manager.open(session_id)
+    result: ResumedPrompt | None = None
+    failure: BaseException | None = None
     try:
-        result = _resume(
-            manager,
-            session_id,
-            tmp_path / "home",
-            tmp_path,
-            context_loader=lambda **kwargs: (_ for _ in ()).throw(
-                AssertionError(f"unexpected default rebuild: {kwargs}")
-            ),
+        result = resume_prompt(
+            resumed.metadata,
+            manager=manager,
+            store=resumed.store,
+            home=home,
+            repo_root=repository,
+            inbox_enabled=True,
+            session_project=project,
+            cwd_project=project,
+            registry=resume_registry,
+            project_projection=projection,
         )
+    except BaseException as exc:  # noqa: BLE001 - asserted below
+        failure = exc
     finally:
-        metadata_updated.set()
-        updater.join(10)
-    assert not updater.is_alive(), "metadata updater did not finish"
-    assert not errors
-    assert calls == 2
-    assert result.context.system_prompt == "new memory"
-    assert manager.read_metadata(session_id).name == "concurrent name"
+        resumed.store.close()
+
+    assert failure is None, f"{recipe} resume did not succeed: {failure}"
+    assert result is not None
+    assert "current memory" in result.context.system_prompt
+    assert "old memory" not in result.context.system_prompt
+    if recipe == "custom":
+        assert result.context.system_prompt.startswith("unknown-prefix\n")
+        assert result.context.system_prompt.endswith("\nunknown-suffix")
+    else:
+        assert result.context.system_prompt == expected.system_prompt

@@ -10,7 +10,6 @@ from unittest.mock import patch
 import pytest
 
 from zeta.cli import project as project_cli
-from zeta.core.project_context import refresh_project_memory
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_store import MemoryKind, MemorySchema
 from zeta.memory.user_authorization import MemoryMutationAuthorization
@@ -201,19 +200,6 @@ def test_format_two_views_are_available_after_per_project_activation(
     synced = push_project_memory(home, LocalTransport(remote), project_id=project_id)
     assert synced.conflicts == ()
     before = _snapshot(project_root)
-
-    prompt = "prefix<zeta-project-memory></zeta-project-memory>suffix"
-    block = "<zeta-project-memory></zeta-project-memory>"
-    refreshed = refresh_project_memory(
-        prompt,
-        home=home,
-        project_id=project_id,
-        memory_offset=len("prefix"),
-        memory_length=len(block),
-        memory_digest=__import__("hashlib").sha256(block.encode()).hexdigest(),
-    )
-    assert refreshed.startswith("prefix<zeta-project-memory>")
-    assert refreshed.endswith("</zeta-project-memory>suffix")
 
     assert _snapshot(project_root) == before
 
