@@ -12,6 +12,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.server_client import _buffer
 from tests.test_server import (
     TIMEOUT,
     _close,
@@ -35,6 +36,8 @@ from tests.test_server_websocket import (
 )
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
 from zeta.server import ZetaServer
+from zeta.server import approval_lifecycle
+from zeta.server.approval_lifecycle import ExternalEnd
 from zeta.tui.app import TUIApp
 
 FEATURES = ["session_grants"]
@@ -246,6 +249,94 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
         await _request(reader, writer, 7, "deny", {"request_id": "call-2"})
         await _frames_until_event(reader, "turn_end")
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_always_tool_grant_survives_external_end_during_approve_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = ToolCall("call-1", "bash", {"command": "printf first"})
+    second = ToolCall("call-2", "bash", {"command": "printf second"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[first]),
+            ScriptedTurn(tool_calls=[second]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    committed = asyncio.Event()
+    release = asyncio.Event()
+    external_entered = asyncio.Event()
+    original_persist = approval_lifecycle.persist_durably
+    original_finish = server.control._approvals._finish_record
+
+    async def gated_finish(record: object, resolution: dict[str, str]) -> None:
+        external_entered.set()
+        await original_finish(record, resolution)  # type: ignore[arg-type]
+
+    async def gated_persist(*args: object, **kwargs: object) -> object:
+        result = await original_persist(*args, **kwargs)
+        committed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(approval_lifecycle, "persist_durably", gated_persist)
+    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
+    try:
+        _, session_id = await _hello_and_create(reader, writer)
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
+
+        approve = asyncio.create_task(
+            _request(
+                reader,
+                writer,
+                4,
+                "approve",
+                {"request_id": "call-1", "scope": "always_tool"},
+            )
+        )
+        await committed.wait()
+        external_end = asyncio.create_task(
+            server.control._approvals.transition(
+                ExternalEnd("call-1", session_id, {})
+            )
+        )
+        await external_entered.wait()
+        await external_end
+        release.set()
+        approve_frames = await approve
+        assert approve_frames[-1]["result"]["decision"] == "approve"
+        buffered = list(_buffer(reader))
+        grant_events = [
+            frame
+            for frame in buffered
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+        ]
+        assert len(grant_events) == 1, buffered
+        assert grant_events[0]["params"]["data"]["changed"] == ["bash"]
+
+        await _frames_until_event(reader, "turn_end")
+        snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
+        assert snapshot["session_id"] == session_id
+        assert snapshot["session_grants"] == ["bash"]
+
+        await _request(reader, writer, 6, "send", {"text": "second"})
+        frames = await _frames_until_event(reader, "turn_end")
+        assert not any(
+            frame.get("params", {}).get("event") == "approval_request"
+            for frame in frames
+        ), frames
+    finally:
+        release.set()
         await _close(server, writer)
 
 
