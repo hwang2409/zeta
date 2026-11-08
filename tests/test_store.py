@@ -2219,6 +2219,67 @@ def test_abandoned_branch_semantic_failure_is_ignored(tmp_path: Path) -> None:
     reopened.close()
 
 
+def test_successful_full_load_does_not_materialize_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="streamed-full-load")
+    for index in range(3):
+        store.append_message(message(MessageRole.ASSISTANT, f"row-{index}"))
+    transcript_size = store.path.stat().st_size
+    store.close()
+    requested_reads: list[int] = []
+    original = ConversationStore._read_fd
+
+    def record_read(fd: int, length: int) -> bytes:
+        requested_reads.append(length)
+        return original(fd, length)
+
+    monkeypatch.setattr(ConversationStore, "_read_fd", staticmethod(record_read))
+
+    reopened = ConversationStore(
+        tmp_path, session_id="streamed-full-load", _read_only=True
+    )
+
+    assert len(reopened.entries) == 3
+    assert transcript_size not in requested_reads, (
+        "successful full load requested one transcript-sized read"
+    )
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("line_ending", "final_newline"),
+    [(b"\n", True), (b"\n", False), (b"\r\n", True), (b"\r\n", False)],
+)
+def test_streamed_full_load_preserves_physical_row_forms(
+    tmp_path: Path, line_ending: bytes, final_newline: bool
+) -> None:
+    store = ConversationStore(tmp_path, session_id="physical-rows")
+    store.append_message(message(MessageRole.ASSISTANT, "x" * (128 * 1024)))
+    store.append_message(message(MessageRole.ASSISTANT, "final"))
+    expected_entries = store.entries
+    expected_digest = store._entry_prefix_digest
+    path = store.path
+    store.close()
+    raw = path.read_bytes().replace(b"\n", line_ending)
+    if not final_newline:
+        raw = raw.removesuffix(b"\n")
+    path.write_bytes(raw)
+
+    reopened = ConversationStore(tmp_path, session_id="physical-rows")
+
+    assert reopened.entries == expected_entries
+    assert reopened._entry_prefix_digest == expected_digest
+    assert reopened._log_offset == path.stat().st_size
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fingerprint = reopened._prefix_fingerprint(fd, path.stat().st_size)
+    finally:
+        os.close(fd)
+    assert reopened._log_prefix_fingerprint == fingerprint
+    reopened.close()
+
+
 def test_full_load_validates_the_final_branch_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
