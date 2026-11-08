@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from rich.console import Console
+from websockets.asyncio.client import connect
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
@@ -453,7 +454,10 @@ async def test_always_tool_grant_survives_external_end_during_approve_settlement
 
 
 @pytest.mark.asyncio
-async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -> None:
+async def test_session_grant_flow_over_authenticated_websocket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     call = ToolCall("call-1", "bash", {"command": "printf websocket"})
     backend = FakeBackend(
         [
@@ -469,30 +473,65 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     await server.start()
-    reader, writer, status, _headers = await _connect_websocket(
-        server, token=None, protocol_token=server._websocket.token
+    assert server._websocket is not None
+    websocket = await connect(
+        f"ws://127.0.0.1:{server._websocket.port}/",
+        subprotocols=["zeta.v1", f"zeta.bearer.{server._websocket.token}"],
     )
-    assert status == 101
+    assert websocket.subprotocol == "zeta.v1"
 
     async def request(
         request_id: int, method: str, params: dict[str, object]
     ) -> list[dict[str, Any]]:
-        await _send_json(
-            writer,
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            },
-        )
-        frames = []
-        while True:
-            frame = await _read_json(reader)
-            frames.append(frame)
-            if frame.get("id") == request_id:
-                return frames
+        async def read_response() -> list[dict[str, Any]]:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            frames = []
+            while True:
+                payload = await websocket.recv()
+                assert isinstance(payload, str), "serve sent a binary WebSocket frame"
+                frame = json.loads(payload)
+                frames.append(frame)
+                if frame.get("id") == request_id:
+                    return frames
 
+        return await await_or_fail(
+            read_response(), what=f"{method} WebSocket response"
+        )
+
+    async def event(name: str) -> dict[str, Any]:
+        async def read_event() -> dict[str, Any]:
+            while True:
+                payload = await websocket.recv()
+                assert isinstance(payload, str), "serve sent a binary WebSocket frame"
+                frame = json.loads(payload)
+                if frame.get("params", {}).get("event") == name:
+                    return frame
+
+        return await await_or_fail(read_event(), what=f"{name} WebSocket event")
+
+    setup_started = asyncio.Event()
+    release_setup = asyncio.Event()
+    original_run_setup = server.runtime._run_setup
+
+    async def gated_run_setup(*args: Any, **kwargs: Any):
+        setup_started.set()
+        await await_or_fail(
+            release_setup.wait(), what="test to release new_session setup"
+        )
+        return await original_run_setup(*args, **kwargs)
+
+    monkeypatch.setattr(server.runtime, "_run_setup", gated_run_setup)
+    create_task: asyncio.Task[list[dict[str, Any]]] | None = None
     try:
         hello = (
             await request(
@@ -505,7 +544,13 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
             )
         )[-1]["result"]
         assert "session_grants" in hello["capabilities"]["features"]
-        created = await request(2, "new_session", {"provider": "codex"})
+        create_task = asyncio.create_task(
+            request(2, "new_session", {"provider": "codex"})
+        )
+        await await_or_fail(setup_started.wait(), what="new_session setup to start")
+        assert not create_task.done(), "new_session responded before setup completed"
+        release_setup.set()
+        created = await create_task
         assert any(
             frame.get("params", {}).get("data", {}).get("change") == "reset"
             for frame in created
@@ -519,10 +564,8 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
             ),
             None,
         )
-        while approval is None:
-            frame = await _read_json(reader)
-            if frame.get("params", {}).get("event") == "approval_request":
-                approval = frame
+        if approval is None:
+            approval = await event("approval_request")
         approved = await request(
             4,
             "approve",
@@ -544,7 +587,12 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
         )
         assert revoked[-1]["result"]["grants"]["session_grants"] == []
     finally:
-        await close_serve(server, writer)
+        release_setup.set()
+        if create_task is not None and not create_task.done():
+            create_task.cancel()
+            await asyncio.gather(create_task, return_exceptions=True)
+        await websocket.close()
+        await close_serve(server)
 
 
 @pytest.mark.asyncio
