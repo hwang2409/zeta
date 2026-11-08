@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import Any
 
@@ -10,11 +9,6 @@ from ...agent.conversation_channel import ConversationChannel
 from ..registry import ToolRegistry, text_block
 
 MAX_QUESTION_LENGTH = 4_000
-
-
-def _consume_publication_result(task: asyncio.Task[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
 
 
 def _error(message: str) -> dict[str, object]:
@@ -57,15 +51,12 @@ def register_ask_parent(
         ):
             return _error("options must contain 1 to 10 nonempty strings")
         question_id = uuid.uuid4().hex
-        publication = asyncio.create_task(
-            channel.publish_question(
-                child_instance_id=child_instance_id,
-                question_id=question_id,
-                question=question,
-                options=options,
-            )
+        await channel.publish_question(
+            child_instance_id=child_instance_id,
+            question_id=question_id,
+            question=question,
+            options=options,
         )
-        publication.add_done_callback(_consume_publication_result)
         text = (
             f"question sent (id {question_id}); continue your work; "
             "the answer arrives as a follow-up message"
