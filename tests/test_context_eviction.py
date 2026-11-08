@@ -82,6 +82,40 @@ def test_invalid_eviction_view_sequences_are_boundaries(
     assert all(item.message.metadata["eviction_view_invalid"] for item in items)
 
 
+def test_covered_rows_skip_message_decoding() -> None:
+    entries = [
+        ConversationEntry(
+            seq=seq,
+            id=str(seq),
+            parent_id=None,
+            lane="main",
+            type="message",
+            data={"message": text(MessageRole.ASSISTANT, str(seq)).to_dict()},
+        )
+        for seq in range(1, 101)
+    ]
+    marker = ConversationEntry(
+        seq=101,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 1,
+            "source_seq_end": 100,
+            "view": [{"seq": 1, "message": entries[0].data["message"]}],
+        },
+    )
+
+    assembler = object.__new__(ContextAssembler)
+    with patch.object(Message, "from_dict", wraps=Message.from_dict) as from_dict:
+        projected = assembler._visible_items([*entries, marker])
+
+    assert [item.message.content[0].text for item in projected] == ["1"]
+    assert from_dict.call_count == 1
+
+
 def test_legacy_pinned_message_uses_original_source_order() -> None:
     request = text(MessageRole.USER, "request")
     entries = [
