@@ -145,6 +145,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self.project_registry = state.registry
         self.project_registry_unavailable = state.unavailable
 
+    @property
+    def observed_storage_epoch(self) -> int:
+        """Return the home epoch held by this manager's writer lease."""
+        return self._storage_lease.observed_epoch
+
     def create(
         self,
         *,

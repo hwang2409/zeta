@@ -33,6 +33,7 @@ from ..checkpoints import (
 )
 from ..session_files import open_session_file
 from ..transcript_recovery import (
+    TRANSCRIPT_REPAIR_EPOCH,
     TranscriptSourceFacts,
     ValidatedPrefix,
     reconcile_pending,
@@ -92,6 +93,7 @@ class TranscriptLoadError(ConversationIntegrityError):
         valid_prefix_end: int | None,
         reason_code: str,
         repairable: bool,
+        repair_available: bool,
         source_device: int,
         source_inode: int,
         source_size: int,
@@ -105,6 +107,7 @@ class TranscriptLoadError(ConversationIntegrityError):
         self.valid_prefix_end = valid_prefix_end
         self.reason_code = reason_code
         self.repairable = repairable
+        self.repair_available = repair_available
         self.source_device = source_device
         self.source_inode = source_inode
         self.source_size = source_size
@@ -144,7 +147,7 @@ class TranscriptLoadError(ConversationIntegrityError):
                         "requires_confirmation": True,
                     }
                 ]
-                if self.repairable
+                if self.repair_available
                 else []
             ),
         }
@@ -848,6 +851,10 @@ class ConversationLogMixin:
             valid_prefix_end=valid_prefix_end,
             reason_code=reason_code,
             repairable=repairable,
+            repair_available=(
+                repairable
+                and self._storage_lease.observed_epoch >= TRANSCRIPT_REPAIR_EPOCH
+            ),
             source_device=stat.st_dev,
             source_inode=stat.st_ino,
             source_size=stat.st_size,
