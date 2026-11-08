@@ -211,6 +211,9 @@ async def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> Non
         _home=tmp_path,
         _decisions_session_id=current.store.session_id,
         loop=current,
+        _run_attention_operation=lambda operation, *args: asyncio.to_thread(
+            operation, *args
+        ),
     )
     output = await DecisionsMixin.slash_decisions(app, "")
     assert "Current" in output
