@@ -12221,8 +12221,11 @@ async def test_session_history_returns_broken_sent_ledger_activation_notice(
 
     workspace = tmp_path / "project"
     workspace.mkdir()
-    ProjectRegistry(tmp_path / "projects").create_project(
-        "project", "test", workspace
+    await asyncio.to_thread(
+        ProjectRegistry(tmp_path / "projects").create_project,
+        "project",
+        "test",
+        workspace,
     )
     manager = SessionManager(tmp_path)
     opened = await asyncio.to_thread(
