@@ -68,6 +68,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
+from tests.support.owned import await_or_fail
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import (
@@ -387,6 +388,30 @@ async def _background_event_transcript_count(
     )
     if app_sink is not None:
         app_sink(app)
+    macro_cancellations: list[asyncio.Task[object]] = []
+    macro_cancellation_reached = asyncio.Event()
+    release_macro_cancellation = asyncio.Event()
+    if owner == "background_macro":
+        kill_background_task = app.loop.tool_registry.background_tasks.kill
+
+        async def track_macro_cancellation(
+            task_id: str, *, cause: str, tui_presented: bool = False
+        ) -> dict[str, object]:
+            task = asyncio.current_task()
+            assert task is not None
+            macro_cancellations.append(task)
+            result = await kill_background_task(
+                task_id, cause=cause, tui_presented=tui_presented
+            )
+            if event == "session_shutdown":
+                macro_cancellation_reached.set()
+                await await_or_fail(
+                    release_macro_cancellation.wait(),
+                    what="release background macro cancellation",
+                )
+            return result
+
+        app.loop.tool_registry.background_tasks.kill = track_macro_cancellation  # type: ignore[method-assign]
     blocked_command = (
         f"{shlex.quote(sys.executable)} -c 'import threading; threading.Event().wait()'"
     )
@@ -504,7 +529,35 @@ async def _background_event_transcript_count(
             app._print = fail_output
             app._print_unit = fail_output
         app.request_exit()
-        await asyncio.wait_for(running, 10)
+        cancellation_owned_at_shutdown = True
+        if owner == "background_macro" and event == "session_shutdown":
+            assert task_id is not None
+            await await_or_fail(
+                macro_cancellation_reached.wait(),
+                what="background macro cancellation cleanup",
+            )
+            await await_or_fail(
+                app.loop.tool_registry.background_tasks.wait(task_id),
+                what="background macro process exit",
+            )
+            checkpoint = asyncio.Event()
+            asyncio.get_running_loop().call_soon(checkpoint.set)
+            await await_or_fail(
+                checkpoint.wait(), what="background macro watcher checkpoint"
+            )
+            cancellation_owned_at_shutdown = (
+                app.loop._background_owner.owns_running(f"macro:{launch.id}")
+            )
+            release_macro_cancellation.set()
+        await await_or_fail(running, what="TUI shutdown")
+        if owner == "background_macro" and event == "session_shutdown":
+            assert cancellation_owned_at_shutdown, (
+                "background macro cancellation was unowned during session shutdown"
+            )
+            assert len(macro_cancellations) == 1
+            assert macro_cancellations[0].done(), (
+                "background macro cancellation survived session shutdown"
+            )
 
     resumed = ""
     if event == "session_shutdown":
