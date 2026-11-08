@@ -17047,7 +17047,7 @@ async def test_provider_error_after_successful_finish_keeps_report(
         child_turns=lambda: 0,
         update_turns=lambda _: None,
         update_step=lambda _: None,
-        update_tool_calls=lambda _: None,
+        record_tool_call=lambda: None,
         finish_lifecycle=lambda *_: {},
         publish_lifecycle=lambda *a, **k: None,
         child_result=lambda text, **kw: {
@@ -17556,6 +17556,7 @@ async def test_explicit_finish_never_enters_run_finish_gate(
             )
 
     loop = Child(registry)
+    # test-contract: seam task intentionally stays live until owner cancellation
     watcher = asyncio.create_task(asyncio.Event().wait())
     loop._background_owner.register(
         "root:1:1",
@@ -17580,7 +17581,7 @@ async def test_explicit_finish_never_enters_run_finish_gate(
         child_turns=lambda: 0,
         update_turns=lambda _: None,
         update_step=lambda _: None,
-        update_tool_calls=lambda _: None,
+        record_tool_call=lambda: None,
         finish_lifecycle=lambda *_: {},
         publish_lifecycle=lambda *a, **k: None,
         child_result=lambda text, **kw: {
@@ -17592,7 +17593,9 @@ async def test_explicit_finish_never_enters_run_finish_gate(
     )
     assert result["structuredContent"]["status"] == "running"
     watcher.cancel()
-    await asyncio.gather(watcher, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(watcher, return_exceptions=True), what="watcher cancellation"
+    )
     loop._background_owner.unregister("root:1:1")
     await registry.close()
     store.close()
@@ -17617,6 +17620,7 @@ async def test_setting_off_preserves_legacy_finish_gate(
     registry.bind_session_store(store)
     loop = Child(registry)
     loop.explicit_finish = False
+    # test-contract: seam task intentionally stays live until owner cancellation
     watcher = asyncio.create_task(asyncio.Event().wait())
     loop._background_owner.register(
         "root:1:1",
@@ -17642,7 +17646,7 @@ async def test_setting_off_preserves_legacy_finish_gate(
         child_turns=lambda: 0,
         update_turns=lambda _: None,
         update_step=lambda _: None,
-        update_tool_calls=lambda _: None,
+        record_tool_call=lambda: None,
         finish_lifecycle=lambda *_: {},
         publish_lifecycle=lambda *a, **k: None,
         child_result=lambda text, **kw: {
@@ -17654,7 +17658,9 @@ async def test_setting_off_preserves_legacy_finish_gate(
     )
     assert called is True
     watcher.cancel()
-    await asyncio.gather(watcher, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(watcher, return_exceptions=True), what="watcher cancellation"
+    )
     loop._background_owner.unregister("root:1:1")
     await registry.close()
     store.close()
@@ -18673,7 +18679,7 @@ async def test_resume_legacy_interrupted_send_row_delivers_once(
         child_turns=lambda: 0,
         update_turns=lambda _: None,
         update_step=lambda _: None,
-        update_tool_calls=lambda _: None,
+        record_tool_call=lambda: None,
         finish_lifecycle=lambda *_: {},
         publish_lifecycle=lambda *a, **k: None,
         child_result=lambda text, **kw: {
@@ -20207,4 +20213,109 @@ async def test_session_host_commands_provider_retry_keeps_turn_snapshot(
             for block in message.content
         )
     finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_child_wake_tool_count_is_cumulative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.tools.agent import _read_agent_status
+
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    first_idle = asyncio.Event()
+    second_idle = asyncio.Event()
+    original_transition = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        original_transition(child_store)
+        turns_used = child_store.agent_lifecycle()["turns_used"]
+        if turns_used == 2:
+            first_idle.set()
+        elif turns_used == 4:
+            second_idle.set()
+
+    async def suppress_immediate_reminder(*_args: object) -> bool:
+        return False
+
+    # test-contract: seam observes each exact idle transition without a sleep
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    # test-contract: seam isolates follow-up delivery from the unrelated reminder turn
+    monkeypatch.setattr(
+        run_consumer_module.IdleNudgeLifecycle,
+        "reserve_immediate_reminder",
+        suppress_immediate_reminder,
+    )
+    child_call = ToolCall(
+        "background-agent",
+        "agent",
+        {
+            "prompt": "work",
+            "description": "background",
+            "agent_type": "run",
+            "background": True,
+        },
+    )
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[child_call])],
+        {
+            "work": [
+                ScriptedTurn(
+                    tool_calls=[
+                        ToolCall("one", "todo", {"items": []}),
+                        ToolCall("two", "todo", {"items": []}),
+                    ]
+                ),
+                ScriptedTurn(content=[TextContent("waiting")]),
+                ScriptedTurn(
+                    tool_calls=[
+                        ToolCall("three", "todo", {"items": []}),
+                        ToolCall("four", "todo", {"items": []}),
+                    ]
+                ),
+                ScriptedTurn(content=[TextContent("waiting again")]),
+            ]
+        },
+        parent_prompt="start",
+        gated_child_prompts={"work"},
+        parent_waits_for_children=False,
+    )
+    parent_store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend, parent_store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    loop.explicit_finish = True
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(backend.child_started["work"].wait(), what="child start")
+        backend.release_children.set()
+        await await_or_fail(first_idle.wait(), what="first idle transition")
+        handle = next(iter(parent_store.agent_children()))
+        assert _read_agent_status(parent_store, requested_handle=handle)[0][
+            "tool_calls"
+        ] == 2
+
+        assert (
+            await send_to_run(
+                parent_store,
+                handle,
+                "follow up",
+                channel=loop._background_owner.conversation_channel,
+            )
+            is None
+        )
+        await await_or_fail(second_idle.wait(), what="second idle transition")
+        assert _read_agent_status(parent_store, requested_handle=handle)[0][
+            "tool_calls"
+        ] == 4
+    except BaseException as failure:
+        child_store = loop._agent_child_stores.get(child_call.id)
+        if child_store is not None:
+            failure.add_note(f"child lifecycle: {child_store.agent_lifecycle()!r}")
+            failure.add_note(f"child transcript tail: {child_store.replay()[-8:]!r}")
+        raise
+    finally:
+        backend.release_children.set()
         await loop.close()
