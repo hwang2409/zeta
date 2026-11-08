@@ -17,7 +17,14 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
-from zeta.server import ZetaServer
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
+from zeta.server import ZetaServer, ergonomics
 from zeta.server import connections as connection_module
 from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
@@ -53,6 +60,11 @@ ROWS = (
     "old_generation_failure",
     "observer_settlement",
     "observer_controller_absent",
+    "replay_only_backward_page",
+    "controller_reconnect_keeps_observer",
+    "approval_reconnect_rejoin",
+    "global_cap_self_eviction",
+    "stream_ended_unnegotiated",
 )
 
 
@@ -106,6 +118,44 @@ async def _assert_events(
     assert [event["stream_id"] for event in events] == [stream_id] * count
     assert [event["seq"] for event in events] == list(range(start, start + count))
     return events
+
+
+def _ended(frame: dict[str, Any], session_id: str, stream_id: str, reason: str) -> bool:
+    return frame.get("params") == {
+        "event": "replay_stream_ended",
+        "session_id": session_id,
+        "stream_id": stream_id,
+        "reason": reason,
+    }
+
+
+def _wire(frames: list[dict[str, Any]]) -> list[tuple[object, ...]]:
+    """Reduce wire frames to (event, stream_id, seq or reason) for exact comparison."""
+    return [
+        (
+            frame["params"]["event"],
+            frame["params"].get("stream_id"),
+            frame["params"].get("seq", frame["params"].get("reason")),
+        )
+        for frame in frames
+        if "params" in frame
+    ]
+
+
+def _watch_release(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """Set the returned event when the server releases the current controller connection."""
+    assert server.connections is not None
+    connection, released = server._client, asyncio.Event()
+    original = server.connections.release
+
+    def release(target: Any) -> None:
+        original(target)
+        if target is connection:
+            released.set()
+
+    # test-contract: seam observe the real connection release after its transport closes
+    monkeypatch.setattr(server.connections, "release", release)
+    return released
 
 
 async def _frames_before_status(client: ReplayClient, request_id: int) -> list[dict[str, Any]]:
@@ -246,12 +296,13 @@ async def _response_write_failure(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, client, session_id = await _started(tmp_path, transport)
+    owner = server._client
+    released = _watch_release(server, monkeypatch)
     failed = asyncio.Event()
-    fail_active = False
     original = _Client._write_physical
 
     async def fail_write(owner: _Client, payload: bytes) -> bool:
-        if b'"id":3' in payload or (fail_active and b'"seq":1' in payload):
+        if b'"id":3' in payload:
             failed.set()
             return False
         return await original(owner, payload)
@@ -261,23 +312,21 @@ async def _response_write_failure(
     try:
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(failed.wait(), what="join response write failure")
-        assert server.connections is not None and server._client is not None
-        assert server.connections.replay.stream_id(server._client) is None
-        assert not any(
-            item.replay_scope is not None
-            for item in server.connections._connections[server._client].output.queue
-        )
-        joined = await _join(client, session_id, 4)
-        failed.clear()
-        fail_active = True
-        await _publish(server, session_id)
-        await await_or_fail(failed.wait(), what="active replay write failure")
-        assert server.connections.replay.stream_id(server._client) is None
-        fail_active = False
-        fresh = await _join(client, session_id, 5)
-        assert fresh["result"]["replay"]["stream_id"] != joined["result"]["replay"]["stream_id"]
-        await _publish(server, session_id)
-        await _assert_events(client, fresh["result"]["replay"]["stream_id"], 1)
+        assert server.connections is not None
+        assert server.connections.replay.stream_id(owner) is None
+        state = server.connections._connections.get(owner)
+        assert state is None or not any(item.replay_scope is not None for item in state.output.queue)
+        frames = await client.closed(4)
+        assert not any(frame.get("params", {}).get("event") == "replay_stream_ended" for frame in frames)
+        await await_or_fail(released.wait(), what="failed connection released")
+        replacement = await connect_replay(server, transport)
+        try:
+            await negotiate(replacement, observer=True)
+            fresh = await _join(replacement, session_id, 5)
+            await _publish(server, session_id)
+            await _assert_events(replacement, fresh["result"]["replay"]["stream_id"], 1)
+        finally:
+            await replacement.close()
     finally:
         await client.close()
         await server.close()
@@ -288,6 +337,7 @@ async def _active_write_failure(
 ) -> None:
     server, client, session_id = await _started(tmp_path, transport)
     await _join(client, session_id)
+    owner = server._client
     failed = asyncio.Event()
     original = _Client._write_physical
 
@@ -302,8 +352,10 @@ async def _active_write_failure(
     try:
         await _publish(server, session_id)
         await await_or_fail(failed.wait(), what="active replay write failure")
-        assert server.connections is not None and server._client is not None
-        assert server.connections.replay.stream_id(server._client) is None
+        assert server.connections is not None
+        assert server.connections.replay.stream_id(owner) is None
+        frames = await client.closed(4)
+        assert all(frame["params"]["event"] != "replay_stream_ended" for frame in frames), "write failure sent an end event"
     finally:
         await client.close()
         await server.close()
@@ -350,12 +402,16 @@ async def _same_connection_rejoin(
             frame for frame in client.buffered
             if frame.get("params", {}).get("stream_id") == first_stream
         ]
-        assert [frame["params"]["seq"] for frame in old_frames] == [1]
+        assert _wire(old_frames) == [
+            ("turn_start", first_stream, 1),
+            ("replay_stream_ended", first_stream, "rejoined"),
+        ], "rejoin did not end the old stream with exactly one event"
+        assert _ended(old_frames[1], session_id, first_stream, "rejoined")
         client.buffered.clear()
         assert len(server.connections.replay._subscriptions) == 1
         assert not server.connections.replay._pending
         await _publish(server, session_id)
-        await _assert_events(client, second_stream, 1)
+        assert _wire(await _frames_before_status(client, 5)) == [("turn_start", second_stream, 1)]
     finally:
         release.set()
         await client.close()
@@ -425,12 +481,18 @@ async def _scope_cap(
         assert server.connections.replay.scope_for(server._client) is None
         assert unrelated in server.connections.replay.scopes()
         release.set()
-        first = await client.event("turn_start")
-        assert first["stream_id"] == joined["result"]["replay"]["stream_id"]
-        assert first["seq"] == 1
+        old_stream = joined["result"]["replay"]["stream_id"]
+        frames = await _frames_before_status(client, 6)
+        assert _wire(frames) == [
+            ("turn_start", old_stream, 1),
+            ("replay_stream_ended", old_stream, "evicted"),
+        ], "scope eviction did not end the stream with exactly one event"
+        assert _ended(frames[1], session_id, old_stream, "evicted")
         fresh = await _join(client, session_id, 4)
         await _publish(server, session_id)
-        await _assert_events(client, fresh["result"]["replay"]["stream_id"], 1)
+        assert _wire(await _frames_before_status(client, 7)) == [
+            ("turn_start", fresh["result"]["replay"]["stream_id"], 1)
+        ]
     finally:
         release.set()
         await client.close()
@@ -491,27 +553,36 @@ async def _active_admission_failure(
     server, client, session_id = await _started(tmp_path, transport)
     joined = await _join(client, session_id)
     assert server.connections is not None
-    original = server.connections._admit
+    original = server.connections._fits
     rejected = False
 
-    def reject_once(state: Any, frame: bytes) -> bool:
+    def reject_once(output: Any, size: int, frames: int = 1) -> bool:
         nonlocal rejected
-        if not rejected and b'"seq":1' in frame:
+        if not rejected:
             rejected = True
             return False
-        return original(state, frame)
+        return original(output, size, frames)
 
-    # test-contract: seam force output-owner admission to reject one active frame
-    monkeypatch.setattr(server.connections, "_admit", reject_once)
+    # test-contract: seam make the real output admission overflow on one active frame
+    monkeypatch.setattr(server.connections, "_fits", reject_once)
+    released = _watch_release(server, monkeypatch)
     try:
         await _publish(server, session_id)
         assert rejected
         assert not server.connections.replay._subscriptions
         assert server.connections.replay._records == 0
-        fresh = await _join(client, session_id, 4)
-        assert fresh["result"]["replay"]["stream_id"] != joined["result"]["replay"]["stream_id"]
-        await _publish(server, session_id)
-        await _assert_events(client, fresh["result"]["replay"]["stream_id"], 1)
+        frames = await client.closed(4)
+        assert [frame.get("error", {}).get("code") for frame in frames] == [-32011]
+        await await_or_fail(released.wait(), what="overflowed connection released")
+        replacement = await connect_replay(server, transport)
+        try:
+            await negotiate(replacement, observer=True)
+            fresh = await _join(replacement, session_id, 5)
+            assert fresh["result"]["replay"]["stream_id"] != joined["result"]["replay"]["stream_id"]
+            await _publish(server, session_id)
+            await _assert_events(replacement, fresh["result"]["replay"]["stream_id"], 1)
+        finally:
+            await replacement.close()
     finally:
         await client.close()
         await server.close()
@@ -561,7 +632,14 @@ async def _replacement(
         }
         await _publish(server, new_session)
         assert not server.connections.replay._subscriptions
-        assert await _frames_before_status(active, 7) == [], "ended observer stream still got events"
+        ended = await _frames_before_status(active, 7)
+        assert _wire(ended) == [("replay_stream_ended", old_stream, "session_replaced")], (
+            "session replacement did not end the observer stream with exactly one event"
+        )
+        assert _ended(ended[0], current_session, old_stream, "session_replaced")
+        await _publish(server, new_session)
+        assert await _frames_before_status(active, 8) == [], "ended observer stream still got events"
+        assert await _frames_before_status(pending, 9) == [], "pending join got an end event"
         fresh = await _join(active, new_session, 4)
         fresh_stream = fresh["result"]["replay"]["stream_id"]
         assert fresh_stream != old_stream
@@ -1017,6 +1095,217 @@ async def _observer_controller_absent(
         await server.close()
 
 
+async def _replay_only_backward_page(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    server, client, session_id = await _started(tmp_path, transport)
+    try:
+        for number in range(60):
+            server.runtime.opened.store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"message-{number}" + "x" * 100)]),
+                    MessageOrigin.USER,
+                )
+            )
+        newest = (await _join(client, session_id))["result"]
+        assert newest["next_before"] is not None
+        page = await client.request(
+            4,
+            "session_history",
+            {
+                "session_id": session_id,
+                "before": newest["next_before"],
+                "history_validator": newest["history_validator"],
+            },
+        )
+        assert "error" not in page, f"session_replay_seq alone cannot page back: {page}"
+
+        def numbers(rows: list[dict[str, Any]]) -> list[int]:
+            return [
+                int(row["content"][0]["text"].split("x", 1)[0].removeprefix("message-"))
+                for row in rows
+                if row["role"] == "user"
+            ]
+
+        older, recent = numbers(page["result"]["messages"]), numbers(newest["messages"])
+        assert older and recent and max(older) < min(recent)
+    finally:
+        await client.close()
+        await server.close()
+
+
+async def _observer_with_stream(
+    server: ZetaServer, transport: Transport, session_id: str
+) -> tuple[ReplayClient, str]:
+    observer = await connect_replay(server, transport)
+    await negotiate(observer, observer=True)
+    return observer, (await _join(observer, session_id, 30))["result"]["replay"]["stream_id"]
+
+
+async def _controller_reconnect_keeps_observer(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, controller, session_id = await _started(tmp_path, transport)
+    observer, stream_id = await _observer_with_stream(server, transport, session_id)
+    assert server.connections is not None
+    released = asyncio.Event()
+    original_release = server.connections.release
+
+    def release(connection: Any) -> None:
+        original_release(connection)
+        released.set()
+
+    # test-contract: seam observe the real controller release after its transport closes
+    monkeypatch.setattr(server.connections, "release", release)
+    replacement: ReplayClient | None = None
+    try:
+        await _publish(server, session_id)
+        assert _wire(await _frames_before_status(observer, 31)) == [("turn_start", stream_id, 1)]
+        await controller.close()
+        await await_or_fail(released.wait(), what="controller released")
+        replacement = await connect_replay(server, transport)
+        await negotiate(replacement)
+        await _publish(server, session_id)
+        assert _wire(await _frames_before_status(observer, 32)) == [("turn_start", stream_id, 2)], (
+            "a controller disconnect ended the observer stream"
+        )
+        plain = await replacement.event("turn_start")
+        assert "stream_id" not in plain and "seq" not in plain
+    finally:
+        if replacement is not None:
+            await replacement.close()
+        await observer.close()
+        await server.close()
+
+
+async def _approval_reconnect_rejoin(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    controller = await connect_replay(server, transport)
+    await negotiate(controller, extra=("approval_reconnect",))
+    created = await controller.request(2, "new_session", {"provider": "codex"})
+    session_id = created["result"]["session"]["session_id"]
+    observer, observer_stream = await _observer_with_stream(server, transport, session_id)
+    controller_stream = (await _join(controller, session_id))["result"]["replay"]["stream_id"]
+    assert server.connections is not None and server._client is not None
+    old_controller = server._client
+    entered, released = asyncio.Event(), asyncio.Event()
+    original_write = _Client._write_physical
+    original_release = server.connections.release
+
+    async def hold_controller(owner: _Client, payload: bytes) -> bool:
+        if owner is old_controller and controller_stream.encode() in payload:
+            entered.set()
+            await asyncio.Event().wait()
+        return await original_write(owner, payload)
+
+    def release(connection: Any) -> None:
+        original_release(connection)
+        if connection is old_controller:
+            released.set()
+
+    # test-contract: seam keep the old controller's replay frames in flight and queued at its close
+    monkeypatch.setattr(_Client, "_write_physical", hold_controller)
+    monkeypatch.setattr(server.connections, "release", release)
+    replacement: ReplayClient | None = None
+    try:
+        await _publish(server, session_id, 2)
+        await await_or_fail(entered.wait(), what="old controller frame in flight")
+        await controller.close()
+        await await_or_fail(released.wait(), what="old controller released")
+        assert server.connections.replay.stream_id(old_controller) is None
+        replacement = await connect_replay(server, transport)
+        await negotiate(replacement, extra=("approval_reconnect",))
+        await _publish(server, session_id)
+        assert _wire(await _frames_before_status(observer, 31)) == [
+            ("turn_start", observer_stream, 1),
+            ("turn_start", observer_stream, 2),
+            ("turn_start", observer_stream, 3),
+        ], "an approval_reconnect reconnect ended the observer stream"
+        assert server.connections.replay._records == 0, "released controller frames leaked replay charges"
+        plain = await replacement.event("turn_start")
+        assert "stream_id" not in plain and "seq" not in plain
+        fresh = (await _join(replacement, session_id, 4))["result"]["replay"]["stream_id"]
+        assert fresh != controller_stream
+        await _publish(server, session_id)
+        assert _wire(await _frames_before_status(replacement, 5)) == [("turn_start", fresh, 1)]
+    finally:
+        if replacement is not None:
+            await replacement.close()
+        await observer.close()
+        await server.close()
+
+
+async def _global_cap_self_eviction(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, client, session_id = await _started(tmp_path, transport)
+    stream_id = (await _join(client, session_id))["result"]["replay"]["stream_id"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_write = _Client._write_physical
+
+    async def gated(owner: _Client, payload: bytes) -> bool:
+        if b'"seq":1' in payload and not entered.is_set():
+            entered.set()
+            await await_or_fail(release.wait(), what="release global-cap frame")
+        return await original_write(owner, payload)
+
+    # test-contract: seam retain real wire frames until the global limit is crossed
+    monkeypatch.setattr(_Client, "_write_physical", gated)
+    monkeypatch.setattr("zeta.server.session_replay.REPLAY_MAX_RECORDS", 2)
+    try:
+        await _publish(server, session_id)
+        await await_or_fail(entered.wait(), what="first global-cap frame")
+        await _publish(server, session_id, 2)
+        release.set()
+        frames = await _frames_before_status(client, 4)
+        assert _wire(frames) == [
+            ("turn_start", stream_id, 1),
+            ("replay_stream_ended", stream_id, "evicted"),
+        ], "global eviction did not end the stream with exactly one event"
+        assert _ended(frames[1], session_id, stream_id, "evicted")
+        await _publish(server, session_id)
+        assert _wire(await _frames_before_status(client, 5)) == [("turn_start", None, None)]
+    finally:
+        release.set()
+        await client.close()
+        await server.close()
+
+
+async def _stream_ended_unnegotiated(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del monkeypatch
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    controller = await connect_replay(server, transport)
+    plain = await connect_replay(server, transport)
+    observer: ReplayClient | None = None
+    try:
+        await negotiate(controller, replay=False)
+        await negotiate(plain, replay=False, observer=True)
+        created = await controller.request(2, "new_session", {"provider": "codex"})
+        old_session = created["result"]["session"]["session_id"]
+        observer, stream_id = await _observer_with_stream(server, transport, old_session)
+        await controller.request(3, "new_session", {"provider": "codex"})
+        ended = await _frames_before_status(observer, 31)
+        assert _wire(ended) == [("replay_stream_ended", stream_id, "session_replaced")]
+        assert _ended(ended[0], old_session, stream_id, "session_replaced")
+        assert all(
+            frame.get("params", {}).get("event") != "replay_stream_ended"
+            for frame in [*await _frames_before_status(controller, 4), *await _frames_before_status(plain, 5)]
+        ), "a connection without session_replay_seq got replay_stream_ended"
+    finally:
+        if observer is not None:
+            await observer.close()
+        await plain.close()
+        await controller.close()
+        await server.close()
+
+
 async def _not_implemented(tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch) -> None:
     del tmp_path, transport, monkeypatch
     pytest.fail("table row has not been implemented")
@@ -1053,6 +1342,11 @@ SCENARIOS.update(
     old_generation_failure=_old_generation_failure,
     observer_settlement=_observer_settlement,
     observer_controller_absent=_observer_controller_absent,
+    replay_only_backward_page=_replay_only_backward_page,
+    controller_reconnect_keeps_observer=_controller_reconnect_keeps_observer,
+    approval_reconnect_rejoin=_approval_reconnect_rejoin,
+    global_cap_self_eviction=_global_cap_self_eviction,
+    stream_ended_unnegotiated=_stream_ended_unnegotiated,
 )
 
 

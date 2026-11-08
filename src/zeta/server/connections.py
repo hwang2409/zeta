@@ -18,7 +18,7 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
-from .session_replay import SessionReplay
+from .session_replay import SessionReplay, history_features
 from .session_replay.output import ReplayOutput, _OutputFrame
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
@@ -254,7 +254,9 @@ class ConnectionRegistry(ReplayOutput):
         required_feature: str | None,
         fields: dict[str, object],
     ) -> bool:
-        if required_feature is not None and required_feature not in state.features:
+        if required_feature is not None and required_feature not in history_features(
+            state.features
+        ):
             return True
         return (
             event is EventDescriptor.APPROVAL_END
@@ -789,7 +791,7 @@ class ConnectionRegistry(ReplayOutput):
         self, connection: Any, method: str, params: dict[str, Any]
     ) -> object:
         target = capture_read(connection, method, params)
-        features = self._connections[connection].features
+        features = history_features(self._connections[connection].features)
         include_delivery_id = {
             "delivery_id",
             "user_message_event",
@@ -919,16 +921,17 @@ class ConnectionRegistry(ReplayOutput):
         target = capture_read(
             connection, method, params, fallback_config=fallback_config
         )
+        features = history_features(state.features)
         result = await self.run_read(
             connection,
             lambda: perform_read(
                 method,
                 target,
                 params,
-                backward_enabled="session_history_backward" in state.features,
-                fidelity="session_history_fidelity" in state.features,
-                content_read="content_read" in state.features,
-                served_turn_end="served_turn_end" in state.features,
+                backward_enabled="session_history_backward" in features,
+                fidelity="session_history_fidelity" in features,
+                content_read="content_read" in features,
+                served_turn_end="served_turn_end" in features,
             ),
             session_id=target[0],
         )

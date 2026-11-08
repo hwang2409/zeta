@@ -209,6 +209,7 @@ class EventDescriptor(StrEnum):
     USAGE = "usage"
     USER_MESSAGE = "user_message"
     SESSION_GRANTS_CHANGED = "session_grants_changed"
+    REPLAY_STREAM_ENDED = "replay_stream_ended"
 
 
 PROTOCOL_VERSION = "1.2"

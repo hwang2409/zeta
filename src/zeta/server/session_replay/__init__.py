@@ -11,6 +11,14 @@ REPLAY_MAX_RECORDS = 256
 REPLAY_MAX_BYTES = 4 * 1024 * 1024
 REPLAY_SCOPE_MAX_RECORDS = 64
 REPLAY_SCOPE_MAX_BYTES = 1 * 1024 * 1024
+REPLAY_IMPLIED_FEATURES = frozenset({"session_history_fidelity", "session_history_backward"})
+
+
+def history_features(features: frozenset[str] | set[str]) -> frozenset[str]:
+    """Return the features a connection's history reads and live filters honor."""
+    if "session_replay_seq" in features:
+        return frozenset(features) | REPLAY_IMPLIED_FEATURES
+    return frozenset(features)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +108,7 @@ class SessionReplay:
         subscription = self._subscriptions.get(connection)
         return None if subscription is None else subscription.stream_id
 
-    def _drop_scope(self, scope: ReplayScopeId) -> None:
+    def _drop_scope(self, scope: ReplayScopeId) -> list[tuple[Any, _Subscription]]:
         current = self._scopes.pop(scope, None)
         if current is not None:
             self._records -= current.records
@@ -110,13 +118,19 @@ class SessionReplay:
                 pending.stale = True
                 self._pending.pop(connection, None)
                 self._next_sequences.pop(connection, None)
-        for connection, subscription in tuple(self._subscriptions.items()):
-            if subscription.scope == scope:
-                self._subscriptions.pop(connection, None)
-                self._next_sequences.pop(connection, None)
+        ended = [
+            (connection, subscription)
+            for connection, subscription in self._subscriptions.items()
+            if subscription.scope == scope
+        ]
+        for connection, _ in ended:
+            self._subscriptions.pop(connection, None)
+            self._next_sequences.pop(connection, None)
+        return ended
 
-    def invalidate_scope(self, scope: ReplayScopeId) -> None:
-        self._drop_scope(scope)
+    def invalidate_scope(self, scope: ReplayScopeId) -> list[tuple[Any, _Subscription]]:
+        """End every stream of one scope; return the active streams that ended."""
+        return self._drop_scope(scope)
 
     def _largest_scope(self) -> ReplayScopeId | None:
         if not self._scopes:
@@ -236,11 +250,12 @@ class SessionReplay:
         if owner.records <= 0:
             self._scopes.pop(scope, None)
 
-    def connection_closed(self, connection: Any) -> None:
+    def connection_closed(self, connection: Any) -> _Subscription | None:
+        """End one connection's streams; return its active stream if one ended."""
         pending = self._pending.pop(connection, None)
-        self._subscriptions.pop(connection, None)
+        ended = self._subscriptions.pop(connection, None)
         self._next_sequences.pop(connection, None)
-        if pending is None:
-            return
-        for _, fields in pending.frames:
-            self.release(fields["_replay_scope"], fields["_replay_size"])
+        if pending is not None:
+            for _, fields in pending.frames:
+                self.release(fields["_replay_scope"], fields["_replay_size"])
+        return ended

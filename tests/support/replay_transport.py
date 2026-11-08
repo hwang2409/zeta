@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import secrets
@@ -47,11 +48,21 @@ class ReplayClient:
         return await self._read_wire()
 
     async def _read_wire(self) -> dict[str, Any]:
-        if not self.websocket:
-            line = await await_or_fail(self.reader.readline(), what="unix replay frame")
-            assert line, "server closed unix replay connection"
-            return json.loads(line)
-        first, second = await await_or_fail(self.reader.readexactly(2), what="websocket replay header")
+        frame = await self._read_or_eof()
+        assert frame is not None, "server closed replay connection"
+        return frame
+
+    async def _read_or_eof(self) -> dict[str, Any] | None:
+        # a write to a connection the server closed surfaces on the next read
+        try:
+            if not self.websocket:
+                line = await await_or_fail(self.reader.readline(), what="unix replay frame")
+                return json.loads(line) if line else None
+            first, second = await await_or_fail(self.reader.readexactly(2), what="websocket replay header")
+        except (asyncio.IncompleteReadError, ConnectionError):
+            return None
+        if first & 0x0F == 8:
+            return None
         assert first & 0x0F == 1 and second & 0x80 == 0
         size = second & 0x7F
         if size == 126:
@@ -59,6 +70,17 @@ class ReplayClient:
         elif size == 127:
             size = int.from_bytes(await self.reader.readexactly(8), "big")
         return json.loads(await self.reader.readexactly(size))
+
+    async def closed(self, request_id: int) -> list[dict[str, Any]]:
+        """Send status; return the frames before the server closed, failing if it answers."""
+        with contextlib.suppress(ConnectionError):
+            await self.send(request_id, "status", {})
+        frames = list(self.buffered)
+        self.buffered.clear()
+        while (frame := await self._read_or_eof()) is not None:
+            assert frame.get("id") != request_id, "failed connection stayed open"
+            frames.append(frame)
+        return frames
 
     async def response(self, request_id: int) -> dict[str, Any]:
         skipped: list[dict[str, Any]] = []
@@ -89,7 +111,9 @@ class ReplayClient:
 
     async def close(self) -> None:
         self.writer.close()
-        await self.writer.wait_closed()
+        # a connection the server closed reports its unsent bytes here
+        with contextlib.suppress(ConnectionError):
+            await self.writer.wait_closed()
 
 
 async def connect_replay(server: ZetaServer, transport: Transport) -> ReplayClient:
@@ -142,8 +166,10 @@ def replay_server(home: Path, transport: Transport, backend_factory: Any) -> Zet
     return ZetaServer(**options)
 
 
-async def negotiate(client: ReplayClient, *, replay: bool = True, observer: bool = False) -> dict[str, Any]:
-    features = (["serve_observers"] if observer else []) + (["session_replay_seq"] if replay else [])
+async def negotiate(
+    client: ReplayClient, *, replay: bool = True, observer: bool = False, extra: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    features = (["serve_observers"] if observer else []) + (["session_replay_seq"] if replay else []) + list(extra)
     params: dict[str, object] = {"protocol_version": "1.1", "features": features}
     if observer:
         params["role"] = "observer"

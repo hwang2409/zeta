@@ -322,8 +322,6 @@ class ServeControl:
         await self._controller_release(reconnect)
 
     def _controller_release(self, reconnect: bool) -> Awaitable[None]:
-        if self.server.connections is not None:
-            self.server.connections.replay_session_replaced()
         self._active_host_commands = None
         if reconnect and self._grace_task is not None:
 

@@ -9,7 +9,7 @@ from typing import Any
 
 from .. import ergonomics
 from ..protocol import EventDescriptor, _Frame
-from . import ReplayScopeId
+from . import ReplayScopeId, _Subscription, history_features
 
 
 @dataclass
@@ -37,25 +37,56 @@ class ReplayOutput:
                 self._publish_replay(observer, event, session_id, fields)
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        self.invalidate_replay_connection(connection)
+        self.invalidate_replay_connection(connection, reason="rejoined")
         self.replay.begin_join(connection, scope)
 
     def invalidate_replay_connection(
-        self, connection: Any, stream_id: str | None = None
+        self,
+        connection: Any,
+        stream_id: str | None = None,
+        *,
+        reason: str | None = None,
     ) -> None:
-        """End one connection's replay stream; with stream_id, only that generation."""
+        """End one connection's replay stream; with stream_id, only that generation.
+
+        Without a reason the connection is closing or failed, so it gets no end event.
+        """
         if stream_id is not None and self.replay.stream_id(connection) != stream_id:
             return
-        self.replay.connection_closed(connection)
+        ended = self.replay.connection_closed(connection)
         self._discard_connection_replay(connection)
+        if ended is not None and reason is not None:
+            self._send_stream_ended(connection, ended, reason)
 
-    def invalidate_replay_scope(self, scope: ReplayScopeId) -> None:
-        self.replay.invalidate_scope(scope)
+    def invalidate_replay_scope(self, scope: ReplayScopeId, reason: str) -> None:
+        ended = self.replay.invalidate_scope(scope)
         self._discard_replay_scope(scope)
+        for connection, subscription in ended:
+            self._send_stream_ended(connection, subscription, reason)
+
+    def _send_stream_ended(
+        self, connection: Any, ended: _Subscription, reason: str
+    ) -> None:
+        """The one place an active stream's end is announced, once per stream_id.
+
+        Callers discard the stream's queued frames first, so the event follows every
+        frame already written or in flight and precedes any later frame.
+        """
+        state = self._connections.get(connection)
+        if state is None:
+            return
+        frame = connection.codec.notification(
+            EventDescriptor.REPLAY_STREAM_ENDED,
+            ended.scope.value,
+            stream_id=ended.stream_id,
+            reason=reason,
+        )
+        if frame is not None:
+            self._publish_observer(state, frame)
 
     def replay_session_replaced(self) -> None:
         for scope in self.replay.scopes():
-            self.invalidate_replay_scope(scope)
+            self.invalidate_replay_scope(scope, "session_replaced")
 
     def _discard_connection_replay(self, connection: Any) -> None:
         state = self._connections.get(connection)
@@ -105,7 +136,7 @@ class ReplayOutput:
         if frame is None:
             return False
         while (victim := self.replay.reserve(scope, len(frame))) is not None:
-            self.invalidate_replay_scope(victim)
+            self.invalidate_replay_scope(victim, "evicted")
             prepared = self.replay.prepare(state.connection, scope)
             if prepared is None:
                 return True
@@ -188,8 +219,12 @@ class ReplayOutput:
             self._finish_caller(output)
 
     def _fail_replay_frame(self, state: Any, item: _OutputFrame) -> None:
-        if item.replay_stream_id is not None:
-            self.invalidate_replay_connection(state.connection, item.replay_stream_id)
+        stream_id = item.replay_stream_id
+        if stream_id is None or self.replay.stream_id(state.connection) != stream_id:
+            return
+        # fail closed: a failed connection cannot reliably get an end event; it rejoins
+        self.invalidate_replay_connection(state.connection)
+        state.connection.writer.close()
 
     async def read_replay_history(
         self, connection: Any, session_id: str
@@ -197,7 +232,7 @@ class ReplayOutput:
         """Read the newest history page of the pinned active store off-loop."""
         store = ergonomics.active(connection.server.runtime, {"session_id": session_id})
         pinned = SimpleNamespace(opened=SimpleNamespace(store=store))
-        features = self._connections[connection].features
+        features = history_features(self._connections[connection].features)
         result = await self.run_read(
             connection,
             lambda: ergonomics.history(
@@ -206,8 +241,8 @@ class ReplayOutput:
                 include_delivery_id={
                     "delivery_id", "user_message_event", "user_message_delivery_id"
                 } <= features,
-                backward_enabled=True,
-                fidelity=True,
+                backward_enabled="session_history_backward" in features,
+                fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
             ),

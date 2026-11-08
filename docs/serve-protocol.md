@@ -1175,6 +1175,7 @@ Event fields are:
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
+| `replay_stream_ended` (feature `session_replay_seq`) | `event`, `session_id: string`, `stream_id: string`, `reason: "session_replaced"|"evicted"|"rejoined"` | none; never carries `seq` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. It is an informational notice that a retry is
@@ -1312,14 +1313,28 @@ error code and message. Provider status and origin remain internal.
   `replay: {"stream_id": "...", "history_seq": 0}`. Events admitted after the
   join carry that opaque stream id and monotonically increasing `seq`, starting
   at 1. The result has the same shape as `session_history` with `before: null`
-  (`messages`, `next_before`, `history_validator`). Observers receive controller
-  session events only through a successful join. Session replacement, controller
-  handoff, replay pressure, or a failed write or admission on the connection
-  ends its stream. A join that is still pending returns `-32009` with data code
-  `stale_event_sequence`. An active stream ends silently: later controller events
-  carry no `stream_id` or `seq`, and observers receive none. The client must send
-  a new join. A second join on the same connection, even a rejected one, ends
-  the old stream.
+  (`messages`, `next_before`, `history_validator`). Negotiating
+  `session_replay_seq` also gives the connection the semantics of
+  `session_history_fidelity` and `session_history_backward`, for the join result,
+  later `session_history` pages, and the `delivery_status` live filter. Observers
+  receive controller session events only through a successful join.
+  A stream ends only on session replacement, replay pressure, a second join on
+  the same connection (even a rejected one), a failed write or admission on the
+  connection, or the connection's close. Observers' streams are not ended by a
+  controller disconnect; a controller's own stream ends with its connection, and a
+  reconnecting controller must join again.
+  A join that is still pending when its stream ends returns `-32009` with data
+  code `stale_event_sequence` and gets no event. An active stream that ends on a
+  live connection gets exactly one `replay_stream_ended` event with that
+  `stream_id` and a `reason` from the closed set `session_replaced`, `evicted`,
+  `rejoined`; a client treats any other reason as "rejoin". The event has no
+  `seq`, is sent at most once per `stream_id`, follows every frame of that stream
+  already on the wire, and precedes any later frame; queued frames of the ended
+  stream are discarded. After it, no frame carries that `stream_id`, and later
+  controller events carry no `stream_id` or `seq`. A failed write or admission
+  closes the connection instead (no event); the client reconnects and joins.
+  Connections without `session_replay_seq` never receive the event. In every
+  case the client sends a new join.
   The server retains at most 64 records/1 MiB per scope and 256 records/4 MiB
   globally, evicting the largest scope first. Older pages continue to use
   `session_history` and do not change the live stream.
@@ -1602,7 +1617,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
-| `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, and visible live events include `stream_id` and `seq` |
+| `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity` and `session_history_backward` for history reads |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 
