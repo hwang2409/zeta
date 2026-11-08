@@ -888,6 +888,34 @@ def test_other_background_notices_remain_visible() -> None:
     assert [item.plain for item in rendered] == ["background task task-1 killed"]
 
 
+@pytest.mark.asyncio
+async def test_status_renders_unavailable_accounts_through_tui(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.account_context = SimpleNamespace(unavailable_accounts=("codex:missing",))
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        rendered = await app._slash_commands.dispatch_async(app, "/status")
+        assert isinstance(rendered, str)
+        app._handle_slash_output(rendered)
+
+        assert "unavailable_accounts: codex:missing" in output.getvalue()
+    finally:
+        await loop.close()
+        loop.store.close()
+
+
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(
@@ -6460,6 +6488,9 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         "".join(text for _style, text in line)
         for line in tui_app_module._status_card_lines(status)
     )
+
+    assert "unavailable_accounts: none\n" in rendered
+    rendered = rendered.replace("unavailable_accounts: none\n", "")
 
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
@@ -13898,6 +13929,44 @@ async def test_tui_model_command_does_no_lock_work_on_loop(
 
 
 @pytest.mark.asyncio
+async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    missing = AccountId("codex", "missing")
+    for account in (current, missing):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    AccountStore(home).credential_path(missing).unlink()
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=80).print(rendered[0])
+        assert (
+            "codex:missing  unavailable: credentials missing"
+            in Text.from_ansi(output.getvalue()).plain
+        )
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -13952,9 +14021,9 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     app.accounts_picker_move(1)
     task = app.accounts_picker_select()
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
-    assert off_loop_calls == ["list"]
+    assert off_loop_calls == ["list", "list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
@@ -14704,6 +14773,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
         {"codex": account},
         {account: "henry@example.com"},
         {account: "henry"},
+        unavailable={account},
     )
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(picker.render())
@@ -14711,6 +14781,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
 
     assert "codex:henry" in plain
     assert "henry@example.com" in plain
+    assert "unavailable: credentials missing" in plain
     assert "n rename" in plain
 
 

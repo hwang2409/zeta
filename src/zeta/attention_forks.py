@@ -32,6 +32,7 @@ from .runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
 )
+from .storage_format import reject_unknown_keys
 
 ATTENTION_FORK_POLICY = ToolPolicy.create(
     (
@@ -73,7 +74,10 @@ def read_attention_fork(
             value = read_bounded_session_json(directory_fd, "attention_fork.json")
     except FileNotFoundError:
         return None
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict):
+        raise TypeError("invalid attention fork metadata")
+    reject_unknown_keys(value, "attention_fork_meta")
+    if set(value) != {
         "forked_from_session",
         "forked_at_entry",
         "attention_id",
