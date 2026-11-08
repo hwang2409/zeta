@@ -23,6 +23,14 @@ def _notice(family: str, reason: str) -> None:
     print(f"::notice::skipped {family}: {reason}")
 
 
+def _missing_api(family: str, owner: object, names: tuple[str, ...]) -> bool:
+    missing = [name for name in names if not callable(getattr(owner, name, None))]
+    if not missing:
+        return False
+    _notice(family, f"missing public API: {', '.join(missing)}")
+    return True
+
+
 def _message_texts(store: object) -> list[str]:
     return [
         part.text
@@ -46,6 +54,13 @@ def _session(home: Path, stage: str) -> dict[str, object] | None:
         _notice("session transcript and metadata", str(exc))
         return None
 
+    family = "session transcript and metadata"
+    if _missing_api(
+        family,
+        SessionManager,
+        ("create", "list_sessions_read_only", "open", "record_name"),
+    ):
+        return None
     manager = SessionManager(home, user_home=home)
     if stage == "predecessor":
         opened = manager.create(
@@ -111,6 +126,13 @@ def _projects(home: Path, stage: str) -> dict[str, object] | None:
         _notice("project memory and inbox", str(exc))
         return None
 
+    family = "project memory and inbox"
+    if _missing_api(
+        family,
+        ProjectRegistry,
+        ("create_project", "list_projects", "load_memory", "update_memory"),
+    ) or _missing_api(family, ProjectInbox, ("send", "read")):
+        return None
     registry = ProjectRegistry(home / "projects")
     if stage == "predecessor":
         sender = registry.create_project("format-sender", "compatibility sender")
@@ -170,7 +192,10 @@ def _accounts(home: Path, stage: str) -> dict[str, object] | None:
     account = AccountId("codex", "compatibility")
     credential = credential_store("codex", home=home, account=account)
     if credential is None:
-        raise RuntimeError("codex account credential store is unavailable")
+        _notice("accounts metadata", "codex account credential store is unavailable")
+        return None
+    if _missing_api("accounts metadata", credential, ("read", "save")):
+        return None
     expected = {
         "predecessor": None,
         "candidate": "fake-predecessor-access",
@@ -193,6 +218,9 @@ def _mcp(home: Path, stage: str) -> dict[str, object] | None:
         from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken
     except (ImportError, AttributeError) as exc:
         _notice("mcp token store", str(exc))
+        return None
+
+    if _missing_api("mcp token store", MCPCredentialStore, ("load", "save_login")):
         return None
 
     async def operate() -> dict[str, object]:
