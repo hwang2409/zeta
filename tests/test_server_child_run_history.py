@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -128,5 +129,25 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
         )[-1]["result"]
         assert continuation["messages"][0]["content"][0]["text"] == "message-0"
         assert continuation["messages"][-1]["content"][0]["text"] == "message-64"
+        child_path = server.runtime.opened.store.session_dir / "agents" / "1"
+        rows = (child_path / "conversation.jsonl").read_text().splitlines(True)
+        replacement = child_path / "conversation.replacement"
+        replacement.write_text("".join(rows[:-1]))
+        os.replace(replacement, child_path / "conversation.jsonl")
+        stale = (
+            await request(
+                reader,
+                writer,
+                5,
+                "child_run_history",
+                {
+                    "session_id": session_id,
+                    "run_id": f"{session_id}:1",
+                    "before": 65,
+                    "history_validator": newest["history_validator"],
+                },
+            )
+        )[-1]
+        assert stale["error"]["code"] == -32009
     finally:
         await close_serve(server, writer)

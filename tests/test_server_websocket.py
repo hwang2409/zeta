@@ -720,3 +720,4 @@ async def test_websocket_child_history_requires_negotiation(tmp_path: Path) -> N
         assert (await _read_json(reader))["error"]["code"] == -32601
     finally:
         await close_serve(server, writer)
+
