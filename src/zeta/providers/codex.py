@@ -101,7 +101,6 @@ class _BlockState:
     kind: str
     state: str = "active"
     text: str = ""
-    arguments: str = ""
     text_done: bool = False
 
 
