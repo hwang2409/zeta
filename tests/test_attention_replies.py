@@ -788,3 +788,49 @@ def test_attention_replies_public_table(
     )
     assert resolved.status == "resolved" and resolved.decision is None
     assert fixture.inbox_messages() == []
+
+
+
+_RELAY_PREAMBLE = (
+    "User relayed from session {sender}. "
+    "Check whether the situation has changed before acting."
+)
+
+
+def _section(record: AttentionRecord, value: str) -> str:
+    return (
+        f"Question: {record.title} (id {record.id}, asked {record.created_at})\n"
+        f"Decision: {value}"
+    )
+
+
+def test_batch_reply_message_names_each_question(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, count=2)
+    values = _stage_all(fixture, ["yes", "no"])
+    fixture.replies.flush(fixture.answerer_session_id)
+    [message] = fixture.inbox_messages()
+    # sections follow the journal order, which sorts by item id
+    ordered = sorted(
+        zip(fixture.records, values, strict=True), key=lambda pair: pair[0].id
+    )
+    assert message["body"] == "\n\n".join(
+        [
+            _RELAY_PREAMBLE.format(sender=fixture.answerer_session_id),
+            *(_section(record, value) for record, value in ordered),
+        ]
+    )
+    assert message["title"] == "Decision batch (2)"
+
+
+def test_single_reply_message_names_its_question(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, count=1)
+    [record] = fixture.records
+    fixture.replies.stage(record.id, "Use SQLite.")
+    fixture.replies.flush(fixture.answerer_session_id)
+    [message] = fixture.inbox_messages()
+    assert message["body"] == (
+        _RELAY_PREAMBLE.format(sender=fixture.answerer_session_id)
+        + "\n\n"
+        + _section(record, "Use SQLite.")
+    )
+    assert message["title"] == f"Decision: {record.title}"

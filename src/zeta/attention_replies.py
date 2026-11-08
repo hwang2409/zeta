@@ -538,10 +538,10 @@ class AttentionReplies:
         sender = (journal / ".sender").read_text(encoding="utf-8")
         first = records[0]
         label = "Decision" if first.kind == "decision" else "Reply"
-        sections = []
-        for record, (_, reply) in zip(records, pairs):
-            item_label = "Decision" if record.kind == "decision" else "Reply"
-            sections.append(f"{item_label}: {reply}")
+        sections = [
+            _reply_section(record, reply)
+            for record, (_, reply) in zip(records, pairs)
+        ]
         inbox = ProjectInbox(
             state.registry,
             sessions_root=self.home / "sessions",
@@ -555,8 +555,8 @@ class AttentionReplies:
             title=f"{label}: {first.title}"
             if len(records) == 1
             else f"{label} batch ({len(records)})",
-            body=f"User relayed from session {sender}. Check whether the situation has changed before acting.\\n\\n"
-            + "\\n\\n".join(sections),
+            body=f"User relayed from session {sender}. Check whether the situation has changed before acting.\n\n"
+            + "\n\n".join(sections),
             message_id=self._message_id(pairs),
             on_visible=self.on_inbox_visible,
         )
@@ -580,6 +580,14 @@ class AttentionReplies:
         for child in path.iterdir():
             child.unlink()
         path.rmdir()
+
+
+def _reply_section(record: AttentionRecord, reply: str) -> str:
+    label = "Decision" if record.kind == "decision" else "Reply"
+    return (
+        f"Question: {record.title} (id {record.id}, asked {record.created_at})\n"
+        f"{label}: {reply}"
+    )
 
 
 def _now() -> str:
