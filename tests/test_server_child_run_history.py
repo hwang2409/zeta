@@ -176,3 +176,35 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
         assert stale["error"]["code"] == -32009
     finally:
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_reads_closed_child_after_serve_restart(tmp_path: Path) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1", started_at="2026-01-01T00:00:00+00:00", depth=1,
+        agent_type="worker", description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("after-restart")]))
+    child.close()
+    await close_serve(server, writer)
+    resumed = ZetaServer(
+        provider="codex", home=tmp_path, socket_path=short_socket_path(tmp_path), approval_reconnect_grace=0
+    )
+    await resumed.runtime.resume_session(session_id)
+    await resumed.start()
+    new_reader, new_writer = await asyncio.open_unix_connection(str(resumed.socket_path))
+    try:
+        await request(new_reader, new_writer, 1, "hello", {"protocol_version": "1.2", "features": ["child_run_history"]})
+        reply = (await request(new_reader, new_writer, 2, "child_run_history", {"session_id": session_id, "run_id": f"{session_id}:1"}))[-1]
+        assert reply["result"]["messages"][0]["content"][0]["text"] == "after-restart"
+        page = reply["result"]
+        continuation = (await request(new_reader, new_writer, 3, "child_run_history", {"session_id": session_id, "run_id": f"{session_id}:1", "before": 0, "history_validator": page["history_validator"]}))[-1]
+        assert continuation["result"]["messages"] == []
+    finally:
+        await close_serve(resumed, new_writer)
