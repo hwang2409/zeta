@@ -20,6 +20,7 @@ from zeta.protocol.types import MESSAGE_ORIGIN_METADATA
 MAX_DIAGNOSTIC_CHARS = 240
 MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ROW_BYTES = 32 * 1024 * 1024
+PREFIX_DIGEST_BYTES = 64 * 1024
 _SAFE_ARGUMENTS = ("command", "path", "url", "query", "name", "cwd")
 
 
@@ -35,6 +36,7 @@ class _Cursor:
     incremental_ready: bool
     last_entry_id: str | None
     active_tail: tuple[dict[str, Any], ...]
+    prefix_digest: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,7 @@ class _ReadResult:
     last_entry_id: str | None
     full: bool
     bytes_read: int
+    prefix_digest: str
 
 
 def _bounded_text(value: str, max_chars: int) -> str:
@@ -169,6 +172,7 @@ def _read_transcript(
         unchanged = (
             cursor is not None
             and cursor.incremental_ready
+            and cursor.prefix_digest is not None
             and _source_identity(info) == _cursor_identity(cursor)
         )
         verified = (
@@ -177,7 +181,13 @@ def _read_transcript(
             and append_receipts is not None
             and _receipts_extend_cursor(fd, info, cursor, append_receipts)
         )
-        full = cursor is None or not (unchanged or verified)
+        prefix_verified = (
+            cursor is not None
+            and cursor.incremental_ready
+            and _prefix_extends_cursor(fd, info, cursor)
+        )
+        full = cursor is None or not (unchanged or verified or prefix_verified)
+        prefix_digest = _prefix_digest(fd, info.st_size)
         offset = 0 if full else cursor.byte_offset
         os.lseek(fd, offset, os.SEEK_SET)
         rows: list[dict[str, Any]] = []
@@ -231,6 +241,7 @@ def _read_transcript(
             last_entry_id,
             full,
             bytes_read,
+            prefix_digest,
         )
     finally:
         os.close(fd)
@@ -253,6 +264,22 @@ def _cursor_identity(cursor: _Cursor) -> tuple[int, int, int, int, int]:
         cursor.source_size,
         cursor.source_mtime_ns,
         cursor.source_ctime_ns,
+    )
+
+
+def _prefix_digest(fd: int, size: int) -> str:
+    prefix = os.pread(fd, min(PREFIX_DIGEST_BYTES, size), 0)
+    return hashlib.sha256(prefix).hexdigest()
+
+
+def _prefix_extends_cursor(fd: int, info: os.stat_result, cursor: _Cursor) -> bool:
+    return (
+        cursor.byte_offset == cursor.source_size
+        and info.st_dev == cursor.source_device
+        and info.st_ino == cursor.source_inode
+        and info.st_size >= cursor.source_size
+        and cursor.prefix_digest is not None
+        and _prefix_digest(fd, cursor.source_size) == cursor.prefix_digest
     )
 
 

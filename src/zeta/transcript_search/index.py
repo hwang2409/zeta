@@ -362,7 +362,7 @@ def _split_utf8(value: str, max_bytes: int) -> list[str]:
     return chunks or [""]
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SANITIZER_VERSION = 2
 INDEX_FILENAME = "transcript-index.sqlite3"
 MAX_ACTIVE_TAIL_BYTES = 1024 * 1024
@@ -469,6 +469,8 @@ class TranscriptIndex:
                     with self._temporary_database() as temporary_path:
                         self._initialize(temporary_path)
                         self._publish(temporary_path)
+                else:
+                    self._migrate_schema()
         except (OSError, sqlite3.Error) as exc:
             raise TranscriptIndexError(
                 f"could not initialize transcript index: {exc}"
@@ -512,8 +514,9 @@ class TranscriptIndex:
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
                         source_inode, source_mtime_ns, source_ctime_ns,
-                        source_size, incremental_ready, last_entry_id, active_tail_json
-                    ) VALUES (?, 0, ?, 0, 0, 0, 0, 0, 1, NULL, '[]')
+                        source_size, incremental_ready, last_entry_id, active_tail_json,
+                        prefix_digest
+                    ) VALUES (?, 0, ?, 0, 0, 0, 0, 0, 1, NULL, '[]', NULL)
                     ON CONFLICT(session_id) DO UPDATE SET last_seq=excluded.last_seq""",
                     (session_id, cursor),
                 )
@@ -717,8 +720,9 @@ class TranscriptIndex:
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
                         source_inode, source_mtime_ns, source_ctime_ns,
-                        source_size, incremental_ready, last_entry_id, active_tail_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_size, incremental_ready, last_entry_id, active_tail_json,
+                        prefix_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         byte_offset=excluded.byte_offset,
                         last_seq=excluded.last_seq,
@@ -729,7 +733,8 @@ class TranscriptIndex:
                         source_size=excluded.source_size,
                         incremental_ready=excluded.incremental_ready,
                         last_entry_id=excluded.last_entry_id,
-                        active_tail_json=excluded.active_tail_json""",
+                        active_tail_json=excluded.active_tail_json,
+                        prefix_digest=excluded.prefix_digest""",
                     (
                         source.session_id,
                         read.byte_offset,
@@ -742,6 +747,7 @@ class TranscriptIndex:
                         incremental_ready,
                         read.last_entry_id,
                         tail_json,
+                        read.prefix_digest,
                     ),
                 )
                 connection.commit()
@@ -781,7 +787,7 @@ class TranscriptIndex:
         row = connection.execute(
             """SELECT byte_offset, last_seq, source_device, source_inode,
                 source_mtime_ns, source_ctime_ns, source_size, incremental_ready,
-                last_entry_id, active_tail_json
+                last_entry_id, active_tail_json, prefix_digest
             FROM session_cursors WHERE session_id = ?""",
             (session_id,),
         ).fetchone()
@@ -792,6 +798,7 @@ class TranscriptIndex:
             bool(row[7]),
             str(row[8]) if row[8] is not None else None,
             tuple(json.loads(row[9])),
+            str(row[10]) if row[10] is not None else None,
         )
 
     @staticmethod
@@ -938,6 +945,29 @@ class TranscriptIndex:
         finally:
             connection.close()
         os.chmod(path, 0o600)
+
+    def _migrate_schema(self) -> None:
+        try:
+            connection = sqlite3.connect(self.path)
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+        except sqlite3.DatabaseError:
+            return
+        with closing(connection):
+            if int(metadata.get("schema_version", -1)) != 4:
+                return
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(session_cursors)")
+            }
+            if "prefix_digest" not in columns:
+                connection.execute(
+                    "ALTER TABLE session_cursors ADD COLUMN prefix_digest TEXT"
+                )
+            connection.execute(
+                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
+            connection.commit()
 
     def _version_state(self) -> tuple[int, int, int, str | None]:
         try:
@@ -1130,7 +1160,8 @@ CREATE TABLE session_cursors (
     source_size INTEGER NOT NULL CHECK(source_size >= 0),
     incremental_ready INTEGER NOT NULL CHECK(incremental_ready IN (0, 1)),
     last_entry_id TEXT,
-    active_tail_json TEXT NOT NULL
+    active_tail_json TEXT NOT NULL,
+    prefix_digest TEXT
 ) WITHOUT ROWID;
 CREATE TABLE units (
     id INTEGER PRIMARY KEY,
