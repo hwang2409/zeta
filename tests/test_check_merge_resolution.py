@@ -945,6 +945,26 @@ def _public_line_case(
     return merge, final
 
 
+def test_final_group_marker_filters_after_restored_rows_are_removed(tmp_path: Path) -> None:
+    r = tmp_path / "final_group_marker"
+    r.mkdir()
+    merge, final = _public_line_case(
+        r,
+        "def check():\n    return 1\n",
+        "def check():\n    added = 2\n    added = 3\n    return 1\n",
+        "def check():\n    return 3\n",
+        "def check():\n    return 3\n",
+        "def check():\n    added = 2\n    return 3\n",
+    )
+    result = run(r, merge, "--final", final)
+    marker = next(
+        line for line in result.stdout.splitlines() if line.startswith("suggested override: ")
+    )
+    body = r / "body"
+    body.write_text(marker.removeprefix("suggested override: ").replace("<reason>", "intentional"))
+    assert run(r, merge, "--final", final, "--pr-body-file", str(body)).returncode == 0
+
+
 def test_pr_line_final_multiset_and_insertion_table(tmp_path: Path) -> None:
     cases = [
         (
@@ -1037,6 +1057,24 @@ def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> N
     ):
         assert expected in second_output
 
+
+
+def test_train_merge_does_not_duplicate_pr_lines_already_on_main(tmp_path: Path) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    anchor()\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    anchor()\n    emit()\n")
+    commit(r, "pr")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    main_change()\n    anchor()\n    emit()\n")
+    commit(r, "main includes pr")
+    _set_origin_main(r)
+    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "main"], cwd=r, check=True)
+    commit(r, "train merges main")
+    assert run(r).returncode == 0
 
 
 def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:

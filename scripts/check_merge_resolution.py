@@ -403,7 +403,7 @@ def _pr_line_items(
         if _main_overlaps(start, end, main_blocks):
             continue
         key = item_key(item)
-        required = max(0, counts[1][key] + counts[2][key] - counts[0][key])
+        required = max(0, max(counts[1][key], counts[2][key]) - counts[0][key])
         lost = min(additions[key], max(0, required - counts[3][key]))
         if lost and sum(item_key(candidate) == key for candidate in result) < lost:
             result.append(item)
@@ -1210,9 +1210,9 @@ def main() -> int:
         _element_findings(old_items, main_items, branch_items, merge_items, unresolved)
     )
     findings.extend(line_findings)
-    findings = _filter_findings(findings, text)
     if final_revision:
         findings = _report_final_moves(findings, final_items, final_lines)
+    findings = _filter_findings(findings, text)
     if findings:
         for finding in findings:
             _render_finding(finding, main_items, branch_items, merge_items)
