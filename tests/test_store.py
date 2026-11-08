@@ -67,6 +67,19 @@ def test_persistent_detached_writer_retains_home_lease(tmp_path: Path) -> None:
         store.close()
 
 
+def test_ordinary_append_does_not_scan_existing_entries(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="no-entry-scan")
+    store.append_message(message(MessageRole.ASSISTANT, "first"))
+
+    class NoScanEntries(list[ConversationEntry]):
+        def __iter__(self):
+            raise AssertionError("ordinary append scanned existing entries")
+
+    store._entries = NoScanEntries(store._entries)
+    store.append_message(message(MessageRole.ASSISTANT, "second"))
+    assert len(store._entries) == 2
+
+
 def test_store_rejects_unknown_notification_kind_on_write(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 

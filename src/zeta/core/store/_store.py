@@ -714,7 +714,7 @@ class ConversationStore(
     ) -> ConversationEntry:
         self._assert_owner_thread()
         self._validate_notification_write(entry_type, data)
-        prior_ids = {entry.id for entry in self._entries}
+        prior_ids = self._entry_ids
         if parent_id is not None and parent_id not in prior_ids:
             raise ConversationIntegrityError(f"missing prior parent {parent_id}")
         entry_id = uuid.uuid4().hex
