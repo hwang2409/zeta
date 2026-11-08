@@ -17,7 +17,7 @@ _DURABILITY_CALLBACKS = {
     ("core/transcript_recovery/__init__.py", "resume_memory_review", "write_json_file"),
     ("session_retention.py", "write_retention_pin", "atomic_publish_file"),
     ("project_registry.py", "_publish", "atomic_publish_file"),
-    ("project_inbox_sent/__init__.py", "_persist", "atomic_publish_file"),
+    ("project_inbox_sent/__init__.py", "publish", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
     (
         "memory/entry_history.py",

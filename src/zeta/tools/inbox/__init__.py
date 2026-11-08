@@ -177,6 +177,54 @@ def _bound(registry: ToolRegistry) -> tuple[ProjectInbox, str, str]:
     )
 
 
+def _send(
+    inbox: ProjectInbox,
+    project_id: str,
+    session_id: str,
+    arguments: dict[str, Any],
+) -> StructuredToolResult:
+    message_id, sent_outcome = inbox.send_with_outcome(
+        from_project=project_id,
+        from_session=session_id,
+        to_project=arguments["project"],
+        kind=arguments["kind"],
+        title=arguments["title"],
+        body=arguments["body"],
+        in_reply_to=arguments.get("in_reply_to"),
+        message_id=arguments.get("id"),
+    )
+    result = {
+        "id": message_id,
+        "sent_health": sent_outcome.health.as_dict(),
+    }
+    if sent_outcome.warning:
+        result["warning"] = sent_outcome.warning
+    return _result("send", project_id, result)
+
+
+def _done(
+    inbox: ProjectInbox,
+    project_id: str,
+    session_id: str,
+    arguments: dict[str, Any],
+) -> StructuredToolResult:
+    message, sent_outcome = inbox.done_with_outcome(
+        project_id,
+        arguments["id"],
+        session_id,
+        arguments["outcome"],
+        reply=arguments.get("reply"),
+    )
+    if sent_outcome is None and inbox.sent_tracker is not None:
+        sent_outcome = inbox.sent_tracker.health()
+    result = {"message": message}
+    if sent_outcome is not None:
+        result["sent_health"] = sent_outcome.health.as_dict()
+        if sent_outcome.warning:
+            result["warning"] = sent_outcome.warning
+    return _result("done", project_id, result)
+
+
 def _run_inbox(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
@@ -193,23 +241,7 @@ def _run_inbox(
             "projects", project_id, {"projects": inbox.known_projects()}
         )
     if action == "send":
-        message_id, sent_outcome = inbox.send_with_outcome(
-            from_project=project_id,
-            from_session=session_id,
-            to_project=arguments["project"],
-            kind=arguments["kind"],
-            title=arguments["title"],
-            body=arguments["body"],
-            in_reply_to=arguments.get("in_reply_to"),
-            message_id=arguments.get("id"),
-        )
-        result = {
-            "id": message_id,
-            "sent_health": sent_outcome.health.as_dict(),
-        }
-        if sent_outcome.warning:
-            result["warning"] = sent_outcome.warning
-        return _result("send", project_id, result)
+        return _send(inbox, project_id, session_id, arguments)
     if action == "list":
         status = arguments.get("status", "new")
         listed = inbox.list(project_id, session_id=session_id)
@@ -235,21 +267,7 @@ def _run_inbox(
         if message is None:
             raise InboxError("message is not new or was claimed by another session")
         return _result("claim", project_id, {"message": message})
-    message, sent_outcome = inbox.done_with_outcome(
-        project_id,
-        arguments["id"],
-        session_id,
-        arguments["outcome"],
-        reply=arguments.get("reply"),
-    )
-    if sent_outcome is None and inbox.sent_tracker is not None:
-        sent_outcome = inbox.sent_tracker.health()
-    result = {"message": message}
-    if sent_outcome is not None:
-        result["sent_health"] = sent_outcome.health.as_dict()
-        if sent_outcome.warning:
-            result["warning"] = sent_outcome.warning
-    return _result("done", project_id, result)
+    return _done(inbox, project_id, session_id, arguments)
 
 
 async def _inbox(

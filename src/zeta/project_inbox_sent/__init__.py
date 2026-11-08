@@ -92,6 +92,10 @@ class _Broken:
     reason: str
 
 
+class _BrokenLedger(ValueError):
+    pass
+
+
 class SentMessageTracker:
     """Own the bounded sent ledger and its read-time broken projection."""
 
@@ -143,16 +147,15 @@ class SentMessageTracker:
         return SentLedgerOutcome(result, health, warning)
 
     def _refresh(self) -> None:
-        state = self._load_state()
+        self._adopt_state(self._load_state())
+
+    def _adopt_state(self, state: _Missing | _Loaded | _Broken) -> None:
         self._state = state
         if isinstance(state, _Loaded):
             self._records = list(state.records)
             self._pending = {
                 r["id"] for r in self._records if "done" not in r["reported"]
             }
-        elif isinstance(state, _Missing):
-            self._records = []
-            self._pending = set()
         else:
             self._records = []
             self._pending = set()
@@ -187,8 +190,7 @@ class SentMessageTracker:
             self._records.sort(key=self._chronology)
             self._pending.add(message_id)
             self._prune()
-            self._persist((record,), self._deleted_ids)
-            return self._outcome(None)
+            return self._persist((record,), self._deleted_ids)
 
     def records(self) -> tuple[dict[str, Any], ...]:
         with self._lock:
@@ -258,16 +260,16 @@ class SentMessageTracker:
             if isinstance(self._state, _Broken) or not updates:
                 return self._outcome(None)
             by_id = {r["id"]: r for r in self._records}
-            changed = []
+            changed: dict[str, dict[str, Any]] = {}
             for mid, status in updates:
                 record = by_id.get(mid)
                 if record is not None and status not in record["reported"]:
                     record["reported"].append(status)
-                    changed.append(record)
+                    changed[mid] = record
                     if status == "done":
                         self._pending.discard(mid)
             if changed:
-                self._persist(tuple(changed), ())
+                return self._persist(tuple(changed.values()), ())
             return self._outcome(None)
 
     def reconcile(
@@ -303,6 +305,10 @@ class SentMessageTracker:
             value = json.loads(payload)
         except (ValueError, RecursionError):
             return _Broken(path, "invalid_json")
+        return self._classify_value(value)
+
+    def _classify_value(self, value: object) -> _Loaded | _Broken:
+        path = self.path
         try:
             version = value.get("schema_version") if isinstance(value, dict) else None
             require_closed_variant("sent_message_ledger.schema_version", version)
@@ -350,42 +356,55 @@ class SentMessageTracker:
             "reported": list(reported),
         }
 
-    def _validate_current(self, raw: object) -> None:
-        if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-            raise ValueError("invalid sent-message tracking ledger")
-        records = raw.get("records")
-        if not isinstance(records, list):
-            raise TypeError("invalid sent-message tracking ledger")
-        validated = [self._validate_record(r) for r in records]
-        if len({r["id"] for r in validated}) != len(validated):
-            raise ValueError("invalid sent-message tracking ledger")
-
     def _persist(
         self, upserts: Iterable[dict[str, Any]], delete_ids: Iterable[str]
-    ) -> None:
+    ) -> SentLedgerOutcome[None]:
+        operation_outcome: SentLedgerOutcome[None] | None = None
+
+        def guard_current(raw: object) -> None:
+            nonlocal operation_outcome
+            state = self._classify_value(raw)
+            if isinstance(state, _Broken):
+                self._adopt_state(state)
+                operation_outcome = self._outcome(None)
+                raise _BrokenLedger
+
+        def broken_invalid_json() -> None:
+            nonlocal operation_outcome
+            self._adopt_state(_Broken(self.path, "invalid_json"))
+            operation_outcome = self._outcome(None)
+
+        def publish(fd: int, name: str, data: bytes) -> None:
+            nonlocal operation_outcome
+            atomic_publish_file(fd, name, data, sync_directory=True)
+            operation_outcome = self._outcome(None)
+
         try:
             with (
                 open_writer(self.sessions_root.parent) as lease,
                 self._session_directory(create=True) as session_fd,
             ):
-                lease.publish_records(
-                    session_fd,
-                    _SENT_TRACKING_FILE,
-                    upserts,
-                    identity="id",
-                    delete_ids=delete_ids,
-                    path=("records",),
-                    initial={"schema_version": 1, "records": []},
-                    validate=self._validate_current,
-                    publish=lambda fd, name, data: atomic_publish_file(
-                        fd, name, data, sync_directory=True
-                    ),
-                )
+                try:
+                    lease.publish_records(
+                        session_fd,
+                        _SENT_TRACKING_FILE,
+                        upserts,
+                        identity="id",
+                        delete_ids=delete_ids,
+                        path=("records",),
+                        initial={"schema_version": 1, "records": []},
+                        validate=guard_current,
+                        on_invalid_json=broken_invalid_json,
+                        publish=publish,
+                    )
+                except _BrokenLedger:
+                    pass
+            if operation_outcome is None:
+                raise ValueError("sent-message tracking outcome is unavailable")
             self._deleted_ids.clear()
-        except (ValueError, TypeError):
-            self._state = self._load_state()
-            self._records = []
-            self._pending = set()
-            self._deleted_ids.clear()
-        except (OSError, SessionError) as exc:
+            return operation_outcome
+        except (OSError, SessionError, ValueError, TypeError) as exc:
+            if operation_outcome is not None:
+                self._deleted_ids.clear()
+                return operation_outcome
             raise ValueError("sent-message tracking is unsafe or unavailable") from exc

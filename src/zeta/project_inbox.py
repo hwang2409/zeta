@@ -277,7 +277,23 @@ class ProjectInbox:
             "in_reply_to": in_reply_to,
             "created_at": _now(),
         }
-        with self._directories(target.project_id, create=True) as dirs:
+        self._publish_outgoing(target.project_id, message_id, body, record)
+        tracker = (
+            self.sent_tracker
+            if self.sent_tracker is not None and self.sent_tracker.session_id == session
+            else SentMessageTracker(self.sessions_root, session)
+        )
+        outcome = tracker.record(message_id, target.project_id)
+        return message_id, outcome
+
+    def _publish_outgoing(
+        self,
+        target_project: str,
+        message_id: str,
+        body: str,
+        record: dict[str, Any],
+    ) -> None:
+        with self._directories(target_project, create=True) as dirs:
             new_fd, _claimed_fd, _done_fd, bodies_fd = dirs[:4]
             body_bytes = body.encode("utf-8")
             if len(body_bytes) > BODY_SPILL_BYTES:
@@ -294,41 +310,34 @@ class ProjectInbox:
                 break
             if existing is None:
                 self._publish_record(new_fd, name, record)
-            else:
-                immutable_fields = {
-                    "schema_version",
-                    "id",
-                    "origin",
-                    "from",
-                    "to_project",
-                    "to_session",
-                    "kind",
-                    "title",
-                    "body",
-                    "in_reply_to",
-                }
-                comparable = {
-                    key: (
-                        existing.get(key, LOCAL_ORIGIN)
-                        if key == "origin"
-                        else existing.get(key)
-                        if key == "to_session"
-                        else existing[key]
-                    )
-                    for key in immutable_fields
-                }
-                expected = {key: record[key] for key in immutable_fields}
-                # Decoding resolves spilled bodies, so compare against the caller body.
-                expected["body"] = body
-                if comparable != expected:
-                    raise InboxError("message id already exists with different content")
-        tracker = (
-            self.sent_tracker
-            if self.sent_tracker is not None and self.sent_tracker.session_id == session
-            else SentMessageTracker(self.sessions_root, session)
-        )
-        outcome = tracker.record(message_id, target.project_id)
-        return message_id, outcome
+                return
+            immutable_fields = {
+                "schema_version",
+                "id",
+                "origin",
+                "from",
+                "to_project",
+                "to_session",
+                "kind",
+                "title",
+                "body",
+                "in_reply_to",
+            }
+            comparable = {
+                key: (
+                    existing.get(key, LOCAL_ORIGIN)
+                    if key == "origin"
+                    else existing.get(key)
+                    if key == "to_session"
+                    else existing[key]
+                )
+                for key in immutable_fields
+            }
+            expected = {key: record[key] for key in immutable_fields}
+            # Decoding resolves spilled bodies, so compare against the caller body.
+            expected["body"] = body
+            if comparable != expected:
+                raise InboxError("message id already exists with different content")
 
     def list(
         self, project: str, *, session_id: str | None = None

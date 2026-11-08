@@ -28,7 +28,7 @@ from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.skills import SkillCatalog
-from zeta.storage_format import open_writer
+from zeta.storage_format import WriterLease, open_writer
 from zeta.tools.inbox import _inbox, _model_visible, _validate_action
 from zeta.tools.registry import ToolRegistry
 
@@ -492,6 +492,89 @@ async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
         await registry.close()
         store.close()
 
+async def _exercise_repair_after_guarded_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    bound = await _inbox(registry, {"action": "projects"})
+    assert bound.get("isError") is not True
+    ledger = store.session_dir / "project-inbox-sent.json"
+    repaired = json.dumps({"schema_version": 1, "records": []}).encode()
+    ledger.write_bytes(repaired)
+    assert registry.sent_message_tracker is not None
+    registry.sent_message_tracker.health()
+    refresh_finished = threading.Event()
+    corruption_finished = threading.Event()
+    guarded_failure_finished = threading.Event()
+    repair_finished = threading.Event()
+    real_refresh = SentMessageTracker._refresh
+    real_publish_records = WriterLease.publish_records
+
+    def gated_refresh(self):
+        real_refresh(self)
+        refresh_finished.set()
+        assert corruption_finished.wait(timeout=10)
+
+    def gated_publish_records(self, *args, **kwargs):
+        try:
+            return real_publish_records(self, *args, **kwargs)
+        except ValueError:
+            guarded_failure_finished.set()
+            assert repair_finished.wait(timeout=10)
+            raise
+
+    def corrupt_then_repair() -> None:
+        if not refresh_finished.wait(timeout=10):
+            return
+        ledger.write_bytes(b"{")
+        corruption_finished.set()
+        if not guarded_failure_finished.wait(timeout=10):
+            return
+        ledger.write_bytes(repaired)
+        repair_finished.set()
+
+    # test-contract: seam force stale state before guarded public tool publication
+    monkeypatch.setattr(SentMessageTracker, "_refresh", gated_refresh)
+    monkeypatch.setattr(
+        WriterLease,
+        "publish_records",
+        gated_publish_records,
+    )
+    repairer = threading.Thread(target=corrupt_then_repair)
+    repairer.start()
+    try:
+        result = await _inbox(
+            registry,
+            {
+                "action": "send",
+                "project": beta.project_id,
+                "kind": "info",
+                "title": "repair after guarded failure",
+                "body": "delivered",
+                "id": "f" * 32,
+            },
+        )
+        assert result.get("isError") is not True
+        assert repair_finished.is_set()
+        repairer.join(10)
+        assert not repairer.is_alive()
+        structured = result["structuredContent"]
+        assert structured["sent_health"]["state"] == "broken"
+        assert "history is incomplete" in structured["warning"]
+        assert ledger.read_bytes() == repaired
+    finally:
+        refresh_finished.set()
+        corruption_finished.set()
+        guarded_failure_finished.set()
+        repair_finished.set()
+        repairer.join(10)
+        await registry.close()
+        store.close()
+
+
 async def _exercise_concurrent_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -560,6 +643,7 @@ async def _exercise_concurrent_repair(
         "mark-ledger",
         "projection-restart",
         "record-concurrent-repair",
+        "record-repair-after-guard",
         "record-cancel",
     ),
 )
@@ -570,6 +654,9 @@ async def test_guarded_sent_operation_table(
 ) -> None:
     if scenario == "record-concurrent-repair":
         await _exercise_concurrent_repair(tmp_path, monkeypatch)
+        return
+    if scenario == "record-repair-after-guard":
+        await _exercise_repair_after_guarded_failure(tmp_path, monkeypatch)
         return
     if scenario == "record-cancel":
         await _exercise_cancelled_send(tmp_path, monkeypatch)
