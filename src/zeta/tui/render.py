@@ -877,7 +877,7 @@ def format_status(
         if decisions_error is not None:
             segments.append(f"decisions unavailable: {decisions_error}")
         elif decisions_count > 0:
-            noun = "decision" if decisions_count == 1 else "decisions"
+            noun = "attention item" if decisions_count == 1 else "attention items"
             segments.append(f"● {decisions_count} {noun}")
         if main_active:
             segments.append("◆ main")
@@ -1011,7 +1011,7 @@ def format_status(
         if marker_start >= 0:
             rendered.stylize(theme.ERROR, marker_start, marker_start + len(marker))
     elif decisions_count > 0:
-        noun = "decision" if decisions_count == 1 else "decisions"
+        noun = "attention item" if decisions_count == 1 else "attention items"
         marker = f"● {decisions_count} {noun}"
         marker_start = value.find(marker)
         if marker_start >= 0:
