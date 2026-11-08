@@ -594,7 +594,7 @@ class SlashSession(Protocol):
 
     def slash_tree(self, args: str) -> str: ...
 
-    def slash_runs(self, args: str) -> str: ...
+    def slash_runs(self, args: str) -> str | Awaitable[str]: ...
 
     def slash_tasks(self, args: str) -> str: ...
 
@@ -823,7 +823,7 @@ def _run_checkpoint(session: SlashSession, args: str) -> str:
     return session.slash_checkpoint(args)
 
 
-def _run_runs(session: SlashSession, args: str) -> str:
+def _run_runs(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_runs(args)
 
 

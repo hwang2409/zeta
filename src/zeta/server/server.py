@@ -22,6 +22,7 @@ from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
     accounts,
+    child_runs,
     ergonomics,
     login,
     model_selection,
@@ -435,6 +436,22 @@ async def _handle_account_switch(
     )  # type: ignore[attr-defined]
 
 
+async def _handle_child_run_list(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await child_runs.list_runs(
+        client.server.runtime,  # type: ignore[attr-defined]
+        params,
+        run_blocking=client.server.control._run_blocking,  # type: ignore[attr-defined]
+    )
+
+
+async def _handle_child_run_send(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await child_runs.send(client.server.runtime, params)  # type: ignore[attr-defined]
+
+
 async def _handle_project(
     client: object,
     request_id: str | int,
@@ -526,6 +543,8 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.DELIVERY_STATUS: _handle_delivery_status,
     MethodDescriptor.SESSION_GRANTS: _handle_session_grants,
     MethodDescriptor.REVOKE_SESSION_GRANTS: _handle_revoke_session_grants,
+    MethodDescriptor.CHILD_RUN_LIST: _handle_child_run_list,
+    MethodDescriptor.CHILD_RUN_SEND: _handle_child_run_send,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")

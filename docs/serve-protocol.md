@@ -183,6 +183,8 @@ feature. Observer connections receive only methods with `read` access.
 | `delivery_status` | `1.0` | `delivery_id` | `read` |
 | `session_grants` | `1.1` | `session_grants` | `read` |
 | `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
+| `child_run_list` | `1.0` | `child_runs` | `controller_read` |
+| `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 
 ## common JSON-RPC shapes
 
@@ -709,6 +711,25 @@ calls through the same policy; revocation affects future calls from both,
 while pending or already authorized calls are unchanged. A controller handoff
 or observer reconnect gets no replay: the client reads `session_grants` for
 the current state.
+
+### child runs (`child_runs` feature)
+
+`child_run_list` lets the controller inspect child runs owned by the active
+session. Params are `session_id` plus optional nonnegative `offset` and `limit`
+from 1 to 100. The result is `runs` and, when more rows remain, `next_offset`.
+Each row contains `run_id`, the top-level `session_id`, nullable
+`parent_run_id`, `description`, `agent_type`, `status`, `accepts_follow_ups`,
+`turns_used`, `tool_count`, `current_step`, `started_at`, optional or null
+`finished_at`, and `elapsed_seconds`. The public `run_id` is the existing child
+instance id. Child-local store ids and the agent tool's `handle` name are not
+exposed.
+
+`child_run_send` queues one message at the child's existing safe delivery
+point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
+`{"accepted":true,"run_id":"..."}`. A missing or terminal child returns
+`-32005`. Both methods return `-32601` unless `child_runs` was negotiated, and
+observers cannot call either method. This feature emits no event; clients call
+`child_run_list` again to read changes.
 
 ### `abort`
 

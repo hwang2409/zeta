@@ -11159,12 +11159,12 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
         child_instance_id="sess:worker",
     )
 
-    assert "worker" in commands.slash_runs("")
+    assert await commands.slash_runs("") == "no live runs"
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
 
-    listing = commands.slash_runs("")
+    listing = await commands.slash_runs("")
     assert "long horizon run" in listing
     assert "[run]" in listing
     assert "explore" not in listing
