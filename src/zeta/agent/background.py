@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import weakref
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
@@ -88,16 +89,13 @@ class BackgroundAgentOwner:
         self.notification_store = notification_store
         self.finish_gate_max_turns = finish_gate_max_turns
         self.finish_gate_timeout = float(finish_gate_timeout)
-        # This internal bound lets tasks outlive a turn but stops abandoned tasks
-        # that never exit; it is not a user setting.
         self.finish_gate_task_timeout = float(finish_gate_task_timeout)
-        # Receipts and adopted descendants can outlive their immediate loop.
-        # The tree owns child leases until root shutdown joins all watchers.
         self.store_leases = ExitStack()
-        self._stores: list[ConversationStore] = []
+        self._stores: set[ConversationStore] = set()
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
         self._store_close_stores: dict[asyncio.Task[Any], ConversationStore] = {}
+        self._store_close_tasks_by_store: dict[ConversationStore, asyncio.Task[Any]] = {}
         self._observed_close_failures: set[asyncio.Task[Any]] = set()
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
@@ -254,51 +252,55 @@ class BackgroundAgentOwner:
         stores = [self.notification_store, *self._stores, *self._parent_stores.values()]
         return tuple(dict.fromkeys(stores))
 
-    def track_store(self, store: ConversationStore) -> None:
-        """Track a child store so completed trees can release its directory fd."""
-
-        self._stores.append(store)
+    def lease_store(self, store: ConversationStore) -> None:
+        """Keep a strong owner until close succeeds or root shutdown runs."""
+        store_ref = weakref.ref(store)
+        self.store_leases.callback(
+            lambda ref: (store := ref()) and store.close(), store_ref
+        )
+        self._stores.add(store)
 
     def mark_store_finished(self, store: ConversationStore) -> None:
         self._pending_stores.add(store)
 
     def release_unused_stores(self) -> None:
-        """Close stores no longer needed by an active adopted descendant.
-
-        The owner ExitStack remains the final safety net for shutdown. Normally,
-        however, completed children must release their descriptor immediately;
-        a nested descendant keeps its ancestor store pinned until adoption or
-        that descendant's own completion.
-        """
-
         referenced = set(self._parent_stores.values())
         for stores in self._active_stores.values():
             referenced.update(stores)
-        for store in self._stores:
-            if store not in self._pending_stores or store in referenced:
-                continue
-            existing = next(
-                (
-                    task
-                    for task, task_store in self._store_close_stores.items()
-                    if task_store is store
-                ),
-                None,
-            )
+        for store in tuple(self._pending_stores - referenced):
+            # only an observed close failure is eligible for retry.
+            existing = self._store_close_tasks_by_store.get(store)
             if existing is not None:
-                # Retry only a failure that wait_for_store_closes already raised;
-                # an unobserved failure must still reach its waiter.
                 if existing not in self._observed_close_failures:
                     continue
                 self._observed_close_failures.discard(existing)
                 self._store_close_tasks.discard(existing)
                 self._store_close_stores.pop(existing, None)
+                self._store_close_tasks_by_store.pop(store, None)
             close_task = asyncio.create_task(
                 store._to_thread_store(store.close),
                 name=f"close child store {store.session_id}",
             )
             self._store_close_tasks.add(close_task)
             self._store_close_stores[close_task] = store
+            self._store_close_tasks_by_store[store] = close_task
+            close_task.add_done_callback(self._finish_store_close)
+
+    def _finish_store_close(self, task: asyncio.Task[Any]) -> None:
+        if task.cancelled() or getattr(task, "_exception", None) is not None:
+            return
+        store = self._store_close_stores.get(task)
+        if store is not None:
+            self._forget_closed_store(task, store)
+
+    def _forget_closed_store(
+        self, task: asyncio.Task[Any], store: ConversationStore
+    ) -> None:
+        self._store_close_stores.pop(task, None)
+        self._store_close_tasks.discard(task)
+        self._store_close_tasks_by_store.pop(store, None)
+        for collection in (self._pending_stores, self._stores):
+            collection.discard(store)
 
     def register(
         self,
@@ -405,8 +407,7 @@ class BackgroundAgentOwner:
                 store = self._store_close_stores.pop(task, None)
                 self._store_close_tasks.discard(task)
                 if store is not None:
-                    self._pending_stores.discard(store)
-                    self._stores.remove(store)
+                    self._forget_closed_store(task, store)
 
     async def wait(self) -> None:
         current = asyncio.current_task()

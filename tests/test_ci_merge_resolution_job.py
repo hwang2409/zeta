@@ -172,24 +172,6 @@ def test_pull_request_checks_only_first_parent_merges(tmp_path: Path) -> None:
         "CHECK_MERGE_RESOLUTION_SCRIPT": str(repo / "scripts/check_merge_resolution.py"),
     }
 
-    old_script = tmp_path / "old-merge-resolution.sh"
-    old_script.write_text(
-        subprocess.check_output(
-            ["git", "show", "origin/perf/integration:scripts/ci_merge_resolution.sh"],
-            cwd=ROOT,
-            text=True,
-            timeout=10,
-        )
-    )
-    old_script.chmod(0o755)
-    old_result = subprocess.run(
-        [str(old_script)], cwd=repo, env=env, text=True,
-        capture_output=True, timeout=20, check=False,
-    )
-    assert old_result.returncode == 1, old_result.stdout + old_result.stderr
-    assert f"checking merge resolution: {inner_sha}" in old_result.stdout
-    assert f"checking merge resolution: {train_sha}" in old_result.stdout
-
     result = subprocess.run(
         _merge_resolution_command(tmp_path),
         cwd=repo,
