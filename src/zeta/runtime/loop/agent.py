@@ -13,7 +13,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 from ...agent import recovery_lease
 from ...agent.background import BackgroundAgentOwner
@@ -119,10 +119,6 @@ from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
-if TYPE_CHECKING:
-    from ...core.project_context import ProjectDiscovery
-
-
 TaskResult = TypeVar("TaskResult")
 
 
@@ -176,7 +172,6 @@ class AgentLoop(
         parent_session_id: str | None = None,
         root_session_dir: Any = None,
         project_registry: Any = None,
-        project_discovery: ProjectDiscovery | None = None,
         child_lineage_publisher: ChildLineagePublisher | None = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
@@ -209,7 +204,6 @@ class AgentLoop(
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
-        self.project_discovery = project_discovery
         self._configure_project_context_recovery(
             registry=None, project_id=None, health=None, prepare=None
         )
