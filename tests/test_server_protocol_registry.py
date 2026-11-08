@@ -96,6 +96,10 @@ def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
     )
     assert registry.command_for("memory").serve.can_run_while_busy("")
     assert not registry.command_for("memory").serve.can_run_while_busy("undo")
+    assert not registry.command_for("plan").serve.can_run_while_busy("")
+    assert not registry.command_for("plan").serve.can_run_while_busy("on")
+    assert not registry.command_for("plan").serve.can_run_while_busy("write a plan")
+    assert not registry.command_for("implement").serve.can_run_while_busy("")
 
 
 def test_protocol_registry_matches_documented_errors_and_events() -> None:
@@ -608,6 +612,12 @@ STRUCTURED_ERROR_FIXTURES = (
         "session missing",
         {"session_id": "s1"},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session missing","data":{"code":"session_not_found","session_id":"s1"}}}\n',
+    ),
+    (
+        ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+        "transcript repair needs the stored-format upgrade (home epoch 2, needs 4)",
+        {"home_epoch": 2, "required_epoch": 4},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32013,"message":"transcript repair needs the stored-format upgrade (home epoch 2, needs 4)","data":{"code":"transcript_repair_requires_upgrade","home_epoch":2,"required_epoch":4}}}\n',
     ),
 )
 

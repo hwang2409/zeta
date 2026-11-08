@@ -14,7 +14,10 @@ from typing import Any
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
-from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
+from ..core.transcript_recovery.runtime import (
+    TranscriptRepairRequiresUpgrade,
+    repair_transcript_for_runtime,
+)
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -359,6 +362,8 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._local_close = False
+        self._controller_release: asyncio.Task[None] | None = None
         self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
@@ -372,6 +377,7 @@ class _Client:
             while True:
                 line = await self._read_frame()
                 if not line:
+                    self._release_dead_connection()
                     graceful = False
                     break
                 await self.connections.wait_until_settled(self)
@@ -402,6 +408,8 @@ class _Client:
                             exc.data,
                         )
                     )
+                    if not self.handshaken:
+                        self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     descriptor, message, data = project_request_error(exc)
                     await self._write(
@@ -414,6 +422,18 @@ class _Client:
                             ErrorDescriptor.PROJECT_REGISTRY_BUSY,
                             str(exc),
                             {"retryable": exc.retryable},
+                        )
+                    )
+                except TranscriptRepairRequiresUpgrade as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+                            str(exc),
+                            {
+                                "home_epoch": exc.home_epoch,
+                                "required_epoch": exc.required_epoch,
+                            },
                         )
                     )
                 except TranscriptLoadError as exc:
@@ -495,21 +515,37 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
+    def _begin_controller_release(self) -> asyncio.Task[None] | None:
+        if self._controller_release is not None:
+            return self._controller_release
+        if self.role == "controller" and self.connections.is_controller(self):
+            self._controller_release = self.server.control.begin_controller_release(
+                reconnect="approval_reconnect" in self.features
+            )
+        return self._controller_release
+
+    def _release_dead_connection(self) -> None:
+        if self._local_close:
+            return
+        self._begin_controller_release()
+        self.connections.release(self)
+
     async def close(self, *, graceful: bool = False) -> None:
         async with self._close_lock:
             if self._closed:
                 return
-            if self.role == "controller" and self.connections.is_controller(self):
-                await self.server.control.controller_released(
-                    reconnect="approval_reconnect" in self.features
-                )
+            release = self._begin_controller_release()
+            if release is not None:
+                await asyncio.shield(release)
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
             if graceful:
                 await self.connections.flush(self)
+            self._local_close = True
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
+            self.connections.release(self)
             self._closed = True
 
     async def _route_request(
@@ -518,13 +554,20 @@ class _Client:
         if method == "hello":
             result = self._hello(params)
             if self.role == "controller":
-                self.server._client_active = True
-                self.server._client = self
                 reconnect = "approval_reconnect" in self.features
-                await self.server.control.controller_claimed(
+                claimed = await self.server.control.controller_claimed(
                     reconnect=reconnect,
                     require_host_binding="session_host_commands" in self.features,
                 )
+                if not claimed:
+                    self.handshaken = False
+                    raise ProtocolError(
+                        ErrorDescriptor.CONNECTION_CAPACITY,
+                        "another client is already connected",
+                    )
+                self.server._client_active = True
+                self.server._client = self
+                self.connections.activate_controller(self)
                 if not reconnect:
                     await self.server.control.controller_ready()
             return True, result
@@ -866,6 +909,8 @@ class _Client:
                     else None
                 ),
             )
+        except TranscriptRepairRequiresUpgrade:
+            raise
         except (ValueError, SessionError) as exc:
             raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
         return {
@@ -908,7 +953,7 @@ class _Client:
                 params, self.features
             )
         if method == "session_settings":
-            return ergonomics.settings(runtime)
+            return ergonomics.settings(runtime, include_plan_mode=True)
         if method in slash_commands.READ_REQUESTS:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self

@@ -874,7 +874,7 @@ def format_status(
         if background_count > 0:
             segments.append(f"bg {background_count}")
         if decisions_count > 0:
-            noun = "decision" if decisions_count == 1 else "decisions"
+            noun = "attention item" if decisions_count == 1 else "attention items"
             segments.append(f"● {decisions_count} {noun}")
         if main_active:
             segments.append("◆ main")
@@ -1003,7 +1003,7 @@ def format_status(
     rendered = Text(value, style=theme.CHROME)
     offset = 0
     if decisions_count > 0:
-        noun = "decision" if decisions_count == 1 else "decisions"
+        noun = "attention item" if decisions_count == 1 else "attention items"
         marker = f"● {decisions_count} {noun}"
         marker_start = value.find(marker)
         if marker_start >= 0:
