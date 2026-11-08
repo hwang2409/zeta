@@ -2234,6 +2234,7 @@ def test_successful_full_load_does_not_materialize_transcript(
         requested_reads.append(length)
         return original(fd, length)
 
+    # test-contract: seam guards the production load against whole-file reads
     monkeypatch.setattr(ConversationStore, "_read_fd", staticmethod(record_read))
 
     reopened = ConversationStore(
