@@ -838,7 +838,9 @@ def _reply_in_process(
             attention_id, reply, session_id
         )
     except BaseException as exc:  # noqa: BLE001 - reported to parent process
-        result.put(("refused", type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
+        # AttentionReplies wraps operation errors; report the original type.
+        cause = exc.__cause__ or exc
+        result.put(("refused", type(cause).__name__, str(exc)))  # type: ignore[attr-defined]
     else:
         result.put(("delivered", outcome.items[0].status))  # type: ignore[attr-defined]
 
@@ -890,7 +892,7 @@ def test_p06_8_attention_resolution_process_progress(tmp_path: Path) -> None:
             "opposing attention resolution made no progress while the holder held"
         )
         if outcome[0] == "refused":
-            assert "InboxError" in outcome[2] or "Busy" in outcome[2], outcome
+            assert outcome[1] in {"InboxError", "ProjectRegistryBusyError"}, outcome
             assert AttentionStore(manager.sessions_dir / other_session).get(
                 other_attention
             ).status == "open"
@@ -908,9 +910,9 @@ def test_p06_8_attention_resolution_process_progress(tmp_path: Path) -> None:
         assert (retried.message_id in published) is (outcome[0] == "delivered"), (
             "a refused attention resolution left its message behind"
         )
-        assert [item.status for item in retried.items] == [
-            "already-resolved" if outcome[0] == "delivered" else "applied"
-        ]
+        # A refused send leaves its sealed journal; the retry's recovery
+        # finishes it first, so the item is already resolved either way.
+        assert [item.status for item in retried.items] == ["already-resolved"]
         assert retried.message_id in _inbox_ids(manager, project.project_id)
         assert AttentionStore(manager.sessions_dir / other_session).get(
             other_attention

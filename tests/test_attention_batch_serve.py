@@ -81,7 +81,8 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
         assert response["text"] == "replied to 3 attention item(s)"
         assert all(store.get(record.id).status == "resolved" for record in records)
         inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
-        assert len(inbox.new_ids(project_id, session_id=session_id)) == 1
+        new_ids = await asyncio.to_thread(inbox.new_ids, project_id, session_id=session_id)
+        assert len(new_ids) == 1
 
         conflict = await asyncio.to_thread(
             store.request,
