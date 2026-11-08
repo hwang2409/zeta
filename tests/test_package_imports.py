@@ -32,8 +32,70 @@ def test_all_exports_resolve_and_cache() -> None:
         assert value is getattr(zeta, name)
 
 
-def test_protocol_exports_preserve_root_surface_and_discoverability() -> None:
+def test_public_interface_preserves_star_import_and_protocol_surface() -> None:
     import zeta
+
+    stable_exports = (
+        "DEFAULT_CODEX_MODEL",
+        "AgentLoop",
+        "ApprovalDecision",
+        "ApprovalPolicy",
+        "ApprovalRequest",
+        "AssembledContext",
+        "AbortSignal",
+        "AnthropicAuthError",
+        "AnthropicBackend",
+        "AnthropicBackendError",
+        "AnthropicHTTPError",
+        "AnthropicStreamError",
+        "CodexAuthError",
+        "CodexBackend",
+        "CodexBackendError",
+        "CodexHTTPError",
+        "CodexStreamError",
+        "BudgetExceeded",
+        "CompactionPolicy",
+        "CompletionBackend",
+        "ContentBlock",
+        "ContentType",
+        "ConversationEntry",
+        "ConversationIntegrityError",
+        "ConversationStore",
+        "ContextAssembler",
+        "ErrorInfo",
+        "ImageContent",
+        "Message",
+        "MessageRole",
+        "META_VERSION",
+        "OpenedSession",
+        "OAuthTokens",
+        "RedactedThinkingContent",
+        "SessionError",
+        "SessionManager",
+        "SessionMetadata",
+        "StaleBranchError",
+        "SummaryCompletionError",
+        "SummaryInputTooLarge",
+        "StreamEvent",
+        "StreamEventType",
+        "TextContent",
+        "ThinkingContent",
+        "ToolAbortSignal",
+        "ToolCall",
+        "ToolDefinition",
+        "ToolRegistry",
+        "ToolResult",
+        "ToolUseContent",
+        "build_authorization_url",
+        "build_messages_payload",
+        "build_responses_payload",
+        "exchange_authorization_code",
+        "env_home",
+        "extract_account_id",
+        "find_most_recent",
+        "list_sessions",
+    )
+    assert zeta.__all__ == list(stable_exports)
 
     protocol_names = {
         "ASSISTANT_RESPONSE_ABORTED",
@@ -92,8 +154,8 @@ def test_protocol_exports_preserve_root_surface_and_discoverability() -> None:
     }
     protocol = importlib.import_module("zeta.protocol.types")
 
-    assert protocol_names <= set(zeta.__all__)
     assert protocol_names <= set(dir(zeta))
+    assert set(stable_exports) <= set(dir(zeta))
     for name in protocol_names:
         value = getattr(zeta, name)
         assert value is getattr(protocol, name)
