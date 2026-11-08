@@ -669,8 +669,13 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
         calls += 1
         return _proposal(prompt)
 
-    runner, registry, project_id, _notices = _runner(
-        tmp_path, invoke, transcript_count=1, minimum_interval=0, retry_backoff_seconds=0
+    runner, registry, project_id, _notices = await asyncio.to_thread(
+        _runner,
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=0,
     )
     runner.state.record_failure(
         seq_start=1, seq_end=1, validation_summary="terminal failure", reason="test",
@@ -686,7 +691,8 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
     await runner.drain()
     before = runner.position_path.read_bytes()
 
-    refused = run_memory_command(
+    refused = await asyncio.to_thread(
+        run_memory_command,
         registry,
         project_id,
         f"retry {receipt.key}",
@@ -706,7 +712,8 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
     )
     runner.activity(1)
     await runner.drain()
-    queued = run_memory_command(
+    queued = await asyncio.to_thread(
+        run_memory_command,
         registry,
         project_id,
         f"retry {receipt.key}",
@@ -855,7 +862,7 @@ async def test_tui_current_session_repair_updates_live_memory_owner(
     from zeta.tui.slash_handlers import SlashHandlerMixin
 
     registry = ProjectRegistry(tmp_path / "projects")
-    project = registry.create_project("recovery", "test")
+    project = await asyncio.to_thread(registry.create_project, "recovery", "test")
     manager = SessionManager(tmp_path)
     current = await await_or_fail(
         asyncio.to_thread(
@@ -874,16 +881,18 @@ async def test_tui_current_session_repair_updates_live_memory_owner(
             MessageOrigin.USER,
         )
     )
-    automatic = registry.compare_and_swap_memory(
-        project.project_id,
-        expected_digest=registry.memory_digest(project.project_id),
-        updates={"state.md": "automatic\n"},
-        provenance={
-            "session_id": current.metadata.session_id,
-            "seq_start": 1,
-            "seq_end": 2,
-            "model": "offline",
-        },
+    automatic = await asyncio.to_thread(
+        lambda: registry.compare_and_swap_memory(
+            project.project_id,
+            expected_digest=registry.memory_digest(project.project_id),
+            updates={"state.md": "automatic\n"},
+            provenance={
+                "session_id": current.metadata.session_id,
+                "seq_start": 1,
+                "seq_end": 2,
+                "model": "offline",
+            },
+        )
     )
     transcript = current.store.path
     transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
@@ -942,7 +951,8 @@ async def test_tui_current_session_repair_updates_live_memory_owner(
         assert len(recovery_files) == 1
         recovery = json.loads(recovery_files[0].read_text(encoding="utf-8"))
         assert recovery["memory_step"] == "review_pending"
-        assert registry.overlapping_automatic_versions(
+        assert await asyncio.to_thread(
+            registry.overlapping_automatic_versions,
             project.project_id,
             session_id=current.metadata.session_id,
             retained_last_sequence=1,

@@ -122,8 +122,8 @@ def test_project_show_v2_returns_kind_views_and_entry_counts(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_project_inspect_reads_fixture_format_two_state(tmp_path: Path) -> None:
-    _, registry, project_id, state_id, _ = _fixture(tmp_path)
-    project = registry.show_project(project_id)
+    _, registry, project_id, state_id, _ = await asyncio.to_thread(_fixture, tmp_path)
+    project = await asyncio.to_thread(registry.show_project, project_id)
     tool_registry = SimpleNamespace(
         project_registry=registry,
         project_id=project_id,
