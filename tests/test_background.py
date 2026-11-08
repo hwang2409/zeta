@@ -1177,8 +1177,8 @@ async def test_unobserved_failed_store_close_is_not_retried(tmp_path: Path) -> N
     owner.mark_store_finished(store)
     owner.release_unused_stores()
     (task,) = tuple(owner._store_close_tasks)
-    await asyncio.wait({task})
-    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.wait({task}), 10)
+    await asyncio.wait_for(asyncio.sleep(0), 10)
     assert task._log_traceback  # callback did not retrieve the failure
 
     # a later child completion releases stores before anyone observed the failure
