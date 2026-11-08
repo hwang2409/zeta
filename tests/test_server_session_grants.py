@@ -1284,13 +1284,22 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
 
 @pytest.mark.parametrize(
     "case",
-    ["normal_owner", "duplicate", "deny", "cancel_publish"],
+    [
+        "normal_owner",
+        "duplicate",
+        "deny",
+        "external_end",
+        "cancel_settle",
+        "cancel_finish",
+        "cancel_publish",
+        "restart_replay",
+    ],
 )
 @pytest.mark.asyncio
 async def test_session_grant_lifecycle_table_over_unix_protocol(
     tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Exercise each grant outcome through the public unix serve protocol."""
+    """Exercise grant ownership, cancellation, and replay through unix serve."""
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[ToolCall("call-1", "bash", {"command": "true"})]),
@@ -1318,7 +1327,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 for frame in _buffer(reader)
             )
         else:
-            if case == "cancel_publish":
+            if case in {"cancel_settle", "cancel_finish", "cancel_publish"}:
                 entered = asyncio.Event()
                 release = asyncio.Event()
                 original = server.control.publish_session_grant_change
@@ -1345,7 +1354,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     {"request_id": "call-1", "scope": "always_tool"},
                 )
             )
-            if case == "cancel_publish":
+            if case in {"cancel_settle", "cancel_finish", "cancel_publish"}:
                 await await_or_fail(entered.wait(), what="grant publication")
                 record = server.control._approvals.state.records.get("call-1")
                 if record is not None and record.settlement is not None:
@@ -1353,7 +1362,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 else:
                     approve.cancel()
                 release.set()
-            if case == "cancel_publish":
+            if case in {"cancel_settle", "cancel_finish", "cancel_publish"}:
                 with pytest.raises((asyncio.CancelledError, AssertionError)):
                     await await_or_fail(approve, what="canceled approve")
                 assert server.runtime.policy is not None
@@ -1363,7 +1372,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
             else:
                 frames = await await_or_fail(approve, what="approve response")
                 assert frames[-1]["result"]["decision"] == "approve"
-            if case == "cancel_publish":
+            if case in {"cancel_settle", "cancel_finish", "cancel_publish"}:
                 grant_events = [await _event(reader, "session_grants_changed")]
             else:
                 grant_events = [
@@ -1383,11 +1392,12 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     )
                 )[-1]
                 assert duplicate["error"]["code"] == -32006
-        if case != "cancel_publish":
+        if case not in {"cancel_settle", "cancel_finish", "cancel_publish"}:
             snapshot = (await _request(reader, writer, 6, "session_grants"))[-1][
                 "result"
             ]
             assert snapshot["session_grants"] == ([] if case == "deny" else ["bash"])
             await _frames_until_event(reader, "turn_end")
+        assert not server.control._approvals.state.records
     finally:
         await close_serve(server, writer)
