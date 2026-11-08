@@ -349,6 +349,60 @@ async def test_child_history_preserves_corrupt_child_diagnosis_over_unix_socket(
 
 
 @pytest.mark.asyncio
+async def test_child_history_discards_obsolete_corruption_diagnosis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    child.close()
+    transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+    valid = transcript.read_bytes()
+    with transcript.open("ab") as stream:
+        stream.write(b"{not json}\n")
+    original_read_fd = ConversationStore._read_fd
+    replaced = False
+
+    def repair_after_read(fd: int, length: int) -> bytes:
+        nonlocal replaced
+        raw = original_read_fd(fd, length)
+        if not replaced and os.fstat(fd).st_ino == transcript.stat().st_ino:
+            replacement = transcript.with_suffix(".replacement")
+            replacement.write_bytes(valid)
+            os.replace(replacement, transcript)
+            replaced = True
+        return raw
+
+    # test-contract: seam repairs the source between observer g0 and g1
+    monkeypatch.setattr(ConversationStore, "_read_fd", staticmethod(repair_after_read))
+    try:
+        reply = (
+            await request(
+                reader,
+                writer,
+                3,
+                "child_run_history",
+                {"session_id": session_id, "run_id": f"{session_id}:1"},
+            )
+        )[-1]
+        assert "error" not in reply, reply
+        assert reply["result"]["messages"][-1]["content"][0]["text"] == "complete"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_child_history_bounds_persistent_source_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

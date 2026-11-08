@@ -771,11 +771,19 @@ class ConversationLogMixin:
         candidate = raw[:complete_end]
         baseline = (len(self._entries), self._entry_prefix_digest)
         validator = _FullLoadValidator(self, candidate, g0)
-        for physical_row in self._iter_physical_rows(candidate, g0, validator.validated_prefix):
-            validator.accept(physical_row)
-        validator.finish(install=False)
+        validation_error: ConversationIntegrityError | None = None
+        try:
+            for physical_row in self._iter_physical_rows(
+                candidate, g0, validator.validated_prefix
+            ):
+                validator.accept(physical_row)
+            validator.finish(install=False)
+        except ConversationIntegrityError as exc:
+            validation_error = exc
         if self._check_observer_source(g0, retry_source_change):
             return
+        if validation_error is not None:
+            raise validation_error
         if complete_end < g0.st_size and not self._observer_append_active():
             self._load_full()
             return
