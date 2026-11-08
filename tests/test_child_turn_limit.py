@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from io import StringIO
 from pathlib import Path
@@ -10,6 +11,7 @@ from rich.console import Console
 import zeta.agent.runner as agent_runner_module
 from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.agent import pending_delivery as pending_delivery_module
 from zeta.agent.receipt import build_agent_receipt, has_agent_receipt_suffix
 from zeta.agent.turn_limit import (
     ChildTurnControl,
@@ -222,6 +224,157 @@ async def test_empty_final_child_completion_does_not_nudge_past_hard_limit(
         await loop.close()
 
 
+@pytest.mark.asyncio
+async def test_profile_turn_limit_allows_final_tool_batch_then_stops(
+    tmp_path: Path,
+) -> None:
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+    durable_effect = tmp_path / "effect"
+
+    async def recording_tool(arguments: dict[str, object]) -> str:
+        del arguments
+        tool_started.set()
+        await asyncio.wait_for(release_tool.wait(), timeout=10)
+        durable_effect.write_text("finished", encoding="utf-8")
+        return "tool complete"
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("record-1", "record", {})]),
+            ScriptedTurn([TextContent("must not run")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.register("record", recording_tool)
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=3,
+        agent_instance_id="root:1",
+        child_turn_control=ChildTurnControl(1, str(store.session_dir)),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    turn = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await asyncio.wait_for(tool_started.wait(), timeout=10)
+        release_tool.set()
+        events = await asyncio.wait_for(turn, timeout=10)
+        assert durable_effect.read_text(encoding="utf-8") == "finished"
+        second_completion_started = len(backend.calls) > 1
+        assert second_completion_started is False
+        assert sum(
+            event.type is StreamEventType.TOOL_EXECUTION_START for event in events
+        ) == 1
+    finally:
+        release_tool.set()
+        if not turn.done():
+            turn.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(turn, return_exceptions=True), timeout=10
+            )
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_during_final_tool_batch_is_terminally_rejected(
+    tmp_path: Path,
+) -> None:
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+    final_tool_finished = False
+
+    async def wait_tool(arguments: dict[str, object]) -> str:
+        nonlocal final_tool_finished
+        del arguments
+        tool_started.set()
+        try:
+            await asyncio.wait_for(release_tool.wait(), timeout=10)
+            final_tool_finished = True
+            return "tool complete"
+        finally:
+            release_tool.set()
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("wait-1", "wait", {})]),
+            ScriptedTurn([TextContent("must not run")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.register("wait", wait_tool)
+    control = ChildTurnControl(1, str(store.session_dir))
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=3,
+        agent_instance_id="root:1",
+        child_turn_control=control,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    turn = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await asyncio.wait_for(tool_started.wait(), timeout=10)
+        await loop.step_delivery.produce(
+            pending_delivery_module.PromptInput(
+                "next step", MessageOrigin.AGENT_SEND, None
+            )
+        )
+        release_tool.set()
+        await asyncio.wait_for(turn, timeout=10)
+        assert final_tool_finished is True
+        follow_up_processed = len(backend.calls) > 1
+        second_completion_started = len(backend.calls) > 1
+        assert follow_up_processed is False
+        assert second_completion_started is False
+    finally:
+        release_tool.set()
+        if not turn.done():
+            turn.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(turn, return_exceptions=True), timeout=10
+            )
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_with_one_lifetime_completion_left_uses_only_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate_called = False
+
+    async def gate(*args, **kwargs):
+        nonlocal gate_called
+        del args, kwargs
+        gate_called = True
+        raise AssertionError("finish gate must not run after the hard limit")
+
+    monkeypatch.setattr(agent_runner_module, "run_finish_gate", gate)
+    backend, result, _store, loop = await _run_limited_child(
+        tmp_path,
+        profile_limit=1,
+        turns=1,
+        monkeypatch=monkeypatch,
+    )
+    try:
+        assert len(backend.calls) == 1
+        assert gate_called is False
+        assert result.structured_content is not None
+        assert result.structured_content["status"] == "turn_limit"
+    finally:
+        await loop.close()
+
+
 async def _run_limited_background(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[ConversationStore, AgentLoop, dict[str, object]]:
@@ -401,7 +554,7 @@ def test_turn_limit_marker_rejects_changed_version_or_path(
     assert parse_turn_limit_result(mutation(marked), tmp_path) is None
 
 
-def test_serve_history_projects_turn_limit_and_handoff(tmp_path: Path) -> None:
+def test_serve_replay_maps_turn_limit_receipt(tmp_path: Path) -> None:
     marked = build_turn_limit_result(_completed_receipt(), tmp_path)
     data = {
         "origin": "notification",
