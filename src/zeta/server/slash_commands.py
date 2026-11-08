@@ -27,7 +27,10 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
-from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
+from ..core.transcript_recovery.runtime import (
+    repair_transcript_for_runtime,
+    transcript_repair_available,
+)
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
@@ -407,6 +410,8 @@ async def list_commands(
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
     entries = _entries_from_registry(registry, include_unavailable=include_unavailable)
+    if not transcript_repair_available(runtime.manager):
+        entries = [entry for entry in entries if entry.name != "repair-transcript"]
     return {
         "commands": [entry.to_dict() for entry in entries],
         "notices": list(registry.notices),

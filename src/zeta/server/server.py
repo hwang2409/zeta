@@ -14,7 +14,10 @@ from typing import Any
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
-from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
+from ..core.transcript_recovery.runtime import (
+    TranscriptRepairRequiresUpgrade,
+    repair_transcript_for_runtime,
+)
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -419,6 +422,18 @@ class _Client:
                             ErrorDescriptor.PROJECT_REGISTRY_BUSY,
                             str(exc),
                             {"retryable": exc.retryable},
+                        )
+                    )
+                except TranscriptRepairRequiresUpgrade as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+                            str(exc),
+                            {
+                                "home_epoch": exc.home_epoch,
+                                "required_epoch": exc.required_epoch,
+                            },
                         )
                     )
                 except TranscriptLoadError as exc:
@@ -894,6 +909,8 @@ class _Client:
                     else None
                 ),
             )
+        except TranscriptRepairRequiresUpgrade:
+            raise
         except (ValueError, SessionError) as exc:
             raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
         return {

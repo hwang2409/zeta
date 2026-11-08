@@ -609,6 +609,12 @@ STRUCTURED_ERROR_FIXTURES = (
         {"session_id": "s1"},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session missing","data":{"code":"session_not_found","session_id":"s1"}}}\n',
     ),
+    (
+        ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+        "transcript repair needs the stored-format upgrade (home epoch 2, needs 4)",
+        {"home_epoch": 2, "required_epoch": 4},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32013,"message":"transcript repair needs the stored-format upgrade (home epoch 2, needs 4)","data":{"code":"transcript_repair_requires_upgrade","home_epoch":2,"required_epoch":4}}}\n',
+    ),
 )
 
 

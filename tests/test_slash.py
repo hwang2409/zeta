@@ -787,6 +787,55 @@ async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_pat
     )
 
 
+@pytest.mark.parametrize("bad_row", [b'{"broken":\n', b'{"broken":'])
+@pytest.mark.asyncio
+async def test_epoch_two_tui_repair_command_returns_upgrade_message(
+    tmp_path: Path,
+    bad_row: bytes,
+) -> None:
+    from tests.support.owned import await_or_fail
+    from zeta.core.session import SessionManager
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
+    manager = SessionManager(tmp_path)
+    current = await await_or_fail(
+        asyncio.to_thread(
+            manager.create,
+            provider="codex",
+            model="offline",
+            cwd=tmp_path,
+            auto_project=False,
+        ),
+        what="create current session",
+    )
+    transcript = current.store.path
+    transcript.write_bytes(transcript.read_bytes() + bad_row)
+    unchanged = {
+        str(path.relative_to(tmp_path)): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and not path.name.startswith(".storage-format")
+    }
+    tui = SimpleNamespace(
+        loop=SimpleNamespace(manager=manager, store=current.store, memory_reconciler=None)
+    )
+    try:
+        output = await SlashHandlerMixin.slash_repair_transcript(
+            tui, f"{current.metadata.session_id} confirm"
+        )
+        assert output == (
+            "transcript repair needs the stored-format upgrade "
+            "(home epoch 2, needs 4)"
+        )
+        assert {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file() and not path.name.startswith(".storage-format")
+        } == unchanged
+    finally:
+        current.store.close()
+
+
 @pytest.mark.asyncio
 async def test_tui_current_session_repair_updates_live_memory_owner(
     tmp_path: Path,

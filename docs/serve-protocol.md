@@ -974,6 +974,7 @@ Error descriptors are:
 | `controller_output_overflow` | `-32011` | none | controller output overflow |
 | `observer_output_overflow` | `-32011` | none | observer output overflow |
 | `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `transcript_repair_requires_upgrade` | `-32013` | `transcript_repair_requires_upgrade` | transcript repair requires the stored-format upgrade |
 | `corrupt_transcript` | `-32000` | `corrupt_transcript` | transcript is corrupt or uses an unsupported format |
 | `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
 | `account_lock_timeout` | `-32008` | `account_lock_timeout` | another process holds the selected account lock |
