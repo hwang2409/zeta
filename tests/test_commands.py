@@ -45,6 +45,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import bash as bash_module
 from zeta.tools._shared.shell import (
     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,
     INLINE_SHELL_OUTPUT_LIMIT_MESSAGE,
@@ -2204,7 +2205,18 @@ async def test_background_macro_start_preflight_failure_closes_created_log(
 
 async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    log_opened = asyncio.Event()
+    real_open_log = bash_module.open_log_off_loop
+
+    async def open_log(opener):
+        handle = await real_open_log(opener)
+        log_opened.set()
+        return handle
+
+    # test-contract: seam abort only after the macro owns its process log
+    monkeypatch.setattr(bash_module, "open_log_off_loop", open_log)
     home = tmp_path / "home"
     _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30\n")
     output = StringIO()
@@ -2226,6 +2238,7 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
         # test-contract: seam no public event reports active provider-turn completion.
         task = app._active_task
         assert task is not None
+        await await_or_fail(log_opened.wait(), what="macro log ownership")
         app.abort_active()
         await asyncio.wait_for(task, timeout=10)
 
