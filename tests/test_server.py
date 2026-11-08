@@ -60,6 +60,7 @@ from tests.support.server_client import (
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountId, AccountStore, AccountUsage
+from zeta.attention_records import AttentionStore
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata, persist_metadata_change
@@ -71,6 +72,7 @@ from zeta.core.store import (
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken, token_store_path
 from zeta.oauth import OAuthTokens
+from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
@@ -8061,9 +8063,184 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
     fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
     rows = fixture.read_text().splitlines()
     assert rows[0] == (
-        "# baseline origin/main 66c084d8; accepted deltas: W1, W2, W3, W5, text->output"
+        "# baseline origin/main 66c084d8; accepted deltas: "
+        "W1, W2, W3, W5, text->output, decisions"
     )
     assert observed == rows[1:]
+
+
+@pytest.mark.asyncio
+async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
+    tmp_path: Path,
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        opened = server.runtime.opened
+        assert opened is not None
+        registry = server.runtime.manager.project_registry
+        assert registry is not None
+        project_record = registry.create_project("serve attention", "test")
+        project_id = project_record.project_id
+        store = AttentionStore(opened.store.session_dir)
+        decision = store.request(
+            session_id=session_id,
+            project_id=project_id,
+            entry_id=None,
+            entry_seq=None,
+            title="choose",
+            why="choose one",
+        )
+        answer = store.request(
+            session_id=session_id,
+            project_id=project_id,
+            entry_id=None,
+            entry_seq=None,
+            title="status",
+            why="an answer",
+            kind="answer",
+        )
+
+        listed = (
+            await _request(
+                reader,
+                writer,
+                "list-attention",
+                "slash_run",
+                {"session_id": session_id, "text": "/decisions"},
+            )
+        )[-1]["result"]["text"]
+        assert listed.index(f"{decision.id} [decision]") < listed.index(
+            f"{answer.id} [answer]"
+        )
+
+        dismissed = (
+            await _request(
+                reader,
+                writer,
+                "dismiss-answer",
+                "slash_run",
+                {
+                    "session_id": session_id,
+                    "text": f"/decisions dismiss {answer.id}",
+                },
+            )
+        )[-1]["result"]
+        assert dismissed["kind"] == "output"
+        assert store.get(answer.id).status == "resolved"
+        assert store.get(answer.id).decision is None
+        assert ProjectInbox(
+            registry, sessions_root=tmp_path / "home" / "sessions"
+        ).new_ids(project_id, session_id=session_id) == ()
+
+        refused = (
+            await _request(
+                reader,
+                writer,
+                "dismiss-decision",
+                "slash_run",
+                {
+                    "session_id": session_id,
+                    "text": f"/decisions dismiss {decision.id}",
+                },
+            )
+        )[-1]
+        assert "error" in refused
+        assert "require a reply" in refused["error"]["message"]
+
+        reply = store.request(
+            session_id=session_id,
+            project_id=project_id,
+            entry_id=None,
+            entry_seq=None,
+            title="later",
+            why="a deferred item",
+            kind="deferred",
+        )
+        replied = (
+            await _request(
+                reader,
+                writer,
+                "reply-answer",
+                "slash_run",
+                {
+                    "session_id": session_id,
+                    "text": f"/decisions reply {reply.id} follow up",
+                },
+            )
+        )[-1]["result"]
+        assert replied["kind"] == "output"
+        inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
+        message_ids = inbox.new_ids(project_id, session_id=session_id)
+        assert len(message_ids) == 1
+        message = inbox.claim(
+            project_id, message_ids[0], session_id
+        )
+        assert message is not None
+        assert "follow up" in message["body"]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_request_attention_kind_is_in_tool_end_result(
+    tmp_path: Path,
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "attention-call",
+                        "request_attention",
+                        {"title": "answer", "why": "context", "kind": "answer"},
+                    )
+                ]
+            ),
+            ScriptedTurn([TextContent("done")]),
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "default-attention-call",
+                        "request_attention",
+                        {"title": "decision", "why": "choose"},
+                    )
+                ]
+            ),
+            ScriptedTurn([TextContent("done again")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path / "home",
+        cwd=project,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    try:
+        await _request(
+            reader, writer, "send-attention", "send", {"text": "request it"}
+        )
+        end = await _event(reader, "tool_end")
+        assert end["tool_result"]["structured_content"]["kind"] == "answer"
+        await _event(reader, "assistant_message")
+        await _event(reader, "turn_end")
+        await _request(
+            reader, writer, "send-default-attention", "send", {"text": "ask again"}
+        )
+        default_end = await _event(reader, "tool_end")
+        assert default_end["tool_result"]["structured_content"]["kind"] == "decision"
+        await _event(reader, "assistant_message")
+        await _event(reader, "turn_end")
+
+        assert AttentionStore(
+            server.runtime.opened.store.session_dir  # type: ignore[union-attr]
+        ).list()[0].kind == "answer"
+    finally:
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -8357,6 +8534,38 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             )
         )[-1]["error"]
         assert wrong_session["code"] == -32003
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/tmp",
+        "/tmp is full",
+        "/Users/henry/x.py is broken",
+        "/this is pasted prose\nsecond line",
+        "//foo",
+    ],
+)
+@pytest.mark.asyncio
+async def test_serve_slash_run_keeps_slash_like_model_text(
+    tmp_path: Path, text: str
+) -> None:
+    server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "slash-model-text",
+                "slash_run",
+                {"session_id": sid, "text": text},
+            )
+        )[-1]["result"]
+        name = text.split("\n", 1)[0][1:].split(maxsplit=1)[0]
+        assert result == {"kind": "unknown", "name": name}
     finally:
         await close_serve(server, writer)
 
@@ -9086,9 +9295,18 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         result = (await run("/fork"))["result"]
         assert result == {"kind": "client_only", "name": "fork"}
 
-        # Unknown commands are rejected structurally, never posted to the model.
-        result = (await run("/nosuchcommand"))["result"]
-        assert result == {"kind": "unknown", "name": "nosuchcommand"}
+        # Unknown slash-safe commands return a visible error, never model input.
+        result = (await run("/statu"))["result"]
+        assert result == {
+            "kind": "error",
+            "text": (
+                "unknown command /statu. type // to send it as text. "
+                "did you mean /status?"
+            ),
+        }
+        # Paths remain unhandled by the shared slash dispatcher.
+        result = (await run("/Users/henry/x"))["result"]
+        assert result["kind"] == "unknown"
 
         # Text that does not start with `/` is a shape error, not a passthrough.
         error = (await run("hello"))["error"]
