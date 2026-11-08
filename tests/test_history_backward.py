@@ -26,6 +26,7 @@ pytest_plugins = ("tests.support.socket_fixtures",)
 
 def _entry(number: int) -> SimpleNamespace:
     return SimpleNamespace(
+        seq=0,
         id=f"message-{number}", type="message",
         data={"message": {"role": "user", "content": [{"type": "text", "text": "text"}]}},
     )
@@ -216,6 +217,7 @@ def test_backward_rejects_cursor_past_stable_end_and_terminal_append() -> None:
     assert error.value.code == -32602
 
     store.entries.append(SimpleNamespace(
+        seq=0,
         id="approval-end", type="approval_history", data={"event": "approval_end"}
     ))
     store._log_offset += 1
@@ -253,6 +255,7 @@ def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.Mon
     monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 4_000)
     group = SimpleNamespace(
+        seq=0,
         id="approval",
         type="approval_history",
         data={"event": "approval_request", "tool_call": {"arguments": {f"k{i}": "x" * 8000 for i in range(20)}}},
@@ -272,6 +275,7 @@ def test_backward_near_limit_continuation_keeps_atomic_group(monkeypatch: pytest
     monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 1_400)
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 1_400)
     atomic = SimpleNamespace(
+        seq=0,
         id="atomic",
         type="message",
         data={
@@ -455,6 +459,7 @@ def test_backward_after_forward_cache_reprojects_for_real_cursor(
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 8_000)
     for size in range(6_700, 7_300):
         big = SimpleNamespace(
+            seq=0,
             id="big", type="message",
             data={"message": {"role": "user", "content": [{"type": "text", "text": "x" * size}]}},
         )
@@ -490,6 +495,7 @@ def test_forward_walk_progresses_when_last_group_is_near_limit(
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 8_000)
     for size in range(6_700, 7_300):
         big = SimpleNamespace(
+            seq=0,
             id="big", type="message",
             data={"message": {"role": "user", "content": [{"type": "text", "text": "x" * size}]}},
         )

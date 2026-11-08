@@ -135,7 +135,11 @@ TIMEOUT = 30
 
 def _client_notifier(client: _Client):
     async def notify(
-        event: EventDescriptor, session_id: str | None = None, **fields: object
+        event: EventDescriptor,
+        session_id: str | None = None,
+        *,
+        replay_row: object = None,  # replay covers; this raw client has no stream
+        **fields: object,
     ) -> bool:
         return await client._write(
             client.codec.notification(event, session_id, **fields)
@@ -1595,6 +1599,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
     entries = Snapshot(
         (
             SimpleNamespace(
+                seq=0,
                 id="message-1",
                 type="message",
                 data={
@@ -1605,6 +1610,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
                 },
             ),
             SimpleNamespace(
+                seq=0,
                 id="message-2",
                 type="message",
                 data={

@@ -785,11 +785,8 @@ class ApprovalLifecycle:
                     "decision": "abort",
                     "reason": reason or "turn_canceled",
                 }
-                try:
-                    # no resolution row was written: the end is live-only
-                    await asyncio.shield(
-                        self._finish_record(record, synthetic, replay_row=WRITE_FAILED)
-                    )
+                try:  # no resolution row was written: the end is live-only
+                    await asyncio.shield(self._finish_record(record, synthetic, WRITE_FAILED))
                 except BaseException as exc:
                     self._release_gate(record, error=exc)
                     raise
@@ -963,11 +960,7 @@ class ApprovalLifecycle:
         return True
 
     async def _finish_record(
-        self,
-        record: ApprovalRecord,
-        resolution: dict[str, str],
-        *,
-        replay_row: RowFacts | None = None,
+        self, record: ApprovalRecord, resolution: dict[str, str], row: RowFacts | None = None
     ) -> None:
         current = self._state.records.get(record.target.key)
         if (
@@ -1012,15 +1005,10 @@ class ApprovalLifecycle:
                 if isinstance(record.target.key, tuple):
                     terminal = record.terminal
                     session_id = self._session_id()
+                    written = history_outcome is None and record.history_published
                     end_result = self._admit(
-                        EventDescriptor.APPROVAL_END,
-                        session_id,
-                        replay_row=(
-                            DELEGATED
-                            if history_outcome is None and record.history_published
-                            else WRITE_FAILED
-                        ),
-                        **payload,
+                        EventDescriptor.APPROVAL_END, session_id,
+                        replay_row=DELEGATED if written else WRITE_FAILED, **payload,
                     )
                     terminal_result = (
                         self._admit(EventDescriptor.TOOL_END, session_id, **terminal[2])
@@ -1039,7 +1027,7 @@ class ApprovalLifecycle:
                             StreamEventType.TOOL_APPROVAL_END
                         ],
                         session_id=self._session_id(),
-                        replay_row=replay_row,
+                        replay_row=row,
                         **payload,
                     )
                     record = self._change(record, live_end=admission)

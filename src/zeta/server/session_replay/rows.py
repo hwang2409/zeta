@@ -224,7 +224,7 @@ def route(
     try:
         return ROUTES[(event, variant_name)]
     except KeyError:
-        raise UnroutedEvent(f"{event.value}/{variant_name or '-'}") from None
+        raise UnroutedEvent(f"{event}/{variant_name or '-'}") from None
 
 
 def covers(

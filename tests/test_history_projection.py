@@ -15,6 +15,7 @@ from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCod
 
 def _entry(number: int, text: str = "text") -> SimpleNamespace:
     return SimpleNamespace(
+        seq=0,
         id=f"message-{number}",
         type="message",
         data={
@@ -122,6 +123,7 @@ def test_session_history_keeps_frame_fitting_approval_and_notification_bytes() -
     payload = "p" * 16_000
     entries = (
         SimpleNamespace(
+            seq=0,
             id="approval-1",
             type="message",
             data={
@@ -147,6 +149,7 @@ def test_session_history_keeps_frame_fitting_approval_and_notification_bytes() -
             },
         ),
         SimpleNamespace(
+            seq=0,
             id="notification-1",
             type="notification",
             data={"kind": "agent_completion", "text": "done", "payload": payload},
@@ -200,6 +203,7 @@ def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
     [
         (
             SimpleNamespace(
+                seq=0,
                 id="message-result",
                 type="message",
                 data={
@@ -217,6 +221,7 @@ def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
         ),
         (
             SimpleNamespace(
+                seq=0,
                 id="notification-1",
                 type="notification",
                 data={
@@ -228,6 +233,7 @@ def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
         ),
         (
             SimpleNamespace(
+                seq=0,
                 id="approval-request-1",
                 type="message",
                 data={
@@ -248,6 +254,7 @@ def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
         ),
         (
             SimpleNamespace(
+                seq=0,
                 id="approval-request-2",
                 type="message",
                 data={
@@ -265,6 +272,7 @@ def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
                 },
             ),
             SimpleNamespace(
+                seq=0,
                 id="approval-end-2",
                 type="approval_resolution",
                 data={"request_id": "request-2", "decision": "allow"},
@@ -272,6 +280,7 @@ def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
         ),
         (
             SimpleNamespace(
+                seq=0,
                 id="approval-history-end",
                 type="approval_history",
                 data={
