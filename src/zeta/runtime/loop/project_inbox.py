@@ -33,6 +33,16 @@ class ProjectInboxNotificationMixin:
             return
         self._inbox_scanner = self._new_project_inbox_scanner()
         await self._check_project_inbox()
+        tracker = self._inbox_scanner.tracker
+        if tracker is not None and tracker.health()["state"] == "broken":
+            await self._append_turn_message(
+                harness_notice(
+                    "inbox sent history",
+                    tracker.health_text(),
+                    event=SENT_STATUS_EVENT,
+                    metadata={"sent_ledger_health": tracker.health()},
+                )
+            )
         watcher = asyncio.create_task(self._watch_project_inbox())
         self._tracked_tasks.add(watcher)
         watcher.add_done_callback(self._tracked_tasks.discard)

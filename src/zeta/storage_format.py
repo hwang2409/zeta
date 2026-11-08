@@ -575,6 +575,7 @@ class WriterLease:
         publish: PublishBytes,
         path: tuple[str, ...] = (),
         initial: object | None = None,
+        validate: Callable[[object], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Patch and explicitly delete object records by identity."""
 
@@ -585,12 +586,16 @@ class WriterLease:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
                 raw: object = ([] if not path else {}) if initial is None else initial
+                exists = False
             else:
+                exists = True
                 try:
                     with os.fdopen(fd, "rb") as stream:
                         raw = json.load(stream)
                 except (OSError, ValueError) as exc:
                     raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+            if validate is not None and exists:
+                validate(raw)
             records = raw
             if path:
                 if type(raw) is not dict:

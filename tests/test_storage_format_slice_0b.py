@@ -798,8 +798,9 @@ def test_closed_variant_readers_reject_without_mutation(
         },
     )
     before = ledger.read_bytes()
-    with pytest.raises(InboxError):
-        SentMessageTracker(home / "sessions", "2" * 32)
+    tracker = SentMessageTracker(home / "sessions", "2" * 32)
+    assert tracker.health()["state"] == "broken"
+    assert tracker.health()["reason"] == "invalid_records"
     assert ledger.read_bytes() == before
 
     monkeypatch.setitem(

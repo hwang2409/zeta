@@ -1415,3 +1415,39 @@ async def test_done_without_reply_injects_completed_status(tmp_path: Path) -> No
     finally:
         await loop.close()
         store.close()
+
+
+def test_broken_sent_ledger_projects_authoritative_delivery_without_writing(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    session_dir = home / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    ledger = session_dir / "project-inbox-sent.json"
+    original = b'{"schema_version":1,"records":[\n'
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    ledger.write_bytes(original)
+    inbox = ProjectInbox(
+        registry, sessions_root=home / "sessions", sent_tracker=tracker
+    )
+    try:
+        message_id = inbox.send(
+            from_project=project_a.project_id,
+            from_session=session_id,
+            to_project=project_b.project_id,
+            kind="bug_report",
+            title="broken ledger",
+            body="delivered",
+            message_id="f" * 32,
+        )
+    except InboxError:
+        message_id = None
+
+    assert message_id == "f" * 32
+    assert ledger.read_bytes() == original
+    result = inbox.sent(project_a.project_id, session_id=session_id)
+    assert result["history_complete"] is False
+    assert result["state"] == "broken"
+    assert [item["id"] for item in result["messages"]] == [message_id]
+    assert result["messages"][0]["reported"] == []

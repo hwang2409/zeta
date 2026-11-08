@@ -170,6 +170,7 @@ def _bound(registry: ToolRegistry) -> tuple[ProjectInbox, str, str]:
             projects,
             sessions_root=projects.root.parent / "sessions",
             sent_tracker=tracker,
+            receipts=store.sent_message_receipts(),
         ),
         registry.project_id,
         store.session_id,
@@ -204,7 +205,13 @@ async def _inbox(
                 in_reply_to=arguments.get("in_reply_to"),
                 message_id=arguments.get("id"),
             )
-            return _result("send", project_id, {"id": message_id})
+            result = {"id": message_id}
+            if inbox.sent_tracker is not None:
+                result["sent_health"] = inbox.sent_tracker.health()
+                warning = inbox.sent_tracker.health_text()
+                if warning:
+                    result["warning"] = warning
+            return _result("send", project_id, result)
         if action == "list":
             status = arguments.get("status", "new")
             state = inbox.list(project_id, session_id=session_id)
@@ -238,7 +245,13 @@ async def _inbox(
             arguments["outcome"],
             reply=arguments.get("reply"),
         )
-        return _result("done", project_id, {"message": message})
+        result = {"message": message}
+        if inbox.sent_tracker is not None:
+            result["sent_health"] = inbox.sent_tracker.health()
+            warning = inbox.sent_tracker.health_text()
+            if warning:
+                result["warning"] = warning
+        return _result("done", project_id, result)
     except (InboxError, ProjectRegistryError, OSError, KeyError, TypeError) as exc:
         return _error(str(exc))
 
