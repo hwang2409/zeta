@@ -995,46 +995,6 @@ class ProjectRegistry(
         finally:
             os.close(directory_fd)
 
-    @staticmethod
-    def _append_reference_blob(directory_fd: int, blob: bytes) -> None:
-        """Append pre-encoded reference bytes to the pinned JSONL file safely."""
-        try:
-            try:
-                os.stat("sessions.jsonl", dir_fd=directory_fd, follow_symlinks=False)
-                created = False
-            except FileNotFoundError:
-                created = True
-            fd = os.open(
-                "sessions.jsonl",
-                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                0o600,
-                dir_fd=directory_fd,
-            )
-            info = os.fstat(fd)
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) & 0o077
-            ):
-                os.close(fd)
-                raise ProjectRegistryError("project session references are unsafe")
-            if (
-                info.st_size + len(blob)
-                > MAX_SESSION_REFERENCES * MAX_SESSION_REFERENCE_SIZE
-            ):
-                os.close(fd)
-                raise ProjectRegistryError("project session reference limit exceeded")
-            with os.fdopen(fd, "ab") as stream:
-                stream.write(blob)
-                stream.flush()
-                os.fsync(stream.fileno())
-            if created:
-                os.fsync(directory_fd)
-        except ProjectRegistryError:
-            raise
-        except OSError as exc:
-            raise ProjectRegistryError("cannot record project session") from exc
-
     def initialize_memory(self, project_id: str) -> None:
         """Create the standard memory files without overwriting human edits."""
         with self._project_lock(

@@ -96,7 +96,7 @@ def test_registry_lock_wait_is_bounded(
     fcntl.flock(fd, fcntl.LOCK_EX)
     # test-contract: seam force the registry lock-timeout path
     monkeypatch.setattr(
-        "zeta.project_registry._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05
+        "zeta.project_locking._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05
     )
     finished = threading.Event()
     outcome: list[BaseException] = []
@@ -304,8 +304,8 @@ async def test_new_tui_keeps_healthy_project_context(
     _case: str,
     corrupt: Callable[[Path, Path, Path], None],
 ) -> None:
-    home, repository, healthy_id, malformed_id = _project_context_isolation_case(
-        tmp_path, corrupt
+    home, repository, healthy_id, malformed_id = await asyncio.to_thread(
+        _project_context_isolation_case, tmp_path, corrupt
     )
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(repository)
@@ -388,8 +388,8 @@ async def test_serve_new_session_keeps_healthy_project_context(
     _case: str,
     corrupt: Callable[[Path, Path, Path], None],
 ) -> None:
-    home, repository, healthy_id, _malformed_id = _project_context_isolation_case(
-        tmp_path, corrupt
+    home, repository, healthy_id, _malformed_id = await asyncio.to_thread(
+        _project_context_isolation_case, tmp_path, corrupt
     )
 
     prompt = await _serve_new_session_prompt(home, repository)
@@ -478,7 +478,7 @@ async def test_broken_registry_serve_hello_without_repair(
     corrupt: Callable[[Path, Path, Path], None],
 ) -> None:
     home = tmp_path / "home"
-    record = _corrupt_registry(home, corrupt)
+    record = await asyncio.to_thread(_corrupt_registry, home, corrupt)
     projects = home / "projects"
     before = _registry_snapshot(projects)
     try:
@@ -504,8 +504,10 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
     await asyncio.to_thread(
         subprocess.run, ["git", "init", "-q", str(repository)], check=True
     )
-    registry = ProjectRegistry(home / "projects")
-    project = registry.create_project("healthy", "git", repository)
+    registry = await asyncio.to_thread(ProjectRegistry, home / "projects")
+    project = await asyncio.to_thread(
+        registry.create_project, "healthy", "git", repository
+    )
     memory_dir = registry.root / project.project_id / "memory"
     (memory_dir / "state.md").write_bytes(b"\xff")
     skill_index = SkillCatalog.empty().index()
@@ -930,6 +932,10 @@ def test_only_registry_state_constructs_project_registry() -> None:
     offenders = []
     for path in source_root.rglob("*.py"):
         if path.name in {"project_registry.py", "project_registry_state.py"}:
+            continue
+        # ssh ships project_publish.py source to uninstalled peers and binds the
+        # bare ProjectRegistry name to its dependency-free class there.
+        if path.relative_to(source_root) == Path("remote_sync/project_publish.py"):
             continue
         if "ProjectRegistry(" in path.read_text(encoding="utf-8"):
             offenders.append(path.relative_to(source_root))

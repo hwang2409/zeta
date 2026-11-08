@@ -34,6 +34,7 @@ from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistry
 from ..runtime.project_registry_state import project_registry
 from ..storage_format import reject_unknown_keys
 from .errors import RemoteSyncError
+from .pinned_project import copy_pinned_project_snapshot, pin_project_snapshot
 from .project_publish import (
     MAX_SYNC_STATE_SIZE,
     ProjectPublicationError,
@@ -401,7 +402,7 @@ def fetch_local_project(
                     and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE
                 ):
                     raise RemoteSyncError(f"memory file {name} is too large")
-            pinned = _pin_project_snapshot(project)
+            pinned = pin_project_snapshot(project)
     except ProjectRegistryBusyError as exc:
         raise RemoteSyncError(f"project registry busy on {peer}; retry") from exc
     except ProjectRegistryError as exc:
@@ -409,7 +410,7 @@ def fetch_local_project(
             return _MISSING
         raise RemoteSyncError(f"invalid project on {peer}: {exc}") from exc
 
-    _copy_pinned_project_snapshot(pinned, destination)
+    copy_pinned_project_snapshot(pinned, destination)
     return project_digest(destination)
 
 
@@ -430,69 +431,6 @@ def publish_local_project(
             )
     except ProjectPublicationError as exc:
         raise RemoteSyncError(str(exc)) from exc
-
-
-def _pin_project_snapshot(source: Path) -> list[tuple[Path, int]]:
-    try:
-        payload = synchronized_payload_paths(source)
-    except ProjectPublicationError as exc:
-        raise RemoteSyncError(str(exc)) from exc
-    if source / "project.json" not in payload:
-        raise RemoteSyncError("project record is missing or unsafe")
-    pinned: list[tuple[Path, int]] = []
-    try:
-        for path in payload:
-            relative = path.relative_to(source)
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                os.close(fd)
-                raise RemoteSyncError("project snapshot file is unsafe")
-            if (
-                relative.parent == Path("memory")
-                and relative.name in MEMORY_FILES
-                and info.st_size > MAX_MEMORY_MIRROR_FILE_SIZE
-            ):
-                os.close(fd)
-                raise RemoteSyncError(f"memory file {relative.name} is too large")
-            pinned.append((relative, fd))
-        return pinned
-    except BaseException:
-        for _relative, fd in pinned:
-            os.close(fd)
-        raise
-
-
-def _copy_pinned_project_snapshot(
-    pinned: list[tuple[Path, int]], destination: Path
-) -> None:
-    try:
-        if destination.exists():
-            shutil.rmtree(destination)
-        destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-        directories = {
-            parent
-            for relative, _fd in pinned
-            for parent in relative.parents
-            if parent != Path(".")
-        }
-        for relative in sorted(
-            directories, key=lambda item: (len(item.parts), item.parts)
-        ):
-            directory = destination / relative
-            directory.mkdir(mode=0o700)
-            directory.chmod(0o700)
-        memory = destination / "memory"
-        memory.mkdir(mode=0o700, exist_ok=True)
-        memory.chmod(0o700)
-        for relative, fd in pinned:
-            target = destination / relative
-            with os.fdopen(os.dup(fd), "rb") as source, target.open("xb") as output:
-                shutil.copyfileobj(source, output)
-            target.chmod(0o600)
-    finally:
-        for _relative, fd in pinned:
-            os.close(fd)
 
 
 def copy_project_snapshot(source: Path, destination: Path) -> None:
