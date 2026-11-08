@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import copy
 import fcntl
 import hashlib
@@ -10,14 +11,14 @@ import json
 import os
 import secrets
 import stat
+import sys
 import threading
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
-
-from .lease_release import RegistryLock
 
 WRITER_EPOCH: Final = 5
 
@@ -317,6 +318,82 @@ type Mutation = SetValue | DeleteValue | ReplaceSubtree | PatchRecords
 PublishBytes = Callable[[int, str, bytes], None]
 
 
+# Lease release that is safe to start from a garbage-collector finalizer.
+# The collector can run a finalizer at any allocation on any thread, including
+# while some thread holds a lease registry lock, so a finalizer that took that
+# lock could deadlock. A finalizer only queues the release with release_later
+# and never runs it. Normal code runs the queue at safe points with
+# drain_releases: after the last registry lock in the process is released,
+# before a lease is acquired, after an explicit close, and at exit.
+# Release callbacks may take only RegistryLock locks.
+
+
+class _ThreadState(threading.local):
+    held = 0
+    draining = False
+
+
+_STATE = _ThreadState()
+_PENDING: deque[tuple[Callable[..., None], tuple[Any, ...]]] = deque()
+# Only normal code touches the process-wide count; finalizers never read it.
+_HELD_LOCK = threading.Lock()
+_held = 0
+
+
+def release_later(close: Callable[..., None], *args: Any) -> None:
+    """Finalizer callback: queue ``close(*args)`` for the next safe point. Takes no lock."""
+
+    _PENDING.append((close, args))
+
+
+def drain_releases() -> None:
+    """Run queued releases; a no-op on a thread that holds a registry lock or is draining."""
+
+    if _STATE.held or _STATE.draining:
+        return
+    _STATE.draining = True
+    try:
+        # A collection inside a close only appends; this loop picks it up.
+        while True:
+            try:
+                close, args = _PENDING.popleft()
+            except IndexError:
+                return
+            try:
+                close(*args)
+            except Exception:  # noqa: BLE001 - a failed release must not fail the unrelated caller
+                sys.excepthook(*sys.exc_info())
+    finally:
+        _STATE.draining = False
+
+
+atexit.register(drain_releases)
+
+
+class RegistryLock:
+    """A non-reentrant lock; the last holder in the process drains releases after it lets go."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> None:
+        global _held
+        self._lock.acquire()
+        with _HELD_LOCK:
+            _held += 1
+        _STATE.held += 1
+
+    def __exit__(self, *_exc: object) -> None:
+        global _held
+        _STATE.held -= 1
+        with _HELD_LOCK:
+            _held -= 1
+            last = not _held
+        self._lock.release()
+        if last and _PENDING:
+            drain_releases()
+
+
 @dataclass(slots=True)
 class _RegistryEntry:
     fd: int
@@ -469,6 +546,7 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
 def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
     """Retain a process-shared home lease after checking writer compatibility."""
 
+    drain_releases()
     canonical = _canonical_home(home)
     with _REGISTRY_LOCK:
         registered = _REGISTRY.get(canonical)

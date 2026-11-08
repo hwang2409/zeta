@@ -20,8 +20,7 @@ from tempfile import TemporaryDirectory
 from typing import Mapping
 
 from ..skills import SkillCatalog
-from ..lease_release import release_later
-from ..storage_format import advance, mapping_mutations, open_writer
+from ..storage_format import advance, mapping_mutations, open_writer, release_later
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project

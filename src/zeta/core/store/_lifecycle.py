@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Self
 
+from ...storage_format import drain_releases
 from ..checkpoints import ConversationIntegrityError
 
 
@@ -18,6 +19,7 @@ class StoreLifecycleMixin:
                 self._runtime_lease.close()
             self.directory_fd = -1
             self._release_lease()
+            drain_releases()
 
     def refresh(self) -> None:
         """Reload durable state without acquiring ownership of the session."""

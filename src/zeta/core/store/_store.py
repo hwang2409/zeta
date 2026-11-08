@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, Self  # noqa: F401 - re-exported by the store facade
 
 from ...agent.receipt import encode_json
-from ...lease_release import release_later
 from ...protocol.types import (
     Message,
     MessageRole,
@@ -36,7 +35,12 @@ from ...protocol.types import (
     ToolUseContent,
     require_new_message_origin,
 )
-from ...storage_format import WriterLease, open_writer, reject_unknown_keys
+from ...storage_format import (
+    WriterLease,
+    open_writer,
+    reject_unknown_keys,
+    release_later,
+)
 from .. import session_execution
 from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (

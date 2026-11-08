@@ -11,9 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from zeta.core import session_execution
 from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
 from zeta.core.session import SessionManager
-from zeta.storage_format import WRITER_EPOCH, open_writer
+from zeta.storage_format import WRITER_EPOCH, RegistryLock, open_writer, release_later
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "zeta"
 _DEADLINE_SECONDS = 10
@@ -47,7 +48,7 @@ def test_finalizers_only_close_fds_or_defer_lease_release() -> None:
     violations = _finalizer_violations()
     assert not violations, (
         "a finalizer can run inside a held registry lock; route lease release "
-        "through zeta.lease_release.release_later (fd-only finalizers may use "
+        "through zeta.storage_format.release_later (fd-only finalizers may use "
         "os.close):\n" + "\n".join(violations)
     )
 
@@ -181,3 +182,109 @@ def test_gc_finalized_writer_owner_during_open_writer_keeps_home_locked(
     finally:
         leases[0].close()
     assert _exclusive_flock_free(lock_path)
+
+
+def test_gc_finalizer_on_another_thread_queues_while_a_registry_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    lease_path = home / "sessions" / opened.metadata.session_id / "runtime.lease"
+    holding = threading.Event()
+    finalizer_returned = threading.Event()
+    waited: list[bool] = []
+
+    def hold_registry_until_finalizer_returns() -> None:
+        with session_execution._REGISTRY_LOCK:
+            holding.set()
+            waited.append(finalizer_returned.wait(_DEADLINE_SECONDS))
+
+    holder = threading.Thread(target=hold_registry_until_finalizer_returns, daemon=True)
+    gc.disable()
+    try:
+        dropped = opened.store
+        dropped._cycle = dropped  # only the collector can free it now
+        dropped_ref = weakref.ref(dropped)
+        del opened, dropped
+        holder.start()
+        assert holding.wait(_DEADLINE_SECONDS), "the holder never took the lock"
+        gc.collect()  # runs the store finalizer on this thread
+        finalizer_returned.set()
+        holder.join(_DEADLINE_SECONDS)
+    finally:
+        finalizer_returned.set()
+        gc.enable()
+        manager._release_storage_lease()
+    assert not holder.is_alive(), "the registry holder never let go"
+    assert dropped_ref() is None, "the collector did not finalize the store"
+    assert waited == [True], (
+        "the finalizer blocked on a registry lock held by another thread"
+    )
+    assert _exclusive_flock_free(lease_path), (
+        "the queued release did not run after the holder let go"
+    )
+
+
+def test_gc_during_a_drain_queues_without_recursion_and_all_closes_run() -> None:
+    ran: list[str] = []
+    registry = RegistryLock()
+
+    class Owner:
+        pass
+
+    def close(name: str) -> None:
+        with registry:  # this exit is inside the drain and must not drain again
+            ran.append(name)
+
+    def close_that_collects() -> None:
+        owner = Owner()
+        owner.cycle = owner  # type: ignore[attr-defined]
+        weakref.finalize(owner, release_later, close, "collected")
+        del owner
+        release_later(close, "queued")
+        gc.collect()
+        close("first")
+
+    def queue_under_lock() -> None:
+        with registry:
+            release_later(close_that_collects)
+
+    _run_bounded(queue_under_lock)
+    assert ran == ["first", "queued", "collected"], (
+        "closes queued during a drain must run after it, in order, without recursion"
+    )
+
+
+def test_next_lease_acquire_runs_releases_queued_with_no_lock_held(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    session_id = opened.metadata.session_id
+    gc.disable()
+    try:
+        dropped = opened.store
+        dropped_epoch = dropped.execution_lease.epoch
+        dropped._cycle = dropped
+        del opened, dropped
+        gc.collect()  # no registry lock is held: the release only queues
+    finally:
+        gc.enable()
+    directory_fd = os.open(home / "sessions" / session_id, os.O_RDONLY)
+    try:
+        lease = session_execution.SessionExecutionLease.acquire(
+            directory_fd,
+            session_id=session_id,
+            owner=session_execution.OwnerHint("headless"),
+        )
+        try:
+            assert lease.epoch != dropped_epoch, (
+                "acquire reused the dropped owner instead of releasing it first"
+            )
+        finally:
+            lease.close()
+    finally:
+        os.close(directory_fd)
+        manager._release_storage_lease()

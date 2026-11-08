@@ -32,8 +32,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from ...lease_release import release_later
-from ...storage_format import WriterLease, mapping_mutations, open_writer
+from ...storage_format import (
+    WriterLease,
+    drain_releases,
+    mapping_mutations,
+    open_writer,
+    release_later,
+)
 from ..process_env import subprocess_env
 from ..session_files import (
     child_directory,
@@ -547,6 +552,7 @@ class WorkspaceSnapshotStore:
 
     def close(self) -> None:
         self._release_lease()
+        drain_releases()
 
     @contextmanager
     def _shadow_workspace(self, *, write: bool = False):

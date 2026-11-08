@@ -12,8 +12,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ...lease_release import RegistryLock
-from ...storage_format import WriterLease
+from ...storage_format import RegistryLock, WriterLease, drain_releases
 from ..checkpoints import ConversationIntegrityError
 from ..fsio import write_all
 from ..session_files import SessionInUseError, open_session_file
@@ -185,6 +184,7 @@ class SessionExecutionLease:
         """Acquire immediately or raise a typed refusal without mutating the session."""
 
         # the loop may do non-waiting local file ops; anything that can wait or fsyncs goes off-loop
+        drain_releases()  # a lease this process dropped must not refuse its next owner
         stat = os.fstat(directory_fd)
         identity = (stat.st_dev, stat.st_ino)
         with _REGISTRY_LOCK:
