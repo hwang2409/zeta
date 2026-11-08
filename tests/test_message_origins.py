@@ -126,7 +126,7 @@ def test_skill_expansion_is_not_labeled_user(tmp_path: Path) -> None:
         skill_catalog=discover_session_skills(project_dir=tmp_path),
     )
 
-    expansion = registry.dispatch(object(), "$review this")
+    expansion = registry.dispatch(SimpleNamespace(slash_lock=SlashLock()), "$review this")
 
     assert isinstance(expansion, ModelInputEnvelope)
     message = Message(
@@ -157,7 +157,7 @@ def test_slash_skill_preserves_user_authored_input(tmp_path: Path) -> None:
         skill_catalog=discover_session_skills(project_dir=tmp_path),
     )
 
-    expansion = registry.dispatch(object(), "/review this branch")
+    expansion = registry.dispatch(SimpleNamespace(slash_lock=SlashLock()), "/review this branch")
 
     assert isinstance(expansion, ModelInputEnvelope)
     message = Message(
