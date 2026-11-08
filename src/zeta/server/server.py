@@ -9,10 +9,7 @@ import socket
 import stat
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from ..runtime.loop import AgentLoop
+from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.session_execution import SessionOwnedError
@@ -987,7 +984,7 @@ class _Client:
         runtime = self.server.runtime
         if runtime.opened is None:
             return None
-        snapshot = _active_runtime_snapshot(
+        snapshot = ergonomics._active_runtime_snapshot(
             runtime.metadata.to_dict(), runtime.loop
         )
         if runtime.policy is not None:
@@ -1151,32 +1148,6 @@ class _Client:
     async def _write_physical(self, payload: _Frame) -> bool:
         async with self._write_lock:
             return await finish_frame_write(self.codec, self.writer, payload)
-
-
-def _active_runtime_snapshot(
-    persisted: dict[str, object], loop: AgentLoop | None
-) -> dict[str, object]:
-    if loop is None:
-        return persisted
-    snapshot = dict(persisted)
-    prompt = loop._runtime_prompt.system_prompt
-    if isinstance(prompt, str):
-        snapshot["system_prompt"] = prompt
-    snapshot["prompt_components"] = {
-        key: dict(component)
-        for key, component in loop._runtime_prompt.prompt_components.items()
-    }
-    snapshot["skill_catalog"] = (
-        snapshot.get("skill_catalog")
-        if loop._live_skill_catalog_snapshot is None
-        else loop._live_skill_catalog_snapshot
-    )
-    snapshot["agent_catalog"] = (
-        snapshot.get("agent_catalog")
-        if loop._live_agent_catalog_snapshot is None
-        else loop._live_agent_catalog_snapshot
-    )
-    return snapshot
 
 
 def _home() -> Path:
