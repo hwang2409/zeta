@@ -17571,8 +17571,12 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     first_wait = True
     confirm_timeouts: list[object] = []
 
-    async def controlled_wait(awaitables, *, timeout=None):
+    async def controlled_wait(awaitables, *, timeout=None, **kwargs):
         nonlocal first_wait
+        # agent_background_module.asyncio is the shared module: the handler
+        # owner's own wait (it passes return_when=) must stay real.
+        if kwargs:
+            return await original_wait(awaitables, timeout=timeout, **kwargs)
         if first_wait:
             first_wait = False
             confirm_timeouts.append(timeout)

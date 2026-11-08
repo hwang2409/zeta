@@ -223,42 +223,41 @@ async def run_handler_with_abort(
     handler_task = asyncio.create_task(
         _invoke_then_close(handler, arguments, execution_signal, stream_publisher)
     )
-    signal_wait = asyncio.create_task(execution_signal.wait())
     clock = asyncio.get_running_loop()
-    outer_canceled = False
-    cancel_sent = False
-    deadline = 0.0
+    deadline: float | None = None  # set when the one cancel is sent
+
+    def request_cancel() -> None:
+        nonlocal deadline
+        if deadline is None:
+            handler_task.cancel()
+            deadline = clock.time() + HANDLER_CANCEL_DRAIN_SECONDS
+
+    async def cancel_on_signal() -> None:
+        await execution_signal.wait()
+        # Let a cooperative handler (bash, agent) see the signal first.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        request_cancel()
+
+    signal_watch = asyncio.create_task(cancel_on_signal())
     try:
         while not handler_task.done():
-            if cancel_sent and clock.time() >= deadline:
+            if deadline is not None and clock.time() >= deadline:
                 _detach(handler_task, tool_call_id)
                 break
             try:
                 await asyncio.wait(
-                    {handler_task} if cancel_sent else {handler_task, signal_wait},
-                    timeout=deadline - clock.time() if cancel_sent else None,
+                    {handler_task} if signal_watch.done() else {handler_task, signal_watch},
+                    timeout=None if deadline is None else deadline - clock.time(),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             except asyncio.CancelledError:
-                outer_canceled = True
-            if cancel_sent or handler_task.done():
-                continue
-            if signal_wait.done():
-                # Let a cooperative handler (bash, agent) see the signal first.
-                for _ in range(2):
-                    try:
-                        await asyncio.sleep(0)
-                    except asyncio.CancelledError:
-                        outer_canceled = True
-            if outer_canceled or signal_wait.done():
-                handler_task.cancel()
-                cancel_sent = True
-                deadline = clock.time() + HANDLER_CANCEL_DRAIN_SECONDS
+                request_cancel()
     finally:
         # Also closes after a detach; the handler task closes on its own end.
         if stream_publisher is not None:
             stream_publisher.close()
-        signal_wait.cancel()
+        signal_watch.cancel()
     return _handler_result(handler_task, execution_signal, tool_call_id)
 
 
