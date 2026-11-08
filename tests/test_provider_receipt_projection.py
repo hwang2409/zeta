@@ -400,8 +400,9 @@ async def test_building_payloads_changes_no_stored_row_or_message(tmp_path: Path
         context = await ContextAssembler(
             store, token_budget=12_000, retained_tail=1, compaction_policy=CompactionPolicy()
         ).assemble_context()
-        messages = context.messages
-        assert any(m.metadata.get("context_evicted") for m in messages)
+        assert any(m.metadata.get("context_evicted") for m in context.messages)
+        # history() adds the hybrid and collapsed shapes the assembler did not make here.
+        messages = [*context.messages, *history()[1:]]
         rows_before = [entry.to_dict() for entry in store.replay()]
         file_before = store.path.read_bytes()
         messages_before = [message.to_dict() for message in messages]
