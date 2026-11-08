@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import asyncio.runners
 import concurrent.futures
 import contextlib
 import json
@@ -25,11 +24,11 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.tools._shared.background_task_owner as owner_module
 import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import (
-    _wait_pid_exited_sync,
     kill_group_if_present,
     read_pid_file,
     wait_for_path_command,
@@ -615,6 +614,7 @@ async def _cancel_close_at(
         "legacy-pending-recovers-once",
         "cancel-process-wait",
         "cancel-reader-drain",
+        "cancel-live-group-probe",
         "cancel-ordered-writer-close",
         "cancel-archive",
         "cancel-persist",
@@ -664,6 +664,62 @@ async def test_background_task_owner_state_table(
                 ToolCall("output", "task_output", {"task_id": task_id})
             )
             return result["structuredContent"]
+
+        if row == "cancel-live-group-probe":
+            child_ready = tmp_path / "detached-probe-child"
+            leader_ready = tmp_path / "detached-probe-leader"
+            probe_entered = asyncio.Event()
+            leader_pids: list[int] = []
+            original_group_exists = owner_module._group_exists
+
+            def group_exists(pid: int) -> bool:
+                exists = original_group_exists(pid)
+                if exists and leader_pids == [pid] and child_ready.exists():
+                    probe_entered.set()
+                return exists
+
+            # test-contract: seam hold cancellation at the live-group probe await
+            monkeypatch.setattr(owner_module, "_group_exists", group_exists)
+            child = "import os,signal; print(os.getpid(), flush=True); signal.pause()"
+            leader = (
+                "import pathlib,signal,subprocess,sys\n"
+                "released = False\n"
+                "def release(*_):\n"
+                "    global released\n"
+                "    released = True\n"
+                "signal.signal(signal.SIGUSR1, release)\n"
+                f"child = subprocess.Popen([sys.executable, '-c', {child!r}], "
+                "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
+                f"pathlib.Path({str(child_ready)!r}).write_text(child.stdout.readline())\n"
+                f"pathlib.Path({str(leader_ready)!r}).write_text(str(__import__('os').getpid()))\n"
+                "while not released:\n"
+                "    signal.pause()\n"
+            )
+            task_id = await start_registered(_python(leader))
+            owner = registry.background_tasks._owners[task_id]
+            leader_pid = owner.record.pid
+            leader_pids.append(leader_pid)
+            child_pid = await read_pid_file(child_ready)
+            await read_pid_file(leader_ready)
+            os.kill(leader_pid, signal.SIGUSR1)
+            try:
+                await await_or_fail(probe_entered.wait(), what="live group probe")
+                lifecycle = owner.lifecycle
+                assert lifecycle is not None
+                lifecycle.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await await_or_fail(
+                        owner.wait(), what="probe cancellation completion"
+                    )
+                await wait_pid_exited(child_pid)
+                assert (await output_registered(task_id))["running"] is False
+                rows = json.loads(
+                    (store.session_dir / "background_tasks.json").read_text()
+                )
+                assert rows and all(not item["running"] for item in rows)
+            finally:
+                kill_group_if_present(leader_pid)
+            return
 
         if row.startswith("cancel-close-") and row != "cancel-close-coordinator":
             task_id = await start_registered(_python("import time; time.sleep(30)"))
@@ -3011,8 +3067,7 @@ async def test_background_task_stays_running_for_detached_group_member(
         tmp_path,
     )
     child_pid = await read_pid_file(ready)
-    # test-contract: latency allow the detached child to outlive the group leader.
-    await asyncio.sleep(0.1)
+    await wait_pid_exited(pid)
     assert (await tasks.output(task_id))["running"] is True
     assert _group_exists(pid)
 
@@ -3032,81 +3087,6 @@ async def test_background_task_stays_running_for_detached_group_member(
         await tasks.close()
 
 
-def test_loop_teardown_cancels_owner_before_detached_leader_exits(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cancellation_started = threading.Event()
-    teardown_finished = threading.Event()
-    errors: list[BaseException] = []
-    leader_pids: list[int] = []
-    child_pids: list[int] = []
-    registries: list[BackgroundTaskRegistry] = []
-    child_ready = tmp_path / "detached-loop-child"
-    original_cancel_all = asyncio.runners._cancel_all_tasks
-
-    def cancel_owner_then_release_leader(loop: asyncio.AbstractEventLoop) -> None:
-        if cancellation_started.is_set():
-            original_cancel_all(loop)
-            return
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        cancellation_started.set()
-        loop.call_soon(os.kill, leader_pids[0], signal.SIGUSR1)
-        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-
-    # test-contract: seam force public asyncio.run teardown before the leader exits
-    monkeypatch.setattr(
-        asyncio.runners, "_cancel_all_tasks", cancel_owner_then_release_leader
-    )
-
-    async def leave_owner_for_loop_teardown() -> None:
-        child = "import os,signal; print(os.getpid(), flush=True); signal.pause()"
-        leader = (
-            "import pathlib,signal,subprocess,sys\n"
-            "released = False\n"
-            "def release(*_):\n"
-            "    global released\n"
-            "    released = True\n"
-            "signal.signal(signal.SIGUSR1, release)\n"
-            f"child = subprocess.Popen([sys.executable, '-c', {child!r}], "
-            "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
-            f"pathlib.Path({str(child_ready)!r}).write_text(child.stdout.readline())\n"
-            "while not released:\n"
-            "    signal.pause()\n"
-        )
-        tasks = BackgroundTaskRegistry()
-        registries.append(tasks)
-        _task_id, leader_pid = await tasks.start(_python(leader), tmp_path)
-        leader_pids.append(leader_pid)
-        child_pids.append(await read_pid_file(child_ready))
-
-    def run_loop() -> None:
-        try:
-            asyncio.run(leave_owner_for_loop_teardown())
-        except BaseException as exc:  # noqa: BLE001 - report every thread outcome
-            errors.append(exc)
-        finally:
-            teardown_finished.set()
-
-    thread = threading.Thread(target=run_loop)
-    thread.start()
-    try:
-        assert cancellation_started.wait(10), "loop teardown did not cancel its tasks"
-        assert teardown_finished.wait(10), (
-            "loop teardown did not finish after cancelling the background owner"
-        )
-        assert not errors
-        _wait_pid_exited_sync(child_pids[0], timeout=1)
-    finally:
-        for leader_pid in leader_pids:
-            kill_group_if_present(leader_pid)
-        thread.join(10)
-        thread_alive = thread.is_alive()
-        if not thread_alive:
-            for registry in registries:
-                asyncio.run(registry.close())
-        assert not thread_alive, "background owner survived test cleanup"
 
 
 @pytest.mark.asyncio

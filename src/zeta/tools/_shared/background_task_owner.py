@@ -8,7 +8,7 @@ import signal
 import time
 from dataclasses import replace
 from enum import Enum, auto
-from typing import IO, TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Literal
 
 from ...core.thread_call import run_owned_thread_call
 from . import process_output
@@ -96,25 +96,8 @@ class _BackgroundTaskOwner:
         process = self.process
         if process is None or process.stdout is None:
             return
-        cancelled = False
-
-        async def finish(awaitable: Any) -> Any:
-            nonlocal cancelled
-            task = asyncio.ensure_future(awaitable)
-            while not task.done():
-                try:
-                    # test-contract: durability each owner step survives caller cancellation
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    cancelled = True
-                    # test-contract: latency teardown kills the owned process group
-                    _signal_group(process, signal.SIGKILL)
-            if task.cancelled():
-                cancelled = True
-                return None
-            return task.result()
-
         writer = _OrderedLogWriter(self.log_handle) if self.log_handle is not None else None
+        cancelled = False
 
         async def read_output() -> None:
             try:
@@ -124,44 +107,21 @@ class _BackgroundTaskOwner:
 
         reader = asyncio.create_task(read_output())
         archive_error: BaseException | None = None
-        try:
-            await finish(process.wait())
-            self.state = _OwnerState.DRAINING
-            # test-contract: durability output drain races the owned reader to completion
-            drain_finished = asyncio.create_task(self._finish_output_drain.wait())
-            try:
-                await finish(
-                    asyncio.wait(
-                        (reader, drain_finished),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                )
-                if drain_finished.done() and not reader.done():
-                    reader.cancel()
-                    # test-contract: durability canceled output reads are fully drained
-                    await asyncio.gather(reader, return_exceptions=True)
-                else:
-                    await finish(reader)
-            finally:
-                if not drain_finished.done():
-                    drain_finished.cancel()
-                # test-contract: durability canceled drain gates are fully drained
-                await asyncio.gather(drain_finished, return_exceptions=True)
-            while not cancelled and self.kill_cause is None and _group_exists(process.pid):
-                # test-contract: latency cancellation bounds detached group probing
-                await asyncio.sleep(0.01)
-        finally:
+
+        async def finish() -> None:
+            nonlocal archive_error
             if not reader.done():
                 reader.cancel()
-                # test-contract: durability canceled output reads are fully drained
-                await asyncio.gather(reader, return_exceptions=True)
-            await finish(self.registry._close_stdin(self.record))
+            # test-contract: durability every exit joins the output reader and process
+            await asyncio.gather(reader, return_exceptions=True)
+            await process.wait()
+            await self.registry._close_stdin(self.record)
             if writer is not None:
-                await finish(writer.close())
+                await writer.close()
             if self.log_fd is not None:
                 self.state = _OwnerState.ARCHIVING
                 try:
-                    await finish(self._archive())
+                    await self._archive()
                 except BaseException as exc:
                     archive_error = exc
                     self.record.note = (
@@ -171,7 +131,44 @@ class _BackgroundTaskOwner:
                         "failed to archive background task output for %s",
                         self.record.task_id,
                     )
-            await finish(self._finish_terminal(process.returncode))
+            await self._finish_terminal(process.returncode)
+
+        try:
+            await process.wait()
+            self.state = _OwnerState.DRAINING
+            # test-contract: durability output drain races the owned reader to completion
+            drain_finished = asyncio.create_task(self._finish_output_drain.wait())
+            try:
+                await asyncio.wait(
+                    (reader, drain_finished),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if drain_finished.done() and not reader.done():
+                    reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
+                else:
+                    await reader
+            finally:
+                if not drain_finished.done():
+                    drain_finished.cancel()
+                await asyncio.gather(drain_finished, return_exceptions=True)
+            while self.kill_cause is None and _group_exists(process.pid):
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            cancelled = True
+            _signal_group(process, signal.SIGKILL)
+        finally:
+            cleanup = asyncio.create_task(finish())
+            while True:
+                try:
+                    await asyncio.shield(cleanup)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    _signal_group(process, signal.SIGKILL)
+                    if cleanup.cancelled():
+                        cleanup = asyncio.create_task(finish())
+
         if archive_error is not None:
             raise archive_error
         if cancelled:
