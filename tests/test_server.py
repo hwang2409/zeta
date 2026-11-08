@@ -9857,7 +9857,8 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
-                    await asyncio.wait_for(release.wait(), 10)
+                    # test-contract: seam the whole serve journey owns the hang guard
+                    await release.wait()
 
     server = ZetaServer(
         home=tmp_path,
@@ -9866,64 +9867,70 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
         provider="codex",
         backend_factory=lambda *_args: (PausedBackend(delay=0), "offline"),
     )
-    reader, writer, sid = await _ready_extensions(server)
-    try:
-        await _request(reader, writer, 3, "send", {"text": "slow"})
-        await asyncio.wait_for(started.wait(), TIMEOUT)
-        fixture = Path(__file__).parent / "fixtures" / "serve_slash_busy_wire_pin.jsonl"
-        rows = [
-            json.loads(line)
-            for line in fixture.read_text().splitlines()
-            if line and not line.startswith("#")
-        ]
-        # These rows are explicit because the base fixture was captured before
-        # /plan was a serve command and must never be captured from the head.
-        rows.extend(
-            [
-                {"text": "/plan", "error_code": -32004},
-                {"text": "/plan on", "error_code": -32004},
-                {"text": "/plan write a plan", "error_code": -32004},
-                {"text": "/implement", "error_code": -32004},
+
+    async def exercise_busy_policy() -> None:
+        reader, writer, sid = await _ready_extensions(server)
+        try:
+            await _request(reader, writer, 3, "send", {"text": "slow"})
+            await asyncio.wait_for(started.wait(), TIMEOUT)
+            fixture = Path(__file__).parent / "fixtures" / "serve_slash_busy_wire_pin.jsonl"
+            rows = [
+                json.loads(line)
+                for line in fixture.read_text().splitlines()
+                if line and not line.startswith("#")
             ]
-        )
-        before = (
-            await _request(
-                reader, writer, "before-plan", "session_settings", {"session_id": sid}
+            # These rows are explicit because the base fixture was captured before
+            # /plan was a serve command and must never be captured from the head.
+            rows.extend(
+                [
+                    {"text": "/plan", "error_code": -32004},
+                    {"text": "/plan on", "error_code": -32004},
+                    {"text": "/plan write a plan", "error_code": -32004},
+                    {"text": "/implement", "error_code": -32004},
+                ]
             )
-        )[-1]["result"]["plan_mode"]
-        for request_id, row in enumerate(rows, start=4):
-            text = row["text"]
-            response = await _request(
-                reader,
-                writer,
-                request_id,
-                "slash_run",
-                {"session_id": sid, "text": text},
-            )
-            message = response[-1]
-            if text == "/plan":
-                after = (
-                    await _request(
-                        reader,
-                        writer,
-                        "after-plan",
-                        "session_settings",
-                        {"session_id": sid},
-                    )
-                )[-1]["result"]["plan_mode"]
-                assert after is before
-            if "result" in row:
-                assert "result" in message and "error" not in message, message
-                assert message["result"] == row["result"]
-            elif "result_kind" in row:
-                assert "result" in message and "error" not in message, message
-                assert message["result"]["kind"] == row["result_kind"]
-            else:
-                assert "error" in message and "result" not in message, message
-                assert message["error"]["code"] == row["error_code"], message
-    finally:
-        release.set()
-        await close_serve(server, writer)
+            before = (
+                await _request(
+                    reader, writer, "before-plan", "session_settings", {"session_id": sid}
+                )
+            )[-1]["result"]["plan_mode"]
+            for request_id, row in enumerate(rows, start=4):
+                text = row["text"]
+                response = await _request(
+                    reader,
+                    writer,
+                    request_id,
+                    "slash_run",
+                    {"session_id": sid, "text": text},
+                )
+                message = response[-1]
+                if text == "/plan":
+                    after = (
+                        await _request(
+                            reader,
+                            writer,
+                            "after-plan",
+                            "session_settings",
+                            {"session_id": sid},
+                        )
+                    )[-1]["result"]["plan_mode"]
+                    assert after is before
+                if "result" in row:
+                    assert "result" in message and "error" not in message, message
+                    assert message["result"] == row["result"]
+                elif "result_kind" in row:
+                    assert "result" in message and "error" not in message, message
+                    assert message["result"]["kind"] == row["result_kind"]
+                else:
+                    assert "error" in message and "result" not in message, message
+                    assert message["error"]["code"] == row["error_code"], message
+        finally:
+            release.set()
+            await close_serve(server, writer)
+
+    await await_or_fail(
+        exercise_busy_policy(), timeout=120, what="busy-policy serve journey"
+    )
 
 
 @pytest.mark.asyncio
