@@ -159,6 +159,8 @@ class AgentNotificationMixin:
     def run_harness_notice_turn(
         self,
         notice: Message,
+        *,
+        task_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Run one zeta-authored notice without representing it as user input."""
 
@@ -169,6 +171,7 @@ class AgentNotificationMixin:
             "",
             origin=MessageOrigin.HARNESS_NUDGE,
             system_message=notice,
+            task_deadline=task_deadline,
         )
 
     def run_turn(
@@ -181,6 +184,7 @@ class AgentNotificationMixin:
         abort_signal: ToolAbortSignal | None = None,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        allow_assistant_reset: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         self._abort_admitted = False
         return self._run_turn(
@@ -191,6 +195,7 @@ class AgentNotificationMixin:
             abort_signal=abort_signal,
             host_environment=host_environment,
             host_instruction=host_instruction,
+            allow_assistant_reset=allow_assistant_reset,
         )
 
     async def _run_turn(
@@ -207,9 +212,9 @@ class AgentNotificationMixin:
         on_turn_context_persisted: Callable[[], None] | None = None,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        allow_assistant_reset: bool = True,
+        task_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        from ..runtime.loop._completion import close_completion
-
         if turn_context is not None:
             if system_message is not None:
                 raise ValueError("pass only one system message")
@@ -227,12 +232,17 @@ class AgentNotificationMixin:
             notification_turn=notification_turn,
             host_environment=host_environment,
             host_instruction=host_instruction,
+            allow_assistant_reset=allow_assistant_reset,
+            task_deadline=task_deadline,
         )
         try:
             async for event in stream:
                 yield event
         finally:
-            await close_completion(stream)
+            try:
+                await stream.aclose()
+            except BaseException:  # noqa: BLE001, S110 - preserve turn cleanup
+                pass
             self._turn_active = False
             self._delivering_prompt_id = None
             flow = self.step_delivery
@@ -295,6 +305,7 @@ class AgentNotificationMixin:
         on_turn_context_persisted: Callable[[], None] | None = None,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        task_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         if (
             not self._notification_turn_scheduled
@@ -312,4 +323,5 @@ class AgentNotificationMixin:
             on_turn_context_persisted=on_turn_context_persisted,
             host_environment=host_environment,
             host_instruction=host_instruction,
+            task_deadline=task_deadline,
         )

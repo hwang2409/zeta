@@ -18,6 +18,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import build_parser
@@ -25,6 +26,7 @@ from zeta.core.session import SessionManager
 from zeta.project_errors import ProjectRegistryBusyError, ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import MessageOrigin, TextContent
+from zeta.providers.completion import owned_completion
 from zeta.runtime.project_registry_state import (
     ProjectRegistryUnavailable,
     load_project_registry,
@@ -212,8 +214,11 @@ async def _serve_new_session_prompt(home: Path, cwd: Path) -> str:
             super().__init__([ScriptedTurn(content=[TextContent("ok")])])
             self.started = asyncio.Event()
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(
+                messages, tool_schemas, control=completion_control()
+            ):
                 self.started.set()
                 yield event
 
