@@ -5286,7 +5286,9 @@ async def test_close_kill_cause_reaches_live_serve_event(
             ),
             None,
         )
-        assert notification is not None, "durable task-exited notification was not found"
+        assert notification is not None, (
+            "durable task-exited notification was not found"
+        )
         rendered = render_event(
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
@@ -7776,9 +7778,7 @@ async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
 @pytest.mark.asyncio
 async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> None:
     observed = [
-        await _hello_wire_line(
-            tmp_path / "hello-1.0", {"protocol_version": "1.0"}
-        ),
+        await _hello_wire_line(tmp_path / "hello-1.0", {"protocol_version": "1.0"}),
         await _hello_wire_line(
             tmp_path / "hello-1.1",
             {
@@ -7892,8 +7892,7 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
     fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
     rows = fixture.read_text().splitlines()
     assert rows[0] == (
-        "# baseline origin/main 66c084d8; accepted deltas: "
-        "W1, W2, W3, W5, text->output"
+        "# baseline origin/main 66c084d8; accepted deltas: W1, W2, W3, W5, text->output"
     )
     assert observed == rows[1:]
 
@@ -8362,9 +8361,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             )
             for _ in range(1_000)
         )
-        store.append_compaction_marker(
-            "summary", sources[0].seq, sources[-1].seq
-        )
+        store.append_compaction_marker("summary", sources[0].seq, sources[-1].seq)
         original_counter = server.runtime.loop.context_assembler.token_counter
 
         def blocked_counter(message: Message) -> int:
@@ -8394,7 +8391,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
                         probe_frames.append(json.loads(stream.readline()))
                         probe_ready.set()
                         if not entered.wait(10):
-                            raise AssertionError("status transcript worker did not start")
+                            raise AssertionError(
+                                "status transcript worker did not start"
+                            )
                         stream.write(
                             b'{"jsonrpc":"2.0","id":"live","method":"status",'
                             b'"params":{}}\n'
@@ -8472,9 +8471,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             or frame.get("params", {}).get("event") is not None
             for frame in frames
         )
-        assert (await _request(observer_reader, observer_writer, "after", "ping"))[
-            -1
-        ]["id"] == "after"
+        assert (await _request(observer_reader, observer_writer, "after", "ping"))[-1][
+            "id"
+        ] == "after"
     finally:
         release.set()
         if request_task is not None and not request_task.done():
@@ -9227,7 +9226,9 @@ async def test_slash_run_guards_mutations_while_approvals_pending(
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
         # MCP config commands mutate shared config — must reject.
-        assert (await run("mcp-disable", "/mcp disable example"))["error"]["code"] == -32004
+        assert (await run("mcp-disable", "/mcp disable example"))["error"][
+            "code"
+        ] == -32004
         # `/project init` mutates the session association — must reject.
         assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only and bypasses the mutation guard.
@@ -9240,10 +9241,18 @@ async def test_slash_run_guards_mutations_while_approvals_pending(
 
 
 @pytest.mark.asyncio
-async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
+async def test_slash_run_during_running_turn_applies_busy_policy(
+    tmp_path: Path,
+) -> None:
     from tests.support.server_backend import ServerFakeBackend
     from zeta.protocol.types import StreamEventType
 
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "init", "--quiet", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -9266,16 +9275,31 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
     try:
         await _request(reader, writer, 3, "send", {"text": "slow"})
         await asyncio.wait_for(started.wait(), TIMEOUT)
-        error = (
-            await _request(
+        fixture = Path(__file__).parent / "fixtures" / "serve_slash_busy_wire_pin.jsonl"
+        rows = [
+            json.loads(line)
+            for line in fixture.read_text().splitlines()
+            if line and not line.startswith("#")
+        ]
+        for request_id, row in enumerate(rows, start=4):
+            text = row["text"]
+            response = await _request(
                 reader,
                 writer,
-                4,
+                request_id,
                 "slash_run",
-                {"session_id": sid, "text": "/status"},
+                {"session_id": sid, "text": text},
             )
-        )[-1]["error"]
-        assert error["code"] == -32004
+            message = response[-1]
+            if "result" in row:
+                assert "result" in message and "error" not in message, message
+                assert message["result"] == row["result"]
+            elif "result_kind" in row:
+                assert "result" in message and "error" not in message, message
+                assert message["result"]["kind"] == row["result_kind"]
+            else:
+                assert "error" in message and "result" not in message, message
+                assert message["error"]["code"] == row["error_code"], message
     finally:
         release.set()
         await close_serve(server, writer)
