@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from .server import ZetaServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
+CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
 
 NotificationSender = Callable[..., Awaitable[bool]]
 
@@ -115,6 +116,7 @@ class ServeControl:
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
+        self._controller_release_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
@@ -257,16 +259,49 @@ class ServeControl:
     async def wait_for_approval_settlement(self) -> None:
         await self._approvals.wait_for_approval_settlement()
 
+    def begin_controller_release(
+        self, *, reconnect: bool = False
+    ) -> asyncio.Task[None]:
+        previous = self._controller_release_task
+        # Establish approval grace before the physical controller slot is released.
+        operation = (
+            None
+            if previous is not None and not previous.done()
+            else self._controller_release(reconnect)
+        )
+
+        async def release() -> None:
+            if previous is not None:
+                await asyncio.shield(previous)
+            if operation is None:
+                await self.controller_released(reconnect=reconnect)
+            else:
+                await operation
+
+        task = asyncio.create_task(release())
+        self._controller_release_task = task
+        return task
+
     async def controller_claimed(
         self, *, reconnect: bool = False, require_host_binding: bool = False
-    ) -> None:
+    ) -> bool:
+        release = self._controller_release_task
+        if release is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(release), CONTROLLER_HANDOFF_DEADLINE_SECONDS
+                )
+            except TimeoutError:
+                return False
+            if self._controller_release_task is release:
+                self._controller_release_task = None
         self._host_binding_required |= require_host_binding
         task = self._grace_task
         if task is None:
-            return
+            return True
         if self._grace_expiring:
             await asyncio.shield(task)
-            return
+            return True
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         self._grace_task = None
@@ -275,6 +310,7 @@ class ServeControl:
         else:
             await self._approvals.transition(Expire())
             await self._disconnect_turn()
+        return True
 
     async def controller_ready(self, *, reconnect: bool = False) -> None:
         if reconnect:
@@ -282,18 +318,33 @@ class ServeControl:
         await self._attach_pending_notifications()
 
     async def controller_released(self, *, reconnect: bool = False) -> None:
+        await self._controller_release(reconnect)
+
+    def _controller_release(self, reconnect: bool) -> Awaitable[None]:
         self._active_host_commands = None
         if reconnect and self._grace_task is not None:
-            await asyncio.shield(self._grace_task)
-            return
+
+            async def wait_for_grace() -> None:
+                assert self._grace_task is not None
+                await asyncio.shield(self._grace_task)
+
+            return wait_for_grace()
         if reconnect and self._approvals.has_pending_approvals():
-            await self._approvals.transition(BeginGrace())
+            self._approvals.transition(BeginGrace())
             self._grace_task = asyncio.create_task(self._expire_grace())
-            if self.server.approval_reconnect_grace == 0:
-                await self._grace_task
-            return
-        await self._terminate_pending_approvals(suppress_write_errors=True)
-        await self._disconnect_turn()
+
+            async def start_grace() -> None:
+                if self.server.approval_reconnect_grace == 0:
+                    assert self._grace_task is not None
+                    await self._grace_task
+
+            return start_grace()
+
+        async def disconnect() -> None:
+            await self._terminate_pending_approvals(suppress_write_errors=True)
+            await self._disconnect_turn()
+
+        return disconnect()
 
     async def _expire_grace(self) -> None:
         try:

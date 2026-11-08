@@ -887,6 +887,34 @@ def test_other_background_notices_remain_visible() -> None:
     assert [item.plain for item in rendered] == ["background task task-1 killed"]
 
 
+@pytest.mark.asyncio
+async def test_status_renders_unavailable_accounts_through_tui(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.account_context = SimpleNamespace(unavailable_accounts=("codex:missing",))
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        rendered = await app._slash_commands.dispatch_async(app, "/status")
+        assert isinstance(rendered, str)
+        app._handle_slash_output(rendered)
+
+        assert "unavailable_accounts: codex:missing" in output.getvalue()
+    finally:
+        await loop.close()
+        loop.store.close()
+
+
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(
@@ -1537,6 +1565,7 @@ def terminal_plain(renderable: object) -> str:
 
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
+
 
 def test_task_safety_kill_renders_cause() -> None:
     cause = "explicit-finish child task safety deadline expired after 3600 seconds"
@@ -6459,6 +6488,9 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         for line in tui_app_module._status_card_lines(status)
     )
 
+    assert "unavailable_accounts: none\n" in rendered
+    rendered = rendered.replace("unavailable_accounts: none\n", "")
+
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
         "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
@@ -8946,6 +8978,27 @@ def test_rebuild_renders_closed_turn_end_reasons(
     assert "turn ended with an error" in rendered
     assert "turn ended when the controller disconnected" in rendered
     assert "completed" not in rendered
+
+
+def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions)
+    with store.path.open("ab") as stream:
+        stream.write(b'{"torn"')
+    with pytest.warns(RuntimeWarning, match="torn"):
+        recovered = ConversationStore(sessions, session_id=store.session_id)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), recovered, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "transcript recovered; preserved corrupt bytes in quarantine" in rendered
+    assert recovered.entries[-1].data["quarantine_id"] in rendered
 
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
@@ -13875,6 +13928,44 @@ async def test_tui_model_command_does_no_lock_work_on_loop(
 
 
 @pytest.mark.asyncio
+async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    missing = AccountId("codex", "missing")
+    for account in (current, missing):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    AccountStore(home).credential_path(missing).unlink()
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=80).print(rendered[0])
+        assert (
+            "codex:missing  unavailable: credentials missing"
+            in Text.from_ansi(output.getvalue()).plain
+        )
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -13929,9 +14020,9 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     app.accounts_picker_move(1)
     task = app.accounts_picker_select()
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
-    assert off_loop_calls == ["list"]
+    assert off_loop_calls == ["list", "list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
@@ -14681,6 +14772,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
         {"codex": account},
         {account: "henry@example.com"},
         {account: "henry"},
+        unavailable={account},
     )
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(picker.render())
@@ -14688,6 +14780,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
 
     assert "codex:henry" in plain
     assert "henry@example.com" in plain
+    assert "unavailable: credentials missing" in plain
     assert "n rename" in plain
 
 

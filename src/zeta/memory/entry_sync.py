@@ -24,6 +24,7 @@ from zeta.memory.entry_store import (
     validate_state,
 )
 from zeta.project_errors import ProjectRegistryError
+from zeta.storage_format import reject_unknown_keys
 
 _MISSING = "missing"
 ConflictChoice = Literal["local", "remote"]
@@ -429,6 +430,7 @@ def parse_resolution_candidates(
         expected = {"kind", "local", "remote", "prepared"}
         entry_ids: tuple[str, ...] = ()
         if kind == "entries":
+            reject_unknown_keys(raw, "entry_sync_entry_resolution_candidate")
             expected.add("entry_ids")
             raw_ids = raw.get("entry_ids")
             if (
@@ -444,6 +446,8 @@ def parse_resolution_candidates(
             entry_ids = tuple(raw_ids)
         elif kind != "schema":
             return None
+        else:
+            reject_unknown_keys(raw, "entry_sync_schema_resolution_candidate")
         if set(raw) != expected or any(
             not _valid_digest(raw.get(name)) for name in ("local", "remote", "prepared")
         ):
@@ -543,10 +547,18 @@ def _parse_conflicts(values: Mapping[str, object]) -> dict[str, EntryConflict]:
         local_digest = str(digests[0])
         remote_digest = str(digests[-1])
         if kind == "schema":
+            try:
+                reject_unknown_keys(raw, "entry_sync_schema_conflict")
+            except ValueError as exc:
+                raise ProjectRegistryError("entry sync conflict record is invalid") from exc
             if key != "schema" or set(raw) != {"kind", "digests"}:
                 raise ProjectRegistryError("entry sync conflict record is invalid")
             parsed[key] = EntryConflict("schema", (), local_digest, remote_digest)
             continue
+        try:
+            reject_unknown_keys(raw, "entry_sync_entry_conflict")
+        except ValueError as exc:
+            raise ProjectRegistryError("entry sync conflict record is invalid") from exc
         entry_ids = raw.get("entry_ids")
         if (
             set(raw) != {"kind", "entry_ids", "digests"}

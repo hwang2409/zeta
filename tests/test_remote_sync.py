@@ -409,9 +409,16 @@ def test_session_transfer_streams_large_conversation_files(
     _git_repo(repo)
     _, opened = _session(local, repo)
     session_id = opened.metadata.session_id
+    opened.store.append_message(
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [TextContent("x" * (2 * 1024 * 1024))],
+            ),
+            MessageOrigin.USER,
+        )
+    )
     opened.store.close()
-    with (local / "sessions" / session_id / "conversation.jsonl").open("ab") as stream:
-        stream.write(b'{"type":"test","data":"' + b"x" * (2 * 1024 * 1024) + b'"}\n')
     original_read_bytes = Path.read_bytes
     original_read_text = Path.read_text
 

@@ -14,6 +14,7 @@ from typing import Any
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
+from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -56,6 +57,7 @@ LOADED_SESSION_MUTATIONS = frozenset(
         "deny",
         "fork_message",
         "rename_session",
+        "repair_transcript",
         "revoke_session_grants",
         "send",
         "send_images",
@@ -357,6 +359,8 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._local_close = False
+        self._controller_release: asyncio.Task[None] | None = None
         self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
@@ -370,6 +374,7 @@ class _Client:
             while True:
                 line = await self._read_frame()
                 if not line:
+                    self._release_dead_connection()
                     graceful = False
                     break
                 await self.connections.wait_until_settled(self)
@@ -400,6 +405,8 @@ class _Client:
                             exc.data,
                         )
                     )
+                    if not self.handshaken:
+                        self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     descriptor, message, data = project_request_error(exc)
                     await self._write(
@@ -493,21 +500,37 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
+    def _begin_controller_release(self) -> asyncio.Task[None] | None:
+        if self._controller_release is not None:
+            return self._controller_release
+        if self.role == "controller" and self.connections.is_controller(self):
+            self._controller_release = self.server.control.begin_controller_release(
+                reconnect="approval_reconnect" in self.features
+            )
+        return self._controller_release
+
+    def _release_dead_connection(self) -> None:
+        if self._local_close:
+            return
+        self._begin_controller_release()
+        self.connections.release(self)
+
     async def close(self, *, graceful: bool = False) -> None:
         async with self._close_lock:
             if self._closed:
                 return
-            if self.role == "controller" and self.connections.is_controller(self):
-                await self.server.control.controller_released(
-                    reconnect="approval_reconnect" in self.features
-                )
+            release = self._begin_controller_release()
+            if release is not None:
+                await asyncio.shield(release)
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
             if graceful:
                 await self.connections.flush(self)
+            self._local_close = True
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
+            self.connections.release(self)
             self._closed = True
 
     async def _route_request(
@@ -516,13 +539,20 @@ class _Client:
         if method == "hello":
             result = self._hello(params)
             if self.role == "controller":
-                self.server._client_active = True
-                self.server._client = self
                 reconnect = "approval_reconnect" in self.features
-                await self.server.control.controller_claimed(
+                claimed = await self.server.control.controller_claimed(
                     reconnect=reconnect,
                     require_host_binding="session_host_commands" in self.features,
                 )
+                if not claimed:
+                    self.handshaken = False
+                    raise ProtocolError(
+                        ErrorDescriptor.CONNECTION_CAPACITY,
+                        "another client is already connected",
+                    )
+                self.server._client_active = True
+                self.server._client = self
+                self.connections.activate_controller(self)
                 if not reconnect:
                     await self.server.control.controller_ready()
             return True, result
@@ -835,8 +865,50 @@ class _Client:
                 f"{param} requires the negotiated {feature} feature",
             )
 
+    async def _repair_transcript(self, params: dict[str, Any]) -> dict[str, object]:
+        runtime = self.server.runtime
+        await self.server.control.require_idle()
+        if params.get("confirm") is not True:
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "repair_transcript requires confirm=true",
+            )
+        session_id = _required_string(params, "session_id")
+        child_run_id = params.get("child_run_id")
+        if child_run_id is not None and not isinstance(child_run_id, str):
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "child_run_id must be a string",
+            )
+        try:
+            result = await repair_transcript_for_runtime(
+                runtime.manager,
+                session_id,
+                child_run_id,
+                parent_store=(
+                    runtime.opened.store if runtime.opened is not None else None
+                ),
+                memory_reconciler=(
+                    runtime.loop.memory_reconciler
+                    if runtime.loop is not None
+                    else None
+                ),
+            )
+        except (ValueError, SessionError) as exc:
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
+        return {
+            "session_id": session_id,
+            "child_run_id": child_run_id,
+            "quarantine_id": result.quarantine_id,
+            "retained_last_sequence": result.retained_last_sequence,
+            "memory_review_required": result.memory_review_required,
+            "overlapping_memory_versions": list(result.overlapping_memory_versions),
+        }
+
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
+        if method == "repair_transcript":
+            return await self._repair_transcript(params)
         if method in {"rename_session", "delete_session"}:
             return await ergonomics.mutate_session(
                 runtime,
@@ -864,21 +936,28 @@ class _Client:
                 params, self.features
             )
         if method == "session_settings":
-            return ergonomics.settings(runtime)
+            return ergonomics.settings(runtime, include_plan_mode=True)
         if method in slash_commands.READ_REQUESTS:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self
             )
-        await self.server.control.require_idle()
         if method == "slash_run":
+            text = _required_string(params, "text")
+            if (
+                self.server.control.turn_busy()
+                and not await slash_commands.can_run_while_busy(runtime, text)
+            ):
+                await self.server.control.require_idle()
             register = self.server.control.model_input_registrar(self.features)
             return await slash_commands.run_command(
                 runtime,
-                _required_string(params, "text"),
+                text,
                 register_model_input=register,
                 approval_control=self.server.control,
                 run_blocking=self.server.control._run_blocking,
+                busy=self.server.control.turn_busy(),
             )
+        await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if method == "set_settings":
             model = _required_string(params, "model")

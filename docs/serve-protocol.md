@@ -888,7 +888,16 @@ synchronously reserves one parent notification turn in the `scheduled` state,
 then streams it to that client. The optional wake delay occurs inside this
 reservation. While the turn is `scheduled` or `running`, idle-only requests such
 as `send` and `resume` return the existing `-32004` busy error; they cannot take
-the reserved turn.
+the reserved turn. `slash_run` follows the same rule for commands that mutate or
+produce model input. It still returns client-only results for commands unavailable
+on serve, and it runs read-only slash commands such as `/status` and `/help`
+while the turn is busy. `/mcp` remains blocked while busy because even its
+status form can initialize and reconcile the live MCP mount on the event loop.
+For commands with argument-sensitive mutation, such as `/vim` and `/project`,
+the registry applies an exact read-only-form predicate and the mutation
+predicate to the arguments before allowing the command to run. The
+shared slash registry declares this per-command policy; commands without a
+busy-safe declaration remain blocked.
 
 The wake claims one notification batch without consuming it. Receipt events
 are streamed from that claim. Each receipt includes a stable
@@ -1320,7 +1329,7 @@ error code and message. Provider status and origin remain internal.
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
-- `session_settings`: returns `model` and `approval_mode`.
+- `session_settings`: returns `model`, `approval_mode`, and `plan_mode`.
 - `account_list`: takes `session_id` and returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
@@ -1431,8 +1440,8 @@ The shared slash registry has this order and surface availability:
 | `mcp` | yes | show MCP server status |
 | `model` | yes | pick a model or switch to one: `/model [name]` |
 | `vim` | yes | show or change vim mode |
-| `plan` | no | show or change plan mode |
-| `implement` | no | implement the proposed plan |
+| `plan` | yes | show or change plan mode |
+| `implement` | yes | implement the proposed plan |
 | `project-instructions` | yes | open or create private project instructions in your editor |
 | `init` | yes | generate or improve project instructions |
 | `paste` | no | paste an image |
@@ -1448,6 +1457,7 @@ The shared slash registry has this order and surface availability:
 | `project` | yes | show or initialize the current project |
 | `inbox` | yes | list this project's inbox |
 | `memory` | yes | show, retry, or undo automatic memory updates |
+| `repair-transcript` | yes | repair one corrupt transcript: `/repair-transcript <session> confirm` |
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
 | `tasks` | no | inspect background processes |
@@ -1462,8 +1472,8 @@ The shared slash registry has this order and surface availability:
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/project`,
-`/project-instructions`, `/status`, and `/vim`. `/project` shows the current
+`/implement`, `/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/plan`,
+`/project`, `/project-instructions`, `/status`, and `/vim`. `/project` shows the current
 association, and `/project init` discovers the working directory and associates
 this session. The mutating
 form is rejected while a turn, child, or approval is active. Runnable user
