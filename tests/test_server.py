@@ -914,6 +914,57 @@ class DelegatedApprovalBackend:
             yield event
 
 
+class NestedDelegatedApprovalBackend:
+    def __init__(self, target: Path) -> None:
+        child = ToolCall(
+            "child-agent",
+            "agent",
+            {"prompt": "child prompt", "description": "child", "background": True},
+        )
+        grandchild = ToolCall(
+            "grandchild-agent",
+            "agent",
+            {
+                "prompt": "grandchild prompt",
+                "description": "grandchild",
+                "background": True,
+            },
+        )
+        approval = ToolCall("grandchild-read", "read", {"path": str(target)})
+        self.parent = FakeBackend(
+            [ScriptedTurn(tool_calls=[child]), ScriptedTurn([TextContent("done")])]
+        )
+        self.child = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[grandchild]),
+                ScriptedTurn([TextContent("must not continue")]),
+            ]
+        )
+        self.grandchild = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[approval]),
+                ScriptedTurn([TextContent("must not continue")]),
+            ]
+        )
+
+    async def complete(self, messages, tool_schemas):
+        prompts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        if "grandchild prompt" in prompts:
+            backend = self.grandchild
+        elif "child prompt" in prompts:
+            backend = self.child
+        else:
+            backend = self.parent
+        async for event in backend.complete(messages, tool_schemas):
+            yield event
+
+
 class BackgroundChildAndForegroundToolBackend:
     def __init__(self, command: str) -> None:
         self.command = command
@@ -1949,6 +2000,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         # test-contract: seam exact lifecycle cardinality is the protocol contract
         assert len(ends) == 1
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
+        assert len(backend.child.calls) == 1
     finally:
         test_error = sys.exception()
         parent_tool_end_release.set()
@@ -1971,6 +2023,48 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
                 if cleanup_error is None:
                     raise
                 cleanup_error.add_note(f"server cleanup failed: {close_error!r}")
+
+
+@pytest.mark.asyncio
+async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    backend = NestedDelegatedApprovalBackend(target)
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    child_watcher: asyncio.Task[object] | None = None
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        approval = await _event(reader, "approval_request")
+        grandchild_id = approval["agent_instance_id"]
+        child_id = grandchild_id.rsplit(":", 1)[0]
+        assert server.runtime.loop is not None
+        owner = server.runtime.loop._background_owner
+        child_watcher = owner._watchers[child_id]
+        assert owner.cancel(child_id)
+        frames = await _request(reader, writer, 4, "status")
+        async with asyncio.timeout(TIMEOUT):
+            while not any(
+                event["request_id"] == approval["request_id"]
+                for event in _named_events(frames, "approval_end")
+            ):
+                frames.append(await _read(reader))
+        await _request(reader, writer, 5, "status")
+        assert len(backend.grandchild.calls) == 1
+    finally:
+        if child_watcher is not None and not child_watcher.done():
+            child_watcher.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(child_watcher, return_exceptions=True), TIMEOUT
+            )
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2702,7 +2796,13 @@ async def test_abort_captures_turn_before_approval_end_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("approval-race", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    aborted_reply = "must not survive abort"
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent(aborted_reply)]),
+        ]
+    )
     server = ZetaServer(
         provider="codex",
         home=tmp_path,
@@ -2750,21 +2850,36 @@ async def test_abort_captures_turn_before_approval_end_write(
 
         response = await await_or_fail(abort, what="abort response")
         assert response[-1]["result"] == {"aborted": True}
-        frames = await await_or_fail(
-            _frames_until_event(reader, "turn_aborted"),
-            what="turn_aborted frame",
+        frames = list(response)
+        if not _named_events(frames, "turn_aborted"):
+            frames += await await_or_fail(
+                _frames_until_event(reader, "turn_aborted"),
+                what="turn_aborted frame",
+            )
+        sentinel = asyncio.Event()
+        asyncio.get_running_loop().call_soon(sentinel.set)
+        await await_or_fail(sentinel.wait(), what="post-abort sentinel")
+
+        names = [
+            frame.get("params", {}).get("event")
+            for frame in frames
+            if frame.get("params", {}).get("event") is not None
+        ]
+        approval_end_index = names.index("approval_end")
+        turn_aborted_index = names.index("turn_aborted")
+        assert names[approval_end_index : turn_aborted_index + 1] == [
+            "approval_end",
+            "tool_end",
+            "turn_aborted",
+        ]
+        canceled_tool_end = _named_events(frames, "tool_end")[-1]
+        assert canceled_tool_end["tool_call"]["id"] == call.id
+        assert canceled_tool_end["tool_result"]["is_canceled"] is True
+        assert len(backend.calls) == 1
+        history = server.runtime.opened.store.messages()
+        assert aborted_reply not in json.dumps(
+            [message.to_dict() for message in history]
         )
-        writer.write(b'{"jsonrpc":"2.0","id":5,"method":"status","params":{}}\n')
-        await await_or_fail(writer.drain(), what="status request write")
-        frames += await await_or_fail(
-            read_until(reader, lambda frame: frame.get("id") == 5, what="status response"),
-            what="status response frames",
-        )
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert names.count("approval_end") == 1
-        assert names.index("approval_end") < names.index("turn_aborted")
-        after_abort = names[names.index("turn_aborted") + 1 :]
-        assert not {"tool_start", "tool_end", "turn_start"}.intersection(after_abort)
     finally:
         allow_approval_end.set()
         if abort is not None and not abort.done():
