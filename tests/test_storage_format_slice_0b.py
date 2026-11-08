@@ -21,7 +21,6 @@ from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken, token_store_
 from zeta.memory.reconciliation_state import ReconciliationState
 from zeta.project_inbox import (
     SENT_HISTORY_LIMIT,
-    InboxError,
     ProjectInbox,
     SentMessageTracker,
 )
