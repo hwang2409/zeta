@@ -35,6 +35,7 @@ import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
 from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeClient
@@ -82,6 +83,7 @@ from zeta.protocol.types import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
     with_message_origin,
 )
@@ -99,6 +101,7 @@ from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
+    tool_end,
 )
 from zeta.server.protocol import (
     MAX_FRAME_BYTES,
@@ -551,6 +554,34 @@ def test_serve_maps_account_state_unknown() -> None:
         STREAM_EVENT_WIRE_EVENTS[StreamEventType.ACCOUNT_STATE_UNKNOWN]
         == "account_state_unknown"
     )
+
+
+def test_agent_status_lost_reason_survives_serve_tool_mapping() -> None:
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=ToolCall("status-1", "agent_status", {"handle": "root:1"}),
+        tool_result=ToolResult(
+            tool_call_id="status-1",
+            content="child root:1: state: failed; reason: lost: owner process exited",
+            structured_content={
+                "children": [
+                    {
+                        "handle": "root:1",
+                        "state": "failed",
+                        "reason": "lost: owner process exited",
+                    }
+                ]
+            },
+        ),
+    )
+
+    mapped = tool_end(event, fidelity=True)
+
+    assert mapped["tool_result"]["structured_content"]["children"][0] == {
+        "handle": "root:1",
+        "state": "failed",
+        "reason": "lost: owner process exited",
+    }
 
 
 def test_server_sends_only_wire_map_event_names() -> None:
@@ -2668,6 +2699,7 @@ async def test_abort_mid_stream(tmp_path: Path) -> None:
 async def test_abort_captures_turn_before_approval_end_write(
     tmp_path: Path,
     scope: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("approval-race", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
@@ -2677,7 +2709,24 @@ async def test_abort_captures_turn_before_approval_end_write(
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
+    approval_end_started = asyncio.Event()
+    allow_approval_end = asyncio.Event()
     reader, writer = await _connect(server)
+    original_write_physical = server.connections._write_physical
+
+    async def pause_approval_end(connection: object, payload: object) -> object:
+        frame = json.loads(payload)
+        if frame.get("params", {}).get("event") == "approval_end":
+            approval_end_started.set()
+            await await_or_fail(
+                allow_approval_end.wait(),
+                what="approval_end release gate",
+            )
+        return await original_write_physical(connection, payload)
+
+    # test-contract: seam hold the physical approval-end write during abort
+    monkeypatch.setattr(server.connections, "_write_physical", pause_approval_end)
+    abort: asyncio.Task[list[dict[str, Any]]] | None = None
     try:
         await _request(
             reader,
@@ -2690,38 +2739,40 @@ async def test_abort_captures_turn_before_approval_end_write(
         await _request(reader, writer, 3, "send", {"text": "wait for approval"})
         await _event(reader, "approval_request")
 
-        assert server._client is not None
-        turn_task = server.control._turn_task
-        assert turn_task is not None
-        original_write_physical = server.connections._write_physical
-        approval_end_started = asyncio.Event()
-        allow_approval_end = asyncio.Event()
-
-        async def pause_approval_end(connection: object, payload: object) -> object:
-            frame = json.loads(payload)
-            if frame.get("params", {}).get("event") == "approval_end":
-                approval_end_started.set()
-                async with asyncio.timeout(TIMEOUT):
-                    await allow_approval_end.wait()
-            return await original_write_physical(connection, payload)
-
-        # test-contract: seam hold the physical approval-end write until turn capture
-        server.connections._write_physical = pause_approval_end  # type: ignore[method-assign]
         abort = asyncio.create_task(
             _request(reader, writer, 4, "abort", {"scope": scope})
         )
-        await asyncio.wait_for(approval_end_started.wait(), TIMEOUT)
-        # The abort captured this turn before the approval_end frame reached the
-        # wire: it marked the cancellation outcome, so the turn cannot finish yet
-        # because its post-gate output is queued behind the held approval_end write.
-        assert server.control._turn_task is turn_task
-        assert server.control._turn_cancel_outcome is not None
+        await await_or_fail(
+            approval_end_started.wait(),
+            what="approval_end publication gate",
+        )
         allow_approval_end.set()
 
-        frames = await asyncio.wait_for(abort, TIMEOUT)
-        assert frames[-1]["result"] == {"aborted": True}
-        await _frames_until_event(reader, "turn_aborted")
+        response = await await_or_fail(abort, what="abort response")
+        assert response[-1]["result"] == {"aborted": True}
+        frames = await await_or_fail(
+            _frames_until_event(reader, "turn_aborted"),
+            what="turn_aborted frame",
+        )
+        writer.write(b'{"jsonrpc":"2.0","id":5,"method":"status","params":{}}\n')
+        await await_or_fail(writer.drain(), what="status request write")
+        frames += await await_or_fail(
+            read_until(reader, lambda frame: frame.get("id") == 5, what="status response"),
+            what="status response frames",
+        )
+        names = [frame.get("params", {}).get("event") for frame in frames]
+        assert names.count("approval_end") == 1
+        assert names.index("approval_end") < names.index("turn_aborted")
+        after_abort = names[names.index("turn_aborted") + 1 :]
+        assert not {"tool_start", "tool_end", "turn_start"}.intersection(after_abort)
     finally:
+        allow_approval_end.set()
+        if abort is not None and not abort.done():
+            abort.cancel()
+            await await_or_fail(
+                asyncio.gather(abort, return_exceptions=True),
+                what="abort request cleanup",
+            )
         await close_serve(server, writer)
 
 
