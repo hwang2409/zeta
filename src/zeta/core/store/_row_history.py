@@ -1,6 +1,7 @@
-"""Durable parent-side history for delegated approval lifecycle events.
+"""Recent-row history lookups: the approval history index and recent-row keys.
 
-Also key-shaped lookup of recent resident rows for serve replay. The store
+Holds durable parent-side history for delegated approval lifecycle events and
+key-shaped lookup of recent resident rows for serve replay. The store
 owns these row shapes so readers never scan ``_entries`` themselves. p08 must
 keep the same names behind a bounded resident key index; these are synchronous
 owner-loop calls, so they may not query SQLite.
