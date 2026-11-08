@@ -7,7 +7,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from .auth import error_body_excerpt
+from ..oauth import error_body_excerpt
 from .transport import retry_after_seconds
 
 _ANTHROPIC_PROMPT_TOKENS = re.compile(

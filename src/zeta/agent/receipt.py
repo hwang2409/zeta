@@ -21,6 +21,17 @@ from ..protocol.types import (
 
 ReceiptState = Literal["running", "completed", "failed", "canceled"]
 TerminalState = Literal["completed", "failed", "canceled"]
+
+
+def child_cleanup_details(
+    scope: Literal["foreground", "background"], canceled: bool
+) -> tuple[str, str]:
+    """Return the durable kill cause and receipt label for child cleanup."""
+
+    action = "cancellation" if canceled else "completion"
+    return f"{scope} child {action} cleanup", f"child {action}"
+
+
 MAX_AGENT_RESULT_BYTES = 10_000
 # A terminal agent receipt has a fixed persisted-message envelope even when its
 # text and metadata are empty. Receipt call sites clamp configured tool-output
@@ -603,32 +614,6 @@ def has_agent_receipt_suffix(value: str) -> bool:
 
 def _without_agent_receipt_suffix(value: str) -> str:
     return _SUFFIX_RE.sub("", value)
-
-
-def ensure_agent_receipt_text(
-    answer: str,
-    state: TerminalState,
-    stats: Mapping[str, object] | None,
-) -> str:
-    match = _SUFFIX_RE.search(answer)
-    if match is not None:
-        expected_error = state == "failed"
-        expected_canceled = state == "canceled"
-        if (
-            match.group("error") == str(expected_error).lower()
-            and match.group("canceled") == str(expected_canceled).lower()
-        ):
-            return answer
-        stats = {
-            "turns_used": int(match.group("turns")),
-            "elapsed": float(match.group("elapsed")),
-            "tool_calls": int(match.group("tool_calls")),
-            "error": expected_error,
-            "canceled": expected_canceled,
-        }
-    result = build_agent_receipt(state, answer, stats)
-    content = result["content"][0]
-    return content["text"] if content["type"] == "text" else answer
 
 
 def receipt_message_size(result: StructuredToolResult, tool_call_id: str = "") -> int:

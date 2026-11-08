@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 
 from tests.support.server_client import event, request
+from tests.support.sockets import short_socket_path as _socket_path
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 
 def _entrypoint() -> Path:
@@ -110,7 +113,7 @@ async def test_installed_serve_process_survives_reconnect_and_restart(
 ) -> None:
     token = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]
     home = Path("/tmp") / f"zeta-process-{token}-home"
-    socket_path = Path("/tmp") / f"zeta-process-{token}.sock"
+    socket_path = _socket_path(tmp_path)
     default_socket = home / "run" / "serve.sock"
     processes: list[asyncio.subprocess.Process] = []
     writers: list[asyncio.StreamWriter] = []

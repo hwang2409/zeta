@@ -27,8 +27,10 @@ from rich.console import Console
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
+pytest_plugins = (
+    ("pytester", "tests.support.fake_backend") if _IS_REPOSITORY_TESTS else ()
+)
 os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
-os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
 
 
 def _is_repository_test_path(path: Path) -> bool:
@@ -39,6 +41,21 @@ def _is_repository_test_path(path: Path) -> bool:
 
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    if not _IS_REPOSITORY_TESTS:
+        return
+    import zeta
+
+    imported = Path(zeta.__file__).resolve()
+    source = (_REPOSITORY_ROOT / "src").resolve()
+    if not imported.is_relative_to(source):
+        pytest.exit(
+            f"wrong zeta import: {imported}; expected source under {source}. "
+            f"run uv run pytest from the worktree root or set PYTHONPATH={source}",
+            returncode=2,
+        )
 
 
 def pytest_collection_modifyitems(
@@ -369,9 +386,7 @@ class LiveHomeWriteGuard:
 # These variables control the test harness itself and must survive environment
 # isolation.  Keep this list explicit so adding a ZETA_* setting cannot silently
 # change CI behavior.
-_TEST_HARNESS_ENV_ALLOWLIST = frozenset(
-    {"ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT", "ZETA_TEST_PARENT_PID"}
-)
+_TEST_HARNESS_ENV_ALLOWLIST = frozenset({"ZETA_TEST_PARENT_PID"})
 
 
 _HOME_GUARD = pytest.StashKey[LiveHomeWriteGuard]()
@@ -519,9 +534,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         )
     yield
     after = _open_file_descriptors()
-    previous_count = (
-        _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
-    )
+    previous_count = _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
     if previous_count is not None and len(after) > previous_count:
         gc.collect()
         after = _open_file_descriptors()
@@ -646,7 +659,9 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         result = []
         thread = threading.Thread(target=lambda: result.append(open_writer(home)))
         thread.start()
-        thread.join()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            raise TimeoutError("test storage writer did not open within 10 seconds")
         return result[0]
 
     @wraps(store_init)
@@ -711,25 +726,39 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
+    from tests.support.owned import await_or_fail, close_owned_app
+    from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
+    from zeta.memory.auto import AutoMemoryReconciler
+    from zeta.project_registry import ProjectRegistry
     from zeta.runtime.loop import AgentLoop
-    from zeta.storage_format import StorageFormatError, advance, open_writer
+    from zeta.server import ZetaServer
+    from zeta.storage_format import open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
+    from zeta.tui.app import TUIApp
 
     loops: list[AgentLoop] = []
     stores: list[ConversationStore] = []
     composed_stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
     managers: list[SessionManager] = []
+    memory_reconcilers: list[AutoMemoryReconciler] = []
     workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
+    servers: list[ZetaServer] = []
+    closed_servers: set[ZetaServer] = set()
+    apps: list[TUIApp] = []
+    closed_apps: weakref.WeakSet[TUIApp] = weakref.WeakSet()
     test_home_leases = {}
     loop_init = AgentLoop.__init__
     loop_close = AgentLoop.close
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
+    project_registry_init = ProjectRegistry.__init__
+    account_store_init = AccountStore.__init__
+    memory_reconciler_init = AutoMemoryReconciler.__init__
 
     @wraps(loop_init)
     def tracked_loop_init(loop, *args, **kwargs):
@@ -739,27 +768,30 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     workspace_init = WorkspaceSnapshotStore.__init__
     registry_init = ToolRegistry.__init__
     background_init = BackgroundTaskRegistry.__init__
+    server_init = ZetaServer.__init__
+    server_close = ZetaServer.close
+    app_init = TUIApp.__init__
+    app_close = TUIApp.close
     store_close = ConversationStore.close
     registry_close = ToolRegistry.close
 
     def ensure_format(home: Path) -> None:
-        home.mkdir(parents=True, exist_ok=True)
-        if not (home / "storage-format.json").exists():
-            advance(home, expected_epoch=0)
         canonical = home.resolve()
         if canonical not in test_home_leases:
             result = []
-            error = []
+            error: list[BaseException] = []
 
             def open_test_writer() -> None:
                 try:
                     result.append(open_writer(home))
-                except StorageFormatError as exc:
+                except BaseException as exc:  # noqa: BLE001 - preserve thread errors
                     error.append(exc)
 
             thread = threading.Thread(target=open_test_writer)
             thread.start()
-            thread.join()
+            thread.join(timeout=10)
+            if thread.is_alive():
+                raise TimeoutError("test storage writer did not open within 10 seconds")
             if error:
                 raise error[0]
             test_home_leases[canonical] = result[0]
@@ -794,6 +826,31 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         manager_init(manager, *args, **kwargs)
         managers.append(manager)
 
+    def on_event_loop() -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    @wraps(project_registry_init)
+    def tracked_project_registry_init(registry, *args, **kwargs):
+        if on_event_loop():
+            root = Path(args[0] if args else kwargs["root"])
+            ensure_format(root.parent)
+        project_registry_init(registry, *args, **kwargs)
+
+    @wraps(account_store_init)
+    def tracked_account_store_init(store, *args, **kwargs):
+        home = Path(args[0] if args else kwargs["home"])
+        ensure_format(home)
+        account_store_init(store, *args, **kwargs)
+
+    @wraps(memory_reconciler_init)
+    def tracked_memory_reconciler_init(reconciler, *args, **kwargs):
+        memory_reconciler_init(reconciler, *args, **kwargs)
+        memory_reconcilers.append(reconciler)
+
     @wraps(workspace_init)
     def tracked_workspace_init(workspace, *args, **kwargs):
         session_dir = Path(args[0])
@@ -822,19 +879,84 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    @wraps(server_init)
+    def tracked_server_init(server, *args, **kwargs):
+        server_init(server, *args, **kwargs)
+        servers.append(server)
+
+    @wraps(app_init)
+    def tracked_app_init(app, *args, **kwargs):
+        app_init(app, *args, **kwargs)
+        apps.append(app)
+
+    @wraps(app_close)
+    async def tracked_app_close(app, *args, **kwargs):
+        await app_close(app, *args, **kwargs)
+        closed_apps.add(app)
+        if app in apps:
+            apps.remove(app)
+
+    @wraps(server_close)
+    async def tracked_server_close(server, *args, **kwargs):
+        await server_close(server, *args, **kwargs)
+        closed_servers.add(server)
+
     # test-contract: seam tracks and closes loops created by tests
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
     # test-contract: seam tracks and closes stores created by tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     # test-contract: seam tracks and closes session managers created by tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam acquires the test home lease before direct registry setup
+    monkeypatch.setattr(ProjectRegistry, "__init__", tracked_project_registry_init)
+    # test-contract: seam acquires the test home lease before direct account setup
+    monkeypatch.setattr(AccountStore, "__init__", tracked_account_store_init)
+    # test-contract: seam tracks process-owned resources created across tests
+    monkeypatch.setattr(
+        AutoMemoryReconciler, "__init__", tracked_memory_reconciler_init
+    )
     # test-contract: seam tracks and closes workspace stores created by tests
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
     # test-contract: seam tracks and closes tool registries created by tests
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     # test-contract: seam tracks and closes background registries created by tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
+    # test-contract: seam tracks and closes servers created by tests
+    monkeypatch.setattr(ZetaServer, "__init__", tracked_server_init)
+    # test-contract: seam records successful server closes for idempotent teardown
+    monkeypatch.setattr(ZetaServer, "close", tracked_server_close)
+    # test-contract: seam tracks and closes apps created by tests
+    monkeypatch.setattr(TUIApp, "__init__", tracked_app_init)
+    # test-contract: seam records successful app closes for idempotent teardown
+    monkeypatch.setattr(TUIApp, "close", tracked_app_close)
     yield
+    first_error: BaseException | None = None
+
+    # Apps own loops and stores, so close them before those lower-level owners.
+    for app in reversed(apps.copy()):
+        if app not in closed_apps:
+            try:
+                await await_or_fail(close_owned_app(app), what="TUIApp.close")
+            except BaseException as exc:  # noqa: BLE001 - close every owner
+                if first_error is None:
+                    first_error = exc
+
+    async def close_server(server: ZetaServer) -> None:
+        nonlocal first_error
+        try:
+            await await_or_fail(server.close(), what="ZetaServer.close")
+        except BaseException as exc:  # noqa: BLE001 - close every owner
+            if first_error is None:
+                first_error = exc
+
+    for server in reversed(servers):
+        if server not in closed_servers:
+            await close_server(server)
+    for reconciler in reversed(memory_reconcilers):
+        try:
+            await reconciler.close()
+        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+            pass
     for loop in reversed(loops):
         if not loop._closed:
             try:
@@ -862,6 +984,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         manager._release_storage_lease()
     for lease in test_home_leases.values():
         lease.close()
+    if first_error is not None:
+        raise first_error
 
 
 @pytest.fixture

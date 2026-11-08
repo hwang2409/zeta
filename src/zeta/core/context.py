@@ -16,6 +16,7 @@ from .context_parts.types import (
 from .context_parts.tool_results import truncate_tool_results
 from .context_usage import SessionUsage
 from ..context_accounting import (
+    MessageTokenCounts,
     context_digest as _digest,
     cooperative_call as _cooperative_call,
     message_token_count as _message_token_count,
@@ -133,13 +134,16 @@ class ContextAssembler(ContextMarkerMixin):
         )
         self.last_context: AssembledContext | None = None
         self.last_usage: dict[str, Any] = {}
+        self._token_counts = MessageTokenCounts()
         self._request_budget = ContextRequestBudget(
             self.store.context_calibration_records(),
             provider_limit=self.token_budget,
             safety_margin=self.safety_margin,
             normal_target_ratio=TARGET_RATIO,
             emergency_target_ratio=EMERGENCY_TARGET_RATIO,
-            token_counter=self.token_counter,
+            token_counter=lambda message, counter=self.token_counter: (
+                self._token_counts.count(message, counter)
+            ),
         )
         self._request_admission = SessionRequestAdmission(
             estimate=self.estimate_request,
@@ -166,6 +170,7 @@ class ContextAssembler(ContextMarkerMixin):
             return True
         branch = self.store.active_branch_snapshot()
         items = self._visible_items(branch)
+        self._track_token_counts(items)
         system_prompt = self._system_prompt_message(system_append)
         messages = [
             *([] if system_prompt is None else [system_prompt]),
@@ -432,8 +437,11 @@ class ContextAssembler(ContextMarkerMixin):
             )
             if truncated is not None:
                 return self._save(truncated, False)
+        # Every evicted user is either pinned at its source position or sent to the summary.
         candidates = [
-            item for index, item in enumerate(items[:boundary]) if index != latest_user
+            item
+            for index, item in enumerate(items[:boundary])
+            if pinned_user is None or index != latest_user
         ]
         evicted = await self._evict_context(
             backend=backend,
@@ -582,6 +590,7 @@ class ContextAssembler(ContextMarkerMixin):
         """Build the immutable inputs for compaction without store access."""
 
         items = self._visible_items(branch)
+        self._track_token_counts(items)
         result_seqs = {
             id(item.message): item.entry.seq
             for item in items
@@ -616,7 +625,12 @@ class ContextAssembler(ContextMarkerMixin):
             committed_tokens = self._count(committed_messages)
         pinned_user = (
             items[latest_user]
-            if latest_user is not None and latest_user < boundary
+            if latest_user is not None
+            and latest_user < boundary
+            and not any(
+                self._is_completed_assistant(item)
+                for item in items[latest_user + 1 : boundary]
+            )
             else None
         )
         prefix_has_uncompacted_items = any(
@@ -848,12 +862,23 @@ class ContextAssembler(ContextMarkerMixin):
                 else _EvictionPlan("none-fallback")
             )
         view = eviction_view(records, result)
-        view_messages = self._eviction_view_messages(view)
-        proposed = floor_plan.proposed_messages(
-            system_messages,
-            view_messages,
-            None if latest_user_item is None else latest_user_item.message,
+        pinned_message = None
+        if latest_user_item is not None:
+            pinned_message = Message(
+                latest_user_item.message.role,
+                list(latest_user_item.message.content),
+                tool_result=latest_user_item.message.tool_result,
+                metadata={
+                    **latest_user_item.message.metadata,
+                    "source_seq": latest_user_item.entry.seq,
+                },
+            )
+        view_messages = self._eviction_view_messages(
+            view,
+            pinned_message,
+            ([] if floor_plan.message is None else [floor_plan.message]),
         )
+        proposed = floor_plan.proposed_messages(system_messages, view_messages)
         result_seqs = {
             id(m): int(m.metadata["source_seq"])
             for m in view_messages
@@ -874,7 +899,7 @@ class ContextAssembler(ContextMarkerMixin):
             source_start,
             source_end,
             replaces,
-            None if latest_user_item is None else latest_user_item.message,
+            pinned_message,
             tuple(view),
             telemetry,
             floor_plan.floor,
@@ -977,6 +1002,22 @@ class ContextAssembler(ContextMarkerMixin):
         )
 
     @staticmethod
+    def _is_completed_assistant(item: _ContextItem) -> bool:
+        return (
+            item.entry is not None
+            and item.entry.type == "message"
+            and item.message.role is MessageRole.ASSISTANT
+            and (
+                item.message.metadata.get(ASSISTANT_RESPONSE_STATE)
+                == ASSISTANT_RESPONSE_COMPLETED
+                or (
+                    ASSISTANT_RESPONSE_STATE not in item.message.metadata
+                    and not item.message.metadata.get(FAILED_TURN_MARKER)
+                )
+            )
+        )
+
+    @staticmethod
     def _latest_persisted_assistant_entry_seq(
         items: Sequence[_ContextItem],
     ) -> int | None:
@@ -1046,7 +1087,15 @@ class ContextAssembler(ContextMarkerMixin):
         return context
 
     def _count(self, messages: Sequence[Message]) -> int:
-        return sum(self.token_counter(message) for message in messages)
+        counter = self.token_counter
+        return sum(self._token_counts.count(message, counter) for message in messages)
+
+    def _track_token_counts(self, items: Sequence[_ContextItem]) -> None:
+        self._token_counts.track(
+            (item.count_source, item.message)
+            for item in items
+            if item.count_source is not None
+        )
 
     def _system_prompt_message(self, system_append: str = "") -> Message | None:
         if not _text_from_message(self.system_prompt).strip():
@@ -1105,7 +1154,7 @@ class ContextAssembler(ContextMarkerMixin):
         for entry in entries:
             marker = markers_by_start.get(entry.seq)
             if marker is not None:
-                items.extend(self._marker_items(marker, active_source_seqs))
+                items.extend(self._marker_items(marker, active_source_seqs, entries))
                 emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
                 continue
@@ -1131,10 +1180,14 @@ class ContextAssembler(ContextMarkerMixin):
                 and message.tool_result.tool_call_id in failed_tool_call_ids
             ):
                 continue
-            items.append(_ContextItem(entry, without_client_delivery_marker(message)))
+            items.append(
+                _ContextItem(
+                    entry, without_client_delivery_marker(message), count_source=entry
+                )
+            )
         for marker in valid_markers:
             if marker.id not in emitted_marker_ids:
-                items.extend(self._marker_items(marker, active_source_seqs))
+                items.extend(self._marker_items(marker, active_source_seqs, entries))
         return items
 
     @staticmethod

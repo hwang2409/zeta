@@ -4,8 +4,202 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Mapping
+from enum import Enum, StrEnum
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class _Frame(bytes):
+    """A complete wire frame constructed by FrameCodec."""
+
+
+class ErrorDescriptor(Enum):
+    """One documented JSON-RPC error variant."""
+
+    PARSE_ERROR = (-32700, None, "invalid JSON or invalid UTF-8 frame")
+    INVALID_REQUEST = (-32600, None, "invalid JSON-RPC request or duplicate handshake")
+    METHOD_NOT_FOUND = (-32601, None, "method or negotiated feature is not supported")
+    INVALID_PARAMS = (
+        -32602,
+        None,
+        "params have the wrong shape, value, or negotiated capability",
+    )
+    INTERNAL_ERROR = (-32000, None, "unexpected server or storage failure")
+    CONNECTION_CAPACITY = (
+        -32001,
+        None,
+        "requested controller or observer connection role is at capacity",
+    )
+    PROTOCOL_MISMATCH = (
+        -32002,
+        None,
+        "handshake is missing or the protocol version does not match",
+    )
+    NO_ACTIVE_SESSION = (
+        -32003,
+        None,
+        "no active session, or the active session requires a host binding",
+    )
+    OPERATION_BUSY = (
+        -32004,
+        None,
+        "operation is blocked by active turn, tool, or background-agent work",
+    )
+    STATE_UNAVAILABLE = (-32005, None, "requested turn or account state is unavailable")
+    APPROVAL_UNAVAILABLE = (
+        -32006,
+        None,
+        "approval request is missing, resolved, or reserved",
+    )
+    FRAME_TOO_LARGE = (-32007, None, "outbound frame exceeds the size limit")
+    HISTORY_SNAPSHOT_STALE = (
+        -32009,
+        "stale_history_snapshot",
+        "session history snapshot is stale",
+    )
+    DELIVERY_ID_EVICTED = (-32010, None, "delivery ID details were evicted")
+    CONTROLLER_OUTPUT_OVERFLOW = (-32011, None, "controller output overflow")
+    OBSERVER_OUTPUT_OVERFLOW = (-32011, None, "observer output overflow")
+    CONTENT_NOT_FOUND = (-32012, "content_not_found", "content handle was not found")
+    TRANSCRIPT_REPAIR_REQUIRES_UPGRADE = (
+        -32013,
+        "transcript_repair_requires_upgrade",
+        "transcript repair requires the stored-format upgrade",
+    )
+    CORRUPT_TRANSCRIPT = (
+        -32000,
+        "corrupt_transcript",
+        "transcript is corrupt or uses an unsupported format",
+    )
+    ACTIVE_SESSION = (-32005, "active_session", "the active session cannot be deleted")
+    ACCOUNT_LOCK_TIMEOUT = (
+        -32008,
+        "account_lock_timeout",
+        "another process holds the selected account lock",
+    )
+    APPROVAL_PERSISTENCE_FAILED = (
+        -32000,
+        "approval_persistence_failed",
+        "approval state could not be persisted",
+    )
+    HOST_BINDING_REQUIRED = (
+        -32003,
+        "host_binding_required",
+        "the session requires a host binding",
+    )
+    INVALID_CONTENT_READ = (
+        -32602,
+        "invalid_content_read",
+        "content_read parameters are invalid",
+    )
+    INVALID_SESSION_GRANTS_PARAMS = (
+        -32602,
+        "invalid_session_grants_params",
+        "session_grants parameters are invalid",
+    )
+    INVALID_SESSION_GRANTS_REVOKE = (
+        -32602,
+        "invalid_session_grants_revoke",
+        "revoke_session_grants parameters are invalid",
+    )
+    LOGIN_IN_PROGRESS = (-32005, "login_in_progress", "a login is already pending")
+    OBSERVER_READ_ONLY = (
+        -32008,
+        "observer_read_only",
+        "a read-only observer requested a write method",
+    )
+    PROJECT_NOT_FOUND = (
+        -32602,
+        "project_not_found",
+        "the requested project does not exist",
+    )
+    PROJECT_REGISTRY_BUSY = (
+        -32000,
+        "project_registry_busy",
+        "another process holds the project registry lock",
+    )
+    SESSION_GRANT_NOT_FOUND = (
+        -32602,
+        "session_grant_not_found",
+        "the requested session grant does not exist",
+    )
+    SESSION_NOT_FOUND = (
+        -32602,
+        "session_not_found",
+        "the requested session does not exist",
+    )
+
+    def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
+        self.code = code
+        self.data_code = data_code
+        self.meaning = meaning
+
+    def data(self, fields: dict[str, object] | None = None) -> dict[str, object] | None:
+        if self.data_code is None:
+            return fields
+        data = {"code": self.data_code}
+        if fields is not None:
+            data.update(fields)
+            data["code"] = self.data_code
+        return data
+
+
+class SlashResultKindDescriptor(StrEnum):
+    """One documented slash_run result kind."""
+
+    OUTPUT = "output"
+    MODEL_INPUT = "model_input"
+    CLIENT_ONLY = "client_only"
+    UNKNOWN = "unknown"
+    ERROR = "error"
+
+
+class SlashErrorCodeDescriptor(StrEnum):
+    """One documented structured slash_run error code."""
+
+    MCP_CREDENTIAL_STORE = "mcp_credential_store"
+
+
+class EventDescriptor(StrEnum):
+    """One documented JSON-RPC event name."""
+
+    AGENT_START = "agent_start"
+    TURN_START = "turn_start"
+    COMPACTION_START = "compaction_start"
+    COMPACTION_END = "compaction_end"
+    MESSAGE_START = "message_start"
+    ASSISTANT_DELTA = "assistant_delta"
+    ASSISTANT_MESSAGE = "assistant_message"
+    RETRY = "retry"
+    ASSISTANT_RESET = "assistant_reset"
+    APPROVAL_REQUEST = "approval_request"
+    APPROVAL_END = "approval_end"
+    TOOL_START = "tool_start"
+    TOOL_OUTPUT = "tool_output"
+    TOOL_END = "tool_end"
+    SUB_AGENT_RECEIPT = "sub_agent_receipt"
+    CHILD_IDLE = "child_idle"
+    TASK_EXIT_NOTIFICATION = "task_exit_notification"
+    PROJECT_INBOX_NOTIFICATION = "project_inbox_notification"
+    CHILD_QUESTION = "child_question"
+    CHILD_QUESTION_WITHDRAWN = "child_question_withdrawn"
+    CHILD_MESSAGE_DELIVERED = "child_message_delivered"
+    ACCOUNT_LIMIT = "account_limit"
+    ACCOUNT_STATE_UNKNOWN = "account_state_unknown"
+    TURN_END = "turn_end"
+    SERVED_TURN_END = "served_turn_end"
+    AGENT_END = "agent_end"
+    ERROR = "error"
+    DELIVERY_STATUS = "delivery_status"
+    MEMORY_UPDATED = "memory_updated"
+    TURN_ABORTED = "turn_aborted"
+    USAGE = "usage"
+    USER_MESSAGE = "user_message"
+    SESSION_GRANTS_CHANGED = "session_grants_changed"
+
 
 PROTOCOL_VERSION = "1.2"
 SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
@@ -35,6 +229,7 @@ FEATURES = (
     "session_history_fidelity",
     "served_turn_end",
     "content_read",
+    "session_grants",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
@@ -77,7 +272,7 @@ class FrameWriteCancelled(asyncio.CancelledError):
 FRAME_CANCEL_GRACE = 1.0
 
 
-async def finish_frame_write(codec: FrameCodec, writer: Any, payload: bytes) -> bool:
+async def finish_frame_write(codec: FrameCodec, writer: Any, payload: _Frame) -> bool:
     """Write one frame; through cancellation, report whether it was written.
 
     Cancellation before this call writes nothing. Cancellation during the
@@ -140,16 +335,17 @@ class ProtocolError(Exception):
 
     def __init__(
         self,
-        code: int,
+        descriptor: ErrorDescriptor,
         message: str,
-        data: object | None = None,
+        data: dict[str, object] | None = None,
         *,
         request_id: str | int | None = None,
     ) -> None:
         super().__init__(message)
-        self.code = code
+        self.descriptor = descriptor
+        self.code = descriptor.code
         self.message = message
-        self.data = data
+        self.data = descriptor.data(data)
         self.request_id = _safe_request_id(request_id)
 
 
@@ -158,7 +354,7 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
 
     if requested not in SUPPORTED_PROTOCOL_VERSIONS:
         raise ProtocolError(
-            -32002,
+            ErrorDescriptor.PROTOCOL_MISMATCH,
             "unsupported protocol version",
             {"requested": requested, "supported": list(SUPPORTED_PROTOCOL_VERSIONS)},
         )
@@ -174,7 +370,7 @@ class FrameCodec:
         request_id = _request_id_hint(line[:MAX_FRAME_BYTES])
         if len(line) > MAX_FRAME_BYTES:
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 f"request frame exceeds {MAX_FRAME_BYTES} bytes",
                 request_id=request_id,
             )
@@ -191,13 +387,13 @@ class FrameCodec:
             ValueError,
         ) as exc:
             raise ProtocolError(
-                -32700,
+                ErrorDescriptor.PARSE_ERROR,
                 "invalid JSON frame",
                 request_id=request_id,
             ) from exc
         if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 "request must be a JSON-RPC 2.0 object",
                 request_id=request_id,
             )
@@ -206,19 +402,19 @@ class FrameCodec:
         request_id = _safe_request_id(raw_request_id)
         if isinstance(raw_request_id, _OversizedInteger):
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 f"numeric request id exceeds {MAX_NUMERIC_ID_DIGITS} digits",
                 request_id=request_id,
             )
         if type(raw_request_id) is not str and type(raw_request_id) is not int:
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 "request id must be a string or integer",
                 request_id=request_id,
             )
         if isinstance(raw_request_id, str) and request_id is None:
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 f"request id exceeds {MAX_REQUEST_ID_BYTES} UTF-8 bytes",
                 request_id=request_id,
             )
@@ -226,23 +422,20 @@ class FrameCodec:
         method = value.get("method")
         if not isinstance(method, str) or not method:
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 "request method must be a nonempty string",
                 request_id=request_id,
             )
         params = value.get("params", {})
         if not isinstance(params, dict):
             raise ProtocolError(
-                -32602,
+                ErrorDescriptor.INVALID_PARAMS,
                 "request params must be an object",
                 request_id=request_id,
             )
         return {"id": raw_request_id, "method": method, "params": params}
 
-    def encode(self, value: Mapping[str, Any]) -> bytes:
-        return self._bounded_json(value, request_id=None)
-
-    def response(self, request_id: str | int | None, result: object) -> bytes:
+    def response(self, request_id: str | int | None, result: object) -> _Frame:
         value = {"jsonrpc": "2.0", "id": request_id, "result": result}
         return self._bounded_json(value, request_id=request_id)
 
@@ -269,20 +462,31 @@ class FrameCodec:
     def error_response(
         self,
         request_id: str | int | None,
-        code: int,
+        descriptor: ErrorDescriptor,
         message: str,
-        data: object | None = None,
-    ) -> bytes:
-        error: dict[str, Any] = {"code": code, "message": message}
-        if data is not None:
-            error["data"] = data
+        data: dict[str, object] | None = None,
+    ) -> _Frame:
+        if not isinstance(descriptor, ErrorDescriptor):
+            logger.error("refusing unregistered error descriptor: %r", descriptor)
+            return self._minimal_error(
+                request_id,
+                ErrorDescriptor.INTERNAL_ERROR,
+                ErrorDescriptor.INTERNAL_ERROR.meaning,
+            )
+        error: dict[str, Any] = {"code": descriptor.code, "message": message}
+        wire_data = descriptor.data(data)
+        if wire_data is not None:
+            error["data"] = wire_data
         value = {"jsonrpc": "2.0", "id": request_id, "error": error}
         return self._bounded_json(value, request_id=request_id)
 
     def notification(
-        self, event: str, session_id: str | None, **fields: object
-    ) -> bytes:
-        params: dict[str, object] = {"event": event}
+        self, event: EventDescriptor, session_id: str | None, **fields: object
+    ) -> _Frame | None:
+        if not isinstance(event, EventDescriptor):
+            logger.error("refusing unregistered event descriptor: %r", event)
+            return None
+        params: dict[str, object] = {"event": event.value}
         if session_id is not None:
             params["session_id"] = session_id
         params.update(fields)
@@ -299,13 +503,16 @@ class FrameCodec:
             session_id, event, "event exceeds the size limit"
         )
 
-    async def write(self, writer: Any, payload: bytes) -> bool:
+    async def write(self, writer: Any, payload: _Frame) -> bool:
         """Write one codec-produced frame; report a disconnected peer."""
 
+        if not isinstance(payload, _Frame):
+            logger.error("refusing frame not constructed by FrameCodec")
+            return False
         if len(payload) > MAX_FRAME_BYTES:
             payload = self.error_response(
                 None,
-                -32007,
+                ErrorDescriptor.FRAME_TOO_LARGE,
                 f"outbound frame exceeds {MAX_FRAME_BYTES} bytes",
             )
         try:
@@ -317,43 +524,45 @@ class FrameCodec:
 
     def _bounded_json(
         self, value: Mapping[str, Any], *, request_id: str | int | None
-    ) -> bytes:
+    ) -> _Frame:
         try:
             payload = self._json_bytes(value)
         except (TypeError, UnicodeEncodeError, ValueError, RecursionError):
             return self._minimal_error(
                 request_id,
-                -32000,
+                ErrorDescriptor.INTERNAL_ERROR,
                 "response could not be serialized",
             )
         if len(payload) <= MAX_FRAME_BYTES:
             return payload
         return self._minimal_error(
             request_id,
-            -32007,
+            ErrorDescriptor.FRAME_TOO_LARGE,
             f"outbound frame exceeds {MAX_FRAME_BYTES} bytes",
         )
 
     @staticmethod
-    def _json_bytes(value: object) -> bytes:
-        return (
-            json.dumps(
-                value,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n"
-        ).encode("utf-8")
+    def _json_bytes(value: object) -> _Frame:
+        return _Frame(
+            (
+                json.dumps(
+                    value,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
 
     def _minimal_error(
-        self, request_id: str | int | None, code: int, message: str
-    ) -> bytes:
+        self, request_id: str | int | None, descriptor: ErrorDescriptor, message: str
+    ) -> _Frame:
         safe_id = _safe_request_id(request_id)
         value = {
             "jsonrpc": "2.0",
             "id": safe_id,
-            "error": {"code": code, "message": message},
+            "error": {"code": descriptor.code, "message": message},
         }
         payload = self._json_bytes(value)
         if len(payload) <= MAX_FRAME_BYTES:
@@ -362,12 +571,12 @@ class FrameCodec:
         return self._json_bytes(value)
 
     def _error_notification(
-        self, session_id: str | None, event: str, message: str
-    ) -> bytes:
+        self, session_id: str | None, event: EventDescriptor, message: str
+    ) -> _Frame:
         params: dict[str, object] = {
-            "event": "error",
+            "event": EventDescriptor.ERROR.value,
             "error": {"code": "frame_too_large", "message": message},
-            "data": {"event": event},
+            "data": {"event": event.value},
         }
         if session_id is not None:
             params["session_id"] = session_id

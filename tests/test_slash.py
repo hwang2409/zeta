@@ -3,6 +3,7 @@ from zeta.skills import SkillCatalog
 import asyncio
 import json
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from io import StringIO
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from zeta.core.slash import (
     UNPRICED_MODEL_IDS,
     UsageTracker,
     UsageSnapshot,
+    _format_status,
     compaction_history,
     context_fill_percent,
     create_slash_registry,
@@ -63,6 +65,10 @@ from zeta.protocol.types import (
 @dataclass(frozen=True, slots=True)
 class FakeSlashSession:
     status: SlashStatus
+
+    def slash_status_command(self, args: str) -> str:
+        del args
+        return _format_status(self.status)
 
     def slash_status(self) -> SlashStatus:
         return self.status
@@ -712,6 +718,283 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_paths() -> None:
+    class Registry:
+        def memory_format(self, project_id: str) -> int:
+            assert project_id == "project"
+            return 1
+
+        def undo_memory(
+            self, project_id: str, *, expected_current: str | None = None
+        ) -> list[tuple[str, str]]:
+            assert project_id == "project"
+            if expected_current != "v1":
+                return [("state.md", "erased later content")]
+            raise ProjectRegistryError(
+                "memory changed since this suggestion; review /memory log"
+            )
+
+        def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
+            return []
+
+        def ensure_memory_supported(self, project_id: str) -> None:
+            pass
+
+        def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]:
+            return []
+
+    class Reconciler:
+        def __init__(self) -> None:
+            self.resumed: list[tuple[str, str]] = []
+
+        async def resume_recovery(self, root: str, quarantine: str) -> str:
+            self.resumed.append((root, quarantine))
+            return "memory recovery resumed"
+
+    from zeta.project_errors import ProjectRegistryError
+    from zeta.server.slash_commands import ServerSlashSession
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    reconciler = Reconciler()
+    registry = Registry()
+    tui = SimpleNamespace(
+        loop=SimpleNamespace(
+            project_registry=registry,
+            session_metadata=SimpleNamespace(project_id="project"),
+            memory_reconciler=reconciler,
+        )
+    )
+    runtime = SimpleNamespace(
+        metadata=SimpleNamespace(project_id="project"),
+        manager=SimpleNamespace(project_registry=registry),
+        loop=SimpleNamespace(memory_reconciler=reconciler),
+    )
+
+    tui_resume = await SlashHandlerMixin.slash_memory(
+        tui, "recovery root quarantine resume"
+    )
+    serve_resume = await ServerSlashSession(runtime).slash_memory(
+        "recovery root quarantine resume"
+    )
+    assert tui_resume == serve_resume == "memory recovery resumed"
+    assert reconciler.resumed == [("root", "quarantine"), ("root", "quarantine")]
+
+    tui_undo = await SlashHandlerMixin.slash_memory(tui, "undo v1")
+    serve_undo = await ServerSlashSession(runtime).slash_memory("undo v1")
+    assert tui_undo == serve_undo == (
+        "memory: memory changed since this suggestion; review /memory log"
+    )
+
+
+@pytest.mark.parametrize("bad_row", [b'{"broken":\n', b'{"broken":'])
+@pytest.mark.asyncio
+async def test_epoch_two_tui_repair_command_returns_upgrade_message(
+    tmp_path: Path,
+    bad_row: bytes,
+) -> None:
+    from tests.support.owned import await_or_fail, owned_app
+    from tests.support.submissions import await_submission_pipeline
+    from zeta.core.session import SessionManager
+
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
+    manager = SessionManager(tmp_path)
+    current = await await_or_fail(
+        asyncio.to_thread(
+            manager.create,
+            provider="codex",
+            model="offline",
+            cwd=tmp_path,
+            auto_project=False,
+        ),
+        what="create current session",
+    )
+    transcript = current.store.path
+    transcript.write_bytes(transcript.read_bytes() + bad_row)
+    loop = AgentLoop(FakeBackend([]), current.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    rendered = StringIO()
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        zeta_home=tmp_path,
+        console=Console(file=rendered, force_terminal=False, width=200),
+    )
+    unchanged = {
+        str(path.relative_to(tmp_path)): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and not path.name.startswith(".storage-format")
+    }
+    async with owned_app(app):
+        app._input_loop_active = True
+        await app._handle_prompt_value(
+            f"/repair-transcript {current.metadata.session_id} confirm"
+        )
+        await await_submission_pipeline(app)
+        output = rendered.getvalue().strip()
+        assert output == (
+            "system · transcript repair needs the stored-format upgrade "
+            "(home epoch 2, needs 4)"
+        )
+        assert {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file() and not path.name.startswith(".storage-format")
+        } == unchanged
+
+
+@pytest.mark.asyncio
+async def test_tui_current_session_repair_updates_live_memory_owner(
+    tmp_path: Path,
+) -> None:
+    from tests.support.owned import await_or_fail
+    from zeta.core.session import SessionManager
+    from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
+    from zeta.project_registry import ProjectRegistry
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("recovery", "test")
+    manager = SessionManager(tmp_path)
+    current = await await_or_fail(
+        asyncio.to_thread(
+            manager.create,
+            provider="codex",
+            model="offline",
+            cwd=tmp_path,
+            project_id=project.project_id,
+            auto_project=False,
+        ),
+        what="create current session",
+    )
+    current.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("retained")]),
+            MessageOrigin.USER,
+        )
+    )
+    automatic = registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=registry.memory_digest(project.project_id),
+        updates={"state.md": "automatic\n"},
+        provenance={
+            "session_id": current.metadata.session_id,
+            "seq_start": 1,
+            "seq_end": 2,
+            "model": "offline",
+        },
+    )
+    transcript = current.store.path
+    transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
+
+    async def unused_invoke(_prompt: str) -> str:
+        raise AssertionError("recovery must not invoke the memory model")
+
+    reconciler = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project.project_id,
+        session_id=current.metadata.session_id,
+        session_dir=current.store.session_dir,
+        invoke=unused_invoke,
+        config=AutoMemoryConfig(enabled=False),
+    )
+    tui = SimpleNamespace(
+        loop=SimpleNamespace(
+            manager=manager,
+            store=current.store,
+            memory_reconciler=reconciler,
+        )
+    )
+    try:
+        output = await SlashHandlerMixin.slash_repair_transcript(
+            tui, f"{current.metadata.session_id} confirm"
+        )
+        assert "repaired transcript" in output
+
+        await await_or_fail(
+            asyncio.to_thread(
+                reconciler.state.record_scanner_failure,
+                seq=2,
+                cause="delayed live publication",
+                occurred_at="2026-01-01T00:00:00Z",
+            ),
+            what="publish delayed live memory failure",
+        )
+        memory_state = json.loads(
+            (transcript.parent / "memory-reconcile.json").read_text(encoding="utf-8")
+        )
+        quarantine_id = reconciler.state.recovery_quarantine_id
+        assert quarantine_id is not None
+        assert reconciler.state.generation == memory_state["generation"] == 1
+        assert (
+            reconciler.state.recovery_quarantine_id
+            == memory_state["recovery_quarantine_id"]
+            == quarantine_id
+        )
+        assert reconciler.state.recovery_cutoff == memory_state["recovery_cutoff"] == 1
+        assert reconciler.state.paused_for_recovery is True
+        assert memory_state["recovery_paused"] is True
+        assert memory_state["seq"] == 1
+        assert memory_state["transcript_bytes"] == 0
+
+        recovery_files = list(transcript.parent.glob("conversation.recovery.*.json"))
+        assert len(recovery_files) == 1
+        recovery = json.loads(recovery_files[0].read_text(encoding="utf-8"))
+        assert recovery["memory_step"] == "review_pending"
+        assert registry.overlapping_automatic_versions(
+            project.project_id,
+            session_id=current.metadata.session_id,
+            retained_last_sequence=1,
+        ) == (automatic.version,)
+    finally:
+        await reconciler.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_recovery_pause_resume_uses_shared_command_path() -> None:
+    class Registry:
+        def memory_format(self, project_id: str) -> int:
+            return 1
+
+        def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
+            return []
+
+        def ensure_memory_supported(self, project_id: str) -> None:
+            pass
+
+        def undo_memory(self, project_id: str) -> list[tuple[str, str]]:
+            return []
+
+        def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]:
+            return []
+
+    class Reconciler:
+        paused = True
+
+        async def resume_recovery(self, root: str, quarantine: str) -> str:
+            assert self.paused
+            self.paused = False
+            return "memory recovery resumed"
+
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    reconciler = Reconciler()
+    tui = SimpleNamespace(
+        loop=SimpleNamespace(
+            project_registry=Registry(),
+            session_metadata=SimpleNamespace(project_id="project"),
+            memory_reconciler=reconciler,
+        )
+    )
+    result = await SlashHandlerMixin.slash_memory(
+        tui, "recovery root quarantine resume"
+    )
+    assert result == "memory recovery resumed"
+    assert reconciler.paused is False
+
+
 def test_status_shows_last_automatic_memory_failure() -> None:
     failed_session = FakeSlashSession(
         replace(
@@ -1113,14 +1396,25 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
     assert app.slash_status().compaction_history == ()
 
 
-def test_unknown_command_passes_through_unchanged() -> None:
+def test_unknown_slash_command_returns_error_with_close_match() -> None:
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
-    assert registry.dispatch(session(), "/unknown arg") is None
-    envelope = registry.input_for_model("/unknown arg")
-    assert envelope.text == "/unknown arg"
-    assert envelope.display_text == "/unknown arg"
-    assert envelope.origin is MessageOrigin.USER
+    result = registry.dispatch(session(), "/statu")
+
+    assert result == (
+        "unknown command /statu. type // to send it as text. did you mean /status?"
+    )
+
+
+def test_non_slash_safe_and_escaped_slash_input_still_reaches_model() -> None:
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
+
+    for value, expected in (("/Users/henry/x", "/Users/henry/x"), ("//quit", "/quit")):
+        assert registry.dispatch(session(), value) is None
+        envelope = registry.input_for_model(value)
+        assert envelope.text == expected
+        assert envelope.display_text == value
+        assert envelope.origin is MessageOrigin.USER
 
 
 def test_double_slash_escapes_registered_command() -> None:

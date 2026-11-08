@@ -539,6 +539,10 @@ def _notification_stats(data: dict[str, Any]) -> list[str]:
 
 # Every stream event is owned by scrollback, another TUI component, or is hidden
 # by design. Keep this exhaustive when adding a StreamEventType member.
+BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = frozenset({
+    StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CHILD_MESSAGE_DELIVERED,
+})
 STREAM_EVENTS_RENDERED = frozenset({
     StreamEventType.MESSAGE_END,
     StreamEventType.RETRY,
@@ -574,8 +578,6 @@ def render_agent_notification(
     """Render durable notifications unless a tool card or prior TUI owns them."""
     if event.data.get("tui_presented") is True:
         return None
-    if event.data.get("background_phase") == "task_kill":
-        return None
     kind = event.data.get("kind", "agent_completion")
     if kind == "project_inbox":
         text = event.data.get("text")
@@ -584,9 +586,11 @@ def render_agent_notification(
         return Text(text, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
+        note = event.data.get("note")
         if event.data.get("background_phase") == "session_shutdown":
+            suffix = f" · {note}" if type(note) is str and note else ""
             return Text(
-                f"background tasks killed on session exit: {task_id}",
+                f"background tasks killed on session exit: {task_id}{suffix}",
                 style=theme.DIM,
             )
         code = event.data.get("exit_code")
@@ -595,6 +599,8 @@ def render_agent_notification(
             return Text("background task notification unavailable", style=theme.ERROR)
         style = theme.RECEIPT if code == 0 else theme.ERROR
         message = f"⏺ task {task_id} exited ({code}) · {headline}"
+        if type(note) is str and note:
+            message += f" · {note}"
         return Text(message, style=style, overflow="ellipsis", no_wrap=True)
     readable_completion = (
         kind == "agent_completion"
@@ -868,7 +874,7 @@ def format_status(
         if background_count > 0:
             segments.append(f"bg {background_count}")
         if decisions_count > 0:
-            noun = "decision" if decisions_count == 1 else "decisions"
+            noun = "attention item" if decisions_count == 1 else "attention items"
             segments.append(f"● {decisions_count} {noun}")
         if main_active:
             segments.append("◆ main")
@@ -997,7 +1003,7 @@ def format_status(
     rendered = Text(value, style=theme.CHROME)
     offset = 0
     if decisions_count > 0:
-        noun = "decision" if decisions_count == 1 else "decisions"
+        noun = "attention item" if decisions_count == 1 else "attention items"
         marker = f"● {decisions_count} {noun}"
         marker_start = value.find(marker)
         if marker_start >= 0:

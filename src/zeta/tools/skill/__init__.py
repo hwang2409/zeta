@@ -20,6 +20,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register(
         "skill",
         lambda arguments, abort_signal: _load(registry, arguments),
+        binding="shared",
         description="Load a skill prompt by name.",
         parameters={
             "type": "object",

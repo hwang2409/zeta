@@ -16,6 +16,7 @@ import pytest
 import zeta.accounts.store as account_store_module
 import zeta.cli.main as cli_main
 from tests.support.credentials import named_account_credentials
+from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountId, AccountStore
 from zeta.core.session_files import SessionFileReplaced
 from zeta.oauth import OAuthTokens
@@ -227,6 +228,7 @@ def test_accounts_status_reports_pending_legacy_migration(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    initialize_storage_home(tmp_path)
     (tmp_path / "codex-oauth.json").write_text(
         json.dumps(OAuthTokens(_ACCESS_SECRET, _REFRESH_SECRET, 1).to_dict())
     )
@@ -274,6 +276,7 @@ def test_accounts_status_is_bounded_while_every_account_lock_is_held(
     assert {path.relative_to(tmp_path).as_posix() for path in lock_paths} == {
         ".accounts-migration.lock",
         ".accounts.lock",
+        ".storage-format.lock",
         ".anthropic-oauth.json.lock",
         ".codex-oauth.json.lock",
         "account-locks/anthropic/default/lifecycle.lock",
@@ -283,6 +286,7 @@ def test_accounts_status_is_bounded_while_every_account_lock_is_held(
         "account-locks/codex/default/usage.lock",
         "account-locks/codex/login.lock",
     }
+    lock_paths = [path for path in lock_paths if path.name != ".storage-format.lock"]
 
     holder = subprocess.Popen(
         [
@@ -417,9 +421,7 @@ def test_accounts_status_lock_timeout_keeps_json_valid_and_reports_other_account
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert ready.exists()
-    monkeypatch.setattr(
-        cli_main, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.1, raising=False
-    )
+    monkeypatch.setattr(cli_main, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.1, raising=False)
     fallback_release = threading.Timer(1, release.touch)
     fallback_release.start()
 
@@ -500,7 +502,7 @@ def test_accounts_status_refresh_lock_timeout_after_initial_read(
                     str(tmp_path),
                     str(ready),
                     str(release),
-                ]
+                ],
             )
             deadline = time.monotonic() + 10
             while not ready.exists() and time.monotonic() < deadline:
@@ -509,9 +511,7 @@ def test_accounts_status_refresh_lock_timeout_after_initial_read(
         return result
 
     monkeypatch.setattr(cli_main, "_read_safe_account_status", read_then_lock)
-    monkeypatch.setattr(
-        account_store_module, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.01
-    )
+    monkeypatch.setattr(account_store_module, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.01)
 
     try:
         assert _run_json(tmp_path, monkeypatch, "--refresh") == 1
@@ -559,9 +559,7 @@ def test_accounts_status_refresh_lock_timeout_has_refresh_result(
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert ready.exists()
-    monkeypatch.setattr(
-        cli_main, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.01, raising=False
-    )
+    monkeypatch.setattr(cli_main, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.01, raising=False)
 
     try:
         assert _run_json(tmp_path, monkeypatch, "--refresh") == 1
@@ -682,15 +680,14 @@ def test_accounts_status_provider_filter(
 
 
 @pytest.mark.parametrize("refresh", [False, True])
-def test_accounts_status_never_blocks_on_any_lock(
+def test_accounts_status_never_blocks_on_account_locks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     refresh: bool,
 ) -> None:
-    # The invariant, checked at the one seam every zeta lock goes through:
-    # nothing the status command reaches may take a lock without LOCK_NB,
-    # so a lock added later anywhere is caught here too.
+    # Account locks must stay nonblocking. Stored-format lease and shape locks
+    # are ordered outside the account lock domain and may block off the event loop.
     import fcntl
 
     _save_account(tmp_path, expires_at=1)
@@ -710,7 +707,16 @@ def test_accounts_status_never_blocks_on_any_lock(
     blocking: list[int] = []
 
     def nonblocking_only(fd: int, operation: int) -> None:
-        if operation & (fcntl.LOCK_EX | fcntl.LOCK_SH) and not operation & fcntl.LOCK_NB:
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+            path = os.fsdecode(raw).rstrip("\0")
+        if (
+            ".storage-format" not in path
+            and operation & (fcntl.LOCK_EX | fcntl.LOCK_SH)
+            and not operation & fcntl.LOCK_NB
+        ):
             blocking.append(operation)
         real_flock(fd, operation)
 

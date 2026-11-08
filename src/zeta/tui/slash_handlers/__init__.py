@@ -7,8 +7,8 @@ cap. ``TUIApp`` mixes these in, so they run against its attributes.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
-from pathlib import Path
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
@@ -23,26 +23,27 @@ from ...accounts import (
 from ...accounts.login import login_failure_message, login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
-from ...core.project_context import discover_project_root
+from ...core.commands.plan_commands import run_implement_command, run_plan_command
+from ...core.project_context import project_command_view
 from ...core.session import (
     SessionError,
     env_home,
     normalize_session_name,
     persist_metadata_change,
 )
-from ...core.slash import (
-    MODEL_CONTEXT_WINDOWS,
-    SlashStatus,
-    compaction_history,
+from ...core.slash import SlashStatus, _format_status
+from ...core.transcript_recovery.runtime import (
+    TranscriptRepairRequiresUpgrade,
+    repair_transcript_for_runtime,
 )
-from ...core.todo import todo_count_tuple
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
-from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType
+from ...protocol.types import StreamEvent, StreamEventType
 from ...providers.factory import build_backend
+from ...runtime.status import build_slash_status, capture_slash_status
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -105,57 +106,43 @@ class SlashHandlerMixin:
             return
         await controller.resolve_approval(decision, requested_key, always=always)
 
+    def slash_status_command(self, args: str) -> str:
+        if not args.strip() and self._full_screen_active():
+            self._consume_overlay_submission()
+            self.open_status_card()
+            return ""
+        return _format_status(self.slash_status())
+
     def slash_status(self) -> SlashStatus:
-        context_assembler = self.loop.context_assembler
-        child_usage = context_assembler.descendant_usage
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
         )
-        items = self.loop.store.todo_items()
-        compaction_history_data = compaction_history(
-            self.loop.store.replay(), context_assembler.token_counter
-        )
-        return SlashStatus(
-            session_id=self.loop.store.session_id,
-            provider=self.provider,
-            model=self.model,
-            retained_tail=context_assembler.retained_tail,
-            tokens_used_this_session=context_assembler.tokens_used_this_session,
-            tokens_in_current_context=context_assembler.token_count,
-            compaction_marker_count=self.loop.store.compaction_marker_count(),
-            pending_approvals=pending,
-            checkpoint_count=self.loop.store.checkpoint_count(),
-            cache_read_input_tokens=context_assembler.cache_read_input_tokens_this_session,
-            cache_creation_input_tokens=context_assembler.cache_creation_input_tokens_this_session,
-            uncached_input_tokens=context_assembler.uncached_input_tokens_this_session,
-            output_tokens_this_session=context_assembler.output_tokens_this_session,
-            child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
-            child_cache_creation_input_tokens=child_usage[
-                "cache_creation_input_tokens"
-            ],
-            child_uncached_input_tokens=child_usage["input_tokens"],
-            child_output_tokens_this_session=child_usage["output_tokens"],
-            context_files=self._context_files,
-            vim_mode=self.vim_mode,
-            plan_mode=self.loop.plan_mode,
-            hooks=(() if self._hooks is None else self._hooks.status_entries),
-            todo_counts=todo_count_tuple(items) if items else None,
-            usage_history=self._usage_tracker.history,
-            usage_cost_by_model=self._usage_tracker.cost_by_model,
-            compaction_history=compaction_history_data,
-            model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
-            mcp_summary=self.loop.mcp_summary,
-            explicit_finish=self.loop.explicit_finish,
-            max_agent_depth=self.loop.max_agent_depth,
-            automatic_memory_failure=(
-                self.loop.memory_reconciler.automatic_memory_status
-                if self.loop.memory_reconciler is not None
-                else None
-            ),
-            transcript_index_failure=self.loop.transcript_index_failure(
-                self._viewed_session_path().name
-            ),
+        viewed_path = self._viewed_session_path()
+        if viewed_path == self.loop.store.session_dir:
+            viewed_health = self.loop.project_context_health
+        else:
+            viewed_loop = self.loop._background_owner.project_context_loops.get(
+                viewed_path.name
+            )
+            viewed_health = (
+                viewed_loop.project_context_health if viewed_loop is not None else None
+            )
+        return build_slash_status(
+            capture_slash_status(
+                self.loop,
+                session_id=self.loop.store.session_id,
+                provider=self.provider,
+                model=self.model,
+                context_files=self._context_files,
+                vim_mode=self.vim_mode,
+                pending_approvals=pending,
+                usage_tracker=self._usage_tracker,
+                project_context_health=(
+                    viewed_health.summary if viewed_health is not None else None
+                ),
+                transcript_session_id=viewed_path.name,
+            )
         )
 
     def model_choices(self) -> tuple[str, ...]:
@@ -199,6 +186,7 @@ class SlashHandlerMixin:
             {item.account: item.detail for item in displays if item.detail},
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
+            {item.account for item in displays if not item.available},
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
@@ -231,7 +219,9 @@ class SlashHandlerMixin:
                 return "accounts unavailable for this session"
             return await asyncio.to_thread(rename_account_command, context.store, args)
         if self.active or self.pending_approvals:
-            return "accounts unavailable: cannot switch while a turn or approval is active"
+            return (
+                "accounts unavailable: cannot switch while a turn or approval is active"
+            )
         if context is None:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
@@ -570,74 +560,33 @@ class SlashHandlerMixin:
             return f"model: {self.model} ({'; '.join(notes)})"
         return f"model: {self.model}"
 
-    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
-        """Toggle plan mode or submit a prompt while entering it."""
+    @property
+    def plan_mode(self) -> bool:
+        override = getattr(self, "_slash_plan_mode", None)
+        if override is not None:
+            return override
+        return self.loop.plan_mode
 
-        requested = args.strip()
-        normalized = requested.lower()
-        if not requested:
-            return await self._set_plan_mode_from_command(not self.loop.plan_mode)
-        if normalized == "off":
-            return await self._set_plan_mode_from_command(False)
-        if normalized == "on":
-            return await self._set_plan_mode_from_command(True)
-        if normalized == "toggle":
-            return await self._set_plan_mode_from_command(not self.loop.plan_mode)
-        if self.active or self.pending_approvals:
-            return (
-                "plan mode unchanged: cannot change plan mode while a turn or "
-                "approval is active"
-            )
-        if not self.loop.plan_mode:
-            blocked = self._plan_mode_background_blocker()
-            if blocked is not None:
-                return blocked
-        if not self.loop.plan_mode:
-            await self._change_plan_mode(True)
-            self._invalidate_prompt()
-        return ModelInputEnvelope(
-            requested,
-            f"/plan {requested}",
-            MessageOrigin.SLASH_EXPANSION,
-        )
+    @plan_mode.setter
+    def plan_mode(self, enabled: bool) -> None:
+        self._slash_plan_mode = enabled
+
+    def set_plan_mode(self, enabled: bool):
+        if self.loop is self:
+            return super().set_plan_mode(enabled)
+        return self.loop.set_plan_mode(enabled)
+
+    def invalidate_prompt(self) -> None:
+        self._invalidate_prompt()
+
+    def plan_mode_background_blocker(self) -> str | None:
+        return self._plan_mode_background_blocker()
+
+    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
+        return await run_plan_command(self, args)
 
     async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
-        """Exit plan mode and submit the explicit implementation request."""
-
-        if args:
-            return "implement unchanged: /implement does not accept arguments"
-        if not self.loop.plan_mode:
-            return "implement unavailable: plan mode is off"
-        if self.active or self.pending_approvals:
-            return (
-                "implement unavailable: cannot leave plan mode while a turn or "
-                "approval is active"
-            )
-        await self._change_plan_mode(False)
-        self._invalidate_prompt()
-        return ModelInputEnvelope(
-            "implement the plan you proposed above",
-            "/implement",
-            MessageOrigin.SLASH_EXPANSION,
-        )
-
-    async def _set_plan_mode_from_command(self, enabled: bool) -> str:
-        if enabled == self.loop.plan_mode:
-            return f"plan mode: {'on' if enabled else 'off'}"
-        if self.active or self.pending_approvals:
-            return (
-                "plan mode unchanged: cannot change plan mode while a turn or "
-                "approval is active"
-            )
-        if enabled:
-            blocked = self._plan_mode_background_blocker()
-            if blocked is not None:
-                return blocked
-        await self._change_plan_mode(enabled)
-        self._invalidate_prompt()
-        if enabled:
-            return "plan mode: on (read-only tools; deliver the plan as your answer)"
-        return "plan mode: off"
+        return await run_implement_command(self, args)
 
     def _plan_mode_background_blocker(self) -> str | None:
         work = tuple(getattr(self.loop, "background_work_descriptions", ()))
@@ -647,11 +596,6 @@ class SlashHandlerMixin:
             "plan mode unchanged: background work is active: "
             f"{', '.join(work)}; stop it or wait"
         )
-
-    async def _change_plan_mode(self, enabled: bool) -> None:
-        persisted = self.loop.set_plan_mode(enabled)
-        if persisted is not None:
-            await persisted
 
     def toggle_plan_mode(self) -> None:
         """Toggle plan mode from the keyboard, reporting the same notice."""
@@ -764,62 +708,72 @@ class SlashHandlerMixin:
         registry = self.loop.project_registry
         if registry is None:
             return "project registry unavailable"
-        project = None
-        if args.strip() == "init":
-            root = (
-                discover_project_root(self.loop.store.cwd)
-                or Path(self.loop.store.cwd).resolve()
+        initialize = args.strip() == "init"
+        try:
+            view = await asyncio.to_thread(
+                project_command_view,
+                registry,
+                self.loop.store.cwd,
+                self.loop.session_metadata.project_id,
+                initialize=initialize,
             )
-            try:
-                project = registry.find_or_create_for_directory(root)
-                await persist_metadata_change(
-                    self.loop.manager,
-                    self.loop.session_metadata,
-                    lambda candidate: self.loop.manager.associate_project(
-                        candidate, project.project_id
-                    ),
-                )
-                self.loop._set_runtime_project(self.loop.session_metadata)
-            except (ProjectRegistryError, OSError, SessionError) as exc:
+        except (ProjectRegistryError, OSError, SessionError) as exc:
+            if initialize:
                 return f"could not initialize project: {exc}"
-        else:
-            if self.loop.session_metadata.project_id:
-                try:
-                    project = registry.show_project(
-                        self.loop.session_metadata.project_id
-                    )
-                except ProjectRegistryError:
-                    project = None
-            if project is None:
-                project = registry.find_for_directory(self.loop.store.cwd)
-        if project is None:
-            return "unassociated (run /project init to associate this directory)"
-        if registry.memory_format(project.project_id) == 2:
-            memory = (
-                ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
+            raise
+        if initialize:
+            assert view.project is not None
+            await persist_metadata_change(
+                self.loop.manager,
+                self.loop.session_metadata,
+                lambda candidate: self.loop.manager.associate_project(
+                    candidate, view.project.project_id
+                ),
             )
-        else:
-            memory = (
-                ", ".join(name for name, _ in registry.load_memory(project.project_id))
-                or "none"
-            )
-        return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
+            self.loop._set_runtime_project(self.loop.session_metadata)
+        return view.text
 
-    def slash_memory(self, args: str) -> str:
+    async def slash_memory(self, args: str) -> str:
         """Show, retry, or undo versioned automatic project-memory changes."""
         registry = self.loop.project_registry
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        return run_memory_command(
+        result = await asyncio.to_thread(
+            run_memory_command,
             registry,
             project_id,
             args,
             getattr(self.loop, "memory_reconciler", None),
             MemoryMutationAuthorization.direct_slash(),
         )
+        return await result if inspect.isawaitable(result) else result
 
-    def slash_inbox(self, args: str) -> str:
+    async def slash_repair_transcript(self, args: str) -> str:
+        """Repair one corrupt root transcript after explicit confirmation."""
+        parts = args.split()
+        if len(parts) not in {2, 3} or parts[-1] != "confirm":
+            return "usage: /repair-transcript <session-id> [<child-run-id>] confirm"
+        child_run_id = parts[1] if len(parts) == 3 else None
+        try:
+            result = await repair_transcript_for_runtime(
+                self.loop.manager,
+                parts[0],
+                child_run_id,
+                parent_store=self.loop.store,
+                memory_reconciler=getattr(self.loop, "memory_reconciler", None),
+            )
+        except TranscriptRepairRequiresUpgrade as exc:
+            return str(exc)
+        return (
+            f"repaired transcript {parts[0]}"
+            + (f" child {child_run_id}" if child_run_id is not None else "")
+            + "; quarantine "
+            f"{result.quarantine_id}; retained through sequence "
+            f"{result.retained_last_sequence}"
+        )
+
+    async def slash_inbox(self, args: str) -> str:
         if args.strip():
             return "usage: /inbox"
         registry = self.loop.project_registry
@@ -827,9 +781,12 @@ class SlashHandlerMixin:
         if registry is None or project_id is None:
             return "project inbox unavailable: session is not associated with a project"
         try:
-            state = ProjectInbox(
-                registry, sessions_root=registry.root.parent / "sessions"
-            ).list(project_id)
+            state = await asyncio.to_thread(
+                ProjectInbox(
+                    registry, sessions_root=registry.root.parent / "sessions"
+                ).list,
+                project_id,
+            )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
         return json.dumps(state, indent=2, sort_keys=True)

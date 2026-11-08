@@ -32,6 +32,7 @@ from prompt_toolkit.keys import ALL_KEYS, Keys
 from prompt_toolkit.layout import Dimension
 from prompt_toolkit.output import Output
 
+from .errors import TerminalRenderError
 from .word_wrap import WordWrapWindow
 
 # --- keybinding remap layer ------------------------------------------------
@@ -193,10 +194,6 @@ def _enable_wheel_reporting(output: Output) -> None:
     output.write_raw("\x1b[?1000h")  # click and wheel reporting
     output.write_raw("\x1b[?1015h")  # urxvt extended coordinates
     output.write_raw("\x1b[?1006h")  # SGR extended coordinates
-
-
-class TerminalRenderError(RuntimeError):
-    """A redraw failed; unwind the TUI before reporting the failure."""
 
 
 def _guard_redraw(application: Application[str]) -> None:
@@ -737,7 +734,7 @@ def build_key_bindings(
 
     if on_decisions_key is not None:
         for decisions_key_name in (
-            "up", "down", "j", "k", "pageup", "pagedown", "enter", "a", "backspace",
+            "up", "down", "j", "k", "pageup", "pagedown", "enter", "a", "d", "backspace",
             "1", "2", "3", "4", "5", "6", "7", "8", "9",
         ):
 
@@ -747,6 +744,14 @@ def build_key_bindings(
                 eager=True,
             )
             def decisions_key(event: KeyPressEvent, key: str = decisions_key_name) -> None:
+                del event
+                on_decisions_key(key)
+
+        for decisions_page_key in ("pageup", "pagedown"):
+            @bindings.add(decisions_page_key, filter=decisions_answer_mode, eager=True)
+            def decisions_answer_page(
+                event: KeyPressEvent, key: str = decisions_page_key
+            ) -> None:
                 del event
                 on_decisions_key(key)
 

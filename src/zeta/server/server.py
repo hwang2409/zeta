@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
+from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
+from ..core.transcript_recovery.runtime import (
+    TranscriptRepairRequiresUpgrade,
+    repair_transcript_for_runtime,
+)
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -22,6 +27,7 @@ from . import (
     model_selection,
     slash_commands,
 )
+from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
@@ -34,8 +40,10 @@ from .project_requests import (
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
+    ErrorDescriptor,
     FrameCodec,
     ProtocolError,
+    _Frame,
     finish_frame_write,
     hello_result,
     negotiate_protocol_version,
@@ -52,6 +60,8 @@ LOADED_SESSION_MUTATIONS = frozenset(
         "deny",
         "fork_message",
         "rename_session",
+        "repair_transcript",
+        "revoke_session_grants",
         "send",
         "send_images",
         "set_compaction",
@@ -167,7 +177,7 @@ class _UnixSocketListener:
 
 
 class ZetaServer:
-    """Serve one local client over a Unix socket or localhost TCP."""
+    """Serve one controller and negotiated observers over local transports."""
 
     def __init__(
         self,
@@ -281,7 +291,7 @@ class ZetaServer:
     async def close(self) -> None:
         try:
             if self._client is not None:
-                await self._client.close()
+                await self._client.close(graceful=True)
         finally:
             self._client = None
             self._client_active = False
@@ -352,6 +362,9 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._local_close = False
+        self._controller_release: asyncio.Task[None] | None = None
+        self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
@@ -359,10 +372,13 @@ class _Client:
         )
 
     async def run(self) -> None:
+        graceful = True
         try:
             while True:
                 line = await self._read_frame()
                 if not line:
+                    self._release_dead_connection()
+                    graceful = False
                     break
                 await self.connections.wait_until_settled(self)
                 try:
@@ -370,7 +386,7 @@ class _Client:
                 except ProtocolError as exc:
                     await self._write(
                         self.codec.error_response(
-                            exc.request_id, exc.code, exc.message, exc.data
+                            exc.request_id, exc.descriptor, exc.message, exc.data
                         )
                     )
                     if not self.handshaken:
@@ -387,42 +403,65 @@ class _Client:
                             exc.request_id
                             if exc.request_id is not None
                             else request_id,
-                            exc.code,
+                            exc.descriptor,
                             exc.message,
                             exc.data,
                         )
                     )
+                    if not self.handshaken:
+                        self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
-                    code, message, data = project_request_error(exc)
+                    descriptor, message, data = project_request_error(exc)
                     await self._write(
-                        self.codec.error_response(request_id, code, message, data)
+                        self.codec.error_response(request_id, descriptor, message, data)
                     )
                 except ProjectRegistryBusyError as exc:
                     await self._write(
                         self.codec.error_response(
                             request_id,
-                            -32000,
+                            ErrorDescriptor.PROJECT_REGISTRY_BUSY,
                             str(exc),
-                            {"code": exc.code, "retryable": exc.retryable},
+                            {"retryable": exc.retryable},
+                        )
+                    )
+                except TranscriptRepairRequiresUpgrade as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+                            str(exc),
+                            {
+                                "home_epoch": exc.home_epoch,
+                                "required_epoch": exc.required_epoch,
+                            },
                         )
                     )
                 except TranscriptLoadError as exc:
                     await self._write(
                         self.codec.error_response(
-                            request_id, -32000, str(exc), exc.protocol_data()
+                            request_id,
+                            ErrorDescriptor.CORRUPT_TRANSCRIPT,
+                            str(exc),
+                            exc.protocol_data(),
                         )
                     )
                 except ConversationIntegrityError as exc:
                     await self._write(
-                        self.codec.error_response(request_id, -32000, str(exc))
+                        self.codec.error_response(
+                            request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
+                        )
                     )
                 except (SessionError, ValueError) as exc:
                     await self._write(
-                        self.codec.error_response(request_id, -32602, str(exc))
+                        self.codec.error_response(
+                            request_id, ErrorDescriptor.INVALID_PARAMS, str(exc)
+                        )
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the socket alive
                     await self._write(
-                        self.codec.error_response(request_id, -32000, str(exc))
+                        self.codec.error_response(
+                            request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
+                        )
                     )
                 else:
                     written = await self._write(self.codec.response(request_id, result))
@@ -436,7 +475,7 @@ class _Client:
                 if not self.handshaken:
                     break
         finally:
-            await self.close()
+            await self.close(graceful=graceful and not self._transport_failed)
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -476,19 +515,37 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
-    async def close(self) -> None:
+    def _begin_controller_release(self) -> asyncio.Task[None] | None:
+        if self._controller_release is not None:
+            return self._controller_release
+        if self.role == "controller" and self.connections.is_controller(self):
+            self._controller_release = self.server.control.begin_controller_release(
+                reconnect="approval_reconnect" in self.features
+            )
+        return self._controller_release
+
+    def _release_dead_connection(self) -> None:
+        if self._local_close:
+            return
+        self._begin_controller_release()
+        self.connections.release(self)
+
+    async def close(self, *, graceful: bool = False) -> None:
         async with self._close_lock:
             if self._closed:
                 return
-            if self.role == "controller" and self.connections.is_controller(self):
-                await self.server.control.controller_released(
-                    reconnect="approval_reconnect" in self.features
-                )
+            release = self._begin_controller_release()
+            if release is not None:
+                await asyncio.shield(release)
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
+            if graceful:
+                await self.connections.flush(self)
+            self._local_close = True
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
+            self.connections.release(self)
             self._closed = True
 
     async def _route_request(
@@ -497,22 +554,45 @@ class _Client:
         if method == "hello":
             result = self._hello(params)
             if self.role == "controller":
-                self.server._client_active = True
-                self.server._client = self
                 reconnect = "approval_reconnect" in self.features
-                await self.server.control.controller_claimed(
+                claimed = await self.server.control.controller_claimed(
                     reconnect=reconnect,
                     require_host_binding="session_host_commands" in self.features,
                 )
+                if not claimed:
+                    self.handshaken = False
+                    raise ProtocolError(
+                        ErrorDescriptor.CONNECTION_CAPACITY,
+                        "another client is already connected",
+                    )
+                self.server._client_active = True
+                self.server._client = self
+                self.connections.activate_controller(self)
                 if not reconnect:
                     await self.server.control.controller_ready()
             return True, result
         if not self.handshaken:
-            raise ProtocolError(-32002, "hello must be the first request")
+            raise ProtocolError(
+                ErrorDescriptor.PROTOCOL_MISMATCH, "hello must be the first request"
+            )
         assert self.server.connections is not None
         return await self.server.connections.route_request(
             self, request_id, method, params
         )
+
+    async def _dispatch_session_grants(
+        self, method: str, params: dict[str, Any]
+    ) -> object:
+        session_grants.require_feature(self.features)
+        runtime = self.server.runtime
+        if method == session_grants.READ:
+            return session_grants.read(runtime.policy, runtime.session_id, params)
+        result, change = session_grants.revoke(
+            runtime.policy, runtime.session_id, params
+        )
+        if change.changed:
+            await self.server.control.publish_session_grant_change(change)
+        return result
 
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]
@@ -524,15 +604,23 @@ class _Client:
             self.server.control._reject_if_unhealthy()
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
-                raise ProtocolError(-32601, "login is unavailable on this server")
+                raise ProtocolError(
+                    ErrorDescriptor.METHOD_NOT_FOUND,
+                    "login is unavailable on this server",
+                )
             return await self.logins.request(method, params)
         if method in ergonomics.EXTENSION_REQUESTS:
             if self.protocol_version == "1.0":
-                raise ProtocolError(-32601, "request requires protocol 1.1")
+                raise ProtocolError(
+                    ErrorDescriptor.METHOD_NOT_FOUND, "request requires protocol 1.1"
+                )
             return await self._ergonomics(method, params)
         if method == "ping":
             if "ping" not in self.features:
-                raise ProtocolError(-32601, "ping requires the negotiated ping feature")
+                raise ProtocolError(
+                    ErrorDescriptor.METHOD_NOT_FOUND,
+                    "ping requires the negotiated ping feature",
+                )
             return {"pong": True}
         if method == "set_turn_context":
             contexts = self.server.turn_contexts
@@ -540,7 +628,8 @@ class _Client:
         if method in PROJECT_REQUESTS:
             if "projects" not in self.features:
                 raise ProtocolError(
-                    -32601, f"{method} requires the negotiated projects feature"
+                    ErrorDescriptor.METHOD_NOT_FOUND,
+                    f"{method} requires the negotiated projects feature",
                 )
             assert self.projects is not None
             return await asyncio.to_thread(
@@ -551,12 +640,9 @@ class _Client:
                 features=self.features,
             )
         if method == "list_sessions":
-            result, page_ids = await self.connections.run_read(
+            result, _page_ids = await self.connections.run_read(
                 self, lambda: self._list_sessions(request_id, params)
             )
-            if self.role != "observer":
-                # project-link repair writes, so it stays off the read-only worker
-                await asyncio.to_thread(self._reconcile_project_links, page_ids)
             return result
         if method == "new_session":
             try:
@@ -590,6 +676,7 @@ class _Client:
                     self.server.control.session_replaced()
                     self.server.control.clear_approvals()
                     await self.server.control.controller_ready()
+                    await self.server.control.publish_session_grant_reset()
                     return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
@@ -613,29 +700,28 @@ class _Client:
                             )
                         except SessionNotFoundError as exc:
                             raise ProtocolError(
-                                -32602,
+                                ErrorDescriptor.SESSION_NOT_FOUND,
                                 str(exc),
-                                {
-                                    "code": "session_not_found",
-                                    "session_id": session_id,
-                                },
+                                {"session_id": session_id},
                             ) from exc
+                        except SessionOwnedError as exc:
+                            raise _session_owned_protocol_error(exc) from exc
                         except Exception as exc:
                             raise ProtocolError(
-                                -32000, "approval persistence failed"
+                                ErrorDescriptor.INTERNAL_ERROR,
+                                "approval persistence failed",
                             ) from exc
                     else:
                         try:
                             await self.server.runtime.resume_session(session_id)
                         except SessionNotFoundError as exc:
                             raise ProtocolError(
-                                -32602,
+                                ErrorDescriptor.SESSION_NOT_FOUND,
                                 str(exc),
-                                {
-                                    "code": "session_not_found",
-                                    "session_id": session_id,
-                                },
+                                {"session_id": session_id},
                             ) from exc
+                        except SessionOwnedError as exc:
+                            raise _session_owned_protocol_error(exc) from exc
                     self.server.control._active_host_commands = candidate
                     self.server.control._host_binding_required = (
                         "session_host_commands" in self.features
@@ -643,12 +729,15 @@ class _Client:
                     self.server.control.session_replaced()
                     self.server.control.clear_approvals()
                     await self.server.control.controller_ready()
+                    await self.server.control.publish_session_grant_reset()
                     return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None
                     self.server.control._host_binding_required = False
                 raise
+        if method in {session_grants.READ, session_grants.REVOKE}:
+            return await self._dispatch_session_grants(method, params)
         if method == "send":
             return await self.server.control.deliveries.send(params, self.features)
         if method == "steer":
@@ -662,9 +751,15 @@ class _Client:
         if method in {"approve", "deny"}:
             scope = params.get("scope", "once")
             if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
-                raise ProtocolError(-32602, "scope must be 'once' or 'always_tool'")
+                raise ProtocolError(
+                    ErrorDescriptor.INVALID_PARAMS,
+                    "scope must be 'once' or 'always_tool'",
+                )
             if scope == "always_tool" and method != "approve":
-                raise ProtocolError(-32602, "scope 'always_tool' requires approve")
+                raise ProtocolError(
+                    ErrorDescriptor.INVALID_PARAMS,
+                    "scope 'always_tool' requires approve",
+                )
             return await self.server.control.resolve_approval(
                 method, _required_string(params, "request_id"), scope
             )
@@ -680,13 +775,23 @@ class _Client:
                 else None
             )
             return await self.server.connections.read_status(
-                self, await self._status(), session_id
+                self,
+                await self._status(
+                    include_connection_setup_counts=(
+                        params.get("include_connection_setup_counts") is True
+                    )
+                ),
+                session_id,
             )
-        raise ProtocolError(-32601, f"method not found: {method}")
+        raise ProtocolError(
+            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
+        )
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
-            raise ProtocolError(-32600, "hello may only be sent once")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_REQUEST, "hello may only be sent once"
+            )
         version = params.get("protocol_version")
         client_version = params.get("client_version")
         self.protocol_version = negotiate_protocol_version(version, client_version)
@@ -695,7 +800,9 @@ class _Client:
             not isinstance(requested, list)
             or not all(isinstance(item, str) for item in requested)
         ):
-            raise ProtocolError(-32602, "features must be an array of strings")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS, "features must be an array of strings"
+            )
         extended = self.protocol_version != "1.0"
         accepted = (
             [item for item in FEATURES if item in (requested or ())] if extended else []
@@ -740,6 +847,8 @@ class _Client:
                 requests.append("clear_steering")
             if "delivery_id" in self.features:
                 requests.append("delivery_status")
+            if session_grants.FEATURE in self.features:
+                requests += [session_grants.READ, session_grants.REVOKE]
         requests = self.server.connections.requests_for_role(role, requests)
         capabilities: dict[str, object] = {
             "requests": requests,
@@ -767,11 +876,56 @@ class _Client:
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
-                -32602, f"{param} requires the negotiated {feature} feature"
+                ErrorDescriptor.INVALID_PARAMS,
+                f"{param} requires the negotiated {feature} feature",
             )
+
+    async def _repair_transcript(self, params: dict[str, Any]) -> dict[str, object]:
+        runtime = self.server.runtime
+        await self.server.control.require_idle()
+        if params.get("confirm") is not True:
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "repair_transcript requires confirm=true",
+            )
+        session_id = _required_string(params, "session_id")
+        child_run_id = params.get("child_run_id")
+        if child_run_id is not None and not isinstance(child_run_id, str):
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "child_run_id must be a string",
+            )
+        try:
+            result = await repair_transcript_for_runtime(
+                runtime.manager,
+                session_id,
+                child_run_id,
+                parent_store=(
+                    runtime.opened.store if runtime.opened is not None else None
+                ),
+                memory_reconciler=(
+                    runtime.loop.memory_reconciler
+                    if runtime.loop is not None
+                    else None
+                ),
+            )
+        except TranscriptRepairRequiresUpgrade:
+            raise
+        except (ValueError, SessionError) as exc:
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
+        return {
+            "session_id": session_id,
+            "child_run_id": child_run_id,
+            "quarantine_id": result.quarantine_id,
+            "retained_last_sequence": result.retained_last_sequence,
+            "memory_review_required": result.memory_review_required,
+            "overlapping_memory_versions": list(result.overlapping_memory_versions),
+        }
 
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
+        if method == "repair_transcript":
+            return await self._repair_transcript(params)
         if method in {"rename_session", "delete_session"}:
             return await ergonomics.mutate_session(
                 runtime,
@@ -786,7 +940,8 @@ class _Client:
         if method == "content_read":
             if "content_read" not in self.features:
                 raise ProtocolError(
-                    -32601, "content_read requires the negotiated content_read feature"
+                    ErrorDescriptor.METHOD_NOT_FOUND,
+                    "content_read requires the negotiated content_read feature",
                 )
             assert self.server.connections is not None
             return await self.server.connections.read_session(self, method, params)
@@ -798,20 +953,28 @@ class _Client:
                 params, self.features
             )
         if method == "session_settings":
-            return ergonomics.settings(runtime)
+            return ergonomics.settings(runtime, include_plan_mode=True)
         if method in slash_commands.READ_REQUESTS:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self
             )
-        await self.server.control.require_idle()
         if method == "slash_run":
+            text = _required_string(params, "text")
+            if (
+                self.server.control.turn_busy()
+                and not await slash_commands.can_run_while_busy(runtime, text)
+            ):
+                await self.server.control.require_idle()
             register = self.server.control.model_input_registrar(self.features)
             return await slash_commands.run_command(
                 runtime,
-                _required_string(params, "text"),
+                text,
                 register_model_input=register,
                 approval_control=self.server.control,
+                run_blocking=self.server.control._run_blocking,
+                busy=self.server.control.turn_busy(),
             )
+        await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if method == "set_settings":
             model = _required_string(params, "model")
@@ -822,7 +985,7 @@ class _Client:
         if method == "set_compaction":
             _required_string(params, "mode")
             raise ProtocolError(
-                -32602,
+                ErrorDescriptor.INVALID_PARAMS,
                 "compaction mode selection was removed; eviction is always used",
             )
         if method == "fork_message":
@@ -843,7 +1006,9 @@ class _Client:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
 
-    async def _status(self) -> dict[str, object]:
+    async def _status(
+        self, *, include_connection_setup_counts: bool = False
+    ) -> dict[str, object]:
         runtime = self.server.runtime
         session = self._session_snapshot()
         reconnect = "approval_reconnect" in self.features and self.role != "observer"
@@ -862,6 +1027,15 @@ class _Client:
         fallback_config = (
             await asyncio.to_thread(runtime._config, None, None)
             if loop is None
+            else None
+        )
+        project_context_health = (
+            (
+                loop.project_context_health.summary
+                if loop is not None and loop.project_context_health is not None
+                else "healthy"
+            )
+            if self.protocol_version != "1.0"
             else None
         )
         transcript_index_failure = (
@@ -893,18 +1067,30 @@ class _Client:
             **({"pending_approvals_truncated": truncated} if reconnect else {}),
             "usage": dict(runtime.usage),
             **(
+                {
+                    "connection_setup_counts": (
+                        runtime.loop.connection_setup_counts()
+                        if runtime.loop is not None
+                        else ()
+                    )
+                }
+                if include_connection_setup_counts
+                else {}
+            ),
+            **(
                 {"transcript_index_failure": transcript_index_failure}
                 if transcript_index_failure is not None
+                else {}
+            ),
+            **(
+                {"project_context_health": project_context_health}
+                if project_context_health is not None
                 else {}
             ),
             "store": runtime.opened.store if runtime.opened is not None else None,
         }
         status.update(suffix)
         return status
-
-    def _reconcile_project_links(self, session_ids: list[str]) -> None:
-        for session_id in session_ids:
-            self.server.runtime.manager._reconcile_project_link(session_id)
 
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
@@ -923,18 +1109,26 @@ class _Client:
             available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
-            item.session_id: item.preview
+            item.session_id: item
             for item in self.server.runtime.manager.list_session_previews(
                 limit=len(metadata), sessions=metadata
             )
         }
-        sessions = [
-            {
-                **item.to_catalog_dict(),
-                "first_message_preview": previews.get(item.session_id, ""),
-            }
-            for item in metadata
-        ]
+        sessions = []
+        for item in metadata:
+            preview = previews[item.session_id]
+            sessions.append(
+                {
+                    **item.to_catalog_dict(),
+                    "first_message_preview": preview.preview,
+                    "in_use": preview.in_use,
+                    **(
+                        {"owner_pid": preview.owner_pid}
+                        if preview.owner_pid is not None
+                        else {}
+                    ),
+                }
+            )
         if self.protocol_version == "1.0":
             for item in sessions:
                 item.pop("name", None)
@@ -960,10 +1154,13 @@ class _Client:
             "next_offset": end if end < len(available) else None,
         }, page_ids
 
-    async def _write(self, payload: bytes) -> bool:
-        return await self.connections.send(self, payload)
+    async def _write(self, payload: _Frame) -> bool:
+        written = await self.connections.send(self, payload)
+        if not written:
+            self._transport_failed = True
+        return written
 
-    async def _write_physical(self, payload: bytes) -> bool:
+    async def _write_physical(self, payload: _Frame) -> bool:
         async with self._write_lock:
             return await finish_frame_write(self.codec, self.writer, payload)
 
@@ -974,10 +1171,34 @@ def _home() -> Path:
     return env_home().expanduser().resolve()
 
 
+def _session_owned_protocol_error(exc: SessionOwnedError) -> ProtocolError:
+    data: dict[str, Any] = {
+        "code": "session_owned",
+        "session_id": exc.session_id,
+    }
+    owner = {
+        key: value
+        for key, value in {
+            "surface": exc.owner_surface,
+            "pid": exc.owner_pid,
+        }.items()
+        if value is not None
+    }
+    if owner:
+        data["owner"] = owner
+    return ProtocolError(
+        ErrorDescriptor.OPERATION_BUSY,
+        "session is active in another zeta process",
+        data,
+    )
+
+
 def _required_string(params: dict[str, Any], name: str) -> str:
     value = params.get(name)
     if not isinstance(value, str) or not value:
-        raise ProtocolError(-32602, f"{name} must be a nonempty string")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string"
+        )
     return value
 
 
@@ -988,24 +1209,34 @@ def _integer(
         return default
     value = params[name]
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-        raise ProtocolError(-32602, f"{name} must be an integer of at least {minimum}")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            f"{name} must be an integer of at least {minimum}",
+        )
     return value
 
 
 def _directory(params: dict[str, Any], name: str) -> Path:
     value = params.get(name)
     if not isinstance(value, str) or not value or not os.path.isabs(value):
-        raise ProtocolError(-32602, f"{name} must be an absolute directory path")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, f"{name} must be an absolute directory path"
+        )
     path = Path(value).resolve()
     if not path.is_dir():
-        raise ProtocolError(-32602, f"{name} is not an existing directory: {value}")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            f"{name} is not an existing directory: {value}",
+        )
     return path
 
 
 def _optional_string(params: dict[str, Any], name: str) -> str | None:
     value = params.get(name)
     if value is not None and (not isinstance(value, str) or not value):
-        raise ProtocolError(-32602, f"{name} must be a nonempty string")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string"
+        )
     return value
 
 

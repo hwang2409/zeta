@@ -1,0 +1,114 @@
+"""Shared live-runtime projection for ``/status``."""
+
+from __future__ import annotations
+
+import copy
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+
+from ..core.checkpoints import ConversationEntry, active_branch
+from ..core.slash import (
+    MODEL_CONTEXT_WINDOWS,
+    SlashStatus,
+    UsageTracker,
+    compaction_history,
+)
+from ..core.todo import todo_count_tuple
+from ..protocol.types import Message
+from .loop import AgentLoop
+
+
+@dataclass(frozen=True, slots=True)
+class SlashStatusSnapshot:
+    """Loop-owned status values plus append-only transcript references."""
+
+    base: SlashStatus
+    transcript_entries: tuple[ConversationEntry, ...]
+    token_counter: Callable[[Message], int]
+
+
+def capture_slash_status(
+    loop: AgentLoop,
+    *,
+    session_id: str,
+    provider: str,
+    model: str,
+    context_files: tuple[str, ...],
+    vim_mode: bool,
+    pending_approvals: tuple[str, ...],
+    usage_tracker: UsageTracker,
+    project_context_health: str | None,
+    transcript_session_id: str | None = None,
+) -> SlashStatusSnapshot:
+    """Capture loop-owned status state without transcript-sized processing."""
+
+    context_assembler = loop.context_assembler
+    child_usage = context_assembler.descendant_usage
+    items = loop.store.todo_items()
+    hooks = loop.hooks
+    return SlashStatusSnapshot(
+        base=SlashStatus(
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            retained_tail=context_assembler.retained_tail,
+            tokens_used_this_session=context_assembler.tokens_used_this_session,
+            tokens_in_current_context=context_assembler.token_count,
+            compaction_marker_count=0,
+            pending_approvals=pending_approvals,
+            checkpoint_count=0,
+            cache_read_input_tokens=context_assembler.cache_read_input_tokens_this_session,
+            cache_creation_input_tokens=(
+                context_assembler.cache_creation_input_tokens_this_session
+            ),
+            uncached_input_tokens=context_assembler.uncached_input_tokens_this_session,
+            output_tokens_this_session=context_assembler.output_tokens_this_session,
+            child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
+            child_cache_creation_input_tokens=child_usage[
+                "cache_creation_input_tokens"
+            ],
+            child_uncached_input_tokens=child_usage["input_tokens"],
+            child_output_tokens_this_session=child_usage["output_tokens"],
+            context_files=context_files,
+            vim_mode=vim_mode,
+            plan_mode=loop.plan_mode,
+            hooks=(() if hooks is None else hooks.status_entries),
+            todo_counts=todo_count_tuple(items) if items else None,
+            usage_history=usage_tracker.history,
+            usage_cost_by_model=usage_tracker.cost_by_model,
+            compaction_history=(),
+            model_window=MODEL_CONTEXT_WINDOWS.get(provider, {}).get(model),
+            mcp_summary=loop.mcp_summary,
+            explicit_finish=loop.explicit_finish,
+            connection_setup_counts=loop.connection_setup_counts(),
+            max_agent_depth=loop.max_agent_depth,
+            automatic_memory_failure=(
+                loop.memory_reconciler.automatic_memory_status
+                if loop.memory_reconciler is not None
+                else None
+            ),
+            transcript_index_failure=loop.transcript_index_failure(
+                transcript_session_id or session_id
+            ),
+            unavailable_accounts=(
+                context.unavailable_accounts
+                if (context := getattr(loop, "account_context", None)) is not None
+                else ()
+            ),
+            project_context_health=project_context_health,
+        ),
+        transcript_entries=loop.store.resident_entries_snapshot(),
+        token_counter=context_assembler.token_counter,
+    )
+
+
+def build_slash_status(snapshot: SlashStatusSnapshot) -> SlashStatus:
+    """Finish the shared projection, including transcript-sized work."""
+
+    entries = copy.deepcopy(active_branch(snapshot.transcript_entries))
+    return replace(
+        snapshot.base,
+        compaction_marker_count=sum(entry.type == "compaction" for entry in entries),
+        checkpoint_count=sum(entry.type == "checkpoint" for entry in entries),
+        compaction_history=compaction_history(entries, snapshot.token_counter),
+    )

@@ -16,8 +16,10 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.session import account_home
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
+from ..protocol.types import is_owned_completion_backend
+from .availability import AccountDisplay
 from .exhaustion import classify_subscription_limit, recovery_alternatives
-from .store import AccountDisplay, AccountError, AccountId, AccountStore
+from .store import AccountError, AccountId, AccountStore
 from .usage import read_usage, record_subscription_limit
 
 if TYPE_CHECKING:
@@ -35,9 +37,10 @@ def account_provider(provider: str) -> str | None:
 
 
 def api_key_mode(provider: str) -> bool:
-    return provider in {"claude", "anthropic"} and os.environ.get(
-        "ZETA_ALLOW_API_KEY"
-    ) == "1"
+    return (
+        provider in {"claude", "anthropic"}
+        and os.environ.get("ZETA_ALLOW_API_KEY") == "1"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +78,13 @@ class SessionAccountContext:
     _active_provider: str | None = None
     _switch_sequences: dict[str, int] = field(default_factory=dict)
     _account_state_unknown: bool = False
-    _unknown_state: _UnknownAccountState | None = field(default=None, init=False, repr=False)
-    _switch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _unavailable_accounts: tuple[str, ...] = ()
+    _unknown_state: _UnknownAccountState | None = field(
+        default=None, init=False, repr=False
+    )
+    _switch_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, init=False, repr=False
+    )
 
     @classmethod
     def load(
@@ -109,6 +117,8 @@ class SessionAccountContext:
             and not api_key_mode(metadata.provider)
         ):
             context.resolve(metadata.provider)
+        if validate:
+            context._refresh_account_availability()
         return context
 
     @property
@@ -128,6 +138,17 @@ class SessionAccountContext:
     @property
     def active_provider(self) -> str | None:
         return self._active_provider
+
+    @property
+    def unavailable_accounts(self) -> tuple[str, ...]:
+        return self._unavailable_accounts
+
+    def _refresh_account_availability(self) -> tuple[AccountDisplay, ...]:
+        displays = tuple(self.store.list_display())
+        self._unavailable_accounts = tuple(
+            str(item.account) for item in displays if not item.available
+        )
+        return displays
 
     @property
     def account_state_unknown(self) -> bool:
@@ -170,8 +191,18 @@ class SessionAccountContext:
             with self.store.pin_guard({canonical: selected}):
                 self._pins[canonical] = selected
                 assert self.manager is not None
-                self.manager.record_account_selection(self.metadata, selected, boundary=0)
+                self.manager.record_account_selection(
+                    self.metadata, selected, boundary=0
+                )
         return selected
+
+    def require_active_available(self, provider: str) -> None:
+        canonical = account_provider(provider)
+        if canonical is None:
+            return
+        selected = self.resolve(canonical)
+        if self.store.contains(selected):
+            self.store.require_available(selected)
 
     def backend_kwargs(self, provider: str) -> dict[str, object]:
         result: dict[str, object] = {"home": self.home}
@@ -189,7 +220,7 @@ class SessionAccountContext:
         selected = self.snapshot()
 
         def load() -> AccountListSnapshot:
-            displays = tuple(self.store.list_display())
+            displays = self._refresh_account_availability()
             providers = {item.account.provider for item in displays}
             defaults = {
                 provider: account
@@ -219,6 +250,7 @@ class SessionAccountContext:
             _frozen=True,
             _active_provider=canonical,
             _switch_sequences=dict(self._switch_sequences),
+            _unavailable_accounts=self._unavailable_accounts,
         )
 
     async def switch_active(
@@ -237,6 +269,7 @@ class SessionAccountContext:
                 raise AccountError("child account snapshots cannot be changed")
             if not self.store.contains(account):
                 raise AccountError(f"account {account} does not exist; use /accounts")
+            self.store.require_available(account)
             assert self.manager is not None
             return self.manager._apply_account_selection(
                 metadata, account, boundary=boundary, switched=True
@@ -303,24 +336,40 @@ class SessionAccountContext:
         new: _PreparedAccountState,
         build_backend: Callable[[SessionMetadata], Any],
     ) -> SessionMetadata:
-        def commit(directory_fd: int) -> tuple[SessionMetadata, Callable[[], None]]:
-            metadata = self._commit_locked(new, directory_fd)
-            if metadata is None:
-                return new.previous_metadata, lambda: self._mark_unknown(build_backend)
-            if self._metadata_equal(metadata, new.metadata):
-                state = self._state_from_metadata(new, metadata)
-                return metadata, lambda: self._apply(loop, state)
-            if not self._metadata_equal(metadata, new.previous_metadata):
-                return metadata, lambda: self._mark_unknown(build_backend)
-            return metadata, lambda: None
-
-        return await self._run_locked_apply(
-            build_backend, commit, pins=new.pins
+        prepared_backend = getattr(new.backend_state, "backend", new.backend_state)
+        discard = (
+            prepared_backend
+            if prepared_backend is not loop.backend
+            and is_owned_completion_backend(prepared_backend)
+            else None
         )
 
-    def _mark_unknown(
-        self, build_backend: Callable[[SessionMetadata], Any]
-    ) -> None:
+        def mark_unknown() -> Any:
+            self._mark_unknown(build_backend)
+            return discard
+
+        def commit(
+            directory_fd: int,
+        ) -> tuple[SessionMetadata, Callable[[], Any], Any]:
+            metadata = self._commit_locked(new, directory_fd)
+            if metadata is None:
+                return new.previous_metadata, mark_unknown, discard
+            if self._metadata_equal(metadata, new.metadata):
+                state = self._state_from_metadata(new, metadata)
+                return metadata, lambda: self._apply(loop, state), discard
+            if not self._metadata_equal(metadata, new.previous_metadata):
+                return metadata, mark_unknown, discard
+            return metadata, lambda: discard, discard
+
+        return await self._run_locked_apply(
+            loop,
+            build_backend,
+            commit,
+            pins=new.pins,
+            discard_backend=discard,
+        )
+
+    def _mark_unknown(self, build_backend: Callable[[SessionMetadata], Any]) -> None:
         self._account_state_unknown = True
         self._unknown_state = _UnknownAccountState(build_backend)
 
@@ -387,7 +436,9 @@ class SessionAccountContext:
     ) -> SessionMetadata | None:
         assert self.manager is not None
         session_id = state.metadata.session_id
+        execution_lease = self.metadata._execution_lease
         current = self.manager._read(session_id, directory_fd=directory_fd)
+        current._execution_lease = execution_lease
         if not self._metadata_equal(current, state.previous_metadata):
             return current
         # Recency refreshes write ``updated_at`` without touching this copy;
@@ -398,16 +449,20 @@ class SessionAccountContext:
         except BaseException as exc:  # noqa: BLE001 - authoritative reread decides
             logger.debug("session transition write reported failure: %s", exc)
         try:
-            return self.manager._read(session_id, directory_fd=directory_fd)
+            authoritative = self.manager._read(session_id, directory_fd=directory_fd)
+            authoritative._execution_lease = execution_lease
+            return authoritative
         except BaseException:  # noqa: BLE001 - disk outcome cannot be proven
             return None
 
     async def _run_locked_apply(
         self,
+        loop: Any,
         build_backend: Callable[[SessionMetadata], Any],
-        operation: Callable[[int], tuple[Any, Callable[[], None]]],
+        operation: Callable[[int], tuple[Any, Callable[[], Any], Any]],
         *,
         pins: Mapping[str, AccountId] | None = None,
+        discard_backend: Any = None,
     ) -> Any:
         event_loop = asyncio.get_running_loop()
         session_id = self.metadata.session_id
@@ -422,21 +477,28 @@ class SessionAccountContext:
                 pins,
             )
         )
-        try:
-            result, applied = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancelled.set()
+        caller_cancellation: asyncio.CancelledError | None = None
+        while not worker.done():
             try:
                 await asyncio.shield(worker)
-            except BaseException:  # noqa: BLE001, S110 - caller cancellation wins
-                pass
-            self._mark_unknown(build_backend)
-            raise
+            except asyncio.CancelledError as exc:
+                caller_cancellation = caller_cancellation or exc
+                cancelled.set()
+        try:
+            result, applied, retired = worker.result()
         except BaseException:
+            if discard_backend is not None:
+                await loop.close_backend(discard_backend, stage="replacement_failure")
             self._mark_unknown(build_backend)
+            if caller_cancellation is not None:
+                raise caller_cancellation
             raise
-        if not applied:
+        if not applied or caller_cancellation is not None:
             self._mark_unknown(build_backend)
+        if retired is not None:
+            await loop.close_backend(retired, stage="replacement")
+        if caller_cancellation is not None:
+            raise caller_cancellation
         return result
 
     def _locked_apply_worker(
@@ -444,10 +506,13 @@ class SessionAccountContext:
         event_loop: asyncio.AbstractEventLoop,
         session_id: str,
         cancelled: threading.Event,
-        operation: Callable[[int], tuple[Any, Callable[[], None]]],
+        operation: Callable[[int], tuple[Any, Callable[[], Any], Any]],
         pins: Mapping[str, AccountId] | None,
-    ) -> tuple[Any, bool]:
+    ) -> tuple[Any, bool, Any]:
         assert self.manager is not None
+        execution_lease = self.metadata._execution_lease
+        if execution_lease is not None:
+            execution_lease.assert_owned()
         with ExitStack() as stack:
             if pins is not None:
                 stack.enter_context(self.store.pin_guard(pins))
@@ -457,30 +522,31 @@ class SessionAccountContext:
                 )
             )
             assert directory_fd is not None
-            result, apply = operation(directory_fd)
-            applied = self._apply_on_loop(event_loop, cancelled, apply)
-            return result, applied
+            result, apply, discard = operation(directory_fd)
+            applied, retired = self._apply_on_loop(event_loop, cancelled, apply)
+            return result, applied, retired if applied else discard
 
     @staticmethod
     def _apply_on_loop(
         event_loop: asyncio.AbstractEventLoop,
         cancelled: threading.Event,
-        apply: Callable[[], None],
-    ) -> bool:
+        apply: Callable[[], Any],
+    ) -> tuple[bool, Any]:
         confirmed = threading.Event()
         gate = threading.Lock()
         active = True
         error: BaseException | None = None
         applied = False
+        retired = None
 
         def apply_if_active() -> None:
-            nonlocal active, applied, error
+            nonlocal active, applied, error, retired
             with gate:
                 if not active:
                     return
                 try:
                     if not cancelled.is_set():
-                        apply()
+                        retired = apply()
                         applied = True
                 except BaseException as exc:  # noqa: BLE001 - return to worker
                     error = exc
@@ -494,7 +560,7 @@ class SessionAccountContext:
                 active = False
         if error is not None:
             raise error
-        return applied
+        return applied, retired
 
     @staticmethod
     def _metadata_equal(left: SessionMetadata, right: SessionMetadata) -> bool:
@@ -522,15 +588,16 @@ class SessionAccountContext:
             state.backend_state,
         )
 
-    def _apply(self, loop: Any, state: _PreparedAccountState) -> None:
+    def _apply(self, loop: Any, state: _PreparedAccountState) -> Any:
         for name in self.metadata.__slots__:
             setattr(self.metadata, name, getattr(state.metadata, name))
         self._pins = state.pins
         self._switch_sequences = state.switch_sequences
         self._active_provider = state.active_provider
-        loop.apply_backend_state(state.backend_state)
+        retired = loop.apply_backend_state(state.backend_state)
         self._account_state_unknown = False
         self._unknown_state = None
+        return retired
 
     async def ensure_account_state(self, loop: Any) -> None:
         if not self._account_state_unknown:
@@ -554,7 +621,9 @@ class SessionAccountContext:
     ) -> None:
         previous = copy.deepcopy(self.metadata)
 
-        def recover(directory_fd: int) -> tuple[None, Callable[[], None]]:
+        def recover(
+            directory_fd: int,
+        ) -> tuple[None, Callable[[], None], None]:
             assert self.manager is not None
             metadata = self.manager._read(
                 previous.session_id, directory_fd=directory_fd
@@ -566,11 +635,13 @@ class SessionAccountContext:
                 )
                 self._apply(loop, state)
 
-            return None, apply
+            return None, apply, None
 
-        await self._run_locked_apply(build_backend, recover)
+        await self._run_locked_apply(loop, build_backend, recover)
 
-    async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
+    async def subscription_limit_event(
+        self, failure: object
+    ) -> dict[str, object] | None:
         return await asyncio.to_thread(self._subscription_limit_event, failure)
 
     def _subscription_limit_event(self, failure: object) -> dict[str, object] | None:

@@ -70,6 +70,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "todo",
         _todo,
+        binding="shared",
         description=(
             "Read the current todo list when items is omitted. "
             "Write the full todo list by providing items. "

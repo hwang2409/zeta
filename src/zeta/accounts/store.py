@@ -11,7 +11,6 @@ import re
 import stat
 import threading
 import time
-import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import (
     AbstractContextManager,
@@ -21,7 +20,7 @@ from contextlib import (
 )
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import httpx
 
@@ -39,8 +38,33 @@ from ..oauth import (
     classify_oauth_refresh_failure,
     credential_file_lock,
 )
+from ..storage_format import (
+    CLOSED_VARIANTS,
+    DeleteValue,
+    SetValue,
+    open_writer,
+    reject_unknown_keys,
+    require_closed_variant,
+)
+from . import availability
+from .files import (
+    exists as _exists,
+)
+from .files import (
+    file_mtime_ns as _file_mtime_ns,
+)
+from .files import fsync_directory as _fsync_directory
+from .files import mkdir_child_durable as _mkdir_child_durable
+from .files import owned_fd as _owned_fd
+from .files import (
+    read_optional as _read_optional,
+)
+from .files import (
+    read_optional_bytes as _read_optional_bytes,
+)
+from .publication import atomic_publish, publish_mapping
 
-_PROVIDERS = {"anthropic", "codex"}
+_PROVIDERS = cast(frozenset[str], CLOSED_VARIANTS["account.provider"])
 _MAX_SWEEP_WARNING_PATHS = 5
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
 
@@ -54,18 +78,25 @@ def _account_label(value: str) -> str:
     return label
 
 
-def _registry_reference_index(value: Mapping[str, Any]) -> dict[tuple[str, str], AccountId]:
+def _registry_reference_index(
+    value: Mapping[str, Any],
+) -> dict[tuple[str, str], AccountId]:
     accounts = value["accounts"]
     labels = value["labels"]
     references: dict[tuple[str, str], AccountId] = {}
     for key, metadata in accounts.items():
         if not isinstance(key, str) or not isinstance(metadata, Mapping):
             raise TypeError
-        account = AccountId(*key.split(":", 1))
-        if key != str(account) or metadata != {
-            "provider": account.provider,
-            "name": account.name,
-        }:
+        provider, name = key.split(":", 1)
+        require_closed_variant("account.provider", provider)
+        account = AccountId(provider, name)
+        if key != str(account) or any(
+            metadata.get(field) != expected
+            for field, expected in {
+                "provider": account.provider,
+                "name": account.name,
+            }.items()
+        ):
             raise ValueError
         label = labels.get(key, account.name)
         if _account_label(label) != label:
@@ -116,17 +147,6 @@ class AccountId:
         return f"{self.provider}:{self.name}"
 
 
-@dataclass(frozen=True, slots=True)
-class AccountDisplay:
-    account: AccountId
-    label: str
-    detail: str | None = None
-    usage: Any = None
-
-    def __str__(self) -> str:
-        return f"{self.account.provider}:{self.label}"
-
-
 class AccountStore:
     """Own the durable account catalog, credentials, and process locks."""
 
@@ -137,22 +157,21 @@ class AccountStore:
 
     @contextmanager
     def _home(self) -> Iterator[int]:
-        self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lease = open_writer(self.home)
         os.chmod(self.home, 0o700)
         fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             yield fd
         finally:
             os.close(fd)
+            lease.close()
 
     @contextmanager
     def _lock_at(
         self, directory_fd: int, name: str, *, wait: bool = True
     ) -> Iterator[None]:
         if wait:
-            require_off_loop_lock(
-                "blocking account", AccountLoopThreadLockError
-            )
+            require_off_loop_lock("blocking account", AccountLoopThreadLockError)
         created = not _exists(directory_fd, name)
         for attempt in range(3):
             try:
@@ -209,8 +228,13 @@ class AccountStore:
                 return None
 
     def _write_usage_bytes(self, account: AccountId, data: bytes) -> None:
-        with self._home() as home_fd, _account_directory(home_fd, account) as account_fd:
-            _atomic_publish(account_fd, "usage.json", data)
+        with (
+            self._home() as home_fd,
+            _account_directory(home_fd, account) as account_fd,
+        ):
+            publish_mapping(
+                self.home, account_fd, "usage.json", json.loads(data), atomic_publish
+            )
             _fsync_directory(account_fd)
 
     @contextmanager
@@ -236,39 +260,22 @@ class AccountStore:
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
-    def list_catalog(self) -> list[AccountDisplay]:
+    def list_catalog(self) -> list[availability.AccountDisplay]:
         with self._home() as home_fd:
             value = self._read_registry(home_fd)
-        return [
-            AccountDisplay(
-                AccountId(*key.split(":", 1)),
-                value["labels"].get(key, key.split(":", 1)[1]),
+        return availability.catalog_display(value)
+
+    def list_display(self) -> list[availability.AccountDisplay]:
+        return availability.list_display(self)
+
+    def require_available(self, account: AccountId) -> None:
+        if not any(
+            item.account == account and item.available for item in self.list_display()
+        ):
+            raise AccountError(
+                f"account {account} is unavailable: credentials missing; "
+                f"run 'zeta accounts login {account.provider} {account.name} --replace'"
             )
-            for key in value["accounts"]
-        ]
-
-    def list_display(self) -> list[AccountDisplay]:
-        result = []
-        catalog = self.list_catalog()
-        with self._home() as home_fd:
-            for item in catalog:
-                tokens = _read_account_tokens(home_fd, item.account)
-                details = (
-                    tuple(filter(None, (tokens.email, tokens.workspace)))
-                    if tokens
-                    else ()
-                )
-                from .usage import read_usage
-
-                result.append(
-                    AccountDisplay(
-                        item.account,
-                        item.label,
-                        " · ".join(details) or None,
-                        read_usage(self, item.account),
-                    )
-                )
-        return result
 
     def default(self, provider: str) -> AccountId | None:
         if provider not in _PROVIDERS:
@@ -422,8 +429,14 @@ class AccountStore:
     def pin_guard(self, accounts: Mapping[str, AccountId]) -> Iterator[None]:
         """Hold registry then account locks while durable pins are published."""
 
-        ordered = sorted(set(accounts.values()), key=lambda item: (item.provider, item.name))
-        with self._home() as home_fd, self._registry_guard(home_fd), ExitStack() as stack:
+        ordered = sorted(
+            set(accounts.values()), key=lambda item: (item.provider, item.name)
+        )
+        with (
+            self._home() as home_fd,
+            self._registry_guard(home_fd),
+            ExitStack() as stack,
+        ):
             for account in ordered:
                 stack.enter_context(self._lifecycle_guard(home_fd, account))
             registered = self._read_registry(home_fd)["accounts"]
@@ -457,9 +470,7 @@ class AccountStore:
         ):
             yield home_fd
 
-    def _recover_account(
-        self, home_fd: int, account: AccountId
-    ) -> OAuthTokens | None:
+    def _recover_account(self, home_fd: int, account: AccountId) -> OAuthTokens | None:
         value = self._read_registry(home_fd)
         registered = str(account) in value["accounts"]
         try:
@@ -473,9 +484,8 @@ class AccountStore:
                 if pending is None:
                     return None
                 credential = _read_optional_bytes(account_fd, "oauth.json")
-                if (
-                    credential is None
-                    or pending != _publication_record(account, credential)
+                if credential is None or pending != _publication_record(
+                    account, credential
                 ):
                     _delete_publication_pending(account_fd)
                     return None
@@ -523,7 +533,9 @@ class AccountStore:
                     self._migrate_provider(home_fd, provider)
         return tuple(warnings)
 
-    def _list_orphan_directories(self, home_fd: int, registered: set[str]) -> list[tuple[str, str, str, set[str]]]:
+    def _list_orphan_directories(
+        self, home_fd: int, registered: set[str]
+    ) -> list[tuple[str, str, str, set[str]]]:
         orphans: list[tuple[str, str, str, set[str]]] = []
         for root, allowed in (
             ("accounts", {"oauth.json", "usage.json", "publish-pending.json"}),
@@ -535,7 +547,16 @@ class AccountStore:
                         try:
                             with child_directory(root_fd, provider) as provider_fd:
                                 names = [
-                                    (name, stat.S_ISDIR(os.stat(name, dir_fd=provider_fd, follow_symlinks=False).st_mode))
+                                    (
+                                        name,
+                                        stat.S_ISDIR(
+                                            os.stat(
+                                                name,
+                                                dir_fd=provider_fd,
+                                                follow_symlinks=False,
+                                            ).st_mode
+                                        ),
+                                    )
                                     for name in sorted(os.listdir(provider_fd))
                                 ]
                         except FileNotFoundError:
@@ -549,7 +570,9 @@ class AccountStore:
                 continue
         return orphans
 
-    def _orphan_is_pending_publication(self, home_fd: int, root: str, provider: str, name: str) -> bool:
+    def _orphan_is_pending_publication(
+        self, home_fd: int, root: str, provider: str, name: str
+    ) -> bool:
         if root != "accounts":
             return False
         account = AccountId(provider, name)
@@ -569,7 +592,9 @@ class AccountStore:
             and pending == _publication_record(account, credential)
         )
 
-    def _remove_orphan_directory(self, home_fd: int, root: str, provider: str, name: str, allowed: set[str]) -> str | None:
+    def _remove_orphan_directory(
+        self, home_fd: int, root: str, provider: str, name: str, allowed: set[str]
+    ) -> str | None:
         from .logout import remove_account_directory, sweep_warning_path
 
         try:
@@ -580,7 +605,9 @@ class AccountStore:
 
     def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
         registered, refused = set(self._read_registry(home_fd)["accounts"]), []
-        for root, provider, name, allowed in self._list_orphan_directories(home_fd, registered):
+        for root, provider, name, allowed in self._list_orphan_directories(
+            home_fd, registered
+        ):
             try:
                 if self._orphan_is_pending_publication(home_fd, root, provider, name):
                     continue
@@ -589,9 +616,14 @@ class AccountStore:
             path = self._remove_orphan_directory(home_fd, root, provider, name, allowed)
             if path is not None:
                 refused.append(path)
-        warnings.extend(f"could not clean up account directory {path}; check its mode or ownership, then delete it or fix it" for path in refused[:_MAX_SWEEP_WARNING_PATHS])
+        warnings.extend(
+            f"could not clean up account directory {path}; check its mode or ownership, then delete it or fix it"
+            for path in refused[:_MAX_SWEEP_WARNING_PATHS]
+        )
         if len(refused) > _MAX_SWEEP_WARNING_PATHS:
-            warnings.append(f"and {len(refused) - _MAX_SWEEP_WARNING_PATHS} more account directories could not be cleaned up")
+            warnings.append(
+                f"and {len(refused) - _MAX_SWEEP_WARNING_PATHS} more account directories could not be cleaned up"
+            )
 
     def _migrate_provider(self, home_fd: int, provider: str) -> None:
         account = AccountId(provider, "default")
@@ -607,15 +639,13 @@ class AccountStore:
             legacy_exists = _exists_regular(home_fd, legacy_name)
             staged = self._recover_account(home_fd, account)
             if registered or staged is not None:
-                if staged is None:
-                    raise AccountError("OAuth credentials are invalid; login required")
                 if legacy_exists:
-                    with _open_account_directory(home_fd, account) as account_fd:
-                        if _file_mtime_ns(home_fd, legacy_name) > _file_mtime_ns(
-                            account_fd, "oauth.json"
-                        ):
+                    with _account_directory(home_fd, account) as account_fd:
+                        if staged is None or _file_mtime_ns(
+                            home_fd, legacy_name
+                        ) > _file_mtime_ns(account_fd, "oauth.json"):
                             tokens = _read_tokens(home_fd, legacy_name)
-                            _stage_account_tokens(account_fd, account, tokens)
+                            self._stage_account_tokens(account_fd, account, tokens)
                             _delete_publication_pending(account_fd)
                     _unlink_legacy(home_fd, legacy_name)
                 return
@@ -623,7 +653,7 @@ class AccountStore:
                 return
             tokens = _read_tokens(home_fd, legacy_name)
             with _account_directory(home_fd, account) as account_fd:
-                _stage_account_tokens(account_fd, account, tokens)
+                self._stage_account_tokens(account_fd, account, tokens)
             self._register_account(home_fd, account, value)
             with _open_account_directory(home_fd, account) as account_fd:
                 _delete_publication_pending(account_fd)
@@ -643,7 +673,10 @@ class AccountStore:
             value = json.loads(raw)
             if (
                 not isinstance(value, Mapping)
-                or value.get("version") != 1
+                or require_closed_variant(
+                    "account_registry.version", value.get("version")
+                )
+                != 1
                 or not isinstance(value.get("accounts"), Mapping)
                 or not isinstance(value.get("defaults"), Mapping)
                 or not isinstance(value.get("labels", {}), Mapping)
@@ -660,28 +693,75 @@ class AccountStore:
             }
             _registry_reference_index(normalized)
             for provider, key in defaults.items():
-                if (
-                    not isinstance(provider, str)
-                    or not isinstance(key, str)
-                    or provider not in _PROVIDERS
-                    or key not in accounts
-                    or not key.startswith(f"{provider}:")
-                ):
+                if not isinstance(provider, str) or not isinstance(key, str):
+                    raise TypeError
+                require_closed_variant("account.provider", provider)
+                if key not in accounts or not key.startswith(f"{provider}:"):
                     raise ValueError
             return normalized
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise AccountError("accounts.json is invalid; use /accounts") from exc
+
+    def _stage_account_tokens(
+        self, account_fd: int, account: AccountId, tokens: OAuthTokens
+    ) -> None:
+        publish_mapping(
+            self.home, account_fd, "oauth.json", tokens.to_dict(), atomic_publish
+        )
+        credential = _read_optional_bytes(account_fd, "oauth.json")
+        if credential is None:
+            raise AccountError("OAuth credentials are invalid; login required")
+        publish_mapping(
+            self.home,
+            account_fd,
+            "publish-pending.json",
+            _publication_record(account, credential),
+            atomic_publish,
+        )
+        _fsync_directory(account_fd)
+        _verify_tokens(account_fd, tokens)
 
     def _write_registry(self, home_fd: int, value: dict[str, Any]) -> None:
         try:
             _registry_reference_index(value)
         except (KeyError, TypeError, ValueError) as exc:
             raise AccountError("accounts.json is invalid; use /accounts") from exc
-        data = (
-            json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode()
-        _atomic_publish(home_fd, "accounts.json", data)
+        raw = _read_optional(home_fd, "accounts.json")
+        current = json.loads(raw) if raw is not None else {}
+        mutations = [
+            SetValue(("version",), 1),
+            SetValue(("accounts",), value["accounts"]),
+            SetValue(("defaults",), value["defaults"]),
+            SetValue(("labels",), value["labels"]),
+        ]
+        if isinstance(current, Mapping):
+            for field in ("accounts", "defaults", "labels"):
+                records = current.get(field)
+                if not isinstance(records, Mapping):
+                    continue
+                for key in records:
+                    if key not in value[field] and self._owns_registry_key(field, key):
+                        mutations.append(DeleteValue((field, key)))
+        with open_writer(self.home) as lease:
+            lease.publish_json(
+                home_fd,
+                "accounts.json",
+                mutations,
+                atomic_publish,
+            )
         _fsync_directory(home_fd)
+
+    @staticmethod
+    def _owns_registry_key(field: str, key: object) -> bool:
+        if not isinstance(key, str):
+            return False
+        if field == "defaults":
+            return key in _PROVIDERS
+        try:
+            account = AccountId(*key.split(":", 1))
+        except (TypeError, ValueError):
+            return False
+        return key == str(account)
 
 
 def rename_account_command(store: AccountStore, args: str) -> str:
@@ -729,7 +809,9 @@ class AccountCredentials:
     def read(self, *, lock_timeout: float | None = None) -> OAuthTokens | None:
         with self.store.lifecycle_guard(
             self.account,
-            timeout=OAUTH_REFRESH_TIMEOUT_SECONDS if lock_timeout is None else lock_timeout,
+            timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            if lock_timeout is None
+            else lock_timeout,
         ) as home_fd:
             return _read_account_tokens(home_fd, self.account)
 
@@ -740,9 +822,7 @@ class AccountCredentials:
         lock_timeout: float | None = None,
         cancel_event: threading.Event | None = None,
     ) -> None:
-        with self.store.credential_guard(
-            self.account, timeout=lock_timeout
-        ) as home_fd:
+        with self.store.credential_guard(self.account, timeout=lock_timeout) as home_fd:
             if cancel_event is None or not cancel_event.is_set():
                 self._publish(home_fd, tokens)
 
@@ -854,7 +934,14 @@ class AccountCredentials:
 
     def _write(self, home_fd: int, tokens: OAuthTokens) -> None:
         with _account_directory(home_fd, self.account) as account_fd:
-            _write_tokens(account_fd, tokens)
+            publish_mapping(
+                self.store.home,
+                account_fd,
+                "oauth.json",
+                tokens.to_dict(),
+                atomic_publish,
+            )
+            _fsync_directory(account_fd)
             _verify_tokens(account_fd, tokens)
 
     def _publish(self, home_fd: int, tokens: OAuthTokens) -> None:
@@ -864,11 +951,8 @@ class AccountCredentials:
         if registered:
             self._write(home_fd, tokens)
             return
-        credential = _token_bytes(tokens)
         with _account_directory(home_fd, self.account) as account_fd:
-            _write_publication_pending(account_fd, self.account, credential)
-            _write_token_bytes(account_fd, credential)
-            _verify_tokens(account_fd, tokens)
+            self.store._stage_account_tokens(account_fd, self.account, tokens)
         self.store._register_account(home_fd, self.account, value)
         with _open_account_directory(home_fd, self.account) as account_fd:
             _delete_publication_pending(account_fd)
@@ -976,7 +1060,9 @@ def _live_session_pins(sessions_root: Path, account: AccountId) -> bool:
             try:
                 metadata = manager.read_metadata(entry.name)
             except (OSError, SessionError, ValueError) as exc:
-                raise AccountError("could not verify live session account pins") from exc
+                raise AccountError(
+                    "could not verify live session account pins"
+                ) from exc
             if metadata.selected_accounts.get(account.provider) == str(account):
                 return True
         if _live_child_pins(path, account):
@@ -1024,73 +1110,8 @@ def _open_account_directory(home_fd: int, account: AccountId) -> Iterator[int]:
         yield account_fd
 
 
-@contextmanager
-def _owned_fd(fd: int) -> Iterator[int]:
-    try:
-        yield fd
-    finally:
-        os.close(fd)
-
-
-def _mkdir_child_durable(parent_fd: int, name: str) -> int:
-    try:
-        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-    except FileExistsError:
-        pass
-    else:
-        _fsync_directory(parent_fd)
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-    os.fchmod(fd, 0o700)
-    return fd
-
-
-def _atomic_publish(directory_fd: int, name: str, data: bytes) -> None:
-    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
-    fd = open_session_file(
-        directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            fd = -1
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        published = open_session_file(directory_fd, name, os.O_RDONLY)
-        try:
-            os.fchmod(published, 0o600)
-        finally:
-            os.close(published)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(temporary, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-
-
 def _token_bytes(tokens: OAuthTokens) -> bytes:
     return (json.dumps(tokens.to_dict(), separators=(",", ":")) + "\n").encode()
-
-
-def _write_tokens(directory_fd: int, tokens: OAuthTokens) -> None:
-    _write_token_bytes(directory_fd, _token_bytes(tokens))
-
-
-def _write_token_bytes(directory_fd: int, credential: bytes) -> None:
-    _atomic_publish(directory_fd, "oauth.json", credential)
-    _fsync_directory(directory_fd)
-
-
-def _stage_account_tokens(
-    account_fd: int, account: AccountId, tokens: OAuthTokens
-) -> None:
-    credential = _token_bytes(tokens)
-    _write_publication_pending(account_fd, account, credential)
-    _write_token_bytes(account_fd, credential)
-    _verify_tokens(account_fd, tokens)
 
 
 def _publication_record(account: AccountId, credential: bytes) -> dict[str, str]:
@@ -1101,29 +1122,18 @@ def _publication_record(account: AccountId, credential: bytes) -> dict[str, str]
     }
 
 
-def _write_publication_pending(
-    directory_fd: int, account: AccountId, credential: bytes
-) -> None:
-    data = (
-        json.dumps(
-            _publication_record(account, credential), separators=(",", ":"), sort_keys=True
-        )
-        + "\n"
-    ).encode()
-    _atomic_publish(directory_fd, "publish-pending.json", data)
-    _fsync_directory(directory_fd)
-
-
 def _read_publication_pending(directory_fd: int) -> dict[str, str] | None:
     raw = _read_optional(directory_fd, "publish-pending.json")
     if raw is None:
         return None
     try:
         value = json.loads(raw)
+        if isinstance(value, Mapping):
+            reject_unknown_keys(value, "account_publication_marker")
         if (
             not isinstance(value, Mapping)
-            or set(value) != {"provider", "name", "sha256"}
-            or value["provider"] not in _PROVIDERS
+            or require_closed_variant("account.provider", value["provider"])
+            != value["provider"]
             or not isinstance(value["name"], str)
             or not _SLUG.fullmatch(value["name"])
             or not isinstance(value["sha256"], str)
@@ -1191,40 +1201,6 @@ def _tokens_from_bytes(credential: bytes) -> OAuthTokens:
         raise AccountError("OAuth credentials are invalid; login required") from exc
 
 
-def _read_optional_bytes(directory_fd: int, name: str) -> bytes | None:
-    try:
-        fd = open_session_file(directory_fd, name, os.O_RDONLY)
-    except FileNotFoundError:
-        return None
-    with os.fdopen(fd, "rb") as handle:
-        return handle.read()
-
-
-def _read_optional(directory_fd: int, name: str) -> str | None:
-    try:
-        fd = open_session_file(directory_fd, name, os.O_RDONLY)
-    except FileNotFoundError:
-        return None
-    with os.fdopen(fd) as handle:
-        return handle.read()
-
-
-def _exists(directory_fd: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def _file_mtime_ns(directory_fd: int, name: str) -> int:
-    fd = open_session_file(directory_fd, name, os.O_RDONLY)
-    try:
-        return os.fstat(fd).st_mtime_ns
-    finally:
-        os.close(fd)
-
-
 def _exists_regular(directory_fd: int, name: str) -> bool:
     try:
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1242,7 +1218,3 @@ def _unlink_legacy(home_fd: int, name: str) -> None:
 
 def _unlink_legacy_file(home_fd: int, name: str) -> None:
     os.unlink(name, dir_fd=home_fd)
-
-
-def _fsync_directory(directory_fd: int) -> None:
-    os.fsync(directory_fd)

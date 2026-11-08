@@ -1,9 +1,16 @@
+import asyncio
+import contextlib
+import json
+from dataclasses import fields, replace
 from io import StringIO
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
+from prompt_toolkit.key_binding import KeyPress
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.output import DummyOutput
@@ -11,12 +18,16 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
-from zeta.core.loop import AgentLoop
+from tests.support.submissions import await_submission_pipeline
+from zeta.attention_decisions import DecisionItem
+from zeta.attention_records import AttentionStore
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.overlay import OverlayControl
+from zeta.tui.slash_handlers import decisions_panel as decisions_panel_module
 
 
 def _lines(texts: list[str]) -> list[list[tuple[str, str]]]:
@@ -75,6 +86,98 @@ async def test_status_card_open_close_preserves_composer_and_transcript(
     assert session.default_buffer.cursor_position == 5
     assert session.layout.has_focus(session.default_buffer)
     assert app._transcript.units == units
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "title"),
+    [
+        ("status", "completion_client_setups"),
+        ("mcp", "MCP servers"),
+        ("tasks", "Background tasks"),
+        ("decisions", "Attention"),
+    ],
+)
+async def test_bare_overlay_commands_dispatch_and_render_through_registry(
+    tmp_path, command: str, title: str
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+        zeta_home=tmp_path / "home",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    existing_tasks = asyncio.all_tasks()
+    dispatched: list[str] = []
+    for name in ("help", command):
+        original = app._slash_commands._commands.get(name)
+        assert original is not None
+
+        def traced(session, args, *, _command=original):
+            dispatched.append(_command.name)
+            return _command.run(session, args)
+
+        app._slash_commands._commands[name] = replace(original, handler=traced)
+    try:
+        app._submit_input("/help")
+        await await_submission_pipeline(app)
+        rendered_help = "\n".join(app._transcript.lines(100))
+        assert "/status — show session status" in rendered_help
+        assert "/accounts — list, switch, or label accounts" in rendered_help
+        assert dispatched == ["help"]
+
+        app._submit_input(f"/{command}")
+        await await_submission_pipeline(app)
+        active = {
+            "status": app.status_card_active,
+            "mcp": app.status_card_active and app._mcp_manager_open,
+            "tasks": app.tasks_panel_active,
+            "decisions": app.decisions_panel_active,
+        }
+        assert active[command], active
+        assert dispatched == ["help", command]
+        screen = Screen(initial_width=80, initial_height=24)
+        with set_app(session.app):
+            session.layout.update_parents_relations()
+            session.layout.container.write_to_screen(
+                screen,
+                MouseHandlers(),
+                WritePosition(0, 0, 80, 24),
+                "",
+                False,
+                None,
+            )
+            screen.draw_all_floats()
+        screen_text = "\n".join(
+            "".join(screen.data_buffer[y][x].char for x in range(80))
+            for y in range(24)
+        )
+        assert title in screen_text
+        assert session.default_buffer.text == ""
+    finally:
+        if command in {"status", "mcp"}:
+            app.close_status_card()
+        elif command == "tasks":
+            app.close_tasks_panel()
+        else:
+            app.close_decisions_panel()
+        await app._submissions.close()
+        await app.loop.close()
+        spawned = asyncio.all_tasks() - existing_tasks - {asyncio.current_task()}
+        for task in spawned:
+            task.cancel()
+        if spawned:
+            await asyncio.wait_for(
+                asyncio.gather(*spawned, return_exceptions=True), timeout=30
+            )
 
 
 class _FixedSizeOutput(DummyOutput):
@@ -159,6 +262,135 @@ async def test_status_card_renders_compaction_with_or_without_fact_floor(
 
 
 @pytest.mark.asyncio
+async def test_decisions_popup_renders_kinds_and_dismisses_information(
+    tmp_path, monkeypatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    attention = AttentionStore(store.session_dir)
+    decision = attention.request(
+        session_id=store.session_id,
+        project_id=None,
+        entry_id=None,
+        entry_seq=None,
+        title="choose",
+        why="choose a value " + "with supporting context " * 20,
+    )
+    information = attention.request(
+        session_id=store.session_id,
+        project_id=None,
+        entry_id=None,
+        entry_seq=None,
+        title="answer",
+        why="the answer is ready " + "with supporting context " * 20,
+    )
+    information_path = attention.directory / f"{information.id}.json"
+    information_value = json.loads(information_path.read_text())
+    information_value["kind"] = "answer"
+    information_path.write_text(json.dumps(information_value))
+    if hasattr(information, "kind"):
+        information = attention.get(information.id)
+    else:
+        information = SimpleNamespace(
+            **{field.name: getattr(information, field.name) for field in fields(information)},
+            kind="answer",
+        )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        zeta_home=tmp_path,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    app._decisions_panel.set_items(
+        [
+            DecisionItem(store.session_id, None, "Unassigned", decision),
+            DecisionItem(store.session_id, None, "Unassigned", information),
+        ]
+    )
+    app.open_decisions_panel()
+    try:
+        with set_app(session.app):
+            session.app.key_processor.feed(KeyPress("j"))
+            session.app.key_processor.process_keys()
+        screen = await _render_status(session, 100, 50)
+        rows = [
+            "".join(screen.data_buffer[y][x].char for x in range(100))
+            for y in range(50)
+        ]
+        text = "\n".join(rows)
+        assert "decision" in text and "answer" in text
+        assert text.index("decision") < text.index("answer")
+        decision_badge = next(
+            style
+            for style, text in app._decisions_panel._list_row(
+                app._decisions_panel.items[0]
+            )
+            if text.startswith("  decision ·")
+        )
+        answer_badge = next(
+            style
+            for style, text in app._decisions_panel._list_row(
+                app._decisions_panel.items[1]
+            )
+            if text.startswith("  answer ·")
+        )
+        def foreground(style: str) -> str:
+            return style.split(" on ", 1)[0].split(" bg:", 1)[0]
+
+        assert foreground(decision_badge) != foreground(answer_badge)
+        assert "d dismiss" in text
+        assert app._decisions_panel.selected.record.kind == "answer"
+        await _render_status(session, 100, 24)
+        with set_app(session.app):
+            for _ in range(20):
+                session.app.key_processor.feed(KeyPress(Keys.PageDown))
+                session.app.key_processor.process_keys()
+        offset_before_dismiss = app._decisions_panel_control.offset
+        assert offset_before_dismiss > 0
+
+        app._stop_decisions_refresh()
+        tick_done = asyncio.Event()
+        dismissal_task: asyncio.Task[None] | None = None
+        original_create_task = asyncio.create_task
+
+        def capture_task(coro):
+            nonlocal dismissal_task
+            dismissal_task = original_create_task(coro)
+            return dismissal_task
+
+        monkeypatch.setattr(decisions_panel_module.asyncio, "create_task", capture_task)
+        original_tick = app._decisions_tick
+
+        async def wait_for_dismissal() -> None:
+            await original_tick()
+            tick_done.set()
+
+        app._decisions_tick = wait_for_dismissal
+        with set_app(session.app):
+            session.app.key_processor.feed(KeyPress("d"))
+            session.app.key_processor.process_keys()
+        try:
+            await asyncio.wait_for(tick_done.wait(), timeout=10)
+        except TimeoutError:
+            if dismissal_task is not None:
+                dismissal_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(dismissal_task, 10)
+            raise
+        assert information.id not in {item.record.id for item in app._decisions_panel.items}
+        dismissed = attention.get(information.id)
+        assert dismissed.status == "resolved"
+        assert dismissed.decision is None
+        assert app._decisions_panel_control.offset > 0
+    finally:
+        app.close_decisions_panel()
+        await app.close()
+
+
+@pytest.mark.asyncio
 async def test_empty_decisions_popup_renders_and_closes(tmp_path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
@@ -178,7 +410,7 @@ async def test_empty_decisions_popup_renders_and_closes(tmp_path) -> None:
             "".join(screen.data_buffer[y][x].char for x in range(80))
             for y in range(24)
         )
-        assert "No open decisions." in text
+        assert "No open attention items." in text
         assert "esc close" in text
 
         app.close_decisions_panel()

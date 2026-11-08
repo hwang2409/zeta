@@ -8,9 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
-from prompt_toolkit.data_structures import Size
+from prompt_toolkit.data_structures import Point, Size
+from prompt_toolkit.key_binding.key_processor import KeyPress
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
@@ -23,11 +26,11 @@ from zeta.attention_forks import (
     release_discussion_fork,
 )
 from zeta.attention_records import AttentionStore
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
 from zeta.tools.resolve_attention import register_fork
@@ -70,9 +73,9 @@ def _request(opened, project_id, title, why, **kw):
 
 def test_status_bar_shows_decisions_only_when_present() -> None:
     with_count = format_status("codex", "fake", "idle", decisions_count=2).plain
-    assert "● 2 decisions" in with_count
+    assert "● 2 attention items" in with_count
     singular = format_status("codex", "fake", "idle", decisions_count=1).plain
-    assert "● 1 decision" in singular
+    assert "● 1 attention item" in singular
     none = format_status("codex", "fake", "idle", decisions_count=0).plain
     assert "decision" not in none
 
@@ -89,9 +92,7 @@ def test_status_bar_shows_main_indicator_during_discussion() -> None:
 
 def _decisions_app(home: Path, opened) -> TUIApp:
     return TUIApp(
-        AgentLoop(
-            FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
-        ),
+        AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="fake",
         zeta_home=home,
@@ -109,9 +110,7 @@ async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -
     _request(other, project.project_id, "Other", "Not this one.")
 
     app = _decisions_app(tmp_path, current)
-    child = ConversationStore(
-        current.store.session_dir / "agents", session_id="child"
-    )
+    child = ConversationStore(current.store.session_dir / "agents", session_id="child")
     app._agent_navigation.current_path = child.session_dir
     await app._decisions_tick()
 
@@ -145,7 +144,9 @@ async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> 
     await app._decisions_tick()
     assert app.decisions_count == 1
 
-    fork_id = await asyncio.to_thread(lambda: create_discussion_fork(tmp_path, current.store.session_id, record.id))
+    fork_id = await asyncio.to_thread(
+        lambda: create_discussion_fork(tmp_path, current.store.session_id, record.id)
+    )
     fork = manager.open(fork_id)
     registry = ToolRegistry(
         tmp_path,
@@ -246,7 +247,9 @@ def test_discussion_fork_decisions_use_source_session(tmp_path: Path) -> None:
 # -- popup rendering --------------------------------------------------------
 
 
-def _item(session_id: str, title: str, why: str, options=(), recommendation=None) -> DecisionItem:
+def _item(
+    session_id: str, title: str, why: str, options=(), recommendation=None
+) -> DecisionItem:
     from zeta.attention_records import AttentionRecord
 
     record = AttentionRecord(
@@ -271,9 +274,7 @@ def test_decisions_popup_lists_items_and_offers_options() -> None:
     one = _item("1" * 32, "Pick DB", "Choose a durable store.", ["SQLite", "Postgres"])
     two = _item("2" * 32, "Pick region", "Where to deploy the worker.")
     # Distinct ids so selection is stable.
-    two = DecisionItem(
-        two.session_id, "p", "proj", replace(two.record, id="b" * 32)
-    )
+    two = DecisionItem(two.session_id, "p", "proj", replace(two.record, id="b" * 32))
     panel.set_items([one, two])
     text = _plain(panel.render_lines())
     assert "Pick DB" in text
@@ -413,12 +414,17 @@ def test_return_without_decision_unbinds_so_item_can_be_rediscussed(
         entry_seq=anchor.seq,
     )
     fork_id = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
-    assert AttentionStore(asker.store.session_dir).get(record.id).fork_session_id == fork_id
+    assert (
+        AttentionStore(asker.store.session_dir).get(record.id).fork_session_id
+        == fork_id
+    )
 
     source = release_discussion_fork(tmp_path, fork_id)
     assert source == asker.store.session_id
     # Open item: the binding is cleared so a fresh fork starts next time.
-    assert AttentionStore(asker.store.session_dir).get(record.id).fork_session_id is None
+    assert (
+        AttentionStore(asker.store.session_dir).get(record.id).fork_session_id is None
+    )
     new_fork = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
     assert new_fork != fork_id
     asker.store.close()
@@ -502,43 +508,123 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
         session = app._make_session()
         app._active_session = session
         app._install_full_screen_layout(session)
-        why = "\n".join(
-            f"why paragraph {index} has useful context " + "useful context " * 12
-            for index in range(17)
+        why = (
+            "\n".join(
+                f"why paragraph {index} has useful context " + "useful context " * 12
+                for index in range(17)
+            )
+            + "\ntail-marker"
         )
         item = _item(
             "1" * 32,
             "Which deployment should we use?",
             why,
-            options=["first option with enough detail to wrap", "second option with enough detail to wrap", "third option with enough detail to wrap"],
+            options=[
+                "first option with enough detail to wrap",
+                "second option with enough detail to wrap",
+                "third option with enough detail to wrap",
+            ],
             recommendation="Use the first option because it is safest.",
         )
         app._decisions_panel.set_items([item])
         app.open_decisions_panel()
 
-        async def render() -> str:
+        async def render() -> tuple[Screen, MouseHandlers]:
             session.app.output = _FixedSizeOutput(width, height)
             screen = Screen()
             handlers = MouseHandlers()
             session.layout.update_parents_relations()
             with set_app(session.app):
                 session.layout.container.write_to_screen(
-                    screen, handlers, WritePosition(0, 0, width, height), "", False, None
+                    screen,
+                    handlers,
+                    WritePosition(0, 0, width, height),
+                    "",
+                    False,
+                    None,
                 )
                 screen.draw_all_floats()
-            return _screen_text(screen, width, height)
+            return screen, handlers
 
-        first = await render()
+        def press(key: str) -> None:
+            with set_app(session.app):
+                session.app.key_processor.feed(KeyPress(key))
+                session.app.key_processor.process_keys()
+
+        first_screen, _ = await render()
+        first = _screen_text(first_screen, width, height)
         assert "↓ more · pgdn" in first
         for _ in range(20):
-            app._decisions_key("pagedown")
-        bottom = await render()
+            press(Keys.PageDown)
+        bottom_screen, _ = await render()
+        bottom = _screen_text(bottom_screen, width, height)
         assert "Recommendation:" in bottom
         assert "↓ more · pgdn" not in bottom
         assert "↑ more · pgup" in bottom
-        app._decisions_key("pageup")
-        returned = await render()
-        assert "more" in returned
+
+        offset_at_bottom = app._decisions_panel_control.offset
+        press(Keys.PageUp)
+        assert app._decisions_panel_control.offset < offset_at_bottom
+        press(Keys.PageDown)
+        assert app._decisions_panel_control.offset == offset_at_bottom
+
+        # The answer input owns focus, but page keys must still scroll the popup.
+        press("a")
+        assert app._decisions_panel.mode == "answer"
+        app._decisions_panel_control.top()
+        for _ in range(20):
+            press(Keys.PageDown)
+        answer_bottom_screen, _ = await render()
+        answer_bottom = _screen_text(answer_bottom_screen, width, height)
+        assert "tail-marker" in answer_bottom
+        assert "↑ more · pgup" in answer_bottom
+        answer_offset = app._decisions_panel_control.offset
+        press("x")
+        assert app._decisions_panel_control.offset == answer_offset
+
+        # The rendered popup installs the wheel handler in MouseHandlers.
+        press(Keys.Escape)
+        app._decisions_panel_control.top()
+        initial_screen, handlers = await render()
+        initial = _screen_text(initial_screen, width, height)
+        assert "↓ more · pgdn" in initial
+        wheel_event = MouseEvent(
+            position=Point(0, 0),
+            event_type=MouseEventType.SCROLL_DOWN,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+        wheel_handler = None
+        with set_app(session.app):
+            for row in range(height):
+                for column in range(width):
+                    candidate = handlers.mouse_handlers[row][column]
+                    if candidate is None:
+                        continue
+                    wheel_event.position = Point(column, row)
+                    candidate(wheel_event)
+                    if app._decisions_panel_control.offset > 0:
+                        wheel_handler = candidate
+                        break
+                if wheel_handler is not None:
+                    break
+            assert wheel_handler is not None
+            for _ in range(30):
+                wheel_handler(wheel_event)
+        wheel_screen, _ = await render()
+        wheel_text = _screen_text(wheel_screen, width, height)
+        assert "tail-marker" in wheel_text
+        assert "↑ more · pgup" in wheel_text
+
+        press(Keys.PageUp)
+        assert (
+            app._decisions_panel_control.offset
+            < app._decisions_panel_control._max_offset()
+        )
+        second = _item("2" * 32, "Other decision", "short", ["Keep"])
+        app._decisions_panel.set_items([second])
+        app._refresh_decisions_panel()
+        assert app._decisions_panel_control.offset == 0
     finally:
         await app.close()
 
@@ -549,7 +635,10 @@ def test_decisions_short_detail_has_no_overflow_indicator() -> None:
     control = OverlayControl()
     control.set_lines(panel.render_lines())
     content = control.create_content(width=80, height=24)
-    text = "\\n".join("".join(fragment[1] for fragment in content.get_line(i)) for i in range(content.line_count))
+    text = "\\n".join(
+        "".join(fragment[1] for fragment in content.get_line(i))
+        for i in range(content.line_count)
+    )
     assert "more" not in text
 
 
@@ -559,18 +648,24 @@ def test_decisions_wraps_wide_unbroken_tokens_by_cells() -> None:
     lines = panel.render_lines()
     question = [line for line in lines if "界" in _plain([line])]
     assert question
-    assert all(sum(max(0, get_cwidth(c)) for c in _plain([line])) <= 66 for line in question)
+    assert all(
+        sum(max(0, get_cwidth(c)) for c in _plain([line])) <= 66 for line in question
+    )
 
 
 def test_decisions_detail_keeps_full_text_and_recommendation() -> None:
     panel = DecisionsPanel()
-    panel.set_items([_item(
-        "1" * 32,
-        "A very long decision title that must remain readable in the detail view",
-        "A long explanation that should wrap across multiple rows instead of being truncated.",
-        ["The first option has enough text to wrap too."],
-        recommendation="Prefer the first option because it is safer.",
-    )])
+    panel.set_items(
+        [
+            _item(
+                "1" * 32,
+                "A very long decision title that must remain readable in the detail view",
+                "A long explanation that should wrap across multiple rows instead of being truncated.",
+                ["The first option has enough text to wrap too."],
+                recommendation="Prefer the first option because it is safer.",
+            )
+        ]
+    )
     text = _plain(panel.render_lines())
     assert "A very long decision title that must remain readable" in text
     assert "truncated" in text

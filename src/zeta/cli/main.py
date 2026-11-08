@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -32,8 +33,7 @@ from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
 from ..storage_format import WRITER_EPOCH, StorageFormatError, advance
-from ..tui.app import create_app
-from ..tui.key_bindings import TerminalRenderError
+from ..tui.errors import TerminalRenderError
 
 
 def _tool_patterns_arg(value: str) -> str:
@@ -340,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
         if action == "login":
             sub.add_argument("--no-browser", action="store_true")
     serve_parser = commands.add_parser(
-        "serve", help="serve zeta to one local frontend client"
+        "serve", help="serve zeta to a local controller and observers"
     )
     serve_parser.add_argument("--socket", dest="socket_path", help="Unix socket path")
     serve_parser.add_argument(
@@ -463,6 +463,8 @@ def _handle_login(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
         return 1
+    except StorageFormatError:
+        raise
     except Exception as exc:
         print(login_failure_message(exc), file=sys.stderr)
         return 1
@@ -480,6 +482,7 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
                         "account": str(item),
                         "id": str(item.account),
                         "detail": item.detail,
+                        "available": item.available,
                         "default": store.default(item.account.provider) == item.account,
                         "usage": usage_json(item.usage),
                     }
@@ -495,7 +498,15 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
             if store.default(item.account.provider) == item.account
             else ""
         )
-        lines.append(str(item) + (f"  {item.detail}" if item.detail else "") + marker)
+        availability = (
+            "  unavailable: credentials missing" if not item.available else ""
+        )
+        lines.append(
+            str(item)
+            + (f"  {item.detail}" if item.detail else "")
+            + availability
+            + marker
+        )
         lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
     print("\n".join(lines))
 
@@ -810,6 +821,8 @@ def _create_tui_app(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
 ) -> object | None:
+    from ..tui.bootstrap import create_app
+
     try:
         if args.continue_session or args.resume is not None:
             print("Loading session…", flush=True)
@@ -817,6 +830,8 @@ def _create_tui_app(
         return create_app(args)
     except SessionError as exc:
         parser.error(str(exc))
+    except StorageFormatError:
+        raise
     except ValueError as exc:
         print(f"zeta: {exc}", file=sys.stderr)
         return None
@@ -916,6 +931,26 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     return 0
 
 
+def _run_console(run: Callable[[], int]) -> int:
+    try:
+        return run()
+    except (AccountError, StorageFormatError) as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run_tui_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    entrypoint: str,
+    original_argv: list[str],
+) -> int:
+    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    if restart_session_id is not None:
+        return _exec_restart(entrypoint, original_argv, restart_session_id)
+    return exit_status
+
+
 async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
     """Run the main TUI, keeping it live while discussion forks are shown.
 
@@ -942,7 +977,7 @@ async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
     return await run_fork_stack(app, build_fork)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     original_argv = list(sys.argv[1:] if argv is None else argv)
     entrypoint = sys.argv[0]
     parser = build_parser()
@@ -966,21 +1001,32 @@ def main(argv: list[str] | None = None) -> int:
                 if server_command[:1] == ["--"]:
                     server_command.pop(0)
                 command = server_command[0] if server_command else None
-                result = service.add(
-                    args.name,
-                    scope=args.scope,
-                    command=command,
-                    args=tuple(server_command[1:]),
-                    url=args.url,
-                    oauth=args.oauth,
-                    env=dict(item.split("=", 1) for item in args.env),
-                    headers=dict(item.split("=", 1) for item in args.header),
+                result = asyncio.run(
+                    service.add(
+                        args.name,
+                        scope=args.scope,
+                        command=command,
+                        args=tuple(server_command[1:]),
+                        url=args.url,
+                        oauth=args.oauth,
+                        env=dict(item.split("=", 1) for item in args.env),
+                        headers=dict(item.split("=", 1) for item in args.header),
+                    )
                 )
-                print(json.dumps(result.as_json(), sort_keys=True))
+                item = next(
+                    value
+                    for value in result.entries
+                    if value.name == args.name and value.scope == args.scope
+                )
+                print(json.dumps(item.as_json(), sort_keys=True))
                 return 0
             if args.mcp_action == "list":
-                asyncio.run(service.refresh_credentials())
-                values = [item.as_json() for item in service.list(scope=args.scope)]
+                view = asyncio.run(service.refresh_credentials())
+                values = [
+                    item.as_json()
+                    for item in view.entries
+                    if args.scope == "effective" or item.scope == args.scope
+                ]
                 output = (
                     json.dumps(values, sort_keys=True)
                     if args.json
@@ -993,7 +1039,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.mcp_action == "show":
                 asyncio.run(service.refresh_credentials())
-                value = service.show(args.name, scope=args.scope).as_json()
+                value = asyncio.run(
+                    service.resolve(args.name, scope=args.scope)
+                ).as_json()
                 output = (
                     json.dumps(value, indent=2, sort_keys=True)
                     if args.json
@@ -1002,20 +1050,22 @@ def main(argv: list[str] | None = None) -> int:
                 print(output)
                 return 0
             if args.mcp_action in {"enable", "disable"}:
-                service.set_enabled(
-                    args.name,
-                    scope=args.scope,
-                    enabled=args.mcp_action == "enable",
+                asyncio.run(
+                    service.set_enabled(
+                        args.name,
+                        scope=args.scope,
+                        enabled=args.mcp_action == "enable",
+                    )
                 )
                 return 0
             if args.mcp_action == "remove":
-                service.remove(args.name, scope=args.scope)
+                asyncio.run(service.remove(args.name, scope=args.scope))
                 return 0
             if args.mcp_action == "trust":
-                service.trust(args.name)
+                asyncio.run(service.set_trusted(args.name, trusted=True))
                 return 0
             if args.mcp_action == "untrust":
-                service.untrust(args.name)
+                asyncio.run(service.set_trusted(args.name, trusted=False))
                 return 0
             if args.mcp_action == "logout":
                 asyncio.run(service.logout(args.name, scope=args.scope))
@@ -1087,6 +1137,8 @@ def main(argv: list[str] | None = None) -> int:
                 approval_reconnect_grace=args.approval_reconnect_grace,
             )
             asyncio.run(run_server(server))
+        except StorageFormatError:
+            raise
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
             return 2
@@ -1114,10 +1166,11 @@ def main(argv: list[str] | None = None) -> int:
         return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
-    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
-    if restart_session_id is not None:
-        return _exec_restart(entrypoint, original_argv, restart_session_id)
-    return exit_status
+    return _run_tui_command(args, parser, entrypoint, original_argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    return _run_console(lambda: _main(argv))
 
 
 __all__ = ["build_parser", "main"]

@@ -29,6 +29,7 @@ from .receipt import (
     agent_stats,
     build_agent_receipt,
     build_explicit_finish_receipt,
+    child_cleanup_details,
     receipt_tool_result,
 )
 from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
@@ -87,9 +88,8 @@ class BackgroundAgentOwner:
         self.notification_store = notification_store
         self.finish_gate_max_turns = finish_gate_max_turns
         self.finish_gate_timeout = float(finish_gate_timeout)
-        # Tasks may outlive the short model-turn safety bound. This internal
-        # bound is not a user setting; it only prevents an abandoned task from
-        # living forever when it never exits.
+        # This internal bound lets tasks outlive a turn but stops abandoned tasks
+        # that never exit; it is not a user setting.
         self.finish_gate_task_timeout = float(finish_gate_task_timeout)
         # Receipts and adopted descendants can outlive their immediate loop.
         # The tree owns child leases until root shutdown joins all watchers.
@@ -106,6 +106,7 @@ class BackgroundAgentOwner:
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
         self._active_stores: dict[str, tuple[ConversationStore, ...]] = {}
+        self.project_context_loops: dict[str, Any] = {}
         self._descriptions: dict[str, str] = {}
         self._canceling = False
         self._cancel_requested: set[str] = set()
@@ -342,15 +343,12 @@ class BackgroundAgentOwner:
         default_store: ConversationStore,
         default_instance_id: str | None = None,
     ) -> tuple[ConversationStore, str | None]:
-        """Read the child's current owner edge before it is unregistered."""
         return (
             self._parent_stores.get(instance_id, default_store),
             self._parent_ids.get(instance_id, default_instance_id),
         )
 
-    def parent_store(
-        self, instance_id: str, default: ConversationStore
-    ) -> ConversationStore:
+    def parent_store(self, instance_id: str, default: ConversationStore) -> ConversationStore:
         return self.parent_edge(instance_id, default)[0]
 
     def cancel_all(self) -> None:
@@ -371,9 +369,11 @@ class BackgroundAgentOwner:
     def active_descriptions(self) -> tuple[str, ...]:
         return tuple(self._descriptions.values())
 
-    def owned_running(self, parent_instance_id: str) -> tuple[tuple[str, str], ...]:
-        """Return running children directly owned by one agent."""
+    @property
+    def active_instance_ids(self) -> frozenset[str]:
+        return frozenset(self._cancellers)
 
+    def owned_running(self, parent_instance_id: str) -> tuple[tuple[str, str], ...]:
         return tuple(
             (instance_id, self._descriptions.get(instance_id, "background task"))
             for instance_id in self._cancellers
@@ -1009,7 +1009,7 @@ async def finish_background_child(
     validate_result: Callable[[object, str], ToolResult],
     publish_event: Callable[[StreamEvent], None],
     cleanup: Callable[[], Awaitable[None] | None],
-    close_child: Callable[[], Awaitable[tuple[str, ...]]],
+    close_child: Callable[[str], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
     background_owner: BackgroundAgentOwner,
     marker_key: str | None = None,
@@ -1029,6 +1029,7 @@ async def finish_background_child(
         else None
     )
     explicit_finish_content: dict[str, object] | None = None
+    close_cause, _ = child_cleanup_details("background", False)
     try:
         try:
             result = await child_task
@@ -1088,11 +1089,11 @@ async def finish_background_child(
             )
         ):
             from .finish_gate import await_owned_work
-
             await await_owned_work(child_loop, finish_gate_state)
-        # Admission has ended. Closing now can only kill tasks whose safety
-        # deadline expired; direct children remain live for durable transfer.
-        killed_tasks = list(await close_child() or ())
+        close_cause, close_event = child_cleanup_details(
+            "background", status == "canceled"
+        )
+        killed_tasks = list(await close_child(close_cause) or ())
         # Completion metadata is persisted in more than one store. Keep the
         # legacy field bounded even when a child owned an unbounded task list.
         killed_task_metadata = [task_id[:64] for task_id in killed_tasks[:64]]
@@ -1101,7 +1102,7 @@ async def finish_background_child(
             killed_task_metadata
         ) or any(len(task_id) > 64 for task_id in killed_tasks)
         killed_task_notice = (
-            "\nbackground tasks killed on child completion: "
+            f"\nbackground tasks killed on {close_event}; cause: {close_cause}: "
             + ", ".join(
                 f"{task_id} (background command; archive: {child_path}/background-output.archive)"
                 for task_id in killed_tasks
@@ -1243,7 +1244,7 @@ async def finish_background_child(
             raise asyncio.CancelledError
     finally:
         try:
-            await close_child()
+            await close_child(close_cause)
             # Let the parent finalize the running/terminal tool result before
             # releasing the child store descriptor.
             await asyncio.sleep(0)

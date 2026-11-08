@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from ..context_accounting import message_token_count
 from ..protocol.types import Message, MessageRole, TextContent
+from ..storage_format import reject_unknown_keys
 
 FACT_FLOOR_CHAR_CAP = 4_096
 _OLDEST_LIMIT = 8
@@ -77,32 +78,24 @@ def _valid_fact(value: object) -> bool:
     if type(value) is not dict or type(value.get("type")) is not str:
         return False
     kind = value["type"]
-    if kind == "pr":
-        return set(value) == {"type", "pr"} and _valid_pr(value.get("pr"))
-    if kind == "pr_verdict":
-        return (
-            set(value) == {"type", "pr", "verdict"}
-            and _valid_pr(value.get("pr"))
-            and value.get("verdict") in _VERDICTS
-        )
-    if kind == "pr_head":
-        return (
-            set(value) == {"type", "pr", "sha"}
-            and _valid_pr(value.get("pr"))
-            and _valid_sha(value.get("sha"))
-        )
-    if kind == "child_status":
-        return (
-            set(value) == {"type", "handle", "status"}
-            and _valid_handle(value.get("handle"))
-            and value.get("status") in _CHILD_STATUSES
-        )
-    if kind == "child_head":
-        return (
-            set(value) == {"type", "handle", "sha"}
-            and _valid_handle(value.get("handle"))
-            and _valid_sha(value.get("sha"))
-        )
+    try:
+        if kind == "pr":
+            reject_unknown_keys(value, "fact_pr")
+            return set(value) == {"type", "pr"} and _valid_pr(value.get("pr"))
+        if kind == "pr_verdict":
+            reject_unknown_keys(value, "fact_pr_verdict")
+            return (set(value) == {"type", "pr", "verdict"} and _valid_pr(value.get("pr")) and value.get("verdict") in _VERDICTS)
+        if kind == "pr_head":
+            reject_unknown_keys(value, "fact_pr_head")
+            return (set(value) == {"type", "pr", "sha"} and _valid_pr(value.get("pr")) and _valid_sha(value.get("sha")))
+        if kind == "child_status":
+            reject_unknown_keys(value, "fact_child_status")
+            return (set(value) == {"type", "handle", "status"} and _valid_handle(value.get("handle")) and value.get("status") in _CHILD_STATUSES)
+        if kind == "child_head":
+            reject_unknown_keys(value, "fact_child_head")
+            return (set(value) == {"type", "handle", "sha"} and _valid_handle(value.get("handle")) and _valid_sha(value.get("sha")))
+    except ValueError:
+        return False
     return False
 
 
@@ -119,12 +112,13 @@ def _valid_sha(value: object) -> bool:
 
 
 def _valid_aggregate(value: object) -> bool:
-    if type(value) is not dict or set(value) != {
-        "fact",
-        "first_seq",
-        "last_seq",
-        "value_rank",
-    }:
+    if type(value) is not dict:
+        return False
+    try:
+        reject_unknown_keys(value, "fact_floor_aggregate")
+    except ValueError:
+        return False
+    if set(value) != {"fact", "first_seq", "last_seq", "value_rank"}:
         return False
     first = value.get("first_seq")
     last = value.get("last_seq")
@@ -145,7 +139,13 @@ def _valid_aggregate(value: object) -> bool:
 
 
 def validate_fact_floor(value: object) -> bool:
-    if type(value) is not dict or set(value) != {"version", "oldest", "newest"}:
+    if type(value) is not dict:
+        return False
+    try:
+        reject_unknown_keys(value, "fact_floor_root")
+    except ValueError:
+        return False
+    if set(value) != {"version", "oldest", "newest"}:
         return False
     oldest = value.get("oldest")
     newest = value.get("newest")
@@ -456,14 +456,8 @@ class FactFloorPlan:
         self,
         system_messages: Sequence[Message],
         view_messages: Sequence[Message],
-        latest_user: Message | None,
     ) -> list[Message]:
-        return [
-            *system_messages,
-            *view_messages,
-            *([] if self.message is None else [self.message]),
-            *([] if latest_user is None else [latest_user]),
-        ]
+        return [*system_messages, *view_messages]
 
 
 def previous_fact_floor(

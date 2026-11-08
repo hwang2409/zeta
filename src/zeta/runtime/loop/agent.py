@@ -48,9 +48,7 @@ from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...core.tool_dispatch import dispatch_tool_calls
-from ...mcp import (
-    MCPMount,
-)
+from ...mcp import MCPManagementService, MCPMount
 from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
 from ...protocol.types import (
@@ -63,11 +61,9 @@ from ...protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
-    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
     TextContent,
-    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
@@ -84,16 +80,12 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
-from ..backend_state import (
-    PreparedBackendState,
-    apply_backend_state,
-    effective_backend_budget,
-    prepare_backend_state,
-)
+from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
     _error_info,
+    _sanitize_account_message,
     assistant_reset_event,
     can_retry_context,
     close_completion,
@@ -107,35 +99,25 @@ from ._completion import (
     wait_for_provider_retry,
 )
 from ._store_writes import StoreWriteMixin
+from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
+    EmptyTurnRecoveryState,
     build_nudge_message,
     build_tool_limit_recovery_message,
+    complete_empty_turn,
+    empty_turn_recovery_error,
     output_limit_error,
     read_turn_metadata,
     should_nudge_empty_turn,
 )
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
+from .project_context_recovery import ProjectContextRecoveryMixin
 from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
-
-
-def _sanitize_account_message(message: Message) -> Message:
-    content = [
-        ThinkingContent(block.text) if isinstance(block, ThinkingContent) else block
-        for block in message.content
-        if not isinstance(block, RedactedThinkingContent)
-    ]
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata=message.metadata,
-    )
-
 
 TaskResult = TypeVar("TaskResult")
 
@@ -144,11 +126,13 @@ TaskResult = TypeVar("TaskResult")
 class _ToollessTransition:
     continue_turn: bool
     consuming_notifications: bool
-    nudged_empty_turn: bool
     nudge_turn_pending: bool
+    recovery_state: EmptyTurnRecoveryState
+    error: ErrorInfo | None = None
 
 
 class AgentLoop(
+    BackendOwnerMixin,
     TurnPersistenceMixin,
     ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
@@ -156,10 +140,10 @@ class AgentLoop(
     StoreWriteMixin,
     AgentNotificationMixin,
     ProjectInboxNotificationMixin,
+    ProjectContextRecoveryMixin,
     MCPSession,
 ):
     post_stream_provider_retry = True
-
     def __init__(
         self,
         backend: CompletionBackend,
@@ -194,9 +178,11 @@ class AgentLoop(
         skill_home: Path | None = None,
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
-        parent_owned_wake_eligible: bool = False,
     ) -> None:
-        if type(max_agent_depth) is not int or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH:
+        if (
+            type(max_agent_depth) is not int
+            or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
+        ):
             raise ValueError(
                 f"maximum agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
@@ -205,6 +191,7 @@ class AgentLoop(
                 f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
         self.backend = backend
+        self._init_backend_owners(backend)
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
@@ -212,13 +199,14 @@ class AgentLoop(
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
-        # Directory of the ROOT session that owns the durable child-link index;
-        # threaded down every loop so nested children publish their lineage
-        # intent into a single flat directory the root can reconcile.
+        # Nested loops publish lineage through the root session directory.
         self.root_session_dir = (
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
+        self._configure_project_context_recovery(
+            registry=None, project_id=None, health=None, prepare=None
+        )
         self._child_lineage_publisher = child_lineage_publisher
         if (
             self._child_lineage_publisher is None
@@ -246,12 +234,12 @@ class AgentLoop(
         self._pending_child_recovery: tuple[NotificationInput, ...] = ()
         self._closed = False
         self._turn_active = False
+        self._abort_admitted = False
         self._delivery_wake_pending = False
         self.explicit_finish = False
         self._explicit_finish_report: dict[str, object] | None = None
         self._delivering_prompt_id: str | None = None
-        # Partial assistant persistence uses these values so provider metadata is
-        # retained even when the stream later fails or is cancelled.
+        # Preserve provider metadata if the partial assistant stream fails.
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
         self.memory_reconciler: AutoMemoryReconciler | None = None
@@ -270,8 +258,9 @@ class AgentLoop(
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None
         self._mcp_home_hint: str | None = None
-        self._mcp_project_dir_value: Path | None = (
-            Path(self.store.cwd).expanduser().resolve()
+        self._mcp_project_dir_value: Path | None = Path(self.store.cwd)
+        self._mcp_management = MCPManagementService(
+            project_dir=self._mcp_project_dir_value
         )
         self._mcp_config_error: str | None = None
         self._mcp_schema_names: set[str] = set()
@@ -333,10 +322,9 @@ class AgentLoop(
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
-        self._plan_mode_prior_prompt: RuntimePrompt | None = None
+        self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
-
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -345,7 +333,6 @@ class AgentLoop(
             if record.running
         )
         return self._background_owner.active_descriptions + process_work
-
     def _active_tool_schemas(self) -> list[ToolSchema]:
         schemas = (
             self.tool_registry.schemas
@@ -359,7 +346,6 @@ class AgentLoop(
         if not agent_tool_available(self.agent_depth, self.max_agent_depth):
             schemas = [schema for schema in schemas if schema.get("name") != "agent"]
         return canonical_tool_schemas(schemas)
-
     def _account_safe_context(self, messages: list[Message]) -> list[Message]:
         account_context = getattr(self, "account_context", None)
         provider = (
@@ -377,16 +363,6 @@ class AgentLoop(
             else _sanitize_account_message(message)
             for message in messages
         ]
-
-    def prepare_backend_state(self, backend: CompletionBackend) -> PreparedBackendState:
-        return prepare_backend_state(self, backend)
-
-    def current_backend_state(self) -> PreparedBackendState:
-        return PreparedBackendState(self.backend, self.context_assembler.token_budget)
-
-    def apply_backend_state(self, state: PreparedBackendState) -> None:
-        apply_backend_state(self, state)
-
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
         token_budget = effective_backend_budget(self.backend, token_budget)
@@ -396,13 +372,16 @@ class AgentLoop(
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
 
+    def admit_abort(self) -> None:
+        self._abort_admitted = True
+
     def abort(
         self,
         *,
         foreground_only: bool = False,
         steering_drop_reason: Literal["abort", "disconnect"] | None = "abort",
     ) -> None:
-        """Signal active tools; optionally preserve background work and steering."""
+        self.admit_abort()
         self.tool_registry.abort()
         if not foreground_only:
             self._background_owner.cancel_all()
@@ -485,9 +464,12 @@ class AgentLoop(
         self.tool_registry.start_batch()
         return True
 
-    async def _close_delivery_resources(self) -> tuple[str, ...]:
+    async def _close_delivery_resources(
+        self, *, background_task_cause: str
+    ) -> tuple[str, ...]:
         killed: tuple[str, ...] = ()
         try:
+            self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
             killed = await self.tool_registry.close()
             late_tasks = tuple(self._tracked_tasks)
             if late_tasks:
@@ -512,25 +494,25 @@ class AgentLoop(
                     self._background_owner.store_leases.close
                 )
         return killed
-
-    async def close(self, *, cancel_background: bool = True) -> tuple[str, ...]:
-        """Close session-owned transports and background processes.
-
-        Returns the ids of background tasks killed by this close so a completing
-        child can report them to its parent.
-        """
-
+    async def close(
+        self,
+        *,
+        cancel_background: bool = True,
+        background_task_cause: str = "session shutdown",
+    ) -> tuple[str, ...]:
+        """Close owned resources and return task ids killed during close."""
         self._closed = True
         killed: tuple[str, ...] = ()
-        if self.wake_scheduler is not None:
-            await self.wake_scheduler.close()
+        await self._close_project_context_recovery()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
         if self.agent_depth == 0:
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
-                self.tool_registry.background_tasks.begin_shutdown()
+                self.tool_registry.background_tasks.begin_shutdown(
+                    background_task_cause
+                )
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
@@ -555,56 +537,59 @@ class AgentLoop(
             if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
                 self._mcp_mount_task.cancel()
                 await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
+            await self.close_mcp_management()
             if self._mcp_mount is not None:
                 await self._mcp_mount.close()
                 self._mcp_mount = None
         finally:
-            killed = await self._close_delivery_resources()
+            if self.wake_scheduler is not None:
+                await self.wake_scheduler.close()
+            await self.close_backend_owners(stage="runtime_close")
+            killed = await self._close_delivery_resources(
+                background_task_cause=background_task_cause
+            )
         return killed
-
     def session_start(self) -> None:
         if self.hooks is not None:
             self.hooks.session_start()
-
     async def _produce_task_exit(self, item: TaskExitInput) -> ProducerResult:
-        data: dict[str, object] = {
-            "task_id": item.task_id,
-            "headline": item.command,
-            "exit_code": item.exit_code,
-            "output_tail": item.output_tail,
-            "background_owner": item.owner,
-            "background_phase": item.phase,
-        }
-        if item.log_path is not None:
-            data["log_path"] = item.log_path
-        if item.note is not None:
-            data["note"] = item.note
         step_delivery = await self._ensure_step_delivery()
         return await step_delivery.produce(
-            NotificationInput("task_exit", data, dedupe_key=item.task_id)
+            NotificationInput(
+                "task_exit",
+                item.notification_data(),
+                dedupe_key=item.task_id,
+                tui_presented=item.tui_presented,
+            )
         )
-
     async def activate(self) -> None:
         """Run frontend startup hooks after the frontend installs its sinks."""
-
         if self._activated:
             return
         self.store.bind_owner_thread()
         self._activated = True
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
-            await self._produce_task_exit(item)
+            await self.tool_registry.background_tasks._notify_exit(
+                item.task_id,
+                item.command,
+                item.exit_code,
+                item.output_tail,
+                item.log_path,
+                item.note,
+                owner=item.owner,
+                phase=item.phase,
+                tui_presented=item.tui_presented,
+            )
         self._pending_task_recovery = ()
         await recovery_lease.activate_agent_children(self)
         self.session_start()
         if self.memory_reconciler is not None:
             self.memory_reconciler.activity()
         await self._activate_project_inbox()
-        # Frontends can render immediately while trusted, enabled MCP servers
-        # connect in the background. Operations that require MCP await this task.
+        # Render now; MCP-dependent operations await the background connection.
         if not self._mcp_mount_attempted and self._mcp_mount_task is None:
             self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
-
     async def resume_pending_tool(
         self,
         request_id: str,
@@ -614,7 +599,6 @@ class AgentLoop(
         host_environment: Mapping[str, str] | None = None,
     ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""
-
         await self._ensure_mcp_servers()
         state = self.store.approval_states().get(request_id)
         if state is None or state[1] is None:
@@ -633,7 +617,6 @@ class AgentLoop(
         if not prepared:
             self.tool_registry.start_batch()
         abort_signal = self.tool_registry.abort_signal
-
         def lifecycle(kind: str) -> None:
             if event_sink is None:
                 return
@@ -644,7 +627,6 @@ class AgentLoop(
             }.get(kind)
             if event_type is not None:
                 event_sink(StreamEvent(event_type, tool_call=tool_call))
-
         try:
             result = await self.tool_registry.execute(
                 tool_call,
@@ -680,10 +662,8 @@ class AgentLoop(
                 )
             )
         return result
-
     def finalize_canceled(self, request_id: str) -> ToolResult | None:
         """Persist one canceled result for a durable approval request."""
-
         state = self.store.approval_states().get(request_id)
         if state is None:
             return None
@@ -692,10 +672,8 @@ class AgentLoop(
         if existing is not None:
             return existing
         return self._finalize_tool_results([tool_call], [None])[0]
-
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         return self.store.tool_result(tool_call_id)
-
     async def _toolless_transition(
         self,
         step_delivery: StepDeliveryFlow,
@@ -703,7 +681,7 @@ class AgentLoop(
         *,
         iteration_consuming_notifications: bool,
         notification_turn: bool,
-        nudged_empty_turn: bool,
+        recovery_state: EmptyTurnRecoveryState,
     ) -> _ToollessTransition:
         should_nudge = (
             not iteration_consuming_notifications
@@ -711,22 +689,36 @@ class AgentLoop(
                 assistant_message,
                 stop_reason=self._turn_stop_reason,
                 notification_turn=notification_turn,
-                already_nudged=nudged_empty_turn,
+                already_nudged=(
+                    recovery_state.nudge_episode
+                    == recovery_state.tool_result_episode
+                ),
+                nudge_count=recovery_state.nudge_count,
             )
+        )
+        consume_pending = step_delivery.has_pending_edge and not notification_turn
+        error = empty_turn_recovery_error(
+            assistant_message,
+            notification_turn=notification_turn,
+            consuming_notifications=consume_pending,
+            should_nudge=should_nudge,
+            recovery_state=recovery_state,
         )
         if should_nudge:
             await step_delivery.admit_terminal("nudge")
             await self._append_turn_message(build_nudge_message())
         elif not step_delivery.has_pending_edge and self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")
-        consume_pending = step_delivery.has_pending_edge and not notification_turn
+        if should_nudge:
+            recovery_state.nudge_count += 1
+            recovery_state.nudge_episode = recovery_state.tool_result_episode
         return _ToollessTransition(
             continue_turn=consume_pending or should_nudge,
             consuming_notifications=consume_pending,
-            nudged_empty_turn=nudged_empty_turn or should_nudge,
             nudge_turn_pending=should_nudge,
+            recovery_state=recovery_state,
+            error=error,
         )
-
     async def _run_turn_impl(
         self,
         user_text: str,
@@ -743,6 +735,7 @@ class AgentLoop(
         max_completions: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
+        self._advance_project_context_recovery()
         await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
@@ -751,7 +744,7 @@ class AgentLoop(
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None and not notification_turn:
             await self._append_turn_message(system_message, on_persisted=on_persisted)
-        if not notification_turn and persist_user_message and user_text:
+        elif system_message is None and not notification_turn and persist_user_message:
             user_message = user_message_for_turn(
                 user_text,
                 origin=origin,
@@ -760,7 +753,7 @@ class AgentLoop(
             )
         elif user_message is not None and user_message not in self.store.messages():
             raise ValueError("cannot reuse a user message that is not persisted")
-        if user_message is not None and persist_user_message:
+        if system_message is None and persist_user_message:
             await self._append_turn_message(user_message)
         await self._flush_skill_refresh_notices()
         setup_error: ErrorInfo | None = None
@@ -802,14 +795,14 @@ class AgentLoop(
         retrying_provider = False
         provider_retry_budget: ProviderRetryBudget | None = None
         self._turn_provider_retry_records = []
-        nudged_empty_turn = False
+        recovery_state = EmptyTurnRecoveryState()
         nudge_turn_pending = False
         recovering_tool_limit = False
         consuming_notifications = False
         iteration_consuming_notifications = False
-        while (max_completions is None or turn_number < max_completions) and (
-            self.max_turns is None
-            or turn_number < self.max_turns
+        while (
+            (max_completions if max_completions is not None else self.max_turns) is None
+            or turn_number < (max_completions if max_completions is not None else self.max_turns)
             or step_delivery.has_pending_edge
             or retrying_context
             or retrying_provider
@@ -817,6 +810,8 @@ class AgentLoop(
             or recovering_tool_limit
         ):
             if not retrying_context and not retrying_provider:
+                if self._abort_admitted:
+                    return
                 provider_retry_budget = None
                 self._turn_provider_retry_records = []
                 iteration_consuming_notifications = consuming_notifications
@@ -928,6 +923,8 @@ class AgentLoop(
                 self._turn_provider_retry_records = provider_retry_budget.records
                 admitted_request = prepared_delivery.admitted_request
                 assert admitted_request is not None
+                if self._abort_admitted:
+                    return
                 completion = apply_retry_budget(
                     self.context_assembler.dispatch_admitted_request(
                         self.backend, admitted_request
@@ -1199,21 +1196,24 @@ class AgentLoop(
                         iteration_consuming_notifications
                     ),
                     notification_turn=notification_turn,
-                    nudged_empty_turn=nudged_empty_turn,
+                    recovery_state=recovery_state,
                 )
-                nudged_empty_turn = transition.nudged_empty_turn
+                recovery_state = transition.recovery_state
                 nudge_turn_pending = transition.nudge_turn_pending
-                yield StreamEvent(
-                    StreamEventType.TURN_END,
-                    message=assistant_message,
-                    data={"turn": turn_number, "tool_calls": 0},
+                events, done = await complete_empty_turn(
+                    transition,
+                    assistant_message,
+                    turn_number,
+                    foreground=self.agent_instance_id is None,
+                    admit_terminal=step_delivery.admit_terminal,
+                    schedule_index=self._schedule_transcript_index,
                 )
+                for event in events:
+                    yield event
                 consuming_notifications = transition.consuming_notifications
-                if transition.continue_turn:
-                    continue
-                self._schedule_transcript_index()
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
+                if done:
+                    return
+                continue
             dispatch = dispatch_tool_calls(
                 self,
                 calls,
@@ -1223,13 +1223,11 @@ class AgentLoop(
             )
             try:
                 async for event in dispatch:
+                    recovery_state.record_event(event)
                     yield event
             except (asyncio.CancelledError, GeneratorExit):
-                # The assistant message is durable before dispatch starts. If
-                # cancellation lands in that small gap, the dispatcher's own
-                # cleanup has not run yet, leaving the provider with an
-                # unpaired function call on resume. Finalization is idempotent,
-                # so this also covers cancellation after dispatch has started.
+                # The assistant message is already durable, so finalization prevents
+                # an unpaired tool call whether cancellation precedes or follows dispatch.
                 for call in calls:
                     self.tool_registry.abort_approval(call)
                 self._finalize_tool_results(calls, [None] * len(calls))
@@ -1237,6 +1235,15 @@ class AgentLoop(
             finally:
                 await dispatch.aclose()
                 await self._background_owner.wait_for_store_closes()
+            if self._explicit_finish_report is not None:
+                yield StreamEvent(
+                    StreamEventType.TURN_END,
+                    message=assistant_message,
+                    data={"turn": turn_number, "tool_calls": len(calls)},
+                )
+                self._schedule_transcript_index()
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
             await self._check_project_inbox()
             yield StreamEvent(
                 StreamEventType.TURN_END,
@@ -1245,10 +1252,7 @@ class AgentLoop(
             )
         yield StreamEvent(
             StreamEventType.ERROR,
-            error=ErrorInfo(
-                "max_turns",
-                f"maximum turns reached: {max_completions or self.max_turns}",
-            ),
+            error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),
         )
         if self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")

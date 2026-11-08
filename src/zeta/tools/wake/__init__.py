@@ -50,6 +50,7 @@ def register_wake(registry: ToolRegistry, scheduler: WakeScheduler) -> None:
         validate_arguments=False,
         requires_approval=False,
         parallel_safe=False,
+        binding="loop",
     )
 
 

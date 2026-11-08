@@ -16,15 +16,20 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.raw_frames import assert_raw_frames_preserved
+from tests.support.serve_close import close_serve
+from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
-    _close,
     _connect,
     _read_raw,
     _request,
-    _socket_path,
 )
 from tests.test_server_observers import _controller_event_stream
+from zeta.agent.finish_gate import FinishGateState
+from zeta.agent.run_consumer import consume_run
+from zeta.agent.terminal_fence import TerminalTransitionFence
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -34,11 +39,15 @@ from zeta.protocol.types import (
     TextContent,
     ToolSchema,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
-from zeta.server.protocol import FrameCodec
+from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
+from zeta.skills import SkillCatalog
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 
 class _GatedBackend(CompletionBackend):
@@ -111,19 +120,29 @@ class _ControllerConnection:
         pass
 
 
+def _frame(connection: _ControllerConnection, label: str) -> bytes:
+    return connection.codec.notification(
+        EventDescriptor.ASSISTANT_DELTA, "session", delta=label
+    )
+
+
 @pytest.mark.asyncio
 async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop())
     connection = _ControllerConnection()
     registry.register(connection)
-    registry.negotiate_role(connection, "controller", "1.2", frozenset({"memory_updated"}))
+    registry.negotiate_role(
+        connection, "controller", "1.2", frozenset({"memory_updated"})
+    )
     control = object.__new__(ServeControl)
     control.closing = False
     control.server = SimpleNamespace(connections=registry)
-    control._notify = lambda event, session_id=None, **fields: registry.publish_controller(event, session_id, **fields)
+    control._notify = lambda event, session_id=None, **fields: (
+        registry.publish_controller(event, session_id, **fields)
+    )
     control._publish_memory_notice("session", "updated")
     await asyncio.sleep(0)
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     assert json.loads(connection.frames[1])["params"]["event"] == "memory_updated"
     registry.release(connection)
     await registry.aclose()
@@ -157,9 +176,14 @@ async def test_controller_event_emitted_before_hello_is_delivered_after_hello() 
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    await registry.publish_controller("assistant_delta", "session", delta="x")
-    assert await registry.send(connection, b"hello\n")
-    assert json.loads(connection.frames[1])["params"]["event"] == "assistant_delta"
+    await registry.publish_controller(
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="x"
+    )
+    assert await registry.send(connection, _frame(connection, "hello"))
+    assert (
+        json.loads(connection.frames[1])["params"]["event"]
+        == EventDescriptor.ASSISTANT_DELTA
+    )
     registry.release(connection)
 
 
@@ -170,9 +194,13 @@ async def test_controller_pre_hello_events_keep_emission_order() -> None:
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for value in ("a", "b", "c"):
-        await registry.publish_controller("assistant_delta", "session", delta=value)
-    assert await registry.send(connection, b"hello\n")
-    assert [json.loads(frame)["params"]["delta"] for frame in connection.frames[1:]] == [
+        await registry.publish_controller(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta=value
+        )
+    assert await registry.send(connection, _frame(connection, "hello"))
+    assert [
+        json.loads(frame)["params"]["delta"] for frame in connection.frames[1:]
+    ] == [
         "a",
         "b",
         "c",
@@ -186,30 +214,35 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     connection.frames.clear()
     first_started = asyncio.Event()
     release_first = asyncio.Event()
+
     async def gated_write(frame: bytes) -> bool:
         async with connection._write_lock:
             if not first_started.is_set():
                 first_started.set()
-                await release_first.wait()
+                await asyncio.wait_for(release_first.wait(), 10)
             connection.frames.append(frame)
             return True
 
     connection._write_physical = gated_write  # type: ignore[method-assign]
     first = asyncio.create_task(
-        registry.publish_controller("assistant_delta", "session", delta="first")
+        registry.publish_controller(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="first"
+        )
     )
-    await first_started.wait()
+    await asyncio.wait_for(first_started.wait(), 10)
     second = asyncio.create_task(
-        registry.publish_controller("assistant_delta", "session", delta="second")
+        registry.publish_controller(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="second"
+        )
     )
     await asyncio.sleep(0)
     assert connection.frames == []
     release_first.set()
-    assert await asyncio.gather(first, second) == [True, True]
+    assert await asyncio.wait_for(asyncio.gather(first, second), 10) == [True, True]
     assert [json.loads(frame)["params"]["delta"] for frame in connection.frames] == [
         "first",
         "second",
@@ -225,7 +258,7 @@ async def test_observer_concurrent_outputs_keep_admission_order() -> None:
     registry.negotiate_role(
         connection, "observer", "1.2", frozenset({"serve_observers"})
     )
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     connection.frames.clear()
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -234,19 +267,24 @@ async def test_observer_concurrent_outputs_keep_admission_order() -> None:
     async def gated_write(frame: bytes) -> bool:
         if not first_started.is_set():
             first_started.set()
-            await release_first.wait()
+            await asyncio.wait_for(release_first.wait(), 10)
         return await original_write(frame)
 
     connection._write_physical = gated_write  # type: ignore[method-assign]
-    first = asyncio.create_task(registry.send(connection, b"first\n"))
-    await first_started.wait()
-    second = asyncio.create_task(registry.send(connection, b"second\n"))
+    first = asyncio.create_task(registry.send(connection, _frame(connection, "first")))
+    await asyncio.wait_for(first_started.wait(), 10)
+    second = asyncio.create_task(
+        registry.send(connection, _frame(connection, "second"))
+    )
     await asyncio.sleep(0)
     assert connection.frames == []
     release_first.set()
-    assert await first
-    assert await second
-    assert connection.frames == [b"first\n", b"second\n"]
+    assert await asyncio.wait_for(first, 10)
+    assert await asyncio.wait_for(second, 10)
+    assert [json.loads(frame)["params"]["delta"] for frame in connection.frames] == [
+        "first",
+        "second",
+    ]
     registry.release(connection)
     await registry.aclose()
 
@@ -257,13 +295,17 @@ async def test_controller_claim_failure_drops_pre_hello_events() -> None:
     first = _ControllerConnection()
     registry.register(first)
     registry.negotiate_role(first, "controller", "1.2", frozenset())
-    await registry.publish_controller("assistant_delta", "session", delta="old")
+    await registry.publish_controller(
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="old"
+    )
     registry.release(first)
     second = _ControllerConnection()
     registry.register(second)
     registry.negotiate_role(second, "controller", "1.2", frozenset())
-    assert await registry.send(second, b"hello\n")
-    assert second.frames == [b"hello\n"]
+    assert await registry.send(second, _frame(second, "hello"))
+    assert [json.loads(frame)["params"]["delta"] for frame in second.frames] == [
+        "hello"
+    ]
     registry.release(second)
 
 
@@ -274,8 +316,10 @@ async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> Non
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for _ in range(257):
-        await registry.publish_controller("assistant_delta", "session", delta="x")
-    assert not await registry.send(connection, b"hello\n")
+        await registry.publish_controller(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="x"
+        )
+    assert not await registry.send(connection, _frame(connection, "hello"))
     assert json.loads(connection.frames[1])["error"]["code"] == -32011
     registry.release(connection)
 
@@ -283,7 +327,7 @@ async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> Non
 async def _send_hello_and_flush(
     registry: ConnectionRegistry, connection: _ControllerConnection
 ) -> bool:
-    sent = await registry.send(connection, b"hello\n")
+    sent = await registry.send(connection, _frame(connection, "hello"))
     controller_ready = getattr(registry, "controller_ready", None)
     if controller_ready is None:
         return sent
@@ -308,13 +352,15 @@ async def test_cancel_after_physical_write_reports_delivered_once() -> None:
 
     connection._write_physical = write_then_cancel  # type: ignore[method-assign]
     publisher = asyncio.create_task(
-        registry.publish_controller("assistant_delta", "session", delta="once")
+        registry.publish_controller(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="once"
+        )
     )
     try:
-        delivered = await publisher
+        delivered = await asyncio.wait_for(publisher, 10)
     except asyncio.CancelledError:
         delivered = await registry.publish_controller(
-            "assistant_delta", "session", delta="once"
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="once"
         )
 
     assert delivered
@@ -338,12 +384,14 @@ async def test_release_after_physical_write_reports_delivered() -> None:
 
     connection._write_physical = write_then_release  # type: ignore[method-assign]
 
-    assert await registry.send(connection, b"delivered\n")
-    assert connection.frames == [b"delivered\n"]
+    assert await registry.send(connection, _frame(connection, "delivered"))
+    assert [json.loads(frame)["params"]["delta"] for frame in connection.frames] == [
+        "delivered"
+    ]
 
 
 @pytest.mark.asyncio
-async def test_controller_release_completes_queued_frames_like_base() -> None:
+async def test_controller_release_fences_queued_frames() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop())
     connection = _ControllerConnection()
     registry.register(connection)
@@ -354,19 +402,19 @@ async def test_controller_release_completes_queued_frames_like_base() -> None:
 
     async def blocked_write(frame: bytes) -> bool:
         write_started.set()
-        await release_write.wait()
+        await asyncio.wait_for(release_write.wait(), 10)
         return True
 
     connection._write_physical = blocked_write  # type: ignore[method-assign]
-    head = asyncio.create_task(registry.send(connection, b"head\n"))
-    await write_started.wait()
-    tail = asyncio.create_task(registry.send(connection, b"tail\n"))
+    head = asyncio.create_task(registry.send(connection, _frame(connection, "head")))
+    await asyncio.wait_for(write_started.wait(), 10)
+    tail = asyncio.create_task(registry.send(connection, _frame(connection, "tail")))
     await asyncio.sleep(0)
 
     registry.release(connection)
     release_write.set()
 
-    assert await asyncio.gather(head, tail) == [True, True]
+    assert await asyncio.wait_for(asyncio.gather(head, tail), 10) == [False, False]
 
 
 @pytest.mark.asyncio
@@ -377,18 +425,22 @@ async def test_observer_release_matches_base() -> None:
     registry.negotiate_role(
         connection, "observer", "1.2", frozenset({"serve_observers"})
     )
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     write_started = asyncio.Event()
 
     async def blocked_write(frame: bytes) -> bool:
         write_started.set()
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return True
 
     connection._write_physical = blocked_write  # type: ignore[method-assign]
-    current = asyncio.create_task(registry.send(connection, b"current\n"))
-    await write_started.wait()
-    queued = asyncio.create_task(registry.send(connection, b"queued\n"))
+    current = asyncio.create_task(
+        registry.send(connection, _frame(connection, "current"))
+    )
+    await asyncio.wait_for(write_started.wait(), 10)
+    queued = asyncio.create_task(
+        registry.send(connection, _frame(connection, "queued"))
+    )
     await asyncio.sleep(0)
 
     registry.release(connection)
@@ -398,7 +450,7 @@ async def test_observer_release_matches_base() -> None:
     assert not current.done()
     assert queued.cancelled()
     current.cancel()
-    await asyncio.gather(current, return_exceptions=True)
+    await asyncio.wait_for(asyncio.gather(current, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
@@ -414,7 +466,7 @@ async def test_aclose_settles_queued_frames_false() -> None:
     async def blocked_write(frame: bytes) -> bool:
         async with connection._write_lock:
             write_started.set()
-            await release_write.wait()
+            await asyncio.wait_for(release_write.wait(), 10)
             return False
 
     async def close() -> None:
@@ -422,16 +474,16 @@ async def test_aclose_settles_queued_frames_false() -> None:
 
     connection._write_physical = blocked_write  # type: ignore[method-assign]
     connection.close = close  # type: ignore[method-assign]
-    head = asyncio.create_task(registry.send(connection, b"head\n"))
-    await write_started.wait()
-    tail = asyncio.create_task(registry.send(connection, b"tail\n"))
+    head = asyncio.create_task(registry.send(connection, _frame(connection, "head")))
+    await asyncio.wait_for(write_started.wait(), 10)
+    tail = asyncio.create_task(registry.send(connection, _frame(connection, "tail")))
     await asyncio.sleep(0)
 
     await registry.aclose()
     await asyncio.sleep(0)
 
-    assert head.done() and await head is False
-    assert tail.done() and await tail is False
+    assert head.done() and await asyncio.wait_for(head, 10) is False
+    assert tail.done() and await asyncio.wait_for(tail, 10) is False
 
 
 class _RecordingWriter:
@@ -460,6 +512,7 @@ async def _capture_direct_raw_stream(
 ) -> bytes:
     counter = iter(range(1000, 2000))
     monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(int=next(counter)))
+    # test-contract: seam freezes timestamps for exact raw-byte comparison
     monkeypatch.setattr(session_module, "_now", lambda: "2026-01-01T00:00:00+00:00")
     backend = _GatedBackend()
     server = ZetaServer(
@@ -542,7 +595,11 @@ async def _replace_registry_controller(
         replacement.features,
     )
     replacement.handshaken = True
-    assert await server.connections.send(replacement, b"hello\n")
+    server.connections.activate_controller(replacement)
+    frame = replacement.codec.notification(
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="hello"
+    )
+    assert await server.connections.send(replacement, frame)
     writer.frames.clear()
     writer.queue.get_nowait()
     return replacement, writer
@@ -555,9 +612,18 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
     expected = (
         Path(__file__).parent / "fixtures" / "serve_control_detach_origin_main.jsonl"
     ).read_bytes()
-    actual = await _controller_event_stream(tmp_path, monkeypatch, observer=False)
-    actual += await _capture_direct_raw_stream(tmp_path / "direct", monkeypatch)
-    assert actual == expected
+    expected_frames = expected.splitlines(keepends=True)
+    split = next(
+        index for index, frame in enumerate(expected_frames) if b'"id":1' in frame
+    )
+    actual_controller = await _controller_event_stream(
+        tmp_path, monkeypatch, observer=False
+    )
+    actual_direct = await _capture_direct_raw_stream(tmp_path / "direct", monkeypatch)
+    assert_raw_frames_preserved(
+        actual_controller, b"".join(expected_frames[:split])
+    )
+    assert_raw_frames_preserved(actual_direct, b"".join(expected_frames[split:]))
 
     server = ZetaServer(home=tmp_path / "owner", port=0, provider="codex")
     await server.start()
@@ -568,6 +634,121 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
         assert server.runtime._background_wake_sink is not None
     finally:
         await server.close()
+
+
+@pytest.mark.parametrize("child_instance_id", ["root:1", "root:1:1"])
+@pytest.mark.asyncio
+async def test_display_only_idle_reaches_serve_without_parent_turn(
+    tmp_path: Path,
+    child_instance_id: str,
+) -> None:
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(reader, writer, 2, "new_session", {})
+        root_loop = server.runtime.loop
+        assert root_loop is not None
+        server_sink = root_loop._background_event_sink
+        assert server_sink is not None
+        idle_events: list[StreamEvent] = []
+
+        def forward(event: StreamEvent) -> None:
+            idle_events.append(event)
+            server_sink(event)
+
+        root_loop.set_background_event_sink(forward)
+        child_store = ConversationStore(tmp_path / f"child-{child_instance_id}")
+        child_loop = AgentLoop(
+            FakeBackend([]),
+            child_store,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+            background_owner=root_loop._background_owner,
+            agent_instance_id=child_instance_id,
+            agent_depth=child_instance_id.count(":"),
+        )
+        child_loop.explicit_finish = True
+        child_loop.set_background_event_sink(root_loop._publish_background_event)
+        child_store.start_agent_lifecycle(
+            handle=child_instance_id,
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=child_instance_id.count(":"),
+            agent_type="worker",
+            description="idle worker",
+        )
+        child_loop._terminal_transition_fence = TerminalTransitionFence(
+            child_store,
+            owned_work=lambda: (),
+            delivering_prompt_id=lambda: None,
+        )
+        root_loop._background_owner.conversation_channel.register_loop(
+            child_instance_id
+        )
+        await child_loop._ensure_step_delivery()
+        idle_waiting = asyncio.Event()
+
+        async def child_result(*args: object, **kwargs: object) -> dict[str, object]:
+            return {
+                "content": [{"type": "text", "text": ""}],
+                "isError": False,
+                "structuredContent": {"status": "running"},
+            }
+
+        async def wait_idle(*args: object) -> bool:
+            idle_waiting.set()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
+            return True
+
+        class OwnedFinishGate(FinishGateState):
+            def can_wake_again(self, loop: object) -> bool:
+                return True
+
+        run = asyncio.create_task(
+            consume_run(
+                child_result,
+                child_loop,
+                "work",
+                child_store=child_store,
+                child_turns=lambda: 1,
+                child_path=str(child_store.session_dir),
+                explicit_finish_metadata={
+                    "child_instance_id": child_instance_id,
+                    "description": "idle worker",
+                },
+                finish_gate_state=OwnedFinishGate(),
+                idle_wait=wait_idle,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            if run.done():
+                run.result()
+            await asyncio.wait_for(idle_waiting.wait(), 10)
+            assert len(idle_events) == 1
+            frame = json.loads(await _read_raw(reader))
+            assert frame["params"]["event"] == "child_idle"
+            assert frame["params"]["data"]["child_instance_id"] == child_instance_id
+            assert frame["params"]["data"]["text"] == "child is idle"
+            assert backend.calls == []
+        finally:
+            run.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(run, return_exceptions=True), 10
+            )
+            await asyncio.wait_for(child_loop.close(), 10)
+            child_store.close()
+    finally:
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -598,7 +779,7 @@ async def test_detached_turn_uses_current_controller_projection(tmp_path: Path) 
         backend.release.set()
         if replacement is not None:
             await replacement.close()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -642,7 +823,7 @@ async def test_post_turn_wake_runs_without_controller(tmp_path: Path) -> None:
         await asyncio.wait_for(backend.later_woke.wait(), TIMEOUT)
     finally:
         backend.release_finalization.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -660,27 +841,31 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
     client = server._client
     assert client is not None and server.connections is not None
-    released = asyncio.Event()
+    reference = weakref.ref(client)
+    cleanup_finished = asyncio.Event()
     original_release = server.connections.release
     client_id = id(client)
+    release_count = 0
+    loop = asyncio.get_running_loop()
 
     def release(connection: Any) -> None:
+        nonlocal release_count
         original_release(connection)
         if id(connection) == client_id:
-            released.set()
+            release_count += 1
+            if release_count == 2:
+                loop.call_soon(cleanup_finished.set)
 
+    # test-contract: seam observe the accept callback after early physical release
     server.connections.release = release  # type: ignore[method-assign]
-    reference = weakref.ref(client)
     writer.close()
     await writer.wait_closed()
-    await asyncio.wait_for(released.wait(), TIMEOUT)
+    await asyncio.wait_for(cleanup_finished.wait(), TIMEOUT)
+    await server.close()
     del client
     gc.collect()
 
-    try:
-        assert server.runtime._background_event_sink is not None
-        assert server.runtime._memory_notice_sink is not None
-        assert server.runtime._background_wake_sink is not None
-        assert reference() is None
-    finally:
-        await server.close()
+    assert server.runtime._background_event_sink is not None
+    assert server.runtime._memory_notice_sink is not None
+    assert server.runtime._background_wake_sink is not None
+    assert reference() is None

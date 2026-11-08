@@ -1,0 +1,176 @@
+import io
+import random
+import re
+import sys
+
+from rich.console import Console
+from rich.text import Text
+
+from zeta.tui.cards.base import UNSAFE_CONTROL_RE, safe_text, strip_terminal_controls
+
+# Reference: the implementation before the clean-text fast path, kept verbatim.
+_OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)")
+_ESC_RE = re.compile(r"\x1b(?:[PX^_].*?\x1b\\|\][^\x07]*(?:\x07|\x1b\\))")
+_C1_DCS_RE = re.compile(r"\x90.*?(?:\x9c|\x1b\\)", re.DOTALL)
+_CSI_UNSUPPORTED_RE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]")
+_CSI_SGR_RE = re.compile(r"\x1b\[[0-?]*[ -/]*m")
+
+
+def _reference(value: str) -> str:
+    value = value.replace("\x9b", "\x1b[")
+    value = _OSC_RE.sub("", value)
+    value = _C1_DCS_RE.sub("", value)
+    value = _ESC_RE.sub("", value)
+    value = _CSI_UNSUPPORTED_RE.sub("", value)
+    result: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "\x1b":
+            match = _CSI_SGR_RE.match(value, index)
+            if match is not None:
+                result.append(match.group())
+                index = match.end()
+                continue
+            index += 1
+            continue
+        character = value[index]
+        if (
+            character in {"\n", "\t"}
+            or ord(character) >= 0x20
+            and not 0x80 <= ord(character) <= 0x9F
+        ):
+            result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def test_unsafe_class_is_exactly_the_characters_the_function_changes() -> None:
+    # Lone surrogates are included: decoded JSON can carry them.
+    for code in range(sys.maxunicode + 1):
+        character = chr(code)
+        expected = _reference(character)
+        assert strip_terminal_controls(character) == expected, hex(code)
+        changed = expected != character
+        assert (UNSAFE_CONTROL_RE.search(character) is not None) == changed, hex(code)
+
+
+def test_mixed_controls_and_escape_sequences_match_reference() -> None:
+    pieces = [
+        "plain",
+        " text ",
+        "\n",
+        "\t",
+        "é",
+        "漢",
+        "\u200b",
+        "\u202e",
+        "\x7f",
+        "\x1b[31m",
+        "\x1b[0m",
+        "\x1b[2J",
+        "\x1b[?25l",
+        "\x9b31m",
+        "\x9b2J",
+        "\x1b]0;title\x07",
+        "\x1b]8;;https://x\x1b\\",
+        "\x9d0;title\x9c",
+        "\x1bPdata\x1b\\",
+        "\x90dcs\x9c",
+        "\x1b",
+        "\x9b",
+        "\x07",
+        "\x00",
+        "\r",
+        "\x85",
+        "[",
+        "]",
+        "\\",
+        "m",
+    ]
+    rng = random.Random(1234)
+    for _ in range(20_000):
+        value = "".join(rng.choice(pieces) for _ in range(rng.randrange(0, 12)))
+        assert strip_terminal_controls(value) == _reference(value), repr(value)
+
+
+def test_safe_text_clean_card_lines_skip_ansi_parser(monkeypatch) -> None:
+    calls = 0
+    original = safe_text.__globals__["Text"].from_ansi
+
+    def count_parser(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(safe_text.__globals__["Text"], "from_ansi", count_parser)
+    clean = "stdout:\nplain output\nexit_code: 0"
+    rendered = safe_text(clean, style="body")
+
+    assert rendered.plain == clean
+    assert calls == 0
+
+
+def test_safe_text_matches_ansi_decoder_for_card_text_corpus() -> None:
+    values = (
+        "plain",
+        "\x1b[31mfailed\x1b[0m",
+        "carriage\rreturn",
+        "windows\r\nline",
+        "trailing\n",
+        "vertical\x0btab\x0cform",
+        "record\x1cseparator\x1dseparator\x1eseparator",
+        "next\x85line\u2028line\u2029line",
+        "tabs\tand unicode 漢字",
+        "",
+    )
+    for value in values:
+        for wrap in (False, True):
+            actual = safe_text(value, style="body", wrap=wrap)
+            expected = Text.from_ansi(
+                strip_terminal_controls(value),
+                style="body",
+                overflow="fold" if wrap else "ellipsis",
+                no_wrap=not wrap,
+            )
+            actual_output = io.StringIO()
+            expected_output = io.StringIO()
+            for text, output in ((actual, actual_output), (expected, expected_output)):
+                Console(
+                    file=output,
+                    force_terminal=True,
+                    color_system=None,
+                    tab_size=4,
+                    width=20,
+                ).print(text, end="")
+            assert actual_output.getvalue() == expected_output.getvalue(), (
+                repr(value),
+                wrap,
+            )
+            assert actual.style == expected.style, (repr(value), wrap, "style")
+            assert actual.tab_size == expected.tab_size, (repr(value), wrap, "tab_size")
+            assert actual.end == expected.end, (repr(value), wrap, "end")
+            assert actual.overflow == expected.overflow, (repr(value), wrap, "overflow")
+            assert actual.no_wrap == expected.no_wrap, (repr(value), wrap, "no_wrap")
+
+
+def test_clean_text_skips_the_character_loop() -> None:
+    value = "clean transcript text with no controls\n\t" * 250
+    lines = 0
+    code = strip_terminal_controls.__code__
+
+    def trace(frame, event, arg):
+        nonlocal lines
+        if frame.f_code is not code:
+            return None
+        if event == "line":
+            lines += 1
+        return trace
+
+    sys.settrace(trace)
+    try:
+        result = strip_terminal_controls(value)
+    finally:
+        sys.settrace(None)
+
+    assert result == value
+    assert lines < 10, f"{lines} lines executed for {len(value)} clean characters"

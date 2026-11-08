@@ -23,6 +23,7 @@ from ..core.agent_progress import live_agent_lifecycle
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
+from ..core.transcript_recovery.runtime import repair_command_for_child_path
 from ..protocol.types import Message, ToolCall, is_passive_harness_message
 from . import theme
 from .cards.agent import (
@@ -61,7 +62,7 @@ from .cards.shared import (
     scan_tool_output as _scan_tool_output,
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
-from .checkpoints import render_replayed_message
+from .checkpoints import render_replayed_message, session_replay_provider
 from .todo import TodoSnapshot
 from .user import displayed_user_text, user_message
 
@@ -519,7 +520,10 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     ]
     if bounded.marker is not None:
         result.insert(0, bounded.marker)
-    return result or ["transcript unavailable"]
+    if result:
+        return result
+    command = repair_command_for_child_path(path)
+    return [f"transcript corrupt; run {command}" if command else "transcript unavailable"]
 
 
 class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
@@ -668,15 +672,16 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
     async def _replay_batches(
         self, messages: list[tuple[str, dict[str, Any]]] | tuple[tuple[str, dict[str, Any]], ...], path: Path
     ) -> None:
+        provider = session_replay_provider(path)
         for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
             if self._closed:
                 return
             for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
-                self._replay(entry_id, raw_message, path)
+                self._replay(entry_id, raw_message, provider)
             await asyncio.sleep(0.001)
 
     def _replay(
-        self, entry_id: str, raw_message: dict[str, Any], path: Path
+        self, entry_id: str, raw_message: dict[str, Any], provider: str | None
     ) -> None:
         try:
             message = Message.from_dict(_bounded_message(raw_message))
@@ -692,7 +697,7 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
             include_thoughts=True,
             replay_tool_results=True,
             replay_tool_starts=True,
-            session_path=path,
+            provider=provider,
         )
         units = self.transcript._units[unit_start:]
         self._entry_units.setdefault(entry_id, []).extend(units)

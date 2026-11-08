@@ -65,7 +65,12 @@ def open_decisions(
         for record in AttentionStore(session_dir).list()
         if record.status == "open"
     ]
-    return tuple(sorted(items, key=lambda item: item.record.created_at))
+    return tuple(
+        sorted(
+            items,
+            key=lambda item: (item.record.kind != "decision", item.record.created_at),
+        )
+    )
 
 
 __all__ = ["DecisionItem", "open_decisions"]

@@ -19,6 +19,7 @@ from prompt_toolkit.application import get_app, run_in_terminal
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.styles import DynamicStyle, Style
+from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
@@ -34,14 +35,12 @@ from ..core.project_context import (
 )
 from ..core.session import SessionMetadata, env_home
 from ..core.slash import (
-    SlashCommand,
     SlashStatus,
     UsageTracker,
     _format_status,
     create_slash_registry,
 )
 from ..diagnostics.tui_stalls import start_tui_stall_watchdog
-from ..mcp.management import MCPManagementService
 from ..protocol.types import (
     Message,
     StreamEvent,
@@ -54,7 +53,7 @@ from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.user_discovery import ExternalToolDiscovery
-from . import overlay, theme
+from . import overlay, render, theme
 from .agent_card import (
     AgentNavigation,
     AgentRunCommandMixin,
@@ -62,6 +61,7 @@ from .agent_card import (
 )
 from .bootstrap import background_notice, build_backend
 from .cards.mcp_manager import MCPManager
+from .cards.shared import wrap_by_cells
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
@@ -117,40 +117,41 @@ from .transcript.history_finder import HistoryFinder
 from .user import displayed_user_text
 
 
-def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
+def _wrap_status_line(line: str, width: int) -> list[overlay.FragmentLine]:
+    if cell_len(line) <= width:
+        return [[overlay.value(line)]]
+    label, separator, value = line.partition(": ")
+    prefix = f"{label}{separator}" if separator else line[: -len(line.lstrip())]
+    if cell_len(prefix) >= width:
+        return [[overlay.value(text)] for text in wrap_by_cells(line, width)]
+    wrapped = wrap_by_cells(
+        value if separator else line.lstrip(), width - cell_len(prefix)
+    )
+    return [
+        [
+            overlay.value(prefix if index == 0 else " " * len(prefix)),
+            overlay.value(text),
+        ]
+        for index, text in enumerate(wrapped)
+    ]
+
+
+def _status_card_lines(
+    status: SlashStatus, width: int | None = None
+) -> list[overlay.FragmentLine]:
+    formatted = _format_status(status).splitlines()
+    body = (
+        [[overlay.value(line)] for line in formatted]
+        if width is None
+        else [row for line in formatted for row in _wrap_status_line(line, width)]
+    )
     return [
         overlay.title("Status"),
         overlay.rule(),
-        *([overlay.value(line)] for line in _format_status(status).splitlines()),
+        *body,
         overlay.rule(),
         overlay.hint("↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"),
     ]
-
-def _tui_slash_commands() -> tuple[SlashCommand, ...]:
-    """Commands that require the full-screen terminal UI."""
-
-    return (
-        SlashCommand(
-            "approve", lambda app, args: app.slash_approve(args), "/approve [key]"
-        ),
-        SlashCommand(
-            "always",
-            lambda app, args: app.slash_always(args),
-            "/always [key] — allow this tool/action for the running session",
-        ),
-        SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]"),
-        SlashCommand("accounts", lambda app, args: app.slash_accounts(args), "switch account"),
-        SlashCommand(
-            "restart",
-            lambda app, args: app.slash_restart(args),
-            "restart this session from the local checkout (reinstall after pyproject changes)",
-        ),
-        SlashCommand(
-            "permissions",
-            lambda app, args: app.slash_permissions(args),
-            "show rules; revoke a session grant: /permissions revoke <grant>; clear all: /permissions clear",
-        ),
-    )
 
 def _prompt_style_with_background(
     foreground: str, background: str, *, background_first: bool = False
@@ -309,7 +310,6 @@ class TUIApp(
             project_dir=repo_root,
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
-            extra_commands=_tui_slash_commands(),
         )
         self.loop.add_skill_catalog_listener(self._slash_commands.register_skills)
         self.loop.set_mcp_prompt_refresh(
@@ -342,11 +342,7 @@ class TUIApp(
         self._mcp_wizard_active = False
         self._mcp_wizard_dialog_active = False
         self._mcp_wizard_task: asyncio.Task[None] | None = None
-        self._mcp_manager = MCPManager(
-            MCPManagementService(
-                home=self._zeta_home, project_dir=repo_root, mount=self.loop._mcp_mount
-            )
-        )
+        self._mcp_manager = MCPManager(self.loop._mcp_management)
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._agent_navigation = AgentNavigation(self.loop.store)
@@ -675,8 +671,6 @@ class TUIApp(
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
-        if self._open_overlay_from_submit(value):
-            return True
         if self._agent_navigation.child_view_active and not value.lstrip().startswith("/"):
             return self._send_to_child(value)
         self._paste_runtime.advance_buffer_generation()
@@ -686,22 +680,28 @@ class TUIApp(
     def _status_toolbar(self) -> list[tuple[str, str]]:
         return status_toolbar(self, get_app().output.get_size().columns)
 
+    def _consume_overlay_submission(self) -> None:
+        session = self._active_session
+        if isinstance(session, FullScreenPromptSession):
+            session.default_buffer.reset()
+            self._draft.clear()
+
     @property
     def status_card_active(self) -> bool:
         return self._status_card_open and self._full_screen_active()
 
-    def open_status_card(self, *, restore_composer: bool = True) -> None:
+    def open_status_card(self) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
-        if restore_composer:
-            self._status_restore_text = buffer.text
-            self._status_restore_cursor = buffer.cursor_position
-        else:
-            self._status_restore_text = ""
-            self._status_restore_cursor = 0
-        self._status_card.set_lines(_status_card_lines(self.slash_status()))
+        self._status_restore_text = buffer.text
+        self._status_restore_cursor = buffer.cursor_position
+        status = self.slash_status()
+        self._status_card.set_lines(
+            _status_card_lines(status),
+            line_factory=lambda width: _status_card_lines(status, width),
+        )
         self._status_card_open = True
         session.layout.focus(self._status_card_window)
         self._invalidate_prompt()
@@ -826,7 +826,7 @@ class TUIApp(
 
     def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
-        if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
+        if event.type in render.BACKGROUND_EVENTS_RENDERED_IMMEDIATELY:
             self._print_unit(self._presenter.render_event(event))
             self._invalidate_stream_prompt()
             return

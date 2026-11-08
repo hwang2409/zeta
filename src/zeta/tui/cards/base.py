@@ -23,6 +23,9 @@ ESC_RE = re.compile(r"\x1b(?:[PX^_].*?\x1b\\|\][^\x07]*(?:\x07|\x1b\\))")
 C1_DCS_RE = re.compile(r"\x90.*?(?:\x9c|\x1b\\)", re.DOTALL)
 CSI_UNSUPPORTED_RE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]")
 CSI_SGR_RE = re.compile(r"\x1b\[[0-?]*[ -/]*m")
+# Every character strip_terminal_controls can change: C0 except tab and newline
+# (includes ESC), and all of C1 (includes CSI, OSC, DCS, ST).
+UNSAFE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x80-\x9f]")
 
 
 def truncate(value: str, limit: int) -> str:
@@ -83,6 +86,8 @@ def tool_content(event: StreamEvent) -> str:
 def strip_terminal_controls(value: str) -> str:
     """Remove terminal controls that are unsafe in transcript scrollback."""
 
+    if UNSAFE_CONTROL_RE.search(value) is None:
+        return value
     value = value.replace("\x9b", "\x1b[")
     value = OSC_RE.sub("", value)
     value = C1_DCS_RE.sub("", value)
@@ -111,8 +116,22 @@ def strip_terminal_controls(value: str) -> str:
 
 
 def safe_text(value: str, *, style: str, wrap: bool = False) -> Text:
+    clean = strip_terminal_controls(value)
+    # Rich's ANSI decoder normalizes control-separated lines, so only bypass it
+    # for text whose shape cannot be changed by decoding.
+    if not any(
+        character in value
+        for character in "\x1b\x9b\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+    ) and not value.endswith("\n"):
+        return Text(
+            clean,
+            style=style,
+            overflow="fold" if wrap else "ellipsis",
+            no_wrap=not wrap,
+            tab_size=8,
+        )
     return Text.from_ansi(
-        strip_terminal_controls(value),
+        clean,
         style=style,
         overflow="fold" if wrap else "ellipsis",
         no_wrap=not wrap,

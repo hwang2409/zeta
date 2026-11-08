@@ -15,12 +15,13 @@ stays reserved for failures, and a background never leaks the Rich ``on
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import OneStyleAndTextTuple
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.utils import get_cwidth
 
 from . import theme
@@ -87,15 +88,15 @@ def value(text: str, style: str | None = None) -> Fragment:
     return (_s(style or theme.BODY), text)
 
 
-def field(name: str, text: str, *, width: int, value_style: str | None = None) -> FragmentLine:
+def field(
+    name: str, text: str, *, width: int, value_style: str | None = None
+) -> FragmentLine:
     """A dim ``label`` paired with a value, label padded to ``width`` cells."""
 
     return [label(name.ljust(width)), value(text, value_style)]
 
 
-def row(
-    fragments: Sequence[Fragment], *, selected: bool
-) -> FragmentLine:
+def row(fragments: Sequence[Fragment], *, selected: bool) -> FragmentLine:
     """A selectable list row: accent ``❯`` gutter and a selection background.
 
     ``fragments`` are ``(style, text)`` pairs expressed in shared theme tokens;
@@ -181,6 +182,8 @@ class OverlayControl(UIControl):
 
     def __init__(self) -> None:
         self._lines: tuple[FragmentLine, ...] = ()
+        self._preferred_lines: tuple[FragmentLine, ...] = ()
+        self._line_factory: Callable[[int], Sequence[FragmentLine]] | None = None
         self._offset = 0
         self._capacity = 1
         self._overflow_hint = False
@@ -203,8 +206,10 @@ class OverlayControl(UIControl):
         *,
         keep_offset: bool = False,
         overflow_hint: bool = False,
+        line_factory: Callable[[int], Sequence[FragmentLine]] | None = None,
     ) -> None:
-        self._lines = tuple(lines)
+        self._lines = self._preferred_lines = tuple(lines)
+        self._line_factory = line_factory
         self._overflow_hint = overflow_hint
         if not keep_offset:
             self._offset = 0
@@ -222,6 +227,14 @@ class OverlayControl(UIControl):
     def bottom(self) -> None:
         self._offset = self._max_offset()
 
+    def mouse_handler(self, mouse_event: MouseEvent) -> None:
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self.scroll(-3)
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self.scroll(3)
+        else:
+            return NotImplemented
+
     def _max_offset(self) -> int:
         return max(0, len(self._lines) - self._capacity)
 
@@ -229,7 +242,7 @@ class OverlayControl(UIControl):
         self._offset = min(max(0, self._offset), self._max_offset())
 
     def preferred_width(self, max_available_width: int) -> int:
-        natural = max((_line_cells(line) for line in self._lines), default=0)
+        natural = max((_line_cells(line) for line in self._preferred_lines), default=0)
         return min(OVERLAY_MAX_WIDTH, max(24, natural + 4))
 
     def preferred_height(
@@ -243,6 +256,9 @@ class OverlayControl(UIControl):
         return len(self._lines) + 2
 
     def create_content(self, width: int, height: int | None) -> UIContent:
+        content_width = max(1, width - 2)
+        if self._line_factory is not None:
+            self._lines = tuple(self._line_factory(content_width))
         capacity = max(1, (height or (len(self._lines) + 2)) - 2)
         has_overflow = self._overflow_hint and len(self._lines) > capacity
         if has_overflow:
@@ -250,7 +266,6 @@ class OverlayControl(UIControl):
         self._capacity = capacity
         self._clamp()
         border = _s(theme.DIM)
-        content_width = max(1, width - 2)
         window = self._lines[self._offset : self._offset + self._capacity]
         rows: list[FragmentLine] = [[(border, "┌" + "─" * content_width + "┐")]]
         for line in window:
@@ -262,7 +277,9 @@ class OverlayControl(UIControl):
                 text = "↑ more · pgup"
             else:
                 text = "↑↓ more · pgup/pgdn"
-            rows.append(frame_line(hint(text), content_width=content_width, border=border))
+            rows.append(
+                frame_line(hint(text), content_width=content_width, border=border)
+            )
         for _ in range(capacity - len(window)):
             rows.append(
                 [(border, "│"), (_s(theme.BODY), " " * content_width), (border, "│")]

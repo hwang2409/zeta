@@ -13,6 +13,11 @@ import os
 import re
 from pathlib import Path
 
+try:
+    from .storage_format import reject_unknown_keys
+except ImportError:  # the SSH installer defines this helper after the source
+    pass
+
 # Memory kind keys (entry_store) and their mirror temporaries (project_publish)
 # share this grammar; it lives here because this module ships to remote peers.
 KIND_KEY_PATTERN = r"[a-z][a-z0-9_-]{0,31}"
@@ -24,6 +29,7 @@ MAX_NAME_LENGTH = 128
 MAX_SCOPE_LENGTH = 4096
 MAX_RECORD_SIZE = 10_000_000
 MAX_MEMORY_FILE_SIZE = 128 * 1024
+MAX_PROJECTS = 10_000
 PROJECT_ID_PATTERN = re.compile(r"p_[0-9a-f]{32}\Z")
 _PROJECT_FIELDS = {
     "schema_version",
@@ -43,6 +49,7 @@ def validate_project_record(
 ) -> tuple[str, str, str, str, str, str | None, str]:
     """Validate one complete registry record using only the standard library."""
 
+    reject_unknown_keys(value, "project_registry_record")
     if (
         not _PROJECT_FIELDS.issubset(value)
         or not set(value).issubset(_PROJECT_FIELDS | _OPTIONAL_PROJECT_FIELDS)
@@ -92,8 +99,7 @@ def validate_project_text(value: object, field: str, maximum: int) -> str:
             f"{field} must be a non-empty string of at most {maximum} characters"
         )
     if "\x00" in value or any(
-        ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF
-        for character in value
+        ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF for character in value
     ):
         raise ValueError(f"{field} contains an invalid character")
     return value

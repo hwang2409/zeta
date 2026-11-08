@@ -1,0 +1,795 @@
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import functools
+import multiprocessing
+import os
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from zeta.core.session import SessionManager
+from zeta.core.session_execution import (
+    OwnerHint,
+    SessionExecutionLease,
+    session_owner_status,
+)
+
+_WAIT_TIMEOUT_SECONDS = 10.0
+
+
+def _recv(connection: Any) -> Any:
+    assert connection.poll(_WAIT_TIMEOUT_SECONDS), (
+        "timed out waiting for process result"
+    )
+    return connection.recv()
+
+
+def _join(process: multiprocessing.Process) -> None:
+    process.join(_WAIT_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.kill()
+        process.join(_WAIT_TIMEOUT_SECONDS)
+        pytest.fail(f"process {process.pid} did not exit before the deadline")
+    assert not process.is_alive(), f"process {process.pid} could not be reaped"
+
+
+def _cleanup_process(process: multiprocessing.Process | None) -> None:
+    if process is None:
+        return
+    if process.is_alive():
+        process.kill()
+    _join(process)
+    process.close()
+
+
+def _read_fifo(path: Path) -> bytes:
+    fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        readable, _, _ = select.select([fd], [], [], _WAIT_TIMEOUT_SECONDS)
+        assert readable, f"timed out reading {path}"
+        data = os.read(fd, 4096)
+        assert data, f"{path} closed without data"
+        return data
+    finally:
+        os.close(fd)
+
+
+def _write_fifo(path: Path, data: bytes) -> None:
+    deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError as exc:
+            if exc.errno != getattr(os, "ENXIO", 6) or time.monotonic() >= deadline:
+                pytest.fail(f"timed out opening {path} for writing: {exc}")
+            threading.Event().wait(0.01)
+    try:
+        assert os.write(fd, data) == len(data)
+    finally:
+        os.close(fd)
+
+
+def _wait_for_stopped(pid: int) -> int:
+    deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        waited_pid, status = os.waitpid(pid, os.WUNTRACED | os.WNOHANG)
+        if waited_pid == pid:
+            return status
+        threading.Event().wait(0.01)
+    pytest.fail(f"process {pid} did not stop before the deadline")
+
+
+def _wait_for_pid_exit(pid: int) -> None:
+    deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        threading.Event().wait(0.01)
+
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    cleanup_deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    while time.monotonic() < cleanup_deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pytest.fail(f"tool process {pid} required SIGKILL after the exit deadline")
+        threading.Event().wait(0.01)
+    pytest.fail(f"tool process {pid} remained after SIGKILL")
+
+
+def _epoch(store: Any) -> str | None:
+    return getattr(getattr(store, "execution_lease", None), "epoch", None)
+
+
+def _hold_session(home: str, session_id: str, ready: Any, release: Any) -> None:
+    manager = SessionManager(home)
+    with manager.open(session_id).store as store:
+        ready.send(("owned", _epoch(store)))
+        assert release.poll(_WAIT_TIMEOUT_SECONDS)
+        release.recv()
+
+
+def _try_open(home: str, session_id: str, result: Any) -> None:
+    manager = SessionManager(home)
+    try:
+        with manager.open(session_id).store as store:
+            result.send(("opened", _epoch(store)))
+    except Exception as exc:  # noqa: BLE001 - report across the process boundary
+        result.send(("error", type(exc).__name__, str(exc)))
+
+
+def _spawn(target: Any, *args: Any) -> multiprocessing.Process:
+    process = multiprocessing.get_context("spawn").Process(target=target, args=args)
+    process.start()
+    return process
+
+
+def _created_session(home: Path, cwd: Path) -> str:
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=cwd)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    manager._release_storage_lease()
+    return session_id
+
+
+def _create_session_process(home: str, cwd: str, result: Any) -> None:
+    result.send(_created_session(Path(home), Path(cwd)))
+
+
+def _production_spawn_owner(
+    home: str,
+    session_id: str,
+    cwd: str,
+    ready_fifo: str,
+    release_fifo: str,
+    done_fifo: str,
+    ready: Any,
+    release: Any,
+) -> None:
+    from zeta.tools._shared.tool_spawn import create_tool_subprocess_shell
+
+    script = (
+        "import os, signal; "
+        f"p={ready_fifo!r}; r={release_fifo!r}; d={done_fifo!r}; "
+        "signal.alarm(30); open(p, 'w').write(str(os.getpid())); "
+        "signal.alarm(30); open(r, 'rb').read(1); "
+        "signal.alarm(30); open(d, 'w').write('done')"
+    )
+    command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    async def start() -> int:
+        process = await create_tool_subprocess_shell(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        return process.pid
+
+    with SessionManager(home).open(session_id).store as store:
+        child_pid = asyncio.run(start())
+        ready.send((child_pid, _epoch(store)))
+        assert release.poll(_WAIT_TIMEOUT_SECONDS)
+        release.recv()
+
+
+def _open_with_format_lock_probe(home: str, session_id: str, result: Any) -> None:
+    from zeta import storage_format
+
+    real_flock = storage_format.fcntl.flock
+    reported = False
+
+    def probe(fd: int, operation: int) -> None:
+        nonlocal reported
+        if operation & fcntl.LOCK_SH and not reported:
+            reported = True
+            result.send("attempting")
+        real_flock(fd, operation)
+
+    storage_format.fcntl.flock = probe
+    try:
+        with SessionManager(home).open(session_id).store as store:
+            result.send(("opened", _epoch(store)))
+    except Exception as exc:  # noqa: BLE001 - report across the process boundary
+        result.send(("error", type(exc).__name__, str(exc)))
+
+
+def test_execution_acquire_uses_only_nonblocking_flock_and_never_fsyncs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations: list[int] = []
+    fsync_calls: list[int] = []
+    real_flock = fcntl.flock
+
+    def record_flock(fd: int, operation: int) -> None:
+        operations.append(operation)
+        real_flock(fd, operation)
+
+    def record_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+
+    monkeypatch.setattr(fcntl, "flock", record_flock)
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        lease = SessionExecutionLease.acquire(
+            directory_fd,
+            session_id="session",
+            owner=OwnerHint("headless"),
+        )
+        lease.close()
+    finally:
+        os.close(directory_fd)
+
+    assert operations == [fcntl.LOCK_EX | fcntl.LOCK_NB]
+    assert fsync_calls == []
+
+
+def test_runtime_lease_record_survives_short_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_write = os.write
+
+    def short_write(fd: int, payload: bytes) -> int:
+        return real_write(fd, payload[:1])
+
+    monkeypatch.setattr(os, "write", short_write)
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    lease: SessionExecutionLease | None = None
+    try:
+        lease = SessionExecutionLease.acquire(
+            directory_fd,
+            session_id="session",
+            owner=OwnerHint("headless"),
+        )
+        assert session_owner_status(directory_fd) == (True, os.getpid()), (
+            "runtime lease reader did not recover the published owner"
+        )
+    finally:
+        if lease is not None:
+            lease.close()
+        os.close(directory_fd)
+
+
+def test_second_process_cannot_open_owned_session(tmp_path: Path) -> None:
+    """The base fails here because both processes return writable stores."""
+
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    owner_ready, owner_send = multiprocessing.Pipe(duplex=False)
+    release_recv, release_send = multiprocessing.Pipe(duplex=False)
+    owner = _spawn(_hold_session, str(home), session_id, owner_send, release_recv)
+    contender: multiprocessing.Process | None = None
+    result_recv = result_send = None
+    try:
+        assert _recv(owner_ready)[0] == "owned"
+        result_recv, result_send = multiprocessing.Pipe(duplex=False)
+        contender = _spawn(_try_open, str(home), session_id, result_send)
+        result = _recv(result_recv)
+        _join(contender)
+        release_send.send(None)
+        _join(owner)
+
+        assert result[0:2] == ("error", "SessionOwnedError")
+        assert owner.exitcode == contender.exitcode == 0
+    finally:
+        _cleanup_process(contender)
+        _cleanup_process(owner)
+        for connection in (
+            owner_ready,
+            owner_send,
+            release_recv,
+            release_send,
+            result_recv,
+            result_send,
+        ):
+            if connection is not None:
+                connection.close()
+
+
+def test_owner_death_allows_immediate_new_epoch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    ready, ready_send = multiprocessing.Pipe(duplex=False)
+    release_recv, release_send = multiprocessing.Pipe(duplex=False)
+    owner = _spawn(_hold_session, str(home), session_id, ready_send, release_recv)
+    successor: multiprocessing.Process | None = None
+    result_recv = result_send = None
+    try:
+        first_epoch = _recv(ready)[1]
+        os.kill(owner.pid, signal.SIGKILL)
+        _join(owner)
+        assert owner.exitcode == -signal.SIGKILL
+
+        result_recv, result_send = multiprocessing.Pipe(duplex=False)
+        successor = _spawn(_try_open, str(home), session_id, result_send)
+        result = _recv(result_recv)
+        _join(successor)
+        assert result[0] == "opened"
+        assert first_epoch is not None and result[1] != first_epoch
+        assert successor.exitcode == 0
+    finally:
+        _cleanup_process(successor)
+        _cleanup_process(owner)
+        for connection in (
+            ready,
+            ready_send,
+            release_recv,
+            release_send,
+            result_recv,
+            result_send,
+        ):
+            if connection is not None:
+                connection.close()
+
+
+def test_suspend_does_not_release_owner(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    ready, ready_send = multiprocessing.Pipe(duplex=False)
+    release_recv, release_send = multiprocessing.Pipe(duplex=False)
+    owner = _spawn(_hold_session, str(home), session_id, ready_send, release_recv)
+    contender: multiprocessing.Process | None = None
+    result_recv = result_send = None
+    try:
+        _recv(ready)
+        os.kill(owner.pid, signal.SIGSTOP)
+        status = _wait_for_stopped(owner.pid)
+        assert os.WIFSTOPPED(status)
+        result_recv, result_send = multiprocessing.Pipe(duplex=False)
+        contender = _spawn(_try_open, str(home), session_id, result_send)
+        result = _recv(result_recv)
+        _join(contender)
+
+        os.kill(owner.pid, signal.SIGCONT)
+        release_send.send(None)
+        _join(owner)
+        assert result[0:2] == ("error", "SessionOwnedError")
+        assert owner.exitcode == contender.exitcode == 0
+    finally:
+        if owner.is_alive():
+            try:
+                os.kill(owner.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        _cleanup_process(contender)
+        _cleanup_process(owner)
+        for connection in (
+            ready,
+            ready_send,
+            release_recv,
+            release_send,
+            result_recv,
+            result_send,
+        ):
+            if connection is not None:
+                connection.close()
+
+
+def test_read_only_store_is_lease_free(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    manager = SessionManager(home)
+    with (
+        manager.open(session_id).store as owner,
+        manager.open(session_id, _read_only=True).store as observer,
+    ):
+        assert observer.messages() == owner.messages()
+        assert observer._runtime_lease is None
+        with pytest.raises(Exception, match="read-only"):
+            observer.append_pending_prompt("no")
+        shared = manager.open(session_id)
+        try:
+            assert _epoch(shared.store) == _epoch(owner)
+        finally:
+            shared.store.close()
+
+
+def test_closed_capability_is_stale(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    store = SessionManager(home).open(session_id).store
+    capability = getattr(store, "execution_lease", None)
+    store.close()
+
+    assert capability is not None
+    with pytest.raises(Exception) as excinfo:
+        capability.assert_owned()
+    assert type(excinfo.value).__name__ == "StaleSessionOwnerError"
+
+    with SessionManager(home).open(session_id).store as successor:
+        assert _epoch(successor) != capability.epoch
+
+
+def test_stale_store_and_metadata_capabilities_cannot_publish(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    manager = SessionManager(home)
+    opened = manager.open(session_id)
+    stale = getattr(opened.store, "execution_lease", None)
+    assert stale is not None
+    stale.close()
+
+    with pytest.raises(Exception) as store_error:
+        opened.store.append_pending_prompt("blocked")
+    assert type(store_error.value).__name__ == "StaleSessionOwnerError"
+    with pytest.raises(Exception) as metadata_error:
+        manager._mutate(
+            session_id,
+            lambda metadata: metadata,
+            execution_lease=stale,
+        )
+    assert type(metadata_error.value).__name__ == "StaleSessionOwnerError"
+    opened.store.close()
+
+    with manager.open(session_id).store as successor:
+        assert successor.pending_prompts() == []
+
+
+def test_execution_descriptor_is_not_inheritable(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    with SessionManager(home).open(session_id).store as store:
+        lease = getattr(store, "execution_lease", None)
+        assert lease is not None
+        assert os.get_inheritable(lease._owned.fd) is False
+
+
+def test_detached_writer_retains_the_resident_epoch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    with SessionManager(home).open(session_id).store as resident:
+        detached = resident._new_persistent_durable_writer()
+        try:
+            assert _epoch(resident) is not None
+            assert _epoch(detached) == _epoch(resident)
+        finally:
+            detached.close()
+
+
+def test_tui_real_render_refuses_owned_session(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    script = (
+        "from zeta.cli.main import _create_tui_app, build_parser; "
+        "parser = build_parser(); "
+        f"args = parser.parse_args(['--provider', 'codex', '--resume', '{session_id}']); "
+        "_create_tui_app(args, parser)"
+    )
+    env = os.environ | {"ZETA_HOME": str(home)}
+
+    with SessionManager(home).open(session_id).store:
+        rendered = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_WAIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+
+    assert rendered.returncode == 2
+    assert "active in another zeta process" in rendered.stderr
+
+
+def test_headless_refuses_owned_session(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    script = (
+        "from zeta.cli.main import build_parser; "
+        "from zeta.runtime.headless import run_headless; "
+        "parser = build_parser(); "
+        f"args = parser.parse_args(['--provider', 'codex', '--resume', '{session_id}', '-p', 'blocked']); "
+        "raise SystemExit(run_headless(args, args.prompt))"
+    )
+    env = os.environ | {"ZETA_HOME": str(home)}
+
+    with SessionManager(home).open(session_id).store:
+        rendered = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_WAIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+
+    assert rendered.returncode == 1
+    assert "active in another zeta process" in rendered.stderr
+
+
+def test_production_spawn_does_not_inherit_execution_owner(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    ready_fifo = tmp_path / "ready.fifo"
+    release_fifo = tmp_path / "release.fifo"
+    done_fifo = tmp_path / "done.fifo"
+    for fifo in (ready_fifo, release_fifo, done_fifo):
+        os.mkfifo(fifo)
+
+    owner_ready, owner_send = multiprocessing.Pipe(duplex=False)
+    owner_release_recv, owner_release_send = multiprocessing.Pipe(duplex=False)
+    owner = _spawn(
+        _production_spawn_owner,
+        str(home),
+        session_id,
+        str(tmp_path),
+        str(ready_fifo),
+        str(release_fifo),
+        str(done_fifo),
+        owner_send,
+        owner_release_recv,
+    )
+    child_pid: int | None = None
+    child_released = False
+    contender: multiprocessing.Process | None = None
+    contender_recv = contender_send = None
+    try:
+        spawned_pid, first_epoch = _recv(owner_ready)
+        child_pid = int(_read_fifo(ready_fifo))
+        assert child_pid == spawned_pid
+
+        contender_recv, contender_send = multiprocessing.Pipe(duplex=False)
+        contender = _spawn(_try_open, str(home), session_id, contender_send)
+        refusal = _recv(contender_recv)
+        _join(contender)
+
+        os.kill(owner.pid, signal.SIGKILL)
+        _join(owner)
+        assert owner.exitcode == -signal.SIGKILL
+        os.kill(child_pid, 0)
+
+        with SessionManager(home).open(session_id).store as successor:
+            successor_epoch = _epoch(successor)
+        _write_fifo(release_fifo, b"1")
+        child_released = True
+        assert _read_fifo(done_fifo) == b"done"
+        assert first_epoch is not None and successor_epoch != first_epoch
+        assert refusal[0:2] == ("error", "SessionOwnedError")
+    finally:
+        if owner.is_alive():
+            owner.kill()
+        _join(owner)
+        if contender is not None:
+            if contender.is_alive():
+                contender.kill()
+            _join(contender)
+        if child_pid is not None:
+            if not child_released:
+                try:
+                    release_fd = os.open(release_fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError:
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    try:
+                        os.write(release_fd, b"1")
+                    finally:
+                        os.close(release_fd)
+            _wait_for_pid_exit(child_pid)
+        for connection in (
+            owner_ready,
+            owner_send,
+            owner_release_recv,
+            owner_release_send,
+            contender_recv,
+            contender_send,
+        ):
+            if connection is not None:
+                connection.close()
+        owner.close()
+        if contender is not None:
+            contender.close()
+
+
+def test_takeover_waits_for_detached_write_to_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import Message, MessageRole, TextContent
+
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    store = SessionManager(home).open(session_id).store
+    write_started = threading.Event()
+    release_write = threading.Event()
+    real_append = ConversationStore.append_message
+
+    @functools.wraps(real_append)
+    def blocked_append(self: Any, *args: Any, **kwargs: Any) -> Any:
+        write_started.set()
+        if not release_write.wait(_WAIT_TIMEOUT_SECONDS):
+            raise TimeoutError("timed out waiting to release detached write")
+        return real_append(self, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationStore, "append_message", blocked_append)
+
+    async def exercise() -> None:
+        write = asyncio.create_task(
+            store.append_message_async(
+                Message(MessageRole.ASSISTANT, [TextContent("persisted")])
+            )
+        )
+        close: asyncio.Task[None] | None = None
+        try:
+            started = await asyncio.wait_for(
+                asyncio.to_thread(write_started.wait, _WAIT_TIMEOUT_SECONDS),
+                _WAIT_TIMEOUT_SECONDS,
+            )
+            assert started
+            loop = asyncio.get_running_loop()
+            close_waiting = loop.create_future()
+            condition = store._durable_write_condition
+            real_wait = condition.wait
+
+            def report_close_wait(*args: Any, **kwargs: Any) -> Any:
+                if not close_waiting.done():
+                    loop.call_soon_threadsafe(close_waiting.set_result, None)
+                return real_wait(*args, **kwargs)
+
+            condition.wait = report_close_wait
+            close = asyncio.create_task(asyncio.to_thread(store.close))
+            await asyncio.wait_for(close_waiting, _WAIT_TIMEOUT_SECONDS)
+            assert store._closing
+
+            result_recv, result_send = multiprocessing.Pipe(duplex=False)
+            contender = _spawn(_try_open, str(home), session_id, result_send)
+            try:
+                result = _recv(result_recv)
+                _join(contender)
+                assert result[0:2] == ("error", "SessionOwnedError")
+                assert contender.exitcode == 0
+            finally:
+                if contender.is_alive():
+                    contender.kill()
+                _join(contender)
+                result_recv.close()
+                result_send.close()
+                contender.close()
+        finally:
+            release_write.set()
+            await asyncio.wait_for(write, _WAIT_TIMEOUT_SECONDS)
+            if close is None:
+                await asyncio.wait_for(
+                    asyncio.to_thread(store.close), _WAIT_TIMEOUT_SECONDS
+                )
+            else:
+                await asyncio.wait_for(close, _WAIT_TIMEOUT_SECONDS)
+
+    asyncio.run(exercise())
+    with SessionManager(home).open(session_id).store as successor:
+        assert _epoch(successor) is not None
+
+
+def test_format_socket_and_execution_lock_order_across_processes(
+    tmp_path: Path,
+) -> None:
+    from zeta.server.server import ZetaServer
+    from zeta.storage_format import StorageFormatError, advance, verify
+
+    connections: list[Any] = []
+    processes: list[multiprocessing.Process] = []
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "storage-format.json").write_text('{"writer_epoch":2}\n')
+    session_id = _created_session(home, tmp_path)
+    try:
+        owner_ready, owner_send = multiprocessing.Pipe(duplex=False)
+        owner_release_recv, owner_release_send = multiprocessing.Pipe(duplex=False)
+        connections.extend(
+            (owner_ready, owner_send, owner_release_recv, owner_release_send)
+        )
+        owner = _spawn(
+            _hold_session, str(home), session_id, owner_send, owner_release_recv
+        )
+        processes.append(owner)
+        assert _recv(owner_ready)[0] == "owned"
+        try:
+            advance(home, expected_epoch=2, target_epoch=3)
+        except StorageFormatError as exc:
+            advance_error = str(exc)
+        else:
+            advance_error = ""
+        owner_release_send.send(None)
+        _join(owner)
+        assert "active writers" in advance_error
+        assert owner.exitcode == 0
+
+        advanced_home = tmp_path / "advanced-home"
+        advanced_home.mkdir()
+        (advanced_home / "storage-format.json").write_text('{"writer_epoch":3}\n')
+        session_recv, session_send = multiprocessing.Pipe(duplex=False)
+        connections.extend((session_recv, session_send))
+        creator = _spawn(
+            _create_session_process, str(advanced_home), str(tmp_path), session_send
+        )
+        processes.append(creator)
+        advanced_session_id = _recv(session_recv)
+        _join(creator)
+        assert creator.exitcode == 0
+
+        format_fd = os.open(advanced_home / ".storage-format.lock", os.O_RDWR)
+        fcntl.flock(format_fd, fcntl.LOCK_EX)
+        result_recv, result_send = multiprocessing.Pipe(duplex=False)
+        connections.extend((result_recv, result_send))
+        contender = _spawn(
+            _open_with_format_lock_probe,
+            str(advanced_home),
+            advanced_session_id,
+            result_send,
+        )
+        processes.append(contender)
+        try:
+            assert _recv(result_recv) == "attempting"
+            assert contender.is_alive()
+        finally:
+            fcntl.flock(format_fd, fcntl.LOCK_UN)
+            os.close(format_fd)
+        assert _recv(result_recv)[0] == "opened"
+        _join(contender)
+        assert contender.exitcode == 0
+
+        socket_path = tmp_path / "serve.sock"
+        socket_lock_fd = os.open(
+            f"{socket_path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
+        )
+        fcntl.flock(socket_lock_fd, fcntl.LOCK_EX)
+        blocked_server = ZetaServer(
+            home=advanced_home, socket_path=socket_path, provider="codex"
+        )
+
+        async def fail_before_session_open() -> None:
+            try:
+                with pytest.raises(RuntimeError, match="already listening"):
+                    await asyncio.wait_for(
+                        blocked_server.start(), _WAIT_TIMEOUT_SECONDS
+                    )
+            finally:
+                await asyncio.wait_for(blocked_server.close(), _WAIT_TIMEOUT_SECONDS)
+
+        try:
+            asyncio.run(fail_before_session_open())
+        finally:
+            fcntl.flock(socket_lock_fd, fcntl.LOCK_UN)
+            os.close(socket_lock_fd)
+
+        socket_result_recv, socket_result_send = multiprocessing.Pipe(duplex=False)
+        connections.extend((socket_result_recv, socket_result_send))
+        after_socket_failure = _spawn(
+            _try_open,
+            str(advanced_home),
+            advanced_session_id,
+            socket_result_send,
+        )
+        processes.append(after_socket_failure)
+        assert _recv(socket_result_recv)[0] == "opened"
+        _join(after_socket_failure)
+        assert after_socket_failure.exitcode == 0
+        assert verify(advanced_home).writer_epoch == 3
+    finally:
+        for process in reversed(processes):
+            _cleanup_process(process)
+        for connection in connections:
+            connection.close()

@@ -62,6 +62,7 @@ class PromptInput:
     text: str
     origin: MessageOrigin
     deadline: float | None
+    starts_new_episode: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,7 @@ class NotificationInput:
     dedupe_key: str | None = None
     after_commit: Callable[[], bool] | None = None
     deadline: float | None = None
+    tui_presented: bool = False
 
 
 type DeliveryInput = PromptInput | NotificationInput
@@ -114,7 +116,10 @@ def _commit_delivery_input(
 ) -> ProducerResult:
     if isinstance(item, PromptInput):
         entry = store.pending_prompt_queue.append(
-            item.text, origin=item.origin, deadline=item.deadline
+            item.text,
+            origin=item.origin,
+            deadline=item.deadline,
+            starts_new_episode=item.starts_new_episode,
         )
         return ProducerResult((entry,), True, 1)
 
@@ -140,6 +145,10 @@ def _commit_delivery_input(
             return ProducerResult((), False)
         existing = _existing_notification(store, kind, data, item.dedupe_key)
         if existing is not None:
+            if item.tui_presented and not store.is_agent_notification_presented_to_tui(existing.id):
+                store._append_row_unlocked(
+                    "notification_tui_presented", {"notification_id": existing.id}
+                )
             changed = _run_after_commit(item, default=False)
             return ProducerResult((store._snapshot_entry(existing),), changed)
         if kind == "inbox":
@@ -162,6 +171,10 @@ def _commit_delivery_input(
                 claimed = _run_after_commit(item, default=True)
                 return ProducerResult((store._snapshot_entry(entry),), claimed, 1)
         entry = store._append_row_unlocked("notification", data)
+        if item.tui_presented:
+            store._append_row_unlocked(
+                "notification_tui_presented", {"notification_id": entry.id}
+            )
         snapshot = store._snapshot_entry(entry)
         claimed = _run_after_commit(item, default=True)
         return ProducerResult((snapshot,), claimed, 1)
@@ -458,6 +471,8 @@ def validate_delivery_input(item: DeliveryInput) -> DeliverySource:
             raise ValueError("prompt text must be a nonempty string")
         if not isinstance(item.origin, MessageOrigin):
             raise TypeError("prompt origin must be a MessageOrigin")
+        if type(item.starts_new_episode) is not bool:
+            raise TypeError("prompt starts_new_episode must be a bool")
         return "prompt"
     if not isinstance(item, NotificationInput):
         raise TypeError("delivery input must be PromptInput or NotificationInput")
@@ -486,6 +501,8 @@ def validate_delivery_input(item: DeliveryInput) -> DeliverySource:
         "macro_completion",
     }:
         raise ValueError("after_commit is not valid for this delivery kind")
+    if item.tui_presented and item.kind != "task_exit":
+        raise ValueError("tui_presented is only valid for task exits")
     return "notification"
 
 

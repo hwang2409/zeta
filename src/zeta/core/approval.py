@@ -10,7 +10,7 @@ import stat
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from ..path_identity import same_physical_path
 from ..protocol.types import (
@@ -24,11 +24,38 @@ from ..protocol.types import (
 from .abort import AbortSignal
 from .store import ConversationStore
 
+PRECEDENCE = ("deny", "ask", "allow", "default")
+
 
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionSnapshot:
+    default: ApprovalDecision
+    precedence: tuple[str, ...]
+    deny: tuple[str, ...]
+    ask: tuple[str, ...]
+    allow: tuple[str, ...]
+    session_grants: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionGrantChange:
+    change: Literal["grant", "revoke", "clear", "reset"]
+    changed: tuple[str, ...]
+    snapshot: PermissionSnapshot
+
+
+class SessionGrantNotFound(ValueError):
+    """The exact displayed session grant is no longer active."""
+
+    def __init__(self, grant: str) -> None:
+        super().__init__(grant)
+        self.grant = grant
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,7 +303,7 @@ class ApprovalAbortPolicy(Protocol):
 
 
 class _ServeApprovalControl(Protocol):
-    def request_approval_abort(
+    def request_approval_abort_gate(
         self,
         request_id: str,
         *,
@@ -343,7 +370,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
     ) -> Awaitable[dict[str, str] | None] | None:
         if self._serve_control is None:
             return None
-        return self._serve_control.request_approval_abort(
+        return self._serve_control.request_approval_abort_gate(
             request_id,
             child_instance_id=child_instance_id,
             reason=reason,
@@ -1028,7 +1055,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         settlement = self._request_serve_abort(request_id)
         if settlement is None:
             return self.abort_or_winner(request_id, capability=capability)
-        resolution = await settlement
+        resolution = await asyncio.shield(settlement)
         return _resolved_decision(
             resolution["decision"] if resolution is not None else None
         )
@@ -1152,3 +1179,42 @@ class ApprovalGate:
         if signal.is_set() and execution_signal is signal:
             return canceled_result(tool_call.id), execution_signal
         return None, execution_signal
+
+
+def permission_snapshot(policy: ApprovalPolicy) -> PermissionSnapshot:
+    """Return a canonical projection of the active approval policy."""
+
+    return PermissionSnapshot(
+        default=policy.default,
+        precedence=PRECEDENCE,
+        deny=tuple(sorted(map(str, policy.always_deny))),
+        ask=tuple(sorted(map(str, policy.always_ask))),
+        allow=tuple(sorted(map(str, policy.always_allow))),
+        session_grants=tuple(sorted(map(str, policy.session_allow))),
+    )
+
+
+def revoke_session_grants(
+    policy: ApprovalPolicy, *, exact: str | None = None, clear: bool = False
+) -> SessionGrantChange:
+    """Remove only existing session grants; never parse input into authority."""
+
+    if (exact is None and not clear) or (exact is not None and clear):
+        raise ValueError("choose exactly one session grant operation")
+    if clear:
+        removed = tuple(sorted(map(str, policy.clear_session_allow())))
+        return SessionGrantChange("clear", removed, permission_snapshot(policy))
+    rule = next((rule for rule in policy.session_allow if str(rule) == exact), None)
+    if rule is None:
+        assert exact is not None
+        raise SessionGrantNotFound(exact)
+    policy.revoke_session_allow(rule)
+    return SessionGrantChange("revoke", (str(rule),), permission_snapshot(policy))
+
+
+def session_grant_change(
+    policy: ApprovalPolicy,
+    change: Literal["grant", "reset"],
+    changed: tuple[str, ...] = (),
+) -> SessionGrantChange:
+    return SessionGrantChange(change, changed, permission_snapshot(policy))

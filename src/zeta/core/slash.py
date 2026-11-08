@@ -1,8 +1,7 @@
 """Small input-time slash-command dispatcher."""
+
 from __future__ import annotations
 
-import asyncio
-import inspect
 import os
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -10,13 +9,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
-from ..mcp.client import MCPPrompt
-from ..mcp.prompt_commands import (
-    MCPPromptCommands,
-    SlashPromptError,
-    dispatch_prompt,
-)
-from ..model_input import ModelInputEnvelope, skill_model_input
+from ..mcp.prompt_commands import SlashPromptError  # noqa: F401 - public export
+from ..model_input import ModelInputEnvelope
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -27,19 +21,18 @@ from ..protocol.types import (
 from ..runtime.project_registry_state import ProjectRegistryState
 from ..skills import (
     SkillCatalog,
-    SkillMeta,
-    is_slash_safe_name,
-    load_skill_prompt,
 )
-from ..skills.invocation import dollar_skill_mentions
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
-    InlineShellRunner,
     load_custom_commands,
-    needs_inline_shell_resolution,
-    render_custom_input,
-    resolve_custom_input,
+)
+from .commands.slash_registry import (
+    ServeSlash,
+    SlashCommand,
+    SlashCommandRegistry,
+    SlashResult,
+    SlashSurface,
 )
 from .project_context import (
     discover_project_root,
@@ -50,13 +43,17 @@ from .store import ConversationEntry
 
 class UsageCounterSource(Protocol):
     """Cumulative usage counters exposed by the context assembler."""
+
     uncached_input_tokens_this_session: int
     output_tokens_this_session: int
     cache_read_input_tokens_this_session: int
     cache_creation_input_tokens_this_session: int
+
+
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
     """One completed turn's token usage."""
+
     turn: int
     input_tokens: int = 0
     output_tokens: int = 0
@@ -64,6 +61,7 @@ class UsageSnapshot:
     cache_creation_input_tokens: int = 0
     model: str | None = None
     estimated_cost_usd: float | None = None
+
     @property
     def cache_total(self) -> int:
         return (
@@ -71,13 +69,17 @@ class UsageSnapshot:
             + self.cache_read_input_tokens
             + self.cache_creation_input_tokens
         )
+
     @property
     def cache_hit_rate(self) -> float | None:
         if self.cache_total == 0:
             return None
         return self.cache_read_input_tokens / self.cache_total * 100
+
+
 class UsageTracker:
     """Keep bounded usage deltas at real turn boundaries."""
+
     def __init__(self, source: UsageCounterSource, provider: str | None = None) -> None:
         self.source = source
         self.provider = provider
@@ -86,12 +88,15 @@ class UsageTracker:
         self._history: deque[UsageSnapshot] = deque(maxlen=8)
         self._cost_by_model: dict[str, UsageSnapshot] = {}
         self._completed_turns = 0
+
     @property
     def history(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._history)
+
     @property
     def cost_by_model(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._cost_by_model.values())
+
     def record(self, event_type: StreamEventType, model: str) -> None:
         current = self._counters()
         self._record_cost_delta(current, model)
@@ -99,14 +104,18 @@ class UsageTracker:
             self._baseline = current
         elif event_type is StreamEventType.TURN_END:
             self._completed_turns += 1
-            snapshot = usage_delta(current, self._baseline, self._completed_turns, model)
+            snapshot = usage_delta(
+                current, self._baseline, self._completed_turns, model
+            )
             self._history.append(snapshot)
             self._baseline = current
+
     def record_compaction(self, model: str) -> None:
         """Record direct compaction usage without adding a trend snapshot."""
         current = self._counters()
         self._record_cost_delta(current, model)
         self._baseline = current
+
     def _record_cost_delta(self, current: Mapping[str, int], model: str) -> None:
         snapshot = usage_delta(current, self._cost_baseline, 0, model)
         self._cost_baseline = dict(current)
@@ -117,7 +126,6 @@ class UsageTracker:
                     estimated_cost_usd=_snapshot_cost(self.provider, snapshot),
                 )
             self._accumulate_cost(snapshot)
-
     def _accumulate_cost(self, snapshot: UsageSnapshot) -> None:
         if snapshot.model is None:
             return
@@ -144,7 +152,6 @@ class UsageTracker:
                 else None
             ),
         )
-
     def _counters(self) -> dict[str, int]:
         return {
             "input_tokens": self.source.uncached_input_tokens_this_session,
@@ -161,7 +168,6 @@ class CompactionSummary:
     turn: int
     entries_folded: int
     tokens_saved: int
-
 
 @dataclass(frozen=True, slots=True)
 class ModelPricing:
@@ -344,9 +350,7 @@ def compaction_summary(
         entries_folded=entries_folded,
         tokens_saved=max(
             0,
-            source_tokens
-            - token_counter(marker_message)
-            - token_counter(summary),
+            source_tokens - token_counter(marker_message) - token_counter(summary),
         ),
     )
 
@@ -444,7 +448,14 @@ def usage_delta(
 
 LONG_CONTEXT_INPUT_THRESHOLD = 272_000
 LONG_CONTEXT_MODELS = frozenset(
-    {"codex-auto-review", "gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}
+    {
+        "codex-auto-review",
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+    }
 )
 
 
@@ -529,18 +540,41 @@ class SlashStatus:
     mcp_summary: str = "mcp: 0 mounted, 0 failed"
     automatic_memory_failure: str | None = None
     transcript_index_failure: str | None = None
+    project_context_health: str | None = None
     explicit_finish: bool = False
+    connection_setup_counts: tuple[dict[str, object], ...] = ()
     max_agent_depth: int = 3
+    unavailable_accounts: tuple[str, ...] = ()
 
 
 class SlashSession(Protocol):
-    def slash_status(self) -> SlashStatus: ...
+    plan_mode: bool
+    active: bool
+    pending_approvals: object
+
+    def set_plan_mode(self, enabled: bool) -> Awaitable[None] | None: ...
+
+    def invalidate_prompt(self) -> None: ...
+
+    def plan_mode_background_blocker(self) -> str | None: ...
+
+    def slash_status_command(self, args: str) -> str: ...
 
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope: ...
 
-    async def slash_mcp_prompt(
-        self, name: str, arguments: dict[str, str]
-    ) -> str: ...
+    async def slash_approve(self, args: str) -> str: ...
+
+    async def slash_always(self, args: str) -> str: ...
+
+    async def slash_deny(self, args: str) -> str: ...
+
+    async def slash_accounts(self, args: str) -> str: ...
+
+    def slash_restart(self, args: str) -> str: ...
+
+    def slash_permissions(self, args: str) -> str: ...
+
+    async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str: ...
 
     def slash_model(self, args: str) -> str: ...
 
@@ -580,296 +614,15 @@ class SlashSession(Protocol):
 
     def slash_project(self, args: str) -> str: ...
 
-    def slash_memory(self, args: str) -> str: ...
+    def slash_memory(self, args: str) -> str | Awaitable[str]: ...
+
+    def slash_repair_transcript(self, args: str) -> str | Awaitable[str]: ...
 
     def slash_inbox(self, args: str) -> str: ...
 
     def slash_theme(self, args: str) -> str: ...
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
-
-
-SlashResult = (
-    str
-    | ModelInputEnvelope
-    | SlashPromptError
-    | Awaitable[str | ModelInputEnvelope | SlashPromptError]
-)
-SlashHandler = Callable[[SlashSession, str], SlashResult]
-
-
-@dataclass(frozen=True, slots=True)
-class SlashCommand:
-    """One named command in the input-time registry."""
-
-    name: str
-    handler: SlashHandler
-    description: str = ""
-
-    def run(self, session: SlashSession, args: str) -> SlashResult:
-        return self.handler(session, args)
-
-
-class SlashCommandRegistry:
-    """Map registered command names to their handlers."""
-
-    def __init__(self) -> None:
-        self._commands: dict[str, SlashCommand] = {}
-        self._custom_commands: dict[str, CustomCommand] = {}
-        self._skills: dict[str, SkillMeta] = {}
-        self._notices: list[str] = []
-        self._warning_notices: set[str] = set()
-        self._mcp_prompts = MCPPromptCommands(
-            self._notices, self._warning_notices
-        )
-
-    def register(self, command: SlashCommand) -> None:
-        if not is_slash_safe_name(command.name):
-            raise ValueError("slash command name must be one nonempty word")
-        if command.name in self._commands:
-            raise ValueError(f"slash command already registered: {command.name}")
-        self._commands[command.name] = command
-
-    @property
-    def custom_commands(self) -> tuple[CustomCommand, ...]:
-        """Return loaded custom commands in stable name order."""
-
-        return tuple(self._custom_commands[name] for name in sorted(self._custom_commands))
-
-    @property
-    def builtin_commands(self) -> tuple[SlashCommand, ...]:
-        """Return built-in commands in registration order."""
-
-        return tuple(self._commands.values())
-
-    @property
-    def skill_entries(self) -> tuple[SkillMeta, ...]:
-        """Return registered skills in stable insertion order."""
-
-        return tuple(self._skills.values())
-
-    @property
-    def mcp_prompt_entries(self) -> tuple[tuple[str, str, str], ...]:
-        """Return live MCP prompt commands as ``(name, description, server)``."""
-
-        return self._mcp_prompts.completion_entries()
-
-    @property
-    def notices(self) -> tuple[str, ...]:
-        """Return non-fatal load notices for the session-start display."""
-
-        return tuple(self._notices)
-
-    @property
-    def warning_notices(self) -> frozenset[str]:
-        """Return notices that need prominent display."""
-
-        return frozenset(self._warning_notices)
-
-    @property
-    def completion_entries(self) -> tuple[tuple[str, str, str], ...]:
-        """Return command names, descriptions, and custom source badges."""
-
-        builtins = tuple(
-            (command.name, command.description, "")
-            for command in self._commands.values()
-        )
-        custom = tuple(
-            (command.name, command.description, command.source)
-            for command in self.custom_commands
-        )
-        skills = tuple(
-            (skill.name, skill.description, skill.source)
-            for skill in self._skills.values()
-        )
-        prompts = self._mcp_prompts.completion_entries()
-        return builtins + custom + skills + prompts
-
-    def set_mcp_prompts(
-        self, entries: Sequence[tuple[str, str, MCPPrompt]]
-    ) -> None:
-        """Replace live MCP prompt commands from one mount snapshot."""
-        self._mcp_prompts.replace(tuple(entries))
-
-    def register_custom(self, command: CustomCommand) -> None:
-        """Register a custom command unless a built-in owns its name."""
-
-        if command.name in self._commands:
-            notice = (
-                f"ignored custom command {command.path}: "
-                f"shadows built-in /{command.name}"
-            )
-            self._notices.append(notice)
-            self._warning_notices.add(notice)
-            return
-        if ":" in command.name:
-            notice = (
-                f"ignored custom command {command.path}: "
-                "colon names are reserved for MCP prompts"
-            )
-            self._notices.append(notice)
-            self._warning_notices.add(notice)
-            return
-        if command.name in self._custom_commands and command.source == "home":
-            return
-        self._custom_commands[command.name] = command
-
-    def register_skills(self, catalog: SkillCatalog) -> None:
-        """Replace skills after built-ins and custom commands."""
-
-        self._skills.clear()
-        self._notices.extend(
-            notice for notice in catalog.notices if notice not in self._notices
-        )
-        self._warning_notices.update(catalog.notices)
-        for skill in catalog.skills:
-            if skill.name in self._commands:
-                notice = f"ignored skill {skill.path}: shadows built-in /{skill.name}"
-            elif skill.name in self._custom_commands:
-                notice = (
-                    f"ignored skill {skill.path}: shadows custom command /{skill.name}"
-                )
-            else:
-                self._skills[skill.name] = skill
-                continue
-            self._notices.append(notice)
-            self._warning_notices.add(notice)
-
-    def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
-        """Run a known command or expand registered dollar-skill mentions."""
-
-        first_line = value.split("\n", 1)[0]
-        if not first_line.startswith("/") or first_line.startswith("//"):
-            mentions = dollar_skill_mentions(value, self._skills)
-            if not mentions:
-                return None
-            prompts = [load_skill_prompt(self._skills[item.name]) for item in mentions]
-            if mentions[0].start == 0 and len(mentions) == 1:
-                request = value[mentions[0].end :]
-                return skill_model_input(prompts[0], request, value)
-            request = f"User request:\n{value}"
-            return ModelInputEnvelope(
-                "\n\n".join((*prompts, request)),
-                display_text=value,
-                origin=MessageOrigin.SKILL_EXPANSION,
-            )
-        parts = first_line[1:].split(maxsplit=1)
-        if not parts:
-            return None
-        name = parts[0]
-        if not is_slash_safe_name(name):
-            return None
-        command = self._commands.get(name)
-        if command is not None:
-            result = command.run(session, parts[1] if len(parts) == 2 else "")
-            if isinstance(result, ModelInputEnvelope):
-                return replace(result, display_text=value)
-            return result
-        custom = self._custom_commands.get(name)
-        skill = self._skills.get(name)
-        if skill is not None:
-            request = value[1 + len(name) :]
-            return skill_model_input(load_skill_prompt(skill), request, value)
-        prompt = self._mcp_prompts.get(name)
-        if prompt is not None:
-            return dispatch_prompt(
-                session,
-                name,
-                prompt[1],
-                parts[1] if len(parts) == 2 else "",
-                display_text=value,
-            )
-        if custom is None or custom.kind != "exec":
-            return None
-        return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
-
-    def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
-        """Run a known command, returning an awaitable for async commands."""
-
-        result = self._dispatch(session, value)
-        if result is not None and inspect.isawaitable(result):
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                return asyncio.run(result)
-        return result
-
-    async def dispatch_async(
-        self, session: SlashSession, value: str
-    ) -> str | ModelInputEnvelope | SlashPromptError | None:
-        """Run a known command, awaiting it when the command is asynchronous."""
-
-        result = self._dispatch(session, value)
-        if result is None:
-            return None
-        if isinstance(result, (str, ModelInputEnvelope, SlashPromptError)):
-            return result
-        resolved = await result
-        if isinstance(resolved, ModelInputEnvelope):
-            return replace(resolved, display_text=value)
-        return resolved
-
-    def input_for_model(self, value: str) -> ModelInputEnvelope:
-        """Expand a custom command or turn an escape into a literal slash."""
-        return render_custom_input(value, self._custom_commands)
-
-    async def resolve_for_model(
-        self,
-        value: str,
-        inline_shell: InlineShellRunner,
-    ) -> ModelInputEnvelope | None:
-        """Expand a prompt macro and resolve its inline shell spans."""
-
-        return await resolve_custom_input(value, self._custom_commands, inline_shell)
-
-    def needs_inline_shell_resolution(self, value: str) -> bool:
-        """Return whether model resolution can wait for shell approval."""
-
-        return needs_inline_shell_resolution(value, self._custom_commands)
-
-    def custom_command_for(self, name: str) -> CustomCommand | None:
-        """Return the loaded custom command named ``name``, or None."""
-
-        return self._custom_commands.get(name)
-
-    def exec_command_for(self, value: str) -> CustomCommand | None:
-        """Return the custom execution command named by one input value."""
-
-        first_line = value.split("\n", 1)[0]
-        if not first_line.startswith("/") or first_line.startswith("//"):
-            return None
-        parts = first_line[1:].split(maxsplit=1)
-        if not parts:
-            return None
-        name = parts[0]
-        if not is_slash_safe_name(name):
-            return None
-        command = self._custom_commands.get(name)
-        return command if command is not None and command.kind == "exec" else None
-
-    def help_text(self) -> str:
-        """Format the built-in and loaded custom commands for /help."""
-
-        lines = ["built-in commands:"]
-        for command in self._commands.values():
-            description = f" — {command.description}" if command.description else ""
-            lines.append(f"  /{command.name}{description}")
-        lines.append("custom commands:")
-        if not self._custom_commands:
-            lines.append("  none")
-        for command in self.custom_commands:
-            description = f" — {command.description}" if command.description else ""
-            kind = " [exec]" if command.kind == "exec" else ""
-            lines.append(
-                f"  /{command.name}{kind}{description} (source: {command.path})"
-            )
-        lines.append("skills (use /name or $name; $name also works inline):")
-        if not self._skills:
-            lines.append("  none")
-        for skill in self._skills.values():
-            description = f" — {skill.description}" if skill.description else ""
-            lines.append(f"  /{skill.name}{description} (source: {skill.path})")
-        return "\n".join(lines)
 
 
 def _format_status(status: SlashStatus) -> str:
@@ -892,9 +645,7 @@ def _format_status(status: SlashStatus) -> str:
     )
     child_tokens = child_total + status.child_output_tokens_this_session
     cache_hit_rate = (
-        "n/a"
-        if cache_total == 0
-        else f"{cache_read / cache_total * 100:.1f}%"
+        "n/a" if cache_total == 0 else f"{cache_read / cache_total * 100:.1f}%"
     )
     child_hit_rate = (
         "n/a"
@@ -903,25 +654,37 @@ def _format_status(status: SlashStatus) -> str:
     )
     cost_text = _format_estimated_cost(status)
     trend = status.usage_history[-8:]
-    trend_text = " ".join(
-        f"{snapshot.turn}:{snapshot.cache_hit_rate:.0f}%"
-        if snapshot.cache_hit_rate is not None
-        else f"{snapshot.turn}:n/a"
-        for snapshot in trend
-    ) or "none"
+    trend_text = (
+        " ".join(
+            f"{snapshot.turn}:{snapshot.cache_hit_rate:.0f}%"
+            if snapshot.cache_hit_rate is not None
+            else f"{snapshot.turn}:n/a"
+            for snapshot in trend
+        )
+        or "none"
+    )
     context_gauge = render_context_gauge(
         status.tokens_in_current_context,
         status.model_window,
     )
     window_text = (
         f"{status.tokens_in_current_context} / {status.model_window}"
-        if status.tokens_in_current_context is not None and status.model_window is not None
+        if status.tokens_in_current_context is not None
+        and status.model_window is not None
         else "unknown"
     )
     lines = [
         f"session_id: {status.session_id}",
         f"provider: {status.provider}",
         f"model: {status.model}",
+        "completion_client_setups: "
+        + (
+            ", ".join(
+                f"{item['provider']}/{item['model']}={item['count']}"
+                for item in status.connection_setup_counts
+            )
+            or "none"
+        ),
         f"vim_mode: {'on' if status.vim_mode else 'off'}",
         f"plan_mode: {'on' if status.plan_mode else 'off'}",
         f"explicit_finish: {'on' if status.explicit_finish else 'off'}",
@@ -931,6 +694,7 @@ def _format_status(status: SlashStatus) -> str:
         f"tokens_in_current_context: {context_tokens}",
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
+        "unavailable_accounts: " + (", ".join(status.unavailable_accounts) or "none"),
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
         status.mcp_summary,
         "usage:",
@@ -954,7 +718,6 @@ def _format_status(status: SlashStatus) -> str:
         "context:",
         f"  window: {window_text}",
         f"  fill: {context_gauge}",
-        "transcript_navigation: ctrl+f find, ctrl+up/down users, pageup/pagedown scroll",
         "compaction_history:",
     ]
     lines.extend(
@@ -968,10 +731,9 @@ def _format_status(status: SlashStatus) -> str:
         [
             "context_files: " + (", ".join(status.context_files) or "none"),
             "hooks: " + (", ".join(status.hooks) or "none"),
-            "automatic_memory_failure: "
-            + (status.automatic_memory_failure or "none"),
-            "transcript_index_failure: "
-            + (status.transcript_index_failure or "none"),
+            "automatic_memory_failure: " + (status.automatic_memory_failure or "none"),
+            "transcript_index_failure: " + (status.transcript_index_failure or "none"),
+            f"project_context_health: {status.project_context_health or 'healthy'}",
         ]
     )
     if status.todo_counts is not None:
@@ -993,7 +755,8 @@ def _format_estimated_cost(status: SlashStatus) -> str:
             return f"unavailable (unknown model: {status.model})"
         return "unavailable (model attribution unavailable)"
     if status.usage_cost_by_model and all(
-        snapshot.estimated_cost_usd is not None for snapshot in status.usage_cost_by_model
+        snapshot.estimated_cost_usd is not None
+        for snapshot in status.usage_cost_by_model
     ):
         total = sum(
             snapshot.estimated_cost_usd or 0.0
@@ -1014,8 +777,7 @@ def _format_estimated_cost(status: SlashStatus) -> str:
 
 
 def _run_status(session: SlashSession, args: str) -> str:
-    del args
-    return _format_status(session.slash_status())
+    return session.slash_status_command(args)
 
 
 async def _run_mcp(session: SlashSession, args: str) -> str | ModelInputEnvelope:
@@ -1045,9 +807,7 @@ def _run_init(
         return "init unchanged: /init does not accept arguments"
     if project_root is None:
         return "init error: not inside a project"
-    return ModelInputEnvelope(
-        INIT_PROMPT, "/init", MessageOrigin.SLASH_EXPANSION
-    )
+    return ModelInputEnvelope(INIT_PROMPT, "/init", MessageOrigin.SLASH_EXPANSION)
 
 
 async def _run_compact(session: SlashSession, args: str) -> str:
@@ -1111,8 +871,12 @@ def _run_project(session: SlashSession, args: str) -> str:
     return session.slash_project(args)
 
 
-def _run_memory(session: SlashSession, args: str) -> str:
+def _run_memory(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_memory(args)
+
+
+def _run_repair_transcript(session: SlashSession, args: str) -> str | Awaitable[str]:
+    return session.slash_repair_transcript(args)
 
 
 def _run_inbox(session: SlashSession, args: str) -> str:
@@ -1132,6 +896,80 @@ enter submit · ctrl+j insert newline
 esc cancel popup · tab toggle finder preview"""
 
 
+def _run_approve(session: SlashSession, args: str) -> SlashResult:
+    return session.slash_approve(args)
+
+
+def _run_always(session: SlashSession, args: str) -> SlashResult:
+    return session.slash_always(args)
+
+
+def _run_deny(session: SlashSession, args: str) -> SlashResult:
+    return session.slash_deny(args)
+
+
+def _run_accounts(session: SlashSession, args: str) -> SlashResult:
+    return session.slash_accounts(args)
+
+
+def _run_restart(session: SlashSession, args: str) -> str:
+    return session.slash_restart(args)
+
+
+def _run_permissions(session: SlashSession, args: str) -> str:
+    return session.slash_permissions(args)
+
+
+def _has_args(args: str) -> bool:
+    return bool(args.strip())
+
+
+def _no_args(args: str) -> bool:
+    return not args.strip()
+
+
+def _never_mutates(_args: str) -> bool:
+    return False
+
+
+def _memory_mutates(args: str) -> bool:
+    action = args.strip()
+    return action == "undo" or action.startswith(
+        ("retry ", "undo ", "accept ", "resolve ")
+    )
+
+
+def _memory_read_only(args: str) -> bool:
+    action = args.strip()
+    return action in {"", "retry", "log"} or action.startswith("log ")
+
+
+def _vim_mutates(args: str) -> bool:
+    return args.strip().lower() in {"on", "off", "toggle"}
+
+
+def _project_mutates(args: str) -> bool:
+    return args.strip() == "init"
+
+
+def _mcp_mutates(args: str) -> bool:
+    return args.strip().partition(" ")[0] in {
+        "add",
+        "remove",
+        "enable",
+        "disable",
+        "trust",
+        "untrust",
+        "auth",
+        "logout",
+        "reconnect",
+    }
+
+
+def _decisions_mutates(args: str) -> bool:
+    return args.strip().partition(" ")[0] in {"dismiss", "reply"}
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -1139,49 +977,105 @@ def create_slash_registry(
     project_eligible: bool | None = None,
     skill_catalog: SkillCatalog,
     project_registry_state: ProjectRegistryState | None = None,
-    extra_commands: Sequence[SlashCommand] = (),
+    surface: SlashSurface = SlashSurface.TUI,
 ) -> SlashCommandRegistry:
-    """Register built-ins and frontend commands before custom commands and skills."""
+    """Register shared builtins before custom commands and skills."""
 
     effective_home = zeta_home or os.environ.get("ZETA_HOME")
-    registry = SlashCommandRegistry()
+    registry = SlashCommandRegistry(surface)
     private_project_root = (
         Path(project_dir).expanduser().resolve()
         if project_dir is not None
         else discover_project_root(Path.cwd())
     )
     project_root = None if project_eligible is False else private_project_root
-    registry.register(SlashCommand("status", _run_status, "show session status"))
+    registry.register(
+        SlashCommand(
+            "status",
+            _run_status,
+            "show session status",
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+        )
+    )
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
-    registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(
-        SlashCommand("model", _run_model, "pick a model or switch to one: /model [name]")
+        SlashCommand(
+            "mcp",
+            _run_mcp,
+            "show MCP server status",
+            ServeSlash(
+                mutates=_mcp_mutates,
+                runs_while_busy=_never_mutates,
+            ),
+        )
     )
-    registry.register(SlashCommand("vim", _run_vim, "show or change vim mode"))
     registry.register(
-        SlashCommand("plan", _run_plan, "show or change plan mode")
+        SlashCommand(
+            "model",
+            _run_model,
+            "pick a model or switch to one: /model [name]",
+            ServeSlash(
+                mutates=_has_args,
+                runs_while_busy=_no_args,
+            ),
+        )
     )
     registry.register(
-        SlashCommand("implement", _run_implement, "implement the proposed plan")
+        SlashCommand(
+            "vim",
+            _run_vim,
+            "show or change vim mode",
+            ServeSlash(
+                mutates=_vim_mutates,
+                runs_while_busy=_no_args,
+            ),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "plan",
+            _run_plan,
+            "show or change plan mode",
+            ServeSlash(),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "implement", _run_implement, "implement the proposed plan", ServeSlash()
+        )
     )
     instruction_handler = lambda session, args: project_instructions_command(
-        session, args, private_project_root,
+        session,
+        args,
+        private_project_root,
         Path(effective_home).expanduser().resolve() if effective_home else None,
         project_registry_state,
     )
-    registry.register(SlashCommand(
-        "project-instructions", instruction_handler,
-        "open or create private project instructions in your editor",
-    ))
+    registry.register(
+        SlashCommand(
+            "project-instructions",
+            instruction_handler,
+            "open or create private project instructions in your editor",
+            ServeSlash(),
+        )
+    )
     registry.register(
         SlashCommand(
             "init",
             lambda session, args: _run_init(session, args, project_root),
             "generate or improve project instructions",
+            ServeSlash(),
         )
     )
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
-    registry.register(SlashCommand("compact", _run_compact, "compact the context"))
+    registry.register(
+        SlashCommand(
+            "compact",
+            _run_compact,
+            "compact the context",
+            ServeSlash(mutates=lambda _args: True),
+        )
+    )
     registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
     registry.register(
         SlashCommand(
@@ -1190,9 +1084,7 @@ def create_slash_registry(
             "fork from a prior user message or checkpoint",
         )
     )
-    registry.register(
-        SlashCommand("tree", _run_tree, "list branches or switch to one")
-    )
+    registry.register(SlashCommand("tree", _run_tree, "list branches or switch to one"))
     registry.register(
         SlashCommand("tools", _run_tools, "list tools or trust project tools")
     )
@@ -1209,30 +1101,100 @@ def create_slash_registry(
         SlashCommand("name", _run_name, "name the current session for the picker")
     )
     registry.register(
-        SlashCommand("project", _run_project, "show or initialize the current project")
+        SlashCommand(
+            "project",
+            _run_project,
+            "show or initialize the current project",
+            ServeSlash(
+                mutates=_project_mutates,
+                runs_while_busy=_no_args,
+            ),
+        )
     )
-    registry.register(SlashCommand("inbox", _run_inbox, "list this project's inbox"))
     registry.register(
-        SlashCommand("memory", _run_memory, "show, retry, or undo automatic memory updates")
+        SlashCommand(
+            "inbox",
+            _run_inbox,
+            "list this project's inbox",
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "memory",
+            _run_memory,
+            "show, retry, or undo automatic memory updates",
+            ServeSlash(mutates=_memory_mutates, runs_while_busy=_memory_read_only),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "repair-transcript",
+            _run_repair_transcript,
+            "repair one corrupt transcript: /repair-transcript <session> confirm",
+            ServeSlash(mutates=lambda _args: True),
+        )
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")
     )
     registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
+    registry.register(SlashCommand("tasks", _run_tasks, "inspect background processes"))
     registry.register(
-        SlashCommand("tasks", _run_tasks, "inspect background processes")
+        SlashCommand(
+            "decisions",
+            _run_decisions,
+            "read, reply to, or dismiss attention items",
+            ServeSlash(mutates=_decisions_mutates),
+        )
     )
     registry.register(
-        SlashCommand("decisions", _run_decisions, "answer or discuss open decisions")
+        SlashCommand(
+            "send", _run_send, "send a follow-up to a run: /send <id> <message>"
+        )
     )
     registry.register(
-        SlashCommand("send", _run_send, "send a follow-up to a run: /send <id> <message>")
+        SlashCommand(
+            "help",
+            lambda _session, _args: registry.help_text(),
+            "list commands",
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+        )
+    )
+    registry.register(SlashCommand("approve", _run_approve, "/approve [key]"))
+    registry.register(
+        SlashCommand(
+            "always",
+            _run_always,
+            "/always [key] — allow this tool/action for the running session",
+        )
+    )
+    registry.register(SlashCommand("deny", _run_deny, "/deny [key]"))
+    registry.register(
+        SlashCommand(
+            "accounts",
+            _run_accounts,
+            "list, switch, or label accounts",
+            ServeSlash(
+                mutates=_has_args,
+                runs_while_busy=_no_args,
+            ),
+        )
     )
     registry.register(
-        SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
+        SlashCommand(
+            "restart",
+            _run_restart,
+            "restart this session from the local checkout (reinstall after pyproject changes)",
+        )
     )
-    for command in extra_commands:
-        registry.register(command)
+    registry.register(
+        SlashCommand(
+            "permissions",
+            _run_permissions,
+            "show rules; revoke a session grant: /permissions revoke <grant>; clear all: /permissions clear",
+        )
+    )
     result = load_custom_commands(
         home=effective_home,
         project_dir=project_dir or Path.cwd(),

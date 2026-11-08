@@ -9,13 +9,13 @@ from typing import Any
 
 import pytest
 from prompt_toolkit.document import Document
-from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
-from zeta.core.loop import AgentLoop
+from tests.support.submissions import await_submission_pipeline
 from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools._shared.process import BackgroundTaskInfo, BackgroundTaskRegistry
 from zeta.tui import theme
@@ -75,102 +75,54 @@ def _styles(panel: BackgroundTasksPanel) -> list[tuple[str, str]]:
 # -- pure view model --------------------------------------------------------
 
 
-def _base_decisions_wrap(text: str, width: int) -> list[str]:
-    """Reference oracle copied from decisions.py at base 6a4b690d."""
-
-    width = max(1, width)
-    lines: list[str] = []
-    for paragraph in text.splitlines() or [""]:
-        current = ""
-        for word in paragraph.split() or [""]:
-            piece = word if not current else f"{current} {word}"
-            if sum(max(0, get_cwidth(ch)) for ch in piece) <= width:
-                current = piece
-            else:
-                if current:
-                    lines.append(current)
-                while sum(max(0, get_cwidth(ch)) for ch in word) > width:
-                    split = 0
-                    cells = 0
-                    for index, character in enumerate(word):
-                        step = max(0, get_cwidth(character))
-                        if cells + step > width:
-                            break
-                        cells += step
-                        split = index + 1
-                    if split == 0:
-                        split = 1
-                    lines.append(word[:split])
-                    word = word[split:]
-                current = word
-        lines.append(current)
-    return lines or [""]
+@pytest.mark.parametrize(
+    ("text", "width", "expected"),
+    [
+        pytest.param("", 0, [""], id="empty-nonpositive-width"),
+        pytest.param("abc", 0, ["a", "b", "c"], id="nonpositive-width"),
+        pytest.param("a  b", 4, ["a b"], id="repeated-spaces"),
+        pytest.param("a\n\n", 4, ["a", ""], id="trailing-newlines"),
+        pytest.param("ab", 2, ["ab"], id="exact-width"),
+        pytest.param("abcdefgh", 3, ["abc", "def", "gh"], id="long-token"),
+        pytest.param("ab界cd", 4, ["ab界", "cd"], id="wide-cjk-boundary"),
+        pytest.param("你", 1, ["你", ""], id="cjk-wider-than-width"),
+        pytest.param("ab🙂cd", 4, ["ab🙂", "cd"], id="emoji-boundary"),
+        pytest.param("alpha   ", 5, ["alpha"], id="trailing-spaces"),
+        pytest.param("a/b", 1, ["a", "/", "b"], id="width-one"),
+        pytest.param("a/\u0301b", 2, ["a/\u0301", "b"], id="combining-after-separator"),
+        pytest.param(
+            "/alpha-beta_gamma.delta",
+            8,
+            ["/alpha-", "beta_", "gamma.", "delta"],
+            id="path-separators",
+        ),
+    ],
+)
+def test_wrap_by_cells_prefers_boundaries_without_splitting_cells(
+    text: str, width: int, expected: list[str]
+) -> None:
+    assert wrap_by_cells(text, width) == expected
 
 
-def _base_tasks_split_cells(text: str, width: int) -> tuple[str, str]:
-    cells = 0
-    for index, ch in enumerate(text):
-        step = max(0, get_cwidth(ch))
-        if cells + step > width:
-            return text[:index], text[index:]
-        cells += step
-    return text, ""
-
-
-def _base_tasks_wrap(text: str, width: int) -> list[str]:
-    """Reference oracle copied from tasks_panel.py at base 6a4b690d."""
-
-    width = max(1, width)
-    lines: list[str] = []
-    for paragraph in text.split("\n"):
-        current = ""
-        cells = 0
-        for word in paragraph.split(" "):
-            piece = word if not current else " " + word
-            piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
-            if current and cells + piece_cells > width:
-                lines.append(current)
-                current, cells = "", 0
-                piece = word
-                piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
-            while piece_cells > width:
-                head, piece = _base_tasks_split_cells(piece, width)
-                lines.append((current + head) if current else head)
-                current, cells = "", 0
-                piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
-            current += piece
-            cells += piece_cells
-        lines.append(current)
-    return lines or [""]
-
-
-_WRAP_CASES = [
-    pytest.param("a  b", 4, id="repeated-spaces"),
-    pytest.param("a ", 4, id="trailing-space"),
-    pytest.param("a\n", 4, id="one-trailing-newline"),
-    pytest.param("a\n\n", 4, id="two-trailing-newlines"),
-    pytest.param("", 1, id="empty"),
-    pytest.param("abc", 1, id="width-one"),
-    pytest.param("abc", 2, id="width-two"),
-    pytest.param("ab", 2, id="exact-width"),
-    pytest.param("你a好", 3, id="mixed-cjk-ascii"),
-    pytest.param("你", 1, id="cjk-wider-than-width"),
-    pytest.param("abcdefgh", 3, id="long-ascii-token"),
-]
-
-
-@pytest.mark.parametrize(("text", "width"), _WRAP_CASES)
-def test_wrap_by_cells_matches_base_decisions(text: str, width: int) -> None:
-    assert wrap_by_cells(text, width) == _base_decisions_wrap(text, width)
-
-
-@pytest.mark.parametrize(("text", "_width"), _WRAP_CASES)
-def test_normalized_tasks_wrap_matches_base(text: str, _width: int) -> None:
-    normalized = " ".join(text.split())
-    detail_width = 66
-    assert wrap_by_cells(normalized, detail_width) == _base_tasks_wrap(
-        normalized, detail_width
-    )
+def test_tasks_panel_normalizes_whitespace_only_command() -> None:
+    panel = BackgroundTasksPanel()
+    panel.set_tasks([_info("task-empty", command="   ")], now=1.0)
+    assert panel.open_details() is not None
+    assert _text(panel) == [
+        "Shell details",
+        "\x00overlay-rule\x00",
+        "Status  running",
+        "Runtime 1s",
+        "PID     100",
+        "",
+        "Command",
+        "  ",
+        "",
+        "Output  showing 0 of 0 lines",
+        "  (no output yet)",
+        "",
+        "↑/↓ scroll · esc back",
+    ]
 
 
 def test_format_runtime_is_compact() -> None:
@@ -377,7 +329,7 @@ async def test_output_tail_reads_only_new_bytes(
         assert tail["output"] == "DELTA\n"
     finally:
         if task_id is not None:
-            await registry.kill(task_id)
+            await registry.kill(task_id, cause="test requested task stop")
         await registry.close()
 
 
@@ -399,8 +351,8 @@ async def test_panel_refresh_owns_output_cursor(
         output_appended.set()
 
     monkeypatch.setattr(registry, "_append", append_output)
-    await registry.input(task_id, "first\n")
-    await output_appended.wait()
+    await asyncio.wait_for(registry.input(task_id, "first\n"), 10)
+    await asyncio.wait_for(output_appended.wait(), 10)
     output_appended.clear()
 
     first_read = asyncio.Event()
@@ -412,11 +364,13 @@ async def test_panel_refresh_owns_output_cursor(
         selected_task_id: str, since: int | None = None, *, max_chars: int | None = None
     ) -> dict[str, object]:
         nonlocal read_count
-        result = await original_output(selected_task_id, since, max_chars=max_chars)
+        result = await asyncio.wait_for(
+            original_output(selected_task_id, since, max_chars=max_chars), 10
+        )
         read_count += 1
         if read_count == 1:
             first_read.set()
-            await release_first_read.wait()
+            await asyncio.wait_for(release_first_read.wait(), 10)
         return result
 
     monkeypatch.setattr(registry, "output", controlled_output)
@@ -426,19 +380,19 @@ async def test_panel_refresh_owns_output_cursor(
 
     refresh = asyncio.create_task(app._tasks_tick())
     try:
-        await first_read.wait()
-        await registry.input(task_id, "second\n")
-        await output_appended.wait()
+        await asyncio.wait_for(first_read.wait(), 10)
+        await asyncio.wait_for(registry.input(task_id, "second\n"), 10)
+        await asyncio.wait_for(output_appended.wait(), 10)
 
         # Paint from the current immutable snapshot while the only output read
         # is paused. Painting must not start another read or move its cursor.
         app._refresh_tasks_panel(keep_offset=True)
         release_first_read.set()
-        await refresh
+        await asyncio.wait_for(refresh, 10)
         settled = asyncio.Event()
         asyncio.get_running_loop().call_soon(settled.set)
-        await settled.wait()
-        await app._tasks_tick()
+        await asyncio.wait_for(settled.wait(), 10)
+        await asyncio.wait_for(app._tasks_tick(), 10)
 
         rendered = "\n".join(_text(app._tasks_panel))
         assert rendered.count("first") == 1
@@ -448,10 +402,14 @@ async def test_panel_refresh_owns_output_cursor(
         release_first_read.set()
         if not refresh.done():
             refresh.cancel()
-            await asyncio.gather(refresh, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), 10
+            )
         app.close_tasks_panel()
         registry.set_notice_sink(None)
-        await registry.kill(task_id)
+        await asyncio.wait_for(
+            registry.kill(task_id, cause="test requested task stop"), 10
+        )
         await registry.close()
 
 
@@ -461,7 +419,7 @@ async def test_snapshot_runtime_and_terminal_phase(tmp_path: Path) -> None:
     running_id, _ = await registry.start("sleep 30", tmp_path)
     exit_id, _ = await registry.start("true", tmp_path)
     try:
-        await registry.wait(exit_id, timeout=10)
+        await asyncio.wait_for(registry.wait(exit_id, timeout=10), 10)
         snap = {task.task_id: task for task in registry.snapshot()}
         assert snap[running_id].running is True
         assert snap[running_id].started_at is not None
@@ -471,7 +429,7 @@ async def test_snapshot_runtime_and_terminal_phase(tmp_path: Path) -> None:
         assert snap[exit_id].ended_at is not None
         assert snap[exit_id].ended_at >= snap[exit_id].started_at
     finally:
-        await registry.kill(running_id)
+        await registry.kill(running_id, cause="test requested task stop")
         await registry.close()
 
 
@@ -536,6 +494,7 @@ async def test_slash_tasks_opens_the_panel(tmp_path: Path) -> None:
     session.default_buffer.set_document(Document("/tasks", 6))
 
     assert app._submit_input("/tasks") is True
+    await await_submission_pipeline(app)
     try:
         assert app.tasks_panel_active
         assert session.default_buffer.text == ""
@@ -572,5 +531,5 @@ async def test_kill_from_panel_kills_selected_and_requires_confirm(tmp_path: Pat
     finally:
         app.close_tasks_panel()
         registry.set_notice_sink(None)
-        await registry.kill(first)
+        await registry.kill(first, cause="test requested task stop")
         await registry.close()

@@ -198,6 +198,8 @@ class CommandRuntimeMixin:
         )
         register_macro_display(call.id, command=target, argv=())
         abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
+        previous_abort_signal = getattr(self, "_standalone_abort_signal", None)
+        self._standalone_abort_signal = abort_signal
         log_path = self.loop.store.session_dir / f"passthrough-{call.id[12:]}.log"
 
         def lifecycle_sink(kind: str) -> None:
@@ -241,6 +243,8 @@ class CommandRuntimeMixin:
             if self._approval_policy is not None:
                 self._approval_policy.forget_ephemeral(call.id)
             forget_macro_display(call.id)
+            if self._standalone_abort_signal is abort_signal:
+                self._standalone_abort_signal = previous_abort_signal
         self._handle_tool_event(
             StreamEvent(
                 StreamEventType.TOOL_EXECUTION_END,
@@ -262,6 +266,7 @@ class CommandRuntimeMixin:
         self._record_macro_receipt(f"ran !{target}, {status}")
         self._loop_state = "idle"
         self._streaming = False
+        self._invalidate_prompt()
 
     def _watch_background_macro(
         self,
@@ -271,6 +276,20 @@ class CommandRuntimeMixin:
         log_path: Path,
     ) -> None:
         instance_id = f"macro:{call.id}"
+        cancellation: asyncio.Task[None] | None = None
+
+        async def cancel() -> None:
+            await self.loop.tool_registry.background_tasks.kill(
+                task_id,
+                cause="background macro canceled by the user",
+                tui_presented=True,
+            )
+
+        def request_cancel() -> asyncio.Task[None]:
+            nonlocal cancellation
+            if cancellation is None:
+                cancellation = asyncio.create_task(cancel())
+            return cancellation
 
         async def watch() -> None:
             try:
@@ -280,6 +299,7 @@ class CommandRuntimeMixin:
                 )
                 phase = metadata[1] if metadata is not None else "natural_exit"
                 exit_code = status_data.get("exit_code")
+                note = status_data.get("note")
                 if phase in {"task_kill", "session_shutdown"}:
                     status = "canceled"
                     text = f"background macro /{command.name} canceled"
@@ -289,6 +309,8 @@ class CommandRuntimeMixin:
                 else:
                     status = "error"
                     text = f"background macro /{command.name} failed with exit {exit_code}"
+                if isinstance(note, str) and note:
+                    text += f": {note}"
                 await self.loop.step_delivery.produce(
                     NotificationInput(
                         "macro_completion",
@@ -300,18 +322,21 @@ class CommandRuntimeMixin:
                             "text": f"{text}; log {log_path}",
                             "background_owner": "background_macro",
                             "background_phase": phase,
+                            **({"note": note} if isinstance(note, str) else {}),
                         },
                     )
                 )
             finally:
-                self.loop._background_owner.unregister(instance_id)
+                try:
+                    if cancellation is not None:
+                        await cancellation
+                finally:
+                    self.loop._background_owner.unregister(instance_id)
 
         watcher = asyncio.create_task(watch())
         self.loop._background_owner.register(
             instance_id,
-            lambda: asyncio.create_task(
-                self.loop.tool_registry.background_tasks.kill(task_id)
-            ),
+            request_cancel,
             watcher,
             description=f"/{command.name}",
         )

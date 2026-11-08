@@ -89,6 +89,7 @@ def _scheduler(
         session_class,  # type: ignore[arg-type]
         on_due=lambda: sink.append(None),
         wall_clock=clock,
+        assert_owned=lambda: None,
         id_factory=Ids(),
     )
 
@@ -408,6 +409,7 @@ async def test_timer_rechecks_utc_after_one_sixty_second_slice() -> None:
         "top_level",
         on_due=fired.set,
         wall_clock=clock,
+        assert_owned=lambda: None,
         id_factory=Ids(),
         wait_for_change=controlled_wait,
     )
@@ -612,7 +614,7 @@ async def test_agent_loop_registers_wake_and_discards_it_on_close(
             ),
         )
         assert result["isError"] is False
-        assert scheduler.owned_work().pending_ids
+        assert scheduler.list_pending()
     finally:
         try:
             await asyncio.wait_for(loop.close(), timeout=10)
@@ -671,11 +673,11 @@ async def test_close_discards_process_local_state_and_stops_owner_checks() -> No
         "top_level",
         on_due=lambda: None,
         wall_clock=clock,
-        assert_owned=lambda: owner_checks.append(None),
+        assert_owned=owner_checks.append,
         id_factory=Ids(),
     )
     scheduler.schedule(after_seconds=10, note="lost on restart")
-    assert scheduler.owned_work().pending_ids
+    assert scheduler.list_pending()
 
     lost = await asyncio.wait_for(scheduler.close(), timeout=10)
 

@@ -15,7 +15,12 @@ from ..config.settings import ResolvedConfig
 from ..config.tool_policy import ToolPolicy
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
-from ..core.project_context import ProjectContext, ProjectDiscovery
+from ..core.project_context import (
+    ProjectContext,
+    ProjectDiscovery,
+    load_project_context,
+    resolve_project_context_from_projects,
+)
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..mcp.envelope import MCPCallLimits
@@ -27,9 +32,11 @@ from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
+from ..storage_format import open_writer
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
+from .project_registry_state import ProjectRegistryState
 from .prompt import RuntimePrompt
 
 BackendBuilder = Callable[..., tuple[CompletionBackend, str]]
@@ -89,6 +96,7 @@ def compose_runtime(
     project_discovery: ProjectDiscovery | None = None,
     memory_notice: Callable[[str], None] | None = None,
     post_stream_provider_retry: bool = True,
+    require_selected_account: bool = True,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -152,6 +160,8 @@ def compose_runtime(
             cleanup.enter_context(opened.store)
         metadata = opened.metadata
         account_context = SessionAccountContext.load(home, manager, metadata)
+        if require_selected_account:
+            account_context.require_active_available(provider)
         backend_kwargs.update(account_context.backend_kwargs(provider))
         backend, selected_model = backend_builder(
             provider, session_model, **backend_kwargs
@@ -185,7 +195,11 @@ def compose_runtime(
                 tool_allow_layers=effective_policy.allow_layers,
             )
         completion_callback = on_completion_success or (
-            lambda: asyncio.to_thread(manager.refresh_recency, metadata.session_id)
+            lambda: asyncio.to_thread(
+                manager.refresh_recency,
+                metadata.session_id,
+                opened.store.execution_lease,
+            )
         )
         policy = ApprovalPolicy(
             store=opened.store,
@@ -295,6 +309,55 @@ def compose_runtime(
         )
         loop.explicit_finish = config.agents_explicit_finish
         loop.post_stream_provider_retry = post_stream_provider_retry
+
+        def prepare_project_context(projection: Any) -> ProjectContext:
+            cwd_project = (
+                resolve_project_context_from_projects(
+                    project_discovery, projection.projects
+                )
+                if project_discovery is not None
+                else None
+            )
+            return load_project_context(
+                cwd=cwd,
+                repo_root=(
+                    project_discovery.primary_root or project_discovery.cwd
+                    if project_discovery is not None
+                    else cwd
+                ),
+                zeta_home=home,
+                catalog=loop.tool_registry.skill_catalog,
+                session_project=projection.session_project,
+                cwd_project=cwd_project,
+                inbox_enabled=config.inbox_enabled,
+                registry=project_registry,
+                project_projection=projection,
+            )
+
+        conservative_recovery = (
+            resuming
+            and project_context.prompt_recipe != "default"
+            and "project_memory" in project_context.prompt_components
+        )
+        loop._configure_project_context_recovery(
+            registry=project_registry,
+            project_id=metadata.project_id,
+            health=project_context.health,
+            prepare=(
+                prepare_project_context
+                if project_context.prompt_recipe == "default" or conservative_recovery
+                else None
+            ),
+            replace_component=("project_memory" if conservative_recovery else None),
+        )
+        if project_registry is not None and (
+            project_context.health is None
+            or project_context.health.code != "project_registry_unavailable"
+        ):
+            manager.project_registry_unavailable = None
+            registry.project_registry_state = manager.project_registry_state = (
+                ProjectRegistryState(project_registry)
+            )
         loop.manager = manager
         loop.session_metadata = metadata
         loop.account_context = account_context
@@ -323,9 +386,11 @@ def compose_runtime(
                                 stall_retries=config.stream_stall_retries,
                                 token_budget=effective_budget,
                             )
+                            loop.register_backend_owner(memory_backend)
                 return await complete_reconciliation(memory_backend, prompt)
 
             assert project_registry is not None
+            memory_storage_lease = open_writer(home)
             memory_reconciler = AutoMemoryReconciler(
                 registry=project_registry,
                 project_id=metadata.project_id,
@@ -339,6 +404,7 @@ def compose_runtime(
                     idle_seconds=config.memory_idle_minutes * 60,
                 ),
                 notice=memory_notice,
+                storage_lease=memory_storage_lease,
             )
             loop.memory_reconciler = memory_reconciler
             loop.context_assembler.on_before_eviction = (
@@ -354,6 +420,7 @@ def compose_runtime(
             if callback is not None
         ]
         if activity_callbacks:
+
             def persisted_activity(seq: int) -> None:
                 for callback in activity_callbacks:
                     callback(seq)

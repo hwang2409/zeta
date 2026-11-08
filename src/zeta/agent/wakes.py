@@ -68,12 +68,6 @@ class _DueDecision:
     passive: tuple[WakeRecord, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class WakeOwnedWork:
-    pending_ids: tuple[str, ...]
-    earliest_due_at_utc: datetime | None
-
-
 class WakeError(ValueError):
     """A visible wake operation error."""
 
@@ -87,7 +81,7 @@ class WakeScheduler:
         *,
         on_due: Callable[[], None],
         wall_clock: Callable[[], datetime] | None = None,
-        assert_owned: Callable[[], None] | None = None,
+        assert_owned: Callable[[], None],
         id_factory: Callable[[], str] | None = None,
         wait_for_change: Callable[[asyncio.Event, float], Awaitable[None]]
         | None = None,
@@ -95,7 +89,7 @@ class WakeScheduler:
         self.session_class = session_class
         self._on_due = on_due
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
-        self._assert_owned = assert_owned or (lambda: None)
+        self._assert_owned = assert_owned
         self._id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self._wait_for_change = wait_for_change or _wait_for_change
         self._records: dict[str, WakeRecord] = {}
@@ -198,17 +192,6 @@ class WakeScheduler:
         self._signal_changed()
         return record
 
-    def owned_work(self) -> WakeOwnedWork:
-        records = tuple(
-            record for record in self._records.values() if record.state != "passive"
-        )
-        return WakeOwnedWork(
-            pending_ids=tuple(sorted(record.wake_id for record in records)),
-            earliest_due_at_utc=min(
-                (record.due_at_utc for record in records), default=None
-            ),
-        )
-
     def has_due(self) -> bool:
         """Return whether any wake presentation is ready without changing state."""
 
@@ -242,6 +225,7 @@ class WakeScheduler:
         """Close one due cohort at the idle admission seam."""
 
         self._require_open()
+        self._assert_owned()
         self.poll_due()
         now = _utc(self._wall_clock())
         passive, due = self._collect_due_cohort(now)
@@ -319,6 +303,7 @@ class WakeScheduler:
 
     def consume_due_passive(self) -> tuple[WakeRecord, ...]:
         self._require_open()
+        self._assert_owned()
         now = _utc(self._wall_clock())
         records = tuple(
             sorted(
@@ -341,6 +326,7 @@ class WakeScheduler:
 
         if self._closed:
             return 0
+        self._assert_owned()
         self._closed = True
         lost = len(self._records)
         self._records.clear()

@@ -3,18 +3,45 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import inspect
 import json
 import os
 import sys
 from collections import deque
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any, Literal
 
 from websockets.asyncio.client import ClientConnection, connect
 
+from tests.support.sockets import short_socket_path
+
 Transport = Literal["unix", "websocket"]
 Role = Literal["controller", "observer"]
+CleanupStep = tuple[str, Callable[[], object | Awaitable[object]]]
+
+
+async def _run_cleanup(
+    steps: Iterable[CleanupStep], primary: BaseException | None = None
+) -> None:
+    errors: list[tuple[str, BaseException]] = []
+    for name, step in steps:
+        try:
+            result = step()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException as error:  # noqa: BLE001
+            errors.append((name, error))
+
+    if primary is not None:
+        for name, error in errors:
+            primary.add_note(f"{name} failed during cleanup: {error!r}")
+        return
+    if errors:
+        (_name, error), *additional_errors = errors
+        for name, additional_error in additional_errors:
+            error.add_note(f"{name} also failed during cleanup: {additional_error!r}")
+        raise error
 
 
 class ServeClient:
@@ -101,8 +128,7 @@ class ServeContract:
 
     @classmethod
     async def start(cls, root: Path, transport: Transport) -> ServeContract:
-        token = hashlib.sha256(str(root).encode()).hexdigest()[:16]
-        socket_path = Path("/tmp") / f"zeta-contract-{token}.sock"
+        socket_path = short_socket_path(root)
         home = root / "home"
         environment = os.environ.copy()
         environment["ZETA_HOME"] = str(home)
@@ -127,16 +153,33 @@ class ServeContract:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        assert process.stderr is not None
-        output = bytearray()
-        while True:
-            line = await process.stderr.readline()
-            output.extend(line)
-            assert line, (
-                f"zeta serve exited before readiness: {output.decode(errors='replace')}"
+        try:
+            assert process.stderr is not None
+            output = bytearray()
+            while True:
+                line = await process.stderr.readline()
+                output.extend(line)
+                assert line, (
+                    "zeta serve exited before readiness: "
+                    f"{output.decode(errors='replace')}"
+                )
+                if line.startswith(b"zeta serve: websocket ready:"):
+                    break
+        except BaseException as error:
+
+            def kill() -> None:
+                if process.returncode is None:
+                    process.kill()
+
+            await _run_cleanup(
+                (
+                    ("process kill", kill),
+                    ("process reap", process.communicate),
+                    ("socket removal", lambda: socket_path.unlink(missing_ok=True)),
+                ),
+                error,
             )
-            if line.startswith(b"zeta serve: websocket ready:"):
-                break
+            raise
         return cls(process, home, socket_path, transport)
 
     async def connect(self, role: Role = "controller") -> ServeClient:
@@ -155,11 +198,27 @@ class ServeContract:
         return client
 
     async def close(self) -> None:
-        for client in reversed(self._clients):
-            await client.close()
-        if self._process.returncode is None:
-            self._process.terminate()
-        stdout, stderr = await self._process.communicate()
-        assert self._process.returncode == 0, (stdout + stderr).decode(errors="replace")
-        assert not self._socket_path.exists(), "serve left its Unix socket behind"
-        Path(f"{self._socket_path}.lock").unlink(missing_ok=True)
+        stdout = stderr = b""
+
+        def terminate() -> None:
+            if self._process.returncode is None:
+                self._process.terminate()
+
+        async def reap() -> None:
+            nonlocal stdout, stderr
+            stdout, stderr = await self._process.communicate()
+
+        def validate_shutdown() -> None:
+            assert self._process.returncode == 0, (stdout + stderr).decode(
+                errors="replace"
+            )
+            assert not self._socket_path.exists(), "serve left its Unix socket behind"
+
+        await _run_cleanup(
+            (
+                *(("client close", client.close) for client in reversed(self._clients)),
+                ("process termination", terminate),
+                ("process reap", reap),
+                ("server shutdown validation", validate_shutdown),
+            )
+        )

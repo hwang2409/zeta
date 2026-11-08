@@ -7,9 +7,18 @@ import functools
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from ..core.approval import ApprovalPolicy, ApprovalRequest
+from ..core.approval import (
+    ApprovalPolicy,
+    ApprovalRequest,
+    PermissionSnapshot,
+    SessionGrantChange,
+    SessionGrantNotFound,
+    permission_snapshot,
+    revoke_session_grants,
+    session_grant_change,
+)
 from ..core.store import ConversationStore
 from ..protocol.types import (
     ErrorInfo,
@@ -35,12 +44,19 @@ from .approval_lifecycle import (
 )
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
-from .protocol import FrameWriteCancelled, ProtocolError, bounded
+from .protocol import (
+    ErrorDescriptor,
+    EventDescriptor,
+    FrameWriteCancelled,
+    ProtocolError,
+    bounded,
+)
 
 if TYPE_CHECKING:
     from .server import ZetaServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
+CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
 
 NotificationSender = Callable[..., Awaitable[bool]]
 
@@ -100,6 +116,7 @@ class ServeControl:
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
+        self._controller_release_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
@@ -107,7 +124,7 @@ class ServeControl:
         self._active_host_commands: SessionHostCommands | None = None
         self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
-            publish=lambda *args, **kwargs: self._notify(*args, **kwargs),
+            admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
             policy=lambda: self.server.runtime.policy,
             session_id=lambda: (
@@ -122,6 +139,7 @@ class ServeControl:
             ),
             offload=lambda job: self._run_blocking(job),
             is_closing=lambda: self.closing,
+            grant_published=self._publish_session_grant,
         )
 
     def start_turn(
@@ -153,9 +171,8 @@ class ServeControl:
     def reject_client_turn_if_detached(self) -> None:
         if self._host_binding_required and self._active_host_commands is None:
             raise ProtocolError(
-                -32003,
+                ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
-                {"code": "host_binding_required"},
             )
 
     def request_turn_failure(self) -> None:
@@ -181,12 +198,16 @@ class ServeControl:
 
     async def require_idle(self) -> None:
         if self.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
 
     @contextmanager
     def reserve_session_swap(self) -> Iterator[None]:
         if self.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         state = self.server.runtime.state
         session_id = None if state is None else state.session_id
         self._session_swap_active = True
@@ -238,16 +259,49 @@ class ServeControl:
     async def wait_for_approval_settlement(self) -> None:
         await self._approvals.wait_for_approval_settlement()
 
+    def begin_controller_release(
+        self, *, reconnect: bool = False
+    ) -> asyncio.Task[None]:
+        previous = self._controller_release_task
+        # Establish approval grace before the physical controller slot is released.
+        operation = (
+            None
+            if previous is not None and not previous.done()
+            else self._controller_release(reconnect)
+        )
+
+        async def release() -> None:
+            if previous is not None:
+                await asyncio.shield(previous)
+            if operation is None:
+                await self.controller_released(reconnect=reconnect)
+            else:
+                await operation
+
+        task = asyncio.create_task(release())
+        self._controller_release_task = task
+        return task
+
     async def controller_claimed(
         self, *, reconnect: bool = False, require_host_binding: bool = False
-    ) -> None:
+    ) -> bool:
+        release = self._controller_release_task
+        if release is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(release), CONTROLLER_HANDOFF_DEADLINE_SECONDS
+                )
+            except TimeoutError:
+                return False
+            if self._controller_release_task is release:
+                self._controller_release_task = None
         self._host_binding_required |= require_host_binding
         task = self._grace_task
         if task is None:
-            return
+            return True
         if self._grace_expiring:
             await asyncio.shield(task)
-            return
+            return True
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         self._grace_task = None
@@ -256,6 +310,7 @@ class ServeControl:
         else:
             await self._approvals.transition(Expire())
             await self._disconnect_turn()
+        return True
 
     async def controller_ready(self, *, reconnect: bool = False) -> None:
         if reconnect:
@@ -263,18 +318,33 @@ class ServeControl:
         await self._attach_pending_notifications()
 
     async def controller_released(self, *, reconnect: bool = False) -> None:
+        await self._controller_release(reconnect)
+
+    def _controller_release(self, reconnect: bool) -> Awaitable[None]:
         self._active_host_commands = None
         if reconnect and self._grace_task is not None:
-            await asyncio.shield(self._grace_task)
-            return
+
+            async def wait_for_grace() -> None:
+                assert self._grace_task is not None
+                await asyncio.shield(self._grace_task)
+
+            return wait_for_grace()
         if reconnect and self._approvals.has_pending_approvals():
-            await self._approvals.transition(BeginGrace())
+            self._approvals.transition(BeginGrace())
             self._grace_task = asyncio.create_task(self._expire_grace())
-            if self.server.approval_reconnect_grace == 0:
-                await self._grace_task
-            return
-        await self._terminate_pending_approvals(suppress_write_errors=True)
-        await self._disconnect_turn()
+
+            async def start_grace() -> None:
+                if self.server.approval_reconnect_grace == 0:
+                    assert self._grace_task is not None
+                    await self._grace_task
+
+            return start_grace()
+
+        async def disconnect() -> None:
+            await self._terminate_pending_approvals(suppress_write_errors=True)
+            await self._disconnect_turn()
+
+        return disconnect()
 
     async def _expire_grace(self) -> None:
         try:
@@ -360,8 +430,9 @@ class ServeControl:
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         loop = self.server.runtime.loop
-        if loop is None:
-            raise ProtocolError(-32003, "no active session")
+        policy = self.server.runtime.policy
+        if loop is None or policy is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         result, core_key = await self._approvals.transition(
             Decide(method, request_id, scope)
         )
@@ -379,6 +450,29 @@ class ServeControl:
             )
         return result
 
+    async def _publish_session_grant(self, tool: str) -> None:
+        policy = self.server.runtime.policy
+        if policy is not None:
+            await self.publish_session_grant_change(
+                session_grant_change(policy, "grant", (tool,))
+            )
+
+    async def publish_session_grant_change(self, change: SessionGrantChange) -> None:
+        connections = self.server.connections
+        session_id = self.server.runtime.session_id
+        if connections is None or session_id is None:
+            return
+        await connections.publish_feature_event(
+            FEATURE, EVENT, session_id, data=event_data(change, session_id)
+        )
+
+    async def publish_session_grant_reset(self) -> None:
+        policy = self.server.runtime.policy
+        if policy is not None:
+            await self.publish_session_grant_change(
+                session_grant_change(policy, "reset")
+            )
+
     def request_approval_abort(
         self,
         request_id: str,
@@ -388,6 +482,19 @@ class ServeControl:
     ) -> Awaitable[object]:
         return asyncio.create_task(
             self._approvals.transition(Cancel(request_id, child_instance_id, reason))
+        )
+
+    def request_approval_abort_gate(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
+    ) -> Awaitable[object]:
+        return self._approvals.request_approval_abort(
+            request_id,
+            child_instance_id=child_instance_id,
+            reason=reason,
         )
 
     async def abort(
@@ -693,12 +800,14 @@ class ServeControl:
             and state.session_id == session_id
         )
         kind = event.type
+        if foreground:
+            state.usage_tracker.record(kind, state.model)
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
         if kind not in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
         }:
-            await self._end_stale_approvals(session_id)
+            self._end_stale_approvals(session_id)
         if kind is StreamEventType.MESSAGE_UPDATE:
             delta = event.delta
             stream_kind = "assistant"
@@ -769,11 +878,13 @@ class ServeControl:
         if kind is StreamEventType.TOOL_EXECUTION_END:
             if foreground:
                 state.tool_finished()
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_end(event, fidelity=fidelity),
-            )
+            fields = event_contract.tool_end(event, fidelity=fidelity)
+            if not foreground and self._approvals.release_or_hold_terminal(
+                _approval_key(event), session_id, fields
+            ):
+                await self._notify(wire_event, session_id, _admitted=True, **fields)
+                return
+            await self._notify(wire_event, session_id, **fields)
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
             await self._end_approval(
@@ -830,7 +941,7 @@ class ServeControl:
         await self._notify(wire_event, session_id, data=dict(event.data))
 
     async def _start_approval(
-        self, event: StreamEvent, session_id: str | None, wire_event: str
+        self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
     ) -> None:
         await self._approvals.transition(Start(event, session_id, wire_event))
 
@@ -870,9 +981,21 @@ class ServeControl:
                 )
             )
 
+    def _admit_controller(
+        self, event: EventDescriptor, session_id: str | None = None, **fields: object
+    ) -> object:
+        connections = getattr(self.server, "connections", None)
+        if connections is None:
+            from .connections import Admission
+
+            return Admission("no_controller")
+        return connections.try_admit_controller(event, session_id, **fields)
+
     async def _notify(
-        self, event: str, session_id: str | None = None, **fields: object
+        self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> bool:
+        if fields.pop("_admitted", False):
+            return True
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
         connections = self.server.connections
@@ -892,8 +1015,8 @@ class ServeControl:
             ExternalEnd(key, session_id, data, suppress_write_errors)
         )
 
-    async def _end_stale_approvals(self, session_id: str | None) -> None:
-        await self._approvals._end_stale_approvals(session_id)
+    def _end_stale_approvals(self, session_id: str | None) -> None:
+        self._approvals._end_stale_approvals(session_id)
 
     async def _terminate_pending_approvals(
         self,
@@ -913,3 +1036,90 @@ def _approval_key(event: StreamEvent) -> ApprovalKey:
     if isinstance(child_id, str) and raw_request_id:
         return child_id, raw_request_id
     return raw_request_id
+
+
+FEATURE = "session_grants"
+READ = "session_grants"
+REVOKE = "revoke_session_grants"
+EVENT = event_contract.AUXILIARY_WIRE_EVENTS[
+    event_contract.AuxiliaryEvent.SESSION_GRANTS_CHANGED
+]
+
+
+def require_feature(features: frozenset[str]) -> None:
+    if FEATURE not in features:
+        raise ProtocolError(
+            ErrorDescriptor.METHOD_NOT_FOUND,
+            "session grants require the negotiated session_grants feature",
+        )
+
+
+def read(
+    policy: ApprovalPolicy | None, session_id: str | None, params: dict[str, Any]
+) -> dict[str, object]:
+    if params:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_SESSION_GRANTS_PARAMS,
+            "session_grants takes no params",
+        )
+    if policy is None or session_id is None:
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+    return snapshot_result(permission_snapshot(policy), session_id)
+
+
+def revoke(
+    policy: ApprovalPolicy | None,
+    session_id: str | None,
+    params: dict[str, Any],
+) -> tuple[dict[str, object], SessionGrantChange]:
+    if policy is None or session_id is None:
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+    valid_grant = (
+        set(params) == {"grant"}
+        and isinstance(params.get("grant"), str)
+        and bool(params["grant"])
+    )
+    valid_clear = set(params) == {"clear"} and params.get("clear") is True
+    if not (valid_grant or valid_clear):
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_SESSION_GRANTS_REVOKE,
+            "invalid revoke_session_grants params",
+        )
+    try:
+        change = (
+            revoke_session_grants(policy, exact=params["grant"])
+            if valid_grant
+            else revoke_session_grants(policy, clear=True)
+        )
+    except SessionGrantNotFound as exc:
+        raise ProtocolError(
+            ErrorDescriptor.SESSION_GRANT_NOT_FOUND,
+            "session grant not found",
+            {"grant": exc.grant},
+        ) from exc
+    return {
+        "removed": list(change.changed),
+        "grants": snapshot_result(change.snapshot, session_id),
+    }, change
+
+
+def event_data(change: SessionGrantChange, session_id: str) -> dict[str, object]:
+    return {
+        "change": change.change,
+        "changed": list(change.changed),
+        "grants": snapshot_result(change.snapshot, session_id),
+    }
+
+
+def snapshot_result(snapshot: PermissionSnapshot, session_id: str) -> dict[str, object]:
+    return {
+        "session_id": session_id,
+        "default": snapshot.default.value,
+        "precedence": list(snapshot.precedence),
+        "rules": {
+            "deny": list(snapshot.deny),
+            "ask": list(snapshot.ask),
+            "allow": list(snapshot.allow),
+        },
+        "session_grants": list(snapshot.session_grants),
+    }

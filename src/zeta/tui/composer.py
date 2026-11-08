@@ -431,6 +431,7 @@ class ComposerAttachmentMixin:
             signal = getattr(self, "_standalone_abort_signal", None)
             if signal is not None:
                 signal.abort()
+            self.loop.abort(foreground_only=True)
             for request in self.pending_approvals:
                 if self._approval_policy is not None:
                     self._approval_policy.abort(request.key)
@@ -760,6 +761,10 @@ class SubmissionMixin:
     """Translate composer callbacks into pipeline messages."""
 
     async def slash_mcp(self, args: str) -> str:
+        if not args.strip() and self._full_screen_active():
+            self._consume_overlay_submission()
+            self.open_mcp_manager()
+            return ""
         return await self.loop.slash_mcp(args)
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:

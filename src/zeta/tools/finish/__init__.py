@@ -71,6 +71,8 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
             report["head_sha"] = head_sha
         if verdict is not None:
             report["verdict"] = verdict
+        if refusal := fence.owned_work_refusal():
+            return _error("finish refused; " + refusal)
         flow = child_loop.step_delivery
         if flow is not None and (await flow.admit_terminal("finish")).pending:
             return _error("finish refused; pending notification must be read first")
@@ -87,6 +89,7 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
     registry.register_session_tool(
         "finish",
         finish,
+        binding="loop",
         description=(
             "Call finish to end this run and report the contract result with status "
             "and summary; include verdict and head_sha when they apply."

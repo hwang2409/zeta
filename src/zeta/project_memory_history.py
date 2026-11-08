@@ -25,6 +25,7 @@ from .memory.version_store import (
 from .memory_migration_plan import reachable_version_pruning_plan
 from .project_errors import ProjectRegistryError
 from .project_schema import MAX_MEMORY_FILE_SIZE
+from .storage_format import reject_unknown_keys
 
 MAX_RETAINED_VERSIONS = 128
 PROJECT_MEMORY_FILES = (
@@ -176,11 +177,37 @@ class _FormatOnePayloadAdapter:
         if self.source_history is not None:
             fields["source_history"] = self.source_history
         return PreparedVersion(
-            {name: self.contents.get(name, "").encode() for name in PROJECT_MEMORY_FILES},
+            {
+                name: self.contents.get(name, "").encode()
+                for name in PROJECT_MEMORY_FILES
+            },
             {name: self.before.get(name, "").encode() for name in PROJECT_MEMORY_FILES},
             fields,
             None,
         )
+
+
+def _overlapping_automatic_versions(
+    records: list[dict[str, object]],
+    *,
+    session_id: str,
+    retained_last_sequence: int,
+    diagnosed_at: str | None,
+) -> tuple[str, ...]:
+    result = []
+    for record in records:
+        provenance = record.get("provenance")
+        if not isinstance(provenance, dict):
+            continue
+        if provenance.get("session_id") != session_id:
+            continue
+        seq_end = provenance.get("seq_end")
+        if type(seq_end) is not int or seq_end <= retained_last_sequence:
+            continue
+        if diagnosed_at is not None and str(record.get("created_at", "")) > diagnosed_at:
+            continue
+        result.append(str(record["version"]))
+    return tuple(result)
 
 
 class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
@@ -229,7 +256,9 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
                 dir_fd=parent_fd,
             )
         except OSError as exc:
-            raise ProjectRegistryError("project memory version store is unavailable") from exc
+            raise ProjectRegistryError(
+                "project memory version store is unavailable"
+            ) from exc
         info = os.fstat(fd)
         if stat.S_IMODE(info.st_mode) & 0o077:
             os.close(fd)
@@ -282,7 +311,9 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         entries = self._legacy_entries(directory_fd)
         return {name: entries.get(name, "") for name in PROJECT_MEMORY_FILES}
 
-    def _version_handles(self, directory_fd: int, *, create: bool) -> tuple[int, int, int]:
+    def _version_handles(
+        self, directory_fd: int, *, create: bool
+    ) -> tuple[int, int, int]:
         root = self._open_directory(directory_fd, _VERSION_ROOT, create=create)
         try:
             blobs = self._open_directory(root, "blobs", create=create)
@@ -315,7 +346,13 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         self, blobs_fd: int, manifest: Mapping[str, object], key: str = "snapshot"
     ) -> dict[str, str]:
         files = manifest.get(key)
-        if not isinstance(files, dict) or set(files) != set(PROJECT_MEMORY_FILES):
+        if not isinstance(files, dict):
+            raise ProjectRegistryError("project memory version is malformed")
+        try:
+            reject_unknown_keys(files, "legacy_memory_snapshot")
+        except ValueError as exc:
+            raise ProjectRegistryError("project memory version is malformed") from exc
+        if set(files) != set(PROJECT_MEMORY_FILES):
             raise ProjectRegistryError("project memory version is malformed")
         result: dict[str, str] = {}
         for name in PROJECT_MEMORY_FILES:
@@ -325,17 +362,24 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             try:
                 fd = os.open(digest, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=blobs_fd)
             except OSError as exc:
-                raise ProjectRegistryError("project memory snapshot is incomplete") from exc
+                raise ProjectRegistryError(
+                    "project memory snapshot is incomplete"
+                ) from exc
             try:
                 info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MEMORY_FILE_SIZE:
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_size > MAX_MEMORY_FILE_SIZE
+                ):
                     raise ProjectRegistryError("project memory snapshot is unsafe")
                 payload = os.read(fd, info.st_size + 1)
                 if hashlib.sha256(payload).hexdigest() != digest:
                     raise ProjectRegistryError("project memory snapshot is corrupt")
                 result[name] = payload.decode("utf-8")
             except (OSError, UnicodeDecodeError) as exc:
-                raise ProjectRegistryError("project memory snapshot is unreadable") from exc
+                raise ProjectRegistryError(
+                    "project memory snapshot is unreadable"
+                ) from exc
             finally:
                 os.close(fd)
         return result
@@ -422,7 +466,9 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(memory_fd)
         except (OSError, ProjectRegistryError) as exc:
-            _LOG.warning("could not refresh project memory mirror at %s: %s", mirror_path, exc)
+            _LOG.warning(
+                "could not refresh project memory mirror at %s: %s", mirror_path, exc
+            )
 
     def _snapshot_locked(self, directory_fd: int) -> MemorySnapshot:
         self._require_format_one(directory_fd)
@@ -446,6 +492,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
 
     def memory_snapshot(self, project_id: str) -> MemorySnapshot:
         """Read the complete bounded memory set and digest atomically."""
+
         def read(root_fd: int) -> MemorySnapshot:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -458,7 +505,9 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     def memory_digest(self, project_id: str) -> str:
         return self.memory_snapshot(project_id).digest
 
-    def _load_memory_view(self, project_id: str, byte_cap: int) -> list[tuple[str, str]]:
+    def _load_memory_view(
+        self, project_id: str, byte_cap: int
+    ) -> list[tuple[str, str]]:
         def read(root_fd: int) -> list[tuple[str, str]]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -594,20 +643,16 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
                 )
 
     @staticmethod
-    def _validate_provenance(provenance: Mapping[str, object] | None) -> dict[str, object]:
+    def _validate_provenance(
+        provenance: Mapping[str, object] | None,
+    ) -> dict[str, object]:
         value = dict(provenance or {})
         if provenance is None:
             return value
-        if set(value) - {
-            "session_id",
-            "seq_start",
-            "seq_end",
-            "fragment_start",
-            "fragment_end",
-            "model",
-            "usage",
-        }:
-            raise ProjectRegistryError("invalid memory provenance")
+        try:
+            reject_unknown_keys(value, "memory_history_provenance")
+        except ValueError as exc:
+            raise ProjectRegistryError("invalid memory provenance") from exc
         session_id, start, end = (
             value.get("session_id"),
             value.get("seq_start"),
@@ -681,6 +726,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             manifest_reader=self._manifest,
             transaction_step=self._memory_transaction_step,
             prune_versions=self._prune_versions,
+            home=self.root.parent,
         )
         self._refresh_memory_mirror(
             directory_fd,
@@ -689,30 +735,42 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         )
         return published.version
 
-    def _prune_versions(self, blobs_fd: int, versions_fd: int, retained: set[str]) -> None:
-        plan = reachable_version_pruning_plan(
+    def _prune_versions(
+        self,
+        blobs_fd: int,
+        versions_fd: int,
+        retained: set[str],
+        dropped: set[str],
+    ) -> None:
+        retained_plan = reachable_version_pruning_plan(
             retained, lambda version: self._manifest(versions_fd, version)
         )
-        for name in os.listdir(versions_fd):
-            if name.endswith(".json") and name[:-5] not in plan.versions:
-                os.unlink(name, dir_fd=versions_fd)
-        for name in os.listdir(blobs_fd):
-            if name not in plan.blobs:
-                os.unlink(name, dir_fd=blobs_fd)
+        dropped_blobs: set[str] = set()
+        for version in dropped - retained_plan.versions:
+            manifest = self._manifest(versions_fd, version)
+            for key in ("snapshot", "before_snapshot"):
+                payloads = manifest.get(key)
+                if isinstance(payloads, dict):
+                    dropped_blobs.update(
+                        value for value in payloads.values() if isinstance(value, str)
+                    )
+                elif isinstance(payloads, str):
+                    dropped_blobs.add(payloads)
+            os.unlink(f"{version}.json", dir_fd=versions_fd)
+        for digest in dropped_blobs - retained_plan.blobs:
+            os.unlink(digest, dir_fd=blobs_fd)
         os.fsync(versions_fd)
         os.fsync(blobs_fd)
 
-
     def export_memory(self, project_id: str) -> MemoryExport:
         """Export logical memory without exposing the version-store layout."""
+
         def read(root_fd: int) -> MemoryExport:
             return self._export_memory_locked(root_fd, project_id)
 
         return self._read(read)
 
-    def _export_memory_locked(
-        self, root_fd: int, project_id: str
-    ) -> MemoryExport:
+    def _export_memory_locked(self, root_fd: int, project_id: str) -> MemoryExport:
         directory_fd = self._project_dir(root_fd, project_id)
         try:
             snapshot = self._snapshot_locked(directory_fd)
@@ -784,7 +842,10 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         ):
             raise ProjectRegistryError("memory export history is too large")
         automatic_files = self._automatic_file_set(list(exported.automatic_files))
-        if automatic_files is None or tuple(sorted(automatic_files)) != exported.automatic_files:
+        if (
+            automatic_files is None
+            or tuple(sorted(automatic_files)) != exported.automatic_files
+        ):
             raise ProjectRegistryError("invalid memory export")
         source_history = [dict(item) for item in exported.versions]
         directory_fd = self._project_dir(root_fd, project_id)
@@ -805,9 +866,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
                         before.contents,
                         mirror_path=self.root / project_id / "memory",
                     )
-                return MemoryCASResult(
-                    list(exported.contents.items()), False, version
-                )
+                return MemoryCASResult(list(exported.contents.items()), False, version)
             version = self._publish_version(
                 directory_fd,
                 project_id=project_id,
@@ -824,14 +883,13 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
                 source_history=source_history,
                 source_automatic_files=automatic_files,
             )
-            return MemoryCASResult(
-                list(exported.contents.items()), True, version
-            )
+            return MemoryCASResult(list(exported.contents.items()), True, version)
         finally:
             os.close(directory_fd)
 
     def memory_state(self, project_id: str) -> MemoryState:
         """Read the current authoritative snapshot and origin flags atomically."""
+
         def read(root_fd: int) -> MemoryState:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -855,6 +913,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         """Read one retained file and its parent snapshot for comparison."""
         if name not in PROJECT_MEMORY_FILES:
             raise ProjectRegistryError("invalid memory file name")
+
         def read(root_fd: int) -> MemoryVersionFile:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -878,9 +937,12 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
 
         return self._read(read)
 
-    def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
+    def memory_log(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, object]]:
         if type(limit) is not int or limit < 1 or limit > 10_000:
             raise ProjectRegistryError("invalid memory history limit")
+
         def read(root_fd: int) -> list[dict[str, object]]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -954,7 +1016,9 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(directory_fd)
 
-    def _replace_memory(self, project_id: str, updates: Mapping[str, str]) -> list[tuple[str, str]]:
+    def _replace_memory(
+        self, project_id: str, updates: Mapping[str, str]
+    ) -> list[tuple[str, str]]:
         self._validate_updates(updates)
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
@@ -995,23 +1059,65 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(directory_fd)
 
-    def undo_memory(self, project_id: str) -> list[tuple[str, str]]:
+    def overlapping_automatic_versions(
+        self,
+        project_id: str,
+        *,
+        session_id: str,
+        retained_last_sequence: int,
+        diagnosed_at: str | None = None,
+    ) -> tuple[str, ...]:
+        """List automatic versions that refer to rows removed by recovery."""
+        def read(root_fd: int) -> tuple[str, ...]:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                return _overlapping_automatic_versions(
+                    self._records_locked(directory_fd),
+                    session_id=session_id,
+                    retained_last_sequence=retained_last_sequence,
+                    diagnosed_at=diagnosed_at,
+                )
+            finally:
+                os.close(directory_fd)
+
+        return self._read(read)
+
+    def undo_memory(
+        self, project_id: str, *, expected_current: str | None = None
+    ) -> list[tuple[str, str]]:
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 records = self._records_locked(directory_fd)
-                undone = {item.get("target_version") for item in records if item.get("kind") == "undo"}
+                undone = {
+                    item.get("target_version")
+                    for item in records
+                    if item.get("kind") == "undo"
+                }
                 target = next(
                     (
                         item
                         for item in reversed(records)
-                        if item.get("kind") in {"update", "import"} and item.get("version") not in undone
+                        if item.get("kind") in {"update", "import"}
+                        and item.get("version") not in undone
                     ),
                     None,
                 )
                 if target is None:
                     raise ProjectRegistryError("project memory history is empty")
-                root, blobs_fd, versions_fd = self._version_handles(directory_fd, create=False)
+                if expected_current is not None:
+                    pointer = self._pointer(directory_fd)
+                    if (
+                        target.get("version") != expected_current
+                        or pointer is None
+                        or pointer.get("current") != expected_current
+                    ):
+                        raise ProjectRegistryError(
+                            "memory changed since this suggestion; review /memory log"
+                        )
+                root, blobs_fd, versions_fd = self._version_handles(
+                    directory_fd, create=False
+                )
                 try:
                     restored = self._contents_from_manifest(
                         blobs_fd, target, "before_snapshot"
