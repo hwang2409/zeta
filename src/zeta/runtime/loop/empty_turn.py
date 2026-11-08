@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ...context_eviction.receipt_constructors import is_receipt_echo
 from ...protocol.types import (
     ErrorInfo,
     Message,
@@ -98,6 +99,8 @@ def _bounded_detail(value: str) -> str:
 def has_visible_output(message: Message) -> bool:
     """True when the assistant produced text or a tool call the user can act on."""
 
+    if is_receipt_echo(message):
+        return False
     for block in message.content:
         if isinstance(block, ToolUseContent):
             return True

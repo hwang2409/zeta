@@ -18887,6 +18887,144 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         store.close()
 
 
+class _QuietReplyChildBackend(CompletionBackend):
+    """Root starts one explicit-finish child; the child answers a follow-up quietly."""
+
+    def __init__(self, follow_up_reply: list[TextContent]) -> None:
+        self.follow_up_reply = follow_up_reply
+        self.root_calls = 0
+        self.follow_up_answered = asyncio.Event()
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+
+    @owned_completion
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        user_texts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        blocks: list[TextContent | ToolUseContent]
+        if "quiet child prompt" in user_texts:
+            if any("quiet follow up" in text for text in user_texts):
+                blocks = list(self.follow_up_reply)
+                self.follow_up_answered.set()
+            else:
+                self.child_started.set()
+                await await_or_fail(self.release_child.wait(), what="child release")
+                blocks = [TextContent("WAIT")]
+        else:
+            self.root_calls += 1
+            if self.root_calls == 1:
+                call = ToolCall(
+                    "start-quiet-child",
+                    "agent",
+                    {
+                        "prompt": "quiet child prompt",
+                        "description": "quiet child",
+                        "agent_type": "run",
+                        "background": True,
+                    },
+                )
+                blocks = [ToolUseContent(call)]
+            else:
+                blocks = [TextContent("started")] if self.root_calls == 2 else []
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.parametrize("reply", ["receipt_echo", "empty"])
+@pytest.mark.asyncio
+async def test_explicit_finish_child_quiet_notification_reply_is_idle_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply: str
+) -> None:
+    from zeta.context_eviction.receipt_constructors import ASSISTANT_RECEIPT
+
+    echo = ASSISTANT_RECEIPT.format(kind="assistant text", seq=5)
+    backend = _QuietReplyChildBackend(
+        [TextContent(echo)] if reply == "receipt_echo" else []
+    )
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+    outcome = asyncio.Event()
+    idle_texts: list[object] = []
+    terminals: list[ToolResult | None] = []
+    channel = loop._background_owner.conversation_channel
+    publish_idle = channel.publish_idle
+
+    async def observe_idle(**kwargs):
+        entry = await publish_idle(**kwargs)
+        if backend.follow_up_answered.is_set():
+            idle_texts.append(kwargs["text"])
+            outcome.set()
+        return entry
+
+    def collect_event(event: StreamEvent) -> None:
+        if not backend.follow_up_answered.is_set():
+            return
+        if event.type is StreamEventType.AGENT_NOTIFICATION:
+            idle_texts.append(event.data.get("text"))
+            outcome.set()
+        elif (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "agent"
+        ):
+            terminals.append(event.tool_result)
+            outcome.set()
+
+    # test-contract: seam observes the parent idle notice after it is published
+    monkeypatch.setattr(channel, "publish_idle", observe_idle)
+    loop.set_background_event_sink(collect_event)
+    root_turn = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await await_or_fail(backend.child_started.wait(), what="child first turn")
+        handle = _run_handle_from_receipt(store)
+        sent = await loop.tool_registry.execute(
+            ToolCall(
+                "send-quiet",
+                "agent_send",
+                {"child_instance_id": handle, "message": "quiet follow up"},
+            )
+        )
+        assert sent["isError"] is False, sent
+        backend.release_child.set()
+        await await_or_fail(root_turn, what="root turn")
+        await await_or_fail(outcome.wait(), what="child outcome after quiet reply")
+        assert terminals == [], "a quiet reply must not end the explicit-finish child"
+        assert idle_texts == ["child is idle"]
+        status = await loop.tool_registry.execute(
+            ToolCall("quiet-status", "agent_status", {"handle": handle})
+        )
+        assert status["structuredContent"]["children"][0]["state"] == "idle"
+    finally:
+        backend.release_child.set()
+        root_turn.cancel()
+        await asyncio.wait_for(asyncio.gather(root_turn, return_exceptions=True), 10)
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
     tmp_path: Path,
