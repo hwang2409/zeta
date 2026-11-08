@@ -56,6 +56,11 @@ class MCPSession:
     async def _ensure_mcp_servers(self) -> None:
         if self._mcp_mount_attempted:
             return
+        if (
+            self._mcp_management.project_dir == self.tool_registry.cwd
+            and not await asyncio.to_thread(self.tool_registry.cwd.is_dir)
+        ):
+            self._mcp_management.project_dir = None
         if self._mcp_mount_task is None:
             self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
         await asyncio.shield(self._mcp_mount_task)
