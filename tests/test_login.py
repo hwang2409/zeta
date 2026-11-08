@@ -199,6 +199,8 @@ async def test_cancelled_login_closes_listener_without_waiting_for_thread(
     url_ready = asyncio.Event()
     callback_url = ""
     join_gate = threading.Event()
+    join_entered = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def build_url(state: str, challenge: str, redirect_uri: str) -> str:
         nonlocal callback_url
@@ -214,7 +216,9 @@ async def test_cancelled_login_closes_listener_without_waiting_for_thread(
 
     def held_join(thread: threading.Thread, timeout: float | None = None) -> None:
         if thread.name == "zeta-login-redirect":
-            join_gate.wait(timeout=10)
+            loop.call_soon_threadsafe(join_entered.set)
+            # the deadline is cleanup safety; join entry decides the race.
+            join_gate.wait(timeout=30)
         else:
             original_join(thread, timeout)
 
@@ -225,9 +229,13 @@ async def test_cancelled_login_closes_listener_without_waiting_for_thread(
     await asyncio.wait_for(url_ready.wait(), timeout=10)
     port = int(urlsplit(callback_url).port or 0)
     task.cancel()
+    join_entry = asyncio.create_task(asyncio.wait_for(join_entered.wait(), timeout=30))
     try:
         done, _ = await await_or_fail(
-            asyncio.wait({task}, timeout=10), what="login cancellation"
+            asyncio.wait(
+                {task, join_entry}, return_when=asyncio.FIRST_COMPLETED
+            ),
+            what="login cancellation or listener join",
         )
         assert task in done, "login cancellation waited for the listener thread"
         with pytest.raises(asyncio.CancelledError):
@@ -238,8 +246,10 @@ async def test_cancelled_login_closes_listener_without_waiting_for_thread(
         assert not list(tmp_path.iterdir())
     finally:
         join_gate.set()
+        join_entry.cancel()
         await await_or_fail(
-            asyncio.gather(task, return_exceptions=True), what="login cleanup"
+            asyncio.gather(task, join_entry, return_exceptions=True),
+            what="login cleanup",
         )
 
 
