@@ -1148,8 +1148,13 @@ def history(
     )
 
 
-def settings(runtime: ServerRuntime) -> dict:
-    return {"model": runtime.model, "approval_mode": runtime.policy.default.value}
+def settings(runtime: ServerRuntime, *, include_plan_mode: bool = False) -> dict:
+    result = {"model": runtime.model, "approval_mode": runtime.policy.default.value}
+    if include_plan_mode:
+        result["plan_mode"] = (
+            runtime.loop.plan_mode if runtime.loop is not None else False
+        )
+    return result
 
 
 def catalog(runtime: ServerRuntime) -> dict:

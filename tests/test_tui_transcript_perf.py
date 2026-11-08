@@ -1509,9 +1509,10 @@ async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_corrupt_child_transcript_renders_diagnosis_without_breaking_parent(
+async def test_epoch_two_corrupt_child_render_does_not_offer_repair(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
     root = ConversationStore(tmp_path / "sessions", session_id="root")
     root.append_message(Message(MessageRole.ASSISTANT, [TextContent("parent healthy")]))
     corrupt = ConversationStore(root.session_dir / "agents", session_id="1")
@@ -1564,6 +1565,7 @@ async def test_corrupt_child_transcript_renders_diagnosis_without_breaking_paren
     assert "parent healthy" in rendered
     assert "sibling healthy" in rendered
     assert "transcript terminated invalid conversation row at row 3 (session 1)" in rendered
+    assert "/repair-transcript" not in rendered
     assert "must-not-leak" not in rendered
     assert child_path.read_bytes() == damaged
 
