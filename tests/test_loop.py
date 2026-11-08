@@ -2962,6 +2962,38 @@ async def test_thinking_only_nudge_runs_even_at_max_turns(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_receipt_echo_reply_is_nudged_like_an_empty_reply(tmp_path: Path) -> None:
+    from zeta.context_eviction.receipt_constructors import ASSISTANT_RECEIPT
+
+    echo = ASSISTANT_RECEIPT.format(kind="assistant text", seq=5)
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent(echo)], stop_reason="end_turn"),
+            ScriptedTurn([TextContent("here is the answer")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    try:
+        events = await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
+        messages = store.messages()
+        nudges = [
+            index
+            for index, message in enumerate(messages)
+            if message.metadata.get("zeta_event") == "empty_turn_nudge"
+        ]
+        assert len(nudges) == 1, "a receipt-only reply must be nudged like an empty one"
+        # The echo stays persisted as written, so the TUI still shows it.
+        assert messages[nudges[0] - 1].content == [TextContent(echo)]
+        assert len(backend.calls) == 2
+        turn_ends = [e for e in events if e.type is StreamEventType.TURN_END]
+        assert turn_ends[-1].message is not None
+        assert turn_ends[-1].message.content == [TextContent("here is the answer")]
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_thinking_only_reply_is_nudged_once_and_recovers(tmp_path: Path) -> None:
     backend = FakeBackend(
         [

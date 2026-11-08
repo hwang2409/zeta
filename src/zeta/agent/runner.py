@@ -300,14 +300,14 @@ async def consume_child(
     if final_message is None:
         text = "agent error: child ended without a final response"
         return terminal_result(state="failed", text=text)
+    from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE, has_visible_output
     final_text = assistant_text(final_message)
-    if not final_text.strip():
+    if not has_visible_output(final_message):  # empty or only eviction receipts
         if final_message.metadata.get("stop_reason") == "max_tokens":
-            from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE
-
             return terminal_result(state="completed", text=OUTPUT_LIMIT_ERROR_MESSAGE)
-        text = "agent error: child returned an empty final assistant message"
-        return terminal_result(state="failed", text=text)
+        if child_loop.explicit_finish:  # wrote nothing: idle, not failed
+            return terminal_result(state="idle", text="", status="running")
+        return terminal_result(state="failed", text="agent error: child returned an empty final assistant message")
     if record_report is not None:
         record_report(final_text)
     if child_loop.explicit_finish:
