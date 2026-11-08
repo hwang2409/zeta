@@ -27,6 +27,7 @@ jobs:
       - name: Check merge resolutions
         env:
           EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
