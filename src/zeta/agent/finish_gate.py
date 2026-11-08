@@ -145,10 +145,6 @@ class CausalEpisodeRegistry:
         if episode is not None:
             episode.member_instance_ids.discard(instance_id)
 
-    @property
-    def association_count(self) -> int:
-        return len(self._by_staged_id) + len(self._by_member)
-
 
 @dataclass(slots=True)
 class FinishGateControl:

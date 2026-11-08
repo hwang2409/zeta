@@ -12,7 +12,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from .storage_format import WRITER_EPOCH, require_closed_variant
+
+AttentionKind = Literal["decision", "answer", "decided", "deferred"]
 
 from .core.session_files import (
     child_directory,
@@ -46,6 +50,7 @@ class AttentionRecord:
     resolved_at: str | None = None
     fork_session_id: str | None = None
     decision: str | None = None
+    kind: AttentionKind = "decision"
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> AttentionRecord:
@@ -54,6 +59,8 @@ class AttentionRecord:
         if not set(value).issubset(allowed):
             raise ValueError("unknown attention record fields")
         normalized = dict(value)
+        normalized["kind"] = value.get("kind", "decision")
+        require_closed_variant("attention.kind", normalized["kind"])
         normalized["options"] = tuple(value.get("options", ()))
         record = cls(**normalized)
         if (
@@ -73,7 +80,7 @@ class AttentionRecord:
         return record
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "id": self.id,
             "created_at": self.created_at,
             "session_id": self.session_id,
@@ -90,13 +97,17 @@ class AttentionRecord:
             "fork_session_id": self.fork_session_id,
             "decision": self.decision,
         }
+        if self.kind != "decision":
+            result["kind"] = self.kind
+        return result
 
 
 class AttentionStore:
     """Own attention records behind one small session-local interface."""
 
-    def __init__(self, session_dir: Path):
+    def __init__(self, session_dir: Path, *, writer_epoch: int = WRITER_EPOCH):
         self.session_dir = Path(session_dir)
+        self.writer_epoch = writer_epoch
         self.directory = self.session_dir / "attention"
 
     def request(
@@ -111,7 +122,19 @@ class AttentionStore:
         options: list[str] | tuple[str, ...] = (),
         recommendation: str | None = None,
         lane: str = "orchestrator",
+        kind: AttentionKind = "decision",
     ) -> AttentionRecord:
+        require_closed_variant("attention.kind", kind)
+        if kind != "decision" and self.writer_epoch < WRITER_EPOCH:
+            raise ValueError(
+                "non-decision attention kinds require the one-way shared cutover: "
+                f"zeta storage-format advance --expected-epoch {self.writer_epoch} "
+                f"--target-epoch {WRITER_EPOCH}"
+            )
+        if kind != "decision" and (options or recommendation is not None):
+            raise ValueError(
+                "non-decision attention kinds cannot have options or recommendation"
+            )
         if (
             not isinstance(title, str)
             or not title.strip()
@@ -147,9 +170,27 @@ class AttentionStore:
             options=tuple(item.strip() for item in options),
             recommendation=recommendation.strip() if recommendation else None,
             status="open",
+            kind=kind,
         )
         self.replace(record, create_directory=True)
         return record
+
+    def dismiss(
+        self, attention_id: str, *, session_id: str
+    ) -> tuple[AttentionRecord, bool]:
+        with self._resolution_lock():
+            current = self.get(attention_id)
+            if current.session_id != session_id:
+                raise ValueError("attention record does not belong to this session")
+            if current.status == "resolved":
+                return current, True
+            if current.kind == "decision":
+                raise ValueError("decision attention items require a reply")
+            dismissed = replace(
+                current, status="resolved", resolved_at=_now(), decision=None
+            )
+            self.replace(dismissed)
+            return dismissed, False
 
     def get(self, attention_id: str) -> AttentionRecord:
         if len(attention_id) != 32 or any(
