@@ -32,7 +32,11 @@ from tests.support.processes import (
     wait_for_path_command,
     wait_pid_exited,
 )
-from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.background import (
+    BackgroundAgentOwner,
+    CancellationRequest,
+    _recover_nested_children,
+)
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -42,6 +46,7 @@ from zeta.protocol.types import (
     MessageRole,
     TextContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
     with_message_origin,
 )
@@ -69,6 +74,101 @@ def _renderable_plain(renderable: object) -> str:
     output = StringIO()
     Console(file=output, width=80, force_terminal=True).print(renderable)
     return Text.from_ansi(output.getvalue()).plain
+
+
+def test_nested_recovery_uses_indexed_tool_result_lookup() -> None:
+    tool_call = ToolCall("call-1", "child", {})
+
+    class Store:
+        session_id = "parent"
+
+        def agent_children(self):
+            return {
+                "marker": {
+                    "tool_call": tool_call.to_dict(),
+                    "child_session_path": "child",
+                    "description": "child",
+                }
+            }
+
+        def tool_result(self, tool_call_id):
+            assert tool_call_id == tool_call.id
+            return ToolResult(tool_call.id, "done")
+
+        def agent_completion_notifications_by_child(self):
+            return {}
+
+        def messages(self):
+            raise AssertionError("recovery must not materialize messages")
+
+        def finish_agent_child(self, marker_key):
+            assert marker_key == "marker"
+
+    _recover_nested_children(Store(), Store(), {}, {}, [])
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_retains_confirmation_tasks() -> None:
+    owner = BackgroundAgentOwner.__new__(BackgroundAgentOwner)
+    owner._canceling = False
+    owner._cancel_requested = set()
+    owner._cancel_confirmations = {}
+    owner._parent_ids = {"child": None}
+    owner._cancellation_tasks = set()
+    confirmation = asyncio.create_task(asyncio.sleep(0, result=True))
+    calls = 0
+
+    def cancel():
+        nonlocal calls
+        calls += 1
+        return CancellationRequest(confirmation, confirmation)
+
+    owner._cancellers = {"child": cancel}
+    owner.cancel_all()
+    await asyncio.wait_for(confirmation, 10)
+    assert calls == 1
+    assert owner._cancel_confirmations == {"child": confirmation}
+    owner.cancel_all()
+    assert calls == 1
+
+
+def test_cancel_subtree_keeps_targeted_behavior() -> None:
+    owner = BackgroundAgentOwner.__new__(BackgroundAgentOwner)
+    calls = []
+    owner._canceling = False
+    owner._cancel_requested = set()
+    owner._cancel_confirmations = {}
+    owner._parent_ids = {"root": None, "child": "root", "other": None}
+    owner._cancellers = {
+        instance_id: (lambda instance_id=instance_id: calls.append(instance_id))
+        for instance_id in owner._parent_ids
+    }
+
+    owner.cancel_subtree("root")
+    assert calls == ["root", "child"]
+    assert owner._cancel_requested == {"root", "child"}
+
+
+def test_cancel_all_invokes_each_canceller_once_without_subtree_scans() -> None:
+    owner = BackgroundAgentOwner.__new__(BackgroundAgentOwner)
+    owner._canceling = False
+    calls = []
+    owner._cancellers = {str(index): (lambda: None) for index in range(3)}
+    owner._cancel_requested = set()
+    owner._cancel_confirmations = {}
+    owner._parent_ids = {str(index): None for index in range(3)}
+    owner._cancellers = {
+        instance_id: (lambda instance_id=instance_id: calls.append(instance_id))
+        for instance_id in owner._cancellers
+    }
+
+    def fail_subtree(_instance_id):
+        raise AssertionError("cancel_all must not scan each subtree")
+
+    owner._subtree_ids = fail_subtree
+    owner.cancel_all()
+    assert calls == ["0", "1", "2"]
+    assert owner._cancel_requested == {"0", "1", "2"}
 
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
