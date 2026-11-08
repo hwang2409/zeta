@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 4
+WRITER_EPOCH: Final = 5
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -98,7 +98,7 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     'tool_result_resource': frozenset({'annotations', 'resource', 'type'}),
     'tool_result_resource_contents': frozenset({'blob', 'mimeType', 'text', 'uri'}),
     'tool_result_annotations': frozenset({'audience', 'lastModified', 'priority'}),
-    'attention_record': frozenset({'created_at', 'decision', 'entry_id', 'entry_seq', 'fork_session_id', 'id', 'lane', 'options', 'project_id', 'recommendation', 'resolved_at', 'session_id', 'status', 'title', 'why'}),
+    'attention_record': frozenset({'created_at', 'kind', 'decision', 'entry_id', 'entry_seq', 'fork_session_id', 'id', 'lane', 'options', 'project_id', 'recommendation', 'resolved_at', 'session_id', 'status', 'title', 'why'}),
     'attention_fork_meta': frozenset({'attention_id', 'forked_at_entry', 'forked_from_session'}),
     "transcript_recovery.evidence": frozenset(
         {
@@ -141,6 +141,7 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "attention.kind": frozenset({"decision", "answer", "decided", "deferred"}),
     "account.provider": frozenset({"anthropic", "codex"}),
     "account_registry.version": frozenset({1}),
     "conversation.entry_type": frozenset(

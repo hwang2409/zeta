@@ -992,7 +992,7 @@ def test_malformed_registry_decisions_use_startup_state(
         assert app.loop.project_context_health is not None
         assert app.loop.project_context_health.code == "malformed_project"
         asyncio.run(app._decisions_tick())
-        assert asyncio.run(app.slash_decisions("")) == "no open decisions"
+        assert asyncio.run(app.slash_decisions("")) == "no open attention items"
     finally:
         asyncio.run(app.close())
 
