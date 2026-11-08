@@ -276,7 +276,10 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         returncode, stderr = run.returncode, run.stderr
     except subprocess.TimeoutExpired as exc:
         # The run is killed; the traffic it recorded is still checked first.
-        run, returncode, stderr = None, "timed out", exc.stderr
+        # The last progress lines name the step that was still running.
+        err = exc.stderr or b""
+        tail = (err.decode() if isinstance(err, bytes) else err).splitlines()[-20:]
+        run, returncode, stderr = None, "timed out", "\n".join(tail)
 
     # Provider traffic went to the local stub only: no keychain read and no
     # connect or lookup to a non-local host got past the harness. The harness

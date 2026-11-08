@@ -78,6 +78,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--idle-seconds", type=int, default=60)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--serve-traffic-only",
+        action="store_true",
+        help="serve probe: one lifetime per session and no timed samples",
+    )
     return parser.parse_args()
 
 
@@ -227,7 +232,14 @@ async def serve_one(
     The copied session is pinned to the stub, so resume's model lookup and any
     wake turn reach only the local stub. `stub_lookups` counts the lookups;
     `stub_requests` counts turn requests that arrived before the last reply.
+    Each step prints a progress line to stderr, so a run that hangs names its step.
     """
+    started = time.perf_counter()
+
+    def step(name: str) -> None:
+        elapsed = time.perf_counter() - started
+        print(f"serve {sid[:8]}: {name} +{elapsed:.2f}s", file=sys.stderr, flush=True)
+
     socket = home / "bench.sock"
     server = await asyncio.to_thread(
         lambda: ZetaServer(
@@ -240,17 +252,24 @@ async def serve_one(
         )
     )
     await server.start()
+    step("server started")
     try:
-        return await _serve_session(socket, sid, stub, repeats)
+        return await _serve_session(socket, sid, stub, repeats, step)
     finally:
         try:
+            step("close start")
             await server.close()
+            step("close done")
         finally:
             socket.unlink(missing_ok=True)
 
 
 async def _serve_session(
-    socket: Path, sid: str, stub: StubOllama, repeats: int
+    socket: Path,
+    sid: str,
+    stub: StubOllama,
+    repeats: int,
+    step: Callable[[str], None],
 ) -> dict[str, Any]:
     # Frames (resume, notifications) exceed StreamReader's 64 KiB default line limit.
     reader, writer = await asyncio.open_unix_connection(str(socket), limit=1 << 26)
@@ -273,6 +292,7 @@ async def _serve_session(
             if frame.get("id") == ident:
                 if "error" in frame:
                     raise RuntimeError(f"{method}: {frame['error']}")
+                step(f"{method} (request {ident})")
                 return ((time.perf_counter_ns() - started) / 1e6, load1()), frame
 
     seen, lookups = len(stub.requests), stub.lookups
@@ -304,14 +324,17 @@ async def _serve_session(
     finally:
         writer.close()
         await writer.wait_closed()
+        step("client closed")
 
 
-def serve_probe(home: Path, sid: str, stub: StubOllama) -> dict[str, Any]:
+def serve_probe(
+    home: Path, sid: str, stub: StubOllama, traffic_only: bool = False
+) -> dict[str, Any]:
     # A resume can start a wake turn, so a second resume on one server is refused;
-    # each resume sample gets its own server.
-    runs = [
-        asyncio.run(serve_one(home, sid, stub, 10 if i == 0 else 0)) for i in range(5)
-    ]
+    # each resume sample gets its own server. Traffic-only runs one lifetime with
+    # no history/status samples: enough to see where provider traffic goes.
+    repeats = [0] if traffic_only else [10, 0, 0, 0, 0]
+    runs = [asyncio.run(serve_one(home, sid, stub, n)) for n in repeats]
     return {
         "resume": summary([r["resume"] for r in runs]),
         "history": summary(runs[0]["history"]),
@@ -773,7 +796,9 @@ def scaling_probe(box: Sandbox, home: Path, sid: str, name: str) -> dict[str, An
 PROBES: dict[str, Callable[..., dict[str, Any]]] = {
     "store": lambda box, home, sid, name, cwd: store_probe(home, sid, name),
     "context": lambda box, home, sid, name, cwd: context_probe(home, sid),
-    "serve": lambda box, home, sid, name, cwd: serve_probe(home, sid, box.stub),
+    "serve": lambda box, home, sid, name, cwd: serve_probe(
+        home, sid, box.stub, ARGS.serve_traffic_only
+    ),
     "tui": lambda box, home, sid, name, cwd: tui_probe(
         box, home, sid, name, cwd, ARGS.idle_seconds
     ),
