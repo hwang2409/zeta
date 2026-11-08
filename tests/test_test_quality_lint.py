@@ -1,3 +1,4 @@
+import difflib
 import subprocess
 from pathlib import Path
 
@@ -27,6 +28,17 @@ def _diff(path: str, source: str, added_lines: set[int] | None = None) -> str:
             *hunks,
         ]
     )
+
+
+def _replacement_diff(path: str, before: str, after: str, *, context: int = 3) -> str:
+    body = difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        n=context,
+    )
+    return f"diff --git a/{path} b/{path}\n" + "".join(body)
 
 
 def _lint(
@@ -864,6 +876,104 @@ MonkeyPatch().setenv(\"ZETA_PATCH\", \"1\")
             quality.GLOBAL_BOOTSTRAP_ERROR.format(name="ZETA_PATCH"),
         ),
     ]
+
+
+@pytest.mark.parametrize("layout", ["one-line", "split"])
+@pytest.mark.parametrize("marked", [False, True])
+def test_private_patch_rule_is_layout_independent(
+    tmp_path: Path, layout: str, marked: bool
+) -> None:
+    path = "tests/test_example.py"
+    one_line = '    monkeypatch.setattr(target, "_private", replacement)\n'
+    if layout == "one-line":
+        call = one_line
+        if marked:
+            call = (
+                "    # test-contract: seam no public replacement hook exists\n" + call
+            )
+    else:
+        marker = (
+            "  # test-contract: seam no public replacement hook exists"
+            if marked
+            else ""
+        )
+        call = (
+            "    monkeypatch.setattr(\n"
+            '        target, "_private", replacement\n'
+            f"    ){marker}\n"
+        )
+    source = "def test_case(monkeypatch):\n" + call
+    new_diff = _replacement_diff(path, "def test_case(monkeypatch):\n", source)
+    reflow_diff = _replacement_diff(
+        path, "def test_case(monkeypatch):\n" + one_line, source
+    )
+
+    new_findings = _lint(tmp_path, source, diff=new_diff)
+    assert [finding.code for finding in new_findings] == ([] if marked else ["TQ003"])
+    assert lint_diff(reflow_diff, tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (
+            'unused = 1\n\ndef test_case(monkeypatch):\n    monkeypatch.setattr(target, "_private", replacement)\n',
+            'def test_case(monkeypatch):\n    monkeypatch.setattr(\n        target, "_private", replacement\n    )\n',
+        ),
+        (
+            'def test_case(monkeypatch):\n    monkeypatch.setattr(target, "_private", replacement)\n    assert one\n    assert two\n\nunused = 1\n',
+            'def test_case(monkeypatch):\n    monkeypatch.setattr(\n        target, "_private", replacement\n    )\n    assert one\n    assert two\n',
+        ),
+        (
+            'first = 1\n\ndef test_case(monkeypatch):\n    monkeypatch.setattr(target, "_private", replacement)\n\nlast = 1\n',
+            'def test_case(monkeypatch):\n    monkeypatch.setattr(\n        target, "_private", replacement\n    )\n',
+        ),
+    ],
+    ids=["deletion-at-line-one", "deletion-at-eof", "multiple-deletion-hunks"],
+)
+def test_private_patch_reflow_survives_zero_count_destination_hunks(
+    tmp_path: Path, before: str, after: str
+) -> None:
+    diff = _replacement_diff("tests/test_example.py", before, after, context=0)
+
+    assert _lint(tmp_path, after, diff=diff) == []
+
+
+def test_new_file_has_an_exactly_empty_base_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = 'def test_case(monkeypatch):\n    monkeypatch.setattr(target, "_private", replacement)\n'
+    seen_base_sources = []
+    real_lint_source = quality.lint_source
+
+    def capture_base_source(path, current, added, base_source=None):
+        seen_base_sources.append(base_source)
+        return real_lint_source(path, current, added, base_source)
+
+    # test-contract: seam lint_diff does not expose its reconstructed base source
+    monkeypatch.setattr(quality, "lint_source", capture_base_source)
+
+    diff = """diff --git a/tests/test_example.py b/tests/test_example.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_example.py
+@@ -0,0 +1,2 @@
++def test_case(monkeypatch):
++    monkeypatch.setattr(target, "_private", replacement)
+"""
+
+    findings = _lint(tmp_path, source, diff=diff)
+
+    assert findings == [
+        quality.Finding(
+            Path("tests/test_example.py"),
+            2,
+            5,
+            "TQ003",
+            quality.CONTRACT_ERROR,
+        )
+    ]
+    assert seen_base_sources == [""]
 
 
 def test_rule_checks_only_added_test_lines(tmp_path: Path) -> None:

@@ -86,6 +86,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop.empty_turn import empty_turn_error
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import (
     ApprovalLifecycle,
@@ -2990,26 +2991,28 @@ async def test_resume_second_client_and_malformed_frame(tmp_path: Path) -> None:
     session = (await _request(reader, writer, 3, "status"))[-1]["result"]["session"][
         "session_id"
     ]
-    second_reader, second_writer = await asyncio.wait_for(
-        asyncio.open_unix_connection(str(first.socket_path)), TIMEOUT
-    )
-    refused = (
-        await _request(
-            second_reader,
-            second_writer,
-            1,
-            "hello",
-            {"protocol_version": "1.0"},
+    try:
+        second_reader, second_writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(first.socket_path)), TIMEOUT
         )
-    )[-1]
-    assert refused["error"]["code"] == -32001
-    second_writer.close()
-    await asyncio.wait_for(second_writer.wait_closed(), TIMEOUT)
-    writer.write(b"not json\n")
-    await writer.drain()
-    malformed = await _read(reader)
-    assert malformed["error"]["code"] == -32700
-    await close_serve(first, writer)
+        refused = (
+            await _request(
+                second_reader,
+                second_writer,
+                1,
+                "hello",
+                {"protocol_version": "1.0"},
+            )
+        )[-1]
+        assert refused["error"]["code"] == -32001
+        second_writer.close()
+        await asyncio.wait_for(second_writer.wait_closed(), TIMEOUT)
+        writer.write(b"not json\n")
+        await writer.drain()
+        malformed = await _read(reader)
+        assert malformed["error"]["code"] == -32700
+    finally:
+        await close_serve(first, writer)
 
     resumed = ZetaServer(
         home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
@@ -3444,23 +3447,23 @@ async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> Non
     )
     await server.start()
     server._account_warnings = ("could not clean up account directory /secret",)
+    writers = []
     try:
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        writers.append(writer)
         writer.close()
         await writer.wait_closed()
         await asyncio.sleep(0)
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
-        try:
-            hello = await _request(
-                reader, writer, 1, "hello", {"protocol_version": "1.0"}
-            )
-            assert hello[-1]["result"]["notices"] == [
-                "could not clean up account directory /secret"
-            ]
-        finally:
-            await close_serve(server, writer)
+        writers.append(writer)
+        hello = await _request(
+            reader, writer, 1, "hello", {"protocol_version": "1.0"}
+        )
+        assert hello[-1]["result"]["notices"] == [
+            "could not clean up account directory /secret"
+        ]
     finally:
-        await server.close()
+        await close_serve(server, *writers)
 
 
 @pytest.mark.asyncio
@@ -3763,6 +3766,12 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
         session_id="session",
         background=True,
     )
+    bounded_error = empty_turn_error("n" * 12_000, "i" * 12_000, "error")
+    await client._event(
+        StreamEvent(StreamEventType.ERROR, error=bounded_error),
+        session_id="session",
+        background=True,
+    )
 
     assert notifications == [
         (
@@ -3784,6 +3793,10 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
                 },
                 "data": {},
             },
+        ),
+        (
+            "error",
+            {"error": {"code": "empty_turn", "message": bounded_error.message}, "data": {}},
         ),
     ]
 
