@@ -190,7 +190,7 @@ def test_read_pty_until_names_early_exit_and_output() -> None:
         stdout=slave,
         stderr=slave,
     )
-    process.wait()
+    process.wait(timeout=10)
     output = bytearray(os.read(master, 4096))
     try:
         os.close(slave)
