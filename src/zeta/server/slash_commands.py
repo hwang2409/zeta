@@ -9,6 +9,7 @@ themselves as such rather than half-executing.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
+from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
@@ -272,6 +274,34 @@ class ServerSlashSession:
                 runtime.loop._set_runtime_project(runtime.metadata)
         return view.text
 
+    async def slash_repair_transcript(self, args: str) -> str:
+        parts = args.split()
+        if len(parts) not in {2, 3} or parts[-1] != "confirm":
+            return "usage: /repair-transcript <session-id> [<child-run-id>] confirm"
+        child_run_id = parts[1] if len(parts) == 3 else None
+        result = await repair_transcript_for_runtime(
+            self._runtime.manager,
+            parts[0],
+            child_run_id,
+            parent_store=(
+                self._runtime.opened.store
+                if self._runtime.opened is not None
+                else None
+            ),
+            memory_reconciler=(
+                self._runtime.loop.memory_reconciler
+                if self._runtime.loop is not None
+                else None
+            ),
+        )
+        return (
+            f"repaired transcript {parts[0]}"
+            + (f" child {child_run_id}" if child_run_id is not None else "")
+            + "; quarantine "
+            f"{result.quarantine_id}; retained through sequence "
+            f"{result.retained_last_sequence}"
+        )
+
     async def slash_memory(self, args: str) -> str:
         runtime = self._runtime
         project_id = runtime.metadata.project_id
@@ -282,7 +312,7 @@ class ServerSlashSession:
             return "memory: project registry unavailable"
         loop = getattr(runtime, "loop", None)
         reconciler = loop.memory_reconciler if loop is not None else None
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             run_memory_command,
             registry,
             project_id,
@@ -290,6 +320,7 @@ class ServerSlashSession:
             reconciler,
             MemoryMutationAuthorization.direct_slash(),
         )
+        return await result if inspect.isawaitable(result) else result
 
     async def slash_mcp(
         self, args: str
