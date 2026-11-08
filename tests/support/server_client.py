@@ -63,6 +63,104 @@ async def request(
         buffered.append(frame)
 
 
+async def approve_and_collect_grant(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request_id: str | int,
+    approval_request_id: str,
+    expected_scope: str,
+    expected_changed: list[str],
+) -> dict[str, Any]:
+    """Collect the approve response and its grant event as one transaction."""
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "approve",
+                    "params": {
+                        "request_id": approval_request_id,
+                        "scope": expected_scope,
+                    },
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+    await asyncio.wait_for(writer.drain(), TIMEOUT)
+    frames: list[dict[str, Any]] = []
+    response: dict[str, Any] | None = None
+    grant_events: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    try:
+        try:
+            async with asyncio.timeout(10):
+                while response is None or not grant_events:
+                    frame = await read(reader)
+                    frames.append(frame)
+                    is_response = frame.get("id") == request_id
+                    is_grant_event = (
+                        frame.get("params", {}).get("event") == "session_grants_changed"
+                    )
+                    if not is_response and not is_grant_event:
+                        deferred.append(frame)
+                        continue
+                    if is_response:
+                        response = frame
+                        assert response.get("result", {}).get("accepted") is True, (
+                            f"approve response was not accepted: response={response!r}; "
+                            f"all observed frames={frames!r}"
+                        )
+                        assert (
+                            response["result"].get("request_id") == approval_request_id
+                        ), (
+                            f"approve response has wrong request id: response={response!r}; "
+                            f"all observed frames={frames!r}"
+                        )
+                        assert response["result"].get("scope") == expected_scope, (
+                            f"approve response has wrong scope: response={response!r}; "
+                            f"all observed frames={frames!r}"
+                        )
+                    if is_grant_event:
+                        grant_events.append(frame["params"])
+                        data = frame["params"].get("data")
+                        assert isinstance(data, dict), (
+                            f"grant event has no data: frame={frame!r}; "
+                            f"all observed frames={frames!r}"
+                        )
+                        assert data.get("change") == "grant", (
+                            f"grant event has wrong change: frame={frame!r}; "
+                            f"all observed frames={frames!r}"
+                        )
+                        assert data.get("changed") == expected_changed, (
+                            f"grant event has wrong data: frame={frame!r}; "
+                            f"all observed frames={frames!r}"
+                        )
+        except (AssertionError, TimeoutError) as exc:
+            if (
+                response is not None
+                and response.get("result", {}).get("accepted") is True
+                and not grant_events
+            ):
+                raise AssertionError(
+                    "approve response without session_grants_changed; "
+                    f"response={response!r}; all observed frames={frames!r}"
+                ) from None
+            raise AssertionError(
+                f"approve collection failed: {exc}; all observed frames={frames!r}"
+            ) from None
+    finally:
+        _buffer(reader).extendleft(reversed(deferred))
+    assert response is not None, (
+        f"missing approve response; all observed frames={frames!r}"
+    )
+    assert len(grant_events) == 1, (
+        f"expected exactly one grant event; all observed frames={frames!r}"
+    )
+    return grant_events[0]
+
+
 async def frames_until_event(
     reader: asyncio.StreamReader, name: str
 ) -> list[dict[str, Any]]:

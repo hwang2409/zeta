@@ -23,6 +23,9 @@ class _ContextItem:
     entry: ConversationEntry | None
     message: Message
     fixed: bool = False
+    # A resident stored value whose content alone determines `message`, so its
+    # token count can be reused on later turns.
+    count_source: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
