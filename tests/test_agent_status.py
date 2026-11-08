@@ -17,6 +17,7 @@ import pytest
 import zeta.tools.agent as agent_tools
 from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from zeta.agent.pending_delivery import send_to_run
 from zeta.agent.presets import AGENT_PRESETS
 from zeta.agent.receipt import encode_json
 from zeta.agent.terminal_fence import TerminalTransitionFence
@@ -77,6 +78,82 @@ async def _status(
     return await loop.tool_registry.execute(
         ToolCall("status-call", "agent_status", arguments)
     )
+
+
+@pytest.mark.asyncio
+async def test_child_tool_count_is_cumulative_across_follow_up_segments(
+    tmp_path: Path,
+) -> None:
+    child_call = ToolCall(
+        "background-agent",
+        "agent",
+        {
+            "prompt": "first work",
+            "description": "background",
+            "agent_type": "run",
+            "background": True,
+        },
+    )
+    todo_one = ToolCall("todo-one", "todo", {"items": []})
+    todo_two = ToolCall("todo-two", "todo", {"items": []})
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[child_call])],
+        {
+            "first work": [
+                ScriptedTurn(tool_calls=[todo_one]),
+                ScriptedTurn(content=[TextContent("first segment")]),
+                ScriptedTurn(tool_calls=[todo_two]),
+                ScriptedTurn(content=[TextContent("second segment")]),
+            ]
+        },
+        parent_prompt="start",
+        gated_child_call=2,
+        gated_child_prompts={"first work"},
+        parent_waits_for_children=False,
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_started["first work"].wait(), timeout=10)
+        handle = next(iter(store.agent_children()))
+        child_path = Path(store.agent_children()[handle]["child_session_path"])
+        assert await send_to_run(
+            store,
+            handle,
+            "follow up",
+            channel=loop._background_owner.conversation_channel,
+        ) is None
+        backend.release_children.set()
+        await wait_background_owner(loop)
+
+        status = await _status(loop, handle)
+        child = status["structuredContent"]["children"][0]
+        assert backend.child_calls["first work"] == 4
+        assert child["tool_calls"] == 3
+        durable = json.loads(
+            (child_path / "agent_lifecycle.json").read_text(encoding="utf-8")
+        )
+        assert durable["tool_calls"] == 3
+
+        rendered = AgentCard.render_receipt(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=child_call,
+                tool_result=ToolResult(
+                    child_call.id,
+                    "done",
+                    structured_content=child,
+                ),
+            ),
+            lifecycle=child,
+        )
+        assert rendered is not None
+        assert "3 tool calls" in rendered.plain
+    finally:
+        backend.release_children.set()
+        await loop.close()
 
 
 @pytest.mark.asyncio

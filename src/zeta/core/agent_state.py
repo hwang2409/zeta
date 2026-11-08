@@ -635,7 +635,7 @@ class AgentStateMixin:
         if turns_used is not None:
             self._agent_lifecycle["turns_used"] = turns_used
         if tool_calls is not None:
-            self._agent_lifecycle["tool_calls"] = tool_calls
+            self._agent_lifecycle["tool_calls"] += tool_calls
         if state is not None:
             self._agent_lifecycle["state"] = state
         if idle_since is not None:
