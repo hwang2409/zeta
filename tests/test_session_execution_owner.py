@@ -17,8 +17,8 @@ from typing import Any
 
 import pytest
 
-from zeta.core.session import SessionManager
 from zeta.core import session_execution
+from zeta.core.session import SessionManager
 from zeta.core.session_execution import (
     OwnerHint,
     SessionExecutionLease,

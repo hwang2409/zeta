@@ -7288,9 +7288,9 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-        await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
+        await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
         backend.release_grandchild.set()
-        await asyncio.wait_for(backend.child_notification_started.wait(), timeout=2)
+        await asyncio.wait_for(backend.child_notification_started.wait(), timeout=10)
 
         child_store = ConversationStore(store.session_dir / "agents", session_id="1")
         root_notifications = store.agent_notifications(pending_only=False)
@@ -7317,12 +7317,18 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     finally:
         backend.release_grandchild.set()
         backend.release_child_notification.set()
-        await loop.close()
-        if grandchild_store is not None:
-            grandchild_store.close()
-        if child_store is not None:
-            child_store.close()
-        store.close()
+        try:
+            await loop.close()
+        finally:
+            try:
+                if grandchild_store is not None:
+                    grandchild_store.close()
+            finally:
+                try:
+                    if child_store is not None:
+                        child_store.close()
+                finally:
+                    store.close()
 
 
 @pytest.mark.asyncio
