@@ -92,6 +92,7 @@ from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.loop._completion import observed_completion
 from zeta.runtime.loop.empty_turn import empty_turn_tool_error
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.runtime.prompt import RuntimePrompt
@@ -115,6 +116,41 @@ pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 async def _collect(events):
     return [event async for event in events]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close", [False, True], ids=["abandoned", "closed"])
+async def test_observed_completion_does_not_leave_a_producer_task(
+    tmp_path: Path, close: bool
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.queue_client_steering(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("steer")]), MessageOrigin.USER
+        )
+    )
+    steering = store.pending_client_steering()
+    assert steering is not None
+    completion_closed = asyncio.Event()
+
+    async def completion() -> AsyncIterator[StreamEvent]:
+        try:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="reply")
+            await await_or_fail(asyncio.Event().wait(), what="completion held open")
+        finally:
+            completion_closed.set()
+
+    before = set(asyncio.all_tasks())
+    stream = observed_completion(completion(), store, steering)
+    event = await await_or_fail(anext(stream), what="first observed completion event")
+    if close:
+        await await_or_fail(stream.aclose(), what="observed completion close")
+
+    assert event.delta == "reply"
+    # test-contract: seam provider consumption must not create a detached task
+    assert set(asyncio.all_tasks()) <= before
+    assert completion_closed.is_set() is close
+    store.close()
 
 
 def _rendered_text(rendered: object) -> str:
