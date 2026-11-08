@@ -123,8 +123,9 @@ async def test_resume_activation_and_stage_reads_do_not_encode_history(
     finally:
         await loop.close(background_task_cause="test cleanup")
 
-    assert activation_encodes == 0, "activation encoded historical rows"
-    assert backend_counts == [0, 0], "delivery staging encoded historical rows"
+    assert (activation_encodes, backend_counts) == (0, [0, 0]), (
+        "activation or delivery staging encoded historical rows"
+    )
 
 
 @pytest.mark.asyncio
