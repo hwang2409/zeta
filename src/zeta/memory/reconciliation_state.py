@@ -715,14 +715,14 @@ class ReconciliationState:
                 return Broken(
                     self.receipts_path,
                     f"malformed receipt at byte offset {offset}: {self._decode_reason(exc)}",
-                    "repair the archive offline and restart",
+                    "back up the archive, restore or repair valid JSON lines, and restart",
                     payload,
                 )
             if not isinstance(value, dict):
                 return Broken(
                     self.receipts_path,
                     f"invalid receipt at byte offset {offset}: expected an object",
-                    "repair the archive offline and restart",
+                    "back up the archive, restore or repair valid JSON lines, and restart",
                     payload,
                 )
             try:
@@ -731,7 +731,7 @@ class ReconciliationState:
                 return Broken(
                     self.receipts_path,
                     f"invalid receipt at byte offset {offset}: {exc}",
-                    "repair the archive offline and restart",
+                    "back up the archive, restore or repair valid JSON lines, and restart",
                     payload,
                 )
             records.append(value)
@@ -955,14 +955,14 @@ class ReconciliationState:
             return Broken(
                 self.path,
                 self._decode_reason(exc),
-                "repair the cursor offline and restart",
+                "back up the cursor, restore or repair valid JSON, and restart",
                 payload,
             )
         if not isinstance(value, dict):
             return Broken(
                 self.path,
                 "invalid reconciliation cursor: expected an object",
-                "repair the cursor offline and restart",
+                "back up the cursor, restore or repair valid JSON, and restart",
                 payload,
             )
         try:
@@ -971,36 +971,14 @@ class ReconciliationState:
             return Broken(
                 self.path,
                 str(exc),
-                "repair the cursor offline and restart",
+                "back up the cursor, restore or repair valid JSON, and restart",
                 payload,
             )
 
     def _normalize_cursor(self, value: Mapping[str, Any]) -> dict[str, Any]:
         normalized = self._empty_value()
-        for name in (
-            "seq",
-            "generation",
-            "transcript_bytes",
-            "transcript_tokens",
-            "early_trigger_seq",
-        ):
-            candidate = value.get(name, 0)
-            if type(candidate) is not int or candidate < 0:
-                raise ValueError(f"invalid reconciliation cursor field: {name}")
-            normalized[name] = candidate
-        for name in (
-            "pending_failures",
-            "completed_ranges",
-            "terminal_receipts",
-        ):
-            candidate = value.get(name, [])
-            if not isinstance(candidate, list) or not all(
-                isinstance(item, dict) for item in candidate
-            ):
-                raise ValueError(f"invalid reconciliation cursor field: {name}")
-            for item in candidate:
-                self._validate_cursor_record(name, item)
-            normalized[name] = candidate
+        self._normalize_cursor_scalars(value, normalized)
+        self._normalize_cursor_records(value, normalized)
         last_failure = value.get("last_failure")
         if last_failure is not None and self._parse_failure(last_failure) is None:
             raise ValueError("invalid reconciliation cursor field: last_failure")
@@ -1019,6 +997,39 @@ class ReconciliationState:
                 raise ValueError("invalid reconciliation cursor field: scanner_failure")
             normalized["scanner_failure"] = {"seq": seq, "cause": cause}
         return normalized
+
+    @staticmethod
+    def _normalize_cursor_scalars(
+        value: Mapping[str, Any], normalized: dict[str, Any]
+    ) -> None:
+        for name in (
+            "seq",
+            "generation",
+            "transcript_bytes",
+            "transcript_tokens",
+            "early_trigger_seq",
+        ):
+            candidate = value.get(name, 0)
+            if type(candidate) is not int or candidate < 0:
+                raise ValueError(f"invalid reconciliation cursor field: {name}")
+            normalized[name] = candidate
+
+    def _normalize_cursor_records(
+        self, value: Mapping[str, Any], normalized: dict[str, Any]
+    ) -> None:
+        for name in (
+            "pending_failures",
+            "completed_ranges",
+            "terminal_receipts",
+        ):
+            candidate = value.get(name, [])
+            if not isinstance(candidate, list) or not all(
+                isinstance(item, dict) for item in candidate
+            ):
+                raise ValueError(f"invalid reconciliation cursor field: {name}")
+            for item in candidate:
+                self._validate_cursor_record(name, item)
+            normalized[name] = candidate
 
     @classmethod
     def _validate_cursor_record(

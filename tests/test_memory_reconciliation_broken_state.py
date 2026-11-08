@@ -172,6 +172,7 @@ async def test_broken_cursor_stops_reconciliation_and_renders_through_tui_and_se
             assert "memory-reconcile.json" in rendered
             assert "malformed JSON" in rendered
             assert "preserved" in rendered
+            assert "back up the cursor" in rendered
     finally:
         await app.close()
 
@@ -210,6 +211,7 @@ async def test_malformed_interior_receipt_stops_without_overwriting(
         assert replacement.automatic_memory_status is not None
         assert "memory-reconcile-receipts.jsonl" in replacement.automatic_memory_status
         assert f"byte offset {len(first) + 1}" in replacement.automatic_memory_status
+        assert "back up the archive" in replacement.automatic_memory_status
     finally:
         await replacement.close()
 
