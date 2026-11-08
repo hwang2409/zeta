@@ -37,7 +37,12 @@ from ...core.checkpoints import (
     load_session_json,
 )
 from ...core.child_lifecycle import select_legacy_child_lifecycle
-from ...core.session_files import child_directory, read_session_file
+from ...core.session_files import (
+    child_directory,
+    open_session_file,
+    read_session_file,
+    session_root,
+)
 from ...core.store import ConversationStore
 from ...models.catalog import known_model_names
 from ...protocol.types import (
@@ -63,7 +68,8 @@ from .approval import ChildApprovalPolicy  # noqa: F401
 
 _TRUNCATION_NOTE = "\n[truncated]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
-_VALID_AGENT_STATES = frozenset({"running", "idle", *_TERMINAL_AGENT_STATES})
+_NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
+_VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _TERMINAL_AGENT_STATES
 _STATUS_REASON_FALLBACK = "child status unavailable"
 _STATUS_REASON_MAX_BYTES = MAX_AGENT_RESULT_BYTES
 _STATUS_ROW_STRING_FIELDS = (
@@ -77,6 +83,8 @@ _STATUS_ROW_STRING_FIELDS = (
     "cwd",
 )
 _MISSING = object()
+_AGENT_OUTPUT_CACHE_MAX_ENTRIES = 4
+_AGENT_OUTPUT_CACHE_MAX_CHARS = 32 * 1024 * 1024
 
 
 def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
@@ -297,20 +305,21 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
         return read_session_file(directory_fd, name)
 
 
-def _read_agent_output(
-    store: object,
-    *,
-    requested_handle: str,
-    offset: int,
-    limit: int | None,
-    max_bytes: int,
-) -> dict[str, object]:
-    receipts = _active_agent_receipts(store)
-    child_path = receipts.get(requested_handle)
-    if child_path is None:
-        raise ValueError("unknown child handle")
+def _read_agent_transcript(
+    child_path: Path,
+    cached: tuple[tuple[int, int, int], str] | None,
+) -> tuple[tuple[int, int, int], str, bool]:
     try:
-        raw = _read_child_file(store, child_path, "conversation.jsonl")
+        with session_root(child_path) as directory_fd:
+            fd = open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY)
+            with os.fdopen(fd, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                key = (before.st_ino, before.st_size, before.st_mtime_ns)
+                if cached is not None and cached[0] == key:
+                    return (*cached, True)
+                raw = handle.read()
+                after = os.fstat(handle.fileno())
+            after_key = (after.st_ino, after.st_size, after.st_mtime_ns)
         rows = raw.splitlines(keepends=True)
         entries: list[ConversationEntry] = []
         for index, line in enumerate(rows):
@@ -355,8 +364,21 @@ def _read_agent_output(
             if entry.type == "message"
         ]
         output = _serialize_agent_transcript(messages)
+        return after_key, output, after_key == key
     except (OSError, ValueError, ConversationIntegrityError) as exc:
         raise ValueError("could not read child transcript") from exc
+
+
+def _read_agent_output(
+    child_path: Path,
+    *,
+    requested_handle: str,
+    offset: int,
+    limit: int | None,
+    max_bytes: int,
+    cached: tuple[tuple[int, int, int], str] | None = None,
+) -> tuple[tuple[int, int, int], str, bool, dict[str, object]]:
+    identity, output, cacheable = _read_agent_transcript(child_path, cached)
     result = _agent_output_page(
         output,
         handle=requested_handle,
@@ -366,7 +388,7 @@ def _read_agent_output(
     )
     if result is None:
         raise ValueError("transcript page exceeds response limit")
-    return result
+    return identity, output, cacheable, result
 
 
 def _unknown_agent_status(
@@ -420,7 +442,7 @@ def _project_agent_status(
         raise ValueError("invalid child metadata state")
     if state in _TERMINAL_AGENT_STATES and finished_at is None:
         raise ValueError("terminal state has no finished_at")
-    if state in {"running", "idle"} and finished_at is not None:
+    if state in _NONTERMINAL_AGENT_STATES and finished_at is not None:
         raise ValueError("non-terminal state has finished_at")
 
     elapsed = _agent_status_elapsed(
@@ -862,16 +884,33 @@ async def _agent_output(
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
     try:
-        return _bounded_agent_result(
-            _read_agent_output(
-                registry.session_store,
-                requested_handle=handle,
-                offset=offset,
-                limit=limit,
-                max_bytes=max_bytes,
-            ),
-            max_bytes,
+        child_path = _active_agent_receipts(registry.session_store).get(handle)
+        if child_path is None:
+            raise ValueError("unknown child handle")
+        cached = registry._agent_output_cache.get(child_path)
+        identity, output, cacheable, result = await asyncio.to_thread(
+            _read_agent_output,
+            child_path,
+            requested_handle=handle,
+            offset=offset,
+            limit=limit,
+            max_bytes=max_bytes,
+            cached=cached,
         )
+        previous = registry._agent_output_cache.pop(child_path, None)
+        if previous is not None:
+            registry._agent_output_cache_chars -= len(previous[1])
+        if cacheable and len(output) <= _AGENT_OUTPUT_CACHE_MAX_CHARS:
+            registry._agent_output_cache[child_path] = (identity, output)
+            registry._agent_output_cache_chars += len(output)
+            registry._agent_output_cache.move_to_end(child_path)
+            while (
+                len(registry._agent_output_cache) > _AGENT_OUTPUT_CACHE_MAX_ENTRIES
+                or registry._agent_output_cache_chars > _AGENT_OUTPUT_CACHE_MAX_CHARS
+            ):
+                _, evicted = registry._agent_output_cache.popitem(last=False)
+                registry._agent_output_cache_chars -= len(evicted[1])
+        return _bounded_agent_result(result, max_bytes)
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)
 

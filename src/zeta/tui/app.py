@@ -19,6 +19,7 @@ from prompt_toolkit.application import get_app, run_in_terminal
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.styles import DynamicStyle, Style
+from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
@@ -52,7 +53,7 @@ from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.user_discovery import ExternalToolDiscovery
-from . import overlay, theme
+from . import overlay, render, theme
 from .agent_card import (
     AgentNavigation,
     AgentRunCommandMixin,
@@ -60,6 +61,7 @@ from .agent_card import (
 )
 from .bootstrap import background_notice, build_backend
 from .cards.mcp_manager import MCPManager
+from .cards.shared import wrap_by_cells
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
@@ -115,11 +117,38 @@ from .transcript.history_finder import HistoryFinder
 from .user import displayed_user_text
 
 
-def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
+def _wrap_status_line(line: str, width: int) -> list[overlay.FragmentLine]:
+    if cell_len(line) <= width:
+        return [[overlay.value(line)]]
+    label, separator, value = line.partition(": ")
+    prefix = f"{label}{separator}" if separator else line[: -len(line.lstrip())]
+    if cell_len(prefix) >= width:
+        return [[overlay.value(text)] for text in wrap_by_cells(line, width)]
+    wrapped = wrap_by_cells(
+        value if separator else line.lstrip(), width - cell_len(prefix)
+    )
+    return [
+        [
+            overlay.value(prefix if index == 0 else " " * len(prefix)),
+            overlay.value(text),
+        ]
+        for index, text in enumerate(wrapped)
+    ]
+
+
+def _status_card_lines(
+    status: SlashStatus, width: int | None = None
+) -> list[overlay.FragmentLine]:
+    formatted = _format_status(status).splitlines()
+    body = (
+        [[overlay.value(line)] for line in formatted]
+        if width is None
+        else [row for line in formatted for row in _wrap_status_line(line, width)]
+    )
     return [
         overlay.title("Status"),
         overlay.rule(),
-        *([overlay.value(line)] for line in _format_status(status).splitlines()),
+        *body,
         overlay.rule(),
         overlay.hint("↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"),
     ]
@@ -668,7 +697,11 @@ class TUIApp(
         buffer = session.default_buffer
         self._status_restore_text = buffer.text
         self._status_restore_cursor = buffer.cursor_position
-        self._status_card.set_lines(_status_card_lines(self.slash_status()))
+        status = self.slash_status()
+        self._status_card.set_lines(
+            _status_card_lines(status),
+            line_factory=lambda width: _status_card_lines(status, width),
+        )
         self._status_card_open = True
         session.layout.focus(self._status_card_window)
         self._invalidate_prompt()
@@ -793,7 +826,7 @@ class TUIApp(
 
     def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
-        if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
+        if event.type in render.BACKGROUND_EVENTS_RENDERED_IMMEDIATELY:
             self._print_unit(self._presenter.render_event(event))
             self._invalidate_stream_prompt()
             return

@@ -729,6 +729,7 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
+    from tests.support.owned import await_or_fail
     from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
@@ -736,6 +737,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     from zeta.memory.auto import AutoMemoryReconciler
     from zeta.project_registry import ProjectRegistry
     from zeta.runtime.loop import AgentLoop
+    from zeta.server import ZetaServer
     from zeta.storage_format import open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
@@ -747,6 +749,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     memory_reconcilers: list[AutoMemoryReconciler] = []
     workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
+    servers: list[ZetaServer] = []
+    closed_servers: set[ZetaServer] = set()
     test_home_leases = {}
     loop_init = AgentLoop.__init__
     loop_close = AgentLoop.close
@@ -764,6 +768,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     workspace_init = WorkspaceSnapshotStore.__init__
     registry_init = ToolRegistry.__init__
     background_init = BackgroundTaskRegistry.__init__
+    server_init = ZetaServer.__init__
+    server_close = ZetaServer.close
     store_close = ConversationStore.close
     registry_close = ToolRegistry.close
 
@@ -871,6 +877,16 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    @wraps(server_init)
+    def tracked_server_init(server, *args, **kwargs):
+        server_init(server, *args, **kwargs)
+        servers.append(server)
+
+    @wraps(server_close)
+    async def tracked_server_close(server, *args, **kwargs):
+        await server_close(server, *args, **kwargs)
+        closed_servers.add(server)
+
     # test-contract: seam tracks and closes loops created by tests
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
     # test-contract: seam tracks and closes stores created by tests
@@ -891,7 +907,24 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     # test-contract: seam tracks and closes background registries created by tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
+    # test-contract: seam tracks and closes servers created by tests
+    monkeypatch.setattr(ZetaServer, "__init__", tracked_server_init)
+    # test-contract: seam records successful server closes for idempotent teardown
+    monkeypatch.setattr(ZetaServer, "close", tracked_server_close)
     yield
+    first_error: BaseException | None = None
+
+    async def close_server(server: ZetaServer) -> None:
+        nonlocal first_error
+        try:
+            await await_or_fail(server.close(), what="ZetaServer.close")
+        except BaseException as exc:  # noqa: BLE001 - close every owner
+            if first_error is None:
+                first_error = exc
+
+    for server in reversed(servers):
+        if server not in closed_servers:
+            await close_server(server)
     for reconciler in reversed(memory_reconcilers):
         try:
             await reconciler.close()
@@ -924,6 +957,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         manager._release_storage_lease()
     for lease in test_home_leases.values():
         lease.close()
+    if first_error is not None:
+        raise first_error
 
 
 @pytest.fixture
