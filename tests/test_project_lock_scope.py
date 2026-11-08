@@ -18,7 +18,9 @@ from zeta.core.session_links import (
     persist_pending_child_link,
     reconcile_child_links,
 )
+from zeta.core.store import ConversationStore
 from zeta.project_registry import ProjectRegistry
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.storage_format import WRITER_EPOCH, advance
 
 
@@ -687,3 +689,65 @@ async def test_p06_8_tui_workspace_lifetime_closes_and_deletes_session(
     finally:
         await app.close()
     SessionManager(home).delete(session_id)
+
+
+def test_p06_installed_callbacks_drain_in_append_order_after_rank_release(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="installed-drain-order")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_returned = threading.Event()
+    delivered: list[tuple[str, str]] = []
+
+    def append(text: str) -> None:
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(text)])
+        )
+
+    def installed(delta: object) -> None:
+        assert delta != "reset"
+        for entry in delta:  # type: ignore[attr-defined]
+            text = entry.data["message"]["content"][0]["text"]
+            delivered.append((text, entry.id))
+            if text == "a":
+                first_entered.set()
+                release_first.wait(timeout=10)
+            elif text == "b":
+                # Re-appending takes the execution and shape ranks again, so it
+                # fails with an order inversion unless the drain runs unlocked.
+                append("c")
+
+    def append_b() -> None:
+        append("b")
+        second_returned.set()
+
+    store.on_entries_installed = installed
+    thread_a = threading.Thread(target=append, args=("a",))
+    thread_b = threading.Thread(target=append_b)
+    try:
+        thread_a.start()
+        assert first_entered.wait(timeout=10)
+        thread_b.start()
+        # B may return before its delta is delivered: A's drainer owns delivery.
+        assert second_returned.wait(timeout=10)
+        assert [text for text, _ in delivered] == ["a"], delivered
+        release_first.set()
+        thread_a.join(timeout=10)
+        thread_b.join(timeout=10)
+        assert not thread_a.is_alive() and not thread_b.is_alive()
+
+        durable = [
+            (row.data["message"]["content"][0]["text"], row.id)
+            for row in store._entries
+            if row.type == "message"
+        ]
+        assert delivered == durable
+        assert [text for text, _ in delivered] == ["a", "b", "c"]
+        assert len({entry_id for _, entry_id in delivered}) == 3
+    finally:
+        release_first.set()
+        thread_a.join(timeout=10)
+        if thread_b.ident is not None:
+            thread_b.join(timeout=10)
+        store.close()
