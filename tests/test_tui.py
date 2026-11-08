@@ -10953,6 +10953,8 @@ async def test_empty_completion_removes_preview_region_before_fallback(
         "",
         "prompt",
         "",
+        "model returned an empty response",
+        "model returned an empty response",
         "",
         "no response",
     ]

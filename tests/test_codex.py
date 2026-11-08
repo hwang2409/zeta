@@ -2155,6 +2155,71 @@ async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["", "cannot help"])
+async def test_codex_refusal_reaches_loop_completion_owner(
+    tmp_path: Path, refusal: str
+) -> None:
+    completed_item = {
+        "type": "message",
+        "id": "message-test",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "refusal", "refusal": refusal}],
+    }
+    stream = sse(
+        [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "message", "id": "message-test", "role": "assistant"},
+            ),
+            event(
+                "response.content_part.added",
+                output_index=0,
+                content_index=0,
+                part={"type": "refusal"},
+            ),
+            event(
+                "response.refusal.done",
+                output_index=0,
+                content_index=0,
+                refusal=refusal,
+            ),
+            event(
+                "response.content_part.done",
+                output_index=0,
+                content_index=0,
+                part={"type": "refusal"},
+            ),
+            event("response.output_item.done", output_index=0, item=completed_item),
+            event("response.completed"),
+        ]
+    )
+    client = client_for(stream)
+    backend = CodexBackend(
+        client=client, token_store=store_for(tmp_path / "codex.json")
+    )
+    try:
+        events = [
+            item
+            async for item in AgentLoop(
+                backend,
+                ConversationStore(tmp_path / "sessions"),
+                skill_catalog=SkillCatalog.empty(),
+            ).run_turn("hello", origin=MessageOrigin.USER)
+        ]
+    finally:
+        await client.aclose()
+
+    turn_end = next(item for item in events if item.type is StreamEventType.TURN_END)
+    if refusal:
+        assert "completion" not in turn_end.data
+    else:
+        assert turn_end.data.get("completion") == "refusal"
+
+
+@pytest.mark.asyncio
 async def test_message_parts_allow_refusal_before_output_text(tmp_path: Path) -> None:
     completed_item = {
         "type": "message",

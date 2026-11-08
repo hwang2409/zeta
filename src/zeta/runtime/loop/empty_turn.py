@@ -107,11 +107,11 @@ def completion_classification(
 ) -> str | None:
     """Classify a terminal no-tool completion for frontends."""
 
+    if has_visible_output(message):
+        return None
     if stop_reason in {"refusal", "content_filter"}:
         return stop_reason
-    if not has_visible_output(message):
-        return "empty"
-    return None
+    return "empty"
 
 
 def has_visible_output(message: Message) -> bool:

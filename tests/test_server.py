@@ -1100,6 +1100,25 @@ async def test_server_streams_scripted_turn_over_real_socket(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_server_forwards_empty_refusal_classification(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn(stop_reason="refusal")])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        assert frames[-1]["result"]["accepted"] is True
+        turn_end = await _event(reader, "turn_end")
+        assert turn_end["data"].get("completion") == "refusal"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_server_streams_display_safe_thinking_body_without_metadata(
     tmp_path: Path,
 ) -> None:
