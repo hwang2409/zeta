@@ -16,7 +16,6 @@ from tests.support.server_client import (
     read_until,
     request,
 )
-from tests.support.server_client import read as buffered_read
 
 _READ_METHODS = {"readline", "readuntil"}
 
