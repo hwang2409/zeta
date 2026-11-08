@@ -49,11 +49,31 @@ from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.empty_turn import (
     build_nudge_message,
     build_tool_limit_recovery_message,
+    empty_turn_error,
+    empty_turn_tool_error,
 )
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
+
+def test_empty_turn_tool_error_reports_success_state() -> None:
+    error = empty_turn_tool_error(
+        ToolCall("ping-call", "ping", {}), ToolResult("ping-call", "pong")
+    )
+
+    assert "(ping-call) ok" in error.message
+
+
+def test_empty_turn_error_bounds_tool_details() -> None:
+    error = empty_turn_error("n" * 12_000, "i" * 12_000, "error")
+
+    assert len(error.message) <= 400
+    assert "n" * 128 in error.message
+    assert "n" * 129 not in error.message
+    assert "i" * 128 in error.message
+    assert "i" * 129 not in error.message
 
 
 def anthropic_request_bytes(

@@ -14,6 +14,7 @@ from typing import Literal
 
 from ...storage_format import WriterLease
 from ..checkpoints import ConversationIntegrityError
+from ..fsio import write_all
 from ..session_files import SessionInUseError, open_session_file
 
 RUNTIME_LEASE_NAME = "runtime.lease"
@@ -129,7 +130,7 @@ def _publish_owner(fd: int, owner: OwnerHint, epoch: str) -> None:
     ).encode()
     os.lseek(fd, 0, os.SEEK_SET)
     os.ftruncate(fd, 0)
-    os.write(fd, record)
+    write_all(fd, record)
 
 
 class SessionExecutionLease:
