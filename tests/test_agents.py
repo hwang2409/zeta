@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent import runner as agent_runner
 from zeta.core.abort import AbortGenerationRegistry
@@ -296,7 +297,7 @@ async def test_model_selected_child_resolves_ollama_endpoint_centrally(
                 client=client,
                 token_budget=40_960,
             )
-            [event async for event in probe.complete([], [])]
+            [event async for event in probe.complete([], [], control=completion_control())]
         assert payloads[0]["options"]["num_ctx"] == 40_960
     finally:
         await loop.close()
@@ -332,7 +333,7 @@ async def test_model_selected_ollama_child_uses_one_effective_budget(
                 client=client,
                 token_budget=40_960,
             )
-            [event async for event in probe.complete([], [])]
+            [event async for event in probe.complete([], [], control=completion_control())]
         return {
             "content": [{"type": "text", "text": "done"}],
             "isError": False,
