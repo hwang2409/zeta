@@ -89,6 +89,7 @@ class _BackgroundTaskOwner:
         if timeout is not None:
             await asyncio.wait((lifecycle,), timeout=timeout)
         if timeout is None or lifecycle.done():
+            # test-contract: durability the owner must finish its terminal commit
             await asyncio.shield(lifecycle)
 
     async def _run(self) -> None:
@@ -102,6 +103,7 @@ class _BackgroundTaskOwner:
             task = asyncio.ensure_future(awaitable)
             while not task.done():
                 try:
+                    # test-contract: durability each owner step survives caller cancellation
                     await asyncio.shield(task)
                 except asyncio.CancelledError:
                     cancelled = True
@@ -123,6 +125,7 @@ class _BackgroundTaskOwner:
         try:
             await finish(process.wait())
             self.state = _OwnerState.DRAINING
+            # test-contract: durability output drain races the owned reader to completion
             drain_finished = asyncio.create_task(self._finish_output_drain.wait())
             try:
                 await finish(
@@ -133,18 +136,21 @@ class _BackgroundTaskOwner:
                 )
                 if drain_finished.done() and not reader.done():
                     reader.cancel()
+                    # test-contract: durability canceled output reads are fully drained
                     await asyncio.gather(reader, return_exceptions=True)
                 else:
                     await finish(reader)
             finally:
                 if not drain_finished.done():
                     drain_finished.cancel()
+                # test-contract: durability canceled drain gates are fully drained
                 await asyncio.gather(drain_finished, return_exceptions=True)
             while self.kill_cause is None and _group_exists(process.pid):
                 await finish(asyncio.sleep(0.01))
         finally:
             if not reader.done():
                 reader.cancel()
+                # test-contract: durability canceled output reads are fully drained
                 await asyncio.gather(reader, return_exceptions=True)
             await finish(self.registry._close_stdin(self.record))
             if writer is not None:
@@ -232,6 +238,7 @@ class _BackgroundTaskOwner:
                 self.terminal_durable.set()
         if self.defer_receipt_for_close:
             self._receipt_release.clear()
+            # test-contract: durability close releases receipts after aggregate state
             await self._receipt_release.wait()
         self.state = _OwnerState.EVIDENCE_PENDING
         if self.record.notify_on_exit:
@@ -325,6 +332,7 @@ class _BackgroundTaskOwner:
         )
         if claimant and process is not None:
             await self.registry._terminate_owned([process])
+        # test-contract: durability kill returns the committed terminal outcome
         await self.wait()
         killed = (
             self.killed_by_claimant
@@ -371,11 +379,14 @@ class _BackgroundTaskOwner:
             transport.close()
 
     async def wait_until_durable(self) -> None:
+        # test-contract: durability close waits for the terminal commit
         durable = asyncio.create_task(self.terminal_durable.wait())
         lifecycle = self.lifecycle
         if lifecycle is None:
+            # test-contract: durability close waits for the terminal commit
             await durable
             return
+        # test-contract: durability close observes either commit or owner failure
         done, pending = await asyncio.wait(
             (durable, lifecycle), return_when=asyncio.FIRST_COMPLETED
         )
@@ -384,6 +395,7 @@ class _BackgroundTaskOwner:
             return
         for task in pending:
             task.cancel()
+        # test-contract: durability canceled close gates are fully drained
         await asyncio.gather(*pending, return_exceptions=True)
         if lifecycle in done:
             # Propagate the bounded terminal-write failure. Close must not
@@ -393,4 +405,5 @@ class _BackgroundTaskOwner:
     async def release_close_receipt(self) -> None:
         self.defer_receipt_for_close = False
         self._receipt_release.set()
+        # test-contract: durability released receipts finish before close returns
         await self.wait()

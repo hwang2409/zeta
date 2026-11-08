@@ -383,6 +383,7 @@ class BackgroundTaskRegistry:
                 record.running = False
                 record.process = None
             else:
+                # test-contract: durability failed starts drain their owner lifecycle
                 monitor_result = await asyncio.gather(
                     owner_state.lifecycle, return_exceptions=True
                 )
@@ -425,6 +426,7 @@ class BackgroundTaskRegistry:
         record = self._record(task_id)
         owner = self._owners[task_id]
         try:
+            # test-contract: durability task wait observes the committed terminal row
             await owner.wait(timeout)
         except asyncio.CancelledError:
             if asyncio.current_task().cancelling() or record.running:
@@ -586,6 +588,7 @@ class BackgroundTaskRegistry:
         cancelled = False
         while not done.done():
             try:
+                # test-contract: durability close ownership survives caller cancellation
                 await asyncio.shield(done)
             except asyncio.CancelledError:
                 cancelled = True
@@ -599,6 +602,7 @@ class BackgroundTaskRegistry:
         cancelled = False
         while not task.done():
             try:
+                # test-contract: durability owned registry steps survive cancellation
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 cancelled = True
@@ -620,6 +624,7 @@ class BackgroundTaskRegistry:
             task = asyncio.ensure_future(awaitable)
             while not task.done():
                 try:
+                    # test-contract: durability termination finishes its claimed step
                     await asyncio.shield(task)
                 except asyncio.CancelledError:
                     cancelled = True
@@ -786,6 +791,7 @@ class BackgroundTaskRegistry:
         finally:
             if not committed and not drain.done():
                 drain.cancel()
+                # test-contract: durability canceled stdin drains are fully reaped
                 await asyncio.gather(drain, return_exceptions=True)
         return True
 
