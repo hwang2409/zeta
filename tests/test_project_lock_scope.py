@@ -204,6 +204,7 @@ def test_p06_4_epoch_selects_legacy_then_named_authority(tmp_path: Path) -> None
     assert (home / "projects" / ".lock").is_file()
     assert not (home / "projects" / old_project.project_id / ".memory.lock").exists()
 
+    del legacy
     advance(home, expected_epoch=WRITER_EPOCH - 1, target_epoch=WRITER_EPOCH)
     current = ProjectRegistry(home / "projects")
     current.load_memory(old_project.project_id)
@@ -252,6 +253,27 @@ def test_p06_5_session_reference_is_reassociated_by_exact_upsert(
         "role": "worker",
         "parent_session_id": "parent",
     }
+
+
+def test_storage_d1_project_lock_obeys_global_rank_order(tmp_path: Path) -> None:
+    from zeta.locking import execution_lock, shape_lock
+
+    home = tmp_path / ".zeta"
+    advance(home, expected_epoch=0)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "demo")
+
+    with execution_lock(), registry._project_lock(
+        project.project_id, "memory", exclusive=False
+    ) as project_fd:
+        assert project_fd >= 0
+
+    with (
+        shape_lock(),
+        pytest.raises(RuntimeError, match="filesystem lock order inversion"),
+        registry._project_lock(project.project_id, "memory", exclusive=False),
+    ):
+        pass
 
 
 def test_p06_8_rank_guard_rejects_inversions_and_unsorted_domains() -> None:

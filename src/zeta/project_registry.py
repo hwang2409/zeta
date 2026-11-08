@@ -17,6 +17,7 @@ import re
 import secrets
 import stat
 import uuid
+import weakref
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from .core.session_files import (
     atomic_publish_file,
     open_session_file,
 )
+from .locking import format_lock
 from .project_context.projection import (
     ProjectContextProjectionMixin,
 )
@@ -53,6 +55,7 @@ from .project_schema import (
 from .storage_format import (
     WriterLease,
     mapping_mutations,
+    open_writer,
     reject_unknown_keys,
     require_closed_variant,
 )
@@ -220,6 +223,11 @@ class ProjectRegistry(
             Path(root).expanduser()
             if root is not None
             else Path.home() / ".zeta" / "projects"
+        )
+        with format_lock():
+            self._storage_lease = open_writer(self.root.parent)
+        self._release_storage_lease = weakref.finalize(
+            self, self._storage_lease.close
         )
 
     def _ensure_root(self) -> None:

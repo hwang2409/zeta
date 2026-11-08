@@ -7,18 +7,18 @@ import os
 import stat
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from typing import TypeVar
 
 from ..core.session_files import require_off_loop_lock
-from ..locking import domain_lock, format_lock, identity_lock
+from ..locking import domain_lock, identity_lock
 from ..project_errors import (
     ProjectNotFoundError,
     ProjectRegistryBusyError,
     ProjectRegistryError,
 )
-from ..storage_format import P06_FEATURE_EPOCH, WriterLease, open_writer
+from ..storage_format import P06_FEATURE_EPOCH, WriterLease
 
 _READ_RETRIES = 10
 _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS = 1.0
@@ -141,11 +141,8 @@ class ProjectLockingMixin:
     @contextmanager
     def _identity_authority(self, *, exclusive: bool) -> Iterator[int]:
         require_off_loop_lock("project identity authority", ProjectRegistryError)
-        with (
-            format_lock(),
-            open_writer(self.root.parent) as lease,
-            self._lease_context(lease),
-        ):
+        lease = self._storage_lease
+        with self._lease_context(lease):
             if exclusive or lease.observed_epoch >= P06_FEATURE_EPOCH:
                 self._ensure_root()
             if lease.observed_epoch < P06_FEATURE_EPOCH:
@@ -154,22 +151,84 @@ class ProjectLockingMixin:
                 ) as root_fd:
                     yield root_fd
                 return
+            with identity_lock(), self._locked_home_mode(
+                exclusive=exclusive
+            ) as root_fd:
+                yield root_fd
+
+    @staticmethod
+    def _release_lock(lock_fd: int) -> None:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    def _named_lock_fd(self, project_fd: int, domain: str) -> int:
+        if domain != "inbox":
+            return self._open_named_lock(project_fd, f".{domain}.lock")
+        try:
+            os.mkdir("inbox", mode=0o700, dir_fd=project_fd)
+        except FileExistsError:
+            pass
+        try:
+            inbox_fd = os.open(
+                "inbox",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=project_fd,
+            )
+        except OSError as exc:
+            raise ProjectRegistryError("project inbox is unavailable") from exc
+        try:
+            if stat.S_IMODE(os.fstat(inbox_fd).st_mode) & 0o077:
+                raise ProjectRegistryError("project inbox is not private")
+            return self._open_named_lock(inbox_fd, ".lock")
+        finally:
+            os.close(inbox_fd)
+
+    @contextmanager
+    def _legacy_project_locks(
+        self,
+        domains: tuple[tuple[str, str], ...],
+        *,
+        exclusive: bool,
+    ) -> Iterator[tuple[int, ...]]:
+        with ExitStack() as stack:
+            stack.enter_context(identity_lock())
             root_fd, _ = self._open_root()
-            rank = identity_lock()
-            rank.__enter__()
-            lock_fd: int | None = None
-            try:
-                lock_fd = self._open_lock(root_fd)
+            stack.callback(os.close, root_fd)
+            lock_fd = self._open_lock(root_fd)
+            self._acquire_lock(
+                lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            )
+            stack.callback(self._release_lock, lock_fd)
+            project_fds = tuple(
+                self._validated_project_fd(root_fd, project_id)
+                for project_id, _domain in domains
+            )
+            for project_fd in project_fds:
+                stack.callback(os.close, project_fd)
+            yield project_fds
+
+    @contextmanager
+    def _named_project_locks(
+        self,
+        domains: tuple[tuple[str, str], ...],
+        *,
+        exclusive: bool,
+    ) -> Iterator[tuple[int, ...]]:
+        with ExitStack() as stack:
+            root_fd, _ = self._open_root()
+            stack.callback(os.close, root_fd)
+            project_fds: list[int] = []
+            for project_id, domain in domains:
+                stack.enter_context(domain_lock(project_id, domain))
+                project_fd = self._validated_project_fd(root_fd, project_id)
+                project_fds.append(project_fd)
+                stack.callback(os.close, project_fd)
+                lock_fd = self._named_lock_fd(project_fd, domain)
                 self._acquire_lock(
                     lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
                 )
-                yield root_fd
-            finally:
-                if lock_fd is not None:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    os.close(lock_fd)
-                rank.__exit__(None, None, None)
-                os.close(root_fd)
+                stack.callback(self._release_lock, lock_fd)
+            yield tuple(project_fds)
 
     @contextmanager
     def _project_locks(
@@ -181,87 +240,17 @@ class ProjectLockingMixin:
         require_off_loop_lock("project domain authority", ProjectRegistryError)
         if domains != tuple(sorted(set(domains))):
             raise AssertionError("project domains must be unique and sorted")
-        with (
-            format_lock(),
-            open_writer(self.root.parent) as lease,
-            self._lease_context(lease),
-        ):
+        lease = self._storage_lease
+        with self._lease_context(lease):
             if exclusive or lease.observed_epoch >= P06_FEATURE_EPOCH:
                 self._ensure_root()
-            root_fd: int | None = None
-            project_fds: list[int] = []
-            locks: list[int] = []
-            ranks = []
-            legacy = lease.observed_epoch < P06_FEATURE_EPOCH
-            try:
-                if legacy:
-                    rank = identity_lock()
-                    rank.__enter__()
-                    ranks.append(rank)
-                    root_fd, _ = self._open_root()
-                    lock_fd = self._open_lock(root_fd)
-                    locks.append(lock_fd)
-                    self._acquire_lock(
-                        lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-                    )
-                    project_fds = [
-                        self._validated_project_fd(root_fd, project_id)
-                        for project_id, _domain in domains
-                    ]
-                else:
-                    root_fd, _ = self._open_root()
-                    for project_id, domain in domains:
-                        rank = domain_lock(project_id, domain)
-                        rank.__enter__()
-                        ranks.append(rank)
-                        project_fd = self._validated_project_fd(root_fd, project_id)
-                        project_fds.append(project_fd)
-                        if domain == "inbox":
-                            try:
-                                os.mkdir("inbox", mode=0o700, dir_fd=project_fd)
-                            except FileExistsError:
-                                pass
-                            try:
-                                lock_dir_fd = os.open(
-                                    "inbox",
-                                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                    dir_fd=project_fd,
-                                )
-                            except OSError as exc:
-                                raise ProjectRegistryError(
-                                    "project inbox is unavailable"
-                                ) from exc
-                            inbox_info = os.fstat(lock_dir_fd)
-                            if stat.S_IMODE(inbox_info.st_mode) & 0o077:
-                                os.close(lock_dir_fd)
-                                raise ProjectRegistryError(
-                                    "project inbox is not private"
-                                )
-                            lock_name = ".lock"
-                        else:
-                            lock_dir_fd = project_fd
-                            lock_name = f".{domain}.lock"
-                        try:
-                            lock_fd = self._open_named_lock(lock_dir_fd, lock_name)
-                        finally:
-                            if lock_dir_fd != project_fd:
-                                os.close(lock_dir_fd)
-                        locks.append(lock_fd)
-                        self._acquire_lock(
-                            lock_fd,
-                            fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
-                        )
-                yield tuple(project_fds)
-            finally:
-                for lock_fd in reversed(locks):
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    os.close(lock_fd)
-                for project_fd in reversed(project_fds):
-                    os.close(project_fd)
-                for rank in reversed(ranks):
-                    rank.__exit__(None, None, None)
-                if root_fd is not None:
-                    os.close(root_fd)
+            locks = (
+                self._legacy_project_locks
+                if lease.observed_epoch < P06_FEATURE_EPOCH
+                else self._named_project_locks
+            )
+            with locks(domains, exclusive=exclusive) as project_fds:
+                yield project_fds
 
     def _identity_read(self, operation: Callable[[int], _T]) -> _T:
         with self._identity_authority(exclusive=False) as root_fd:
