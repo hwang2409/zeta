@@ -59,15 +59,12 @@ def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
     )
     definition = registry.definitions_by_name["request_attention"]
     assert isinstance(definition, ToolDefinition)
-    assert (
-        "Use once when a decision only the user can make is pending"
-        in definition.description
-    )
-    assert "then continue other work" in definition.description
-    assert "Do not repeat that you are waiting on the user" in definition.description
-    assert (
-        "assuming the user has read nothing since their last message"
-        in definition.description
+    assert definition.description == (
+        "Use once per topic to put important user attention in the inbox, then continue work. "
+        "Set kind to decision only when the user must choose; include options and a recommendation when useful. "
+        "Set kind to answer for a direct answer to an earlier user question, decided for an important decision you made for the user, or deferred for an important issue you left for the user. "
+        "Write why as self-contained context, assuming the user has read nothing since their last message. "
+        "Do not use this for routine progress, and do not repeat an open item."
     )
     identity = Path(zeta.__file__).parent / "prompts" / "identity.md"
     assert "request_attention" not in identity.read_text(encoding="utf-8")

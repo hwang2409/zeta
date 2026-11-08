@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+from scripts.storage_format_compatibility import (
+    _assert_mutation_delta,
+    _digest_tree,
+    _run_roundtrips,
+)
+from zeta.storage_format import WRITER_EPOCH
 
 _SPEC = importlib.util.spec_from_file_location(
     "storage_format_compatibility", Path("scripts/storage_format_compatibility.py")
@@ -70,3 +81,80 @@ def test_select_predecessor_checks_adjacent_merges_for_pull_and_push(tmp_path: P
     assert selected_push == qualifying
     assert selected_pull != non_qualifying_merge
     assert qualifying != selected_pull
+
+
+def test_selected_writer_round_trips_and_reopens_candidate_data() -> None:
+    _run_roundtrips(Path(__file__).parents[1], WRITER_EPOCH)
+
+
+def test_main_runs_selected_predecessor_roundtrip_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    predecessor = "a" * 40
+    phases: list[tuple[bool, int]] = []
+
+    def fake_git(*args: str) -> str:
+        if args[0] == "archive":
+            Path(args[-1]).touch()
+        return predecessor
+
+    def fake_run(command: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[0] == "uv":
+            return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    # test-contract: seam isolate the command entry from git and package installation
+    monkeypatch.setattr(_COMPAT, "_git", fake_git)
+    # test-contract: seam force the selected predecessor at the command boundary
+    monkeypatch.setattr(_COMPAT, "select_predecessor", lambda **kwargs: (predecessor, [predecessor]))
+    # test-contract: seam exercise the bootstrap predecessor command path
+    monkeypatch.setattr(_COMPAT, "has_probe", lambda commit: False)
+    # test-contract: seam give the stub predecessor its public writer epoch
+    monkeypatch.setattr(_COMPAT, "_writer_epoch", lambda source: WRITER_EPOCH)
+    # test-contract: seam replace bounded child processes while testing command wiring
+    monkeypatch.setattr(_COMPAT, "_run_phase", fake_run)
+    # test-contract: seam provide the selected predecessor lock artifact
+    monkeypatch.setattr(
+        _COMPAT,
+        "_copy_predecessor_lock",
+        lambda commit, destination: destination.write_text("stub-lock\n"),
+    )
+    # test-contract: seam observe whether the command reaches the round-trip gate
+    monkeypatch.setattr(
+        _COMPAT,
+        "_run_roundtrips",
+        lambda source, epoch: phases.append((source.is_dir(), epoch)),
+    )
+    monkeypatch.setattr(sys, "argv", ["storage_format_compatibility.py", "--output-dir", str(tmp_path)])
+
+    assert _COMPAT.main() == 0
+    assert phases == [(True, WRITER_EPOCH)]
+
+
+def test_subprocess_timeout_names_the_failed_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    def timeout(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(("uv", "run"), 180)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+
+    with pytest.raises(RuntimeError, match="candidate writer timed out after 7 seconds"):
+        _COMPAT._run_phase(("uv", "run"), phase="candidate writer", timeout=7)
+
+
+def test_mutation_delta_rejects_non_declared_path(tmp_path: Path) -> None:
+    (tmp_path / "owned.json").write_text("before")
+    before = _digest_tree(tmp_path)
+    (tmp_path / "owned.json").write_text("after")
+    (tmp_path / "undeclared.json").write_text("changed")
+    after = _digest_tree(tmp_path)
+    with pytest.raises(RuntimeError, match="undeclared paths"):
+        _assert_mutation_delta(before, after, ("owned.json",))
+
+
+def test_digest_changes_when_higher_epoch_home_is_mutated(tmp_path: Path) -> None:
+    path = tmp_path / "storage-format.json"
+    path.write_text('{"writer_epoch":4}\n')
+    before = _digest_tree(tmp_path)
+    path.write_text('{"writer_epoch":3}\n')
+    assert _digest_tree(tmp_path)["storage-format.json"] != before["storage-format.json"]
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == _digest_tree(tmp_path)["storage-format.json"]

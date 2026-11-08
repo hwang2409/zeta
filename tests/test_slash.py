@@ -787,6 +787,63 @@ async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_pat
     )
 
 
+@pytest.mark.parametrize("bad_row", [b'{"broken":\n', b'{"broken":'])
+@pytest.mark.asyncio
+async def test_epoch_two_tui_repair_command_returns_upgrade_message(
+    tmp_path: Path,
+    bad_row: bytes,
+) -> None:
+    from tests.support.owned import await_or_fail, owned_app
+    from tests.support.submissions import await_submission_pipeline
+    from zeta.core.session import SessionManager
+
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
+    manager = SessionManager(tmp_path)
+    current = await await_or_fail(
+        asyncio.to_thread(
+            manager.create,
+            provider="codex",
+            model="offline",
+            cwd=tmp_path,
+            auto_project=False,
+        ),
+        what="create current session",
+    )
+    transcript = current.store.path
+    transcript.write_bytes(transcript.read_bytes() + bad_row)
+    loop = AgentLoop(FakeBackend([]), current.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    rendered = StringIO()
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        zeta_home=tmp_path,
+        console=Console(file=rendered, force_terminal=False, width=200),
+    )
+    unchanged = {
+        str(path.relative_to(tmp_path)): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and not path.name.startswith(".storage-format")
+    }
+    async with owned_app(app):
+        app._input_loop_active = True
+        await app._handle_prompt_value(
+            f"/repair-transcript {current.metadata.session_id} confirm"
+        )
+        await await_submission_pipeline(app)
+        output = rendered.getvalue().strip()
+        assert output == (
+            "system · transcript repair needs the stored-format upgrade "
+            "(home epoch 2, needs 4)"
+        )
+        assert {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file() and not path.name.startswith(".storage-format")
+        } == unchanged
+
+
 @pytest.mark.asyncio
 async def test_tui_current_session_repair_updates_live_memory_owner(
     tmp_path: Path,
@@ -1339,14 +1396,25 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
     assert app.slash_status().compaction_history == ()
 
 
-def test_unknown_command_passes_through_unchanged() -> None:
+def test_unknown_slash_command_returns_error_with_close_match() -> None:
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
-    assert registry.dispatch(session(), "/unknown arg") is None
-    envelope = registry.input_for_model("/unknown arg")
-    assert envelope.text == "/unknown arg"
-    assert envelope.display_text == "/unknown arg"
-    assert envelope.origin is MessageOrigin.USER
+    result = registry.dispatch(session(), "/statu")
+
+    assert result == (
+        "unknown command /statu. type // to send it as text. did you mean /status?"
+    )
+
+
+def test_non_slash_safe_and_escaped_slash_input_still_reaches_model() -> None:
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
+
+    for value, expected in (("/Users/henry/x", "/Users/henry/x"), ("//quit", "/quit")):
+        assert registry.dispatch(session(), value) is None
+        envelope = registry.input_for_model(value)
+        assert envelope.text == expected
+        assert envelope.display_text == value
+        assert envelope.origin is MessageOrigin.USER
 
 
 def test_double_slash_escapes_registered_command() -> None:
