@@ -832,7 +832,8 @@ class ConnectionRegistry:
                 self._child_reader[1].close()
             with ExitStack() as cleanup:
                 directory_fd = root_store.directory_fd
-                for component in ("agents", *map(str, segments)):
+                components = [component for segment in segments for component in ("agents", str(segment))]
+                for component in components:
                     directory_fd = cleanup.enter_context(
                         child_directory(directory_fd, component)
                     )

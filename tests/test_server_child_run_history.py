@@ -96,6 +96,20 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
         child.append_message(
             Message(MessageRole.ASSISTANT, [TextContent(f"message-{index}")])
         )
+    nested = ConversationStore(
+        child.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    nested.start_agent_lifecycle(
+        handle=f"{session_id}:1:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=2,
+        agent_type="worker",
+        description="nested",
+    )
+    nested.append_message(Message(MessageRole.ASSISTANT, [TextContent("nested")]))
+    nested.close()
     child.close()
     try:
         newest_reply = (
@@ -113,6 +127,17 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
         assert newest["messages"][0]["content"][0]["text"] == "message-0"
         assert newest["messages"][-1]["content"][0]["text"] == "message-129"
         assert newest.get("next_before") is None
+        nested_reply = (
+            await request(
+                reader,
+                writer,
+                4,
+                "child_run_history",
+                {"session_id": session_id, "run_id": f"{session_id}:1:1"},
+            )
+        )[-1]
+        assert "result" in nested_reply, nested_reply
+        assert nested_reply["result"]["messages"][0]["content"][0]["text"] == "nested"
         continuation = (
             await request(
                 reader,
