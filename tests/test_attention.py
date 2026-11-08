@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -570,3 +571,59 @@ def test_failed_fork_binding_removes_created_session(
 
     assert {path.name for path in manager.sessions_dir.iterdir()} == sessions_before
     opened.store.close()
+
+
+def test_discussion_fork_releases_source_before_project_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = _session(tmp_path)
+    anchor = opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Choose")])
+    )
+    attention = AttentionStore(opened.store.session_dir).request(
+        session_id=opened.store.session_id,
+        project_id=None,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Question",
+        why="Need a choice.",
+    )
+    session_id = opened.store.session_id
+    opened.store.close()
+
+    publication_started = threading.Event()
+    metadata_updated = threading.Event()
+    real_create = SessionManager.create
+    errors: list[BaseException] = []
+    fork_ids: list[str] = []
+
+    def gated_create(self, *args, **kwargs):
+        publication_started.set()
+        assert metadata_updated.wait(10), (
+            "source session remained owned during fork project publication"
+        )
+        return real_create(self, *args, **kwargs)
+
+    def create_fork() -> None:
+        try:
+            fork_ids.append(create_discussion_fork(tmp_path, session_id, attention.id))
+        except BaseException as exc:  # noqa: BLE001 - joined below
+            errors.append(exc)
+            metadata_updated.set()
+
+    monkeypatch.setattr(SessionManager, "create", gated_create)
+    worker = threading.Thread(target=create_fork)
+    worker.start()
+    try:
+        assert publication_started.wait(10), "fork publication did not start"
+        SessionManager(tmp_path).rename(session_id, "updated during fork")
+        metadata_updated.set()
+    finally:
+        metadata_updated.set()
+        worker.join(10)
+    assert not worker.is_alive(), "fork creator did not finish"
+    assert not errors
+    assert len(fork_ids) == 1
+    assert SessionManager(tmp_path).read_metadata(session_id).name == (
+        "updated during fork"
+    )

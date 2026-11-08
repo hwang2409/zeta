@@ -19,6 +19,7 @@ from zeta.core import session_files
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.core.session import SessionManager
+from zeta.project_memory_history import MemorySnapshot
 from zeta.project_registry import (
     MAX_MEMORY_FILE_SIZE,
     MAX_SESSION_REFERENCE_SIZE,
@@ -73,6 +74,79 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
     assert "Do not ask the user to confirm the sender" in enabled.system_prompt
     assert "claim it, do the work, then mark it done" in enabled.system_prompt
     assert "inbox action send" not in disabled.system_prompt
+
+
+def test_memory_snapshot_releases_domain_lock_after_pinning_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope")
+    registry.initialize_memory(project.project_id)
+    before = registry.memory_snapshot(project.project_id)
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=before.digest,
+        updates={"brief.md": "before"},
+    )
+    expected = registry.memory_snapshot(project.project_id)
+    read_started = threading.Event()
+    release_read = threading.Event()
+    writer_done = threading.Event()
+    snapshots: list[MemorySnapshot] = []
+    errors: list[BaseException] = []
+    real_read = os.read
+    reader_id: int | None = None
+
+    def gated_read(fd: int, size: int) -> bytes:
+        if threading.get_ident() == reader_id and not read_started.is_set():
+            read_started.set()
+            if not release_read.wait(10):
+                raise AssertionError("snapshot read release was not signalled")
+        return real_read(fd, size)
+
+    def read_snapshot() -> None:
+        nonlocal reader_id
+        reader_id = threading.get_ident()
+        try:
+            snapshots.append(registry.memory_snapshot(project.project_id))
+        except BaseException as exc:  # noqa: BLE001 - joined below
+            errors.append(exc)
+
+    def write_memory() -> None:
+        try:
+            registry.compare_and_swap_memory(
+                project.project_id,
+                expected_digest=expected.digest,
+                updates={"brief.md": "after"},
+            )
+        except BaseException as exc:  # noqa: BLE001 - joined below
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    # test-contract: seam pause production reads after their descriptor is pinned
+    monkeypatch.setattr(registry_module.os, "read", gated_read)
+    reader = threading.Thread(target=read_snapshot)
+    writer = threading.Thread(target=write_memory)
+    reader.start()
+    try:
+        assert read_started.wait(10), "snapshot did not start reading its pinned file"
+        writer.start()
+        assert writer_done.wait(10), (
+            "memory writer remained blocked behind pinned snapshot reading"
+        )
+    finally:
+        release_read.set()
+        reader.join(10)
+        if writer.ident is not None:
+            writer.join(10)
+    assert not reader.is_alive(), "snapshot reader did not finish"
+    assert not writer.is_alive(), "memory writer did not finish"
+    assert not errors
+    assert len(snapshots) == 1
+    assert snapshots[0].contents["brief.md"] == "before"
+    assert registry.memory_snapshot(project.project_id).contents["brief.md"] == "after"
 
 
 def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -> None:
