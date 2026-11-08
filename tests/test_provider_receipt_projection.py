@@ -11,6 +11,8 @@ from zeta.context_eviction import evict_messages, eviction_view
 from zeta.context_eviction.receipt_constructors import (
     _collapsed_assistant_receipt,
     _notification_receipt_from_fields,
+    is_receipt_echo,
+    receipt_tokens,
 )
 from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.store import ConversationStore
@@ -200,6 +202,27 @@ def row_range() -> tuple[list[Message], int]:
     ], 1
 
 
+def row_legacy_text_receipt() -> tuple[list[Message], int]:
+    # stored 2026-10-03..10-08, before receipts carried eviction_receipt.
+    text = {
+        "content": [{"text": "[assistant text evicted · seq 4]", "type": "text"}],
+        "metadata": {"context_evicted": True, "source_seq": 4},
+        "role": "assistant",
+    }
+    collapsed = {
+        "content": [{"text": "[older duplicate read collapsed into seq 9]", "type": "text"}],
+        "metadata": {"collapsed_into_seq": 9, "context_evicted": True, "source_seq": 6},
+        "role": "assistant",
+    }
+    return [
+        user("start"),
+        Message.from_dict(text),
+        user("more"),
+        Message.from_dict(collapsed),
+        user("next"),
+    ], 2
+
+
 def row_echo() -> tuple[list[Message], int]:
     return [user("before"), echo(), user("after")], 0
 
@@ -213,6 +236,7 @@ ROWS: dict[str, Callable[[], tuple[list[Message], int]]] = {
     "hybrid": row_hybrid,
     "thinking-only": row_thinking_only,
     "range": row_range,
+    "legacy-text-receipt": row_legacy_text_receipt,
     "echo": row_echo,
 }
 
@@ -451,11 +475,6 @@ async def test_building_payloads_changes_no_stored_row_or_message(tmp_path: Path
     ],
 )
 def test_receipt_grammar_accepts_only_whole_receipt_text(text: str, tokens: int | None) -> None:
-    from zeta.context_eviction.receipt_constructors import (
-        is_receipt_echo,
-        receipt_tokens,
-    )
-
     parsed = receipt_tokens(text)
     assert (None if parsed is None else len(parsed)) == tokens
     assert is_receipt_echo(reply(THINKING, TextContent(text))) is (tokens is not None)

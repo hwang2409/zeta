@@ -11,6 +11,7 @@ from ..context_eviction.receipt_constructors import (
     _valid_persisted_reasoning_receipt_metadata,
     is_receipt_echo,
     reasoning_marker,
+    receipt_tokens,
 )
 from ..protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -68,21 +69,31 @@ def _provider_message(message: Message) -> Message | None:
     if metadata.get("context_evicted") is not True or message.tool_result is not None:
         return message
     has_tool_use = any(isinstance(block, ToolUseContent) for block in message.content)
+    text = "".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
     kind = metadata.get(RECEIPT_KIND_METADATA)
-    if kind in ("assistant", "range", "notification") and not has_tool_use:
+    seq = metadata.get("source_seq")
+    legacy = _valid_persisted_reasoning_receipt_metadata(metadata)
+    # Receipts stored before eviction_receipt existed carry only the legacy
+    # metadata; their whole text must parse as receipt grammar.
+    tokens = (
+        receipt_tokens(text)
+        if not has_tool_use and (legacy or _legacy_collapsed_metadata(metadata))
+        else None
+    )
+    if not has_tool_use and (kind in ("assistant", "range", "notification") or tokens):
         fields = metadata.get(RECEIPT_FIELDS_METADATA)
-        if isinstance(fields, Mapping) and fields.get("kind") == REASONING_KIND:
+        if (isinstance(fields, Mapping) and fields.get("kind") == REASONING_KIND) or (
+            tokens and set(tokens) == {reasoning_marker(seq)}
+        ):
             return None
-        text = "".join(
-            block.text for block in message.content if isinstance(block, TextContent)
-        )
         return harness_notice(
             "context eviction", text, event="eviction_receipt", visible=False
         )
-    seq = metadata.get("source_seq")
     last = message.content[-1] if message.content else None
     if (
-        _valid_persisted_reasoning_receipt_metadata(metadata)
+        legacy
         and type(seq) is int
         and isinstance(last, TextContent)
         and last.text == reasoning_marker(seq)
@@ -90,3 +101,10 @@ def _provider_message(message: Message) -> Message | None:
         body = message.content[:-1]
         return Message(message.role, body, metadata=dict(metadata)) if body else None
     return message
+
+
+def _legacy_collapsed_metadata(metadata: Mapping[str, object]) -> bool:
+    rest = {key: value for key, value in metadata.items() if key != "collapsed_into_seq"}
+    return type(metadata.get("collapsed_into_seq")) is int and (
+        _valid_persisted_reasoning_receipt_metadata(rest)
+    )
