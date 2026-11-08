@@ -28,7 +28,13 @@ class PrepareAssembly(Protocol):
 class ContextPreparation:
     """Own one cancellable, stale-head-checked assembly preparation."""
 
-    def __init__(self, store: ConversationStore, prepare: PrepareAssembly, token_budget: int, estimator_budget: int) -> None:
+    def __init__(
+        self,
+        store: ConversationStore,
+        prepare: PrepareAssembly,
+        token_budget: int,
+        estimator_budget: int,
+    ) -> None:
         self._store = store
         self._prepare = prepare
         self._token_budget = token_budget
@@ -53,7 +59,11 @@ class ContextPreparation:
     def budget(self, reserved_estimator_tokens: int) -> int:
         if reserved_estimator_tokens < 0:
             raise ValueError("reserved estimator tokens must be non-negative")
-        return self._token_budget if reserved_estimator_tokens == 0 else max(1, self._estimator_budget - reserved_estimator_tokens)
+        return (
+            self._token_budget
+            if reserved_estimator_tokens == 0
+            else max(1, self._estimator_budget - reserved_estimator_tokens)
+        )
 
     async def prepare_and_take(
         self,
@@ -62,8 +72,8 @@ class ContextPreparation:
         reserved_estimator_tokens: int,
         system_append: str,
     ) -> tuple[tuple[ConversationEntry, ...], _AssemblyPreparation]:
-        assembly_budget = self.budget(reserved_estimator_tokens)
         while True:
+            assembly_budget = self.budget(reserved_estimator_tokens)
             key = self.key(
                 self._store.active_branch_head_id(),
                 force=force,
@@ -79,10 +89,16 @@ class ContextPreparation:
                 system_append=system_append,
             )
 
-    async def prepare(self, *, force: bool, reserved_estimator_tokens: int, system_append: str) -> bool:
-        assembly_budget = self.budget(reserved_estimator_tokens)
+    async def prepare(
+        self,
+        *,
+        force: bool,
+        reserved_estimator_tokens: int,
+        system_append: str,
+    ) -> bool:
         try:
             while True:
+                assembly_budget = self.budget(reserved_estimator_tokens)
                 branch = self._store.active_branch_snapshot()
                 branch_id = branch[-1].id if branch else None
                 preparation = await asyncio.to_thread(
@@ -94,8 +110,17 @@ class ContextPreparation:
                     system_append=system_append,
                 )
                 await asyncio.sleep(0)
-                if self._store.active_branch_head_id() == branch_id:
-                    key = self.key(branch_id, force=force, assembly_budget=assembly_budget, system_append=system_append)
+                current_budget = self.budget(reserved_estimator_tokens)
+                if (
+                    self._store.active_branch_head_id() == branch_id
+                    and current_budget == assembly_budget
+                ):
+                    key = self.key(
+                        branch_id,
+                        force=force,
+                        assembly_budget=assembly_budget,
+                        system_append=system_append,
+                    )
                     self._prepared = (key, (tuple(branch), preparation))
                     return preparation.should_compact
         except asyncio.CancelledError:
