@@ -45,6 +45,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools._shared import process as process_module
 from zeta.tools._shared.shell import (
     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,
     INLINE_SHELL_OUTPUT_LIMIT_MESSAGE,
@@ -2203,8 +2204,17 @@ async def test_background_macro_start_preflight_failure_closes_created_log(
 
 
 async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    process_started = asyncio.Event()
+    original_spawn_background = process_module.spawn_background
+
+    async def spawn_background(*args: Any, **kwargs: Any) -> Any:
+        process = await original_spawn_background(*args, **kwargs)
+        process_started.set()
+        return process
+
+    monkeypatch.setattr(process_module, "spawn_background", spawn_background)
     home = tmp_path / "home"
     _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30\n")
     output = StringIO()
@@ -2223,6 +2233,7 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
         app._submit_input("/wait")
         await _drain_submission_consumer(app)
         assert app.active
+        await asyncio.wait_for(process_started.wait(), timeout=10)
         # test-contract: seam no public event reports active provider-turn completion.
         task = app._active_task
         assert task is not None
