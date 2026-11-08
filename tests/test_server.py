@@ -8208,6 +8208,8 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
             why="an answer",
             kind="answer",
         )
+        broken_path = store.directory / "junk.json"
+        broken_path.write_bytes(b"must not be read")
 
         listed = (
             await _request(
@@ -8221,6 +8223,8 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         assert listed.index(f"{decision.id} [decision]") < listed.index(
             f"{answer.id} [answer]"
         )
+        assert "junk.json [broken] attention/junk.json: invalid_name" in listed
+        assert broken_path.read_bytes() == b"must not be read"
 
         dismissed = (
             await _request(

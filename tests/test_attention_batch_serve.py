@@ -34,6 +34,41 @@ async def _stop_publication_watcher(watcher: asyncio.Task[None]) -> None:
 
 
 @pytest.mark.asyncio
+async def test_serve_decisions_lists_broken_record_without_body(tmp_path: Path) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        opened = server.runtime.opened
+        assert opened is not None
+        registry = server.runtime.manager.project_registry
+        assert registry is not None
+        project_id = await asyncio.to_thread(registry.create_project, "broken", "test")
+        record = await _seed_attention_record(
+            AttentionStore(opened.store.session_dir),
+            session_id,
+            project_id.project_id,
+            "secret request",
+        )
+        path = opened.store.session_dir / "attention" / f"{record.id}.json"
+        path.write_bytes(b'{"why":"secret request body"')
+        raw_response = await _request(
+            reader,
+            writer,
+            "broken-list",
+            "slash_run",
+            {"session_id": session_id, "text": "/decisions"},
+        )
+        response = raw_response[-1]["result"]["text"]
+        assert record.id in response
+        assert "attention/" in response
+        assert "invalid_json" in response
+        assert "secret request body" not in response
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -82,6 +117,44 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
         assert all(store.get(record.id).status == "resolved" for record in records)
         inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
         assert len(inbox.new_ids(project_id, session_id=session_id)) == 1
+
+        broken_id = "e" * 32
+        broken_path = opened.store.session_dir / "attention" / f"{broken_id}.json"
+        broken_bytes = b'{"why":"do not expose"'
+        broken_path.write_bytes(broken_bytes)
+        refusal = (
+            f"attention record {broken_id} is broken (invalid_json); "
+            f"repair attention/{broken_id}.json before replying"
+        )
+        for command in ("reply", "dismiss"):
+            response = (
+                await _request(
+                    reader,
+                    writer,
+                    f"broken-{command}",
+                    "slash_run",
+                    {
+                        "session_id": session_id,
+                        "text": f"/decisions {command} {broken_id} yes".rstrip(),
+                    },
+                )
+            )[-1]["result"]
+            assert response["text"] == refusal
+        broken_payload = json.dumps([{"id": broken_id, "reply": "yes"}])
+        response = (
+            await _request(
+                reader,
+                writer,
+                "broken-batch",
+                "slash_run",
+                {
+                    "session_id": session_id,
+                    "text": f"/decisions batch {broken_payload}",
+                },
+            )
+        )[-1]["result"]
+        assert response["text"] == refusal
+        assert broken_path.read_bytes() == broken_bytes
 
         conflict = await asyncio.to_thread(
             store.request,
