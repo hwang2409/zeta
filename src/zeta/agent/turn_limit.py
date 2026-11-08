@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..core.store import ConversationStore
 
 from ..protocol.types import Message, harness_notice
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
@@ -134,6 +138,143 @@ def project_payload(payload: dict[str, object], child_session_path: str) -> dict
     )
     projected["structuredContent"] = structured
     return projected
+
+
+def background_turn_limit_state(
+    *,
+    result: object,
+    child_turns: Callable[[], int],
+    child_loop: Any,
+    child_instance_id: str,
+    child_session_path: str,
+    final_text: str,
+    background_owner: Any,
+) -> tuple[bool, int, bytes | None]:
+    structured = (
+        result.get("structuredContent", {}) if isinstance(result, dict) else {}
+    )
+    control = getattr(child_loop, "child_turn_control", None)
+    turn_limited = control is not None and control.exhausted
+    turns_used = max(child_turns(), int(structured.get("turns_used", 0)))
+    if not turn_limited:
+        return False, turns_used, None
+    return (
+        True,
+        turns_used,
+        background_fallback_handoff(
+            control=control,
+            child_instance_id=child_instance_id,
+            child_session_path=child_session_path,
+            final_text=final_text,
+            background_owner=background_owner,
+            child_loop=child_loop,
+        ),
+    )
+
+
+def background_fallback_handoff(
+    *,
+    control: ChildTurnControl,
+    child_instance_id: str,
+    child_session_path: str,
+    final_text: str,
+    background_owner: Any,
+    child_loop: Any,
+) -> bytes:
+    children = background_owner.owned_running(child_instance_id)
+    tasks = tuple(
+        (task.task_id, task.headline)
+        for task in child_loop.tool_registry.background_tasks.snapshot()
+        if task.running
+    )
+    return fallback_handoff(
+        control=control,
+        child_instance_id=child_instance_id,
+        child_session_path=child_session_path,
+        final_text=final_text,
+        children=children,
+        tasks=tasks,
+    )
+
+
+async def write_background_turn_limit(
+    store: ConversationStore,
+    handoff_bytes: bytes,
+    receipt: str,
+    child_session_path: str,
+) -> str:
+    await store._to_thread_agent_state(
+        store.ensure_turn_limit_handoff,
+        handoff_bytes,
+    )
+    return build_turn_limit_result(receipt, child_session_path)
+
+
+async def finalize_exhausted_child(
+    *,
+    control: ChildTurnControl | None,
+    text: str,
+    child_session_path: str,
+    child_instance_id: str,
+    child_store: ConversationStore | None,
+    background: bool,
+    owned_children: Callable[[], Sequence[tuple[str, str]]],
+    owned_tasks: Callable[[], Sequence[tuple[str, str]]],
+    terminal_result: Callable[..., dict[str, object]],
+    finish_turn_limit: Callable[[str], dict[str, object]] | None,
+    record_report: Callable[[str], None] | None,
+) -> dict[str, object] | None:
+    if control is None or not control.exhausted:
+        return None
+    readable_text = text.strip() or "no final assistant text"
+    if record_report is not None and text.strip():
+        record_report(text)
+    if not background:
+        if child_store is None:
+            raise RuntimeError("limited child has no session store")
+        content = fallback_handoff(
+            control=control,
+            child_instance_id=child_instance_id,
+            child_session_path=child_session_path,
+            final_text=text,
+            children=owned_children(),
+            tasks=owned_tasks(),
+        )
+        await child_store._to_thread_agent_state(
+            child_store.ensure_turn_limit_handoff, content
+        )
+    if background:
+        result = terminal_result(state="completed", text=readable_text)
+    else:
+        if finish_turn_limit is None:
+            raise RuntimeError("limited child has no terminal commit")
+        result = finish_turn_limit(readable_text)
+    return project_payload(result, child_session_path)
+
+
+def finish_foreground_turn_limit(
+    *,
+    store: ConversationStore,
+    child_session_path: str,
+    readable_text: str,
+    turns_used: int,
+    stats: dict[str, object],
+    build_result: Callable[..., dict[str, object]],
+) -> dict[str, object]:
+    payload = build_result(
+        readable_text,
+        state="completed",
+        stats=stats,
+        persist_receipt=False,
+    )
+    receipt = payload["content"][0]["text"]
+    store.finish_agent_lifecycle(
+        "completed",
+        final_result=build_turn_limit_result(receipt, child_session_path),
+        turns_used=turns_used,
+        canonical_receipt=True,
+    )
+    return payload
 
 
 def fallback_handoff(

@@ -18,7 +18,6 @@ from ..core.project_context import ProjectContext
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
-from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
 from ..project_context.projection import ProjectContextProjection
 from ..project_registry import ProjectRegistryError
@@ -35,7 +34,6 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
-from ..providers.factory import build_backend, credential_store
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
@@ -49,6 +47,7 @@ from .child_context import (
     _child_base_system_prompt,
     _compose_child_project_context,
     _load_child_project_context,
+    resolve_child_backend,
 )
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
@@ -65,9 +64,8 @@ from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
 from .turn_limit import (
     ChildTurnControl,
-    build_turn_limit_result,
-    fallback_handoff,
-    project_payload,
+    finalize_exhausted_child,
+    finish_foreground_turn_limit,
 )
 
 logger = logging.getLogger(__name__)
@@ -221,33 +219,21 @@ async def consume_child(
             await consume_events(events)
         finally:
             await events.aclose()
-        turn_control = getattr(child_loop, "child_turn_control", None)
-        if turn_control is not None and turn_control.exhausted:
-            text = assistant_text(last_message) if last_message is not None else ""
-            readable_text = text.strip() or "no final assistant text"
-            if record_report is not None and text.strip():
-                record_report(text)
-            if not background:
-                if child_store is None:
-                    raise RuntimeError("limited child has no session store")
-                content = fallback_handoff(
-                    control=turn_control,
-                    child_instance_id=child_loop.agent_instance_id or "unknown",
-                    child_session_path=child_path,
-                    final_text=text,
-                    children=owned_children(),
-                    tasks=owned_tasks(),
-                )
-                await child_store._to_thread_agent_state(
-                    child_store.ensure_turn_limit_handoff, content
-                )
-            if background:
-                result = terminal_result(state="completed", text=readable_text)
-            else:
-                if finish_turn_limit is None:
-                    raise RuntimeError("limited child has no terminal commit")
-                result = finish_turn_limit(readable_text)
-            return project_payload(result, child_path)
+        limited_result = await finalize_exhausted_child(
+            control=getattr(child_loop, "child_turn_control", None),
+            text=assistant_text(last_message) if last_message is not None else "",
+            child_session_path=child_path,
+            child_instance_id=child_loop.agent_instance_id or "unknown",
+            child_store=child_store,
+            background=background,
+            owned_children=owned_children,
+            owned_tasks=owned_tasks,
+            terminal_result=terminal_result,
+            finish_turn_limit=finish_turn_limit,
+            record_report=record_report,
+        )
+        if limited_result is not None:
+            return limited_result
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]
@@ -358,40 +344,6 @@ async def consume_run(
         receipt_components=receipt_components,
         **kwargs,
     )
-
-
-def resolve_child_backend(
-    loop: AgentLoop, model: object
-) -> tuple[CompletionBackend | None, str | None]:
-    """Give composed child loops a distinct backend owner."""
-    if model is None:
-        if not is_owned_completion_backend(loop.backend):
-            return loop.backend, None
-        model = loop.backend.model
-    if type(model) is not str or not model.strip():
-        return None, "agent error: model must be a nonempty string"
-    try:
-        provider = provider_for_model(model)
-    except ValueError as exc:
-        return None, f"agent error: {exc}"
-    context = getattr(loop, "account_context", None)
-    account_kwargs = context.backend_kwargs(provider) if context is not None else {}
-    store = credential_store(provider, **account_kwargs)
-    if store is not None:
-        tokens = store.read() or store.bootstrap()
-        if tokens is None:
-            message = f"agent error: not logged in to {provider}; "
-            return None, message + f"run zeta login --provider {provider}"
-    try:
-        child_budget = effective_budget_for_model(
-            provider, model, loop.context_assembler.token_budget
-        )
-        backend, _ = build_backend(
-            provider, model, token_budget=child_budget, **account_kwargs
-        )
-    except (OSError, RuntimeError, ValueError) as exc:
-        return None, f"agent error: could not start {provider} backend: {exc}"
-    return backend, None
 
 
 async def _build_child_loop(
@@ -994,21 +946,14 @@ async def run_agent_tool(
 
     def finish_turn_limit(readable_text: str) -> dict[str, object]:
         turns_used = child_turns()
-        stats = agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
-        payload = child_result(
-            readable_text,
-            state="completed",
-            stats=stats,
-            persist_receipt=False,
-        )
-        receipt = payload["content"][0]["text"]
-        child_store.finish_agent_lifecycle(
-            "completed",
-            final_result=build_turn_limit_result(receipt, child_path),
+        return finish_foreground_turn_limit(
+            store=child_store,
+            child_session_path=child_path,
+            readable_text=readable_text,
             turns_used=turns_used,
-            canonical_receipt=True,
+            stats=agent_stats(child_store.agent_lifecycle(), turns_used=turns_used),
+            build_result=child_result,
         )
-        return payload
 
     def publish_lifecycle(
         kind: str,

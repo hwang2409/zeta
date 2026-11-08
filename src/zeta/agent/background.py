@@ -30,11 +30,16 @@ from .receipt import (
     build_agent_receipt,
     build_explicit_finish_receipt,
     child_cleanup_details,
+    lifecycle_tool_result,
     receipt_tool_result,
 )
 from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
 from .terminal_fence import TerminalTransitionFence
-from .turn_limit import build_turn_limit_result, fallback_handoff, project_payload
+from .turn_limit import (
+    background_turn_limit_state,
+    project_payload,
+    write_background_turn_limit,
+)
 
 _AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
 
@@ -443,54 +448,6 @@ def _nested_canceled_result(marker: dict[str, object]) -> ToolResult:
     return receipt_tool_result(ToolCall.from_dict(marker["tool_call"]).id, result)
 
 
-def _lifecycle_tool_result(
-    tool_call: ToolCall, child_store: ConversationStore, child_path: Path
-) -> ToolResult | None:
-    lifecycle = child_store.agent_lifecycle()
-    if lifecycle is None or lifecycle.get("finished_at") is None:
-        return None
-    state = lifecycle.get("state")
-    final_result = lifecycle.get("final_result")
-    if type(state) is not str or type(final_result) is not str or not final_result:
-        return None
-    structured: dict[str, object] = {
-        "turns_used": lifecycle.get("turns_used", 0),
-        "child_session_path": str(child_path),
-        "status": state,
-    }
-    for key in ("agent_type", "handle", "depth"):
-        if key in lifecycle:
-            structured["child_instance_id" if key == "handle" else key] = lifecycle[key]
-    state_value: TerminalState = (
-        "completed"
-        if state == "completed"
-        else "canceled"
-        if state == "canceled"
-        else "failed"
-    )
-    if lifecycle.get("final_result_is_receipt") is True:
-        return ToolResult(
-            tool_call.id,
-            final_result,
-            is_error=state_value == "failed",
-            structured_content=structured,
-            is_canceled=state_value == "canceled",
-        )
-    result = build_agent_receipt(
-        state_value,
-        final_result,
-        agent_stats(
-            lifecycle,
-            status=state_value,
-            turns_used=structured["turns_used"]
-            if type(structured["turns_used"]) is int
-            else 0,
-        ),
-        structured_content=structured,
-    )
-    return receipt_tool_result(tool_call.id, result)
-
-
 def _existing_tool_result(store: ConversationStore, tool_call_id: str) -> bool:
     return any(
         message.tool_result is not None
@@ -738,7 +695,7 @@ def _recover_nested_children(
                         notification_stats = existing_stats
             elif not existing_result:
                 lifecycle_result = (
-                    _lifecycle_tool_result(tool_call, child_store, child_path)
+                    lifecycle_tool_result(tool_call, child_store, child_path)
                     if child_store is not None
                     else None
                 )
@@ -954,7 +911,7 @@ def _recover_agent_children(
                 continue
             existing_result = loop._existing_tool_result(tool_call.id)
             recovered_result = (
-                _lifecycle_tool_result(tool_call, child_store, child_path)
+                lifecycle_tool_result(tool_call, child_store, child_path)
                 if child_store is not None
                 else None
             )
@@ -1079,29 +1036,15 @@ async def finish_background_child(
                     if explicit_finish_report["status"] == "failed"
                     else "completed"
                 )
-        result_structured = (
-            result.get("structuredContent", {}) if isinstance(result, dict) else {}
+        turn_limited, turns_used, turn_limit_handoff = background_turn_limit_state(
+            result=result,
+            child_turns=child_turns,
+            child_loop=child_loop,
+            child_instance_id=child_instance_id,
+            child_session_path=child_path,
+            final_text=notification_text,
+            background_owner=background_owner,
         )
-        turn_control = getattr(child_loop, "child_turn_control", None)
-        turn_limited = turn_control is not None and turn_control.exhausted
-        turns_used = max(child_turns(), int(result_structured.get("turns_used", 0)))
-        turn_limit_handoff: bytes | None = None
-        if turn_limited:
-            assert turn_control is not None
-            owned_children = background_owner.owned_running(child_instance_id)
-            owned_tasks = tuple(
-                (task.task_id, task.headline)
-                for task in child_loop.tool_registry.background_tasks.snapshot()
-                if task.running
-            )
-            turn_limit_handoff = fallback_handoff(
-                control=turn_control,
-                child_instance_id=child_instance_id,
-                child_session_path=child_path,
-                final_text=notification_text,
-                children=owned_children,
-                tasks=owned_tasks,
-            )
         if (
             child_loop is not None
             and status != "canceled"
@@ -1210,10 +1153,12 @@ async def finish_background_child(
         async def commit_adopt_publish() -> ConversationEntry:
             persisted_text = notification_text
             if turn_limit_handoff is not None:
-                await child_store._to_thread_agent_state(
-                    child_store.ensure_turn_limit_handoff, turn_limit_handoff
+                persisted_text = await write_background_turn_limit(
+                    child_store,
+                    turn_limit_handoff,
+                    notification_text,
+                    child_path,
                 )
-                persisted_text = build_turn_limit_result(notification_text, child_path)
             transferred = await child_store.finalize_background_agent(
                 parent_store=effective_parent_store,
                 terminal_state=lifecycle_state,

@@ -13,9 +13,18 @@ from ..core.project_context import (
     resolve_project_context_from_projects,
 )
 from ..core.session import env_home
+from ..core.slash import effective_budget_for_model
+from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
 from ..project_context.projection import ProjectContextProjection
-from ..protocol.types import Message, MessageRole, TextContent
+from ..protocol.types import (
+    CompletionBackend,
+    Message,
+    MessageRole,
+    TextContent,
+    is_owned_completion_backend,
+)
+from ..providers.factory import build_backend, credential_store
 from ..runtime.prompt import (
     PromptFragment,
     RuntimePrompt,
@@ -27,6 +36,40 @@ from .presets import AgentPreset, compose_system_prompt
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
+
+
+def resolve_child_backend(
+    loop: AgentLoop, model: object
+) -> tuple[CompletionBackend | None, str | None]:
+    """Give composed child loops a distinct backend owner."""
+    if model is None:
+        if not is_owned_completion_backend(loop.backend):
+            return loop.backend, None
+        model = loop.backend.model
+    if type(model) is not str or not model.strip():
+        return None, "agent error: model must be a nonempty string"
+    try:
+        provider = provider_for_model(model)
+    except ValueError as exc:
+        return None, f"agent error: {exc}"
+    context = getattr(loop, "account_context", None)
+    account_kwargs = context.backend_kwargs(provider) if context is not None else {}
+    store = credential_store(provider, **account_kwargs)
+    if store is not None:
+        tokens = store.read() or store.bootstrap()
+        if tokens is None:
+            message = f"agent error: not logged in to {provider}; "
+            return None, message + f"run zeta login --provider {provider}"
+    try:
+        child_budget = effective_budget_for_model(
+            provider, model, loop.context_assembler.token_budget
+        )
+        backend, _ = build_backend(
+            provider, model, token_budget=child_budget, **account_kwargs
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, f"agent error: could not start {provider} backend: {exc}"
+    return backend, None
 
 
 def _load_child_project_context(
