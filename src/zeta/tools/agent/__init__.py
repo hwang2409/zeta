@@ -457,7 +457,7 @@ def _lost_agent_status(
 def _project_agent_status(
     lifecycle: object,
     handle: str,
-    child_path: Path,
+    child_path: Path | None = None,
     *,
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
@@ -498,7 +498,7 @@ def _project_agent_status(
     cwd = _status_text(lifecycle.get("cwd", _MISSING), "cwd", "")
     projection = (
         parse_turn_limit_result(lifecycle.get("final_result"), child_path)
-        if state == "completed"
+        if state == "completed" and child_path is not None
         else None
     )
     if projection is not None:
