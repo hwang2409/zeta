@@ -11,10 +11,12 @@ poller keeps fresh while the app is open.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 from prompt_toolkit.document import Document
 
+from ...protocol.types import StreamEvent, StreamEventType
 from ...runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
@@ -27,7 +29,9 @@ from ..overlay import OverlayControl
 # attention records); a few-second cadence keeps the status-bar count fresh
 # without busy-polling.
 _POLL_INTERVAL = 2.0
-_PANEL_REFRESH_INTERVAL = 0.5
+_SCAN_TIMEOUT = 10.0
+_SCAN_RETRY_LIMIT = 3
+_SCAN_RETRY_BASE = 0.5
 
 
 def _registry_state(app: object) -> ProjectRegistryState:
@@ -52,8 +56,11 @@ class DecisionsMixin:
         self._decisions_panel_control = OverlayControl()
         self._decisions_panel_open = False
         self._decisions_count = 0
-        self._decisions_poll_task: asyncio.Task[None] | None = None
-        self._decisions_refresh_task: asyncio.Task[None] | None = None
+        self._decisions_error: str | None = None
+        self._decisions_scan_task: asyncio.Task[None] | None = None
+        self._decisions_scan_work: asyncio.Future[tuple] | None = None
+        self._decisions_scan_requested = asyncio.Event()
+        self._decisions_stopping = False
         self._decisions_restore_text = ""
         self._decisions_restore_cursor = 0
         self._decisions_answer_buffer = ""
@@ -67,6 +74,10 @@ class DecisionsMixin:
     @property
     def decisions_count(self) -> int:
         return self._decisions_count
+
+    @property
+    def decisions_error(self) -> str | None:
+        return self._decisions_error
 
     @property
     def _decisions_session_id(self) -> str:
@@ -85,16 +96,10 @@ class DecisionsMixin:
             self._consume_overlay_submission()
             self.open_decisions_panel()
             return ""
-        from ...attention_decisions import open_decisions
         from ...attention_records import AttentionStore
 
         parts = args.split(maxsplit=2)
-        items = await asyncio.to_thread(
-            open_decisions,
-            self._home,
-            self._decisions_session_id,
-            _registry_state(self),
-        )
+        items = await DecisionsMixin._read_decisions(self, _SCAN_TIMEOUT)
         if parts and parts[0] in {"reply", "dismiss"}:
             if len(parts) < 2:
                 return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
@@ -131,38 +136,123 @@ class DecisionsMixin:
             for item in items
         )
 
-    # -- status-bar count poll ----------------------------------------------
+    # -- status-bar count scan ----------------------------------------------
 
     def start_decisions_poll(self) -> None:
-        if self._decisions_poll_task is not None:
-            return
-        self._decisions_poll_task = asyncio.create_task(self._decisions_poll_loop())
+        self._decisions_stopping = False
+        self.request_decisions_refresh()
 
-    def stop_decisions_poll(self) -> None:
-        task = self._decisions_poll_task
-        self._decisions_poll_task = None
+    async def stop_decisions_poll(self) -> None:
+        self._decisions_stopping = True
+        task = self._decisions_scan_task
+        self._decisions_scan_task = None
+        self._decisions_scan_requested.clear()
         if task is not None and not task.done():
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
-    async def _decisions_poll_loop(self) -> None:
+    def _refresh_decisions_for_event(self, event: StreamEvent) -> None:
+        if (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "resolve_attention"
+            and event.tool_result is not None
+            and not event.tool_result.is_error
+        ):
+            self.request_decisions_refresh()
+
+    def request_decisions_refresh(self) -> None:
+        if self._decisions_stopping:
+            return
+        self._decisions_scan_requested.set()
+        if self._decisions_scan_task is None or self._decisions_scan_task.done():
+            self._decisions_scan_task = asyncio.create_task(
+                self._decisions_scan_loop(), name="zeta-decisions-scan"
+            )
+
+    async def _decisions_scan_loop(self) -> None:
         while True:
-            await self._decisions_tick()
-            await asyncio.sleep(_POLL_INTERVAL)
+            self._decisions_scan_requested.clear()
+            scanned = await self._scan_decisions_with_retries()
+            if not scanned:
+                await self._decisions_scan_requested.wait()
+                continue
+            # The completed scan includes every request received while it ran.
+            self._decisions_scan_requested.clear()
+            try:
+                await asyncio.wait_for(
+                    self._decisions_scan_requested.wait(), timeout=_POLL_INTERVAL
+                )
+            except TimeoutError:
+                pass
 
-    async def _decisions_tick(self) -> None:
+    async def _scan_decisions_with_retries(self) -> bool:
+        for attempt in range(_SCAN_RETRY_LIMIT + 1):
+            try:
+                await self._decisions_tick()
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - projection failures stay visible
+                if attempt == _SCAN_RETRY_LIMIT:
+                    self._set_decisions_error(exc)
+                    return False
+                await asyncio.sleep(_SCAN_RETRY_BASE * 2**attempt)
+        return False
+
+    def _set_decisions_error(self, error: BaseException) -> None:
+        reason = str(error).strip() or type(error).__name__
+        self._decisions_error = reason[:80]
+        self._invalidate_prompt()
+
+    async def _read_decisions(self, timeout: float | None) -> tuple:
         from ...attention_decisions import open_decisions
 
+        work = getattr(self, "_decisions_scan_work", None)
+        if work is None:
+            loop = asyncio.get_running_loop()
+            work = loop.create_future()
+            self._decisions_scan_work = work
+            args = (self._home, self._decisions_session_id, _registry_state(self))
+
+            def deliver(result: tuple | Exception) -> None:
+                if work.done():
+                    return
+                if isinstance(result, Exception):
+                    work.set_exception(result)
+                else:
+                    work.set_result(result)
+
+            def scan() -> None:
+                try:
+                    result = open_decisions(*args)
+                except Exception as exc:  # noqa: BLE001 - publish scan failures
+                    result = exc
+                if loop.is_closed():
+                    return
+                try:
+                    loop.call_soon_threadsafe(deliver, result)
+                except RuntimeError:
+                    pass  # The loop closed after the check.
+
+            threading.Thread(
+                target=scan, name="zeta-decisions-scan", daemon=True
+            ).start()
         try:
-            items = await asyncio.to_thread(
-                open_decisions,
-                self._home,
-                self._decisions_session_id,
-                _registry_state(self),
-            )
-        except OSError:
-            return
-        changed = len(items) != self._decisions_count
+            return await asyncio.wait_for(asyncio.shield(work), timeout=timeout)
+        finally:
+            if work.done() and self._decisions_scan_work is work:
+                self._decisions_scan_work = None
+
+    async def _decisions_tick(self) -> None:
+        try:
+            items = await self._read_decisions(_SCAN_TIMEOUT)
+        except TimeoutError as exc:
+            self._set_decisions_error(exc)
+            items = await self._read_decisions(timeout=None)
+        changed = len(items) != self._decisions_count or self._decisions_error is not None
         self._decisions_count = len(items)
+        self._decisions_error = None
         if self._decisions_panel_open:
             self._decisions_panel.set_items(items)
             self._decisions_panel_control.set_lines(
@@ -188,7 +278,7 @@ class DecisionsMixin:
             self._decisions_panel.render_lines(), overflow_hint=True
         )
         session.layout.focus(self._decisions_panel_window)
-        self._start_decisions_refresh()
+        self.request_decisions_refresh()
         self._invalidate_prompt()
 
     def close_decisions_panel(self) -> None:
@@ -196,7 +286,6 @@ class DecisionsMixin:
             return
         self._decisions_panel_open = False
         self._decisions_panel.exit_answer()
-        self._stop_decisions_refresh()
         session = self._active_session
         if isinstance(session, FullScreenPromptSession):
             session.default_buffer.set_document(
@@ -204,23 +293,6 @@ class DecisionsMixin:
             )
             session.layout.focus(session.default_buffer)
         self._invalidate_prompt()
-
-    def _start_decisions_refresh(self) -> None:
-        self._stop_decisions_refresh()
-        self._decisions_refresh_task = asyncio.create_task(
-            self._decisions_refresh_loop()
-        )
-
-    def _stop_decisions_refresh(self) -> None:
-        task = self._decisions_refresh_task
-        self._decisions_refresh_task = None
-        if task is not None and not task.done():
-            task.cancel()
-
-    async def _decisions_refresh_loop(self) -> None:
-        while self._decisions_panel_open:
-            await self._decisions_tick()
-            await asyncio.sleep(_PANEL_REFRESH_INTERVAL)
 
     # -- keyboard -----------------------------------------------------------
 
@@ -313,8 +385,7 @@ class DecisionsMixin:
                 )
             except (OSError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
-            await self._decisions_tick()
-            self._refresh_decisions_panel()
+            self.request_decisions_refresh()
 
         self._decisions_panel.exit_answer()
         asyncio.create_task(run())

@@ -1024,6 +1024,51 @@ async def test_unobserved_failed_store_close_is_not_retried(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_canceled_store_close_waiter_does_not_cancel_shared_close(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    original_close = store.close
+    event_loop = asyncio.get_running_loop()
+    close_entered = asyncio.Event()
+    release_close = threading.Event()
+
+    def gated_close() -> None:
+        event_loop.call_soon_threadsafe(close_entered.set)
+        release_close.wait(10)
+        original_close()
+
+    store.close = gated_close  # type: ignore[method-assign]
+    owner.track_store(store)
+    owner.mark_store_finished(store)
+    owner.release_unused_stores()
+    canceled_waiter = asyncio.create_task(owner.wait_for_store_closes())
+    other_waiter = asyncio.create_task(owner.wait_for_store_closes())
+    try:
+        await asyncio.wait_for(close_entered.wait(), 10)
+        # A canceled child turn stops waiting while the shared close still runs.
+        canceled_waiter.cancel()
+        await asyncio.wait({canceled_waiter}, timeout=10)
+        release_close.set()
+        await asyncio.wait_for(other_waiter, 10)
+        assert store not in owner._stores
+    finally:
+        release_close.set()
+        for waiter in (canceled_waiter, other_waiter):
+            waiter.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(canceled_waiter, other_waiter, return_exceptions=True),
+            10,
+        )
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(owner._store_close_tasks), return_exceptions=True),
+            10,
+        )
+        original_close()
+
+
+@pytest.mark.asyncio
 async def test_wait_for_store_closes_does_not_spin_before_done_callback(
     tmp_path: Path,
 ) -> None:

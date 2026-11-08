@@ -496,7 +496,7 @@ class AgentStateMixin:
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def mark_agent_canceled(self, parent_tool_call_id: str) -> None:
-        """Persist a child cancellation after its task has stopped."""
+        """Persist a child cancellation and its terminal lifecycle."""
 
         if not parent_tool_call_id:
             raise ValueError("parent tool call id must be nonempty")
