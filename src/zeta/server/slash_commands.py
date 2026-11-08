@@ -17,8 +17,8 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
-from ..attention_decisions import DecisionItem
-from ..attention_records import Broken
+from ..attention_decisions import DecisionItem, open_decisions
+from ..attention_records import Broken, broken_record_refusal
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
@@ -112,8 +112,6 @@ class ServerSlashSession:
     # --- runnable server-side ---
 
     async def slash_decisions(self, args: str) -> str:
-        from ..attention_decisions import open_decisions
-
         _loop, opened = self._active_loop_and_session()
         command, _, remainder = args.strip().partition(" ")
         registry_state = self._runtime.manager.project_registry_state
@@ -197,6 +195,18 @@ class ServerSlashSession:
     async def _run_decisions_batch(
         self, batch: list[tuple[str, str]], from_session: str
     ) -> str:
+        _loop, opened = self._active_loop_and_session()
+        items = await asyncio.to_thread(
+            open_decisions,
+            self._runtime.home,
+            opened.metadata.session_id,
+            self._runtime.manager.project_registry_state,
+        )
+        by_id = {item.record.id: item.record for item in items}
+        for attention_id, _reply in batch:
+            record = by_id.get(attention_id)
+            if isinstance(record, Broken):
+                return broken_record_refusal(record)
         await self._run_attention_operation(
             self._attention_replies(from_session).stage_and_flush,
             batch,

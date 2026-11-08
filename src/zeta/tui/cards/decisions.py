@@ -116,14 +116,19 @@ class DecisionsPanel:
         """Return the 1-based offered option for the selection, or ``None``."""
 
         item = self.selected
-        if item is None or number < 1 or number > len(item.record.options):
+        if (
+            item is None
+            or isinstance(item.record, Broken)
+            or number < 1
+            or number > len(item.record.options)
+        ):
             return None
         return item.record.options[number - 1]
 
     # -- answer field -------------------------------------------------------
 
     def enter_answer(self) -> bool:
-        if self.selected is None:
+        if self.selected is None or isinstance(self.selected.record, Broken):
             return False
         self._mode = "answer"
         self._answer = ""
@@ -154,7 +159,11 @@ class DecisionsPanel:
         selection = self.selected
         if selection is not None:
             lines.extend(self._detail(selection))
-        if selection is not None and not isinstance(selection.record, Broken) and selection.record.kind != "decision":
+        if (
+            selection is not None
+            and not isinstance(selection.record, Broken)
+            and selection.record.kind != "decision"
+        ):
             lines.append(overlay.hint("d dismiss"))
         if self._mode == "answer":
             lines.append(self._answer_line())

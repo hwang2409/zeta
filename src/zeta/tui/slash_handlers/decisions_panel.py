@@ -15,7 +15,7 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
-from ...attention_records import Broken
+from ...attention_records import Broken, broken_record_refusal
 from ...runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
@@ -106,6 +106,8 @@ class DecisionsMixin:
             )
             if record is None:
                 return "attention item not found"
+            if isinstance(record, Broken):
+                return broken_record_refusal(record)
             replies = self._attention_replies(record.session_id)
             if parts[0] == "dismiss":
                 await self._run_attention_operation(replies.dismiss, attention_id)
@@ -292,8 +294,8 @@ class DecisionsMixin:
             self._dismiss_selected()
             return
         elif key == "a":
-            panel.enter_answer()
-            self._decisions_answer_buffer = ""
+            if panel.enter_answer():
+                self._decisions_answer_buffer = ""
         elif key == "enter":
             self._discuss_selected()
             return
@@ -351,6 +353,7 @@ class DecisionsMixin:
                 panel_item.record.id
                 for panel_item in self._decisions_panel.items
                 if panel_item.session_id == record.session_id
+                and not isinstance(panel_item.record, Broken)
             }
             try:
                 replies = self._attention_replies(record.session_id)
@@ -389,6 +392,9 @@ class DecisionsMixin:
     def _discuss_selected(self) -> None:
         item = self._decisions_panel.selected
         if item is None or self._decisions_switching:
+            return
+        if isinstance(item.record, Broken):
+            self._print_system(broken_record_refusal(item.record))
             return
         self._decisions_switching = True
         source_id, attention_id = item.session_id, item.record.id

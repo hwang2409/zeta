@@ -58,7 +58,9 @@ def open_decisions(
     items = [
         DecisionItem(
             session_id=session_id,
-            project_id=record.project_id if isinstance(record, AttentionRecord) else None,
+            project_id=record.project_id
+            if isinstance(record, AttentionRecord)
+            else None,
             project_name=names.get(record.project_id or "", "Unassigned")
             if isinstance(record, AttentionRecord)
             else "Unassigned",
@@ -73,7 +75,9 @@ def open_decisions(
             key=lambda item: (
                 not isinstance(item.record, AttentionRecord)
                 or item.record.kind != "decision",
-                item.record.created_at if isinstance(item.record, AttentionRecord) else item.record.path,
+                item.record.created_at
+                if isinstance(item.record, AttentionRecord)
+                else item.record.path,
             ),
         )
     )

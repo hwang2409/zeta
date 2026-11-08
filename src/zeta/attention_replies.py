@@ -13,7 +13,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from .attention_records import AttentionRecord, AttentionStore, Broken, Missing
+from .attention_records import (
+    AttentionRecord,
+    AttentionStore,
+    Broken,
+    Missing,
+    broken_record_refusal,
+)
 from .project_inbox import ProjectInbox
 from .runtime.project_registry_state import (
     ProjectRegistryState,
@@ -385,9 +391,7 @@ class AttentionReplies:
     def _record(self, attention_id: str) -> AttentionRecord:
         state = AttentionStore(self.session_dir).record_state(attention_id)
         if isinstance(state, Broken):
-            raise ReplyConflict(
-                f"attention record {state.id} is broken ({state.reason}); repair {state.path} before replying"
-            )
+            raise ReplyConflict(broken_record_refusal(state))
         if isinstance(state, Missing):
             raise ReplyConflict(f"attention record {attention_id} is missing")
         return state.value
@@ -442,7 +446,9 @@ class AttentionReplies:
         pairs: list[tuple[str, str]] = []
         for item in replies:
             if not isinstance(item, tuple) or len(item) != 2:
-                raise TypeError("replies must be a list of attention id and reply pairs")
+                raise TypeError(
+                    "replies must be a list of attention id and reply pairs"
+                )
             pairs.append(
                 (cls._validate_attention_id(item[0]), cls._validate_reply(item[1]))
             )

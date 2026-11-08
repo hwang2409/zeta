@@ -334,9 +334,7 @@ def test_attention_replies_public_table(
                     RuntimeError("wake unavailable")
                 ),
             )
-            outcome = failing.reply(
-                target.id, "answer", fixture.answerer_session_id
-            )
+            outcome = failing.reply(target.id, "answer", fixture.answerer_session_id)
             assert outcome.message_id is not None
             assert len(fixture.inbox_messages()) == 1
             return

@@ -47,6 +47,13 @@ class Broken:
 RecordState = Missing | Loaded | Broken
 
 
+def broken_record_refusal(record: Broken) -> str:
+    return (
+        f"attention record {record.id} is broken ({record.reason}); "
+        f"repair {record.path} before replying"
+    )
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -203,16 +210,34 @@ class AttentionStore:
         except FileNotFoundError:
             return Missing()
         except OSError:
-            return Broken(attention_id, self._relative_path(path), "unreadable", "manual repair", b"")
+            return Broken(
+                attention_id,
+                self._relative_path(path),
+                "unreadable",
+                "manual repair",
+                b"",
+            )
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 os.close(fd)
-                return Broken(attention_id, self._relative_path(path), "unreadable", "manual repair", b"")
+                return Broken(
+                    attention_id,
+                    self._relative_path(path),
+                    "unreadable",
+                    "manual repair",
+                    b"",
+                )
             with os.fdopen(fd, "rb") as stream:
                 raw = stream.read(_MAX_RECORD_BYTES + 1)
         except OSError:
-            return Broken(attention_id, self._relative_path(path), "unreadable", "manual repair", b"")
+            return Broken(
+                attention_id,
+                self._relative_path(path),
+                "unreadable",
+                "manual repair",
+                b"",
+            )
         try:
             if len(raw) > _MAX_RECORD_BYTES:
                 raise ValueError("too large")
@@ -231,7 +256,9 @@ class AttentionStore:
             reason = "id_mismatch"
         except ValueError as exc:
             reason = "too_large" if str(exc) == "too large" else "invalid_schema"
-        return Broken(attention_id, self._relative_path(path), reason, "manual repair", raw)
+        return Broken(
+            attention_id, self._relative_path(path), reason, "manual repair", raw
+        )
 
     def _relative_path(self, path: Path) -> str:
         return path.relative_to(self.session_dir).as_posix()
@@ -259,7 +286,12 @@ class AttentionStore:
             elif isinstance(state, Broken):
                 records.append(state)
         return tuple(
-            sorted(records, key=lambda item: item.created_at if isinstance(item, AttentionRecord) else item.path)
+            sorted(
+                records,
+                key=lambda item: (
+                    item.created_at if isinstance(item, AttentionRecord) else item.path
+                ),
+            )
         )
 
     def replace(
