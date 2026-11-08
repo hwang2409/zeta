@@ -1,8 +1,12 @@
+import io
 import random
 import re
 import sys
 
-from zeta.tui.cards.base import UNSAFE_CONTROL_RE, strip_terminal_controls
+from rich.console import Console
+from rich.text import Text
+
+from zeta.tui.cards.base import UNSAFE_CONTROL_RE, safe_text, strip_terminal_controls
 
 # Reference: the implementation before the clean-text fast path, kept verbatim.
 _OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)")
@@ -87,6 +91,66 @@ def test_mixed_controls_and_escape_sequences_match_reference() -> None:
     for _ in range(20_000):
         value = "".join(rng.choice(pieces) for _ in range(rng.randrange(0, 12)))
         assert strip_terminal_controls(value) == _reference(value), repr(value)
+
+
+def test_safe_text_clean_card_lines_skip_ansi_parser(monkeypatch) -> None:
+    calls = 0
+    original = safe_text.__globals__["Text"].from_ansi
+
+    def count_parser(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(safe_text.__globals__["Text"], "from_ansi", count_parser)
+    clean = "stdout:\nplain output\nexit_code: 0"
+    rendered = safe_text(clean, style="body")
+
+    assert rendered.plain == clean
+    assert calls == 0
+
+
+def test_safe_text_matches_ansi_decoder_for_card_text_corpus() -> None:
+    values = (
+        "plain",
+        "\x1b[31mfailed\x1b[0m",
+        "carriage\rreturn",
+        "windows\r\nline",
+        "trailing\n",
+        "vertical\x0btab\x0cform",
+        "record\x1cseparator\x1dseparator\x1eseparator",
+        "next\x85line\u2028line\u2029line",
+        "tabs\tand unicode 漢字",
+        "",
+    )
+    for value in values:
+        for wrap in (False, True):
+            actual = safe_text(value, style="body", wrap=wrap)
+            expected = Text.from_ansi(
+                strip_terminal_controls(value),
+                style="body",
+                overflow="fold" if wrap else "ellipsis",
+                no_wrap=not wrap,
+            )
+            actual_output = io.StringIO()
+            expected_output = io.StringIO()
+            for text, output in ((actual, actual_output), (expected, expected_output)):
+                Console(
+                    file=output,
+                    force_terminal=True,
+                    color_system=None,
+                    tab_size=4,
+                    width=20,
+                ).print(text, end="")
+            assert actual_output.getvalue() == expected_output.getvalue(), (
+                repr(value),
+                wrap,
+            )
+            assert actual.style == expected.style, (repr(value), wrap, "style")
+            assert actual.tab_size == expected.tab_size, (repr(value), wrap, "tab_size")
+            assert actual.end == expected.end, (repr(value), wrap, "end")
+            assert actual.overflow == expected.overflow, (repr(value), wrap, "overflow")
+            assert actual.no_wrap == expected.no_wrap, (repr(value), wrap, "no_wrap")
 
 
 def test_clean_text_skips_the_character_loop() -> None:

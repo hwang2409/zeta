@@ -27,6 +27,7 @@ from .config import (
 from .http import StreamableHTTPMCPClient
 from .management import (
     ManagedServer,
+    MCPManagementClosedError,
     MCPManagementError,
     MCPManagementService,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "MCPClient",
     "MCPConfig",
     "MCPConfigError",
+    "MCPManagementClosedError",
     "MCPManagementError",
     "MCPManagementService",
     "MCPMount",

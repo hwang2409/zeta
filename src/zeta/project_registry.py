@@ -50,9 +50,11 @@ from .project_schema import (
     validate_project_text,
 )
 from .storage_format import (
+    WRITER_EPOCH,
     WriterLease,
     mapping_mutations,
     open_writer,
+    reject_unknown_keys,
     require_closed_variant,
 )
 
@@ -332,6 +334,9 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
         if not write:
             raise AssertionError("read operations must use _read")
         lease = open_writer(self.root.parent)
+        if lease.observed_epoch != WRITER_EPOCH:
+            lease.close()
+            raise ProjectRegistryError("project writes are unavailable before the writer epoch")
         self._ensure_root()
         try:
             with self._locked_home() as root_fd:
@@ -804,14 +809,12 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
 
     @staticmethod
     def _decode_session_link(value: object) -> dict[str, object]:
-        if not isinstance(value, dict) or set(value) != {
-            "session_id",
-            "transcript_path",
-            "role",
-            "parent_session_id",
-            "recorded_at",
-        }:
+        if not isinstance(value, dict):
             raise ProjectRegistryError("malformed project session reference")
+        try:
+            reject_unknown_keys(value, "project_session_reference")
+        except ValueError as exc:
+            raise ProjectRegistryError("malformed project session reference") from exc
         _validate_text(value["session_id"], "session_id", 128, allow_surrogates=True)
         path = _validate_text(
             value["transcript_path"], "transcript_path", MAX_SCOPE_LENGTH

@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -481,6 +482,7 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
                         "account": str(item),
                         "id": str(item.account),
                         "detail": item.detail,
+                        "available": item.available,
                         "default": store.default(item.account.provider) == item.account,
                         "usage": usage_json(item.usage),
                     }
@@ -496,7 +498,15 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
             if store.default(item.account.provider) == item.account
             else ""
         )
-        lines.append(str(item) + (f"  {item.detail}" if item.detail else "") + marker)
+        availability = (
+            "  unavailable: credentials missing" if not item.available else ""
+        )
+        lines.append(
+            str(item)
+            + (f"  {item.detail}" if item.detail else "")
+            + availability
+            + marker
+        )
         lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
     print("\n".join(lines))
 
@@ -921,6 +931,26 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     return 0
 
 
+def _run_console(run: Callable[[], int]) -> int:
+    try:
+        return run()
+    except (AccountError, StorageFormatError) as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run_tui_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    entrypoint: str,
+    original_argv: list[str],
+) -> int:
+    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    if restart_session_id is not None:
+        return _exec_restart(entrypoint, original_argv, restart_session_id)
+    return exit_status
+
+
 async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
     """Run the main TUI, keeping it live while discussion forks are shown.
 
@@ -1136,18 +1166,11 @@ def _main(argv: list[str] | None = None) -> int:
         return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
-    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
-    if restart_session_id is not None:
-        return _exec_restart(entrypoint, original_argv, restart_session_id)
-    return exit_status
+    return _run_tui_command(args, parser, entrypoint, original_argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:
-        return _main(argv)
-    except StorageFormatError as exc:
-        print(f"zeta: {exc}", file=sys.stderr)
-        return 2
+    return _run_console(lambda: _main(argv))
 
 
 __all__ = ["build_parser", "main"]
