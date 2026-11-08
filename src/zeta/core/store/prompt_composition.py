@@ -10,6 +10,7 @@ from typing import Any
 
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
+from ...storage_format import reject_unknown_keys
 from ..session_files import SessionError
 
 
@@ -30,12 +31,13 @@ def parse_prompt_recipe(
         raise SessionError(f"session prompt recipe is invalid: {path}")
     components: dict[str, dict[str, int | str]] = {}
     for key, component in raw_components.items():
+        if type(component) is dict:
+            reject_unknown_keys(component, "prompt_component")
         if (
             type(system_prompt) is not str
             or type(key) is not str
             or not key
             or type(component) is not dict
-            or set(component) != {"offset", "length", "digest"}
             or type(component.get("offset")) is not int
             or type(component.get("length")) is not int
             or type(component.get("digest")) is not str

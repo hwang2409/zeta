@@ -15,7 +15,8 @@ from typing import Any, Literal
 from ...storage_format import (
     CLOSED_VARIANTS,
     RECOVERY_STATE_MEMORY_PAIRS,
-    STRICT_PAYLOAD_KEYS,
+    StorageFormatError,
+    reject_unknown_keys,
 )
 from ..checkpoints import ConversationEntry, load_session_json
 from ..session_files import open_session_file, write_json_file
@@ -236,8 +237,13 @@ def _after_recovery_step(_step: FaultStep) -> None:
 
 def parse_evidence_manifest(value: Mapping[str, Any]) -> EvidenceManifest:
     """Strictly parse one immutable quarantine manifest."""
-    keys = STRICT_PAYLOAD_KEYS["transcript_recovery.evidence"]
-    if set(value) != keys or value.get("schema") != _EVIDENCE_SCHEMA:
+    try:
+        reject_unknown_keys(value, "transcript_recovery.evidence")
+    except StorageFormatError as exc:
+        raise TranscriptRecoveryIntegrityError(
+            "invalid quarantine manifest shape"
+        ) from exc
+    if value.get("schema") != _EVIDENCE_SCHEMA:
         raise TranscriptRecoveryIntegrityError("invalid quarantine manifest shape")
     manifest = EvidenceManifest(
         quarantine_id=_record_id(value.get("quarantine_id")),
@@ -272,8 +278,11 @@ def parse_evidence_manifest(value: Mapping[str, Any]) -> EvidenceManifest:
 
 def parse_recovery_record(value: Mapping[str, Any]) -> RecoveryRecord:
     """Strictly parse one mutable recovery-state record."""
-    keys = STRICT_PAYLOAD_KEYS["transcript_recovery.state"]
-    if set(value) != keys or value.get("schema") != _STATE_SCHEMA:
+    try:
+        reject_unknown_keys(value, "transcript_recovery.state")
+    except StorageFormatError as exc:
+        raise TranscriptRecoveryIntegrityError("invalid recovery record shape") from exc
+    if value.get("schema") != _STATE_SCHEMA:
         raise TranscriptRecoveryIntegrityError("invalid recovery record shape")
     state = value.get("state")
     memory_step = value.get("memory_step")
@@ -783,10 +792,13 @@ def _mapping(value: Any, label: str) -> Mapping[str, Any]:
 
 
 def _parse_target(value: Any) -> RepairTarget:
-    if not isinstance(value, Mapping) or set(value) != {
-        "root_session_id",
-        "child_run_id",
-    }:
+    if not isinstance(value, Mapping):
+        raise TranscriptRecoveryIntegrityError("invalid recovery target")
+    try:
+        reject_unknown_keys(value, "transcript_recovery.target")
+    except StorageFormatError as exc:
+        raise TranscriptRecoveryIntegrityError("invalid recovery target") from exc
+    if "root_session_id" not in value or "child_run_id" not in value:
         raise TranscriptRecoveryIntegrityError("invalid recovery target")
     root = value.get("root_session_id")
     child = value.get("child_run_id")
