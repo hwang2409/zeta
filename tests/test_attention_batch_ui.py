@@ -112,6 +112,32 @@ def _press(app: TUIApp, key: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tui_renders_broken_attention_without_request_body(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "alpha", "git"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    record = await asyncio.to_thread(
+        _request, owner, project.project_id, "secret request"
+    )
+    path = tmp_path / "sessions" / owner.store.session_id / "attention" / f"{record.id}.json"
+    path.write_bytes(b"{\"why\":\"secret request body\"")
+    app = await _make_app(tmp_path, owner, owner.store.session_id)
+    try:
+        rendered = "".join(
+            text for line in app._decisions_panel.render_lines() for _style, text in line
+        )
+        assert record.id in rendered
+        assert "attention/" in rendered
+        assert "invalid_json" in rendered
+        assert "secret request body" not in rendered
+    finally:
+        owner.store.close()
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_popup_waits_for_recovery_before_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

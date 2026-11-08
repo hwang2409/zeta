@@ -25,6 +25,28 @@ from .core.session_files import (
 _MAX_RECORD_BYTES = 256 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class Missing:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Loaded:
+    value: AttentionRecord
+
+
+@dataclass(frozen=True, slots=True)
+class Broken:
+    id: str
+    path: str
+    reason: str
+    recoverability: str
+    bytes: bytes
+
+
+RecordState = Missing | Loaded | Broken
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -170,17 +192,59 @@ class AttentionStore:
         self.replace(record, create_directory=True)
         return record
 
-    def get(self, attention_id: str) -> AttentionRecord:
+    def record_state(self, attention_id: str) -> RecordState:
         if len(attention_id) != 32 or any(
             character not in "0123456789abcdef" for character in attention_id
         ):
             raise ValueError("invalid attention id")
-        value = _bounded_json(self.directory / f"{attention_id}.json")
-        if not isinstance(value, dict):
-            raise TypeError("attention record must be a JSON object")
-        return AttentionRecord.from_dict(value)
+        path = self.directory / f"{attention_id}.json"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return Missing()
+        except OSError:
+            return Broken(attention_id, self._relative_path(path), "unreadable", "manual repair", b"")
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                os.close(fd)
+                return Broken(attention_id, self._relative_path(path), "unreadable", "manual repair", b"")
+            with os.fdopen(fd, "rb") as stream:
+                raw = stream.read(_MAX_RECORD_BYTES + 1)
+        except OSError:
+            return Broken(attention_id, self._relative_path(path), "unreadable", "manual repair", b"")
+        try:
+            if len(raw) > _MAX_RECORD_BYTES:
+                raise ValueError("too large")
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise TypeError("not an object")
+            record = AttentionRecord.from_dict(value)
+            if record.id != attention_id:
+                raise LookupError("id mismatch")
+            return Loaded(record)
+        except json.JSONDecodeError:
+            reason = "invalid_json"
+        except TypeError:
+            reason = "invalid_schema"
+        except LookupError:
+            reason = "id_mismatch"
+        except ValueError as exc:
+            reason = "too_large" if str(exc) == "too large" else "invalid_schema"
+        return Broken(attention_id, self._relative_path(path), reason, "manual repair", raw)
 
-    def list(self) -> tuple[AttentionRecord, ...]:
+    def _relative_path(self, path: Path) -> str:
+        return path.relative_to(self.session_dir).as_posix()
+
+    def get(self, attention_id: str) -> AttentionRecord:
+        state = self.record_state(attention_id)
+        if isinstance(state, Loaded):
+            return state.value
+        if isinstance(state, Missing):
+            raise FileNotFoundError(attention_id)
+        raise ValueError(f"broken attention record: {state.reason}")
+
+    def list(self) -> tuple[AttentionRecord | Broken, ...]:
         try:
             paths = tuple(self.directory.iterdir())
         except (FileNotFoundError, NotADirectoryError, PermissionError):
@@ -189,11 +253,14 @@ class AttentionStore:
         for path in paths:
             if path.suffix != ".json":
                 continue
-            try:
-                records.append(self.get(path.stem))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                continue
-        return tuple(sorted(records, key=lambda item: item.created_at))
+            state = self.record_state(path.stem)
+            if isinstance(state, Loaded):
+                records.append(state.value)
+            elif isinstance(state, Broken):
+                records.append(state)
+        return tuple(
+            sorted(records, key=lambda item: item.created_at if isinstance(item, AttentionRecord) else item.path)
+        )
 
     def replace(
         self, record: AttentionRecord, *, create_directory: bool = False

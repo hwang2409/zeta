@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .attention_records import AttentionRecord, AttentionStore
+from .attention_records import AttentionRecord, AttentionStore, Broken
 from .project_errors import ProjectRegistryError
 from .project_registry import ProjectRegistry
 from .runtime.project_registry_state import (
@@ -25,7 +25,7 @@ class DecisionItem:
     session_id: str
     project_id: str | None
     project_name: str
-    record: AttentionRecord
+    record: AttentionRecord | Broken
 
 
 def _project_names(registry: ProjectRegistry | None) -> dict[str, str]:
@@ -58,17 +58,23 @@ def open_decisions(
     items = [
         DecisionItem(
             session_id=session_id,
-            project_id=record.project_id,
-            project_name=names.get(record.project_id or "", "Unassigned"),
+            project_id=record.project_id if isinstance(record, AttentionRecord) else None,
+            project_name=names.get(record.project_id or "", "Unassigned")
+            if isinstance(record, AttentionRecord)
+            else "Unassigned",
             record=record,
         )
         for record in AttentionStore(session_dir).list()
-        if record.status == "open"
+        if isinstance(record, Broken) or record.status == "open"
     ]
     return tuple(
         sorted(
             items,
-            key=lambda item: (item.record.kind != "decision", item.record.created_at),
+            key=lambda item: (
+                not isinstance(item.record, AttentionRecord)
+                or item.record.kind != "decision",
+                item.record.created_at if isinstance(item.record, AttentionRecord) else item.record.path,
+            ),
         )
     )
 

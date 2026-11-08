@@ -14,7 +14,7 @@ import pytest
 
 from tests.support.owned import await_or_fail
 from zeta import attention_replies
-from zeta.attention_records import AttentionRecord, AttentionStore
+from zeta.attention_records import AttentionRecord, AttentionStore, Broken
 from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox, SentMessageTracker
@@ -83,6 +83,28 @@ def _fixture(home: Path, count: int = 3) -> ReplyFixture:
         answerer.store.session_id,
         records,
     )
+
+
+def test_broken_attention_is_listed_and_cannot_be_replied_or_deleted(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, count=1)
+    path = fixture.attention_dir / f"{fixture.records[0].id}.json"
+    original = path.read_bytes()
+    path.write_bytes(b"{")
+
+    listed = AttentionStore(tmp_path / "sessions" / fixture.session_id).list()
+    assert len(listed) == 1
+    broken = listed[0]
+    assert isinstance(broken, Broken)
+    assert broken.id == fixture.records[0].id
+    assert broken.path == f"attention/{broken.id}.json"
+    assert broken.reason == "invalid_json"
+    assert broken.bytes == b"{"
+    with pytest.raises(attention_replies.ReplyConflict, match="invalid_json"):
+        fixture.replies.dismiss(broken.id)
+    assert path.read_bytes() == b"{"
+    assert original != path.read_bytes()
 
 
 def _make_information_item(fixture: ReplyFixture, record: AttentionRecord) -> None:

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
+from ...attention_records import Broken
 from ...runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
@@ -121,7 +122,11 @@ class DecisionsMixin:
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
-            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            (
+                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
+                if isinstance(item.record, Broken)
+                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            )
             for item in items
         )
 
@@ -281,6 +286,7 @@ class DecisionsMixin:
         elif (
             key == "d"
             and panel.selected is not None
+            and not isinstance(panel.selected.record, Broken)
             and panel.selected.record.kind != "decision"
         ):
             self._dismiss_selected()
@@ -336,6 +342,9 @@ class DecisionsMixin:
         if item is None:
             return
         record = item.record
+        if isinstance(record, Broken):
+            self._print_system(f"attention record is broken: {record.reason}")
+            return
 
         async def run() -> None:
             item_ids = {
@@ -362,7 +371,9 @@ class DecisionsMixin:
 
     def _dismiss_selected(self) -> None:
         item = self._decisions_panel.selected
-        if item is None:
+        if item is None or isinstance(item.record, Broken):
+            if item is not None:
+                self._print_system(f"attention record is broken: {item.record.reason}")
             return
 
         async def run() -> None:

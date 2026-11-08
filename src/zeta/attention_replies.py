@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from .attention_records import AttentionRecord, AttentionStore
+from .attention_records import AttentionRecord, AttentionStore, Broken, Missing
 from .project_inbox import ProjectInbox
 from .runtime.project_registry_state import (
     ProjectRegistryState,
@@ -383,7 +383,14 @@ class AttentionReplies:
         )
 
     def _record(self, attention_id: str) -> AttentionRecord:
-        return AttentionStore(self.session_dir).get(attention_id)
+        state = AttentionStore(self.session_dir).record_state(attention_id)
+        if isinstance(state, Broken):
+            raise ReplyConflict(
+                f"attention record {state.id} is broken ({state.reason}); repair {state.path} before replying"
+            )
+        if isinstance(state, Missing):
+            raise ReplyConflict(f"attention record {attention_id} is missing")
+        return state.value
 
     def _check_session(self, record: AttentionRecord) -> None:
         if record.session_id != self.source_session_id:

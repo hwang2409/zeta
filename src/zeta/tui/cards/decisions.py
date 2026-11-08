@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from prompt_toolkit.utils import get_cwidth
 
 from ...attention_decisions import DecisionItem
+from ...attention_records import Broken
 from .. import overlay, theme
 from .shared import wrap_by_cells
 
@@ -153,7 +154,7 @@ class DecisionsPanel:
         selection = self.selected
         if selection is not None:
             lines.extend(self._detail(selection))
-        if selection is not None and selection.record.kind != "decision":
+        if selection is not None and not isinstance(selection.record, Broken) and selection.record.kind != "decision":
             lines.append(overlay.hint("d dismiss"))
         if self._mode == "answer":
             lines.append(self._answer_line())
@@ -162,6 +163,10 @@ class DecisionsPanel:
 
     def _list_row(self, item: DecisionItem) -> FragmentLine:
         selected = item.record.id == self._selected_id
+        if isinstance(item.record, Broken):
+            label = f"broken · {item.record.id}"
+            title = f"{item.record.path}: {item.record.reason}"
+            return overlay.row([(theme.ERROR, title)], selected=selected)
         label = f"{item.record.kind} · {item.project_name} · {item.session_id[:8]}"
         title = item.record.title
         available = CONTENT_WIDTH - len(label) - 4
@@ -178,6 +183,15 @@ class DecisionsPanel:
 
     def _detail(self, item: DecisionItem) -> list[FragmentLine]:
         width = CONTENT_WIDTH - 2
+        if isinstance(item.record, Broken):
+            return [
+                overlay.blank(),
+                *_labelled_text("State", "broken attention record", width, theme.ERROR),
+                *_labelled_text("Id", item.record.id, width, theme.DIM),
+                *_labelled_text("Path", item.record.path, width, theme.DIM),
+                *_labelled_text("Reason", item.record.reason, width, theme.ERROR),
+                overlay.rule(),
+            ]
         lines: list[FragmentLine] = [overlay.blank()]
         lines.extend(
             _labelled_text(

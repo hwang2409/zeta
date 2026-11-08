@@ -18,6 +18,7 @@ from typing import Protocol
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..attention_decisions import DecisionItem
+from ..attention_records import Broken
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
@@ -142,7 +143,11 @@ class ServerSlashSession:
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
-            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            (
+                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
+                if isinstance(item.record, Broken)
+                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            )
             for item in items
         )
 
@@ -212,6 +217,8 @@ class ServerSlashSession:
         item = next((item for item in items if item.record.id == attention_id), None)
         if item is None:
             return "attention item not found"
+        if isinstance(item.record, Broken):
+            return f"attention record {item.record.id} is broken ({item.record.reason}); repair {item.record.path} before replying"
         replies = self._attention_replies(item.session_id)
         if command == "dismiss":
             await self._run_attention_operation(replies.dismiss, item.record.id)
