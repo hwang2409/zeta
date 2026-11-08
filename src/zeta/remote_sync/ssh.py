@@ -381,7 +381,10 @@ with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as tempor
             target.chmod(0o600)
     for directory in staging.rglob("*"):
         if directory.is_dir(): directory.chmod(0o700)
-    if transfer_digest(staging) != transfer: _reject("archive does not match its transfer digest")
+    if transfer_digest(staging) != transfer:
+        import hashlib as _h
+        _listing = sorted((str(p.relative_to(staging)), p.stat().st_size, _h.sha256(p.read_bytes()).hexdigest()[:12]) for p in staging.rglob("*") if p.is_file())
+        _reject(f"archive does not match its transfer digest DIAG got={transfer_digest(staging)} want={transfer} files={_listing}")
     try:
         publish_local_project(home, ident, staging, expected_digest=expected)
     except ProjectPublicationError as exc:
