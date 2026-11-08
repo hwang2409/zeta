@@ -3038,6 +3038,7 @@ def test_loop_teardown_cancels_owner_before_detached_leader_exits(
     teardown_finished = threading.Event()
     errors: list[BaseException] = []
     leader_pids: list[int] = []
+    registries: list[BackgroundTaskRegistry] = []
     child_ready = tmp_path / "detached-loop-child"
     original_cancel_all = asyncio.runners._cancel_all_tasks
 
@@ -3073,6 +3074,7 @@ def test_loop_teardown_cancels_owner_before_detached_leader_exits(
             "    signal.pause()\n"
         )
         tasks = BackgroundTaskRegistry()
+        registries.append(tasks)
         _task_id, leader_pid = await tasks.start(_python(leader), tmp_path)
         leader_pids.append(leader_pid)
         await read_pid_file(child_ready)
@@ -3097,7 +3099,11 @@ def test_loop_teardown_cancels_owner_before_detached_leader_exits(
         for leader_pid in leader_pids:
             kill_group_if_present(leader_pid)
         thread.join(10)
-        assert not thread.is_alive(), "background owner survived test cleanup"
+        thread_alive = thread.is_alive()
+        if not thread_alive:
+            for registry in registries:
+                asyncio.run(registry.close())
+        assert not thread_alive, "background owner survived test cleanup"
 
 
 @pytest.mark.asyncio
