@@ -26,7 +26,8 @@ from zeta.protocol.types import (
     ToolCall,
     with_message_origin,
 )
-from zeta.server import ZetaServer, ergonomics
+from zeta.server import ZetaServer
+from zeta.server.handlers import history as ergonomics
 from zeta.server.protocol import EventDescriptor
 
 pytest_plugins = ("tests.support.socket_fixtures",)

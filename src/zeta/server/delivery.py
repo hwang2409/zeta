@@ -120,7 +120,8 @@ class DeliveryRequests:
     async def send_images(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
-        from . import ergonomics, image_delivery
+        from .handlers import history as ergonomics
+        from .handlers import send_images as image_delivery
 
         control = self._control
         runtime = control.server.runtime
@@ -405,7 +406,7 @@ class DeliveryRequests:
 async def _cleanup_canceled_image_delivery(
     worker: asyncio.Task[Any], runtime: Any
 ) -> None:
-    from . import image_delivery
+    from .handlers import send_images as image_delivery
 
     settled = asyncio.Event()
     worker.add_done_callback(lambda _: settled.set())

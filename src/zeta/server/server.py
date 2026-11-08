@@ -22,7 +22,6 @@ from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
     accounts,
-    ergonomics,
     login,
     model_selection,
     slash_commands,
@@ -30,12 +29,13 @@ from . import (
 from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
-from .host_commands import SessionHostCommands
-from .project_requests import (
+from .handlers import history as ergonomics
+from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
     project_request_error,
 )
+from .host_commands import SessionHostCommands
 from .protocol import (
     _ERGONOMICS_METHODS,
     _LOGIN_METHODS,

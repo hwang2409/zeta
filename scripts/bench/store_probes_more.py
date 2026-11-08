@@ -509,7 +509,8 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
     # Requests a resume-started wake turn sent to the stub (never a real provider).
     out["subprocess_stub_requests"] = len(box.stub.requests) - seen
 
-    from zeta.server import ZetaServer, ergonomics
+    from zeta.server import ZetaServer
+    from zeta.server.handlers import history as ergonomics
 
     async def in_process() -> dict[str, Any]:
         server = await asyncio.to_thread(

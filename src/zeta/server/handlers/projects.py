@@ -8,20 +8,20 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..project_errors import (
+from ...project_errors import (
     ProjectNotFoundError,
     ProjectRegistryBusyError,
     ProjectRegistryError,
     UnsupportedMemoryFormatError,
 )
-from ..project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
-from ..project_memory_history import PROJECT_MEMORY_FILES
-from ..project_registry import Project, ProjectRegistry
-from .entry_project_views import EntryProjectViews
-from .protocol import ErrorDescriptor, FrameCodec
+from ...project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
+from ...project_memory_history import PROJECT_MEMORY_FILES
+from ...project_registry import Project, ProjectRegistry
+from ..protocol import ErrorDescriptor, FrameCodec
+from .project_views import EntryProjectViews
 
 if TYPE_CHECKING:
-    from .runtime import ServerRuntime
+    from ..runtime import ServerRuntime
 
 
 class ProjectNotFound(Exception):

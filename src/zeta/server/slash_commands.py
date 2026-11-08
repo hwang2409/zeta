@@ -43,7 +43,8 @@ from ..runtime.status import (
     build_slash_status,
     capture_slash_status,
 )
-from . import accounts, ergonomics
+from . import accounts
+from .handlers import history as ergonomics
 from .model_selection import apply as apply_settings
 from .protocol import (
     ErrorDescriptor,

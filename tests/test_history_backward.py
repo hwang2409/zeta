@@ -18,7 +18,8 @@ from zeta.protocol.types import (
     TextContent,
     with_message_origin,
 )
-from zeta.server import ZetaServer, ergonomics, protocol
+from zeta.server import ZetaServer, protocol
+from zeta.server.handlers import history as ergonomics
 from zeta.server.protocol import FrameCodec, ProtocolError
 
 pytest_plugins = ("tests.support.socket_fixtures",)

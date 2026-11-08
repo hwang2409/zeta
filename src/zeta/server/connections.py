@@ -8,7 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from . import content, ergonomics
+from . import content
+from .handlers import history as ergonomics
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,

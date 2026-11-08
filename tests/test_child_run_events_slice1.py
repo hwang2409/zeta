@@ -33,7 +33,7 @@ from zeta.protocol.types import (
     ToolResult,
 )
 from zeta.runtime.loop import AgentLoop
-from zeta.server.ergonomics import history
+from zeta.server.handlers.history import history
 from zeta.skills import SkillCatalog
 from zeta.transcript_search.index import TranscriptIndex, TranscriptSource
 from zeta.tui.app import TUIApp

@@ -16,7 +16,8 @@ from zeta.protocol.types import (
     MessageRole,
     with_message_origin,
 )
-from zeta.server import content, ergonomics
+from zeta.server import content
+from zeta.server.handlers import history as ergonomics
 from zeta.server.protocol import ProtocolError
 
 _PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")

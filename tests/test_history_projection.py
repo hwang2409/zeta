@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from zeta.core.store import ConversationStore
-from zeta.server import ergonomics
 from zeta.server.connections import ConnectionRegistry
+from zeta.server.handlers import history as ergonomics
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 
 
