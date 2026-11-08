@@ -1385,7 +1385,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         if cleanup is not None:
             await asyncio.wait_for(cleanup, 10)
 
-        await close_serve(server, writer)
+        await server.close()
         late = ConversationStore(tmp_path / "late-child")
         late_call = ToolCall("late-call", "read", {"path": "late"})
         late.append_message_with_approval_requests(
