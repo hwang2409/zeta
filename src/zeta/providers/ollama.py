@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -241,6 +241,7 @@ class OllamaBackend(CompletionBackend):
         diagnostics_path: str | Path | None = None,
         token_budget: int | None = None,
         model_context_window: int | None = None,
+        stall_wait_for: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         if not base_url or any(ch.isspace() for ch in base_url):
             raise ValueError("Ollama base URL must be a nonempty URL")
@@ -258,6 +259,7 @@ class OllamaBackend(CompletionBackend):
         )
         self.model_context_window = model_context_window
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
+        self.stall_wait_for = stall_wait_for
         self.set_token_budget(token_budget)
         # The shared watchdog owns read-stall timing. Keep HTTPX from racing it.
         self.timeout = (
@@ -361,6 +363,7 @@ class OllamaBackend(CompletionBackend):
                         response.aiter_bytes(),
                         seconds=self.stall_seconds,
                         on_stall=stall_error,
+                        wait_for=self.stall_wait_for,
                     ):
                         body.extend(chunk[: 500 - len(body)])
                         if len(body) >= 500:
@@ -383,6 +386,7 @@ class OllamaBackend(CompletionBackend):
                     _bounded_stream_lines(response),
                     seconds=self.stall_seconds,
                     on_stall=stall_error,
+                    wait_for=self.stall_wait_for,
                 ):
                     if not line.strip():
                         continue

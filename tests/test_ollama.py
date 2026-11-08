@@ -1686,6 +1686,16 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
     async def enter_without_header_deadline(enter, *_args):
         return await asyncio.wait_for(enter, timeout=_CLIENT_DEADLINE_SECONDS)
 
+    watchdog_reads = 0
+
+    async def timeout_after_first_body_chunk(enter, *, timeout):
+        nonlocal watchdog_reads
+        watchdog_reads += 1
+        if watchdog_reads == 2:
+            enter.close()
+            raise TimeoutError
+        return await enter
+
     monkeypatch.setattr(
         "zeta.providers.ollama.wait_for_response_headers",
         enter_without_header_deadline,
@@ -1700,12 +1710,14 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
                 base_url=tcp_http_server.url,
                 stall_seconds=0.5,
                 stall_retries=1,
+                stall_wait_for=timeout_after_first_body_chunk,
             ).complete([], []):
                 events.append(event)
 
         with pytest.raises(OllamaError, match="Ollama HTTP 400: final error"):
             await asyncio.wait_for(collect(), timeout=_CLIENT_DEADLINE_SECONDS)
         assert tcp_http_server.calls == 2
+        assert watchdog_reads == 4  # first body chunk, forced stall, final body, EOF
         assert any(
             event.type is StreamEventType.RETRY and event.data.get("is_stall") is True
             for event in events
