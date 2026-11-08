@@ -125,6 +125,24 @@ def _agent_type_metadata(agent_type: str | None) -> dict[str, str]:
     return {} if agent_type is None else {"agent_type": agent_type}
 
 
+def _agent_child_registration_values(
+    marker: dict[str, Any],
+) -> tuple[ToolCall, dict[str, Any]]:
+    """Decode a stored child marker for registration in another store."""
+
+    turns_used = marker.get("turns_used", 0)
+    return ToolCall.from_dict(marker["tool_call"]), {
+        "child_session_path": marker["child_session_path"],
+        "description": marker["description"],
+        "agent_type": marker.get("agent_type"),
+        "background": marker.get("background", False),
+        "child_instance_id": marker.get("child_instance_id"),
+        "accepts_follow_ups": marker.get("accepts_follow_ups", False) is True,
+        "explicit_finish": marker.get("explicit_finish", False) is True,
+        "turns_used": turns_used if type(turns_used) is int else 0,
+    }
+
+
 def drop_invalid_killed_task_metadata(
     lifecycle: dict[str, Any], lifecycle_path: Path
 ) -> dict[str, Any]:
@@ -699,25 +717,12 @@ class AgentStateMixin:
             )
         else:
             for marker_key, marker in self.agent_children().items():
-                tool_call = ToolCall.from_dict(marker["tool_call"])
+                tool_call, registration_values = _agent_child_registration_values(marker)
                 await parent_store._commit_storage_command(
                     _RegisterAgentChildCommand(
-                        tool_call=tool_call,
-                        child_session_path=marker["child_session_path"],
-                        description=marker["description"],
-                        agent_type=marker.get("agent_type"),
-                        background=marker.get("background", False),
-                        child_instance_id=marker.get("child_instance_id"),
-                        accepts_follow_ups=(
-                            marker.get("accepts_follow_ups", False) is True
-                        ),
-                        explicit_finish=marker.get("explicit_finish", False) is True,
-                        turns_used=(
-                            marker.get("turns_used", 0)
-                            if type(marker.get("turns_used", 0)) is int
-                            else 0
-                        ),
+                        tool_call=tool_call, **registration_values
                     )
+                )
                 )
                 await self._commit_storage_command(
                     _FinishAgentChildCommand(marker_key=marker_key)
