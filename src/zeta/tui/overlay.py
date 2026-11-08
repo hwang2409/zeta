@@ -88,15 +88,15 @@ def value(text: str, style: str | None = None) -> Fragment:
     return (_s(style or theme.BODY), text)
 
 
-def field(name: str, text: str, *, width: int, value_style: str | None = None) -> FragmentLine:
+def field(
+    name: str, text: str, *, width: int, value_style: str | None = None
+) -> FragmentLine:
     """A dim ``label`` paired with a value, label padded to ``width`` cells."""
 
     return [label(name.ljust(width)), value(text, value_style)]
 
 
-def row(
-    fragments: Sequence[Fragment], *, selected: bool
-) -> FragmentLine:
+def row(fragments: Sequence[Fragment], *, selected: bool) -> FragmentLine:
     """A selectable list row: accent ``❯`` gutter and a selection background.
 
     ``fragments`` are ``(style, text)`` pairs expressed in shared theme tokens;
@@ -277,7 +277,9 @@ class OverlayControl(UIControl):
                 text = "↑ more · pgup"
             else:
                 text = "↑↓ more · pgup/pgdn"
-            rows.append(frame_line(hint(text), content_width=content_width, border=border))
+            rows.append(
+                frame_line(hint(text), content_width=content_width, border=border)
+            )
         for _ in range(capacity - len(window)):
             rows.append(
                 [(border, "│"), (_s(theme.BODY), " " * content_width), (border, "│")]

@@ -179,12 +179,12 @@ class _RecordingServeApprovalControl:
         self.aborts: list[tuple[str, str | None, str]] = []
         self.cleanups: list[str] = []
 
-    async def request_approval_abort(
+    async def request_approval_abort_gate(
         self,
         request_id: str,
         *,
-        child_instance_id: str | None,
-        reason: str,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
     ) -> dict[str, str]:
         self.aborts.append((request_id, child_instance_id, reason))
         return {"decision": "abort", "reason": reason}

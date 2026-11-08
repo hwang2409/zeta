@@ -996,7 +996,9 @@ class ProjectInbox:
         if value.get("to_session") is not None:
             _id(value["to_session"], "target session")
         sender = value["from"]
-        if not isinstance(sender, dict) or not {"project", "session"}.issubset(sender):
+        if not isinstance(sender, dict) or not all(
+            field in sender for field in ("project", "session")
+        ):
             raise InboxError("invalid message sender")
         _text(sender.get("project"), "sender project")
         _id(sender.get("session"), "sender session")

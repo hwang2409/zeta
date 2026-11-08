@@ -1,8 +1,10 @@
 import ast
 import asyncio
 import fcntl
+import gc
 import inspect
 import json
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -16,7 +18,10 @@ from zeta.core.store import ConversationStore
 from zeta.mcp.client import MCPHTTPError
 from zeta.mcp.config import load_mcp_config_overlay
 from zeta.mcp.http import StreamableHTTPMCPClient
-from zeta.mcp.management import MCPManagementError, MCPManagementService
+from zeta.mcp.management import (
+    MCPManagementError,
+    MCPManagementService,
+)
 from zeta.mcp.mount import MCPMount, mount_mcp_servers
 from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.loop import AgentLoop
@@ -28,6 +33,243 @@ def service(tmp_path, mount=None):
     return MCPManagementService(
         home=tmp_path / "home", project_dir=tmp_path / "repo", mount=mount
     )
+
+
+async def _close_management_service(manager: MCPManagementService) -> None:
+    close = getattr(manager, "aclose", None)
+    if close is not None:
+        await close()
+
+
+@pytest.mark.parametrize(
+    "scenario", ("no transaction", "during transaction", "after close", "double close")
+)
+@pytest.mark.asyncio
+async def test_management_service_close_owns_transaction_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    manager = service(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    original_transaction = manager._transaction
+    transaction_calls = 0
+
+    def gated_transaction(mutation=None):
+        nonlocal transaction_calls
+        transaction_calls += 1
+        if scenario == "during transaction":
+            entered.set()
+            closed = getattr(manager, "_closed", None)
+            if closed is not None:
+                if not closed.wait(10):
+                    raise AssertionError("management close did not begin")
+            elif not release.wait(10):
+                raise AssertionError("management transaction gate was not released")
+        return original_transaction(mutation)
+
+    # test-contract: seam transaction worker has no public readiness hook
+    monkeypatch.setattr(manager, "_transaction", gated_transaction)
+    transaction = None
+    try:
+        if scenario == "during transaction":
+            transaction = asyncio.create_task(
+                manager.add("local", scope="project", command=sys.executable)
+            )
+            assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(_close_management_service(manager), 10)
+        if scenario == "double close":
+            await asyncio.wait_for(_close_management_service(manager), 10)
+        calls_after_close = transaction_calls
+        release.set()
+        if transaction is not None:
+            result = await asyncio.wait_for(
+                asyncio.gather(transaction, return_exceptions=True), 10
+            )
+            assert type(result[0]).__name__ == "MCPManagementClosedError"
+            assert not manager.path("project").exists()
+        with pytest.raises(MCPManagementError) as exc_info:
+            await manager.add("late", scope="user", command=sys.executable)
+        assert type(exc_info.value).__name__ == "MCPManagementClosedError"
+        assert transaction_calls == calls_after_close
+    finally:
+        release.set()
+        if transaction is not None and not transaction.done():
+            transaction.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(transaction, return_exceptions=True), 10
+            )
+
+
+@pytest.mark.asyncio
+async def test_management_close_ignores_cancelled_transaction_from_closed_loop(
+    tmp_path: Path,
+) -> None:
+    manager = service(tmp_path)
+    def make_cancelled_task_from_closed_loop() -> asyncio.Task[object]:
+        old_loop = asyncio.new_event_loop()
+        try:
+            transaction = old_loop.create_task(asyncio.sleep(0))
+            transaction.cancel()
+            old_loop.run_until_complete(
+                asyncio.gather(transaction, return_exceptions=True)
+            )
+            return transaction
+        finally:
+            old_loop.close()
+
+    manager._transaction_task = await asyncio.to_thread(
+        make_cancelled_task_from_closed_loop
+    )
+
+    await manager.aclose()
+    assert manager._closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_transaction_waiter_retrieves_closed_worker_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = service(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_transaction = manager._transaction
+
+    def gated_transaction(mutation=None):
+        started.set()
+        try:
+            if not release.wait(10):
+                raise AssertionError("transaction was not released")
+            return original_transaction(mutation)
+        finally:
+            finished.set()
+
+    # test-contract: seam force cancellation between the public waiter and worker
+    monkeypatch.setattr(manager, "_transaction", gated_transaction)
+    exceptions: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
+    waiter = asyncio.create_task(manager.runtime_config())
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        waiter.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(waiter, return_exceptions=True), 10
+        )
+        manager._closed.set()
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 10)
+        manager._transaction_task = None
+        gc.collect()
+        await asyncio.sleep(0)
+        assert exceptions == []
+    finally:
+        release.set()
+        manager._closed.set()
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
+async def test_management_close_propagates_outer_cancellation(
+    tmp_path: Path,
+) -> None:
+    manager = service(tmp_path)
+    transaction_event = asyncio.Event()
+    transaction = asyncio.create_task(asyncio.wait_for(transaction_event.wait(), 10))
+    manager._transaction_task = transaction
+    closing = asyncio.create_task(manager.aclose())
+    try:
+        assert await asyncio.to_thread(manager._closed.wait, timeout=10)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(closing, 10)
+    finally:
+        transaction.cancel()
+        await asyncio.wait_for(asyncio.gather(transaction, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
+async def test_management_close_interrupts_lock_held_by_another_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = service(tmp_path)
+    config_path = manager.path("user")
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text('{"servers": {}}\n')
+    before = config_path.read_bytes()
+    before_mtime = config_path.stat().st_mtime_ns
+    lock_path = config_path.with_name(f".{config_path.name}.lock")
+    holder = await asyncio.wait_for(
+        asyncio.to_thread(
+            subprocess.Popen,
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl,sys\n"
+                    "lock=open(sys.argv[1], 'a+')\n"
+                    "fcntl.flock(lock.fileno(), fcntl.LOCK_EX)\n"
+                    "print('ready', flush=True)\n"
+                    "sys.stdin.read(1)\n"
+                ),
+                str(lock_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        ),
+        10,
+    )
+    blocked = threading.Event()
+    original_flock = fcntl.flock
+
+    def observed_flock(fd, operation):
+        try:
+            return original_flock(fd, operation)
+        except BlockingIOError:
+            blocked.set()
+            raise
+
+    # test-contract: seam observe the real non-blocking flock collision
+    monkeypatch.setattr(fcntl, "flock", observed_flock)
+    transaction = None
+    try:
+        assert holder.stdout is not None
+        assert (
+            await asyncio.wait_for(asyncio.to_thread(holder.stdout.readline), 10)
+            == "ready\n"
+        )
+        transaction = asyncio.create_task(
+            manager.add("late", scope="user", command=sys.executable)
+        )
+        assert await asyncio.to_thread(blocked.wait, 10)
+
+        await asyncio.wait_for(_close_management_service(manager), 10)
+        assert config_path.read_bytes() == before
+        assert config_path.stat().st_mtime_ns == before_mtime
+
+        assert holder.stdin is not None
+        holder.stdin.write("\n")
+        holder.stdin.flush()
+        result = await asyncio.wait_for(
+            asyncio.gather(transaction, return_exceptions=True), 10
+        )
+        assert type(result[0]).__name__ == "MCPManagementClosedError"
+        assert config_path.read_bytes() == before
+        assert config_path.stat().st_mtime_ns == before_mtime
+    finally:
+        if holder.stdin is not None and not holder.stdin.closed:
+            holder.stdin.close()
+        await asyncio.wait_for(asyncio.to_thread(holder.wait), 10)
+        if holder.stdout is not None:
+            holder.stdout.close()
+        if transaction is not None and not transaction.done():
+            transaction.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(transaction, return_exceptions=True), 10
+            )
 
 
 def test_resident_mcp_state_has_no_public_read_bypass():
@@ -1062,6 +1304,29 @@ async def test_contended_config_lock_fails_off_loop_with_nonblocking_flock(
     assert attempted
     assert all(thread != loop_thread for thread, _operation in attempted)
     assert all(operation & fcntl.LOCK_NB for _thread, operation in attempted)
+    await asyncio.wait_for(manager.view(), 10)
+
+
+@pytest.mark.asyncio
+async def test_failed_transaction_does_not_poison_next_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = service(tmp_path)
+    original_transaction = manager._transaction
+    calls = 0
+
+    def fail_once(mutation=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise MCPManagementError("forced transaction failure")
+        return original_transaction(mutation)
+
+    # test-contract: seam force one failed transaction before the next public call
+    monkeypatch.setattr(manager, "_transaction", fail_once)
+    with pytest.raises(MCPManagementError, match="forced transaction failure"):
+        await manager.add("first", scope="project", command=sys.executable)
+    await asyncio.wait_for(manager.view(), 10)
 
 
 @pytest.mark.asyncio
