@@ -8,7 +8,6 @@ import math
 import os
 import time
 from collections.abc import Sequence
-from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -44,7 +43,7 @@ from ...core.checkpoints import (
 from ...core.child_lifecycle import select_legacy_child_lifecycle
 from ...core.session_execution import execution_owner_state
 from ...core.session_files import (
-    child_directory,
+    descend_directory,
     read_session_file,
 )
 from ...core.store import ConversationStore
@@ -300,24 +299,20 @@ def _agent_output_page(
 
 
 def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> bytes:
-    with ExitStack() as cleanup:
-        directory_fd = store.directory_fd
-        for component in child_path.relative_to(store.session_dir.absolute()).parts:
-            directory_fd = cleanup.enter_context(
-                child_directory(directory_fd, component)
-            )
+    with descend_directory(
+        store.directory_fd,
+        tuple(child_path.relative_to(store.session_dir.absolute()).parts),
+    ) as directory_fd:
         return read_session_file(directory_fd, name)
 
 
 def _read_child_lifecycle(
     store: ConversationStore, child_path: Path
 ) -> tuple[object, str | None]:
-    with ExitStack() as cleanup:
-        directory_fd = store.directory_fd
-        for component in child_path.relative_to(store.session_dir.absolute()).parts:
-            directory_fd = cleanup.enter_context(
-                child_directory(directory_fd, component)
-            )
+    with descend_directory(
+        store.directory_fd,
+        tuple(child_path.relative_to(store.session_dir.absolute()).parts),
+    ) as directory_fd:
         return (
             read_agent_lifecycle_state(
                 directory_fd, child_path / "agent_lifecycle.json"

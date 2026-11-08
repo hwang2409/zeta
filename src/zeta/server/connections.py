@@ -9,7 +9,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from ..core.session_files import child_directory
+from ..core.session_files import descend_directory
 from ..core.store import ConversationStore
 from ..core.store._child_runs import (
     child_run_segments,
@@ -832,11 +832,14 @@ class ConnectionRegistry:
                 self._child_reader[1].close()
             with ExitStack() as cleanup:
                 directory_fd = root_store.directory_fd
-                components = [component for segment in segments for component in ("agents", str(segment))]
-                for component in components:
-                    directory_fd = cleanup.enter_context(
-                        child_directory(directory_fd, component)
-                    )
+                components = tuple(
+                    component
+                    for segment in segments
+                    for component in ("agents", str(segment))
+                )
+                directory_fd = cleanup.enter_context(
+                    descend_directory(directory_fd, components)
+                )
                 try:
                     verify_child_run_directory(directory_fd, run_id)
                 except (FileNotFoundError, OSError, ValueError) as exc:

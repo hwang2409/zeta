@@ -32,9 +32,9 @@ async def _open(tmp_path: Path, features: list[str]):
         "hello",
         {"protocol_version": "1.2", "features": features},
     )
-    session_id = (
-        await request(reader, writer, 2, "new_session", {"provider": "codex"})
-    )[-1]["result"]["session"]["session_id"]
+    new_reply = (await request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]
+    assert "result" in new_reply, new_reply
+    session_id = new_reply["result"]["session"]["session_id"]
     return server, reader, writer, session_id
 
 
