@@ -3836,6 +3836,21 @@ async def _run_post_cap_tool_cycle(
 
     child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
     if send_fresh_prompt:
+        flow = owner.conversation_channel._delivery_targets[child_handle].flow
+        prompt_suppressed = asyncio.Event()
+        original_suppress = flow.suppress_pending
+
+        def observe_suppression(staged_ids: tuple[str, ...]) -> None:
+            prompt_suppressed.set()
+            original_suppress(staged_ids)
+
+        monkeypatch.setattr(flow, "suppress_pending", observe_suppression)
+        fresh_response = asyncio.create_task(
+            asyncio.wait_for(backend.fresh_prompt_seen.wait(), 10)
+        )
+        suppressed_response = asyncio.create_task(
+            asyncio.wait_for(prompt_suppressed.wait(), 10)
+        )
         assert (
             await send_to_run(
                 store,
@@ -3845,9 +3860,21 @@ async def _run_post_cap_tool_cycle(
             )
             is None
         )
-        await await_or_fail(
-            backend.fresh_prompt_seen.wait(), what="fresh prompt completion"
+        done, pending = await await_or_fail(
+            asyncio.wait(
+                {fresh_response, suppressed_response},
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
+            what="fresh prompt response or suppression",
         )
+        for task in pending:
+            task.cancel()
+        await await_or_fail(
+            asyncio.gather(*pending, return_exceptions=True),
+            what="fresh prompt race cleanup",
+        )
+        assert fresh_response in done
+        assert suppressed_response not in done
 
     if not send_fresh_prompt:
         state = next(
