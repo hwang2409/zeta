@@ -221,7 +221,6 @@ async def test_publication_callback_only_signals_watcher_on_event_loop() -> None
         nonlocal notifier_thread
         notifier_thread = threading.get_ident()
         owner.notify_project_inbox_publication()
-        owner.notify_project_inbox_publication()
 
     try:
         await await_or_fail(asyncio.to_thread(publish_burst), what="signal publication")

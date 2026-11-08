@@ -59,7 +59,14 @@ def _wait_for_records(home: Path, session_id: str, record_ids: set[str]) -> None
     store = AttentionStore(home / "sessions" / session_id)
     deadline = time.monotonic() + 9
     while time.monotonic() < deadline:
-        if all(store.get(record_id).status == "resolved" for record_id in record_ids):
+        try:
+            resolved = all(
+                store.get(record_id).status == "resolved" for record_id in record_ids
+            )
+        except (FileNotFoundError, ValueError):
+            # Atomic replacement can unlink the inode after this reader opens it.
+            resolved = False
+        if resolved:
             return
         threading.Event().wait(0.01)
     raise AssertionError("attention records did not resolve before deadline")
