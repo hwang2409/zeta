@@ -16,6 +16,7 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.raw_frames import assert_raw_frames_preserved
 from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
@@ -39,6 +40,7 @@ from zeta.protocol.types import (
     TextContent,
     ToolSchema,
 )
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
@@ -55,6 +57,7 @@ class _GatedBackend(CompletionBackend):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -78,6 +81,7 @@ class _PostTurnBackend(CompletionBackend):
         self.woke = asyncio.Event()
         self.later_woke = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -85,9 +89,13 @@ class _PostTurnBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         self.calls += 1
         if self.calls == 1:
-            yield StreamEvent(StreamEventType.MESSAGE_END)
-            self.finalization_entered.set()
-            await self.release_finalization.wait()
+            # the completion owner closes the stream at MESSAGE_END; hold
+            # turn finalization inside that close.
+            try:
+                yield StreamEvent(StreamEventType.MESSAGE_END)
+            finally:
+                self.finalization_entered.set()
+                await await_or_fail(self.release_finalization.wait(), what="self.release_finalization.wait()")
             return
         if self.calls == 2:
             self.woke.set()
@@ -105,9 +113,7 @@ class _ControllerConnection:
             "Server",
             (),
             {
-                "runtime": type(
-                    "Runtime", (), {"set_post_stream_provider_retry": lambda *_: None}
-                )()
+                "runtime": type("Runtime", (), {})()
             },
         )()
 

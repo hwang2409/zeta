@@ -73,6 +73,7 @@ class DeliveryRequests:
                 value.text,
                 origin=value.origin,
                 user_message=value.message,
+                allow_assistant_reset="assistant_reset" in features,
             )
             return {"accepted": True, "session_id": runtime.session_id}
 
@@ -112,6 +113,7 @@ class DeliveryRequests:
                 origin=value.origin,
                 user_message=message,
                 persist_user_message=False,
+                allow_assistant_reset="assistant_reset" in features,
             ),
             canceled=canceled_after_commit,
         )
@@ -140,6 +142,7 @@ class DeliveryRequests:
             asyncio.to_thread(image_delivery.prepare_image_delivery, runtime, params)
         )
         try:
+            # test-contract: seam request cancellation owns and cleans up this worker
             prepared = await asyncio.shield(worker)
         except asyncio.CancelledError:
             await _cleanup_canceled_image_delivery(worker, runtime)
@@ -169,7 +172,9 @@ class DeliveryRequests:
                     image_delivery.cleanup_image_delivery, runtime, prepared
                 )
                 raise
-            control.start_turn(text, message)
+            control.start_turn(
+                text, message, allow_assistant_reset="assistant_reset" in features
+            )
             return {"accepted": True, "session_id": runtime.session_id}
 
         tagged = tag_client_delivery(message, delivery_id, prepared.payload_digest)
@@ -206,6 +211,7 @@ class DeliveryRequests:
                 text,
                 tagged,
                 persist_user_message=False,
+                allow_assistant_reset="assistant_reset" in features,
             ),
             canceled=canceled_after_commit,
         )

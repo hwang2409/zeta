@@ -95,6 +95,7 @@ async def consume_child(
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
     failure_message: str | None = None
+    failure_error: tuple[str, str] | None = None
     tool_calls = 0
     explicit_report: dict[str, object] | None = None
 
@@ -118,7 +119,7 @@ async def consume_child(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
     ) -> None:
-        nonlocal failure_message, final_message, tool_calls, explicit_report
+        nonlocal failure_error, failure_message, final_message, tool_calls, explicit_report
         final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
@@ -180,6 +181,7 @@ async def consume_child(
                 if gate_control is not None and gate_control.turn_ended():
                     return
             elif event.type is StreamEventType.ERROR and event.error is not None:
+                failure_error = (event.error.code, event.error.message)
                 failure_message = event.error.message
 
     def owned_children() -> tuple[tuple[str, str], ...]:
@@ -280,6 +282,20 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
+        if failure_error is not None and failure_error[0] == "account_lock_timeout":
+            result = terminal_result(
+                state="idle",
+                text=f"agent error: {failure_message}",
+                error=False,
+                status="running",
+            )
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                structured["recoverable_error"] = {
+                    "code": failure_error[0],
+                    "message": failure_error[1],
+                }
+            return result
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
