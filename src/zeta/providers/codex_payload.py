@@ -15,6 +15,7 @@ from ..media.images import (
 )
 from ..protocol.tool_batches import without_incomplete_tool_batches
 from ..protocol.types import (
+    _VALIDATED_IMAGE,
     ContentBlock,
     ImageContent,
     Message,
@@ -22,6 +23,7 @@ from ..protocol.types import (
     TextContent,
     ThinkingContent,
     ToolImageBlock,
+    ToolResult,
     ToolSchema,
     ToolUseContent,
     flatten_tool_content,
@@ -33,17 +35,23 @@ from .payload_common import (
 )
 
 
-def _image_input_block(image: ToolImageBlock) -> dict[str, Any] | None:
-    data = decoded_image_bytes(image)
-    if (
-        data is None
-        or image["mimeType"] not in SUPPORTED_IMAGE_MEDIA_TYPES
-        or not image_signature_matches(image["mimeType"], data)
+class _CodexImageURL(str):
+    """marks a validated image URL for the large-image request encoder."""
+
+
+def _image_input_block(
+    image: ToolImageBlock, *, validated: bool = False
+) -> dict[str, Any] | None:
+    data = None if validated else decoded_image_bytes(image)
+    if image["mimeType"] not in SUPPORTED_IMAGE_MEDIA_TYPES:
+        return None
+    if not validated and (
+        data is None or not image_signature_matches(image["mimeType"], data)
     ):
         return None
     return {
         "type": "input_image",
-        "image_url": f"data:{image['mimeType']};base64,{image['data']}",
+        "image_url": _CodexImageURL(f"data:{image['mimeType']};base64,{image['data']}"),
     }
 
 
@@ -51,7 +59,9 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
     result: list[dict[str, Any]] = []
     for block in blocks:
         if isinstance(block, TextContent):
-            result.append({"type": "output_text" if output else "input_text", "text": block.text})
+            result.append(
+                {"type": "output_text" if output else "input_text", "text": block.text}
+            )
         elif isinstance(block, ImageContent):
             if output:
                 raise CodexHTTPError("image content is not valid assistant output")
@@ -64,7 +74,11 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
                 image["path"] = block.path
             if block.size is not None:
                 image["size"] = block.size
-            wire = _image_input_block(image)
+            wire = _image_input_block(
+                image,
+                validated=type(block) is ImageContent
+                and getattr(block, "_validation_marker", None) is _VALIDATED_IMAGE,
+            )
             result.append(
                 wire
                 or {
@@ -89,7 +103,9 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
                         "call_id": block.tool_call.id,
                         "name": block.tool_call.name,
                         "arguments": json.dumps(
-                            block.tool_call.arguments, sort_keys=True, separators=(",", ":")
+                            block.tool_call.arguments,
+                            sort_keys=True,
+                            separators=(",", ":"),
                         ),
                     }
                 )
@@ -144,7 +160,9 @@ def build_responses_payload(
                 wire_blocks = _wire_text(message.content, output=False)
                 for block in wire_blocks:
                     if block.get("type") == "input_text":
-                        block["text"] = f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{block['text']}"
+                        block["text"] = (
+                            f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{block['text']}"
+                        )
                 if wire_blocks:
                     input_items.append({"role": "user", "content": wire_blocks})
                 system_at_head = False
@@ -162,7 +180,16 @@ def build_responses_payload(
                 has_text_block = any(block["type"] == "text" for block in blocks)
                 for block in blocks:
                     if block["type"] == "image":
-                        wire = _image_input_block(block)
+                        marker = getattr(message.tool_result, "_validation_marker", ())
+                        wire = _image_input_block(
+                            block,
+                            validated=(
+                                type(message.tool_result) is ToolResult
+                                and isinstance(marker, tuple)
+                                and (id(block), block["data"], block["mimeType"])
+                                in marker
+                            ),
+                        )
                         if wire is not None:
                             images.append(wire)
                             if not has_text_block:
