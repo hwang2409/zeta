@@ -225,7 +225,7 @@ def context_probe(home: Path, sid: str) -> dict[str, Any]:
 
 
 async def serve_one(
-    home: Path, sid: str, stub: StubOllama, repeats: int
+    home: Path, sid: str, stub: StubOllama, repeats: int, lifetime: int
 ) -> dict[str, Any]:
     """One `zeta serve` process lifetime: hello, one resume, then history/status.
 
@@ -238,7 +238,8 @@ async def serve_one(
 
     def step(name: str) -> None:
         elapsed = time.perf_counter() - started
-        print(f"serve {sid[:8]}: {name} +{elapsed:.2f}s", file=sys.stderr, flush=True)
+        line = f"serve {sid[:8]} lifetime {lifetime}: {name} +{elapsed:.2f}s"
+        print(line, file=sys.stderr, flush=True)
 
     socket = home / "bench.sock"
     server = await asyncio.to_thread(
@@ -334,7 +335,10 @@ def serve_probe(
     # each resume sample gets its own server. Traffic-only runs one lifetime with
     # no history/status samples: enough to see where provider traffic goes.
     repeats = [0] if traffic_only else [10, 0, 0, 0, 0]
-    runs = [asyncio.run(serve_one(home, sid, stub, n)) for n in repeats]
+    runs = [
+        asyncio.run(serve_one(home, sid, stub, n, i))
+        for i, n in enumerate(repeats, 1)
+    ]
     return {
         "resume": summary([r["resume"] for r in runs]),
         "history": summary(runs[0]["history"]),
