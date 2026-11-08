@@ -455,9 +455,6 @@ def todo_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     return tool_panel(call, body, header=header)
 
 
-DETAIL_MAX_LINES = 12
-
-
 class _BoundedDetail:
     def __init__(self, fields: list[tuple[str, str]]) -> None:
         self.fields = fields
@@ -469,7 +466,7 @@ class _BoundedDetail:
             prefix = f"{label}: " if label else ""
             lines = hard_wrap_by_cells(value, max(1, width - len(prefix)))
             lines = lines or [""]
-            visible = lines[:DETAIL_MAX_LINES]
+            visible = lines[:MAX_CARD_LINES]
             rendered.append(prefix + visible[0])
             rendered.extend(" " * len(prefix) + line for line in visible[1:])
             omitted = len(lines) - len(visible)
@@ -487,6 +484,7 @@ def _wrapped_detail_card(
     return tool_panel(call, Group(_BoundedDetail(fields)), header=header)
 
 
+@register_tool_card("finish")
 def finish_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     call = event.tool_call
     if call is None or running or event.tool_result is None:
@@ -504,6 +502,7 @@ def finish_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     return _wrapped_detail_card(call, fields)
 
 
+@register_tool_card("agent_handoff")
 def agent_handoff_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     call = event.tool_call
     if call is None or running or event.tool_result is None:
@@ -514,10 +513,6 @@ def agent_handoff_tool_card(event: StreamEvent, running: bool) -> RenderableType
     return _wrapped_detail_card(call, [("", detail)])
 
 
-SPECIAL_TOOL_CARD_RENDERERS = {
-    "finish": finish_tool_card,
-    "agent_handoff": agent_handoff_tool_card,
-}
 
 
 @register_tool_card("skill")

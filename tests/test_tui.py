@@ -165,6 +165,7 @@ from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
 from zeta.tui.cards.decisions import DecisionsPanel
+from zeta.tui.cards.shared import MAX_CARD_LINES
 from zeta.tui.cards.tasks_panel import BackgroundTasksPanel
 from zeta.tui.cards.tool import TOOL_CARD_REGISTRY
 from zeta.tui.layout import (
@@ -1818,7 +1819,11 @@ async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
 ) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     try:
-        assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {"exec"}
+        assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {
+            "exec",
+            "finish",
+            "agent_handoff",
+        }
     finally:
         await registry.close()
 
@@ -15329,23 +15334,52 @@ def test_finish_and_handoff_cards_cap_long_detail(
     tool_name: str, content: str, structured_content: dict[str, str] | None
 ) -> None:
     call = ToolCall(f"{tool_name}-detail", tool_name, {})
-    rendered = render_event(
-        StreamEvent(
-            StreamEventType.TOOL_EXECUTION_END,
-            tool_call=call,
-            tool_result=ToolResult(
-                call.id, content, structured_content=structured_content
-            ),
-        )
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, content, structured_content=structured_content),
     )
-
+    rendered = render_event(event)
     assert rendered is not None
+
     output = StringIO()
-    _test_console(output, width=100).print(rendered)
+    _test_console(output, width=38).print(rendered)
     snapshot = Text.from_ansi(output.getvalue()).plain.rstrip()
-    assert "… +" in snapshot
-    assert snapshot.count("… +") == 1
-    assert "summary paragraph." in snapshot or "reason paragraph." in snapshot
+    body = [line[2:-2] for line in snapshot.splitlines()[2:-1]]
+    if tool_name == "finish":
+        start = next(index for index, line in enumerate(body) if line.startswith("summary: "))
+        end = next(
+            (index for index in range(start + 1, len(body)) if body[index].strip().startswith(("verdict:", "head_sha:"))),
+            len(body),
+        )
+        body = body[start:end]
+    visible = [line for line in body if "… +" not in line]
+    assert len(visible) == MAX_CARD_LINES
+    assert len([line for line in body if "… +" in line]) == 1
+    expected_omitted = 185 if tool_name == "finish" else 120
+    assert f"… +{expected_omitted} lines" in snapshot
+
+
+def test_finish_and_handoff_cards_handle_fallback_detail() -> None:
+    cases = (
+        ("finish", "finish fallback", None, True),
+        ("finish", "finish malformed", {"summary": object()}, False),
+        ("agent_handoff", "handoff fallback", {"unexpected": "field"}, True),
+    )
+    for tool_name, content, structured, content_visible in cases:
+        call = ToolCall(f"{tool_name}-fallback", tool_name, {})
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, content, structured_content=structured),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        _test_console(output, width=38).print(rendered)
+        if content_visible:
+            assert content in Text.from_ansi(output.getvalue()).plain
 
 
 def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
@@ -15366,4 +15400,6 @@ def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
         assert rendered is not None
         output = StringIO()
         _test_console(output, width=100).print(rendered)
-        assert "… +" not in Text.from_ansi(output.getvalue()).plain
+        snapshot = Text.from_ansi(output.getvalue()).plain
+        assert "… +" not in snapshot
+        assert "short summary" in snapshot or "short reason" in snapshot

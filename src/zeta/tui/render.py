@@ -77,7 +77,7 @@ from .cards.shared import (
 from .cards.shared import (
     scan_tool_output as _scan_tool_output,
 )
-from .cards.tool import SPECIAL_TOOL_CARD_RENDERERS, TOOL_CARD_REGISTRY
+from .cards.tool import TOOL_CARD_REGISTRY
 
 MAX_RESULT = 180
 MAX_ERROR_REASON = 400
@@ -721,10 +721,6 @@ def render_event(
                 style=theme.RECEIPT,
             )
         card_renderer = TOOL_CARD_REGISTRY.get(event.tool_call.name.strip().lower())
-        if card_renderer is None:
-            card_renderer = SPECIAL_TOOL_CARD_RENDERERS.get(
-                event.tool_call.name.strip().lower()
-            )
         if card_renderer is not None:
             return card_renderer(event, True)
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
@@ -749,10 +745,6 @@ def render_event(
             return _tool_receipt(event)
         if event.tool_call is not None:
             card_renderer = TOOL_CARD_REGISTRY.get(event.tool_call.name.strip().lower())
-            if card_renderer is None:
-                card_renderer = SPECIAL_TOOL_CARD_RENDERERS.get(
-                    event.tool_call.name.strip().lower()
-                )
             if card_renderer is not None:
                 return card_renderer(event, False)
         content = _tool_content(event)
