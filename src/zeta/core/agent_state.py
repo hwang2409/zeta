@@ -819,6 +819,13 @@ class AgentStateMixin:
     def _write_agent_lifecycle(self) -> None:
         """Atomically write lifecycle data without changing session state bytes."""
 
+        existing = read_agent_lifecycle_state(
+            self.directory_fd, self.agent_lifecycle_path
+        )
+        if isinstance(existing, BrokenAgentLifecycle):
+            raise ConversationIntegrityError(
+                "agent lifecycle is broken; refusing to overwrite preserved bytes"
+            )
         if (
             self._agent_lifecycle is not None
             and "final_result_is_receipt" in self._agent_lifecycle

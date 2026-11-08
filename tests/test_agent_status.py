@@ -31,6 +31,7 @@ from zeta.core.agent_state import (
     MissingAgentLifecycle,
     read_agent_lifecycle_state,
 )
+from zeta.core.checkpoints import ConversationIntegrityError
 from zeta.core.store import ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
@@ -473,6 +474,10 @@ def test_agent_lifecycle_read_distinguishes_loaded_broken_and_missing(
         assert broken == BrokenAgentLifecycle(
             child.agent_lifecycle_path, "invalid lifecycle json"
         )
+        with pytest.raises(ConversationIntegrityError):
+            child.finish_agent_lifecycle(
+                "failed", final_result="must not replace broken evidence"
+            )
         assert child.agent_lifecycle_path.read_bytes() == b"{"
 
         child.agent_lifecycle_path.unlink()
