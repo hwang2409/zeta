@@ -81,7 +81,10 @@ from ._results import (
     _success_result,
     text_block,
 )
-from ._shared.process import BackgroundTaskRegistry
+from ._shared.process import (
+    background_tasks_for_session,
+    bind_background_tasks_to_session,
+)
 from ._shared.sandbox import SandboxPolicy
 from ._spill import SpillStore
 from ._validation import (
@@ -316,7 +319,7 @@ class ToolRegistry:
         # Set by AgentLoop; copied into child session clones.  Kept optional so
         # registries used by standalone tool tests remain valid.
         self._agent_owner: Any = None
-        self.background_tasks = BackgroundTaskRegistry.for_session_store(
+        self.background_tasks = background_tasks_for_session(
             session_store, command_niceness=command_niceness
         )
         self.bash_cwd = (
@@ -753,7 +756,7 @@ class ToolRegistry:
             clone.cwd,
             allow_outside=not clone.tool_policy.restricted,
         )
-        clone.background_tasks = BackgroundTaskRegistry.for_session_store(
+        clone.background_tasks = background_tasks_for_session(
             store, command_niceness=clone.command_niceness
         )
         clone.bash_cwd = store.bash_cwd
@@ -816,7 +819,7 @@ class ToolRegistry:
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
         )
-        self.background_tasks.bind_session_store(store)
+        bind_background_tasks_to_session(self.background_tasks, store)
         self.bash_cwd = store.bash_cwd
 
     @property

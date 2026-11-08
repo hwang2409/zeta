@@ -61,23 +61,6 @@ BACKGROUND_OUTPUT_DRAIN_TIMEOUT = 0.25
 class BackgroundTaskRegistry:
     """Own detached process groups and their bounded session output."""
 
-    @classmethod
-    def for_session_store(
-        cls,
-        store: ConversationStore | None,
-        *,
-        command_niceness: int,
-    ) -> BackgroundTaskRegistry:
-        if store is None:
-            return cls(command_niceness=command_niceness)
-        return cls(
-            session_dir=store.session_dir,
-            directory_fd=store.directory_fd,
-            command_niceness=command_niceness,
-            storage_lease=store._storage_lease,
-            notification_exists=store.has_task_exit_notification,
-        )
-
     def __init__(
         self,
         *,
@@ -189,9 +172,8 @@ class BackgroundTaskRegistry:
     ) -> None:
         self._notice_sink = sink
 
-    def bind_session_store(self, store: ConversationStore) -> None:
-        self._notification_exists = store.has_task_exit_notification
-        self.bind_session_dir(store.session_dir, store.directory_fd, store._storage_lease)
+    def set_notification_exists(self, lookup: Callable[[str], bool]) -> None:
+        self._notification_exists = lookup
 
     def set_notification_sink(
         self,
@@ -1015,3 +997,24 @@ class BackgroundTaskRegistry:
             delete_ids=(),
             publish=write_session_file,
         )
+
+
+def background_tasks_for_session(
+    store: ConversationStore | None, *, command_niceness: int
+) -> BackgroundTaskRegistry:
+    if store is None:
+        return BackgroundTaskRegistry(command_niceness=command_niceness)
+    return BackgroundTaskRegistry(
+        session_dir=store.session_dir,
+        directory_fd=store.directory_fd,
+        command_niceness=command_niceness,
+        storage_lease=store._storage_lease,
+        notification_exists=store.has_task_exit_notification,
+    )
+
+
+def bind_background_tasks_to_session(
+    tasks: BackgroundTaskRegistry, store: ConversationStore
+) -> None:
+    tasks.set_notification_exists(store.has_task_exit_notification)
+    tasks.bind_session_dir(store.session_dir, store.directory_fd, store._storage_lease)
