@@ -57,8 +57,8 @@ class DecisionsMixin:
         self._decisions_count = 0
         self._decisions_error: str | None = None
         self._decisions_scan_task: asyncio.Task[None] | None = None
+        self._decisions_scan_work: asyncio.Task[tuple] | None = None
         self._decisions_scan_requested = asyncio.Event()
-        self._decisions_scan_generation = 0
         self._decisions_stopping = False
         self._decisions_restore_text = ""
         self._decisions_restore_cursor = 0
@@ -95,17 +95,7 @@ class DecisionsMixin:
             self._consume_overlay_submission()
             self.open_decisions_panel()
             return ""
-        from ...attention_decisions import open_decisions
-
-        items = await asyncio.wait_for(
-            asyncio.to_thread(
-                open_decisions,
-                self._home,
-                self._decisions_session_id,
-                _registry_state(self),
-            ),
-            timeout=_SCAN_TIMEOUT,
-        )
+        items = await DecisionsMixin._read_decisions(self, _SCAN_TIMEOUT)
         if not items:
             return "no open decisions"
         lines = ["open decisions:"]
@@ -157,6 +147,8 @@ class DecisionsMixin:
             if not scanned:
                 await self._decisions_scan_requested.wait()
                 continue
+            # The completed scan includes every request received while it ran.
+            self._decisions_scan_requested.clear()
             try:
                 await asyncio.wait_for(
                     self._decisions_scan_requested.wait(), timeout=_POLL_INTERVAL
@@ -183,22 +175,32 @@ class DecisionsMixin:
         self._decisions_error = reason[:80]
         self._invalidate_prompt()
 
-    async def _decisions_tick(self) -> None:
+    async def _read_decisions(self, timeout: float | None) -> tuple:
         from ...attention_decisions import open_decisions
 
-        self._decisions_scan_generation += 1
-        generation = self._decisions_scan_generation
-        items = await asyncio.wait_for(
-            asyncio.to_thread(
-                open_decisions,
-                self._home,
-                self._decisions_session_id,
-                _registry_state(self),
-            ),
-            timeout=_SCAN_TIMEOUT,
-        )
-        if generation != self._decisions_scan_generation:
-            return
+        work = getattr(self, "_decisions_scan_work", None)
+        if work is None:
+            work = asyncio.create_task(
+                asyncio.to_thread(
+                    open_decisions,
+                    self._home,
+                    self._decisions_session_id,
+                    _registry_state(self),
+                )
+            )
+            self._decisions_scan_work = work
+        try:
+            return await asyncio.wait_for(asyncio.shield(work), timeout=timeout)
+        finally:
+            if work.done() and self._decisions_scan_work is work:
+                self._decisions_scan_work = None
+
+    async def _decisions_tick(self) -> None:
+        try:
+            items = await self._read_decisions(_SCAN_TIMEOUT)
+        except TimeoutError as exc:
+            self._set_decisions_error(exc)
+            items = await self._read_decisions(timeout=None)
         changed = len(items) != self._decisions_count or self._decisions_error is not None
         self._decisions_count = len(items)
         self._decisions_error = None

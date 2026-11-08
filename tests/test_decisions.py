@@ -423,7 +423,7 @@ async def test_child_resolution_event_refreshes_rendered_count(
 
 
 @pytest.mark.asyncio
-async def test_hung_decisions_scan_renders_unavailable(
+async def test_hung_decisions_scan_stays_single_flight_and_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import zeta.attention_decisions as decisions_module
@@ -434,32 +434,50 @@ async def test_hung_decisions_scan_renders_unavailable(
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
     await asyncio.to_thread(_request, current, project.project_id, "Current", "This one.")
     app = _decisions_app(tmp_path, current)
+    real_open = decisions_module.open_decisions
+    entered = asyncio.Event()
     release = ThreadEvent()
     unavailable = asyncio.Event()
+    recovered = asyncio.Event()
+    calls = 0
+    loop = asyncio.get_running_loop()
 
-    def hung_open(*_args, **_kwargs):
+    def hung_open(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        loop.call_soon_threadsafe(entered.set)
         release.wait(timeout=10)
-        return ()
+        return real_open(*args, **kwargs)
 
     try:
         await app._decisions_tick()
         assert "1 decision" in _rendered_decisions_status(app)
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
         app._invalidate_prompt = lambda: (
-            unavailable.set() if app.decisions_error is not None else None
+            unavailable.set() if app.decisions_error is not None else recovered.set()
         )
         monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
         # test-contract: seam timeout is shortened; the toolbar render is unchanged
         monkeypatch.setattr(panel_module, "_SCAN_TIMEOUT", 0.01, raising=False)
-        # test-contract: seam backoff is shortened; the toolbar render is unchanged
-        monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
         app.start_decisions_poll()
-        try:
-            await asyncio.wait_for(unavailable.wait(), 10)
-        except TimeoutError:
-            pass
+        await await_or_fail(entered.wait(), what="started decision scan")
+        for _ in range(50):
+            app._handle_tool_event(_resolved_event())
+            app.close_decisions_panel()
+            app.open_decisions_panel()
+        await await_or_fail(unavailable.wait(), what="timed-out decision scan")
 
         rendered = _rendered_decisions_status(app)
+        assert calls == 1
         assert "decisions unavailable: TimeoutError" in rendered and "1 decision" not in rendered
+
+        recovered.clear()
+        release.set()
+        await await_or_fail(recovered.wait(), what="late decision scan recovery")
+        assert calls == 1
+        assert "1 decision" in _rendered_decisions_status(app)
     finally:
         release.set()
         await _stop_decisions(app)
