@@ -355,6 +355,7 @@ async def test_cancelled_tui_adapter_still_checks_late_publication(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
+        assert checks == []
         release.set()
         assert await await_or_fail(
             asyncio.to_thread(worker_done.wait, 10), what="TUI worker finish"
