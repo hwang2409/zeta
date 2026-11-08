@@ -17,8 +17,10 @@ from tests.support.scripted_provider import (
     load_fake_script,
     parse_fake_script,
 )
+from tests.support.serve_close import close_serve
 from tests.support.server_client import event as _event
 from tests.support.server_client import request as _request
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.cli.main import build_parser
 from zeta.protocol.types import (
     Message,
@@ -30,6 +32,8 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.headless import run_headless
 from zeta.server import ZetaServer
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "scripted-provider"
 TIMEOUT = 5
@@ -290,10 +294,6 @@ def test_text_and_thinking_stream_in_chunks() -> None:
     ]
 
 
-def _socket_path(tmp_path: Path) -> Path:
-    return Path("/tmp") / f"zeta-sf-{tmp_path.name}.sock"
-
-
 async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
     script = parse_fake_script(BASH_SCRIPT)
     server = ZetaServer(
@@ -322,7 +322,7 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         result = await resolve_approval(method, request_id, scope)
-        await tool_ended.wait()
+        await asyncio.wait_for(tool_ended.wait(), 10)
         return result
 
     server.control._notify = record_tool_end
@@ -349,9 +349,7 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         await _event(reader, "turn_end")
         return end["tool_result"]
     finally:
-        writer.close()
-        await asyncio.wait_for(writer.wait_closed(), TIMEOUT)
-        await asyncio.wait_for(server.close(), TIMEOUT)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -405,9 +403,7 @@ async def test_serve_scripted_provider_error_reaches_client(
         assert error["error"]["code"] == "rate_limit_error"
         assert error["error"]["message"] == "slow down"
     finally:
-        writer.close()
-        await asyncio.wait_for(writer.wait_closed(), TIMEOUT)
-        await asyncio.wait_for(server.close(), TIMEOUT)
+        await close_serve(server, writer)
 
 
 def test_headless_scripted_tool_respects_allowlist_and_approval(

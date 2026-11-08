@@ -249,12 +249,6 @@ def register(registry: ToolRegistry) -> None:
     _register(registry, _ACTIONS)
 
 
-def register_send_only(registry: ToolRegistry) -> None:
-    if registry.project_id is None:
-        return
-    _register(registry, {"send": _ACTIONS["send"]})
-
-
 def _approval_subject(
     registry: ToolRegistry, arguments: Mapping[str, object]
 ) -> str | None:
