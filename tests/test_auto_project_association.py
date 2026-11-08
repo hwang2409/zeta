@@ -165,6 +165,7 @@ def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
         project_registry=m.project_registry,
         skill_catalog=SkillCatalog.empty(),
     )
+    tools.project_registry_state = m.project_registry_state
     # Registration is the public capability boundary; invoke the async handler directly.
     from zeta.tools.project import _inspect_project
 

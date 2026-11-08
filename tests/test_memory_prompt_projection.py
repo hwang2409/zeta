@@ -34,7 +34,11 @@ load_project_context = partial(
 
 def _context_projects(registry: ProjectRegistry, project_id: str) -> dict[str, object]:
     project = registry.show_project(project_id)
-    return {"session_project": project, "cwd_project": project}
+    return {
+        "session_project": project,
+        "cwd_project": project,
+        "project_projection": registry.project_context_projection(project_id),
+    }
 
 
 def _source(
@@ -230,6 +234,7 @@ def test_format_one_prompt_block_is_byte_identical_golden(tmp_path: Path) -> Non
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        project_projection=registry.project_context_projection(project.project_id),
     )
     assert context.memory_offset is not None and context.memory_length is not None
     block = context.system_prompt[
@@ -356,7 +361,10 @@ def test_fresh_cwd_child_loads_current_memory(
         context_assembler=SimpleNamespace(system_prompt="parent prompt"),
         store=SimpleNamespace(cwd=str(parent_cwd)),
         active_home=str(home),
-        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        tool_registry=SimpleNamespace(
+            skill_catalog=SkillCatalog.empty(),
+            project_registry_state=ProjectRegistryState(registry),
+        ),
         root_project_id=project_id,
         project_registry=registry,
     )
@@ -375,11 +383,15 @@ async def test_serve_resume_rebuilds_identity_and_memory_components(
     workspace.mkdir()
     (home / "AGENTS.md").parent.mkdir(parents=True)
     (home / "AGENTS.md").write_text("identity before", encoding="utf-8")
-    registry = ProjectRegistry(home / "projects")
-    project = registry.create_project("serve", "test", workspace)
-    registry.initialize_memory(project.project_id)
-    registry.update_memory(
-        project.project_id, {"state.md": "# State\n\nmemory before\n"}
+    registry = await asyncio.to_thread(ProjectRegistry, home / "projects")
+    project = await asyncio.to_thread(
+        registry.create_project, "serve", "test", workspace
+    )
+    await asyncio.to_thread(registry.initialize_memory, project.project_id)
+    await asyncio.to_thread(
+        registry.update_memory,
+        project.project_id,
+        {"state.md": "# State\n\nmemory before\n"},
     )
 
     first_runtime = ServerRuntime(home, cwd=workspace, provider="codex")
@@ -389,8 +401,10 @@ async def test_serve_resume_rebuilds_identity_and_memory_components(
     assert metadata.prompt_components
 
     (home / "AGENTS.md").write_text("identity after", encoding="utf-8")
-    registry.update_memory(
-        project.project_id, {"state.md": "# State\n\nmemory after\n"}
+    await asyncio.to_thread(
+        registry.update_memory,
+        project.project_id,
+        {"state.md": "# State\n\nmemory after\n"},
     )
     assert (
         await first_runtime.resume_session(metadata.session_id)
@@ -425,14 +439,23 @@ async def test_serve_resume_rebuilds_identity_and_memory_components(
 async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_memory(
     tmp_path: Path,
 ) -> None:
-    home, workspace, registry, project_id = _entry_project(tmp_path)
-    _add(registry, project_id, (AddOperation("state", "memory before", _source(1)),))
-    context = load_project_context(
-        cwd=workspace,
-        repo_root=workspace,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        **_context_projects(registry, project_id),
+    home, workspace, registry, project_id = await asyncio.to_thread(
+        _entry_project, tmp_path
+    )
+    await asyncio.to_thread(
+        _add,
+        registry,
+        project_id,
+        (AddOperation("state", "memory before", _source(1)),),
+    )
+    context = await asyncio.to_thread(
+        lambda: load_project_context(
+            cwd=workspace,
+            repo_root=workspace,
+            zeta_home=home,
+            catalog=SkillCatalog.empty(),
+            **_context_projects(registry, project_id),
+        )
     )
     assert context.memory_offset is not None
     assert context.memory_length is not None
@@ -457,7 +480,12 @@ async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_m
     )
     session_id = opened.metadata.session_id
     opened.store.close()
-    _add(registry, project_id, (AddOperation("state", "memory after", _source(2)),))
+    await asyncio.to_thread(
+        _add,
+        registry,
+        project_id,
+        (AddOperation("state", "memory after", _source(2)),),
+    )
 
     runtime = ServerRuntime(home, cwd=tmp_path, provider="codex")
     metadata = await runtime.resume_session(session_id)
