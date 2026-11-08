@@ -204,18 +204,27 @@ class UnroutedEvent(LookupError):
     """A published replay event kind or variant has no route table entry."""
 
 
+def variant(
+    event: EventDescriptor,
+    fields: Mapping[str, Any],
+    facts: RowFacts,
+    owner: str | None = None,
+) -> str:
+    classify = _VARIANTS.get(event)
+    return "" if classify is None else classify(fields, facts, owner)
+
+
 def route(
     event: EventDescriptor,
     fields: Mapping[str, Any],
     facts: RowFacts,
     owner: str | None = None,
 ) -> Source:
-    classify = _VARIANTS.get(event)
-    variant = "" if classify is None else classify(fields, facts, owner)
+    variant_name = variant(event, fields, facts, owner)
     try:
-        return ROUTES[(event, variant)]
+        return ROUTES[(event, variant_name)]
     except KeyError:
-        raise UnroutedEvent(f"{event.value}/{variant or '-'}") from None
+        raise UnroutedEvent(f"{event.value}/{variant_name or '-'}") from None
 
 
 def covers(

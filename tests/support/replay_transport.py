@@ -167,10 +167,15 @@ def replay_server(home: Path, transport: Transport, backend_factory: Any) -> Zet
 
 
 async def negotiate(
-    client: ReplayClient, *, replay: bool = True, observer: bool = False, extra: tuple[str, ...] = ()
+    client: ReplayClient,
+    *,
+    replay: bool = True,
+    observer: bool = False,
+    extra: tuple[str, ...] = (),
+    protocol_version: str = "1.1",
 ) -> dict[str, Any]:
     features = (["serve_observers"] if observer else []) + (["session_replay_seq"] if replay else []) + list(extra)
-    params: dict[str, object] = {"protocol_version": "1.1", "features": features}
+    params: dict[str, object] = {"protocol_version": protocol_version, "features": features}
     if observer:
         params["role"] = "observer"
     return await client.request(1, "hello", params)

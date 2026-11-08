@@ -1318,9 +1318,14 @@ error code and message. Provider status and origin remain internal.
   `session_history_fidelity` and `session_history_backward`, for the join result,
   later `session_history` pages, and the `delivery_status` live filter. Observers
   receive controller session events only through a successful join.
-  A stream ends only on session replacement, replay pressure, a second join on
+  An event whose history row is already in the join's history is not sent on
+  that stream and spends no `seq`, so each effect appears once, in history or
+  live. A stream ends only on session replacement, replay pressure, a second join on
   the same connection (even a rejected one), a failed write or admission on the
-  connection, or the connection's close. Observers' streams are not ended by a
+  connection, or the connection's close; it also ends with `evicted` when a late
+  event's history row is too old to place against the join's history, and with
+  `session_replaced` when the session's stored rows were reloaded in a way that
+  can renumber them. Observers' streams are not ended by a
   controller disconnect; a controller's own stream ends with its connection, and a
   reconnecting controller must join again.
   A join that is still pending when its stream ends returns `-32009` with data
