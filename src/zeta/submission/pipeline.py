@@ -175,6 +175,13 @@ class SubmissionPipeline:
 
     @property
     def active(self) -> bool:
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if self._slash_tasks and current not in self._slash_tasks.values():
+            # A running slash command is work; only the command itself ignores it.
+            return True
         return any(
             (
                 entry.state in self._NONTERMINAL or entry is self._provider_entry
