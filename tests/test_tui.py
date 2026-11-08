@@ -158,6 +158,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    harness_notice,
     with_message_origin,
 )
 from zeta.tui import theme
@@ -8702,9 +8703,8 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
                     time.sleep(0.01)
             return bool(should_stop and should_stop())
 
-        deliveries = recover_agent_children(loop, should_stop=observed_stop)
+        recover_agent_children(loop, should_stop=observed_stop)
         recovery_steps += children_before - len(loop.store.agent_children())
-        return deliveries
 
     monkeypatch.setattr(background, "_recover_agent_children", gated_recovery)
     app = TUIApp(
@@ -8724,10 +8724,19 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         assert app._input_loop_active, (
             "TUI input did not start during activation recovery"
         )
-        app.request_exit()
-        await activation_cancelled.wait()
-        recovery_release.set()
-        await run_task
+        try:
+            app.request_exit()
+            await asyncio.wait_for(activation_cancelled.wait(), 10)
+            recovery_release.set()
+            await asyncio.wait_for(run_task, 10)
+        finally:
+            recovery_release.set()
+            if not run_task.done():
+                run_task.cancel()
+            try:
+                await asyncio.wait_for(run_task, 10)
+            except asyncio.CancelledError:
+                pass
 
     interrupted_store = ConversationStore(
         tmp_path / "sessions", session_id=root.session_id
@@ -13890,6 +13899,14 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     assert nudge.role is MessageRole.SYSTEM
     assert nudge.content[0].text.startswith("[zeta] empty-turn recovery:")
     store.append_message(nudge)
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("continuing")]))
+    store.append_message(
+        harness_notice(
+            "shell cwd",
+            "/removed/worktree was removed; continuing in /survivor",
+            event="shell_cwd_recovered",
+        )
+    )
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("here is the answer")])
     )
@@ -13907,6 +13924,11 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
         rendered = Text.from_ansi(output.getvalue()).plain
         assert "here is the answer" in rendered
         assert "[zeta] empty-turn recovery:" in rendered
+        assert (
+            "[zeta] shell cwd: /removed/worktree was removed; continuing in"
+            in rendered
+        )
+        assert "/survivor" in rendered
         assert rendered.count("do the thing") == 1
     finally:
         await app.loop.close()

@@ -73,6 +73,9 @@ def broken_record_refusal(record: Broken) -> str:
     )
 
 
+ATTENTION_KIND_EPOCH = 5
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -169,11 +172,11 @@ class AttentionStore:
         kind: AttentionKind = "decision",
     ) -> AttentionRecord:
         require_closed_variant("attention.kind", kind)
-        if kind != "decision" and self.writer_epoch < WRITER_EPOCH:
+        if kind != "decision" and self.writer_epoch < ATTENTION_KIND_EPOCH:
             raise ValueError(
                 "non-decision attention kinds require the one-way shared cutover: "
                 f"zeta storage-format advance --expected-epoch {self.writer_epoch} "
-                f"--target-epoch {WRITER_EPOCH}"
+                f"--target-epoch {ATTENTION_KIND_EPOCH}"
             )
         if kind != "decision" and (options or recommendation is not None):
             raise ValueError(
