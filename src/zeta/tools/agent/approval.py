@@ -17,6 +17,7 @@ from ...core.approval import (
     ApprovedCwdExecution,
     ApprovedExecution,
     ApprovedPathExecution,
+    _poll_approval_resolution,
 )
 from ...core.store import ConversationStore
 from ...protocol.types import (
@@ -308,44 +309,28 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
             self.child_store,
             child_instance_id=self.child_instance_id,
         )
-        while True:
+        def current() -> tuple[bool, ApprovalDecision | None]:
             state = self.child_store.approval_states().get(tool_call.id)
-            if state is not None and state[1] is not None:
-                if state[1] == ApprovalDecision.ALLOW.value:
-                    return self._consume_allow_binding(
-                        tool_call, execution_token, capability
-                    )
-                self._pending_bindings.pop(tool_call.id, None)
-                if state[1] == "abort":
-                    return None
-                return ApprovalDecision.DENY
-            if abort_signal.is_set():
-                return await self._resolve_abort_or_winner(
-                    tool_call.id,
-                    execution_token=execution_token,
-                    capability=capability,
+            if state is None or state[1] is None:
+                return False, None
+            if state[1] == ApprovalDecision.ALLOW.value:
+                return True, self._consume_allow_binding(
+                    tool_call, execution_token, capability
                 )
-            abort_task = asyncio.create_task(abort_signal.wait())
-            poll_task = asyncio.create_task(asyncio.sleep(0.05))
-            try:
-                done, pending = await asyncio.wait(
-                    {abort_task, poll_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            except asyncio.CancelledError:
-                abort_task.cancel()
-                poll_task.cancel()
-                await asyncio.gather(abort_task, poll_task, return_exceptions=True)
-                raise
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            if abort_task in done:
-                return await self._resolve_abort_or_winner(
-                    tool_call.id,
-                    execution_token=execution_token,
-                    capability=capability,
-                )
+            self._pending_bindings.pop(tool_call.id, None)
+            if state[1] == "abort":
+                return True, None
+            return True, ApprovalDecision.DENY
+
+        return await _poll_approval_resolution(
+            abort_signal,
+            current=current,
+            abort_or_winner=lambda: self._resolve_abort_or_winner(
+                tool_call.id,
+                execution_token=execution_token,
+                capability=capability,
+            ),
+        )
 
     def _consume_allow_binding(
         self,
