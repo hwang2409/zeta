@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from typing import TYPE_CHECKING
 
 from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationEntry
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...protocol.types import ContentBlock, Message
-from ...transcript_search.index import is_indexable_top_level_project_session
+from ...transcript_search.index import (
+    TranscriptIndexError,
+    is_indexable_top_level_project_session,
+)
 from ...transcript_search.refresh import (
     refresh_transcript_index,
     transcript_index_refresh_failure,
@@ -20,6 +23,14 @@ from ...transcript_search.refresh import (
 if TYPE_CHECKING:
     from ...core.session import SessionMetadata
     from .agent import AgentLoop
+
+
+async def _observe_refresh(refresh: Coroutine[object, object, None]) -> None:
+    try:
+        await refresh
+    except TranscriptIndexError:
+        # The refresh already logged one warning and kept the failure for status.
+        return
 
 
 class StoreWriteMixin:
@@ -109,12 +120,14 @@ class StoreWriteMixin:
             return
         receipts = self.store.take_persisted_appends()
         self._create_task(
-            refresh_transcript_index(
-                registry.root,
-                self.root_project_id,
-                self.store.session_id,
-                self.store.session_dir,
-                receipts or None,
+            _observe_refresh(
+                refresh_transcript_index(
+                    registry.root,
+                    self.root_project_id,
+                    self.store.session_id,
+                    self.store.session_dir,
+                    receipts or None,
+                )
             )
         )
 
