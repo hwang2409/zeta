@@ -1042,12 +1042,13 @@ async def run_agent_tool(
     ) -> None:
         if not await confirmation:
             return
+        child_loop.admit_abort()
         child_loop.tool_registry.abort()
         child_loop.store.drop_client_steering("abort")
         loop._background_owner.cancel_subtree(child_instance_id)
-        await loop._background_owner.wait_for_descendant_watchers(child_instance_id)
         if not child_task.done():
             child_task.cancel()
+        await loop._background_owner.wait_for_descendant_watchers(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
         child_store.mark_agent_canceled(tool_call.id)
 
