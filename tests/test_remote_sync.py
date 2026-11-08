@@ -62,7 +62,7 @@ from zeta.remote_sync.project_publish import (
 )
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
-from zeta.storage_format import open_writer
+from zeta.storage_format import GATED_HOME_PATHS, StorageFormatError, open_writer
 from zeta.tools import ToolRegistry
 from zeta.tools import session_push as session_push_tool
 from zeta.tools.session_push import register as register_session_push
@@ -1421,6 +1421,89 @@ def test_p06_3_generated_project_programs_match_fresh_home_epoch(
     assert project_digest(install_home / "projects" / project_id) == project_digest(
         snapshot
     )
+
+
+@pytest.mark.parametrize(
+    "pattern", [pattern for pattern, _owner in GATED_HOME_PATHS]
+)
+def test_p06_3_generated_project_programs_refuse_manifestless_state_like_local(
+    tmp_path: Path, pattern: str
+) -> None:
+    def seed(home: Path) -> None:
+        home.mkdir()
+        if pattern.endswith("/*"):
+            (home / pattern[:-2]).mkdir()
+            (home / pattern[:-2] / "existing").write_text("state\n")
+        else:
+            (home / pattern).write_text("state\n")
+
+    local_home = tmp_path / "local-home"
+    seed(local_home)
+    with pytest.raises(StorageFormatError, match="manifest is missing"):
+        open_writer(local_home).close()
+
+    remote_home = tmp_path / "remote-home"
+    seed(remote_home)
+    fetch = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            ssh_module._PROJECT_FETCH_SCRIPT,
+            str(remote_home),
+            "missing-project",
+        ],
+        check=False,
+        capture_output=True,
+    )
+
+    assert fetch.returncode == 53, "generated program wrote over gated state"
+    assert not (remote_home / "storage-format.json").exists()
+    assert not (local_home / "storage-format.json").exists()
+
+
+def test_p06_3_generated_project_program_retains_stored_format_lease(
+    tmp_path: Path,
+) -> None:
+    source, project_id = _format_two_project_snapshot(tmp_path)
+    remote = initialize_storage_home(tmp_path / "remote")
+    shutil.copytree(source, remote / "projects" / project_id)
+    payload = remote / "projects" / project_id / "sync" / "payload.bin"
+    payload.parent.mkdir()
+    # Incompressible and larger than a pipe buffer: the program cannot finish
+    # while the test leaves its output undrained.
+    payload.write_bytes(os.urandom(4 << 20))
+    fetch = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            ssh_module._PROJECT_FETCH_SCRIPT,
+            str(remote),
+            project_id,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    lock_fd = os.open(remote / ".storage-format.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        assert fetch.stdout is not None
+        # Output starts only inside project authority, after the lease is taken.
+        first = fetch.stdout.read(1)
+        assert first, fetch.stderr.read() if fetch.stderr else ""
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            advanced = True
+        except BlockingIOError:
+            advanced = False
+        assert not advanced, "generated program did not retain the stored-format lease"
+        rest = fetch.stdout.read()
+        assert fetch.wait(timeout=30) == 0
+        assert len(first + rest) > 4 << 20
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(lock_fd)
+        if fetch.poll() is None:
+            fetch.kill()
+        fetch.communicate(timeout=10)
 
 
 def test_p06_3_generated_project_fetch_uses_one_memory_authority(

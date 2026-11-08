@@ -606,17 +606,38 @@ def _create_gated_discussion_fork(
         result.put(("created", fork_id))  # type: ignore[attr-defined]
 
 
-def _delete_fork_source(home: str, source_session_id: str, result: object) -> None:
+def _mutate_fork_source(
+    home: str, source_session_id: str, mutation: str, result: object
+) -> None:
     try:
-        SessionManager(Path(home)).delete(source_session_id)
+        manager = SessionManager(Path(home))
+        if mutation == "delete":
+            manager.delete(source_session_id)
+        else:
+            source = manager.open(source_session_id)
+            try:
+                source.store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent("Keep going")])
+                )
+            finally:
+                source.store.close()
     except BaseException as exc:  # noqa: BLE001 - reported to parent process
         result.put(("failed", type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
     else:
-        result.put(("deleted",))  # type: ignore[attr-defined]
+        result.put(("mutated",))  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize(
+    ("mutation", "refusal"),
+    [
+        ("delete", "not found"),
+        # Only the exact post-publication revalidation can reject this case:
+        # the attention record is still present and the bind would succeed.
+        ("append", "source changed during fork allocation"),
+    ],
+)
 def test_p06_8_discussion_fork_allocation_process_progress(
-    tmp_path: Path,
+    tmp_path: Path, mutation: str, refusal: str
 ) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "Alpha")
@@ -639,7 +660,7 @@ def test_p06_8_discussion_fork_allocation_process_progress(
     publication_started = context.Event()
     publication_release = context.Event()
     fork_result = context.Queue()
-    deletion_result = context.Queue()
+    mutation_result = context.Queue()
     creator = context.Process(
         target=_create_gated_discussion_fork,
         args=(
@@ -651,39 +672,40 @@ def test_p06_8_discussion_fork_allocation_process_progress(
             fork_result,
         ),
     )
-    deleter = context.Process(
-        target=_delete_fork_source,
-        args=(str(tmp_path), source_session_id, deletion_result),
+    mutator = context.Process(
+        target=_mutate_fork_source,
+        args=(str(tmp_path), source_session_id, mutation, mutation_result),
     )
     creator.start()
     try:
         assert publication_started.wait(10), "fork project publication did not start"
-        deleter.start()
-        assert deletion_result.get(timeout=10) == ("deleted",), (
+        mutator.start()
+        assert mutation_result.get(timeout=10) == ("mutated",), (
             "public opposing mutation did not complete before fork project publication"
         )
         publication_release.set()
         creator.join(10)
-        deleter.join(10)
+        mutator.join(10)
         assert not creator.is_alive(), "fork creator did not finish"
-        assert not deleter.is_alive(), "source deleter did not finish"
+        assert not mutator.is_alive(), "source mutator did not finish"
         assert creator.exitcode == 0
-        assert deleter.exitcode == 0
+        assert mutator.exitcode == 0
 
         outcome = fork_result.get(timeout=10)
         assert outcome[0] == "rejected", "stale discussion fork was bound"
-        assert "not found" in outcome[2]
-        assert list(manager.sessions_dir.iterdir()) == [], (
+        assert refusal in outcome[2]
+        remaining = {path.name for path in manager.sessions_dir.iterdir()}
+        assert remaining == (set() if mutation == "delete" else {source_session_id}), (
             "created fork was not cleaned"
         )
     finally:
         publication_release.set()
-        for process in (creator, deleter):
+        for process in (creator, mutator):
             if process.pid is not None and process.is_alive():
                 process.kill()
             if process.pid is not None:
                 process.join(10)
                 process.close()
-        for result in (fork_result, deletion_result):
+        for result in (fork_result, mutation_result):
             result.close()
             result.join_thread()

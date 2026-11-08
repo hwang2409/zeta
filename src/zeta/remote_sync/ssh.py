@@ -14,7 +14,12 @@ from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
 from .. import memory_migration_plan, project_schema
-from ..storage_format import ACCEPTED_KEY_SETS, P06_FEATURE_EPOCH, WRITER_EPOCH
+from ..storage_format import (
+    ACCEPTED_KEY_SETS,
+    GATED_HOME_PATHS,
+    P06_FEATURE_EPOCH,
+    WRITER_EPOCH,
+)
 from . import (
     RemoteSyncError,
     _append_resume_hint,
@@ -65,53 +70,61 @@ _PROJECT_AUTHORITY = rf'''
 import contextlib, fcntl, json, os, pathlib, secrets, stat, sys
 _P06_FEATURE_EPOCH = {P06_FEATURE_EPOCH}
 _WRITER_EPOCH = {WRITER_EPOCH}
+_GATED_HOME_PATHS = {tuple(pattern for pattern, _owner in GATED_HOME_PATHS)!r}
+_LEASE = None
 
 def _has_gated_state(home):
-    projects = home / "projects"
-    sessions = home / "sessions"
-    if projects.exists() or any((home / name).exists() for name in (
-        "accounts.json", "accounts", "anthropic-oauth.json", "codex-oauth.json", "mcp-tokens"
-    )):
-        return True
-    try: return sessions.exists() and next(sessions.iterdir(), None) is not None
-    except OSError: return True
+    for pattern in _GATED_HOME_PATHS:
+        listed = pattern.endswith("/*")
+        path = home / (pattern[:-2] if listed else pattern)
+        if not os.path.lexists(path): continue
+        if not listed or path.is_symlink() or not path.is_dir(): return True
+        try:
+            if next(path.iterdir(), None) is not None: return True
+        except OSError: return True
+    return False
+
+def _publish_manifest(home):
+    temporary = home / f".storage-format.json.{{secrets.token_hex(16)}}.tmp"
+    try:
+        with temporary.open("x") as stream:
+            stream.write(json.dumps({{"writer_epoch": _WRITER_EPOCH}}, separators=(",", ":")) + "\n")
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary, home / "storage-format.json")
+        directory_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
+    finally:
+        try: temporary.unlink()
+        except FileNotFoundError: pass
 
 def _writer_epoch(home):
+    # Mirror storage_format.open_writer: bootstrap only an empty home, then
+    # retain a shared stored-format lease for the life of this program.
+    global _LEASE
+    if _LEASE is not None: return _LEASE[1]
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     manifest_path = home / "storage-format.json"
     try:
-        manifest = json.loads(manifest_path.read_text())
-    except FileNotFoundError:
-        lock_path = home / ".storage-format.lock"
-        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        try:
+        lock_fd = os.open(home / ".storage-format.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError: sys.exit(53)
+    try:
+        if manifest_path.exists():
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        else:
             try: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError: sys.exit(53)
-            try:
-                manifest = json.loads(manifest_path.read_text())
-            except FileNotFoundError:
+            if not manifest_path.exists():
                 if _has_gated_state(home): sys.exit(53)
-                temporary = home / f".storage-format.json.{{secrets.token_hex(16)}}.tmp"
-                try:
-                    with temporary.open("x") as stream:
-                        stream.write(json.dumps({{"writer_epoch": _WRITER_EPOCH}}, separators=(",", ":")) + "\n")
-                        stream.flush(); os.fsync(stream.fileno())
-                    os.replace(temporary, manifest_path)
-                    directory_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
-                    try: os.fsync(directory_fd)
-                    finally: os.close(directory_fd)
-                finally:
-                    try: temporary.unlink()
-                    except FileNotFoundError: pass
-                manifest = {{"writer_epoch": _WRITER_EPOCH}}
-            except (OSError, ValueError): sys.exit(53)
-        finally:
-            os.close(lock_fd)
+                _publish_manifest(home)
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        manifest = json.loads(manifest_path.read_text())
     except (OSError, ValueError):
-        sys.exit(53)
+        os.close(lock_fd); sys.exit(53)
     if type(manifest) is not dict or set(manifest) != {{"writer_epoch"}}: sys.exit(53)
     epoch = manifest.get("writer_epoch")
     if type(epoch) is not int or epoch < 1 or epoch > _WRITER_EPOCH: sys.exit(53)
+    _LEASE = (lock_fd, epoch)
     return epoch
 
 def _lock_file(directory_fd, name, operation):
