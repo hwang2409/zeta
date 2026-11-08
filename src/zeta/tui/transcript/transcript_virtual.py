@@ -15,6 +15,8 @@ from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.layout.controls import UIContent
 from rich.console import Console
+from rich.padding import Padding
+from rich.segment import Segment
 from rich.text import Text
 from rich.theme import Theme
 
@@ -99,11 +101,26 @@ class TranscriptVirtualMixin:
             width=max(1, width),
             theme=rich_theme,
         )
-        console.print(renderable)
-        rendered = "\n".join(
-            line.rstrip(" ") for line in output.getvalue().splitlines()
-        )
-        return Text.from_ansi(rendered).plain
+        if not isinstance(renderable, Padding) or not isinstance(
+            renderable.renderable, Text
+        ):
+            console.print(renderable)
+            rendered = "\n".join(
+                line.rstrip(" ") for line in output.getvalue().splitlines()
+            )
+            return Text.from_ansi(rendered).plain
+
+        lines: list[str] = []
+        for line in Segment.split_lines(console.render(renderable, console.options)):
+            parts = [segment.text for segment in line]
+            for index in range(len(line) - 1, -1, -1):
+                if line[index].style:
+                    break
+                parts[index] = parts[index].rstrip(" ")
+                if parts[index]:
+                    break
+            lines.append("".join(parts))
+        return "\n".join(lines)
 
     def _search_rendered(self, unit: Any, width: int) -> str:
         value = unit.value

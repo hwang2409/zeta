@@ -39,6 +39,15 @@ from ..transcript_recovery import (
     reconcile_pending,
     repair_transcript,
 )
+from ..transcript_recovery.stream import (
+    PhysicalRow as _PhysicalRow,
+)
+from ..transcript_recovery.stream import (
+    StreamingTranscript as _StreamingTranscript,
+)
+from ..transcript_recovery.stream import (
+    TranscriptFailureKind,
+)
 from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
@@ -69,15 +78,6 @@ MAX_PENDING_APPEND_RECEIPTS = 256
 type InstalledEntriesDelta = tuple[ConversationEntry, ...] | Literal["reset"]
 
 _LOGGER = logging.getLogger(__name__)
-
-
-TranscriptFailureKind = Literal[
-    "torn_tail",
-    "invalid_row",
-    "broken_links",
-    "unsupported_format",
-    "unrecoverable_header",
-]
 
 
 class TranscriptLoadError(ConversationIntegrityError):
@@ -188,14 +188,6 @@ class _DetachedLogState:
     publication_delta: InstalledEntriesDelta = ()
 
 
-@dataclass(frozen=True, slots=True)
-class _PhysicalRow:
-    row_number: int
-    byte_offset: int
-    value: dict[str, Any] | None
-    torn: bool = False
-
-
 class _FullLoadValidator:
     """Validate rows in order and retain every index needed by the loaded store."""
 
@@ -225,12 +217,9 @@ class _FullLoadValidator:
         "_client_delivery_outcomes",
     )
 
-    def __init__(
-        self, store: ConversationStore, raw: bytes, stat: os.stat_result
-    ) -> None:
+    def __init__(self, store: ConversationStore, source: _StreamingTranscript) -> None:
         self.store = store
-        self.raw = raw
-        self.stat = stat
+        self.source = source
         self.state = copy.copy(store)
         self.state._entries = []
         self.state._entry_prefix_digest = b""
@@ -249,15 +238,11 @@ class _FullLoadValidator:
         reason_code: str,
         repairable: bool = True,
     ) -> TranscriptLoadError:
-        return self.store._transcript_error(
+        return self.source.error(
+            row,
             kind=kind,
-            row_number=row.row_number,
-            byte_offset=row.byte_offset,
-            valid_prefix_end=None if row.row_number == 1 else row.byte_offset,
             reason_code=reason_code,
             repairable=repairable,
-            raw=self.raw,
-            stat=self.stat,
             validated_prefix=(
                 self.validated_prefix(row.byte_offset) if row.row_number > 1 else None
             ),
@@ -424,15 +409,11 @@ class _FullLoadValidator:
 
     def finish(self) -> None:
         if not self.header_seen:
-            raise self.store._transcript_error(
+            raise self.source.error(
+                None,
                 kind="unrecoverable_header",
-                row_number=None,
-                byte_offset=None,
-                valid_prefix_end=None,
                 reason_code="missing_header",
                 repairable=False,
-                raw=self.raw,
-                stat=self.stat,
             )
         if self.state._entries:
             self._select_branch(self.state._entries[-1])
@@ -838,11 +819,11 @@ class ConversationLogMixin:
         valid_prefix_end: int | None,
         reason_code: str,
         repairable: bool,
-        raw: bytes,
         stat: os.stat_result,
+        prefix_digest: str,
+        source_digest: str | None,
         validated_prefix: ValidatedPrefix | None = None,
     ) -> TranscriptLoadError:
-        prefix_end = valid_prefix_end or 0
         return TranscriptLoadError(
             kind=kind,
             session_id=self.session_id,
@@ -858,20 +839,21 @@ class ConversationLogMixin:
             source_device=stat.st_dev,
             source_inode=stat.st_ino,
             source_size=stat.st_size,
-            prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
+            prefix_digest=prefix_digest,
             source_facts=(
                 TranscriptSourceFacts(
                     device=stat.st_dev,
                     inode=stat.st_ino,
                     size=stat.st_size,
-                    source_digest=hashlib.sha256(raw).hexdigest(),
-                    prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
+                    source_digest=source_digest,
+                    prefix_digest=prefix_digest,
                     first_bad_row=row_number,
                     first_bad_offset=byte_offset,
                     prefix=validated_prefix,
                     diagnosed_at=_now(),
                 )
                 if repairable
+                and source_digest is not None
                 and row_number is not None
                 and byte_offset is not None
                 and validated_prefix is not None
@@ -879,77 +861,13 @@ class ConversationLogMixin:
             ),
         )
 
-    @staticmethod
-    def _recovery_prefix_for_error(
-        validated_prefix: Callable[[int], ValidatedPrefix] | None,
-        row_offset: int,
-        *,
-        repairable: bool,
-    ) -> ValidatedPrefix | None:
-        if not repairable or validated_prefix is None:
-            return None
-        return validated_prefix(row_offset)
-
     def _iter_physical_rows(
         self: ConversationStore,
-        raw: bytes,
-        stat: os.stat_result,
-        validated_prefix: Callable[[int], ValidatedPrefix] | None = None,
+        source: _StreamingTranscript,
+        validated_prefix: Callable[[int], ValidatedPrefix],
     ) -> Iterator[_PhysicalRow]:
         """Yield decoded physical rows and one marker for a writable torn tail."""
-        offset = 0
-        lines = raw.splitlines(keepends=True)
-        for index, line in enumerate(lines):
-            if index and index % 64 == 0:
-                time.sleep(0.0001)
-            row_number = index + 1
-            row_offset = offset
-            try:
-                value = load_session_json(line)
-            except ConversationIntegrityError as exc:
-                torn = (
-                    index == len(lines) - 1
-                    and not line.endswith(b"\n")
-                    and isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeError))
-                )
-                if torn and not self._read_only:
-                    yield _PhysicalRow(row_number, row_offset, None, torn=True)
-                    return
-                raise self._transcript_error(
-                    kind=(
-                        "unrecoverable_header"
-                        if index == 0
-                        else "torn_tail"
-                        if torn
-                        else "invalid_row"
-                    ),
-                    row_number=row_number,
-                    byte_offset=row_offset,
-                    valid_prefix_end=None if index == 0 else row_offset,
-                    reason_code="invalid_json",
-                    repairable=index > 0,
-                    raw=raw,
-                    stat=stat,
-                    validated_prefix=self._recovery_prefix_for_error(
-                        validated_prefix, row_offset, repairable=index > 0
-                    ),
-                ) from exc
-            if not isinstance(value, dict):
-                raise self._transcript_error(
-                    kind="unrecoverable_header" if index == 0 else "invalid_row",
-                    row_number=row_number,
-                    byte_offset=row_offset,
-                    valid_prefix_end=None if index == 0 else row_offset,
-                    reason_code="row_not_object",
-                    repairable=index > 0,
-                    raw=raw,
-                    stat=stat,
-                    validated_prefix=self._recovery_prefix_for_error(
-                        validated_prefix, row_offset, repairable=index > 0
-                    ),
-                )
-            offset += len(line)
-            yield _PhysicalRow(row_number, row_offset, value)
+        yield from source.rows(validated_prefix)
 
     def _repair_explicit_load_error(
         self: ConversationStore, error: TranscriptLoadError
@@ -971,14 +889,14 @@ class ConversationLogMixin:
 
     def _repair_torn_row(
         self: ConversationStore,
-        torn_offset: int | None,
+        torn_row: _PhysicalRow | None,
         validator: _FullLoadValidator,
-        stat: os.stat_result,
-        raw: bytes,
+        source: _StreamingTranscript,
         delta: tuple[ConversationEntry, ...],
     ) -> bool:
-        if torn_offset is None:
+        if torn_row is None:
             return False
+        torn_offset = torn_row.byte_offset
         if self._storage_lease.observed_epoch != WRITER_EPOCH:
             self._repair_torn_tail_legacy(torn_offset)
             self._log_offset = torn_offset
@@ -986,13 +904,13 @@ class ConversationLogMixin:
             self._append_torn_warning_legacy()
             return True
         prefix = validator.validated_prefix(torn_offset)
-        source = TranscriptSourceFacts(
-            device=stat.st_dev,
-            inode=stat.st_ino,
-            size=stat.st_size,
-            source_digest=hashlib.sha256(raw).hexdigest(),
-            prefix_digest=hashlib.sha256(raw[:torn_offset]).hexdigest(),
-            first_bad_row=len(raw[:torn_offset].splitlines()) + 1,
+        source_facts = TranscriptSourceFacts(
+            device=source.stat.st_dev,
+            inode=source.stat.st_ino,
+            size=source.stat.st_size,
+            source_digest=source.finish_digest(),
+            prefix_digest=torn_row.prefix_digest,
+            first_bad_row=torn_row.row_number,
             first_bad_offset=torn_offset,
             prefix=prefix,
             diagnosed_at=_now(),
@@ -1000,7 +918,7 @@ class ConversationLogMixin:
         self._last_repair_result = repair_transcript(
             self.directory_fd,
             self._repair_target,
-            source,
+            source_facts,
             strict_reopen=self._strict_reopen_repaired_transcript,
             memory_review_required=False,
         )
@@ -1024,39 +942,41 @@ class ConversationLogMixin:
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
             stat = os.fstat(fd)
-            raw = self._read_fd(fd, stat.st_size)
+            source = _StreamingTranscript(self, fd, stat)
+            validator = _FullLoadValidator(self, source)
+            torn_row: _PhysicalRow | None = None
+            last_row: _PhysicalRow | None = None
+            try:
+                for physical_row in self._iter_physical_rows(
+                    source, validator.validated_prefix
+                ):
+                    last_row = physical_row
+                    if physical_row.torn:
+                        torn_row = physical_row
+                        break
+                    validator.accept(physical_row)
+                validator.finish()
+            except TranscriptLoadError as error:
+                if self._repair_explicit_load_error(error):
+                    return
+                raise
+
+            delta = (
+                self._installed_delta_from_baseline(self._entries, baseline)
+                if self.on_entries_installed is not None
+                else ()
+            )
+            if self._repair_torn_row(torn_row, validator, source, delta):
+                return
+            source.finish_digest()
+            if not self._read_only and last_row is not None and not last_row.terminated:
+                self._write_bytes(b"\n")
+                self._publish_entries_installed(delta)
+            else:
+                self._set_log_stat(stat, fd=fd)
+                self._publish_entries_installed(delta)
         finally:
             os.close(fd)
-
-        validator = _FullLoadValidator(self, raw, stat)
-        torn_offset: int | None = None
-        try:
-            for physical_row in self._iter_physical_rows(
-                raw, stat, validator.validated_prefix
-            ):
-                if physical_row.torn:
-                    torn_offset = physical_row.byte_offset
-                    break
-                validator.accept(physical_row)
-            validator.finish()
-        except TranscriptLoadError as error:
-            if self._repair_explicit_load_error(error):
-                return
-            raise
-
-        delta = (
-            self._installed_delta_from_baseline(self._entries, baseline)
-            if self.on_entries_installed is not None
-            else ()
-        )
-        if self._repair_torn_row(torn_offset, validator, stat, raw, delta):
-            return
-        if not self._read_only and not raw.endswith(b"\n"):
-            self._write_bytes(b"\n")
-            self._publish_entries_installed(delta)
-        else:
-            self._set_log_stat(stat)
-            self._publish_entries_installed(delta)
 
     def _validate_header(self: ConversationStore, header: dict[str, Any]) -> None:
         header_data = header.get("data")
@@ -1149,20 +1069,20 @@ class ConversationLogMixin:
     def _strict_reopen_repaired_transcript(self: ConversationStore) -> None:
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
-            stat = os.fstat(fd)
-            raw = self._read_fd(fd, stat.st_size)
+            source = _StreamingTranscript(self, fd, os.fstat(fd))
+            validator = _FullLoadValidator(self, source)
+            for physical_row in self._iter_physical_rows(
+                source, validator.validated_prefix
+            ):
+                if physical_row.torn:
+                    raise ConversationIntegrityError(
+                        f"invalid conversation row {physical_row.row_number}: {self.path}"
+                    )
+                validator.accept(physical_row)
+            validator.finish()
+            source.finish_digest()
         finally:
             os.close(fd)
-        validator = _FullLoadValidator(self, raw, stat)
-        for physical_row in self._iter_physical_rows(
-            raw, stat, validator.validated_prefix
-        ):
-            if physical_row.torn:
-                raise ConversationIntegrityError(
-                    f"invalid conversation row {physical_row.row_number}: {self.path}"
-                )
-            validator.accept(physical_row)
-        validator.finish()
 
     def _repair_torn_tail_legacy(self: ConversationStore, offset: int) -> None:
         with os.fdopen(
@@ -1239,12 +1159,17 @@ class ConversationLogMixin:
         known = getattr(self, "_log_prefix_fingerprint", None)
         return known is not None and self._prefix_fingerprint(fd, offset) == known
 
-    def _set_log_stat(self: ConversationStore, stat: os.stat_result) -> None:
-        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+    def _set_log_stat(
+        self: ConversationStore, stat: os.stat_result, *, fd: int | None = None
+    ) -> None:
+        owned_fd = fd is None
+        if fd is None:
+            fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
             fingerprint = self._prefix_fingerprint(fd, stat.st_size)
         finally:
-            os.close(fd)
+            if owned_fd:
+                os.close(fd)
         self._log_identity = (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
         self._log_offset = stat.st_size
         self._log_mtime_ns = stat.st_mtime_ns
