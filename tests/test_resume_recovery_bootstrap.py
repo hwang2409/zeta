@@ -92,14 +92,23 @@ async def test_resume_activation_and_stage_reads_do_not_encode_history(
         return original_encode(entry)
 
     backend_counts: list[int] = []
+    stage_calls = 0
+    original_stage = ConversationStore._stage_delivery_request
+
+    def count_stage(candidate, *args, **kwargs):
+        nonlocal stage_calls
+        stage_calls += 1
+        return original_stage(candidate, *args, **kwargs)
 
     def serialize(_messages, _tool_schemas) -> bytes:
         backend_counts.append(historical_encodes)
         return b"request"
 
+    count_stage.__name__ = "_stage_delivery_request"
     monkeypatch.setattr(
         ConversationStore, "_encoded_entry_line", staticmethod(count_historical)
     )
+    monkeypatch.setattr(ConversationStore, "_stage_delivery_request", count_stage)
     backend = FakeBackend(
         [
             ScriptedTurn([TextContent("first")]),
@@ -123,7 +132,7 @@ async def test_resume_activation_and_stage_reads_do_not_encode_history(
     finally:
         await loop.close(background_task_cause="test cleanup")
 
-    assert (activation_encodes, backend_counts) == (0, [0, 0]), (
+    assert (activation_encodes, stage_calls, backend_counts) == (0, 4, [0, 0]), (
         "activation or delivery staging encoded historical rows"
     )
 
@@ -240,19 +249,33 @@ async def test_warm_writer_sees_external_append_between_open_and_start(
     )
     external.close()
     reloads = 0
-    original = ConversationStore._load_full
+    snapshots = 0
+    original_load = ConversationStore._load_full
+    original_snapshot = ConversationStore._snapshot_log_state
 
     def count_reloads(store: ConversationStore) -> None:
         nonlocal reloads
         reloads += 1
-        original(store)
+        original_load(store)
+
+    def count_snapshots(store: ConversationStore):
+        nonlocal snapshots
+        snapshots += 1
+        return original_snapshot(store)
 
     monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
+    monkeypatch.setattr(ConversationStore, "_snapshot_log_state", count_snapshots)
     flow = StepDeliveryFlow(resident)
     await flow.initialize()
     try:
         assert reloads == 0
-        assert resident.messages()[-1].content == [TextContent("external")]
+        assert snapshots == 1
+        reopened = ConversationStore(tmp_path, session_id=resident.session_id)
+        try:
+            assert resident.entries == reopened.entries
+            assert resident.messages()[-1].content == [TextContent("external")]
+        finally:
+            reopened.close()
     finally:
         await asyncio.to_thread(resident.close)
 

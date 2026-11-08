@@ -242,13 +242,22 @@ class AsyncDurableWritesMixin:
             method_name, args, kwargs
         )
         owner_identity, owner_offset = owner_log
+        unchanged_read = (
+            method_name in {"_stage_delivery_request", "_warm_step_delivery_writer"}
+            and receipts == ()
+            and not reloaded
+            and writer_baseline == baseline
+            and (len(writer._entries), writer._entry_prefix_digest) == writer_baseline
+            and (writer._log_identity, writer._log_offset) == owner_log
+            and writer._log_metadata_matches()
+        )
         starts_at_owner_prefix = bool(
             receipts
             and receipts[0].start_offset == owner_offset
             and (receipts[0].source_device, receipts[0].source_inode)
             == owner_identity[:2]
         )
-        if (
+        if unchanged_read or (
             not reloaded
             and starts_at_owner_prefix
             and self._worker_prefix_matches_baseline(
