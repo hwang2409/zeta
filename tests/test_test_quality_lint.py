@@ -1272,3 +1272,53 @@ def test_non_test_python_files_are_ignored(tmp_path: Path) -> None:
     target.write_text(source)
 
     assert lint_diff(_diff(path, source), tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "codes"),
+    [
+        ("tests/test_x.py", "async def test_x():\n    await x\n", {"TQ004"}),
+        (
+            "tests/conftest.py",
+            'import os\nos.environ["ZETA_HOME"] = "x"\n',
+            {"TQ005"},
+        ),
+        (
+            "sitecustomize.py",
+            'import os\nos.environ["ZETA_HOME"] = "x"\n',
+            {"TQ005"},
+        ),
+        (
+            "conftest.py",
+            'import os\nos.environ["ZETA_HOME"] = "x"\n',
+            {"TQ005"},
+        ),
+        (
+            "src/zeta/x.py",
+            (
+                'from pathlib import Path\nimport asyncio\n'
+                'async def x():\n    await x\n'
+                '    await asyncio.to_thread(Path("x").exists())\n'
+            ),
+            {"TQ007"},
+        ),
+        (
+            "src/zeta/tests/test_y.py",
+            (
+                'from pathlib import Path\nimport asyncio\n'
+                'async def test_y():\n    await x\n'
+                '    await asyncio.to_thread(Path("x").exists())\n'
+            ),
+            {"TQ004", "TQ007"},
+        ),
+        ("scripts/x.py", "async def x():\n    await x\n", set()),
+    ],
+)
+def test_lint_diff_applies_rule_families_by_path(
+    tmp_path: Path, path: str, source: str, codes: set[str]
+) -> None:
+    target = tmp_path / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source)
+
+    assert {finding.code for finding in lint_diff(_diff(path, source), tmp_path)} == codes

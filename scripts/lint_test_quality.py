@@ -229,6 +229,15 @@ def _is_test_path(path: Path) -> bool:
     )
 
 
+def _rule_families(path: Path) -> set[str]:
+    families: set[str] = set()
+    if _is_test_path(path) or path.name in {"conftest.py", "sitecustomize.py"}:
+        families.add("test")
+    if path.parts[:2] == ("src", "zeta"):
+        families.add("async")
+    return families
+
+
 def _name(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
         return node.id
@@ -1126,6 +1135,7 @@ def lint_source(
     nodes = [node for node in ast.walk(tree) if hasattr(node, "lineno")]
     added_nodes = [node for node in nodes if _touches_added_line(node, added)]
     deadline_nodes = _deadline_nodes(nodes, added_nodes, added, parents)
+    families = _rule_families(path)
     findings = (
         _scan_added_nodes(
             path,
@@ -1135,13 +1145,14 @@ def lint_source(
             serialized_names,
             new_private_patches,
         )
-        if _is_test_path(path)
+        if "test" in families
         else []
     )
-    if path.parts[:2] == ("src", "zeta"):
+    if "async" in families:
         findings.extend(_async_blocking_findings(path, tree, lines, added))
-    findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents))
-    findings.extend(_global_bootstrap_findings(path, tree, source, added))
+    if "test" in families:
+        findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents))
+        findings.extend(_global_bootstrap_findings(path, tree, source, added))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
 
@@ -1149,11 +1160,7 @@ def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
     root = Path.cwd() if root is None else root
     findings: list[Finding] = []
     for path, added in _added_lines(diff).items():
-        if not added or not (
-            _is_test_path(path)
-            or path.name in {"conftest.py", "sitecustomize.py"}
-            or path.parts[:2] == ("src", "zeta")
-        ):
+        if not added or not _rule_families(path):
             continue
         source_path = root / path
         if source_path.is_file():
