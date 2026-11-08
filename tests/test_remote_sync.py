@@ -1607,6 +1607,70 @@ def test_p06_3_generated_project_install_uses_one_project_authority(
     assert (remote / "projects" / installed_project_id / "sync" / "new.json").read_text() == "{}\n"
 
 
+
+def test_p06_remote_memory_snapshot_and_publication_are_coherent(
+    tmp_path: Path,
+) -> None:
+    # Local half of the stable one-authority protocol; the ssh half is the
+    # p06-3 generated-program tests above.
+    source, held_project_id, target_id = _two_format_two_projects(tmp_path)
+    remote = initialize_storage_home(tmp_path / "remote")
+    for project_id in (held_project_id, target_id):
+        shutil.copytree(
+            source / "projects" / project_id, remote / "projects" / project_id
+        )
+    (remote / "projects").chmod(0o700)
+    before = project_digest(remote / "projects" / target_id)
+    sync_file = source / "projects" / target_id / "sync" / "new.json"
+    sync_file.parent.mkdir()
+    sync_file.write_text("{}\n")
+    transport = LocalTransport(remote)
+    fetched = tmp_path / "fetched"
+
+    def fetch_then_publish() -> str:
+        try:
+            digest = transport.fetch_project(target_id, fetched)
+            transport.publish_project(
+                target_id, source / "projects" / target_id, expected_digest=digest
+            )
+            return digest
+        except RemoteSyncError as exc:
+            return str(exc)
+
+    held_lock = remote / "projects" / held_project_id / ".memory.lock"
+    legacy_root_lock = remote / "projects" / ".lock"
+    held_lock.touch(mode=0o600)
+    legacy_root_lock.touch(mode=0o600)
+    handle = held_lock.open("r+b")
+    root_handle = legacy_root_lock.open("r+b")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        fcntl.flock(root_handle, fcntl.LOCK_EX)
+        future = executor.submit(fetch_then_publish)
+        try:
+            outcome = future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
+            outcome = "blocked by unrelated project authority"
+    finally:
+        fcntl.flock(root_handle, fcntl.LOCK_UN)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        root_handle.close()
+        handle.close()
+        if future is not None:
+            future.result(timeout=10)
+        executor.shutdown(wait=True)
+
+    assert outcome == before, "local project sync did not use one project authority"
+    assert project_digest(fetched) == before
+    assert (remote / "projects" / target_id / "sync" / "new.json").read_text() == "{}\n"
+    reopened = ProjectRegistry(remote / "projects").project_context_projection(
+        target_id
+    )
+    assert reopened.health is None and reopened.session_project is not None
+
+
 def _publish_initial_project(
     kind: str,
     remote: Path,
