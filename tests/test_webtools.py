@@ -517,10 +517,13 @@ async def test_registry_close_drains_in_flight_web_request(
         assert isinstance(cancelled[0], asyncio.CancelledError)
         async with registry.web_clients._condition:
             pass
-        assert client.is_closed, "cancelled registry close left its web client open"
+        client_closed = client.is_closed
+        if not client_closed:
+            await client.aclose()
         await await_or_fail(
             server.connection_closed.wait(), what="request connection context to close"
         )
+        assert client_closed, "cancelled registry close left its web client open"
         assert registry.web_clients._close_task is None
         assert server.open_connections == 0
     finally:
