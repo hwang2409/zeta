@@ -134,24 +134,29 @@ class TranscriptFinderMixin:
         value = unit.value
         if isinstance(value, Padding) and isinstance(value.renderable, Text):
             text = value.renderable
-            bounded = Padding(
-                text[:_FINDER_PREVIEW_TEXT_LIMIT],
-                (value.top, value.right, value.bottom, value.left),
-                style=value.style,
-                expand=value.expand,
-            )
-            revision = self._unit_revision(unit)
-            plain = await asyncio.to_thread(
-                self._render_search_snapshot,
-                bounded,
-                self._content_width,
-                copy.deepcopy(RICH_THEME),
-            )
-            if self._unit_revision(unit) == revision:
-                self._cache_search_text(
-                    unit.key, self._content_width, revision, plain
+            source_length = min(len(text), _FINDER_PREVIEW_TEXT_LIMIT)
+            previous_plain: str | None = None
+            while True:
+                bounded = Padding(
+                    text[:source_length],
+                    (value.top, value.right, value.bottom, value.left),
+                    style=value.style,
+                    expand=value.expand,
                 )
-            return (plain[:_FINDER_PREVIEW_TEXT_LIMIT],)
+                plain = await asyncio.to_thread(
+                    self._render_search_snapshot,
+                    bounded,
+                    self._content_width,
+                    copy.deepcopy(RICH_THEME),
+                )
+                prefix = plain[:_FINDER_PREVIEW_TEXT_LIMIT]
+                if source_length == len(text) or (
+                    len(plain) >= _FINDER_PREVIEW_TEXT_LIMIT
+                    and prefix == previous_plain
+                ):
+                    return (prefix,)
+                previous_plain = prefix
+                source_length = min(len(text), source_length * 2)
         if _is_tool_unit(value) or isinstance(getattr(value, "plain", None), str):
             return self._finder_source_parts(unit)
         width = self._content_width

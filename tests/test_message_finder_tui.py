@@ -191,7 +191,9 @@ def test_finder_bounds_replayed_user_padding_before_rich_render(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transcript = TranscriptWidget()
-    shapes = []
+    shapes = [
+        Padding(Text((" " * 100 + "\n") * 200 + "needle"), (0, 0, 0, 0))
+    ]
     for index in range(20):
         text = Text(
             ("wide界" if index % 2 else "combining e\u0301") * 8_000,
@@ -214,17 +216,26 @@ def test_finder_bounds_replayed_user_padding_before_rich_render(
     )
 
     async def exercise() -> None:
-        for shape in shapes:
-            original = shape.renderable.copy()
-            unit = transcript.append(shape)
-            expected = Text.from_ansi(
-                transcript._search_rendered(unit, transcript._content_width)
-            ).plain[: transcript_finder._FINDER_PREVIEW_TEXT_LIMIT]
-            assert await transcript._finder_source_parts_async(unit) == (expected,)
-            assert shape.renderable == original
+        for width in (20, 40, 80, 120):
+            transcript._content_width = width
+            for shape in shapes:
+                original = shape.renderable.copy()
+                unit = transcript.append(shape)
+                expected = Text.from_ansi(
+                    transcript._search_rendered(unit, width)
+                ).plain[: transcript_finder._FINDER_PREVIEW_TEXT_LIMIT]
+                actual = (await transcript._finder_source_parts_async(unit))[0]
+                assert actual == expected
+                assert transcript_finder.find_matches("needle", actual) == transcript_finder.find_matches(
+                    "needle", expected
+                )
+                assert shape.renderable == original
+                if "needle" in expected:
+                    assert "needle" in transcript._searchable_text(unit, width)
 
     asyncio.run(exercise())
-    assert rendered_lengths == [transcript_finder._FINDER_PREVIEW_TEXT_LIMIT] * len(shapes)
+    assert rendered_lengths
+    assert max(rendered_lengths) <= max(len(shape.renderable) for shape in shapes)
 
 
 def test_open_finder_lists_messages_with_roles() -> None:
