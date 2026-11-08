@@ -89,6 +89,8 @@ async def test_serve_real_event_path_maps_wake_tool_with_negotiated_fidelity() -
 
     class State:
         session_id = "session"
+        model = "test"
+        usage_tracker = SimpleNamespace(record=lambda *_args: None)
 
         def tool_started(self) -> None:
             pass
