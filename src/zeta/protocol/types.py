@@ -6,7 +6,7 @@ import base64
 import binascii
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
@@ -45,6 +45,27 @@ class MessageRole(StrEnum):
 MESSAGE_ORIGIN_METADATA = "zeta.origin"
 
 _VALIDATED_IMAGE = object()
+
+
+class _ValidationState:
+    __slots__ = ("_validation_marker",)
+
+    def __getstate__(self) -> list[Any]:
+        return [getattr(self, item.name) for item in fields(type(self))]
+
+    def __setstate__(self, state: list[Any]) -> None:
+        for item, value in zip(fields(type(self)), state, strict=True):
+            object.__setattr__(self, item.name, value)
+
+
+def _image_validation_snapshot(
+    content_blocks: list[dict[str, Any]],
+) -> tuple[tuple[int, str, str], ...]:
+    return tuple(
+        (id(block), block["data"], block["mimeType"])
+        for block in content_blocks
+        if block["type"] == "image"
+    )
 
 
 class MessageOrigin(StrEnum):
@@ -102,14 +123,11 @@ class TextContent:
 
 
 @dataclass(frozen=True, slots=True)
-class ImageContent:
+class ImageContent(_ValidationState):
     data: str
     mime_type: str
     path: str | None = None
     size: int | None = None
-    _validation_marker: object | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
 
     @property
     def type(self) -> ContentType:
@@ -587,7 +605,7 @@ def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolResult:
+class ToolResult(_ValidationState):
     tool_call_id: str
     content: str
     is_error: bool = False
@@ -597,9 +615,6 @@ class ToolResult:
     )
     is_canceled: bool = field(default=False, compare=False)
     lifecycle_projection: dict[str, Any] | None = field(default=None, compare=False)
-    _validation_marker: object | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -678,13 +693,7 @@ class ToolResult:
         )
         if content_blocks is not None:
             object.__setattr__(
-                result,
-                "_validation_marker",
-                tuple(
-                    (id(block), block["data"], block["mimeType"])
-                    for block in content_blocks
-                    if block["type"] == "image"
-                ),
+                result, "_validation_marker", _image_validation_snapshot(content_blocks)
             )
         return result
 

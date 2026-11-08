@@ -1,8 +1,11 @@
 import asyncio
 import base64
+import copy
+import dataclasses
 import http.server
 import json
 import multiprocessing
+import pickle
 import threading
 import time
 import uuid
@@ -42,6 +45,31 @@ from zeta.providers.codex import (
     extract_account_id,
 )
 from zeta.providers.codex_payload import _cache_affinity_json
+
+
+def test_validation_provenance_is_private_and_legacy_pickle_safe() -> None:
+    data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+    image = Message.from_dict(
+        {"role": "user", "content": [{"type": "image", "data": data, "mimeType": "image/png"}]}
+    ).content[0]
+    result = ToolResult.from_dict(
+        {
+            "tool_call_id": "call",
+            "content": "image",
+            "is_error": False,
+            "content_blocks": [{"type": "image", "data": data, "mimeType": "image/png"}],
+        }
+    )
+    assert json.dumps(dataclasses.asdict(image)) == json.dumps(
+        {"data": data, "mime_type": "image/png", "path": None, "size": None}
+    )
+    assert "_validation_marker" not in dataclasses.asdict(result)
+    assert copy.deepcopy(image) == image
+    assert dataclasses.replace(image, path="x") == ImageContent(data, "image/png", "x")
+    old_image = pickle.loads(bytes.fromhex("80049542000000000000008c137a6574612e70726f746f636f6c2e7479706573948c0c496d616765436f6e74656e749493942981945d94288c0178948c09696d6167652f706e67944e4e65622e"))
+    old_result = pickle.loads(bytes.fromhex("8004953c000000000000008c137a6574612e70726f746f636f6c2e7479706573948c0a546f6f6c526573756c749493942981945d94288c026964948c017894894e4e894e65622e"))
+    assert build_responses_payload([Message(MessageRole.USER, [old_image])], [], model="gpt-5")["input"]
+    assert build_responses_payload([Message(MessageRole.TOOL_RESULT, tool_result=old_result)], [], model="gpt-5")["input"]
 from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.runtime.loop import AgentLoop

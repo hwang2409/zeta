@@ -77,7 +77,7 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
             wire = _image_input_block(
                 image,
                 validated=type(block) is ImageContent
-                and block._validation_marker is _VALIDATED_IMAGE,
+                and getattr(block, "_validation_marker", None) is _VALIDATED_IMAGE,
             )
             result.append(
                 wire
@@ -180,7 +180,7 @@ def build_responses_payload(
                 has_text_block = any(block["type"] == "text" for block in blocks)
                 for block in blocks:
                     if block["type"] == "image":
-                        marker = message.tool_result._validation_marker
+                        marker = getattr(message.tool_result, "_validation_marker", ())
                         wire = _image_input_block(
                             block,
                             validated=(
