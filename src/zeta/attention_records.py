@@ -29,6 +29,7 @@ from .core.session_files import (
     session_directory,
     write_session_file,
 )
+from .storage_format import reject_unknown_keys
 
 _MAX_RECORD_BYTES = 256 * 1024
 _MAX_BROKEN_ID_CHARS = 160
@@ -97,6 +98,7 @@ class AttentionRecord:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> AttentionRecord:
+        reject_unknown_keys(value, "attention_record")
         allowed = set(cls.__dataclass_fields__)
         if not set(value).issubset(allowed):
             raise ValueError("unknown attention record fields")

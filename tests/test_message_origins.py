@@ -14,13 +14,15 @@ from rich.console import Console
 
 from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
+from tests.support.serve_close import close_serve
 from tests.test_agent import (
     RunBackend,
     _agent_call,
     _collect,
     _run_handle_from_receipt,
 )
-from tests.test_server import _close, _connect, _frames_until_event, _request
+from tests.test_server import _connect, _frames_until_event, _request
 from tests.test_steering import SteerToolBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -281,7 +283,7 @@ _MODEL_INPUT_AUDIT = (
         "/mcp resources server mcp://doc/1",
     ),
     ("escaped slash", MessageOrigin.USER, "//status"),
-    ("unknown slash", MessageOrigin.USER, "/not-a-command"),
+    ("unknown slash", MessageOrigin.USER, "//not-a-command"),
     ("attachments/images", MessageOrigin.USER, "inspect @note.txt"),
     ("paste expansion", MessageOrigin.USER, "inspect [Image #1]"),
     ("steer/queued input", MessageOrigin.USER, "steer now"),
@@ -348,7 +350,7 @@ async def _audit_tui_row(path: str, tmp_path: Path) -> dict[str, object]:
         "MCP prompt": "/server:prompt value",
         "MCP resource": "/mcp resources server mcp://doc/1",
         "escaped slash": "//status",
-        "unknown slash": "/not-a-command",
+        "unknown slash": "//not-a-command",
         "attachments/images": "inspect @note.txt",
         "paste expansion": "inspect [Image #1]",
         "steer/queued input": "steer now",
@@ -426,14 +428,14 @@ async def _audit_tui_row(path: str, tmp_path: Path) -> dict[str, object]:
     if path == "steer/queued input":
         first = asyncio.create_task(app._handle_prompt_value("start"))
         assert isinstance(backend, SteerToolBackend)
-        await backend.turn1_streaming.wait()
+        await await_or_fail(backend.turn1_streaming.wait(), what="turn1 streaming")
         await app._handle_prompt_value(typed)
         backend.release_turn1.set()
-        await first
+        await await_or_fail(first, what="first prompt task")
     else:
         await app._handle_prompt_value(typed)
     assert app._active_task is not None
-    await app._active_task
+    await await_or_fail(app._active_task, what="active prompt task")
     user_rows = [
         entry.to_dict()
         for entry in store.entries
@@ -543,7 +545,7 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
             raise AssertionError(path)
         if path != "serve steer":
             assert server._client is not None and server.control._turn_task is not None
-            await server.control._turn_task
+            await asyncio.wait_for(server.control._turn_task, 10)
         if input_id is not None:
             reused = await _request(reader, writer, 5, "send", {"input_id": input_id})
             assert reused[-1]["error"]["code"] == -32602
@@ -562,7 +564,7 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
             )
         return messages[0]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 async def _audit_production_row(path: str, tmp_path: Path) -> dict[str, object]:

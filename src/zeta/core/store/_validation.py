@@ -9,6 +9,7 @@ from typing import Any
 
 from ...agent.receipt import valid_killed_task_fields
 from ...protocol.types import Message, MessageRole
+from ...storage_format import reject_unknown_keys
 
 MAX_AGENT_NOTIFICATION_TEXT = 10_000
 AGENT_COMPLETION_NOTIFICATION_KIND = "agent_completion"
@@ -58,6 +59,12 @@ def validate_terminal_transition_data(data: Mapping[str, Any]) -> None:
     """Validate one durable finish-or-cancel fence winner."""
     action = data.get("action")
     report = data.get("report")
+    if "report" in data:
+        reject_unknown_keys(data, "response_action_report")
+    else:
+        reject_unknown_keys(data, "response_action")
+    if isinstance(report, dict):
+        reject_unknown_keys(report, "response_report")
     if action not in {"finish", "cancel"}:
         raise ValueError("invalid terminal transition")
     if action == "cancel":
@@ -87,6 +94,7 @@ def validate_terminal_transition_data(data: Mapping[str, Any]) -> None:
 def validate_child_idle_notification_data(data: Mapping[str, Any]) -> None:
     """Apply the bounded schema for a nonterminal child-idle notice."""
 
+    reject_unknown_keys(data, "child_idle_notification")
     allowed = {
         "origin",
         "kind",

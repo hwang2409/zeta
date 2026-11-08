@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..core.fsio import write_all
 from ..providers.stream_diagnostics import write_stream_diagnostic
 from ..storage_format import PatchRecords, SetValue, WriterLease
 
@@ -30,6 +31,37 @@ def _reconciliation_record_id(name: str, item: dict[str, Any]) -> str:
     if name == "completed_ranges":
         return json.dumps((item["seq_start"], item["seq_end"]), separators=(",", ":"))
     return str(item["key"])
+
+
+@dataclass(frozen=True, slots=True)
+class Missing:
+    """A persisted reconciliation file does not exist yet."""
+
+
+@dataclass(frozen=True, slots=True)
+class Loaded:
+    """A validated persisted reconciliation value."""
+
+    value: Any
+
+
+@dataclass(frozen=True, slots=True)
+class Broken:
+    """Persisted reconciliation bytes that need explicit repair."""
+
+    path: Path
+    reason: str
+    recoverability: str
+    bytes: bytes | None
+
+    def status_line(self) -> str:
+        return (
+            "automatic project-memory reconciliation blocked: "
+            f"{self.path}: {self.reason}; bytes preserved; {self.recoverability}."
+        )
+
+
+PersistedState = Missing | Loaded | Broken
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +138,17 @@ class ReconciliationState:
         self.diagnostics_path = diagnostics_path
         self.receipts_path = path.with_name("memory-reconcile-receipts.jsonl")
         self._storage_lease = storage_lease
-        self._value = self._read()
+        cursor = self._read()
+        receipts = self._read_receipt_archive()
+        self._broken = tuple(
+            result for result in (cursor, receipts) if isinstance(result, Broken)
+        )
+        self._value = (
+            cursor.value if isinstance(cursor, Loaded) else self._empty_value()
+        )
+        self._archived_receipts = (
+            receipts.value if isinstance(receipts, Loaded) else ()
+        )
         self._published_record_ids = {
             name: {_reconciliation_record_id(name, item) for item in self._value[name]}
             for name in ("pending_failures", "completed_ranges", "terminal_receipts")
@@ -114,8 +156,69 @@ class ReconciliationState:
         self._bound_loaded_receipts()
 
     @property
+    def broken(self) -> Broken | None:
+        """Return the first persistence fault that blocks reconciliation."""
+        return self._broken[0] if self._broken else None
+
+    @property
     def seq(self) -> int:
         return int(self._value["seq"])
+
+    @property
+    def generation(self) -> int:
+        return int(self._value.get("generation", 0))
+
+    @property
+    def recovery_quarantine_id(self) -> str | None:
+        value = self._value.get("recovery_quarantine_id")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def recovery_cutoff(self) -> int | None:
+        value = self._value.get("recovery_cutoff")
+        return value if type(value) is int and value >= 0 else None
+
+    @property
+    def paused_for_recovery(self) -> bool:
+        return self._value.get("recovery_paused") is True
+
+    def reset_for_recovery(
+        self,
+        *,
+        generation: int,
+        retained_last_sequence: int = 0,
+        quarantine_id: str,
+        paused: bool,
+    ) -> None:
+        """Forget byte evidence and rescan the repaired transcript from byte zero."""
+        if type(generation) is not int or generation < 1:
+            raise ValueError("invalid recovery generation")
+        if type(retained_last_sequence) is not int or retained_last_sequence < 0:
+            raise ValueError("invalid recovery cutoff")
+        if not quarantine_id:
+            raise ValueError("invalid recovery quarantine id")
+        self._value["generation"] = generation
+        self._value["recovery_quarantine_id"] = quarantine_id
+        self._value["recovery_cutoff"] = retained_last_sequence
+        self._value["recovery_paused"] = paused
+        self._value["seq"] = retained_last_sequence
+        self._value["transcript_bytes"] = 0
+        self._value["transcript_tokens"] = 0
+        self._value["early_trigger_seq"] = min(
+            self.early_trigger_seq, retained_last_sequence
+        )
+        self._value["pending_failures"] = []
+        self._value["completed_ranges"] = []
+        self._value["terminal_receipts"] = []
+        self._value["last_failure"] = None
+        self._value["scanner_failure"] = None
+        self._publish("transcript-recovery")
+
+    def resume_recovery(self, quarantine_id: str) -> None:
+        if self.recovery_quarantine_id != quarantine_id:
+            raise ValueError("memory recovery quarantine does not match")
+        self._value["recovery_paused"] = False
+        self._publish("transcript-recovery-resumed")
 
     @property
     def transcript_bytes(self) -> int:
@@ -203,7 +306,7 @@ class ReconciliationState:
         records = {
             str(item["key"]): item
             for item in (
-                *self._read_receipt_archive(),
+                *self._archived_receipts,
                 *self._value["terminal_receipts"],
             )
         }
@@ -460,7 +563,7 @@ class ReconciliationState:
                 item
                 for item in (
                     *self._value["terminal_receipts"],
-                    *self._read_receipt_archive(),
+                    *self._archived_receipts,
                 )
                 if item["key"] == key
             ),
@@ -499,7 +602,7 @@ class ReconciliationState:
             )
         covered.extend(
             (int(item["seq_start"]), int(item["seq_end"]))
-            for item in self._read_receipt_archive()
+            for item in self._archived_receipts
         )
         result: list[tuple[int, int]] = []
         cursor = max(start, self.seq + 1)
@@ -544,6 +647,8 @@ class ReconciliationState:
             )
 
     def _bound_loaded_receipts(self) -> None:
+        if self.broken is not None:
+            return
         receipts = self._value["terminal_receipts"]
         if len(receipts) <= _MAX_RECENT_TERMINAL_RECEIPTS:
             return
@@ -567,7 +672,7 @@ class ReconciliationState:
         seq_start: int | None = None,
         seq_end: int | None = None,
     ) -> None:
-        records = self._read_receipt_archive()
+        records = self._archived_receipts
         retained = tuple(
             item
             for item in records
@@ -582,24 +687,69 @@ class ReconciliationState:
         if len(retained) != len(records):
             self._write_receipt_archive(retained)
 
-    def _read_receipt_archive(self) -> tuple[dict[str, Any], ...]:
+    def _read_receipt_archive(self) -> PersistedState:
         try:
-            lines = self.receipts_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return ()
+            payload = self.receipts_path.read_bytes()
+        except FileNotFoundError:
+            return Missing()
+        except OSError as exc:
+            return self._broken_read(self.receipts_path, exc)
+        if payload and not payload.endswith(b"\n"):
+            tail_offset = payload.rfind(b"\n") + 1
+            try:
+                self._truncate_receipt_tail(tail_offset)
+            except OSError as exc:
+                return Broken(
+                    self.receipts_path,
+                    f"torn final receipt could not be truncated: {self._os_reason(exc)}",
+                    "restore write access and restart",
+                    payload,
+                )
+            payload = payload[:tail_offset]
         records: list[dict[str, Any]] = []
-        for line in lines:
+        offset = 0
+        for line in payload.splitlines(keepends=True):
             try:
                 value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict) and isinstance(value.get("key"), str):
-                records.append(value)
-        return tuple(records)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                return Broken(
+                    self.receipts_path,
+                    f"malformed receipt at byte offset {offset}: {self._decode_reason(exc)}",
+                    "back up the archive, restore or repair valid JSON lines, and restart",
+                    payload,
+                )
+            if not isinstance(value, dict):
+                return Broken(
+                    self.receipts_path,
+                    f"invalid receipt at byte offset {offset}: expected an object",
+                    "back up the archive, restore or repair valid JSON lines, and restart",
+                    payload,
+                )
+            try:
+                self._validate_terminal_record(value)
+            except ValueError as exc:
+                return Broken(
+                    self.receipts_path,
+                    f"invalid receipt at byte offset {offset}: {exc}",
+                    "back up the archive, restore or repair valid JSON lines, and restart",
+                    payload,
+                )
+            records.append(value)
+            offset += len(line)
+        return Loaded(tuple(records))
+
+    def _truncate_receipt_tail(self, offset: int) -> None:
+        fd = os.open(self.receipts_path, os.O_WRONLY | os.O_NOFOLLOW)
+        try:
+            os.ftruncate(fd, offset)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def _append_receipt_archive(self, records: list[Mapping[str, Any]]) -> None:
         if not records:
             return
+        self._require_writable()
         self.receipts_path.parent.mkdir(parents=True, exist_ok=True)
         payload = b"".join(
             json.dumps(item, sort_keys=True, separators=(",", ":")).encode() + b"\n"
@@ -613,7 +763,7 @@ class ReconciliationState:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -625,10 +775,15 @@ class ReconciliationState:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+        self._archived_receipts = (
+            *self._archived_receipts,
+            *(dict(item) for item in records),
+        )
         if self.receipts_path.stat().st_size > _MAX_RECEIPT_ARCHIVE_BYTES:
-            self._write_receipt_archive(self._read_receipt_archive())
+            self._write_receipt_archive(self._archived_receipts)
 
     def _write_receipt_archive(self, records: tuple[Mapping[str, Any], ...]) -> None:
+        self._require_writable()
         deduplicated = {str(item["key"]): dict(item) for item in records}
         lines = [
             json.dumps(item, sort_keys=True, separators=(",", ":")).encode() + b"\n"
@@ -649,6 +804,7 @@ class ReconciliationState:
                 self.receipts_path.unlink()
             except FileNotFoundError:
                 pass
+            self._archived_receipts = ()
             return
         self.receipts_path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(
@@ -656,7 +812,7 @@ class ReconciliationState:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
             os.close(fd)
             fd = -1
@@ -675,8 +831,12 @@ class ReconciliationState:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
+        self._archived_receipts = tuple(
+            json.loads(line) for line in reversed(retained)
+        )
 
     def _publish(self, reason: str) -> None:
+        self._require_writable()
         self._value["session_id"] = self.session_id
         self._value["project_id"] = self.project_id
         self._value["reason"] = reason
@@ -725,7 +885,7 @@ class ReconciliationState:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
             os.close(fd)
             fd = -1
@@ -741,9 +901,34 @@ class ReconciliationState:
             except FileNotFoundError:
                 pass
 
-    def _read(self) -> dict[str, Any]:
-        empty: dict[str, Any] = {
+    @staticmethod
+    def _recovery_fields(value: Mapping[str, Any]) -> dict[str, object]:
+        fields: dict[str, object] = {
+            "recovery_quarantine_id": None,
+            "recovery_cutoff": None,
+            "recovery_paused": False,
+        }
+        quarantine_id = value.get("recovery_quarantine_id")
+        if quarantine_id is not None and not (
+            isinstance(quarantine_id, str) and quarantine_id
+        ):
+            raise ValueError("invalid reconciliation cursor field: recovery_quarantine_id")
+        fields["recovery_quarantine_id"] = quarantine_id
+        cutoff = value.get("recovery_cutoff")
+        if cutoff is not None and not (type(cutoff) is int and cutoff >= 0):
+            raise ValueError("invalid reconciliation cursor field: recovery_cutoff")
+        fields["recovery_cutoff"] = cutoff
+        paused = value.get("recovery_paused", False)
+        if type(paused) is not bool:
+            raise ValueError("invalid reconciliation cursor field: recovery_paused")
+        fields["recovery_paused"] = paused
+        return fields
+
+    @staticmethod
+    def _empty_value() -> dict[str, Any]:
+        return {
             "seq": 0,
+            "generation": 0,
             "transcript_bytes": 0,
             "transcript_tokens": 0,
             "early_trigger_seq": 0,
@@ -752,41 +937,174 @@ class ReconciliationState:
             "terminal_receipts": [],
             "last_failure": None,
             "scanner_failure": None,
+            "recovery_quarantine_id": None,
+            "recovery_cutoff": None,
+            "recovery_paused": False,
         }
+
+    def _read(self) -> PersistedState:
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return empty
+            payload = self.path.read_bytes()
+        except FileNotFoundError:
+            return Missing()
+        except OSError as exc:
+            return self._broken_read(self.path, exc)
+        try:
+            value = json.loads(payload)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            return Broken(
+                self.path,
+                self._decode_reason(exc),
+                "back up the cursor, restore or repair valid JSON, and restart",
+                payload,
+            )
         if not isinstance(value, dict):
-            return empty
+            return Broken(
+                self.path,
+                "invalid reconciliation cursor: expected an object",
+                "back up the cursor, restore or repair valid JSON, and restart",
+                payload,
+            )
+        try:
+            return Loaded(self._normalize_cursor(value))
+        except ValueError as exc:
+            return Broken(
+                self.path,
+                str(exc),
+                "back up the cursor, restore or repair valid JSON, and restart",
+                payload,
+            )
+
+    def _normalize_cursor(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = self._empty_value()
+        self._normalize_cursor_scalars(value, normalized)
+        self._normalize_cursor_records(value, normalized)
+        last_failure = value.get("last_failure")
+        if last_failure is not None and self._parse_failure(last_failure) is None:
+            raise ValueError("invalid reconciliation cursor field: last_failure")
+        normalized["last_failure"] = last_failure
+        normalized.update(self._recovery_fields(value))
+        for key, item in value.items():
+            if key not in normalized:
+                normalized[key] = item
+        scanner_failure = value.get("scanner_failure")
+        if scanner_failure is not None:
+            if not isinstance(scanner_failure, dict):
+                raise ValueError("invalid reconciliation cursor field: scanner_failure")
+            seq = scanner_failure.get("seq")
+            cause = scanner_failure.get("cause")
+            if type(seq) is not int or seq < 0 or not isinstance(cause, str):
+                raise ValueError("invalid reconciliation cursor field: scanner_failure")
+            normalized["scanner_failure"] = {"seq": seq, "cause": cause}
+        return normalized
+
+    @staticmethod
+    def _normalize_cursor_scalars(
+        value: Mapping[str, Any], normalized: dict[str, Any]
+    ) -> None:
         for name in (
             "seq",
+            "generation",
             "transcript_bytes",
             "transcript_tokens",
             "early_trigger_seq",
         ):
             candidate = value.get(name, 0)
             if type(candidate) is not int or candidate < 0:
-                return empty
-            empty[name] = candidate
+                raise ValueError(f"invalid reconciliation cursor field: {name}")
+            normalized[name] = candidate
+
+    def _normalize_cursor_records(
+        self, value: Mapping[str, Any], normalized: dict[str, Any]
+    ) -> None:
         for name in (
             "pending_failures",
             "completed_ranges",
             "terminal_receipts",
         ):
             candidate = value.get(name, [])
-            if isinstance(candidate, list) and all(
+            if not isinstance(candidate, list) or not all(
                 isinstance(item, dict) for item in candidate
             ):
-                empty[name] = candidate
-        empty["last_failure"] = value.get("last_failure")
-        scanner_failure = value.get("scanner_failure")
-        if isinstance(scanner_failure, dict):
-            seq = scanner_failure.get("seq")
-            cause = scanner_failure.get("cause")
-            if type(seq) is int and seq >= 0 and isinstance(cause, str):
-                empty["scanner_failure"] = {"seq": seq, "cause": cause}
-        return empty
+                raise ValueError(f"invalid reconciliation cursor field: {name}")
+            for item in candidate:
+                self._validate_cursor_record(name, item)
+            normalized[name] = candidate
+
+    @classmethod
+    def _validate_cursor_record(
+        cls, name: str, item: Mapping[str, Any]
+    ) -> None:
+        if name == "pending_failures":
+            required = {
+                "key": str,
+                "seq_start": int,
+                "seq_end": int,
+                "reason": str,
+                "attempt_count": int,
+            }
+        elif name == "completed_ranges":
+            required = {"seq_start": int, "seq_end": int}
+        else:
+            cls._validate_terminal_record(item)
+            return
+        for field, expected in required.items():
+            candidate = item.get(field)
+            if type(candidate) is not expected:
+                raise ValueError(f"invalid reconciliation cursor field: {name}.{field}")
+        start = item["seq_start"]
+        end = item["seq_end"]
+        if start < 0 or end < start:
+            raise ValueError(f"invalid reconciliation cursor field: {name}.range")
+        if name == "pending_failures" and (
+            item["attempt_count"] < 0
+            or type(item.get("retry_after")) not in (int, float)
+        ):
+            raise ValueError(f"invalid reconciliation cursor field: {name}.attempt")
+
+    @staticmethod
+    def _validate_terminal_record(item: Mapping[str, Any]) -> None:
+        required = {
+            "key": str,
+            "seq_start": int,
+            "seq_end": int,
+            "attempt_count": int,
+            "validation_summary": str,
+            "occurred_at": str,
+        }
+        for field, expected in required.items():
+            if type(item.get(field)) is not expected:
+                raise ValueError(f"invalid terminal receipt field: {field}")
+        if (
+            item["seq_start"] < 0
+            or item["seq_end"] < item["seq_start"]
+            or item["attempt_count"] < 0
+        ):
+            raise ValueError("invalid terminal receipt counters")
+
+    @staticmethod
+    def _decode_reason(exc: json.JSONDecodeError | UnicodeDecodeError) -> str:
+        if isinstance(exc, json.JSONDecodeError):
+            return f"malformed JSON at byte offset {exc.pos}"
+        return f"invalid UTF-8 at byte offset {exc.start}"
+
+    @staticmethod
+    def _os_reason(exc: OSError) -> str:
+        return exc.strerror or type(exc).__name__
+
+    @classmethod
+    def _broken_read(cls, path: Path, exc: OSError) -> Broken:
+        return Broken(
+            path,
+            f"could not read: {cls._os_reason(exc)}",
+            "restore read access and restart",
+            None,
+        )
+
+    def _require_writable(self) -> None:
+        broken = self.broken
+        if broken is not None:
+            raise RuntimeError(broken.status_line())
 
     def _write_outcome_diagnostics(
         self,

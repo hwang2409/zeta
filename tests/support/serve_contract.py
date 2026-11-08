@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import json
 import os
@@ -14,6 +13,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from websockets.asyncio.client import ClientConnection, connect
+
+from tests.support.sockets import short_socket_path
 
 Transport = Literal["unix", "websocket"]
 Role = Literal["controller", "observer"]
@@ -127,8 +128,7 @@ class ServeContract:
 
     @classmethod
     async def start(cls, root: Path, transport: Transport) -> ServeContract:
-        token = hashlib.sha256(str(root).encode()).hexdigest()[:16]
-        socket_path = Path("/tmp") / f"zeta-contract-{token}.sock"
+        socket_path = short_socket_path(root)
         home = root / "home"
         environment = os.environ.copy()
         environment["ZETA_HOME"] = str(home)
@@ -220,9 +220,5 @@ class ServeContract:
                 ("process termination", terminate),
                 ("process reap", reap),
                 ("server shutdown validation", validate_shutdown),
-                (
-                    "socket lock cleanup",
-                    lambda: Path(f"{self._socket_path}.lock").unlink(missing_ok=True),
-                ),
             )
         )

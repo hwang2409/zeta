@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal, TypedDict
 
+from ..storage_format import reject_unknown_keys
+
 TodoStatus = Literal["pending", "in_progress", "completed", "canceled"]
 
 
@@ -43,6 +45,10 @@ def parse_todo_items(value: object) -> list[TodoItem]:
     for index, item in enumerate(value):
         if type(item) is not dict:
             raise ValueError(f"todo item {index} must be an object")
+        try:
+            reject_unknown_keys(item, "todo_item")
+        except ValueError:
+            raise ValueError(f"todo item {index} must contain only content and status") from None
         if set(item) != {"content", "status"}:
             raise ValueError(f"todo item {index} must contain only content and status")
         content = item.get("content")

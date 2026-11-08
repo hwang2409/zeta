@@ -22,7 +22,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager
-from zeta.project_errors import ProjectRegistryBusyError
+from zeta.project_errors import ProjectRegistryBusyError, ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.project_registry_state import (
@@ -328,6 +328,55 @@ async def test_new_tui_keeps_healthy_project_context(
         await app.close()
 
 
+def test_missing_project_directory_is_not_silently_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def registry_with_disappearing_project() -> ProjectRegistry:
+        registry = ProjectRegistry(tmp_path / "projects")
+        registry.create_project("disappearing", "git")
+        original_project_dir = registry._project_dir
+
+        def disappear(root_fd: int, project_id: str, *, create: bool = False) -> int:
+            shutil.rmtree(registry.root / project_id)
+            return original_project_dir(root_fd, project_id, create=create)
+
+        # test-contract: seam force directory disappearance after enumeration.
+        monkeypatch.setattr(registry, "_project_dir", disappear)
+        return registry
+
+    strict = registry_with_disappearing_project()
+    with pytest.raises(ProjectRegistryError):
+        strict.list_projects()
+
+    tolerant = registry_with_disappearing_project()
+    projection = tolerant.project_context_projection(None)
+    assert projection.projects == ()
+    assert projection.health is not None
+    assert projection.health.code == "malformed_project"
+
+
+def test_new_tui_ignores_crash_leftover_and_auto_creates_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = initialize_storage_home(tmp_path / "home")
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    projects = home / "projects"
+    projects.mkdir(mode=0o700)
+    leftover = projects / ("p_" + "0" * 32)
+    leftover.mkdir(mode=0o700)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(repository)
+
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    try:
+        assert app.loop.session_metadata.project_id is not None
+        assert app.loop.project_context_health is None
+    finally:
+        asyncio.run(app.close())
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("_case", "corrupt"),
@@ -540,6 +589,40 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
     async def turn(text: str) -> None:
         await _collect_turn(app.loop, text)
 
+    async def _join(task: asyncio.Task[Any] | None) -> None:
+        # Recovery runs its projection read and prepare off the turn loop. Wait for
+        # the real task the last boundary started instead of counting turns, so a
+        # slow read under load cannot race the assertions below. Shield keeps the
+        # loop-owned task alive if this wait times out.
+        if task is not None:
+            await asyncio.wait_for(asyncio.shield(task), 10)
+
+    async def _advance_until_prepare_entry() -> None:
+        # One boundary starts the projection read; the next consumes it and starts
+        # the prepare task, whose thread sets prepare_entered before it blocks.
+        for _ in range(6):
+            if app.loop._project_context_prepare_task is not None:
+                break
+            await _join(app.loop._project_context_read_task)
+            await turn("advance")
+        assert await asyncio.wait_for(
+            asyncio.to_thread(prepare_entered.wait, 10), timeout=15
+        )
+
+    async def _advance_until(event: threading.Event) -> None:
+        # Drive recovery through its real read/prepare tasks until the event fires.
+        for _ in range(6):
+            if event.is_set():
+                break
+            await _join(app.loop._project_context_read_task)
+            await _join(app.loop._project_context_prepare_task)
+            if event.is_set():
+                break
+            await turn("advance")
+        assert await asyncio.wait_for(
+            asyncio.to_thread(event.wait, 10), timeout=15
+        )
+
     closing_app = None
     close_task = None
     close_read_release = threading.Event()
@@ -550,10 +633,7 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
         assert app.loop.project_context_health is not None
 
         (memory_dir / "state.md").write_text("RECOVERED-MEMORY", encoding="utf-8")
-        for index in range(4):
-            await turn(f"advance-{index}")
-            if prepare_entered.is_set():
-                break
+        await _advance_until_prepare_entry()
         assert prepare_entered.is_set()
         skill = home / "skills" / "recovered" / "SKILL.md"
         skill.parent.mkdir(parents=True)
@@ -571,10 +651,7 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
         )
 
         await turn("fifth")
-        for index in range(3):
-            if prepare_done[1].is_set():
-                break
-            await turn(f"retry-{index}")
+        await _advance_until(prepare_done[1])
         assert prepare_done[1].is_set()
         assert app.loop.project_context_health is not None
 
@@ -792,7 +869,6 @@ async def test_resolve_attention_does_not_open_registry(
         "reply",
         lambda *_args, **_kwargs: ReplyOutcome(
             items=(ReplyItemOutcome(record.id, "applied"),),
-            published=True,
             message_id="message-id",
         ),
     )

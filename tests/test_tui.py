@@ -68,6 +68,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
+from tests.support.owned import await_or_fail
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import (
@@ -77,6 +78,8 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
+from zeta.attention_decisions import DecisionItem
+from zeta.attention_records import AttentionRecord
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -87,6 +90,7 @@ from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
+from zeta.project_context.projection import ProjectContextHealth
 from zeta.providers.anthropic import (
     AnthropicBackend,
     AnthropicCredentialDriver,
@@ -100,6 +104,7 @@ from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
+from zeta.tools._shared.process import BackgroundTaskInfo
 from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
@@ -114,7 +119,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
-from zeta.tui.cards import agent_shutdown, agent_sync
+from zeta.tui.cards import agent_lifetime, agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -159,6 +164,8 @@ from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
+from zeta.tui.cards.decisions import DecisionsPanel
+from zeta.tui.cards.tasks_panel import BackgroundTasksPanel
 from zeta.tui.cards.tool import TOOL_CARD_REGISTRY
 from zeta.tui.layout import (
     QueuedPanel,
@@ -168,6 +175,7 @@ from zeta.tui.layout import (
     queued_lines,
     queued_panel,
 )
+from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import (
     STREAM_EVENTS_HANDLED_ELSEWHERE,
     STREAM_EVENTS_HIDDEN,
@@ -386,6 +394,30 @@ async def _background_event_transcript_count(
     )
     if app_sink is not None:
         app_sink(app)
+    macro_cancellations: list[asyncio.Task[object]] = []
+    macro_cancellation_reached = asyncio.Event()
+    release_macro_cancellation = asyncio.Event()
+    if owner == "background_macro":
+        kill_background_task = app.loop.tool_registry.background_tasks.kill
+
+        async def track_macro_cancellation(
+            task_id: str, *, cause: str, tui_presented: bool = False
+        ) -> dict[str, object]:
+            task = asyncio.current_task()
+            assert task is not None
+            macro_cancellations.append(task)
+            result = await kill_background_task(
+                task_id, cause=cause, tui_presented=tui_presented
+            )
+            if event == "session_shutdown":
+                macro_cancellation_reached.set()
+                await await_or_fail(
+                    release_macro_cancellation.wait(),
+                    what="release background macro cancellation",
+                )
+            return result
+
+        app.loop.tool_registry.background_tasks.kill = track_macro_cancellation  # type: ignore[method-assign]
     blocked_command = (
         f"{shlex.quote(sys.executable)} -c 'import threading; threading.Event().wait()'"
     )
@@ -503,7 +535,35 @@ async def _background_event_transcript_count(
             app._print = fail_output
             app._print_unit = fail_output
         app.request_exit()
-        await asyncio.wait_for(running, 10)
+        cancellation_owned_at_shutdown = True
+        if owner == "background_macro" and event == "session_shutdown":
+            assert task_id is not None
+            await await_or_fail(
+                macro_cancellation_reached.wait(),
+                what="background macro cancellation cleanup",
+            )
+            await await_or_fail(
+                app.loop.tool_registry.background_tasks.wait(task_id),
+                what="background macro process exit",
+            )
+            checkpoint = asyncio.Event()
+            asyncio.get_running_loop().call_soon(checkpoint.set)
+            await await_or_fail(
+                checkpoint.wait(), what="background macro watcher checkpoint"
+            )
+            cancellation_owned_at_shutdown = (
+                app.loop._background_owner.owns_running(f"macro:{launch.id}")
+            )
+            release_macro_cancellation.set()
+        await await_or_fail(running, what="TUI shutdown")
+        if owner == "background_macro" and event == "session_shutdown":
+            assert cancellation_owned_at_shutdown, (
+                "background macro cancellation was unowned during session shutdown"
+            )
+            assert len(macro_cancellations) == 1
+            assert macro_cancellations[0].done(), (
+                "background macro cancellation survived session shutdown"
+            )
 
     resumed = ""
     if event == "session_shutdown":
@@ -884,6 +944,34 @@ def test_other_background_notices_remain_visible() -> None:
         "background task task-1 killed",
     )
     assert [item.plain for item in rendered] == ["background task task-1 killed"]
+
+
+@pytest.mark.asyncio
+async def test_status_renders_unavailable_accounts_through_tui(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.account_context = SimpleNamespace(unavailable_accounts=("codex:missing",))
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        rendered = await app._slash_commands.dispatch_async(app, "/status")
+        assert isinstance(rendered, str)
+        app._handle_slash_output(rendered)
+
+        assert "unavailable_accounts: codex:missing" in output.getvalue()
+    finally:
+        await loop.close()
+        loop.store.close()
 
 
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
@@ -1536,6 +1624,7 @@ def terminal_plain(renderable: object) -> str:
 
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
+
 
 def test_task_safety_kill_renders_cause() -> None:
     cause = "explicit-finish child task safety deadline expired after 3600 seconds"
@@ -4917,6 +5006,75 @@ def test_agent_rendering_stays_on_one_status_line() -> None:
     assert isinstance(progress, Panel)
 
 
+def _render_overlay_at_80(lines: list[list[tuple[str, str]]]) -> list[str]:
+    control = OverlayControl()
+    control.set_lines(lines)
+    content = control.create_content(width=72, height=30)
+    return [
+        "".join(fragment[1] for fragment in content.get_line(index)).rstrip()
+        for index in range(content.line_count)
+    ]
+
+
+def test_decisions_panel_wraps_long_paths_at_a_separator() -> None:
+    path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
+    record = AttentionRecord(
+        id="a" * 32,
+        created_at="2026-01-01T00:00:00Z",
+        session_id="1" * 32,
+        project_id="p_test",
+        entry_id=None,
+        entry_seq=None,
+        lane="orchestrator",
+        title="Choose path",
+        why=f"{path}verylongfilenamewithoutbreaks",
+        options=(),
+        recommendation=None,
+        status="open",
+    )
+    panel = DecisionsPanel()
+    panel.set_items([DecisionItem(record.session_id, "p_test", "project", record)])
+
+    rendered = _render_overlay_at_80(panel.render_lines())
+    content = [line.strip("│ ") for line in rendered]
+
+    assert f"Why: {path}" in content
+    assert "verylongfilenamewithoutbreaks" in content
+    assert all(cell_len(line) <= 72 for line in rendered)
+
+
+def test_tasks_panel_wraps_long_commands_at_a_separator() -> None:
+    path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
+    panel = BackgroundTasksPanel()
+    panel.set_tasks(
+        [
+            BackgroundTaskInfo(
+                task_id="task-path",
+                command=f"python {path}verylongfilenamewithoutbreaks",
+                pid=42,
+                owner="run_background",
+                running=True,
+                exit_code=None,
+                note=None,
+                terminal_phase=None,
+                started_at=0.0,
+                ended_at=None,
+                output_bytes=0,
+                output_lines=0,
+            )
+        ],
+        now=1.0,
+    )
+    assert panel.open_details() is not None
+
+    rendered = _render_overlay_at_80(panel.render_lines())
+    content = [line.strip("│ ") for line in rendered]
+
+    assert path in content
+    assert "verylongfilenamewithoutbreaks" in content
+    assert all(cell_len(line) <= 72 for line in rendered)
+
+
 def test_idle_agent_card_reports_count_fd_floor_and_warning(tmp_path: Path) -> None:
     from zeta.tui.cards.agent_sync import AgentTranscriptTreeSnapshot
 
@@ -5099,6 +5257,30 @@ def test_child_message_delivered_background_event_renders_parent_receipt(
     )
 
     assert "delivered to worker: check the retry" in output.getvalue()
+
+
+def test_nested_stalled_idle_background_event_renders_last_message(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "child_instance_id": "root:1:1",
+                "description": "nested verifier",
+                "status": "child_idle",
+                "text": "nested verifier is waiting for review",
+            },
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "nested verifier" in rendered
+    assert "nested verifier is waiting for review" in rendered
 
 
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
@@ -6434,6 +6616,9 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         for line in tui_app_module._status_card_lines(status)
     )
 
+    assert "unavailable_accounts: none\n" in rendered
+    rendered = rendered.replace("unavailable_accounts: none\n", "")
+
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
         "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
@@ -6458,6 +6643,117 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         "\0overlay-rule\0\n"
         "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width", [40, 80, 160])
+async def test_status_card_wraps_complete_project_context_health(
+    tmp_path: Path, width: int
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    project_id = "p_004e3eba882987ad117afcb5a15c30ef"
+    app.loop.project_context_health = ProjectContextHealth(
+        "malformed_project",
+        project_id,
+        "project.json",
+        "project metadata is malformed",
+    )
+
+    try:
+        app.slash_status_command("")
+        screen = render_full_screen(session, width, height=60)
+        with set_app(session.app):
+            screen.draw_all_floats()
+        app._status_card.bottom()
+        screen = render_full_screen(session, width, height=60)
+        with set_app(session.app):
+            screen.draw_all_floats()
+        rendered_lines = [
+            "".join(
+                screen.data_buffer[row][column].char for column in range(width)
+            ).rstrip()
+            for row in range(60)
+        ]
+        rendered = "\n".join(rendered_lines)
+        compact = "".join(rendered.replace("│", "").split())
+        expected = (
+            f"project_context_health:malformed_project({project_id}/project.json):"
+            "projectmetadataismalformed"
+        )
+
+        assert expected in compact
+        assert all(cell_len(line) <= width for line in rendered_lines)
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+async def test_status_card_wraps_long_path_at_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    width = 40
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    path = "/Users/henry/zeta/wrap-word-boundary/long-token"
+    status = SlashStatus(
+        session_id="status-wrap",
+        provider="codex",
+        model="offline",
+        retained_tail=0,
+        tokens_used_this_session=0,
+        tokens_in_current_context=None,
+        compaction_marker_count=0,
+        pending_approvals=(),
+        context_files=(path,),
+    )
+    monkeypatch.setattr(app, "slash_status", lambda: status)
+
+    try:
+        app.slash_status_command("")
+        screen = render_full_screen(session, width, height=60)
+        with set_app(session.app):
+            screen.draw_all_floats()
+        rendered_lines = [
+            "".join(screen.data_buffer[row][column].char for column in range(width)).rstrip()
+            for row in range(60)
+        ]
+        path_lines = [
+            line.strip(" │")
+            for line in rendered_lines
+            if "INSERT" not in line
+            and any(part in line for part in ("Users", "wrap-word-boundary", "long-token"))
+        ]
+
+        assert path_lines
+        assert "long-token" in "".join(path_lines)
+        if width == 40:
+            assert path_lines[0] == "context_files: /Users/henry/zeta/"
+        else:
+            assert path_lines == [f"context_files: {path}"]
+        assert all(cell_len(line) <= width for line in rendered_lines)
+    finally:
+        await app.close()
 
 
 @pytest.mark.asyncio
@@ -6512,8 +6808,9 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
             in rendered
         )
         assert (
-            "project_context_health: malformed_memory "
-            "(p_child/memory/brief.md): project memory is malformed" in rendered
+            "project_context_health:malformed_memory"
+            "(p_child/memory/brief.md):projectmemoryismalformed"
+            in "".join(rendered.split())
         )
         assert "completion_client_setups: codex/gpt-test=1" in rendered
 
@@ -6521,8 +6818,9 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         lines = tui_app_module._status_card_lines(app.slash_status())
         rendered = "\n".join("".join(text for _style, text in line) for line in lines)
         assert (
-            "project_context_health: malformed_memory "
-            "(p_root/memory/state.md): project memory is malformed" in rendered
+            "project_context_health:malformed_memory"
+            "(p_root/memory/state.md):projectmemoryismalformed"
+            in "".join(rendered.split())
         )
     finally:
         await app.close()
@@ -8866,6 +9164,27 @@ def test_rebuild_renders_closed_turn_end_reasons(
     assert "turn ended with an error" in rendered
     assert "turn ended when the controller disconnected" in rendered
     assert "completed" not in rendered
+
+
+def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions)
+    with store.path.open("ab") as stream:
+        stream.write(b'{"torn"')
+    with pytest.warns(RuntimeWarning, match="torn"):
+        recovered = ConversationStore(sessions, session_id=store.session_id)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), recovered, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "transcript recovered; preserved corrupt bytes in quarantine" in rendered
+    assert recovered.entries[-1].data["quarantine_id"] in rendered
 
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
@@ -11688,7 +12007,8 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     navigation.selected_index = 1
     navigation.open_selected()
     assert navigation.transcript_control._sync_task is not None
-    await navigation.transcript_control._sync_task
+    # test-contract: seam no public transcript-sync completion event exists
+    await asyncio.wait_for(navigation.transcript_control._sync_task, timeout=10)
     source = navigation.transcript_control._source
     assert source is not None
     previous = navigation.transcript_control._snapshot
@@ -11712,6 +12032,38 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     monkeypatch.setattr(source, "refresh", blocked_refresh)
     # test-contract: seam no public transcript-source closed event exists
     monkeypatch.setattr(source, "close", close_and_signal)
+    transcript_handed_off = asyncio.Event()
+    todo_cleanup_release = asyncio.Event()
+    transcript_cleanup_tasks: set[asyncio.Task[None]] = set()
+    finish_transcript_cleanup = agent_lifetime.finish_cleanup_or_handoff
+    finish_todo_cleanup = agent_sync.finish_cleanup_or_handoff
+
+    async def record_transcript_cleanup(tasks, close, *, deadline, label) -> None:
+        before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+        try:
+            await finish_transcript_cleanup(
+                tasks, close, deadline=deadline, label=label
+            )
+            transcript_cleanup_tasks.update(
+                agent_shutdown._LATE_CLEANUP_TASKS - before
+            )
+        finally:
+            transcript_handed_off.set()
+
+    async def block_todo_cleanup(tasks, close, *, deadline, label) -> None:
+        await asyncio.wait_for(transcript_handed_off.wait(), timeout=10)
+        # Keep the empty todo cleanup pending until both owners have handed off.
+        blocker = asyncio.create_task(
+            asyncio.wait_for(todo_cleanup_release.wait(), timeout=10)
+        )
+        await finish_todo_cleanup(
+            (blocker, *tasks), close, deadline=deadline, label=label
+        )
+
+    monkeypatch.setattr(
+        agent_lifetime, "finish_cleanup_or_handoff", record_transcript_cleanup
+    )
+    monkeypatch.setattr(agent_sync, "finish_cleanup_or_handoff", block_todo_cleanup)
     # test-contract: seam no public shutdown-budget injection exists
     monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
     late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
@@ -11723,9 +12075,17 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
         await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
         # test-contract: durability shutdown retains one late transcript cleanup
-        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
+        assert len(transcript_cleanup_tasks) == 1 and transcript_cleanup_tasks <= (
+            agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
+        )
     finally:
         agent_sync._REFRESH_LOCK.release()
+        todo_cleanup_release.set()
+        late_cleanup_tasks = agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
+        if late_cleanup_tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*late_cleanup_tasks, return_exceptions=True), timeout=10
+            )
 
     assert await asyncio.to_thread(closed.wait, 10)
     assert source._stores == {}
@@ -12321,6 +12681,24 @@ async def test_later_successful_snapshot_clears_earlier_failure(
     first_finished = threading.Event()
     writes = 0
     original_write = persistence_module.write_json_file
+    original_mark_persisted = persistence._mark_persisted
+    mark_started = asyncio.Event()
+    release_mark = asyncio.Event()
+    mark_finished = asyncio.Event()
+    mark_task: asyncio.Task[None] | None = None
+
+    async def finish_mark(revision: int) -> None:
+        await asyncio.wait_for(release_mark.wait(), 10)
+        original_mark_persisted(revision)
+        mark_finished.set()
+
+    def gated_mark_persisted(revision: int) -> None:
+        nonlocal mark_task
+        mark_started.set()
+        mark_task = asyncio.create_task(finish_mark(revision))
+
+    # test-contract: seam no public event reports that pending draft state was cleared
+    monkeypatch.setattr(persistence, "_mark_persisted", gated_mark_persisted)
 
     def write(*args: object, **kwargs: object) -> None:
         nonlocal writes
@@ -12333,20 +12711,28 @@ async def test_later_successful_snapshot_clears_earlier_failure(
             first_finished.set()
 
     monkeypatch.setattr(persistence_module, "write_json_file", write)
-    persistence.schedule("first")
-    assert await asyncio.to_thread(first_finished.wait, 1)
-    persistence.schedule("second")
-    error: OSError | None = None
     try:
-        await persistence.flush_pending()
-    except OSError as exc:
-        error = exc
+        persistence.schedule("first")
+        assert await asyncio.to_thread(first_finished.wait, 10)
+        persistence.schedule("second")
+        error: OSError | None = None
+        try:
+            await persistence.flush_pending()
+        except OSError as exc:
+            error = exc
 
-    assert error is None, (
-        "a successful newer snapshot retained the earlier write failure"
-    )
-    assert persistence.load() == "second"
-    assert persistence._pending_text is None
+        assert error is None, (
+            "a successful newer snapshot retained the earlier write failure"
+        )
+        await asyncio.wait_for(mark_started.wait(), 10)
+        assert persistence.load() == "second"
+        release_mark.set()
+        await asyncio.wait_for(mark_finished.wait(), 10)
+        assert persistence.pending_text is None
+    finally:
+        release_mark.set()
+        if mark_task is not None:
+            await asyncio.wait_for(mark_task, 10)
 
 
 @pytest.mark.asyncio
@@ -12479,7 +12865,8 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
 
     _patch_draft_publish(monkeypatch, fail_write)
     # test-contract: seam Run the CLI against the controlled application.
-    monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda *_args: app)
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -12541,7 +12928,8 @@ def test_new_session_continues_after_failed_draft_save(
     _patch_draft_publish(monkeypatch, fail_write)
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -12631,7 +13019,8 @@ def test_failed_active_draft_is_printed_on_every_exit(
 
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     # test-contract: seam Observe the CLI restart boundary without replacing the process.
@@ -12715,7 +13104,8 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
 
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     # test-contract: seam Observe the CLI restart boundary without replacing the process.
@@ -12766,7 +13156,8 @@ def test_new_session_with_successful_draft_prints_nothing(
         return False, False
 
     # test-contract: seam Run the CLI against controlled session applications.
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -13334,6 +13725,86 @@ async def test_undo_restores_next_image_token_after_deleted_token(
     await app.loop.close()
 
 
+@pytest.mark.parametrize(
+    ("text", "hint"),
+    [
+        ("/quit", None),
+        ("/modle x", "/model?"),
+        ("/statu", "/status?"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unknown_slash_command_is_rendered_without_model_request(
+    tmp_path: Path, text: str, hint: str | None
+) -> None:
+    output = StringIO()
+    backend = FakeBackend([])
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        app._submissions.wake()
+        app._submissions.submit(text, steer=False)
+        await wait_until(lambda: not app._submissions.active)
+
+        assert backend.calls == []
+        assert f"unknown command {text.split(maxsplit=1)[0]}" in output.getvalue()
+        if hint is None:
+            assert "did you mean" not in output.getvalue()
+        else:
+            assert "did you mean" in output.getvalue()
+            assert hint in output.getvalue()
+    finally:
+        await app._submissions.close()
+        await app.loop.close()
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("text", "model_text"),
+    [
+        ("/tmp", "/tmp"),
+        ("/tmp is full", "/tmp is full"),
+        ("/Users/henry/x.py is broken", "/Users/henry/x.py is broken"),
+        ("/this is pasted prose\nsecond line", "/this is pasted prose\nsecond line"),
+        ("//foo", "/foo"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_slash_like_model_text_reaches_model(
+    tmp_path: Path, text: str, model_text: str
+) -> None:
+    backend = FakeBackend([ScriptedTurn()])
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    try:
+        app._submissions.wake()
+        app._submissions.submit(text, steer=False)
+        await wait_until(lambda: not app._submissions.active)
+
+        assert any(
+            any(
+                getattr(block, "text", None) == model_text
+                for message in messages
+                for block in message.content
+            )
+            for messages, _ in backend.calls
+        )
+    finally:
+        await app._submissions.close()
+        await app.loop.close()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_background_wake_and_submission_share_one_provider_consumer(
     tmp_path: Path,
@@ -13728,6 +14199,44 @@ async def test_tui_model_command_does_no_lock_work_on_loop(
 
 
 @pytest.mark.asyncio
+async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    missing = AccountId("codex", "missing")
+    for account in (current, missing):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    AccountStore(home).credential_path(missing).unlink()
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=80).print(rendered[0])
+        assert (
+            "codex:missing  unavailable: credentials missing"
+            in Text.from_ansi(output.getvalue()).plain
+        )
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -13782,9 +14291,9 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     app.accounts_picker_move(1)
     task = app.accounts_picker_select()
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
-    assert off_loop_calls == ["list"]
+    assert off_loop_calls == ["list", "list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
@@ -14534,6 +15043,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
         {"codex": account},
         {account: "henry@example.com"},
         {account: "henry"},
+        unavailable={account},
     )
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(picker.render())
@@ -14541,6 +15051,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
 
     assert "codex:henry" in plain
     assert "henry@example.com" in plain
+    assert "unavailable: credentials missing" in plain
     assert "n rename" in plain
 
 

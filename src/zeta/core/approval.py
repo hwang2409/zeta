@@ -303,7 +303,7 @@ class ApprovalAbortPolicy(Protocol):
 
 
 class _ServeApprovalControl(Protocol):
-    def request_approval_abort(
+    def request_approval_abort_gate(
         self,
         request_id: str,
         *,
@@ -370,7 +370,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
     ) -> Awaitable[dict[str, str] | None] | None:
         if self._serve_control is None:
             return None
-        return self._serve_control.request_approval_abort(
+        return self._serve_control.request_approval_abort_gate(
             request_id,
             child_instance_id=child_instance_id,
             reason=reason,
@@ -1055,7 +1055,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         settlement = self._request_serve_abort(request_id)
         if settlement is None:
             return self.abort_or_winner(request_id, capability=capability)
-        resolution = await settlement
+        resolution = await asyncio.shield(settlement)
         return _resolved_decision(
             resolution["decision"] if resolution is not None else None
         )

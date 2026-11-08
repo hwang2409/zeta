@@ -48,6 +48,7 @@ from zeta.memory.version_store import (
     require_memory_format,
 )
 from zeta.project_errors import ProjectRegistryError
+from zeta.storage_format import reject_unknown_keys
 
 _CURRENT = "memory-current.json"
 _MAX_STATE_BYTES = 8 * 1024 * 1024
@@ -225,8 +226,10 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
 
     @staticmethod
     def _entry_blob(blobs_fd: int, digest: object) -> tuple[EntryMemoryState, str]:
-        if isinstance(digest, dict) and set(digest) == {"state"}:
-            digest = digest["state"]
+        if isinstance(digest, dict):
+            reject_unknown_keys(digest, "entry_memory_snapshot_reference")
+            if set(digest) == {"state"}:
+                digest = digest["state"]
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ProjectRegistryError("format-2 memory version is malformed")
         try:

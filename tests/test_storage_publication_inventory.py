@@ -6,6 +6,15 @@ from pathlib import Path
 # Direct durability callbacks are permitted only behind a gated writer, for
 # immutable payloads, or for an intrinsic append format.
 _DURABILITY_CALLBACKS = {
+    ("core/transcript_recovery/__init__.py", "_abandon_recovery", "write_json_file"),
+    ("core/transcript_recovery/__init__.py", "reconcile_pending", "write_json_file"),
+    ("core/transcript_recovery/__init__.py", "repair_transcript", "write_json_file"),
+    (
+        "core/transcript_recovery/__init__.py",
+        "set_memory_review_required",
+        "write_json_file",
+    ),
+    ("core/transcript_recovery/__init__.py", "resume_memory_review", "write_json_file"),
     ("session_retention.py", "write_retention_pin", "atomic_publish_file"),
     ("project_registry.py", "_publish", "atomic_publish_file"),
     ("project_inbox.py", "_persist", "atomic_publish_file"),
@@ -37,6 +46,7 @@ _RAW_PUBLICATION = {
     ("core/session.py", "create", "os.replace"),
     ("core/session_links.py", "_quarantine_entry", "os.rename"),
     ("core/session_files.py", "write_session_file", "os.replace"),
+    ("core/transcript_recovery/__init__.py", "repair_transcript", "os.replace"),
     ("memory/reconciliation_state.py", "_write_receipt_archive", "os.replace"),
     ("memory/reconciliation_state.py", "_publish_bytes", "os.replace"),
     ("memory/auto.py", "_append_diagnostic_record", "os.replace"),
@@ -56,6 +66,9 @@ _RAW_PUBLICATION = {
     ("accounts/publication.py", "atomic_publish", "os.replace"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "os.replace"),
     ("transcript_search/index.py", "_publish", "os.replace"),
+    ("attention_replies.py", "stage", "os.replace"),
+    ("attention_replies.py", "_finish_journal_locked", "os.replace"),
+    ("attention_replies.py", "_prepare_locked", "os.replace"),
 }
 
 _RAW_DELETION = {
@@ -75,6 +88,7 @@ _RAW_DELETION = {
     ("core/session_files.py", "unlink_session_file", "unlink"),
     ("core/session_files.py", "write_session_file", "unlink"),
     ("core/session_links.py", "_remove_entry", "unlink"),
+    ("core/transcript_recovery/__init__.py", "_unlink_if_present", "unlink"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "unlink"),
     ("mcp/management.py", "_atomic_json", "unlink"),
     ("mcp/oauth_store.py", "_publish_locked", "unlink"),
@@ -107,6 +121,10 @@ _RAW_DELETION = {
     ("tools/_atomic_replace.py", "atomic_create", "unlink"),
     ("tools/_atomic_replace.py", "atomic_replace", "unlink"),
     ("tools/_shared/background_output_archive.py", "_remove_generated_log", "unlink"),
+    ("attention_replies.py", "stage", "unlink"),
+    ("attention_replies.py", "flush", "unlink"),
+    ("attention_replies.py", "_recover_locked", "unlink"),
+    ("attention_replies.py", "_cleanup", "unlink"),
     ("tools/_spill.py", "_evict_before", "unlink"),
     ("tools/_spill.py", "temporary_file", "unlink"),
     ("tools/_spill.py", "write_group", "unlink"),

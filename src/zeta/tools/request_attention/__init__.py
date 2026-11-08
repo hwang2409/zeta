@@ -26,7 +26,7 @@ async def _request_attention(
     anchor = branch[-1] if branch else None
     record = AttentionStore(
         store.session_dir,
-        writer_epoch=store._storage_lease.writer_epoch,
+        writer_epoch=store._storage_lease.observed_epoch,
     ).request(
         session_id=store.session_id,
         project_id=registry.project_id,
