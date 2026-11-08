@@ -30,9 +30,9 @@ from zeta.tools import ToolRegistry
 
 
 def service(tmp_path, mount=None):
-    return MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "repo", mount=mount
-    )
+    project = tmp_path / "repo"
+    project.mkdir()
+    return MCPManagementService(home=tmp_path / "home", project_dir=project, mount=mount)
 
 
 async def _close_management_service(manager: MCPManagementService) -> None:
@@ -407,12 +407,12 @@ async def test_project_http_does_not_require_trust_but_stdio_does(tmp_path):
 
 @pytest.mark.asyncio
 async def test_clone_path_has_independent_trust_and_pending_stdio_is_filtered(tmp_path):
-    first = MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "clone-a"
-    )
-    second = MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "clone-b"
-    )
+    clone_a = tmp_path / "clone-a"
+    clone_b = tmp_path / "clone-b"
+    clone_a.mkdir()
+    clone_b.mkdir()
+    first = MCPManagementService(home=tmp_path / "home", project_dir=clone_a)
+    second = MCPManagementService(home=tmp_path / "home", project_dir=clone_b)
     await first.add("local", scope="project", command=sys.executable)
     second.path("project").parent.mkdir(parents=True)
     second.path("project").write_text(first.path("project").read_text())
@@ -1305,6 +1305,35 @@ async def test_contended_config_lock_fails_off_loop_with_nonblocking_flock(
     assert all(thread != loop_thread for thread, _operation in attempted)
     assert all(operation & fcntl.LOCK_NB for _thread, operation in attempted)
     await asyncio.wait_for(manager.view(), 10)
+
+
+@pytest.mark.asyncio
+async def test_missing_project_root_is_not_recreated_during_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    manager = MCPManagementService(home=tmp_path / "home", project_dir=project)
+    original_acquire = manager._acquire_locks
+    removed = False
+
+    def remove_project_before_lock(paths):
+        nonlocal removed
+        if not removed and any(path == project / ".zeta" / "mcp.json" for path in paths):
+            removed = True
+            project.rmdir()
+        return original_acquire(paths)
+
+    # test-contract: remove the project after path calculation and before lock creation
+    monkeypatch.setattr(manager, "_acquire_locks", remove_project_before_lock)
+    try:
+        snapshot = await manager.refresh()
+        assert not project.exists()
+        assert snapshot.entries == ()
+        with pytest.raises(MCPManagementError, match="project directory"):
+            await manager.add("missing", scope="project", command=sys.executable)
+    finally:
+        await manager.aclose()
 
 
 @pytest.mark.asyncio

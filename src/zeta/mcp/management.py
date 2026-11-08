@@ -241,11 +241,32 @@ class MCPManagementService:
         if self._closed.is_set():
             raise MCPManagementClosedError("MCP management service is closed")
 
+    def _project_root_for_path(self, path: Path) -> Path | None:
+        if self.project_dir is None:
+            return None
+        project_path = self._project_path or project_config_path(
+            self.project_dir
+        ).resolve()
+        return project_path.parent.parent if path == project_path else None
+
     def _atomic_json(
         self, path: Path, data: object, *, mode: int | None = None
     ) -> None:
         self._ensure_open()
-        path.parent.mkdir(parents=True, exist_ok=True)
+        project_root = self._project_root_for_path(path)
+        if project_root is not None:
+            if not project_root.is_dir():
+                raise MCPManagementError(
+                    "project directory no longer exists; cannot write MCP config"
+                )
+            try:
+                path.parent.mkdir(parents=False, exist_ok=True)
+            except FileNotFoundError as exc:
+                raise MCPManagementError(
+                    "project directory no longer exists; cannot write MCP config"
+                ) from exc
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_open()
         fd, temporary = tempfile.mkstemp(
             prefix=".mcp-management.", dir=str(path.parent)
@@ -309,10 +330,24 @@ class MCPManagementService:
         try:
             for path in sorted(set(paths), key=str):
                 self._ensure_open()
-                path.parent.mkdir(parents=True, exist_ok=True)
+                project_root = self._project_root_for_path(path)
+                if project_root is not None:
+                    try:
+                        if not project_root.is_dir():
+                            continue
+                        path.parent.mkdir(parents=False, exist_ok=True)
+                    except FileNotFoundError:
+                        continue
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
                 lock_path = path.with_name(f".{path.name}.lock")
                 self._ensure_open()
-                handle = lock_path.open("a+")
+                try:
+                    handle = lock_path.open("a+")
+                except FileNotFoundError:
+                    if project_root is None:
+                        raise
+                    continue
                 try:
                     while True:
                         self._ensure_open()
