@@ -21,8 +21,8 @@ from pathlib import Path
 import pytest
 
 from tests.support.storage_homes import initialize_storage_home
-from zeta.cli.main import main as cli_main
 from zeta import remote_sync as remote_sync_module
+from zeta.cli.main import main as cli_main
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.memory.entry_store import _KIND_KEY
