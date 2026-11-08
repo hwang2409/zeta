@@ -115,9 +115,9 @@ def _read_call(tmp_path: Path, call_id: str) -> ToolCall:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
-@pytest.mark.parametrize("newer_row", (False, True), ids=("idle", "after_newer_row"))
+@pytest.mark.parametrize("mode", ("idle", "after_newer_row", "during_join"))
 async def test_join_while_send_echo_is_held_sees_message_once(
-    tmp_path: Path, transport: Transport, newer_row: bool
+    tmp_path: Path, transport: Transport, mode: str
 ) -> None:
     window = Window(
         replay_server(tmp_path, transport, _backend(FakeBackend([ScriptedTurn([TextContent("ok")])]))),
@@ -138,10 +138,24 @@ async def test_join_while_send_echo_is_held_sees_message_once(
             controller.request(3, "send", {"text": "marker-text", "delivery_id": "d-1"})
         )
         await await_or_fail(window.entered.wait(), what="delivery row installed")
-        if newer_row:
+        if mode == "after_newer_row":
             window.server.runtime.opened.store.append_task_notification(
                 task_id="newer", command="true", exit_code=0
             )
+        if mode == "during_join":
+            connections = window.server.connections
+            assert connections is not None
+            read = connections.read_replay_history
+
+            async def read_then_release_echo(*args: Any) -> Any:
+                result = await read(*args)
+                # the echo is admitted while this join is still pending
+                window.release.set()
+                await await_or_fail(send, what="send response")
+                return result
+
+            # test-contract: seam admit the echo between the join's history read and its end
+            connections.read_replay_history = read_then_release_echo  # type: ignore[method-assign]
         history = await window.join(observer)
         window.release.set()
         await await_or_fail(send, what="send response")
