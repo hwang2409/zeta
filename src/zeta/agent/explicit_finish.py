@@ -142,7 +142,13 @@ def owned_work_descriptions(child_loop: object) -> tuple[str, ...]:
         for task in child_loop.tool_registry.background_tasks.snapshot()
         if task.running
     )
-    return tuple(description for _, description in (*children, *tasks))
+    wake_scheduler = getattr(child_loop, "wake_scheduler", None)
+    wakes = (
+        tuple(record.wake_id for record in wake_scheduler.list_pending())
+        if wake_scheduler is not None
+        else ()
+    )
+    return tuple(description for _, description in (*children, *tasks)) + wakes
 
 
 def register_handoff(child_loop: object) -> None:

@@ -212,7 +212,13 @@ class FinishGateState:
             )
         )
         pending_delivery = flow is not None and flow.has_model_visible_delivery
-        return any((owned_children, owned_tasks, pending_question, pending_delivery))
+        wake_scheduler = getattr(child_loop, "wake_scheduler", None)
+        pending_wake = bool(
+            wake_scheduler is not None and wake_scheduler.list_pending()
+        )
+        return any(
+            (owned_children, owned_tasks, pending_question, pending_delivery, pending_wake)
+        )
 
     async def run_model_turn(
         self,

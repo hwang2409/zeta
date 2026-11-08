@@ -9,6 +9,7 @@ import threading
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from io import StringIO
 from itertools import pairwise
@@ -56,6 +57,7 @@ from zeta.agent.presets import (
 )
 from zeta.agent.runner import _child_base_system_prompt
 from zeta.agent.terminal_fence import TerminalTransitionFence
+from zeta.agent.wakes import WakeScheduler
 from zeta.config.settings import SettingsError, load_settings
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -5109,7 +5111,7 @@ async def test_agent_returns_child_text_and_persists_child_session(
     assert {schema["name"] for schema in backend.calls[1][1]} == {
         schema["name"]
         for schema in backend.calls[0][1]
-        if schema["name"] not in {"request_attention", "resolve_attention"}
+        if schema["name"] not in {"request_attention", "resolve_attention", "wake"}
     }
 
 
@@ -7144,6 +7146,7 @@ async def test_unrestricted_nested_child_never_receives_parent_loop_handlers(
         assert backend.child_a_schemas == backend.lead_schemas - {
             "finish",
             "agent_handoff",
+            "wake",
         }
         assert {"runtime_schema", "skill", "test_mcp"} <= backend.child_a_schemas
         await asyncio.wait_for(backend.child_a_finished.wait(), 10)
@@ -14712,6 +14715,7 @@ async def _run_until_idle_wait(
     *,
     replies: list[str] | None = None,
     wait_for_idle: bool = True,
+    wait_for_wake: bool = False,
     child_instance_id: str = "root:1",
 ) -> tuple[asyncio.Task[dict[str, object]], asyncio.Event, list[str]]:
     idle_waiting = asyncio.Event()
@@ -14732,9 +14736,12 @@ async def _run_until_idle_wait(
             "structuredContent": {"status": "running"},
         }
 
-    async def wait_idle(_wake, _timeout):
+    async def wait_idle(wake, _timeout):
         idle_waiting.set()
-        await asyncio.wait_for(asyncio.Event().wait(), 10)
+        if wait_for_wake:
+            await asyncio.wait_for(wake(), 10)
+        else:
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
@@ -14913,6 +14920,68 @@ async def test_owned_idle_is_displayed_without_notifying_parent(
         assert wakes == []
     finally:
         await _cancel_idle_fixture(run, registry, parent, child)
+
+
+@pytest.mark.asyncio
+async def test_pending_wake_suppresses_idle_notice_until_it_fires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, child, registry, loop, _parent_flow, _wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    scheduler = WakeScheduler(
+        "parent_owned",
+        on_due=lambda: loop._background_owner.conversation_channel.wake("root:1"),
+        wall_clock=lambda: now,
+        assert_owned=lambda: None,
+    )
+    loop.wake_scheduler = scheduler
+    scheduler.schedule(after_seconds=10, note="check later")
+    idle_published = asyncio.Event()
+    publish_idle = loop._background_owner.conversation_channel.publish_idle
+
+    async def publish_idle_and_signal(**kwargs: object) -> object:
+        result = await publish_idle(**kwargs)
+        idle_published.set()
+        return result
+
+    monkeypatch.setattr(
+        loop._background_owner.conversation_channel,
+        "publish_idle",
+        publish_idle_and_signal,
+    )
+    run, idle_waiting, prompts = await _run_until_idle_wait(
+        loop,
+        child,
+        monkeypatch,
+        replies=["final useful status", "reminder did no work"],
+        wait_for_wake=True,
+    )
+    try:
+        await asyncio.wait_for(idle_waiting.wait(), 10)
+        assert not any(
+            entry.data.get("kind") == "child_idle"
+            for entry in parent.agent_notifications(pending_only=False)
+        )
+        now += timedelta(seconds=10)
+        assert scheduler.poll_due()
+        scheduler.admit_due()
+        scheduler._on_due()
+        await asyncio.wait_for(idle_published.wait(), 10)
+        assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
+        assert any(
+            entry.data.get("kind") == "child_idle"
+            for entry in parent.agent_notifications(pending_only=False)
+        )
+    finally:
+        if not run.done():
+            run.cancel()
+            await asyncio.wait_for(asyncio.gather(run, return_exceptions=True), 10)
+        await asyncio.wait_for(scheduler.close(), 10)
+        await asyncio.wait_for(registry.close(), 10)
+        parent.close()
+        child.close()
 
 
 @pytest.mark.asyncio
