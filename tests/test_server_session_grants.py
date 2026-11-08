@@ -1343,6 +1343,9 @@ async def test_abort_canceled_settlement_keeps_controller_connected(
         "cancel_publish",
         "cancel_history",
         "cancel_write",
+        "cancel_owner_exit",
+        "abort",
+        "replacement",
         "restart_replay",
     ],
 )
@@ -1380,6 +1383,12 @@ async def test_session_grant_lifecycle_table_over_real_transports(
     observed: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
 
+    async def read_websocket_json() -> dict[str, Any]:
+        try:
+            return await _read_json(reader)
+        except AssertionError as exc:
+            raise AssertionError("server closed the websocket") from exc
+
     async def request(request_id: int, method: str, params: dict[str, object]) -> list[dict[str, Any]]:
         if transport == "unix":
             frames = await _request(reader, writer, request_id, method, params)
@@ -1387,10 +1396,24 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             await _send_json(writer, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
             frames = []
             while True:
-                frame = await _read_json(reader)
+                frame = await read_websocket_json()
                 frames.append(frame)
                 if frame.get("id") == request_id:
                     break
+        observed.extend(frames)
+        if transport == "websocket":
+            pending.extend(frames)
+        return frames
+
+    async def receive_response(request_id: int) -> list[dict[str, Any]]:
+        frames = []
+        while True:
+            frame = await (
+                _read(reader) if transport == "unix" else read_websocket_json()
+            )
+            frames.append(frame)
+            if frame.get("id") == request_id:
+                break
         observed.extend(frames)
         if transport == "websocket":
             pending.extend(frames)
@@ -1403,7 +1426,11 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     pending.pop(index)
                     return frame["params"]
         while True:
-            frame = await (_event(reader, name) if transport == "unix" else _read_json(reader))
+            frame = await (
+                _event(reader, name)
+                if transport == "unix"
+                else read_websocket_json()
+            )
             if transport == "websocket" and frame.get("params", {}).get("event") != name:
                 pending.append(frame)
                 continue
@@ -1422,7 +1449,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 if pending:
                     frame = pending.pop(0)
                 else:
-                    frame = await _read_json(reader)
+                    frame = await read_websocket_json()
                 frames.append(frame)
                 if frame.get("params", {}).get("event") == name:
                     break
@@ -1440,6 +1467,67 @@ async def test_session_grant_lifecycle_table_over_real_transports(
         _, session_id = await hello_create()
         await request( 3, "send", {"text": "grant"})
         assert (await event("approval_request"))["request_id"] == "call-1"
+        if case in {"abort", "replacement"}:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original_durable = ConversationStore._to_thread_durable
+
+            async def gated_replacement_durable(
+                *args: object, **kwargs: object
+            ) -> object:
+                result = await original_durable(*args, **kwargs)
+                # test-contract: seam gate the replacement's real durable await
+                entered.set()
+                await await_or_fail(release.wait(), what="replacement settlement")
+                return result
+
+            # test-contract: seam gate the replacement settlement await
+            monkeypatch.setattr(
+                ConversationStore, "_to_thread_durable", gated_replacement_durable
+            )
+            abort = asyncio.create_task(request(4, "abort", {}))
+            await await_or_fail(entered.wait(), what="replacement settlement gate")
+            if case == "replacement":
+                replacement_request = {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "new_session",
+                    "params": {"provider": "codex"},
+                }
+                if transport == "unix":
+                    writer.write((json.dumps(replacement_request) + "\n").encode())
+                    await writer.drain()
+                else:
+                    await _send_json(writer, replacement_request)
+            record = server.control._approvals.state.records["call-1"]
+            assert record.settlement is not None
+            record.settlement.cancel()
+            release.set()
+            abort_frames = await await_or_fail(abort, what="abort response")
+            assert abort_frames[-1]["result"] == {"aborted": True}
+            if case == "replacement":
+                replacement_frames = await await_or_fail(
+                    receive_response(5), what="new session response"
+                )
+                assert (
+                    replacement_frames[-1]["result"]["session"]["session_id"]
+                    != session_id
+                )
+            if case == "abort":
+                await event("approval_end")
+            approval_ends = [
+                params
+                for frame in observed
+                if (params := frame.get("params", frame)).get("event")
+                == "approval_end"
+                and params.get("request_id") == "call-1"
+            ]
+            assert len(approval_ends) == 1
+            assert approval_ends[0]["reason"] == "turn_canceled"
+            status = (await request(6, "status", {}))[-1]
+            assert status["result"]["state"] in {"idle", "running"}
+            assert not server.control._approvals.state.records
+            return
         cancel = case.startswith("cancel_")
         if case == "deny":
             response = (
@@ -1514,6 +1602,35 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     ConversationStore,
                     "append_approval_history_async",
                     gated_history,
+                )
+            elif case == "cancel_owner_exit":
+                original_settle_record = (
+                    approval_lifecycle.ApprovalLifecycle._settle_record
+                )
+
+                async def gated_owner_exit(
+                    lifecycle: Any,
+                    record: Any,
+                    decision: str,
+                    reason: str | None = None,
+                ) -> dict[str, str]:
+                    nonlocal settlement
+                    result = await original_settle_record(
+                        lifecycle, record, decision, reason
+                    )
+                    settlement = asyncio.current_task()
+                    # test-contract: seam capture the lifecycle owner task
+                    assert settlement is not None
+                    # test-contract: seam gate owner exit after shared admission
+                    entered.set()
+                    await await_or_fail(release.wait(), what="settlement owner exit")
+                    return result
+
+                # test-contract: seam gate the lifecycle owner exit
+                monkeypatch.setattr(
+                    approval_lifecycle.ApprovalLifecycle,
+                    "_settle_record",
+                    gated_owner_exit,
                 )
             elif case == "cancel_write":
                 assert server.connections is not None
