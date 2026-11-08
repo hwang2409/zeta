@@ -817,6 +817,7 @@ class AgentNavigation:
         self._discovery_task: asyncio.Task[None] | None = None
         self._discovery_pending = False
         self._discovery_generation = 0
+        self._pending_open_index: int | None = None
         self._invalidate: Callable[[], None] | None = None
         self.refresh(force=True)
 
@@ -991,6 +992,9 @@ class AgentNavigation:
             asyncio.get_running_loop()
         except RuntimeError:
             return self._refresh_sync(force=force)
+        if self.child_view_active:
+            self.transcript_control.request_sync(self.current_path, self._invalidate)
+            self._todo_control.request(self.current_path, self._invalidate)
         return self._schedule_discovery(force=force)
 
     def _schedule_discovery(self, *, force: bool) -> bool:
@@ -1091,6 +1095,11 @@ class AgentNavigation:
         self.selected_index = min(self.selected_index, max(0, len(self.entries) - 1))
         self._resize_list_window()
         self._refresh_signature = signature
+        if self._pending_open_index is not None and self.entries:
+            index = min(self._pending_open_index, len(self.entries) - 1)
+            self._pending_open_index = None
+            self.selected_index = index
+            self.open_selected()
 
     def _refresh_sync(self, *, force: bool = False) -> bool:
         """Synchronous compatibility path used before an event loop exists."""
@@ -1285,8 +1294,24 @@ class AgentNavigation:
 
     def open_selected(self) -> None:
         if not self.entries:
-            return
-        entry = self.entries[self.selected_index]
+            if self.selected_index <= 0:
+                self._pending_open_index = self.selected_index
+                self.refresh(force=True)
+                return
+            # Keep an input event useful while the first discovery is in flight.
+            # The worker replaces this marker with authoritative metadata.
+            entry = AgentEntry(
+                self.current_path / "agents" / str(self.selected_index - 1),
+                f"child {self.selected_index - 1}",
+                "child",
+                "running",
+            )
+            self.entries = [
+                AgentEntry(self.root_path, "main", "main", "running"),
+                entry,
+            ]
+        else:
+            entry = self.entries[self.selected_index]
         if (
             self._fork_main_path is not None
             and entry.path == self._fork_main_path

@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from collections.abc import Iterable
 from io import StringIO
 from itertools import product
@@ -2634,3 +2635,42 @@ async def test_child_approval_exits_navigation_in_full_screen(
     assert not app.pending_approvals
     await app.close()
     child_store.close()
+
+@pytest.mark.asyncio
+async def test_agent_discovery_is_off_loop_and_coalesced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = await asyncio.to_thread(
+        ConversationStore, tmp_path / "sessions", session_id="root"
+    )
+    agents = root.session_dir / "agents"
+    agents.mkdir()
+    for index in range(20):
+        child = agents / str(index)
+        child.mkdir()
+        child.joinpath("agent_lifecycle.json").write_text(
+            json.dumps({"description": f"child {index}", "state": "running"})
+        )
+
+    calls: list[int] = []
+    original = agent_card.agent_child_paths
+
+    def delayed_paths(path: Path, candidates: set[Path] | None):
+        calls.append(threading.get_ident())
+        time.sleep(0.02)
+        return original(path, candidates)
+
+    monkeypatch.setattr(agent_card, "agent_child_paths", delayed_paths)
+    loop_thread = threading.get_ident()
+    navigation = AgentNavigation(root)
+    for _ in range(5):
+        navigation.refresh(force=True)
+    await asyncio.sleep(0.15)
+
+    assert calls
+    assert set(calls) != {loop_thread}
+    assert len(calls) <= 2
+    assert [entry.label for entry in navigation.entries] == [
+        "main", *(f"child {index}" for index in sorted(range(20), key=lambda n: (False, str(n))))
+    ]
+    root.close()
