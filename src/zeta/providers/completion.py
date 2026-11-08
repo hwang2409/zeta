@@ -199,14 +199,16 @@ class CompletionRetryBudget:
         is_account_lock = getattr(source, "code", None) == "account_lock_timeout"
         if is_account_lock:
             return self._plan_account_lock(source, now, event_data)
-        if self.account_lock_exclusion_started_at is not None:
+        if self.started_at is None:
+            self.started_at = now
+            self.excluded_stall_seconds = 0.0
+            self.excluded_account_lock_seconds = 0.0
+            self.account_lock_exclusion_started_at = None
+        elif self.account_lock_exclusion_started_at is not None:
             self.excluded_account_lock_seconds += (
                 now - self.account_lock_exclusion_started_at
             )
             self.account_lock_exclusion_started_at = None
-        if self.started_at is None:
-            self.started_at = now
-            self.excluded_stall_seconds = 0.0
         generic_attempts = self.attempts - self.account_lock_attempts
         if generic_attempts >= self.max_attempts:
             self.exhausted = True

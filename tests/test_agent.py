@@ -36,6 +36,7 @@ from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
+from zeta.accounts import AccountCredentialLockTimeoutError
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.background import (
@@ -15877,6 +15878,166 @@ async def test_idle_child_is_running_during_wake_turn(
         await registry.close()
         child_store.close()
         parent_store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_lock_exhaustion_keeps_child_alive_for_follow_up(
+    tmp_path: Path,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.exhausted = asyncio.Event()
+            self.follow_up_succeeded = asyncio.Event()
+            self._completion_wait = no_wait
+
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls += 1
+            if self.calls <= 5:
+                if self.calls == 5:
+                    self.exhausted.set()
+                raise AccountCredentialLockTimeoutError()
+            assert "continue" in _user_texts(messages)
+            self.follow_up_succeeded.set()
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(
+                    MessageRole.ASSISTANT,
+                    [TextContent("follow-up succeeded")],
+                ),
+            )
+
+    async def no_wait(_delay: float) -> None:
+        return None
+
+    def child_result(
+        text: str,
+        *,
+        state: str | None = None,
+        error: bool | None = None,
+        status: str | None = None,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        return {
+            "content": [{"type": "text", "text": text}],
+            "isError": error if error is not None else state == "failed",
+            "structuredContent": {"status": status or state},
+        }
+
+    store = ConversationStore(tmp_path)
+    store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(store)
+    backend = Backend()
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        agent_depth=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.explicit_finish = True
+    flow = await loop._ensure_step_delivery()
+    channel = loop._background_owner.conversation_channel
+    channel.register_loop("root:1")
+    loop._terminal_transition_fence = TerminalTransitionFence(
+        store,
+        notification_pending=lambda: flow.has_pending_edge,
+    )
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "start",
+            child_store=store,
+            child_path=str(tmp_path),
+            publish=lambda _status: None,
+            child_turns=lambda: 0,
+            update_turns=lambda _turns: None,
+            update_step=lambda _step: None,
+            update_tool_calls=lambda _calls: None,
+            finish_lifecycle=lambda _state, _text: {},
+            publish_lifecycle=lambda *_args, **_kwargs: None,
+            child_result=child_result,
+            error_message=str,
+        )
+    )
+    try:
+        await await_or_fail(backend.exhausted.wait(), what="account retries exhausted")
+        produced = await channel.produce_to(
+            "root:1",
+            pending_delivery_module.PromptInput(
+                "continue",
+                MessageOrigin.AGENT_SEND,
+                asyncio.get_running_loop().time() + 10,
+            ),
+        )
+        assert produced is not None
+        await await_or_fail(
+            backend.follow_up_succeeded.wait(), what="successful child follow-up"
+        )
+        assert backend.calls == 6
+        assert not run.done()
+        assert store.agent_lifecycle()["state"] in {"running", "idle"}
+    finally:
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(run, what="cancelled child run")
+        channel.unregister_loop("root:1")
+        await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_non_account_error_still_terminates_child(tmp_path: Path) -> None:
+    class Backend(CompletionBackend):
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("auth_error", "invalid credentials"),
+            )
+
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(Backend(), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    def child_result(text: str, *, state=None, **_kwargs):
+        return {
+            "content": [{"type": "text", "text": text}],
+            "isError": state == "failed",
+            "structuredContent": {"status": state},
+        }
+
+    try:
+        result = await agent_runner_module.consume_child(
+            loop,
+            "start",
+            origin=MessageOrigin.AGENT_PROMPT,
+            child_path=str(tmp_path),
+            publish=lambda _status: None,
+            child_turns=lambda: 0,
+            update_turns=lambda _turns: None,
+            update_step=lambda _step: None,
+            update_tool_calls=lambda _calls: None,
+            finish_lifecycle=lambda _state, _text: {},
+            publish_lifecycle=lambda *_args, **_kwargs: None,
+            child_result=child_result,
+            error_message=str,
+        )
+    finally:
+        await loop.close()
+    assert result["isError"] is True
+    assert result["structuredContent"] == {"status": "failed"}
 
 
 @pytest.mark.asyncio

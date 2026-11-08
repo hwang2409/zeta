@@ -341,6 +341,19 @@ async def test_account_lock_timeout_waits_then_retries_same_completion() -> None
     assert len(delays) == 1
 
 
+def test_account_lock_before_generic_error_does_not_extend_generic_window() -> None:
+    budget = CompletionRetryBudget()
+    account_error = AccountCredentialLockTimeoutError()
+    generic_error = _RetryableError("busy")
+
+    assert budget.start_attempt("test", 0.0)
+    assert budget.plan(account_error, 90.0) is not None
+    assert budget.start_attempt("test", 100.0)
+    assert budget.plan(generic_error, 100.0) is not None
+    assert budget.plan(generic_error, 160.0) is not None
+    assert budget.plan(generic_error, 160.001) is None
+
+
 @pytest.mark.asyncio
 async def test_account_lock_retry_does_not_consume_transient_attempt_budget() -> None:
     clock = _ManualClock()
