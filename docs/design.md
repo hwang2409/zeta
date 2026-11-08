@@ -119,7 +119,7 @@ strictly smaller.
 | ZETA-3 | Codex backend: ChatGPT plan OAuth, backend-api Responses stream; same boundary test | ZETA-1 |
 | ZETA-4 | ToolRegistry + first tools (read/list/exec with session cwd defaults) + pre-execution hook | ZETA-1 |
 | ZETA-5 | ApprovalPolicy with durable pending requests + resume re-emit | ZETA-4 |
-| ZETA-6 | ContextAssembler + CompactionPolicy (budget, retained tail, summary completion, digest) | ZETA-2 or ZETA-3 |
+| ZETA-6 | ContextAssembler + CompactionPolicy (budget, retained tail, summary completion) | ZETA-2 or ZETA-3 |
 | ZETA-7 | Session resume (--continue/--resume), provider-transport recreation | ZETA-6 |
 | ZETA-8 | TUI: sticky composer, patch_stdout pump, status bar, commit-on-newline streaming | ZETA-2/3 |
 | ZETA-10 | `zeta login` CLI subcommand: wire existing PKCE OAuth machinery (build_authorization_url + exchange_authorization_code, both providers) into a CLI flow with a local redirect server; store tokens via AnthropicCredentialStore / CodexCredentialStore. Motivation: no login surface today; when both stored tokens revoke (session on another machine invalidates them), users have no in-harness recovery path. | ZETA-2/3 |
