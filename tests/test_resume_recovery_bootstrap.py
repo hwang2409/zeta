@@ -470,6 +470,79 @@ async def test_warm_writer_startup_and_close_are_cancellation_safe(
     await asyncio.wait_for(close, 2)
 
 
+@pytest.mark.asyncio
+async def test_close_waits_for_durable_delta_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resident = _opened_store_with_writer_snapshot(tmp_path, "close-delta-proof")
+    proof_entered = threading.Event()
+    release_proof = threading.Event()
+    writer_fds_closed = threading.Event()
+    original_proof = ConversationStore._proven_bounded_durable_delta
+
+    def gated_proof(store: ConversationStore, *args, **kwargs):
+        proof_entered.set()
+        assert release_proof.wait(10)
+        return original_proof(store, *args, **kwargs)
+
+    monkeypatch.setattr(
+        ConversationStore, "_proven_bounded_durable_delta", gated_proof
+    )
+    flow = StepDeliveryFlow(resident)
+    operation = asyncio.create_task(flow.initialize())
+    close_errors: list[OSError] = []
+    close_done = threading.Event()
+
+    def close_store() -> None:
+        try:
+            resident.close()
+        except OSError as exc:
+            close_errors.append(exc)
+        finally:
+            close_done.set()
+
+    close: threading.Thread | None = None
+    try:
+        assert await asyncio.to_thread(proof_entered.wait, 10)
+        writer = resident._durable_writer
+        assert writer is not None
+        release_writer_lease = writer._release_lease
+
+        def track_writer_close() -> None:
+            release_writer_lease()
+            writer_fds_closed.set()
+
+        writer._release_lease = track_writer_close
+        close = threading.Thread(target=close_store)
+        close.start()
+        with resident._durable_write_condition:
+            assert resident._durable_write_condition.wait_for(
+                lambda: resident._closing, timeout=10
+            )
+            closed_before_proof = resident._closed
+        if closed_before_proof:
+            assert writer_fds_closed.wait(10)
+        release_proof.set()
+        await asyncio.wait_for(operation, 10)
+        assert await asyncio.to_thread(close_done.wait, 10)
+        close.join()
+        assert close_errors == []
+        reopened = ConversationStore(tmp_path, session_id=resident.session_id)
+        try:
+            assert reopened.messages()[-1].content == [TextContent("resident payload")]
+        finally:
+            reopened.close()
+    finally:
+        release_proof.set()
+        if not operation.done():
+            await asyncio.wait_for(operation, 10)
+        if close is None:
+            await asyncio.to_thread(resident.close)
+        elif close.is_alive():
+            assert await asyncio.to_thread(close_done.wait, 10)
+            close.join()
+
+
 def test_writer_snapshot_uses_structural_copy(tmp_path: Path) -> None:
     resident = _opened_store_with_writer_snapshot(tmp_path, "structural-snapshot")
     try:
