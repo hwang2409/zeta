@@ -659,7 +659,7 @@ async def test_request_exit_wakes_active_full_screen_prompt(tmp_path: Path) -> N
         finally:
             if session.app.future is not None and not session.app.future.done():
                 session.app.exit(exception=EOFError())
-            await running
+            await await_or_fail(running, what="full-screen prompt exit")
 
 
 @pytest.mark.asyncio
@@ -853,19 +853,26 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
 async def test_background_completion_is_rendered_when_exit_overtakes_acknowledgement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_durable_write = ConversationStore._run_durable_write
+    original_durable_write = ConversationStore._run_committed_mutation
     ack_committed = threading.Event()
     release_ack = threading.Event()
     apps: list[TUIApp] = []
 
-    def pause_after_ack_commit(self, method_name, args, kwargs):
-        result = original_durable_write(self, method_name, args, kwargs)
-        if method_name == "_acknowledge_staged_delivery":
+    def pause_after_ack_commit(
+        self, command, expected_generation, cancelled_before_write
+    ):
+        result = original_durable_write(
+            self, command, expected_generation, cancelled_before_write
+        )
+        if type(command).__name__ == "_AcknowledgeStagedDeliveryCommand":
             ack_committed.set()
             assert release_ack.wait(timeout=5)
         return result
 
-    monkeypatch.setattr(ConversationStore, "_run_durable_write", pause_after_ack_commit)
+    # test-contract: seam pauses after durable acknowledgement commit
+    monkeypatch.setattr(
+        ConversationStore, "_run_committed_mutation", pause_after_ack_commit
+    )
     transcript = asyncio.create_task(
         _background_event_transcript_count(
             tmp_path,
@@ -879,7 +886,7 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         assert len(apps) == 1
         apps[0].request_exit()
         release_ack.set()
-        count, rendered = await transcript
+        count, rendered = await await_or_fail(transcript, what="test await")
         assert count == 1, rendered
         markers = {entry.type for entry in apps[0].loop.store.tui_replay_entries()}
         assert "notification_tui_presented" in markers
@@ -887,7 +894,9 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         release_ack.set()
         if not transcript.done():
             transcript.cancel()
-            await asyncio.gather(transcript, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(transcript, return_exceptions=True), what="test await"
+            )
 
 
 @pytest.mark.asyncio
@@ -12078,9 +12087,7 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
             await finish_transcript_cleanup(
                 tasks, close, deadline=deadline, label=label
             )
-            transcript_cleanup_tasks.update(
-                agent_shutdown._LATE_CLEANUP_TASKS - before
-            )
+            transcript_cleanup_tasks.update(agent_shutdown._LATE_CLEANUP_TASKS - before)
         finally:
             transcript_handed_off.set()
 

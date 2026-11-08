@@ -31,6 +31,7 @@ from ..checkpoints import (
     _now,
     load_session_json,
 )
+from ..checkpoints.entry_types import sent_message_receipts
 from ..session_files import open_session_file
 from ..transcript_recovery import (
     TRANSCRIPT_REPAIR_EPOCH,
@@ -39,7 +40,6 @@ from ..transcript_recovery import (
     reconcile_pending,
     repair_transcript,
 )
-from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
@@ -231,6 +231,9 @@ class _FullLoadValidator:
         self.store = store
         self.raw = raw
         self.stat = stat
+        # The resident rows stay a prefix only if the digest at their count matches.
+        self.baseline = (len(store._entries), store._entry_prefix_digest)
+        self._digest_at_baseline: bytes | None = b"" if not store._entries else None
         self.state = copy.copy(store)
         self.state._entries = []
         self.state._entry_prefix_digest = b""
@@ -344,6 +347,8 @@ class _FullLoadValidator:
         self.rows_by_id[entry.id] = row
         self.state._entry_ids.add(entry.id)
         self.state._record_entry_prefix(entry)
+        if len(self.state._entries) == self.baseline[0]:
+            self._digest_at_baseline = self.state._entry_prefix_digest
         self.state._sent_message_receipts.extend(sent_message_receipts(entry))
         if (
             entry.type == "notification"
@@ -437,8 +442,15 @@ class _FullLoadValidator:
         if self.state._entries:
             self._select_branch(self.state._entries[-1])
         self.state._rebuild_client_deliveries(self.state._entries)
+        if self.resets_resident_rows:
+            self.store._reset_generation += 1
         for attribute in self._STATE_ATTRIBUTES:
             setattr(self.store, attribute, getattr(self.state, attribute))
+
+    @property
+    def resets_resident_rows(self) -> bool:
+        """True when the loaded log is not an extension of the resident rows."""
+        return self._digest_at_baseline != self.baseline[1]
 
 
 class ConversationLogMixin:
@@ -600,25 +612,6 @@ class ConversationLogMixin:
             return
         self._publish_prepared_entries_installed(self._owned_installed_delta(delta))
 
-    @classmethod
-    def _installed_delta_from_baseline(
-        cls,
-        entries: list[ConversationEntry],
-        baseline: tuple[int, bytes],
-    ) -> InstalledEntriesDelta:
-        """Prepare an owned suffix, or reset when the old log is not a prefix."""
-        count, expected_digest = baseline
-        if count > len(entries):
-            return "reset"
-        digest = b""
-        for index in range(count):
-            digest = cls._next_entry_prefix_digest(
-                digest, cls._encoded_entry_line(entries[index])
-            )
-        if digest != expected_digest:
-            return "reset"
-        return cls._owned_installed_delta(tuple(entries[count:]))
-
     def _install_log_state(
         self: ConversationStore, state: _DetachedLogState
     ) -> _DetachedLogState:
@@ -754,6 +747,8 @@ class ConversationLogMixin:
             self._sent_message_receipts = []
             self._reset_incremental_validation_state()
             self._rebuild_client_deliveries(self._entries)
+            if had_entries:
+                self._reset_generation += 1
             header = {
                 "schema": SCHEMA,
                 "session_id": self.session_id,
@@ -1020,7 +1015,6 @@ class ConversationLogMixin:
                 self._repair_target,
                 strict_reopen=self._strict_reopen_repaired_transcript,
             )
-        baseline = (len(self._entries), self._entry_prefix_digest)
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
             stat = os.fstat(fd)
@@ -1044,11 +1038,15 @@ class ConversationLogMixin:
                 return
             raise
 
-        delta = (
-            self._installed_delta_from_baseline(self._entries, baseline)
-            if self.on_entries_installed is not None
-            else ()
-        )
+        delta: InstalledEntriesDelta = ()
+        if self.on_entries_installed is not None:
+            delta = (
+                "reset"
+                if validator.resets_resident_rows
+                else self._owned_installed_delta(
+                    tuple(self._entries[validator.baseline[0] :])
+                )
+            )
         if self._repair_torn_row(torn_offset, validator, stat, raw, delta):
             return
         if not self._read_only and not raw.endswith(b"\n"):
