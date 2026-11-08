@@ -88,8 +88,6 @@ def prepare_project_transfer(project: Path) -> PreparedTransfer:
         PreparedTransfer(archive_bytes, ""), project.name, verify_digest=False
     ) as extracted:
         digest = transfer_digest(extracted)
-        import sys as _s
-        print("DIAG client", digest, sorted((str(p.relative_to(extracted)), p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest()[:12]) for p in extracted.rglob("*") if p.is_file()), file=_s.stderr)
     return PreparedTransfer(archive_bytes, digest)
 
 
