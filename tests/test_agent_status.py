@@ -124,11 +124,15 @@ async def test_child_tool_count_is_cumulative_across_follow_up_segments(
         child_path = Path(store.agent_children()[handle]["child_session_path"])
         child_store = loop._agent_child_stores[child_call.id]
         first_tool_seen = asyncio.Event()
+        observed_live: dict[str, object] = {}
         original_update = child_store.update_agent_lifecycle
 
         def observe_tool_count(**kwargs: object) -> None:
             original_update(**kwargs)
             if kwargs.get("tool_calls") == 1:
+                live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
+                assert live is not None
+                observed_live.update(live)
                 first_tool_seen.set()
 
         monkeypatch.setattr(child_store, "update_agent_lifecycle", observe_tool_count)
@@ -142,7 +146,7 @@ async def test_child_tool_count_is_cumulative_across_follow_up_segments(
         await asyncio.wait_for(first_tool_seen.wait(), timeout=10)
         live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
         assert live is not None
-        assert live["tool_calls"] == 1
+        assert observed_live["tool_calls"] == 1
         await wait_background_owner(loop)
 
         status = await _status(loop, handle)
