@@ -1287,6 +1287,7 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
     entered = threading.Event()
     release = threading.Event()
     waiting = asyncio.Event()
+    cancellation_seen = asyncio.Event()
     original = ConversationStore.commit
     calls = 0
 
@@ -1308,6 +1309,12 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
     monkeypatch.setattr(
         mutation_module, "_reservation_waiting", lambda _path: waiting.set()
     )
+    # test-contract: seam observes cancellation before releasing the paused worker
+    monkeypatch.setattr(
+        _async_writes,
+        "_mutation_cancellation_observed",
+        lambda _policy: cancellation_seen.set(),
+    )
     address = ConversationAddress("project", "root", "root")
     owner = asyncio.create_task(
         commit_conversation_async(address, AppendConversationRows((_warning("owner"),)))
@@ -1322,6 +1329,9 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
         )
         await await_or_fail(waiting.wait(), what="transient reservation admission")
         owner.cancel()
+        await await_or_fail(
+            cancellation_seen.wait(), what="transient owner cancellation policy"
+        )
         assert not owner.done()
         assert waiter is not None and not waiter.done()
         release.set()
@@ -1337,9 +1347,6 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert [entry.data["message"] for entry in reopened.entries] == [
-            "owner",
-            "waiter",
-        ]
+        assert [entry.data["message"] for entry in reopened.entries] == ["waiter"]
     finally:
         await asyncio.to_thread(reopened.close)
