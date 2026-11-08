@@ -2562,6 +2562,40 @@ def test_cli_resolves_label_or_id(
     assert store.default("codex") == account
 
 
+def test_save_keeps_email_when_replacement_has_no_email(tmp_path: Path) -> None:
+    credential = named_account_credentials(tmp_path, "codex", "work")
+    credential.save(
+        OAuthTokens("old-access", "old-refresh", 9_999_999_999.0, email="old@example.com")
+    )
+
+    credential.save(OAuthTokens("new-access", "new-refresh", 9_999_999_999.0))
+
+    assert credential.read() == OAuthTokens(
+        "new-access",
+        "new-refresh",
+        9_999_999_999.0,
+        email="old@example.com",
+    )
+
+
+def test_save_replaces_email_when_replacement_has_one(tmp_path: Path) -> None:
+    credential = named_account_credentials(tmp_path, "codex", "work")
+    credential.save(
+        OAuthTokens("old-access", "old-refresh", 9_999_999_999.0, email="old@example.com")
+    )
+
+    credential.save(
+        OAuthTokens("new-access", "new-refresh", 9_999_999_999.0, email="new@example.com")
+    )
+
+    assert credential.read() == OAuthTokens(
+        "new-access",
+        "new-refresh",
+        9_999_999_999.0,
+        email="new@example.com",
+    )
+
+
 def test_refresh_keeps_workspace_when_response_has_only_email(tmp_path: Path) -> None:
     credential = named_account_credentials(tmp_path, "anthropic")
     credential.save(
