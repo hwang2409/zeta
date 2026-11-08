@@ -38,18 +38,20 @@ from .protocol import (
     _LOGIN_METHODS,
     _PROJECT_METHODS,
     FEATURES,
+    HANDLERS,
     MAX_FRAME_BYTES,
     Access,
     ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
-    Handler,
     MethodDescriptor,
     ProtocolError,
     _Frame,
+    feature_error,
     finish_frame_write,
     hello_result,
     negotiate_protocol_version,
+    protocol_error,
 )
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
@@ -77,20 +79,6 @@ LOADED_SESSION_MUTATIONS = frozenset(
 )
 
 
-def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
-    async def handle(
-        client: object, request_id: str | int, params: dict[str, Any]
-    ) -> object:
-        return await client._dispatch_descriptor(request_id, descriptor, params)  # type: ignore[attr-defined]
-
-    return handle
-
-
-HANDLERS: dict[MethodDescriptor, Handler] = {
-    descriptor: _descriptor_handler(descriptor) for descriptor in MethodDescriptor
-}
-if HANDLERS.keys() != set(MethodDescriptor):
-    raise RuntimeError("serve method handlers are not exhaustive")
 
 class _UnixSocketListener:
     def __init__(
@@ -628,41 +616,8 @@ class _Client:
             raise self._descriptor_feature_error(descriptor)
         return await HANDLERS[descriptor](self, request_id, params)
 
-    def _descriptor_protocol_error(self, descriptor: MethodDescriptor) -> ProtocolError:
-        message = {
-            **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),
-            **dict.fromkeys(_ERGONOMICS_METHODS, "request requires protocol 1.1"),
-            MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
-            MethodDescriptor.PING: "ping requires the negotiated ping feature",
-            MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
-            **dict.fromkeys(
-                _PROJECT_METHODS,
-                f"{descriptor.wire} requires the negotiated projects feature",
-            ),
-            MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
-            MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
-        }.get(descriptor, f"{descriptor.wire} requires protocol 1.1")
-        return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
-
-    def _descriptor_feature_error(self, descriptor: MethodDescriptor) -> ProtocolError:
-        message = {
-            MethodDescriptor.CLEAR_STEERING: "clear_steering requires the negotiated abort_scope feature",
-            MethodDescriptor.DELIVERY_STATUS: "delivery_status requires negotiated feature 'delivery_id'",
-            MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
-            MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
-            MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
-            MethodDescriptor.PING: "ping requires the negotiated ping feature",
-            MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
-            **dict.fromkeys(
-                _PROJECT_METHODS,
-                f"{descriptor.wire} requires the negotiated projects feature",
-            ),
-        }.get(
-            descriptor,
-            f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
-        )
-        return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
-
+    _descriptor_protocol_error = staticmethod(protocol_error)
+    _descriptor_feature_error = staticmethod(feature_error)
     async def _dispatch_descriptor(
         self,
         request_id: str | int,
