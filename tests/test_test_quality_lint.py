@@ -1145,7 +1145,8 @@ def test_merge_resolution_passes_pull_request_body() -> None:
 
     assert "types: [opened, synchronize, reopened, edited]" in workflow
     assert "name: merge resolution" in workflow
-    assert "github.event.changes.body != null" in workflow
+    assert "if: github.event_name" not in workflow
+    assert "group: merge-resolution-${{ github.event.pull_request.number || github.run_id }}" in workflow
     assert "PR_BODY: ${{ github.event.pull_request.body }}" not in workflow
     script = Path("scripts/ci_merge_resolution.sh").read_text()
     assert 'gh pr view "$PR_NUMBER" --json body -q .body' in script
