@@ -164,6 +164,6 @@ def test_workflow_runs_body_edits_without_touching_main_ci() -> None:
     assert "name: merge resolution" in workflow
     assert "github.event.changes.body != null" in workflow
     assert "format('title-{0}', github.run_id)" in workflow
-    assert "timeout-minutes: 5" in workflow
+    assert "timeout-minutes: 10" in workflow
     assert "PR_BODY:" not in workflow
     assert "merge-resolution:" not in Path(ROOT / ".github/workflows/ci.yml").read_text()

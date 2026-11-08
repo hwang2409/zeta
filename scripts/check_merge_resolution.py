@@ -31,7 +31,7 @@ def same_item(left: Item, right: Item) -> bool:
 
 
 def _item_in(items: dict, item: Item) -> bool:
-    return any(same_item(item, candidate) for candidate in items.values())
+    return item_key(item) in items
 
 
 def _definition_fingerprint(
@@ -928,12 +928,11 @@ def main() -> int:
         == git("rev-parse", f"{final_revision}^{{commit}}").strip()
     ):
         final_revision = None
-    if final_revision:
+    final_items = {}
+    final_sources = {}
+    final_error_path = None
+    if error and final_revision:
         final_items, final_sources, final_error_path = _final_index(final_revision)
-    else:
-        final_items = {}
-        final_sources = {}
-        final_error_path = None
     if error:
         return _parse_error_status(
             error,
@@ -954,7 +953,8 @@ def main() -> int:
         _element_findings(old_items, main_items, branch_items, merge_items, unresolved)
     )
     findings = _filter_findings(findings, text)
-    if final_revision:
+    if final_revision and findings:
+        final_items, final_sources, final_error_path = _final_index(final_revision)
         findings = _report_final_moves(findings, final_items)
     if findings:
         for finding in findings:
