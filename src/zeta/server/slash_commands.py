@@ -429,6 +429,34 @@ async def list_commands(
     }
 
 
+async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
+    """Return whether slash_run can resolve without starting model work."""
+
+    first_line = text.split("\n", 1)[0]
+    parts = first_line[1:].split(maxsplit=1)
+    if not parts:
+        return False
+    name = parts[0]
+    tail = parts[1] if len(parts) == 2 else ""
+    if runtime.loop is not None:
+        await runtime.loop.refresh_skills()
+    registry = await asyncio.to_thread(build_registry, runtime)
+    command = registry.command_for(name)
+    if command is not None:
+        if not registry.available(command):
+            return True
+        return command.serve is not None and command.serve.can_run_while_busy(tail)
+    custom = registry.custom_command_for(name)
+    if custom is not None:
+        return custom.kind == "exec" or registry.needs_inline_shell_resolution(text)
+    if any(skill.name == name for skill in registry.skill_entries):
+        return False
+    return any(
+        prompt_name == name
+        for prompt_name, _description, _source in registry.mcp_prompt_entries
+    )
+
+
 async def run_command(
     runtime: ServerRuntime,
     text: str,
@@ -436,6 +464,7 @@ async def run_command(
     register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
     approval_control: _ApprovalProjection | None = None,
     run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
+    busy: bool = False,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
@@ -453,7 +482,11 @@ async def run_command(
     command = registry.command_for(name)
     if command is not None and not registry.available(command):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    if command is not None and command.serve is not None and command.serve.mutates(tail):
+    if (
+        command is not None
+        and command.serve is not None
+        and command.serve.mutates(tail)
+    ):
         ergonomics.require_mutable(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
@@ -466,18 +499,24 @@ async def run_command(
         if custom.kind != "prompt" or registry.needs_inline_shell_resolution(text):
             return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
         envelope = registry.input_for_model(text)
+        if busy:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(
-        runtime, approval_control, run_blocking=run_blocking
-    )
+    session = ServerSlashSession(runtime, approval_control, run_blocking=run_blocking)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}
     if isinstance(result, SlashPromptError):
         return {"kind": SlashResultKindDescriptor.ERROR, "text": result.message}
     if isinstance(result, ModelInputEnvelope):
+        if busy:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         return _model_input_result(result, register_model_input)
     if isinstance(result, _ClientOnlySlashResult):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": result.name}
@@ -580,6 +619,7 @@ __all__ = [
     "ServerSlashSession",
     "SlashCommandInfo",
     "build_registry",
+    "can_run_while_busy",
     "list_commands",
     "run_command",
 ]
