@@ -30,6 +30,16 @@ from typing import Any
 
 import httpx
 
+from .completion import (
+    AuthIteratorProviderAttempt,
+    CompletionControl,
+    CompletionRun,
+    ProviderAttempt,
+    complete as own_completion,
+    is_completion_sentinel,
+    report_provider_record,
+)
+from .codex_arguments import _parse_complete_object, _parse_partial_object
 from .codex_payload import (
     _cache_affinity_json,
     build_responses_payload,
@@ -42,23 +52,17 @@ from .transport import (
     HTTPClientLease,
     SSEEventAccumulator,
     StreamFinished,
-    StreamProgress,
+    StreamProgressDiagnostics,
     build_response_error,
     cleanup_transport,
-    close_resource,
     close_transport_resources,
     is_control_exception,
-    provider_retry_notice,
     request_error,
     retry_after_seconds,
-    retry_provider_completion,
     sse_lines,
-    stall_retry_kwargs,
     task_is_cancelling,
-    wait_for_response_headers,
 )
 from .usage import normalize_usage
-from .retry_policy import current_retry_budget
 from ..protocol.types import (
     CompletionBackend,
     ContentBlock,
@@ -168,34 +172,35 @@ class CodexBackend(CompletionBackend):
         self,
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
-    ) -> AsyncIterator[StreamEvent]:
-        return self._complete(messages, tool_schemas)
+        *,
+        control: CompletionControl,
+    ) -> CompletionRun:
+        return own_completion(self, messages, tool_schemas, control=control)
 
-    async def _complete(
+    def create_attempt(
         self,
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
-    ) -> AsyncIterator[StreamEvent]:
-        attempts = retry_provider_completion(
-            lambda: self._complete_once(messages, tool_schemas),
-            lambda token: self._complete_once(messages, tool_schemas, token=token),
+        token: str | None = None,
+    ) -> ProviderAttempt:
+        def map_error(error: BaseException) -> BaseException:
+            if (
+                token is not None
+                and isinstance(error, CodexAuthError)
+                and error.status_code == 401
+            ):
+                return CodexAuthError(
+                    "Codex authentication failed after token refresh; "
+                    "run `zeta login --provider codex`",
+                    status_code=401,
+                )
+            return error
+
+        return AuthIteratorProviderAttempt(
+            self._complete_once(messages, tool_schemas, token=token),
             self._refresh_token,
-            lambda error: (
-                isinstance(error, CodexAuthError) and error.status_code == 401
-            ),
-            lambda error: CodexAuthError(
-                "Codex authentication failed after token refresh; run `zeta login --provider codex`",
-                status_code=401,
-            ),
-            provider_retry_notice,
-            self._record_retry_exhausted,
-            **stall_retry_kwargs(self.stall_retries),
+            map_error,
         )
-        try:
-            async for event in attempts:
-                yield event
-        finally:
-            await close_resource(attempts)
 
     @property
     def connection_setup_count(self) -> int:
@@ -221,10 +226,14 @@ class CodexBackend(CompletionBackend):
         token: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         async with self._lease.borrow() as client:
-            async for event in self._complete_once_with_client(
+            events = self._complete_once_with_client(
                 client, messages, tool_schemas, token=token
-            ):
-                yield event
+            )
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                await events.aclose()
 
     async def _complete_once_with_client(
         self,
@@ -236,6 +245,7 @@ class CodexBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         stream_context: Any = None
         entered = False
+        completed = False
         primary_exception: BaseException | None = None
         try:
             access_token = (
@@ -259,12 +269,7 @@ class CodexBackend(CompletionBackend):
             stream_context = client.stream(
                 "POST", self.base_url, headers=headers, json=payload
             )
-            response = await wait_for_response_headers(
-                stream_context.__aenter__(),
-                self.stall_seconds,
-                "Codex",
-                CodexStreamError,
-            )
+            response = await stream_context.__aenter__()
             entered = True
             try:
                 if response.status_code >= 400:
@@ -285,11 +290,15 @@ class CodexBackend(CompletionBackend):
                     self.stall_seconds,
                     diagnostics_path=self.diagnostics_path,
                 ):
+                    completed = is_completion_sentinel(event)
                     yield event
             except CodexBackendError as exc:
                 primary_exception = exc
             except httpx.HTTPError as exc:
                 primary_exception = request_error(exc, CodexHTTPError)
+            except GeneratorExit as exc:
+                # the owner closes a completed response: the success path.
+                primary_exception = None if completed else exc
             except BaseException as exc:
                 if task_is_cancelling() and not is_control_exception(exc):
                     primary_exception = asyncio.CancelledError()
@@ -308,12 +317,11 @@ class CodexBackend(CompletionBackend):
                 and self.diagnostics_path is not None
                 and getattr(primary_exception, "code", None) == "server_error"
             ):
-                budget = current_retry_budget()
                 primary_exception.stream_diagnostic = (
                     self.diagnostics_path,
                     self.model,
                     getattr(primary_exception, "diagnostic_context", {}),
-                    budget.attempts if budget is not None else 1,
+                    1,
                 )
             primary_exception = await cleanup_transport(
                 stream_context=stream_context,
@@ -395,18 +403,27 @@ async def _decode_response(
     response_data: dict[str, Any] = {"stream_started_at": monotonic()}
     reassembly = _ReassemblyState()
     finished = StreamFinished()
-    progress = StreamProgress()
+    progress = StreamProgressDiagnostics()
+
+    def record_mismatches() -> None:
+        # the completion owner closes the stream at MESSAGE_END, so record
+        # reassembly diagnostics before publishing it.
+        if diagnostics_path is not None and reassembly.mismatches:
+            StreamDiagnostics.record_reassembly_mismatches(
+                diagnostics_path, provider="codex", count=reassembly.mismatches
+            )
+
     async for line in sse_lines(
         response,
         stall_seconds,
         "Codex",
         CodexStreamError,
         finished=finished,
-        progress=progress,
     ):
         record = decoder.feed(line)
         if record is None:
             continue
+        report_provider_record(record[1].get("type", record[0]))
         progress.observe(record)
         response_data["max_progress_gap_s"] = progress.maximum_gap_s()
         event, payload = record
@@ -424,9 +441,11 @@ async def _decode_response(
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 finished.value = True
+                record_mismatches()
             yield translated
     record = decoder.finish()
     if record is not None:
+        report_provider_record(record[1].get("type", record[0]))
         progress.observe(record)
         response_data["max_progress_gap_s"] = progress.maximum_gap_s()
         response_data["event_count"] = response_data.get("event_count", 0) + 1
@@ -443,6 +462,7 @@ async def _decode_response(
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 finished.value = True
+                record_mismatches()
             yield translated
     if response_state != "stopped":
         if any(
@@ -454,10 +474,6 @@ async def _decode_response(
             )
         raise CodexStreamError(
             "Codex stream ended before response completion", retryable=True
-        )
-    if diagnostics_path is not None and reassembly.mismatches:
-        StreamDiagnostics.record_reassembly_mismatches(
-            diagnostics_path, provider="codex", count=reassembly.mismatches
         )
 
 
@@ -1022,7 +1038,16 @@ def _decode_terminal_response(
                 f"Codex completed {invalid_item.kind} status "
                 f"{_format_provider_status(invalid_item.completion_status)} is invalid"
             )
-        stop_reason = "end_turn"
+        stop_reason = (
+            "refusal"
+            if any(
+                block.kind == "refusal"
+                for item in items.values()
+                for key in item.blocks
+                if (block := blocks.get(key)) is not None
+            )
+            else "end_turn"
+        )
 
     if isinstance(response, Mapping):
         response_data.update(
@@ -1214,20 +1239,3 @@ def _complete_item(item: _ItemState) -> list[ContentBlock]:
     arguments = _parse_complete_object(item.arguments)
     return [ToolUseContent(ToolCall(item.call_id, item.name, arguments))]
 
-
-def _parse_partial_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _parse_complete_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value or "{}")
-    except json.JSONDecodeError as exc:
-        raise CodexStreamError("Codex tool arguments are invalid JSON") from exc
-    if not isinstance(parsed, dict):
-        raise CodexStreamError("Codex tool arguments are not an object")
-    return parsed

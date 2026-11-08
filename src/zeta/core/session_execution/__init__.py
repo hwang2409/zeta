@@ -12,7 +12,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ...storage_format import WriterLease
+from ...storage_format import RegistryLock, WriterLease, drain_releases
 from ..checkpoints import ConversationIntegrityError
 from ..fsio import write_all
 from ..session_files import SessionInUseError, open_session_file
@@ -71,7 +71,7 @@ class _OwnedLease:
 
 
 _REGISTRY: dict[tuple[int, int], _OwnedLease] = {}
-_REGISTRY_LOCK = threading.Lock()
+_REGISTRY_LOCK = RegistryLock()
 
 
 def _read_owner_hint(fd: int) -> tuple[str | None, int | None, str | None]:
@@ -184,6 +184,7 @@ class SessionExecutionLease:
         """Acquire immediately or raise a typed refusal without mutating the session."""
 
         # the loop may do non-waiting local file ops; anything that can wait or fsyncs goes off-loop
+        drain_releases()  # a lease this process dropped must not refuse its next owner
         stat = os.fstat(directory_fd)
         identity = (stat.st_dev, stat.st_ino)
         with _REGISTRY_LOCK:
@@ -345,13 +346,15 @@ class SessionExecutionLease:
             if owned.refs:
                 return
             owned.state = "releasing"
+            fd = owned.fd
+            try:
+                os.ftruncate(fd, 0)
+            except OSError:
+                pass
+            fcntl.flock(fd, fcntl.LOCK_UN)
             if _REGISTRY.get(owned.identity) is owned:
                 del _REGISTRY[owned.identity]
-            fd, owned.fd = owned.fd, -1
-        try:
-            os.ftruncate(fd, 0)
-        except OSError:
-            pass
+            owned.fd = -1
         os.close(fd)
 
 

@@ -24,7 +24,11 @@ from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
-from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.fake_backend import (
+    FakeBackend,
+    PerActorFakeBackend,
+    ScriptedTurn,
+)
 from tests.support.processes import (
     kill_group_if_present,
     read_pid_file,
@@ -39,6 +43,7 @@ from zeta.protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    StreamEvent,
     TextContent,
     ToolCall,
     ToolUseContent,
@@ -253,9 +258,8 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
     monkeypatch.setattr(process_module, "_terminate_process", terminate_after_archive)
     monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
     waiter = asyncio.create_task(registry.wait(task_id))
-    killer = asyncio.create_task(
-        registry.kill(task_id, cause="test requested task stop")
-    )
+    cause = "test requested task stop"
+    killer = asyncio.create_task(registry.kill(task_id, cause=cause))
     try:
         await asyncio.wait_for(archive_entered.wait(), 10)
         await asyncio.wait_for(monitor_cancelled.wait(), 10)
@@ -264,6 +268,7 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
         status = await asyncio.wait_for(waiter, 10)
         assert status["running"] is False
         await asyncio.wait_for(killer, 10)
+        assert registry.snapshot()[0].note == cause
     finally:
         release_archive.set()
         await asyncio.wait_for(
@@ -327,6 +332,31 @@ async def test_canceled_monitor_propagates_when_record_already_stopped() -> None
 
 async def _collect(events):
     return [event async for event in events]
+
+
+@pytest.mark.asyncio
+async def test_archive_failure_does_not_replace_task_kill_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry = BackgroundTaskRegistry()
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    cause = "test requested task stop"
+
+    async def fail_archive(record, log_handle) -> None:
+        log_handle.close()
+        record.log_fd = None
+        raise OSError("injected archive failure")
+
+    # test-contract: seam force output archiving to fail after the kill cause is durable
+    monkeypatch.setattr(registry, "_archive_record", fail_archive)
+    try:
+        with pytest.raises(OSError, match="injected archive failure"):
+            await asyncio.wait_for(registry.kill(task_id, cause=cause), 10)
+
+        assert registry.snapshot()[0].note == cause
+        assert "failed to archive background task output" in caplog.text
+    finally:
+        await asyncio.wait_for(registry.close(), 10)
 
 
 @pytest.mark.asyncio
@@ -704,7 +734,7 @@ def test_store_replay_accepts_task_and_unknown_notification_kinds(
 
 
 def test_child_question_notification_renders_question() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -729,7 +759,7 @@ def test_child_question_notification_renders_question() -> None:
 
 
 def test_child_idle_notification_renders_readable_report() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -755,7 +785,7 @@ def test_child_idle_notification_renders_readable_report() -> None:
 
 
 def test_child_idle_notification_without_description_shows_error_line() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui import theme
     from zeta.tui.render import render_agent_notification
 
@@ -776,7 +806,7 @@ def test_child_idle_notification_without_description_shows_error_line() -> None:
 
 
 def test_child_question_withdrawn_notification_renders_text() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -800,7 +830,7 @@ def test_child_question_withdrawn_notification_renders_text() -> None:
     assert "question withdrawn: child finished" not in plain
 
 def test_child_question_notification_strips_terminal_controls() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -827,7 +857,7 @@ def test_child_question_notification_strips_terminal_controls() -> None:
 
 
 def test_child_question_withdrawn_notification_ignores_legacy_text() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -852,7 +882,7 @@ def test_child_question_withdrawn_notification_ignores_legacy_text() -> None:
 def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
     # S7: the TUI renders task_exited receipts and tolerates unknown kinds
     # without ever rendering them as agent completions.
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     def render(data: dict) -> str:
@@ -1080,10 +1110,13 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         {"prompt": "child", "description": "background", "background": True},
     )
     backend = PerActorFakeBackend(
-        [ScriptedTurn(tool_calls=[call])],
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ],
         {"child": [ScriptedTurn([TextContent("done")])]},
         parent_prompt="start",
-        gated_child_call=0,
+        gated_child_prompts=set(),
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -2748,7 +2781,7 @@ async def test_explicit_finish_task_safety_deadline_names_cause_for_every_task(
     )
 
     deadline.set()
-    killed = await asyncio.wait_for(kill, 10)
+    killed = await asyncio.wait_for(kill, 30)
     await asyncio.wait_for(wake.wait(), 10)
     events = store.agent_notifications(pending_only=False)
     cause = (

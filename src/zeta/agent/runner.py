@@ -60,9 +60,14 @@ from .presets import (
     AgentPreset,
     resolve_child_profile_tools,
 )
-from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
+from .receipt import (
+    MAX_AGENT_RESULT_BYTES,
+    TerminalState,
+    child_cleanup_details,
+    recoverable_error_result,
+)
 from .run_consumer import consume_run as consume_follow_up_run
-from .terminal_fence import TerminalTransitionFence
+from .terminal_fence import TerminalTransitionFence, persist_confirmed_cancel
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
@@ -95,6 +100,7 @@ async def consume_child(
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
     failure_message: str | None = None
+    failure_error: tuple[str, str] | None = None
     tool_calls = 0
     explicit_report: dict[str, object] | None = None
 
@@ -118,7 +124,7 @@ async def consume_child(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
     ) -> None:
-        nonlocal failure_message, final_message, tool_calls, explicit_report
+        nonlocal failure_error, failure_message, final_message, tool_calls, explicit_report
         final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
@@ -180,6 +186,7 @@ async def consume_child(
                 if gate_control is not None and gate_control.turn_ended():
                     return
             elif event.type is StreamEventType.ERROR and event.error is not None:
+                failure_error = (event.error.code, event.error.message)
                 failure_message = event.error.message
 
     def owned_children() -> tuple[tuple[str, str], ...]:
@@ -280,18 +287,20 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
+        if failure_error is not None and failure_error[0] == "account_lock_timeout":
+            return recoverable_error_result(terminal_result, failure_message, *failure_error)
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
         return terminal_result(state="failed", text=text)
+    from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE, has_visible_output
     final_text = assistant_text(final_message)
-    if not final_text.strip():
+    if not has_visible_output(final_message):  # empty or only eviction receipts
         if final_message.metadata.get("stop_reason") == "max_tokens":
-            from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE
-
             return terminal_result(state="completed", text=OUTPUT_LIMIT_ERROR_MESSAGE)
-        text = "agent error: child returned an empty final assistant message"
-        return terminal_result(state="failed", text=text)
+        if child_loop.explicit_finish:  # wrote nothing: idle, not failed
+            return terminal_result(state="idle", text="", status="running")
+        return terminal_result(state="failed", text="agent error: child returned an empty final assistant message")
     if record_report is not None:
         record_report(final_text)
     if child_loop.explicit_finish:
@@ -1036,20 +1045,12 @@ async def run_agent_tool(
         # child's own abort path) must not both write; a failed write releases it.
         child_canceled = True
         try:
-            if terminal_fence is not None and not await terminal_fence.cancel():
-                transition = await child_store._to_thread_durable(
-                    child_store._terminal_transition
-                )
-                lifecycle = child_store.agent_lifecycle() or {}
-                if transition != "cancel" or lifecycle.get("state") == "canceled":
-                    return False
-            await child_store._to_thread_agent_state(
-                child_store.mark_agent_canceled, tool_call.id
+            return await persist_confirmed_cancel(
+                terminal_fence, child_store, tool_call.id
             )
         except BaseException:
             child_canceled = False
             raise
-        return True
 
     async def cleanup_canceled_child(
         confirmation: asyncio.Task[bool],

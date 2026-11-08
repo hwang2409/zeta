@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ...context_eviction.receipt_constructors import is_receipt_echo
 from ...protocol.types import (
     ErrorInfo,
     Message,
@@ -80,10 +81,17 @@ async def complete_empty_turn(
             ),
             True,
         )
+    data: dict[str, Any] = {"turn": turn_number, "tool_calls": 0}
+    classification = completion_classification(
+        assistant_message,
+        stop_reason=assistant_message.metadata.get("stop_reason"),
+    )
+    if classification is not None:
+        data["completion"] = classification
     turn_end = StreamEvent(
         StreamEventType.TURN_END,
         message=assistant_message,
-        data={"turn": turn_number, "tool_calls": 0},
+        data=data,
     )
     if transition.continue_turn:
         return (turn_end,), False
@@ -95,9 +103,23 @@ def _bounded_detail(value: str) -> str:
     return value[:MAX_EMPTY_TURN_DETAIL_CHARS]
 
 
+def completion_classification(
+    message: Message, *, stop_reason: str | None
+) -> str | None:
+    """Classify a terminal no-tool completion for frontends."""
+
+    if has_visible_output(message):
+        return None
+    if stop_reason in {"refusal", "content_filter"}:
+        return stop_reason
+    return "empty"
+
+
 def has_visible_output(message: Message) -> bool:
     """True when the assistant produced text or a tool call the user can act on."""
 
+    if is_receipt_echo(message):
+        return False
     for block in message.content:
         if isinstance(block, ToolUseContent):
             return True
@@ -195,7 +217,7 @@ def should_nudge_empty_turn(
         not notification_turn
         and not already_nudged
         and nudge_count < max_nudges
-        and stop_reason != "max_tokens"
+        and stop_reason not in {"max_tokens", "refusal", "content_filter"}
         and not has_visible_output(message)
     )
 
