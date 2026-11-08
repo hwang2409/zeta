@@ -17,6 +17,7 @@ from collections.abc import (
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
+from ..core.checkpoints import ConversationEntry
 from ..core.store import (
     ConversationStore,
     PendingPromptCommitTimeoutError,
@@ -163,6 +164,9 @@ class StepDeliveryFlow:
         self._low_capacity_notifications = False
         self._low_capacity_notice_emitted = False
         self._initialize_lock = asyncio.Lock()
+        self._input_admission_lock = asyncio.Lock()
+        self._stalled_notice_published = False
+        self._stalled_had_wake_source = False
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -182,32 +186,73 @@ class StepDeliveryFlow:
         source = validate_delivery_input(item)
         self._require_owner_loop()
         await self.initialize()
-        commit_window = (
-            max(0.0, item.deadline - time.monotonic())
-            if isinstance(item, PromptInput) and item.deadline is not None
-            else None
-        )
-        try:
-            result = await self.store._to_thread_durable(
-                self.store._commit_delivery_input, item
+        async with self._input_admission_lock:
+            commit_window = (
+                max(0.0, item.deadline - time.monotonic())
+                if isinstance(item, PromptInput) and item.deadline is not None
+                else None
             )
-        except PendingPromptWriterReloadedError:
-            if not isinstance(item, PromptInput) or item.deadline is None:
-                raise
-            assert commit_window is not None
-            retry = replace(item, deadline=time.monotonic() + commit_window)
-            result = await self.store._to_thread_durable(
-                self.store._commit_delivery_input, retry
-            )
-        if result.changed and not (
-            isinstance(item, NotificationInput)
-            and (
-                item.kind in _MUTATION_ONLY_KINDS
-                or item.data.get("display_only") is True
-            )
-        ):
-            self._arm_edge(source)
-        return result
+            try:
+                result = await self.store._to_thread_durable(
+                    self.store._commit_delivery_input, item
+                )
+            except PendingPromptWriterReloadedError:
+                if not isinstance(item, PromptInput) or item.deadline is None:
+                    raise
+                assert commit_window is not None
+                retry = replace(item, deadline=time.monotonic() + commit_window)
+                result = await self.store._to_thread_durable(
+                    self.store._commit_delivery_input, retry
+                )
+            if result.changed and not (
+                isinstance(item, NotificationInput)
+                and (
+                    item.kind in _MUTATION_ONLY_KINDS
+                    or item.data.get("display_only") is True
+                )
+            ):
+                self._arm_edge(source)
+            return result
+
+    async def publish_stalled(
+        self,
+        can_wake_again: Callable[[], bool],
+        publish: Callable[[], Awaitable[ConversationEntry | None]],
+    ) -> Literal["published", "suppressed", "already_published"]:
+        """Publish once when no model-visible work can wake this idle flow."""
+
+        self._require_owner_loop()
+        await self.initialize()
+        async with self._input_admission_lock:
+            if can_wake_again():
+                self._stalled_had_wake_source = True
+                return "suppressed"
+            if self._stalled_had_wake_source:
+                self._stalled_notice_published = False
+                self._stalled_had_wake_source = False
+            if self._stalled_notice_published:
+                return "already_published"
+            commit = asyncio.create_task(publish())
+            deferred_cancel = False
+            while not commit.done():
+                try:
+                    await asyncio.shield(commit)
+                except asyncio.CancelledError:
+                    deferred_cancel = True
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+            commit.result()
+            self._stalled_notice_published = True
+            if deferred_cancel:
+                raise asyncio.CancelledError
+            return "published"
+
+    def reset_stalled_episode(self) -> None:
+        """Start a new stalled episode after external input starts a turn."""
+
+        self._stalled_notice_published = False
+        self._stalled_had_wake_source = False
 
     def wake(self, source: DeliverySource) -> None:
         if source not in {"prompt", "notification"}:
@@ -583,6 +628,10 @@ class StepDeliveryFlow:
         )
 
     @property
+    def has_model_visible_delivery(self) -> bool:
+        return bool(self.pending_ids())
+
+    @property
     def active_publications(self) -> DeliveryPublications:
         active = self._active
         return active.publications if active is not None else DeliveryPublications()
@@ -803,14 +852,16 @@ async def send_to_run(
         return no_live_run
     match = QUESTION_ANSWER_PATTERN.match(message)
     if match is not None:
+        question_id = match.group(1)
         await channel.produce_to_parent_of(
             child_instance_id,
             NotificationInput(
                 "question_answer_ack",
                 {
                     "child_instance_id": child_instance_id,
-                    "question_id": match.group(1),
+                    "question_id": question_id,
                 },
             ),
         )
+        channel.question_answered(child_instance_id, question_id)
     return None
