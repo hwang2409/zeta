@@ -124,6 +124,10 @@ class SessionReplay:
         self._bytes += size
         return True
 
+    def stream_id(self, connection: Any) -> str | None:
+        subscription = self._subscriptions.get(connection)
+        return None if subscription is None else subscription.stream_id
+
     def begin_join(self, connection: Any, scope: ReplayScopeId) -> PendingReplayJoin:
         self.connection_closed(connection)
         pending = PendingReplayJoin(connection, scope, secrets.token_urlsafe(9))

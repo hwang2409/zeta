@@ -71,6 +71,7 @@ class ControllerMetadata:
 class _OutputFrame:
     payload: _Frame
     future: asyncio.Future[bool] | None = None
+    replay_stream_id: str | None = None
 
 
 @dataclass
@@ -291,7 +292,20 @@ class ConnectionRegistry:
         return outcome
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
+        old_stream = self.replay.stream_id(connection)
         self.replay.begin_join(connection, scope)
+        if old_stream is not None:
+            state = self._connections.get(connection)
+            if state is not None and state.output is not None:
+                kept: deque[_OutputFrame] = deque()
+                while state.output.queue:
+                    item = state.output.queue.popleft()
+                    if item.replay_stream_id == old_stream:
+                        self._finish_frame_accounting(state.output, item)
+                    else:
+                        kept.append(item)
+                state.output.queue = kept
+                self._assert_retained_accounting(state.output)
 
     async def finish_replay_join(
         self,
@@ -334,7 +348,10 @@ class ConnectionRegistry:
         if not self._admit(state, frame):
             self.replay.connection_closed(state.connection)
             return False
-        self._enqueue(state.output, _OutputFrame(frame))
+        self._enqueue(
+            state.output,
+            _OutputFrame(frame, replay_stream_id=published.stream_id),
+        )
         return True
 
     def drain_replay(self, connection: Any) -> None:
@@ -347,7 +364,10 @@ class ConnectionRegistry:
             if frame is None or not self._admit(state, frame):
                 self.replay.connection_closed(connection)
                 return
-            self._enqueue(state.output, _OutputFrame(frame))
+            self._enqueue(
+                state.output,
+                _OutputFrame(frame, replay_stream_id=fields.get("stream_id")),
+            )
 
     async def publish_controller(
         self,
