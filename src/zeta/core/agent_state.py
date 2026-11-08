@@ -643,22 +643,6 @@ class AgentStateMixin:
         self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(self._agent_lifecycle)
         publish_live_agent_lifecycle(self.agent_lifecycle_path, self._agent_lifecycle)
 
-    def checkpoint_agent_lifecycle(self) -> None:
-        """Persist the current live lifecycle for recovery between segments."""
-
-        live_lifecycle = live_agent_lifecycle(self.agent_lifecycle_path)
-        if live_lifecycle is None:
-            return
-        with self._append_lock():
-            self._load()
-            self._load_session_state()
-            if self._agent_lifecycle is None:
-                return
-            for field in ("current_step", "turns_used", "tool_calls", "elapsed", "state", "idle_since"):
-                if field in live_lifecycle:
-                    self._agent_lifecycle[field] = live_lifecycle[field]
-            self._write_agent_lifecycle()
-
     def finish_agent_lifecycle(
         self,
         state: str,

@@ -19713,3 +19713,43 @@ async def test_session_host_commands_provider_retry_keeps_turn_snapshot(
         )
     finally:
         await loop.close()
+
+@pytest.mark.asyncio
+async def test_idle_child_wake_tool_count_is_cumulative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from zeta.tools.agent import _read_agent_status
+
+    monkeypatch.setitem(AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True))
+    idle_seen = asyncio.Event()
+    original_transition = run_consumer_module._transition_idle
+
+    async def observe_idle(child_store: ConversationStore) -> None:
+        await original_transition(child_store)
+        idle_seen.set()
+
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    child_call = ToolCall("background-agent", "agent", {"prompt": "work", "description": "background", "agent_type": "run", "background": True})
+    finish_one = ToolCall("finish-one", "finish", {"status": "done", "summary": "first"})
+    finish_two = ToolCall("finish-two", "finish", {"status": "done", "summary": "second"})
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[child_call])],
+        {"work": [
+            ScriptedTurn(tool_calls=[ToolCall("one", "todo", {"items": []}), ToolCall("two", "todo", {"items": []})]),
+            ScriptedTurn(tool_calls=[finish_one]),
+            ScriptedTurn(tool_calls=[ToolCall("three", "todo", {"items": []}), ToolCall("four", "todo", {"items": []})]),
+            ScriptedTurn(tool_calls=[finish_two]),
+        ]},
+        parent_prompt="start", gated_child_prompts=set(), parent_waits_for_children=False,
+    )
+    parent_store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, parent_store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(idle_seen.wait(), what="first idle transition")
+        handle = next(iter(parent_store.agent_children()))
+        assert await send_to_run(parent_store, handle, "follow up", channel=loop._background_owner.conversation_channel) is None
+        await wait_background_owner(loop)
+        status = _read_agent_status(parent_store, requested_handle=handle)
+        assert status[0]["tool_calls"] == 4
+    finally:
+        await loop.close()

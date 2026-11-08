@@ -46,13 +46,12 @@ def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -
         )
 
 
-async def _transition_idle(child_store: ConversationStore) -> None:
+def _transition_idle(child_store: ConversationStore) -> None:
     child_store.update_agent_lifecycle(
         state="idle",
         current_step="idle, waiting for follow-up",
         idle_since=_now(),
     )
-    await child_store._to_thread_agent_state(child_store.checkpoint_agent_lifecycle)
 
 
 def _finalize_result(
@@ -146,11 +145,7 @@ async def consume_run(
             return {}
         idle = state == "idle"
         if idle:
-            child_store.update_agent_lifecycle(
-                state="idle",
-                current_step="idle, waiting for follow-up",
-                idle_since=_now(),
-            )
+            _transition_idle(child_store)
         return agent_stats(
             child_store.agent_lifecycle(),
             status="idle" if idle else "running",
@@ -206,7 +201,7 @@ async def consume_run(
                 )
                 continue
             if idle:
-                await _transition_idle(child_store)
+                _transition_idle(child_store)
                 content = result.get("content")
                 text = "child is idle"
                 if (
