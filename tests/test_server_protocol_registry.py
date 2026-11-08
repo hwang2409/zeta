@@ -158,6 +158,9 @@ async def test_real_method_conformance_matrix(transport: str, tmp_path: Path) ->
         finally:
             await contract.close()
 
+
+
+
 def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
     registry = create_slash_registry(skill_catalog=SkillCatalog(()), surface="serve")
     safe = {
@@ -186,6 +189,8 @@ def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
     assert not registry.command_for("plan").serve.can_run_while_busy("on")
     assert not registry.command_for("plan").serve.can_run_while_busy("write a plan")
     assert not registry.command_for("implement").serve.can_run_while_busy("")
+
+
 
 
 

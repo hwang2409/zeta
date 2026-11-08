@@ -163,6 +163,11 @@ class SlashErrorCodeDescriptor(StrEnum):
     MCP_CREDENTIAL_STORE = "mcp_credential_store"
 
 
+class ApprovalDecision(StrEnum):
+    APPROVE = "approve"
+    DENY = "deny"
+
+
 class EventDescriptor(StrEnum):
     """One documented JSON-RPC event name."""
 
@@ -332,6 +337,40 @@ class MethodDescriptor(Enum):
 Handler = Callable[[object, str | int, dict[str, object]], object]
 
 
+_LOGIN_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
+)
+_ERGONOMICS_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in (
+        "RENAME_SESSION",
+        "DELETE_SESSION",
+        "REPAIR_TRANSCRIPT",
+        "SESSION_TREE",
+        "SESSION_HISTORY",
+        "CONTENT_READ",
+        "MODEL_CATALOG",
+        "SESSION_SETTINGS",
+        "SET_SETTINGS",
+        "SET_COMPACTION",
+        "SEND_IMAGES",
+        "SWITCH_BRANCH",
+        "FORK_MESSAGE",
+        "SLASH_LIST",
+        "SLASH_RUN",
+        "ACCOUNT_LIST",
+        "ACCOUNT_LOGOUT",
+        "ACCOUNT_REFRESH",
+        "ACCOUNT_SWITCH",
+    )
+)
+_PROJECT_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
+)
+
+
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
@@ -462,6 +501,59 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
     if requested == "1.0" and advertised in SUPPORTED_PROTOCOL_VERSIONS[1:]:
         return advertised
     return requested
+
+
+def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
+    async def handle(
+        client: object, request_id: str | int, params: dict[str, Any]
+    ) -> object:
+        return await client._dispatch_descriptor(request_id, descriptor, params)  # type: ignore[attr-defined]
+
+    return handle
+
+
+HANDLERS: dict[MethodDescriptor, Handler] = {
+    descriptor: _descriptor_handler(descriptor) for descriptor in MethodDescriptor
+}
+if HANDLERS.keys() != set(MethodDescriptor):
+    raise RuntimeError("serve method handlers are not exhaustive")
+
+
+def protocol_error(descriptor: MethodDescriptor) -> ProtocolError:
+    message = {
+        **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),
+        **dict.fromkeys(_ERGONOMICS_METHODS, "request requires protocol 1.1"),
+        MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
+        MethodDescriptor.PING: "ping requires the negotiated ping feature",
+        MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
+        **dict.fromkeys(
+            _PROJECT_METHODS,
+            f"{descriptor.wire} requires the negotiated projects feature",
+        ),
+        MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+        MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+    }.get(descriptor, f"{descriptor.wire} requires protocol 1.1")
+    return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
+
+
+def feature_error(descriptor: MethodDescriptor) -> ProtocolError:
+    message = {
+        MethodDescriptor.CLEAR_STEERING: "clear_steering requires the negotiated abort_scope feature",
+        MethodDescriptor.DELIVERY_STATUS: "delivery_status requires negotiated feature 'delivery_id'",
+        MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
+        MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+        MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+        MethodDescriptor.PING: "ping requires the negotiated ping feature",
+        MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
+        **dict.fromkeys(
+            _PROJECT_METHODS,
+            f"{descriptor.wire} requires the negotiated projects feature",
+        ),
+    }.get(
+        descriptor,
+        f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
+    )
+    return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
 
 
 class FrameCodec:

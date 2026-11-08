@@ -28,20 +28,22 @@ from . import (
     slash_commands,
 )
 from . import control as session_grants
-from .approval_lifecycle import ApprovalDecision
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
-    PROJECT_REQUESTS,
     ProjectRequests,
     project_request_error,
 )
 from .protocol import (
+    _ERGONOMICS_METHODS,
+    _LOGIN_METHODS,
+    _PROJECT_METHODS,
     FEATURES,
     MAX_FRAME_BYTES,
     Access,
+    ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
     Handler,
@@ -228,61 +230,6 @@ async def _handle_status(
     )  # type: ignore[attr-defined]
 
 
-_LOGIN_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
-)
-LOADED_SESSION_MUTATIONS = frozenset(
-    {
-        "abort",
-        "approve",
-        "clear_steering",
-        "deny",
-        "fork_message",
-        "rename_session",
-        "repair_transcript",
-        "revoke_session_grants",
-        "send",
-        "send_images",
-        "set_compaction",
-        "set_settings",
-        "set_turn_context",
-        "slash_run",
-        "steer",
-        "switch_branch",
-    }
-
-
-)
-_ERGONOMICS_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in (
-        "RENAME_SESSION",
-        "DELETE_SESSION",
-        "SESSION_TREE",
-        "SESSION_HISTORY",
-        "CONTENT_READ",
-        "MODEL_CATALOG",
-        "SESSION_SETTINGS",
-        "SET_SETTINGS",
-        "SET_COMPACTION",
-        "SEND_IMAGES",
-        "SWITCH_BRANCH",
-        "FORK_MESSAGE",
-        "SLASH_LIST",
-        "SLASH_RUN",
-        "ACCOUNT_LIST",
-        "ACCOUNT_LOGOUT",
-        "ACCOUNT_REFRESH",
-        "ACCOUNT_SWITCH",
-    )
-)
-_PROJECT_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
-)
-
-
 async def _handle_rename_session(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
@@ -371,7 +318,7 @@ async def _handle_session_settings(
 ) -> object:
     runtime = client.server.runtime  # type: ignore[attr-defined]
     ergonomics.active(runtime, params)
-    return ergonomics.settings(runtime)
+    return ergonomics.settings(runtime, include_plan_mode=True)
 
 
 async def _handle_set_settings(
@@ -584,6 +531,7 @@ if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
 
 
+
 class _UnixSocketListener:
     def __init__(
         self,
@@ -604,7 +552,7 @@ class _UnixSocketListener:
         accept: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]],
     ) -> _UnixSocketListener:
         cls._prepare_parent(path)
-        lock_fd = os.open(
+        lock_fd = os.open(  # async-blocking: local non-waiting socket lock setup
             f"{path}.lock",
             os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
@@ -619,7 +567,7 @@ class _UnixSocketListener:
             identity: tuple[int, int] | None = None
             try:
                 unix_socket.bind(str(path))
-                socket_stat = path.lstat()
+                socket_stat = path.lstat()  # async-blocking: local socket identity check
                 identity = (socket_stat.st_dev, socket_stat.st_ino)
                 server = await asyncio.start_unix_server(
                     accept, sock=unix_socket, limit=MAX_FRAME_BYTES + 1
@@ -1155,6 +1103,7 @@ class _Client:
 
     async def _handle_new_session(
         self, request_id: str | int, params: dict[str, Any]
+
     ) -> object:
         try:
             initial_model = _optional_string(params, "model")
@@ -1359,11 +1308,24 @@ class _Client:
             "overlapping_memory_versions": list(result.overlapping_memory_versions),
         }
 
-    async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
+    async def _ergonomics(
+        self, descriptor: MethodDescriptor, params: dict[str, Any]
+    ) -> object:
+        if isinstance(descriptor, str):
+            descriptor = MethodDescriptor.for_wire(descriptor)
+            if descriptor is None:
+                raise ProtocolError(
+                    ErrorDescriptor.METHOD_NOT_FOUND, "method not found"
+                )
         runtime = self.server.runtime
-        if method == "repair_transcript":
+        method = descriptor.wire
+        if descriptor is MethodDescriptor.REPAIR_TRANSCRIPT:
             return await self._repair_transcript(params)
-        if method in {"rename_session", "delete_session"}:
+        if descriptor in {
+            MethodDescriptor.RENAME_SESSION,
+            MethodDescriptor.DELETE_SESSION,
+        }:
+
             return await ergonomics.mutate_session(
                 runtime,
                 method,
@@ -1371,10 +1333,10 @@ class _Client:
                 params.get("name"),
                 self.server.control.require_idle,
             )
-        if method in {"session_tree", "session_history"}:
+        if descriptor in {MethodDescriptor.SESSION_TREE, MethodDescriptor.SESSION_HISTORY}:
             assert self.server.connections is not None
             return await self.server.connections.read_session(self, method, params)
-        if method == "content_read":
+        if descriptor is MethodDescriptor.CONTENT_READ:
             if "content_read" not in self.features:
                 raise ProtocolError(
                     ErrorDescriptor.METHOD_NOT_FOUND,
@@ -1382,20 +1344,27 @@ class _Client:
                 )
             assert self.server.connections is not None
             return await self.server.connections.read_session(self, method, params)
-        if method == "model_catalog":
+        if descriptor is MethodDescriptor.MODEL_CATALOG:
             return ergonomics.catalog(runtime)
         store = ergonomics.active(runtime, params)
-        if method == "send_images":
+        if descriptor is MethodDescriptor.SEND_IMAGES:
             return await self.server.control.deliveries.send_images(
                 params, self.features
             )
-        if method == "session_settings":
+        if descriptor is MethodDescriptor.SESSION_SETTINGS:
             return ergonomics.settings(runtime, include_plan_mode=True)
-        if method in slash_commands.READ_REQUESTS:
+        if descriptor in {
+            MethodDescriptor.SLASH_LIST,
+            MethodDescriptor.ACCOUNT_LIST,
+            MethodDescriptor.ACCOUNT_LOGOUT,
+            MethodDescriptor.ACCOUNT_REFRESH,
+            MethodDescriptor.ACCOUNT_SWITCH,
+        }:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self
             )
-        if method == "slash_run":
+        if descriptor is MethodDescriptor.SLASH_RUN:
+
             text = _required_string(params, "text")
             if (
                 self.server.control.turn_busy()
@@ -1413,21 +1382,21 @@ class _Client:
             )
         await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
-        if method == "set_settings":
+        if descriptor is MethodDescriptor.SET_SETTINGS:
             model = _required_string(params, "model")
             mode = _required_string(params, "approval_mode")
             model_selection.validate(model, mode)
             await model_selection.apply_rpc(runtime, model, mode)
             return ergonomics.settings(runtime)
-        if method == "set_compaction":
+        if descriptor is MethodDescriptor.SET_COMPACTION:
             _required_string(params, "mode")
             raise ProtocolError(
                 ErrorDescriptor.INVALID_PARAMS,
                 "compaction mode selection was removed; eviction is always used",
             )
-        if method == "fork_message":
+        if descriptor is MethodDescriptor.FORK_MESSAGE:
             store.append_message_fork(_required_string(params, "message_id"))
-        elif method == "switch_branch":
+        elif descriptor is MethodDescriptor.SWITCH_BRANCH:
             head = _required_string(params, "head_id")
             current = store.replay()
             if not current or current[-1].id != head:

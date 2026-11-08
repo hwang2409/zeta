@@ -152,6 +152,7 @@ feature. Observer connections receive only methods with `read` access.
 | `status` | `1.0` | `none` | `read` |
 | `rename_session` | `1.1` | `none` | `session_mutation` |
 | `delete_session` | `1.1` | `none` | `controller_write` |
+| `repair_transcript` | `1.1` | `none` | `session_mutation` |
 | `session_tree` | `1.1` | `none` | `read` |
 | `session_history` | `1.1` | `none` | `read` |
 | `content_read` | `1.1` | `content_read` | `read` |

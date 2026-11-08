@@ -7,7 +7,6 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
-from enum import StrEnum
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -23,7 +22,7 @@ from .approval_settlement.approval_grants import (
     finish_grant,
 )
 from .connections import Admission
-from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
+from .protocol import ApprovalDecision, ErrorDescriptor, EventDescriptor, ProtocolError
 
 Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
@@ -61,11 +60,6 @@ class Start:
     stream_event: StreamEvent
     session_id: str | None
     wire_event: EventDescriptor
-
-
-class ApprovalDecision(StrEnum):
-    APPROVE = "approve"
-    DENY = "deny"
 
 
 @dataclass(frozen=True, slots=True)
