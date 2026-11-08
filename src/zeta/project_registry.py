@@ -876,28 +876,6 @@ class ProjectRegistry(
         ) as project_fd:
             return read(project_fd)
 
-    def record_session(
-        self,
-        project_id: str,
-        *,
-        session_id: str,
-        transcript_path: str,
-        role: str = "session",
-        parent_session_id: str | None = None,
-    ) -> None:
-        """Exact-upsert one transcript reference under sessions authority."""
-        self.record_sessions(
-            project_id,
-            [
-                {
-                    "session_id": session_id,
-                    "transcript_path": transcript_path,
-                    "role": role,
-                    "parent_session_id": parent_session_id,
-                }
-            ],
-        )
-
     @staticmethod
     def _prepare_session_records(
         project_id: str, records: list[Mapping[str, object]]
@@ -933,130 +911,56 @@ class ProjectRegistry(
             )
         return prepared
 
-    def record_sessions(
-        self, project_id: str, records: list[Mapping[str, object]]
-    ) -> None:
-        """Exact-upsert a bounded batch under one sessions-domain lock."""
-        self._record_session_batches({project_id: records})
-
     def _record_child_lineage_batch(
-        self, records_by_project: Mapping[str, list[Mapping[str, object]]]
+        self,
+        project_fd: int,
+        remove_ids: set[str],
+        records: list[dict[str, object]],
     ) -> None:
-        """Publish one reconciled child-lineage batch under sessions authority."""
-        self._record_session_batches(records_by_project)
+        """Apply one child-lineage project group under held sessions authority."""
+        self._update_sessions_locked(project_fd, remove_ids, records)
 
-    def _record_session_batches(
-        self, records_by_project: Mapping[str, list[Mapping[str, object]]]
+    def _update_sessions_locked(
+        self,
+        project_fd: int,
+        remove_ids: set[str],
+        records: list[dict[str, object]],
     ) -> None:
-        """Exact-upsert all project batches after acquiring sorted authority."""
-        prepared = {
-            project_id: self._prepare_session_records(project_id, records)
-            for project_id, records in records_by_project.items()
-        }
-        prepared = {
-            project_id: records for project_id, records in prepared.items() if records
-        }
-        if not prepared:
-            return
-        target_by_session: dict[str, str] = {}
-        for project_id, records in prepared.items():
-            for record in records:
-                session_id = str(record["session_id"])
-                previous = target_by_session.setdefault(session_id, project_id)
-                if previous != project_id:
-                    raise ProjectRegistryError(
-                        "session cannot be published to two projects"
-                    )
-        project_ids = self._identity_read(
-            lambda root_fd: [
-                project.project_id for project in self._list_locked(root_fd)
-            ]
-        )
-        domains = tuple(sorted((project_id, "sessions") for project_id in project_ids))
-        with self._project_locks(domains, exclusive=True) as project_fds:
-            for (project_id, _domain), project_fd in zip(
-                domains, project_fds, strict=True
-            ):
-                remove_ids = {
-                    session_id
-                    for session_id, target in target_by_session.items()
-                    if target != project_id
-                }
-                self._remove_sessions_locked(project_fd, remove_ids)
-                records = prepared.get(project_id)
-                if records:
-                    self._record_sessions_locked(project_fd, records)
-
-    def _remove_sessions_locked(
-        self, project_fd: int, session_ids: set[str]
-    ) -> None:
-        if not session_ids:
-            return
+        """Apply removals and exact upserts with one bounded project rewrite."""
         directory_fd = os.dup(project_fd)
         try:
+            if not remove_ids and len(records) == 1:
+                with self._open_session_records(
+                    directory_fd, repair_torn_final=True
+                ) as fd:
+                    if fd is not None and self._session_record_matches(fd, records[0]):
+                        return
             existing = self._read_session_records(
                 directory_fd, repair_torn_final=True
             )
             retained = [
                 record
                 for record in existing
-                if str(record["session_id"]) not in session_ids
+                if str(record["session_id"]) not in remove_ids
             ]
-            if len(retained) == len(existing):
-                return
-            payload = b"".join(
-                (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-                for record in retained
-            )
-            self._writer_lease().publish_append(
-                "project.session_role",
-                (record["role"] for record in retained),
-                lambda: atomic_publish_file(
-                    directory_fd,
-                    "sessions.jsonl",
-                    payload,
-                    sync_directory=True,
-                ),
-            )
-        finally:
-            os.close(directory_fd)
-
-    def _record_sessions_locked(
-        self,
-        project_fd: int,
-        records: list[dict[str, object]],
-    ) -> None:
-        directory_fd = os.dup(project_fd)
-        try:
-            if len(records) == 1:
-                with self._open_session_records(
-                    directory_fd, repair_torn_final=True
-                ) as fd:
-                    if fd is not None and self._session_record_matches(
-                        fd, records[0]
-                    ):
-                        return
-            existing = self._read_session_records(
-                directory_fd, repair_torn_final=True
-            )
+            changed = len(retained) != len(existing)
             positions = {
                 str(record["session_id"]): index
-                for index, record in enumerate(existing)
+                for index, record in enumerate(retained)
             }
-            changed = False
             for record in records:
                 session_id = str(record["session_id"])
                 position = positions.get(session_id)
                 if position is None:
-                    if len(existing) >= MAX_SESSION_REFERENCES:
+                    if len(retained) >= MAX_SESSION_REFERENCES:
                         raise ProjectRegistryError(
                             "project session reference limit exceeded"
                         )
-                    positions[session_id] = len(existing)
-                    existing.append(record)
+                    positions[session_id] = len(retained)
+                    retained.append(record)
                     changed = True
                     continue
-                current = existing[position]
+                current = retained[position]
                 business = {
                     key: value for key, value in record.items() if key != "recorded_at"
                 }
@@ -1064,23 +968,23 @@ class ProjectRegistry(
                     key: value for key, value in current.items() if key != "recorded_at"
                 }
                 if current_business != business:
-                    existing[position] = record
+                    retained[position] = record
                     changed = True
             if not changed:
                 return
             payload = b"".join(
                 (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-                for record in existing
+                for record in retained
             )
             if any(
                 len((json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
                 > MAX_SESSION_REFERENCE_SIZE
-                for record in existing
+                for record in retained
             ):
                 raise ProjectRegistryError("project session reference is too large")
             self._writer_lease().publish_append(
                 "project.session_role",
-                (record["role"] for record in existing),
+                (record["role"] for record in retained),
                 lambda: atomic_publish_file(
                     directory_fd,
                     "sessions.jsonl",
