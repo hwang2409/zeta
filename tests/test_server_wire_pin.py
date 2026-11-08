@@ -9,6 +9,26 @@ import pytest
 from tests.support.serve_contract import ServeContract
 
 PIN = Path(__file__).parent / "fixtures" / "serve_wire_pin.jsonl"
+_ERGONOMICS_METHODS = {
+    "rename_session",
+    "delete_session",
+    "session_tree",
+    "session_history",
+    "content_read",
+    "switch_branch",
+    "fork_message",
+    "model_catalog",
+    "session_settings",
+    "set_settings",
+    "set_compaction",
+    "send_images",
+    "slash_list",
+    "slash_run",
+    "account_list",
+    "account_logout",
+    "account_refresh",
+    "account_switch",
+}
 
 
 def _pin() -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -29,6 +49,9 @@ def _w4_delta(raw: str, method: str) -> str:
 async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
     metadata, pins = _pin()
     assert pins
+    ergonomics_rows = [pin for pin in pins if pin.get("kind") == "ergonomics_valid"]
+    assert len(ergonomics_rows) == len(_ERGONOMICS_METHODS)
+    assert {pin["method"] for pin in ergonomics_rows} == _ERGONOMICS_METHODS
     assert PIN.read_text().splitlines()[0] == (
         '{"fixture":"serve_wire_pin","base_sha":"e8e77882"}'
     )
