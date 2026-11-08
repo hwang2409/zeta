@@ -9,13 +9,25 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from ._log import _DurableLogDelta
 from ._pending_prompts import PendingPromptWriterReloadedError
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
     from ._log import InstalledEntriesDelta, _DetachedLogState
     from ._store import ConversationStore
+
+
+@dataclass(frozen=True, slots=True)
+class _DurableLogDelta:
+    """Small worker-validated suffix plus the durable log facts it produced."""
+
+    entries: tuple[ConversationEntry, ...]
+    installed_delta: InstalledEntriesDelta
+    entry_prefix_digest: bytes
+    log_identity: tuple[int, int, int]
+    log_offset: int
+    log_mtime_ns: int
+    log_prefix_fingerprint: bytes
 
 
 @dataclass(frozen=True, slots=True)
