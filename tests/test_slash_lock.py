@@ -51,7 +51,7 @@ class _Printed:
         async def seen() -> None:
             while self.count(text) < times:
                 self._changed.clear()
-                await self._changed.wait()
+                await asyncio.wait_for(self._changed.wait(), 10)
 
         await await_or_fail(seen(), what=f"system message {text!r}")
 
@@ -286,6 +286,7 @@ async def test_tui_mcp_auth_cancel_is_immediate_and_frees_the_lock(
     monkeypatch.setattr(oauth, "discover_protected_resource", resource)
     monkeypatch.setattr(oauth, "discover_auth_server", auth_server)
     monkeypatch.setattr(oauth, "register_client", register)
+    # test-contract: seam the real browser opener is the only way out of the process
     monkeypatch.setattr(oauth, "_default_browser_opener", open_browser)
     loop = AgentLoop(
         FakeBackend([]),
