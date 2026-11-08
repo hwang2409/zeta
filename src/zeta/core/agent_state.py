@@ -616,7 +616,7 @@ class AgentStateMixin:
         state: str | None = None,
         idle_since: str | None = None,
     ) -> None:
-        """Update a live child's process-local progress."""
+        """Update a live child's progress; ``tool_calls`` adds to its total."""
 
         if current_step is not None and not current_step:
             raise ValueError("agent lifecycle step must be nonempty")
