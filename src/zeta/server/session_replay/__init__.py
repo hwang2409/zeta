@@ -65,6 +65,19 @@ class HeldFrame:
 
 
 @dataclass(slots=True)
+class DeferredFrame:
+    """A publish-first replay copy waiting for its history row to install."""
+
+    event: Any
+    session_id: str
+    fields: dict[str, object]
+    required_feature: str | None
+    facts: Any
+    key: Any
+    size: int
+
+
+@dataclass(slots=True)
 class PendingReplayJoin:
     connection: Any
     scope: ReplayScopeId
@@ -120,6 +133,8 @@ class SessionReplay:
         self._pending: dict[Any, PendingReplayJoin] = {}
         self._next_sequences: dict[Any, int] = {}
         self._scopes: dict[ReplayScopeId, _Scope] = {}
+        # at most one record per publish-first event kind, so two per scope
+        self._deferred: dict[ReplayScopeId, dict[Any, DeferredFrame]] = {}
         self._next_ordinal = 0
         self._records = 0
         self._bytes = 0
@@ -155,6 +170,8 @@ class SessionReplay:
         return None if subscription is None else subscription.stream_id
 
     def _drop_scope(self, scope: ReplayScopeId) -> list[tuple[Any, _Subscription]]:
+        # a scope drop closes its deferred records; their charges leave with the scope
+        self._deferred.pop(scope, None)
         current = self._scopes.pop(scope, None)
         if current is not None:
             self._records -= current.records
@@ -208,6 +225,27 @@ class SessionReplay:
         self._records += 1
         self._bytes += size
         return None
+
+    def defer(self, scope: ReplayScopeId, frame: DeferredFrame) -> None:
+        """Keep a charged record; the caller closed any record of the same event."""
+        records = self._deferred.setdefault(scope, {})
+        assert frame.event not in records
+        records[frame.event] = frame
+
+    def deferred(self, scope: ReplayScopeId) -> tuple[DeferredFrame, ...]:
+        records = self._deferred.get(scope)
+        return () if records is None else tuple(records.values())
+
+    def take_deferred(self, scope: ReplayScopeId, frame: DeferredFrame) -> bool:
+        """Remove one record and its charge; False if a scope drop took it first."""
+        records = self._deferred.get(scope)
+        if records is None or records.get(frame.event) is not frame:
+            return False
+        del records[frame.event]
+        if not records:
+            del self._deferred[scope]
+        self.release(scope, frame.size)
+        return True
 
     def begin_join(
         self, connection: Any, scope: ReplayScopeId, reset_generation: int

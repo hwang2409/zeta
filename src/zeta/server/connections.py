@@ -18,7 +18,7 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
-from .session_replay import SessionReplay, history_features
+from .session_replay import DeferredFrame, SessionReplay, history_features
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
 
@@ -272,8 +272,13 @@ class ConnectionRegistry(ReplayOutput):
         **fields: object,
     ) -> Admission:
         """Admit one controller event without waiting for physical output."""
-        covers = self._replay_covers(event, session_id, fields, replay_row)
-        self._publish_observer_replay(event, session_id, required_feature, fields, covers)
+        covers = self._replay_covers(
+            event, session_id, fields, replay_row, required_feature
+        )
+        if not isinstance(covers, DeferredFrame):
+            self._publish_observer_replay(
+                event, session_id, required_feature, fields, covers
+            )
         outcome, frame, output = self._controller_preflight(
             self._controller,
             event,
@@ -283,7 +288,10 @@ class ConnectionRegistry(ReplayOutput):
         )
         if outcome.kind != "admitted" or frame is None or output is None:
             return outcome
-        if self._publish_replay(
+        assert self._controller is not None
+        if isinstance(covers, DeferredFrame) and "session_replay_seq" in self._controller.features:
+            return outcome
+        if not isinstance(covers, DeferredFrame) and self._publish_replay(
             self._controller, event, session_id, dict(fields), covers
         ):
             return outcome
@@ -305,8 +313,13 @@ class ConnectionRegistry(ReplayOutput):
         replay_row: RowFacts | None = None,
         **fields: object,
     ) -> bool:
-        covers = self._replay_covers(event, session_id, fields, replay_row)
-        self._publish_observer_replay(event, session_id, required_feature, fields, covers)
+        covers = self._replay_covers(
+            event, session_id, fields, replay_row, required_feature
+        )
+        if not isinstance(covers, DeferredFrame):
+            self._publish_observer_replay(
+                event, session_id, required_feature, fields, covers
+            )
         outcome, frame, output = self._controller_preflight(
             self._controller,
             event,
@@ -318,7 +331,12 @@ class ConnectionRegistry(ReplayOutput):
             return False
         state = self._controller
         assert state is not None
-        if self._publish_replay(state, event, session_id, fields, covers):
+        # a replay controller's copy waits in the deferred record like any stream's
+        if isinstance(covers, DeferredFrame) and "session_replay_seq" in state.features:
+            return True
+        if not isinstance(covers, DeferredFrame) and self._publish_replay(
+            state, event, session_id, fields, covers
+        ):
             return True
         if not self._admit(state, frame):
             return False
@@ -348,6 +366,8 @@ class ConnectionRegistry(ReplayOutput):
             and (state is not self._controller or not self._controller_output_paused)
         )
         covers = self._replay_covers(event, session_id, {"data": data}, None)
+        # feature events have no publish-first route
+        assert not isinstance(covers, DeferredFrame)
         for state in states:
             frame = state.connection.codec.notification(event, session_id, data=data)
             if frame is None:

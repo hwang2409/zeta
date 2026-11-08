@@ -11,9 +11,10 @@ publisher's ``RowFacts``. A source is one of:
 - a store key builder: the store finds the newest resident row for that key.
 - ``CARRIED``: the publisher holds its committed row and passes ``RowFacts.seq``.
 - ``LIVE``: the frame has no history row.
-- ``PUBLISH_FIRST``: the row installs after publication (assistant_message, the
-  user echo without a delivery id); a later slice defers these, until then they
-  carry no ``covers``.
+- ``PublishFirst(key)``: the row installs after publication (assistant_message,
+  the user echo without a delivery id). The publisher passes ``RowFacts.seq`` =
+  the newest resident seq at publication; replay copies wait until ``key`` finds
+  the first matching row after it (see ``ReplayOutput.defer_replay``).
 
 A kind or variant with no entry raises ``UnroutedEvent``; serve fails closed.
 
@@ -33,10 +34,13 @@ from ...core.store import (
     ApprovalHistory,
     ApprovalRequest,
     ApprovalResolution,
+    AssistantResponseAfter,
     DeliveredMessage,
     RecentRowKey,
     ToolResult,
+    UserTurnMessageAfter,
 )
+from ...protocol.types import MessageOrigin
 from ..protocol import EventDescriptor
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,8 @@ class RowFacts:
     variant: str | None = None
     seq: int | None = None
     delivery_id: str | None = None
+    # the origin a send without delivery id passed to start_turn
+    origin: MessageOrigin | None = None
 
 
 # a publisher whose history write failed: the effect is live-only
@@ -77,9 +83,30 @@ class _Source:
 
 CARRIED = _Source("CARRIED")
 LIVE = _Source("LIVE")
-PUBLISH_FIRST = _Source("PUBLISH_FIRST")
 KeyBuilder = Callable[[Mapping[str, Any], RowFacts], RecentRowKey]
-Source = _Source | KeyBuilder
+
+
+class PublishFirst:
+    """A route whose row installs after publication; ``key`` finds it later."""
+
+    def __init__(self, key: Callable[[RowFacts], AssistantResponseAfter | UserTurnMessageAfter]) -> None:
+        self.key = key
+
+    def __repr__(self) -> str:
+        return "PUBLISH_FIRST"
+
+
+def _mark(facts: RowFacts) -> int:
+    assert facts.seq is not None, "a publish-first publisher passes its mark"
+    return facts.seq
+
+
+def _user_turn(facts: RowFacts) -> UserTurnMessageAfter:
+    assert facts.origin is not None, "a send without delivery id passes its origin"
+    return UserTurnMessageAfter(_mark(facts), facts.origin)
+
+
+Source = _Source | PublishFirst | KeyBuilder
 
 
 def _data(fields: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -173,8 +200,10 @@ ROUTES: dict[tuple[EventDescriptor, str], Source] = {
     ),
     # the queued steer row is not in history; its delivered row has no live event
     (EventDescriptor.USER_MESSAGE, "steer"): LIVE,
-    (EventDescriptor.USER_MESSAGE, "undelivered"): PUBLISH_FIRST,
-    (EventDescriptor.ASSISTANT_MESSAGE, ""): PUBLISH_FIRST,
+    (EventDescriptor.USER_MESSAGE, "undelivered"): PublishFirst(_user_turn),
+    (EventDescriptor.ASSISTANT_MESSAGE, ""): PublishFirst(
+        lambda facts: AssistantResponseAfter(_mark(facts))
+    ),
     (EventDescriptor.TOOL_END, "foreground"): lambda fields, facts: ToolResult(
         _tool_call_id(fields)
     ),
@@ -235,7 +264,7 @@ def covers(
     facts: RowFacts,
 ) -> Covers:
     """Return the seq of the frame's history row; O(1) or a bounded store lookup."""
-    if source is LIVE or source is PUBLISH_FIRST:
+    if source is LIVE or isinstance(source, PublishFirst):
         return None
     if source is CARRIED:
         if facts.seq is None:

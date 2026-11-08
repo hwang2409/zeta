@@ -69,7 +69,9 @@ class DeliveryRequests:
             enabled="model_input_ids" in features,
         )
         if delivery_id is None:
-            await control.user_message(value.display_text, "send", features)
+            await control.user_message(
+                value.display_text, "send", features, origin=value.origin
+            )
             control.start_turn(
                 value.text,
                 origin=value.origin,

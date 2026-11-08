@@ -396,8 +396,13 @@ class ServeControl:
         features: frozenset[str],
         attachments: list[dict[str, object]] | None = None,
         delivery_id: str | None = None,
+        origin: MessageOrigin = MessageOrigin.USER,
     ) -> None:
-        """Echo an accepted user message so observers can rebuild the transcript."""
+        """Echo an accepted user message so observers can rebuild the transcript.
+
+        Without a delivery id the row installs later in the turn, so ``origin``
+        (what the caller passes to ``start_turn``) and the mark find it.
+        """
         if "user_message_event" in features:
             fields: dict[str, object] = {
                 "text": bounded(text, USER_MESSAGE_MAX_BYTES),
@@ -414,9 +419,22 @@ class ServeControl:
                     event_contract.AuxiliaryEvent.USER_MESSAGE
                 ],
                 self.server.runtime.session_id,
-                replay_row=RowFacts(delivery_id=delivery_id),
+                replay_row=RowFacts(delivery_id=delivery_id)
+                if delivery_id is not None
+                else RowFacts(seq=self._row_mark(), origin=origin),
                 **fields,
             )
+
+    def _row_mark(self) -> int | None:
+        """The newest resident row seq; a publish-first row installs after it."""
+        opened = self.server.runtime.opened
+        return None if opened is None else opened.store.active_branch_head_sequence()
+
+    def _close_deferred_replay(self, session_id: str | None) -> None:
+        """At a turn's end, admit deferred replay copies; rows not found never install."""
+        connections = self.server.connections
+        if connections is not None and session_id is not None:
+            connections.release_deferred_replay(session_id, close=True)
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
         if self.closing:
@@ -608,6 +626,7 @@ class ServeControl:
                 terminal_events.clear()
                 terminal_error = None
                 agent_end = None
+            self._close_deferred_replay(session_id)
             await self.deliveries.finalize_turn(
                 session_id,
                 state,
@@ -714,6 +733,7 @@ class ServeControl:
                 and loop.notification_system_message() is not None
             ):
                 self._schedule_background_wake(session_id)
+            self._close_deferred_replay(session_id)
             await self.deliveries.finalize_turn(
                 session_id,
                 state,
@@ -781,6 +801,7 @@ class ServeControl:
         finally:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
+            self._close_deferred_replay(session_id)
             await self.deliveries.finalize_turn(
                 session_id,
                 state,
@@ -849,7 +870,10 @@ class ServeControl:
                 )
             if event.message is not None:
                 await self._notify(
-                    wire_event, session_id, **event_contract.assistant_message(event)
+                    wire_event,
+                    session_id,
+                    replay_row=RowFacts(seq=self._row_mark()),
+                    **event_contract.assistant_message(event),
                 )
             return
         connections = getattr(self.server, "connections", None)

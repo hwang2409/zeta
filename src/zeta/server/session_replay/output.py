@@ -9,8 +9,16 @@ from types import SimpleNamespace
 from typing import Any
 
 from .. import ergonomics
-from ..protocol import EventDescriptor, _Frame
-from . import DROP, EVICT, ReplayScopeId, _Subscription, history_features, rows
+from ..protocol import EventDescriptor, FrameCodec, _Frame
+from . import (
+    DROP,
+    EVICT,
+    DeferredFrame,
+    ReplayScopeId,
+    _Subscription,
+    history_features,
+    rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +54,17 @@ class ReplayOutput:
         session_id: str | None,
         fields: dict[str, object],
         replay_row: rows.RowFacts | None,
-    ) -> rows.Covers:
-        """Find the history row one publication presents, once for every stream."""
+        required_feature: str | None = None,
+    ) -> rows.Covers | DeferredFrame:
+        """Find the history row one publication presents, once for every stream.
+
+        Run first for every replay admission: deferred copies whose rows have
+        installed go out before this frame. A publish-first frame returns its
+        deferred record instead: its replay copies wait for the row.
+        """
         if session_id is None:
             return None
+        self.release_deferred_replay(session_id)
         scope = ReplayScopeId.top(session_id)
         facts = replay_row or rows.RowFacts()
         try:
@@ -58,10 +73,69 @@ class ReplayOutput:
             logger.error("replay event has no route table entry: %s", exc)
             self.invalidate_replay_scope(scope, "evicted")
             return None
+        if isinstance(source, rows.PublishFirst) and facts.seq is not None:
+            return self._defer_replay(
+                scope, DeferredFrame(
+                    event, session_id, dict(fields), required_feature, facts,
+                    source.key(facts), FrameCodec().serialized_size(fields),
+                )
+            )
         store = self._replay_store(scope)
         if store is None:
             return None
         return rows.covers(event, source, store, fields, facts)
+
+    def _defer_replay(self, scope: ReplayScopeId, frame: DeferredFrame) -> DeferredFrame:
+        """Hold one charged record per publish-first event; non-replay output is not held."""
+        for old in self.replay.deferred(scope):
+            # supersede: the release check just ran and found no row for it
+            if old.event is frame.event and self.replay.take_deferred(scope, old):
+                self._admit_deferred(old, None)
+        while (victim := self.replay.reserve(scope, frame.size)) is not None:
+            self.invalidate_replay_scope(victim, "evicted")
+            if victim == scope:
+                return frame
+        self.replay.defer(scope, frame)
+        return frame
+
+    def release_deferred_replay(self, session_id: str, *, close: bool = False) -> None:
+        """Admit deferred copies whose rows installed, before any later frame.
+
+        With close (a turn's end), a record with no row is admitted live-only:
+        its row will never install, so it is provisional across a stream end.
+        """
+        scope = ReplayScopeId.top(session_id)
+        records = self.replay.deferred(scope)
+        if not records:
+            return
+        store = self._replay_store(scope)
+        ready: list[tuple[int | None, DeferredFrame]] = []
+        for record in records:
+            seq = None if store is None else store.recent_row_seq(record.key)
+            if seq is None and store is not None and record.key.seq + 1 < store.recent_row_floor():
+                # more rows than the lookup window since the mark: fail closed
+                self.invalidate_replay_scope(scope, "evicted")
+                return
+            if seq is not None or close:
+                ready.append((seq, record))
+        # rows go out in install order; live-only copies after them
+        for seq, record in sorted(ready, key=lambda item: (item[0] is None, item[0] or 0)):
+            if self.replay.take_deferred(scope, record):
+                self._admit_deferred(record, seq)
+
+    def _admit_deferred(self, record: DeferredFrame, covers: rows.Covers) -> None:
+        """Send one deferred copy to every replay stream of its scope."""
+        for state in (self._controller, *self._observers):
+            if state is None or (
+                state is self._controller and self._controller_output_paused
+            ):
+                continue
+            if not self._feature_rejected(
+                state, record.event, record.required_feature, record.fields
+            ):
+                self._publish_replay(
+                    state, record.event, record.session_id, record.fields, covers
+                )
 
     def _replay_store(self, scope: ReplayScopeId) -> Any:
         """The scope's store while a replay stream or join needs it, else None."""

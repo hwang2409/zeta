@@ -7,6 +7,7 @@ row; a stream drops it when the row is inside the history it joined with.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -25,8 +26,10 @@ from tests.support.replay_transport import (
     replay_server,
 )
 from zeta.core.store import _row_history
+from zeta.model_input import ModelInputEnvelope
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -38,12 +41,12 @@ from zeta.protocol.types import (
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
 from zeta.server.protocol import EventDescriptor
-from zeta.server.session_replay import rows
+from zeta.server.session_replay import DeferredFrame, rows
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
 TRANSPORTS: tuple[Transport, ...] = ("unix", "websocket")
-CONTROLLER_FEATURES = ("delivery_id", "user_message_event", "user_message_delivery_id")
+CONTROLLER_FEATURES = ("delivery_id", "user_message_event", "user_message_delivery_id", "model_input_ids")
 Route = tuple[EventDescriptor, str]
 
 
@@ -119,13 +122,25 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
     assert server.connections is not None
     original = server.connections._replay_covers
 
-    def recorded(event: EventDescriptor, session_id: str | None, fields: dict[str, Any], replay_row: Any) -> Any:
-        covers = original(event, session_id, fields, replay_row)
-        serve.published.append((event, dict(fields), replay_row or rows.RowFacts(), covers))
+    def recorded(
+        event: EventDescriptor, session_id: str | None, fields: dict[str, Any], replay_row: Any, *rest: Any
+    ) -> Any:
+        covers = original(event, session_id, fields, replay_row, *rest)
+        # a publish-first frame is recorded when its deferred copy is admitted
+        if not isinstance(covers, DeferredFrame):
+            serve.published.append((event, dict(fields), replay_row or rows.RowFacts(), covers))
         return covers
+
+    admit_deferred = server.connections._admit_deferred
+
+    def recorded_deferred(record: DeferredFrame, covers: Any) -> None:
+        serve.published.append((record.event, dict(record.fields), record.facts, covers))
+        admit_deferred(record, covers)
 
     # test-contract: seam observe each publication's internal covers before the wire strips it
     server.connections._replay_covers = recorded  # type: ignore[method-assign]
+    # test-contract: seam observe each deferred copy's covers when its row is found
+    server.connections._admit_deferred = recorded_deferred  # type: ignore[method-assign]
     return serve
 
 
@@ -162,6 +177,14 @@ def _history_rows_for(
             row
             for row in history
             if row.get("event") == event.value and row.get("delivery_id") == fields["delivery_id"]
+        ]
+    if event is EventDescriptor.USER_MESSAGE and facts.delivery_id is None:
+        return [row for row in history if row.get("role") == "user" and any(fields["text"] in text for text in _texts([row]))]
+    if event is EventDescriptor.ASSISTANT_MESSAGE:
+        return [
+            row
+            for row in history
+            if row.get("role") == "assistant" and _texts([row]) == _texts([fields["message"]])
         ]
     if event is EventDescriptor.USER_MESSAGE:
         return [
@@ -220,6 +243,56 @@ class BlockingBackend:
 async def _delivery(serve: Serve) -> None:
     await serve.controller.request(serve.request_id(), "send", {"text": "delivery-marker", "delivery_id": "d-1"})
     await _wait_event(serve.observer, "user_message", text="delivery-marker")
+    await _wait_event(serve.observer, "agent_end")
+
+
+async def _send_plain(serve: Serve) -> None:
+    await serve.controller.request(serve.request_id(), "send", {"text": "plain-marker"})
+    await _wait_event(serve.observer, "user_message", text="plain-marker")
+    await _wait_event(serve.observer, "agent_end")
+
+
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+)
+
+
+async def _send_images(serve: Serve) -> None:
+    image = {"name": "shot.png", "mime_type": "image/png", "data": base64.b64encode(PNG).decode()}
+    await serve.controller.request(
+        serve.request_id(), "send_images", {"session_id": serve.session_id, "text": "image-marker", "images": [image]}
+    )
+    await _wait_event(serve.observer, "user_message", text="image-marker")
+    await _wait_event(serve.observer, "agent_end")
+
+
+async def _send_skill(serve: Serve) -> None:
+    input_id = serve.server.control._model_inputs.register(
+        serve.session_id,
+        ModelInputEnvelope("skill-marker expanded body", "skill-marker", MessageOrigin.SKILL_EXPANSION),
+    )
+    await serve.controller.request(serve.request_id(), "send", {"input_id": input_id})
+    await _wait_event(serve.observer, "user_message", text="skill-marker")
+    await _wait_event(serve.observer, "agent_end")
+
+
+class TruncatedBackend:
+    """A reply cut off mid-stream: its row is written as ``failed``."""
+
+    @owned_completion
+    async def complete(self, messages: Any, tool_schemas: Any) -> Any:
+        del messages, tool_schemas
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("failed-marker")]),
+            data={"truncated": True},
+        )
+
+
+async def _assistant_failed(serve: Serve) -> None:
+    await serve.controller.request(serve.request_id(), "send", {"text": "go"})
+    await _wait_event(serve.observer, "assistant_message")
     await _wait_event(serve.observer, "agent_end")
 
 
@@ -385,6 +458,12 @@ SCENARIOS = {
     "delivery_after_newer_row": Scenario(
         "delivery_after_newer_row", lambda tmp: _text_backend("ok"), lambda s, b: _delivery_after_newer_row(s)
     ),
+    "send_plain": Scenario("send_plain", lambda tmp: _text_backend("ok"), lambda s, b: _send_plain(s)),
+    "send_images": Scenario("send_images", lambda tmp: _text_backend("ok"), lambda s, b: _send_images(s)),
+    "send_skill": Scenario("send_skill", lambda tmp: _text_backend("ok"), lambda s, b: _send_skill(s)),
+    "assistant_failed": Scenario(
+        "assistant_failed", lambda tmp: TruncatedBackend(), lambda s, b: _assistant_failed(s)
+    ),
     "foreground_tool": Scenario("foreground_tool", _foreground_tool_backend, lambda s, b: _foreground_tool(s)),
     "background_child": Scenario("background_child", _background_backend, lambda s, b: _background(s)),
     "dropped_steer": Scenario("dropped_steer", lambda tmp: BlockingBackend(), _dropped_steer),
@@ -402,6 +481,8 @@ SCENARIOS = {
 # which scenarios produce each row-backed route; a new table entry without one fails P
 PREMISE_SCENARIOS: dict[Route, tuple[str, ...]] = {
     (EventDescriptor.USER_MESSAGE, "delivered"): ("delivery_idle", "delivery_after_newer_row"),
+    (EventDescriptor.USER_MESSAGE, "undelivered"): ("send_plain", "send_images", "send_skill"),
+    (EventDescriptor.ASSISTANT_MESSAGE, ""): ("delivery_idle", "assistant_failed"),
     (EventDescriptor.TOOL_END, "foreground"): ("foreground_tool",),
     (EventDescriptor.TOOL_END, "background_terminal"): ("background_child",),
     (EventDescriptor.APPROVAL_REQUEST, "foreground"): ("foreground_tool",),
@@ -412,7 +493,7 @@ PREMISE_SCENARIOS: dict[Route, tuple[str, ...]] = {
     **{(event, "durable"): (f"notification_{event.value}",) for event in NOTIFICATIONS},
 }
 ROW_BACKED = [
-    route for route, source in rows.ROUTES.items() if source is not rows.LIVE and source is not rows.PUBLISH_FIRST
+    route for route, source in rows.ROUTES.items() if source is not rows.LIVE
 ]
 PREMISE_CASES = [
     (route, scenario) for route in ROW_BACKED for scenario in PREMISE_SCENARIOS.get(route, ("missing",))
