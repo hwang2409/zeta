@@ -8,6 +8,7 @@ from ..context_eviction.receipt_constructors import (
     REASONING_KIND,
     RECEIPT_FIELDS_METADATA,
     RECEIPT_KIND_METADATA,
+    _valid_persisted_reasoning_receipt_metadata,
     is_receipt_echo,
     reasoning_marker,
 )
@@ -81,7 +82,7 @@ def _provider_message(message: Message) -> Message | None:
     seq = metadata.get("source_seq")
     last = message.content[-1] if message.content else None
     if (
-        set(metadata) == {"context_evicted", "source_seq"}
+        _valid_persisted_reasoning_receipt_metadata(metadata)
         and type(seq) is int
         and isinstance(last, TextContent)
         and last.text == reasoning_marker(seq)
