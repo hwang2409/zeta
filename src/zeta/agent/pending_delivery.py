@@ -844,6 +844,7 @@ async def send_to_run(
                 message,
                 origin,
                 time.monotonic() + AGENT_SEND_COMMIT_TIMEOUT_SECONDS,
+                starts_new_episode=True,
             ),
         )
     except PendingPromptCommitTimeoutError:
