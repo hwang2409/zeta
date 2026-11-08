@@ -754,8 +754,6 @@ async def _frames_until_eof(reader: asyncio.StreamReader) -> list[dict[str, Any]
     return frames
 
 
-
-
 class OAuthRefreshFailureBackend:
     def __init__(self, driver: Any, status_code: int) -> None:
         self.driver = driver
@@ -3465,9 +3463,7 @@ async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> Non
         await asyncio.sleep(0)
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         writers.append(writer)
-        hello = await _request(
-            reader, writer, 1, "hello", {"protocol_version": "1.0"}
-        )
+        hello = await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         assert hello[-1]["result"]["notices"] == [
             "could not clean up account directory /secret"
         ]
@@ -3805,7 +3801,10 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
         ),
         (
             "error",
-            {"error": {"code": "empty_turn", "message": bounded_error.message}, "data": {}},
+            {
+                "error": {"code": "empty_turn", "message": bounded_error.message},
+                "data": {},
+            },
         ),
     ]
 
@@ -11336,7 +11335,9 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     # test-contract: seam the bounded queue has no public admission hook
     monkeypatch.setattr(server.connections, "_enqueue", record_enqueue)
     # test-contract: seam approval settlement has no public pre-publication hook
-    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish_record)
+    monkeypatch.setattr(
+        server.control._approvals, "_finish_record", gated_finish_record
+    )
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
