@@ -45,7 +45,6 @@ run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 _OWNER_COUNTS = None
 _OWNER_COUNT_GROUPS = []
-_OWNER_COUNT_ERRORS = []
 _OWNER_LEAK_BASELINE = _TEST_SITE_PACKAGES / "owner_leak_ratchet.txt"
 
 
@@ -622,6 +621,7 @@ def _fd_summary() -> str:
 def _finish_owner_counts(session: pytest.Session) -> None:
     from tests.support.owner_counts import gate_failures, merge_rows, write_rows
 
+    errors = []
     if _OWNER_COUNTS is not None:
         owner_rows = _OWNER_COUNTS.rows()
         _OWNER_COUNTS.uninstall()
@@ -629,7 +629,7 @@ def _finish_owner_counts(session: pytest.Session) -> None:
         try:
             owner_rows = merge_rows(_OWNER_COUNT_GROUPS)
         except ValueError as exc:
-            _OWNER_COUNT_ERRORS.append(str(exc))
+            errors.append(str(exc))
             owner_rows = []
     worker_output = getattr(session.config, "workeroutput", None)
     if worker_output is not None:
@@ -637,11 +637,10 @@ def _finish_owner_counts(session: pytest.Session) -> None:
     else:
         if observed_path := os.environ.get("ZETA_OWNER_COUNTS"):
             write_rows(Path(observed_path), owner_rows)
-        if _OWNER_LEAK_BASELINE.exists():  # record phase; removed with the baseline
-            _OWNER_COUNT_ERRORS.extend(gate_failures(owner_rows, _OWNER_LEAK_BASELINE))
-        for failure in _OWNER_COUNT_ERRORS:
+        errors.extend(gate_failures(owner_rows, _OWNER_LEAK_BASELINE))
+        for failure in errors:
             print(failure, flush=True)
-        if _OWNER_COUNT_ERRORS:
+        if errors:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
