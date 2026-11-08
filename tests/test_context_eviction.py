@@ -82,6 +82,72 @@ def test_invalid_eviction_view_sequences_are_boundaries(
     assert all(item.message.metadata["eviction_view_invalid"] for item in items)
 
 
+def test_covered_rows_skip_message_decoding() -> None:
+    entries = [
+        ConversationEntry(
+            seq=seq,
+            id=str(seq),
+            parent_id=None,
+            lane="main",
+            type="message",
+            data={"message": text(MessageRole.ASSISTANT, str(seq)).to_dict()},
+        )
+        for seq in range(1, 101)
+    ]
+    marker = ConversationEntry(
+        seq=101,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 1,
+            "source_seq_end": 100,
+            "view": [{"seq": 1, "message": entries[0].data["message"]}],
+        },
+    )
+
+    assembler = object.__new__(ContextAssembler)
+    with patch.object(Message, "from_dict", wraps=Message.from_dict) as from_dict:
+        projected = assembler._visible_items([*entries, marker])
+
+    # test-contract: seam _visible_items is the narrow projection seam under test
+    assert [item.message.content[0].text for item in projected] == ["1"]
+    # test-contract: seam _visible_items is the narrow projection seam under test
+    assert from_dict.call_count == 1
+
+
+def test_covered_rows_with_invalid_metadata_keep_decoder_validation() -> None:
+    malformed = text(MessageRole.ASSISTANT, "malformed").to_dict()
+    malformed["metadata"] = []
+    entry = ConversationEntry(
+        seq=1,
+        id="1",
+        parent_id=None,
+        lane="main",
+        type="message",
+        data={"message": malformed},
+    )
+    marker = ConversationEntry(
+        seq=2,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 1,
+            "source_seq_end": 1,
+            "view": [{"seq": 1, "message": text(MessageRole.ASSISTANT, "1").to_dict()}],
+        },
+    )
+
+    assembler = object.__new__(ContextAssembler)
+    with pytest.raises(ValueError, match="message metadata must be an object"):
+        assembler._visible_items([entry, marker])
+
+
 def test_legacy_pinned_message_uses_original_source_order() -> None:
     request = text(MessageRole.USER, "request")
     entries = [
