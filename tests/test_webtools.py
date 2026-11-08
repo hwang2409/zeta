@@ -479,6 +479,7 @@ async def test_registry_close_drains_in_flight_web_request(
         )
         assert rejected["isError"] is True
         assert "web client owner is closed" in rejected["content"][0]["text"]
+        client = next(iter(registry.web_clients._anonymous.values())).client
 
         close_task.cancel()
         cancelled = await await_or_fail(
@@ -488,6 +489,9 @@ async def test_registry_close_drains_in_flight_web_request(
         assert isinstance(cancelled[0], asyncio.CancelledError)
         response_gate.set()
         await await_or_fail(request, what="in-flight fetch to release its web client")
+        async with registry.web_clients._condition:
+            pass
+        assert client.is_closed, "cancelled registry close left its web client open"
         await await_or_fail(
             server.connection_closed.wait(), what="request connection context to close"
         )
