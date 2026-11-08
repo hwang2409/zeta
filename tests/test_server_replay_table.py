@@ -1192,14 +1192,14 @@ async def _approval_reconnect_rejoin(
     controller_stream = (await _join(controller, session_id))["result"]["replay"]["stream_id"]
     assert server.connections is not None and server._client is not None
     old_controller = server._client
-    entered, released = asyncio.Event(), asyncio.Event()
+    entered, released, hold = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_write = _Client._write_physical
     original_release = server.connections.release
 
     async def hold_controller(owner: _Client, payload: bytes) -> bool:
         if owner is old_controller and controller_stream.encode() in payload:
             entered.set()
-            await asyncio.Event().wait()
+            await await_or_fail(hold.wait(), what="old controller frame held until its close")
         return await original_write(owner, payload)
 
     def release(connection: Any) -> None:
