@@ -159,7 +159,12 @@ class ContextAssembler(ContextMarkerMixin):
         self._session_usage = SessionUsage(
             sink=self.usage_sink, on_growth=self.on_token_growth
         )
-        self._preparation_owner = ContextPreparation(self.store, lambda branch, *, force, assembly_budget, system_append: self._prepare_assembly(branch, force=force, assembly_budget=assembly_budget, system_append=system_append), self.token_budget, self.estimator_token_budget)
+        self._preparation_owner = ContextPreparation(
+            self.store,
+            self._prepare_assembly,
+            self.token_budget,
+            self.estimator_token_budget,
+        )
     def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
         if force:
@@ -194,7 +199,9 @@ class ContextAssembler(ContextMarkerMixin):
             raise ValueError("token budget must be positive")
         self.token_budget = token_budget
         self._request_budget.update_provider_limit(token_budget)
-        self._preparation_owner.invalidate()
+        self._preparation_owner.update_budgets(
+            token_budget, self.estimator_token_budget
+        )
 
     def update_backend(self, backend: CompletionBackend) -> None:
         """Replace the session backend without bypassing request admission."""
@@ -359,7 +366,6 @@ class ContextAssembler(ContextMarkerMixin):
         return list(context.messages)
 
     def discard_prepared_context(self) -> None:
-        """Drop an unconsumed preparation, including its message graph."""
         self._preparation_owner.discard()
 
     async def prepare_context(
@@ -406,20 +412,14 @@ class ContextAssembler(ContextMarkerMixin):
             prepared = self._preparation_owner.take(key)
             if prepared is not None:
                 branch, preparation = prepared
+                branch_id = self._branch_id(branch)
                 break
-            branch = self.store.active_branch_snapshot()
-            branch_id = self._branch_id(branch)
-            preparation = await asyncio.to_thread(
-                _cooperative_call,
-                self._prepare_assembly,
-                branch,
+            await self._preparation_owner.prepare(
                 force=force,
-                assembly_budget=assembly_budget,
+                reserved_estimator_tokens=reserved_estimator_tokens,
                 system_append=system_append,
             )
-            await asyncio.sleep(0)
-            if self.store.active_branch_head_id() == branch_id:
-                break
+            continue
         items = preparation.items
         result_seqs = preparation.result_seqs
         boundary = preparation.boundary

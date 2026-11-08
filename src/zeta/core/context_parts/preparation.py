@@ -39,6 +39,11 @@ class ContextPreparation:
     def key(branch_id: str | None, *, force: bool, assembly_budget: int, system_append: str) -> PreparationKey:
         return branch_id, force, assembly_budget, system_append
 
+    def update_budgets(self, token_budget: int, estimator_budget: int) -> None:
+        self._token_budget = token_budget
+        self._estimator_budget = estimator_budget
+        self.discard()
+
     def budget(self, reserved_estimator_tokens: int) -> int:
         if reserved_estimator_tokens < 0:
             raise ValueError("reserved estimator tokens must be non-negative")
