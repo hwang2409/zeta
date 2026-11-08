@@ -753,7 +753,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     servers: list[ZetaServer] = []
     closed_servers: set[ZetaServer] = set()
     apps: list[TUIApp] = []
-    closed_apps: set[TUIApp] = set()
+    closed_apps: weakref.WeakSet[TUIApp] = weakref.WeakSet()
     test_home_leases = {}
     loop_init = AgentLoop.__init__
     loop_close = AgentLoop.close
@@ -896,6 +896,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     async def tracked_app_close(app, *args, **kwargs):
         await app_close(app, *args, **kwargs)
         closed_apps.add(app)
+        apps.remove(app)
 
     @wraps(server_close)
     async def tracked_server_close(server, *args, **kwargs):
@@ -934,7 +935,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     first_error: BaseException | None = None
 
     # Apps own loops and stores, so close them before those lower-level owners.
-    for app in reversed(apps):
+    for app in reversed(apps.copy()):
         if app not in closed_apps:
             try:
                 await await_or_fail(close_owned_app(app), what="TUIApp.close")
