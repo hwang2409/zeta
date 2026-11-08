@@ -14,7 +14,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .storage_format import WRITER_EPOCH, require_closed_variant
+from .storage_format import (
+    FEATURE_EPOCHS,
+    WRITER_EPOCH,
+    StorageFeature,
+    feature_enabled,
+    require_closed_variant,
+)
 
 AttentionKind = Literal["decision", "answer", "decided", "deferred"]
 
@@ -125,11 +131,14 @@ class AttentionStore:
         kind: AttentionKind = "decision",
     ) -> AttentionRecord:
         require_closed_variant("attention.kind", kind)
-        if kind != "decision" and self.writer_epoch < WRITER_EPOCH:
+        if kind != "decision" and not feature_enabled(
+            self.writer_epoch, StorageFeature.ATTENTION_KINDS
+        ):
+            required_epoch = FEATURE_EPOCHS[StorageFeature.ATTENTION_KINDS]
             raise ValueError(
                 "non-decision attention kinds require the one-way shared cutover: "
                 f"zeta storage-format advance --expected-epoch {self.writer_epoch} "
-                f"--target-epoch {WRITER_EPOCH}"
+                f"--target-epoch {required_epoch}"
             )
         if kind != "decision" and (options or recommendation is not None):
             raise ValueError(

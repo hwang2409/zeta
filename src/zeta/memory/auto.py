@@ -32,7 +32,7 @@ from ..protocol.types import (
     MessageOrigin,
 )
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
-from ..storage_format import WRITER_EPOCH, WriterLease, open_writer
+from ..storage_format import StorageFeature, WriterLease, feature_enabled, open_writer
 from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
 from .profiles import early_update_debounce_seconds, early_update_max_wait_seconds
 from .reconciler import (
@@ -281,7 +281,9 @@ class AutoMemoryReconciler:
         memory_review_required: bool,
     ) -> None:
         """Apply a repaired transcript only on this reconciler's owner loop."""
-        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+        if not feature_enabled(
+            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
+        ):
             raise ProjectRegistryError("memory writes are unavailable before the writer epoch")
         generation = self.state.generation + 1
         await asyncio.to_thread(
@@ -308,10 +310,10 @@ class AutoMemoryReconciler:
         """Commit one recovery review, then resume scanning from its cutoff."""
         if root_session_id != self.session_id:
             return "memory recovery: unavailable for this session"
-        if self._storage_lease.observed_epoch != WRITER_EPOCH:
-            raise ProjectRegistryError(
-                "memory writes are unavailable before the writer epoch"
-            )
+        if not feature_enabled(
+            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
+        ):
+            raise ProjectRegistryError("memory writes are unavailable before the writer epoch")
 
         def resume() -> int:
             with ConversationStore(

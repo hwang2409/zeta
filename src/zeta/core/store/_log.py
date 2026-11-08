@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from ...agent.receipt import encode_json
-from ...storage_format import WRITER_EPOCH
+from ...storage_format import StorageFeature, feature_enabled
 from ..checkpoints import (
     CONVERSATION_ENTRY_TYPES,
     ConversationEntry,
@@ -33,7 +33,6 @@ from ..checkpoints import (
 )
 from ..session_files import open_session_file
 from ..transcript_recovery import (
-    TRANSCRIPT_REPAIR_EPOCH,
     TranscriptSourceFacts,
     ValidatedPrefix,
     reconcile_pending,
@@ -853,7 +852,10 @@ class ConversationLogMixin:
             repairable=repairable,
             repair_available=(
                 repairable
-                and self._storage_lease.observed_epoch >= TRANSCRIPT_REPAIR_EPOCH
+                and feature_enabled(
+                    self._storage_lease.observed_epoch,
+                    StorageFeature.TRANSCRIPT_REPAIR,
+                )
             ),
             source_device=stat.st_dev,
             source_inode=stat.st_ino,
@@ -956,7 +958,9 @@ class ConversationLogMixin:
     ) -> bool:
         if not self._repair_explicit or error._source_facts is None:
             return False
-        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+        if not feature_enabled(
+            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
+        ):
             raise error
         self._last_repair_result = repair_transcript(
             self.directory_fd,
@@ -979,7 +983,9 @@ class ConversationLogMixin:
     ) -> bool:
         if torn_offset is None:
             return False
-        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+        if not feature_enabled(
+            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
+        ):
             self._repair_torn_tail_legacy(torn_offset)
             self._log_offset = torn_offset
             self._publish_entries_installed(delta)
@@ -1014,7 +1020,9 @@ class ConversationLogMixin:
 
     def _load_full(self: ConversationStore) -> None:
         self._full_reload_count += 1
-        if not self._read_only and self._storage_lease.observed_epoch == WRITER_EPOCH:
+        if not self._read_only and feature_enabled(
+            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
+        ):
             reconcile_pending(
                 self.directory_fd,
                 self._repair_target,
