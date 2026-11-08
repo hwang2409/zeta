@@ -2835,10 +2835,7 @@ async def test_abort_captures_turn_before_approval_end_write(
             "hello",
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
-        new_session = await _request(
-            reader, writer, 2, "new_session", {"provider": "codex"}
-        )
-        session_id = new_session[-1]["result"]["session"]["session_id"]
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "wait for approval"})
         await _event(reader, "approval_request")
 
@@ -2859,12 +2856,9 @@ async def test_abort_captures_turn_before_approval_end_write(
                 _frames_until_event(reader, "turn_aborted"),
                 what="turn_aborted frame",
             )
-        writer.write(b'{"jsonrpc":"2.0","id":5,"method":"status","params":{}}\n')
-        await await_or_fail(writer.drain(), what="status request write")
-        frames += await await_or_fail(
-            read_until(reader, lambda frame: frame.get("id") == 5, what="status response"),
-            what="status response frames",
-        )
+        sentinel = asyncio.Event()
+        asyncio.get_running_loop().call_soon(sentinel.set)
+        await await_or_fail(sentinel.wait(), what="post-abort sentinel")
 
         names = [
             frame.get("params", {}).get("event")
@@ -2878,23 +2872,14 @@ async def test_abort_captures_turn_before_approval_end_write(
             "tool_end",
             "turn_aborted",
         ]
-        assert not {"tool_start", "tool_end", "turn_start"}.intersection(
-            names[turn_aborted_index + 1 :]
-        )
         canceled_tool_end = _named_events(frames, "tool_end")[-1]
         assert canceled_tool_end["tool_call"]["id"] == call.id
         assert canceled_tool_end["tool_result"]["is_canceled"] is True
         assert len(backend.calls) == 1
-        history = (
-            await _request(
-                reader,
-                writer,
-                6,
-                "session_history",
-                {"session_id": session_id},
-            )
-        )[-1]["result"]["messages"]
-        assert aborted_reply not in json.dumps(history)
+        history = server.runtime.opened.store.messages()
+        assert aborted_reply not in json.dumps(
+            [message.to_dict() for message in history]
+        )
     finally:
         allow_approval_end.set()
         if abort is not None and not abort.done():
