@@ -57,6 +57,7 @@ from .storage_format import (
     mapping_mutations,
     open_writer,
     reject_unknown_keys,
+    release_later,
     require_closed_variant,
 )
 
@@ -227,7 +228,7 @@ class ProjectRegistry(
         with format_lock():
             self._storage_lease = open_writer(self.root.parent)
         self._release_storage_lease = weakref.finalize(
-            self, self._storage_lease.close
+            self, release_later, self._storage_lease.close
         )
 
     def _ensure_root(self) -> None:

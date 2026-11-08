@@ -228,10 +228,10 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(
         inbox = ProjectInbox(
             manager.project_registry, sessions_root=tmp_path / "sessions"
         )
-        assert (
-            len(inbox.new_ids(project.project_id, session_id=owner.store.session_id))
-            == 1
+        new_ids = await asyncio.to_thread(
+            inbox.new_ids, project.project_id, session_id=owner.store.session_id
         )
+        assert len(new_ids) == 1
         await await_or_fail(wake_event.wait(), what="same-session wake")
         assert len(wakes) == 1
     finally:
@@ -301,10 +301,10 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
         inbox = ProjectInbox(
             manager.project_registry, sessions_root=tmp_path / "sessions"
         )
-        assert (
-            len(inbox.new_ids(project.project_id, session_id=owner.store.session_id))
-            == 1
+        new_ids = await asyncio.to_thread(
+            inbox.new_ids, project.project_id, session_id=owner.store.session_id
         )
+        assert len(new_ids) == 1
         await await_or_fail(wake_event.wait(), what="same-session wake")
         assert len(wakes) == 1
     finally:
