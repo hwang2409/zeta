@@ -18,6 +18,7 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
@@ -27,7 +28,10 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
-from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
+from ..core.transcript_recovery.runtime import (
+    repair_transcript_for_runtime,
+    transcript_repair_available,
+)
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
@@ -111,6 +115,90 @@ class ServerSlashSession:
 
     # --- runnable server-side ---
 
+    async def slash_decisions(self, args: str) -> str:
+        from ..attention_decisions import open_decisions
+        from ..attention_forks import deliver_attention_decision
+        from ..attention_records import AttentionStore
+
+        loop = self._runtime.loop
+        opened = self._runtime.opened
+        if loop is None or opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        parts = args.split(maxsplit=2)
+        registry_state = self._runtime.manager.project_registry_state
+        items = await asyncio.to_thread(
+            open_decisions,
+            self._runtime.home,
+            opened.metadata.session_id,
+            registry_state,
+        )
+        if parts and parts[0] in {"dismiss", "reply"}:
+            if len(parts) < 2:
+                return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
+            item = next((item for item in items if item.record.id == parts[1]), None)
+            if item is None:
+                return "attention item not found"
+            store = AttentionStore(self._runtime.home / "sessions" / item.session_id)
+            if parts[0] == "dismiss":
+                await asyncio.to_thread(
+                    store.dismiss, item.record.id, session_id=item.session_id
+                )
+                return f"dismissed {item.record.id}"
+            if len(parts) < 3 or not parts[2].strip():
+                return "reply text must be nonempty"
+            await asyncio.to_thread(
+                deliver_attention_decision,
+                self._runtime.home,
+                item.record,
+                parts[2],
+                from_session=opened.metadata.session_id,
+                registry_state=registry_state,
+            )
+            return f"replied to {item.record.id}"
+        if not items:
+            return "no open attention items"
+        return "open attention items:\n" + "\n".join(
+            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            for item in items
+        )
+
+    @property
+    def plan_mode(self) -> bool:
+        return self._runtime.loop.plan_mode if self._runtime.loop is not None else False
+
+    @property
+    def active(self) -> bool:
+        return False
+
+    @property
+    def pending_approvals(self) -> tuple[str, ...]:
+        if self._approval_control is None:
+            return ()
+        return self._approval_control.pending_approval_labels()
+
+    def set_plan_mode(self, enabled: bool):
+        if self._runtime.loop is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        return self._runtime.loop.set_plan_mode(enabled)
+
+    def invalidate_prompt(self) -> None:
+        return None
+
+    def plan_mode_background_blocker(self) -> str | None:
+        work = tuple(getattr(self._runtime.loop, "background_work_descriptions", ()))
+        if not work:
+            return None
+        return (
+            "plan mode unchanged: background work is active: "
+            f"{', '.join(work)}; stop it or wait"
+        )
+
+    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
+        return await run_plan_command(self, args)
+
+    async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
+        return await run_implement_command(self, args)
+
     def slash_status_command(self, args: str) -> str | Awaitable[str]:
         del args
         if self._run_blocking is None:
@@ -169,7 +257,12 @@ class ServerSlashSession:
         displays = await asyncio.to_thread(context.store.list_display)
         lines: list[str] = []
         for item in displays:
-            lines.append(str(item) + (f"  {item.detail}" if item.detail else ""))
+            availability = (
+                "  unavailable: credentials missing" if not item.available else ""
+            )
+            lines.append(
+                str(item) + (f"  {item.detail}" if item.detail else "") + availability
+            )
             lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
         return "\n".join(lines) or "no accounts"
 
@@ -406,7 +499,14 @@ async def list_commands(
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
-    entries = _entries_from_registry(registry, include_unavailable=include_unavailable)
+    repair_available = transcript_repair_available(runtime.manager)
+    entries = [
+        entry
+        for entry in _entries_from_registry(
+            registry, include_unavailable=include_unavailable
+        )
+        if repair_available or entry.name != "repair-transcript"
+    ]
     return {
         "commands": [entry.to_dict() for entry in entries],
         "notices": list(registry.notices),
@@ -452,7 +552,7 @@ async def run_command(
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
-    if not text.startswith("/") or text.startswith("//"):
+    if not text.startswith("/"):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must start with '/'")
     first_line = text.split("\n", 1)[0]
     parts = first_line[1:].split(maxsplit=1)

@@ -431,6 +431,7 @@ class ComposerAttachmentMixin:
             signal = getattr(self, "_standalone_abort_signal", None)
             if signal is not None:
                 signal.abort()
+            self.loop.abort(foreground_only=True)
             for request in self.pending_approvals:
                 if self._approval_policy is not None:
                     self._approval_policy.abort(request.key)

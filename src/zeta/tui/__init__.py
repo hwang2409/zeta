@@ -1,11 +1,13 @@
 """Interactive terminal interface for zeta."""
 
-from .app import TUIApp
-
 __all__ = ["TUIApp", "main"]
 
 
 def __getattr__(name: str) -> object:
+    if name == "TUIApp":
+        from .app import TUIApp
+
+        return TUIApp
     if name == "main":
         from ..cli.main import main
 
