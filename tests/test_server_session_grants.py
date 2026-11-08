@@ -1330,6 +1330,7 @@ async def test_abort_canceled_settlement_keeps_controller_connected(
         await close_serve(server, writer)
 
 
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
 @pytest.mark.parametrize(
     "case",
     [
@@ -1346,8 +1347,8 @@ async def test_abort_canceled_settlement_keeps_controller_connected(
     ],
 )
 @pytest.mark.asyncio
-async def test_session_grant_lifecycle_table_over_unix_protocol(
-    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+async def test_session_grant_lifecycle_table_over_real_transports(
+    tmp_path: Path, transport: str, case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Exercise grant ownership and every cancellation await over unix serve."""
     GrantPublication = getattr(approval_lifecycle, "GrantPublication", None)
@@ -1360,26 +1361,94 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
     )
     server = ZetaServer(
         home=tmp_path,
-        socket_path=_socket_path(tmp_path),
+        socket_path=_socket_path(tmp_path) if transport == "unix" else None,
+        port=0 if transport == "websocket" else None,
+        ws_port=0 if transport == "websocket" else None,
         provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer = await _connect(server)
+    if transport == "unix":
+        reader, writer = await _connect(server)
+    else:
+        await server.start()
+        reader, writer, status, _headers = await _connect_websocket(
+            server, token=None, protocol_token=server._websocket.token
+        )
+        assert status == 101
     replacement_reader: asyncio.StreamReader | None = None
     replacement_writer: asyncio.StreamWriter | None = None
+    observed: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+
+    async def request(request_id: int, method: str, params: dict[str, object]) -> list[dict[str, Any]]:
+        if transport == "unix":
+            frames = await _request(reader, writer, request_id, method, params)
+        else:
+            await _send_json(writer, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            frames = []
+            while True:
+                frame = await _read_json(reader)
+                frames.append(frame)
+                if frame.get("id") == request_id:
+                    break
+        observed.extend(frames)
+        if transport == "websocket":
+            pending.extend(frames)
+        return frames
+
+    async def event(name: str) -> dict[str, Any]:
+        if transport == "websocket":
+            for index, frame in enumerate(pending):
+                if frame.get("params", {}).get("event") == name:
+                    pending.pop(index)
+                    return frame["params"]
+        while True:
+            frame = await (_event(reader, name) if transport == "unix" else _read_json(reader))
+            if transport == "websocket" and frame.get("params", {}).get("event") != name:
+                pending.append(frame)
+                continue
+            observed.append(frame)
+            return frame["params"] if transport == "websocket" else frame
+
+    def buffered() -> list[dict[str, Any]]:
+        return _buffer(reader) if transport == "unix" else pending
+
+    async def frames_until(name: str) -> list[dict[str, Any]]:
+        if transport == "unix":
+            frames = await _frames_until_event(reader, name)
+        else:
+            frames = []
+            while True:
+                if pending:
+                    frame = pending.pop(0)
+                else:
+                    frame = await _read_json(reader)
+                frames.append(frame)
+                if frame.get("params", {}).get("event") == name:
+                    break
+        observed.extend(frames)
+        return frames
+
+    async def hello_create() -> tuple[dict[str, Any], str]:
+        hello = (await request(1, "hello", {"protocol_version": "1.2", "features": FEATURES}))[-1]["result"]
+        assert "session_grants" in hello["capabilities"]["features"]
+        created = (await request(2, "new_session", {"provider": "codex"}))[-1]["result"]
+        reset = await event("session_grants_changed")
+        assert reset["data"]["change"] == "reset"
+        return hello, created["session"]["session_id"]
     try:
-        _, session_id = await _hello_and_create(reader, writer)
-        await _request(reader, writer, 3, "send", {"text": "grant"})
-        assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
+        _, session_id = await hello_create()
+        await request( 3, "send", {"text": "grant"})
+        assert (await event("approval_request"))["request_id"] == "call-1"
         cancel = case.startswith("cancel_")
         if case == "deny":
             response = (
-                await _request(reader, writer, 4, "deny", {"request_id": "call-1"})
+                await request( 4, "deny", {"request_id": "call-1"})
             )[-1]
             assert response["result"]["decision"] == "deny"
             assert not any(
                 frame.get("params", {}).get("event") == "session_grants_changed"
-                for frame in _buffer(reader)
+                for frame in buffered()
             )
         else:
             entered = asyncio.Event()
@@ -1484,10 +1553,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     history_published=True,
                 )
             approve = asyncio.create_task(
-                _request(
-                    reader,
-                    writer,
-                    4,
+                request(4,
                     "approve",
                     {"request_id": "call-1", "scope": "always_tool"},
                 )
@@ -1524,7 +1590,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
             if cancel:
                 published = [
                     frame
-                    for frame in _buffer(reader)
+                    for frame in buffered()
                     if frame.get("params", {}).get("event") == "session_grants_changed"
                 ]
                 assert len(published) == 1, (
@@ -1536,25 +1602,24 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 )
                 status = (
                     await await_or_fail(
-                        _request(reader, writer, 10, "status"),
+                        request(10, "status", {}),
                         what=f"{case} live controller status",
                     )
                 )[-1]
                 assert status["result"]["state"] == "idle", (
                     f"{case} live controller did not remain connected: {status!r}"
                 )
-                snapshot_frames = await _request(reader, writer, 11, "session_grants")
+                snapshot_frames = await request(11, "session_grants", {})
                 all_frames.extend(snapshot_frames)
                 snapshot = snapshot_frames[-1]
                 assert snapshot["result"]["session_grants"] == ["bash"]
-                send_frames = await _request(
-                    reader, writer, 12, "send", {"text": "ask again"}
+                send_frames = await request(12, "send", {"text": "ask again"}
                 )
                 all_frames.extend(send_frames)
                 send_response = send_frames[-1]
                 assert send_response.get("result", {}).get("accepted") is True
                 next_turn = await await_or_fail(
-                    _frames_until_event(reader, "turn_end"),
+                    frames_until("turn_end"),
                     what=f"{case} next turn end",
                 )
                 all_frames.extend(next_turn)
@@ -1562,11 +1627,14 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     frame.get("params", {}).get("event") == "approval_request"
                     for frame in next_turn
                 )
-                changed = [
-                    frame
-                    for frame in [*all_frames, *_buffer(reader)]
-                    if frame.get("params", {}).get("event") == "session_grants_changed"
-                ]
+                changed: list[dict[str, Any]] = []
+                for frame in [*all_frames, *observed]:
+                    if (
+                        frame.get("params", {}).get("event") == "session_grants_changed"
+                        and frame.get("params", {}).get("data", {}).get("change") == "grant"
+                        and frame not in changed
+                    ):
+                        changed.append(frame)
                 assert len(changed) == 1, (
                     f"{case} must publish exactly one grant-change event; observed {changed!r}"
                 )
@@ -1576,12 +1644,12 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
             else:
                 grant_events = [
                     frame
-                    for frame in _buffer(reader)
+                    for frame in buffered()
                     if frame.get("params", {}).get("event") == "session_grants_changed"
                 ]
                 assert len(grant_events) == (0 if case == "deny" else 1)
                 if case == "duplicate":
-                    _buffer(reader).clear()
+                    buffered().clear()
                     assert server.runtime.opened is not None
                     duplicate_call = ToolCall(
                         "call-2", "bash", {"command": "true"}
@@ -1589,13 +1657,10 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     server.runtime.opened.store.append_approval_request(
                         "call-2", duplicate_call
                     )
-                    before = (await _request(reader, writer, 5, "session_grants"))[-1]
+                    before = (await request(5, "session_grants", {}))[-1]
                     assert before["result"]["session_grants"] == ["bash"]
                     duplicate_response = (
-                        await _request(
-                            reader,
-                            writer,
-                            6,
+                        await request(6,
                             "approve",
                             {"request_id": "call-2", "scope": "always_tool"},
                         )
@@ -1603,11 +1668,11 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     assert duplicate_response.get("result", {}).get("accepted") is True, (
                         f"duplicate approval was not accepted: {duplicate_response!r}"
                     )
-                    sentinel = (await _request(reader, writer, 7, "session_grants"))[-1]
+                    sentinel = (await request(7, "session_grants", {}))[-1]
                     assert sentinel["result"]["session_grants"] == ["bash"]
                     duplicate_events = [
                         frame
-                        for frame in _buffer(reader)
+                        for frame in buffered()
                         if frame.get("params", {}).get("event")
                         == "session_grants_changed"
                     ]
@@ -1618,7 +1683,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
         if not cancel:
             restarted = case == "restart_replay"
             if restarted:
-                await _frames_until_event(reader, "turn_end")
+                await frames_until("turn_end")
                 await close_serve(server, writer)
                 writer = None  # type: ignore[assignment]
                 replay_backend = FakeBackend(
@@ -1631,50 +1696,51 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 )
                 server = ZetaServer(
                     home=tmp_path,
-                    socket_path=_socket_path(tmp_path),
+                    socket_path=_socket_path(tmp_path) if transport == "unix" else None,
+                    port=0 if transport == "websocket" else None,
+                    ws_port=0 if transport == "websocket" else None,
                     provider="codex",
                     backend_factory=lambda provider, model, home: (
                         replay_backend,
                         model or "offline",
                     ),
                 )
-                reader, writer = await _connect(server)
-                await _request(
-                    reader,
-                    writer,
-                    10,
+                if transport == "unix":
+                    reader, writer = await _connect(server)
+                else:
+                    await server.start()
+                    reader, writer, status, _headers = await _connect_websocket(
+                        server, token=None, protocol_token=server._websocket.token
+                    )
+                    assert status == 101
+                pending.clear()
+                await request(10,
                     "hello",
                     {"protocol_version": "1.2", "features": FEATURES},
                 )
-                await _request(
-                    reader,
-                    writer,
-                    11,
+                await request(11,
                     "resume",
                     {"session_id": session_id},
                 )
-                reset = await _event(reader, "session_grants_changed")
+                reset = await event("session_grants_changed")
                 assert reset["data"]["change"] == "reset"
-            snapshot = (await _request(reader, writer, 6, "session_grants"))[-1][
+            snapshot = (await request(6, "session_grants", {}))[-1][
                 "result"
             ]
             expected_grants = [] if case in {"deny", "restart_replay"} else ["bash"]
             assert snapshot["session_grants"] == expected_grants
             if restarted:
-                await _request(reader, writer, 12, "send", {"text": "ask again"})
-                assert (await _event(reader, "approval_request"))[
+                await request( 12, "send", {"text": "ask again"})
+                assert (await event("approval_request"))[
                     "request_id"
                 ] == "call-2"
-                await _request(
-                    reader,
-                    writer,
-                    13,
+                await request(13,
                     "deny",
                     {"request_id": "call-2"},
                 )
-                await _frames_until_event(reader, "turn_end")
+                await frames_until("turn_end")
             else:
-                await _frames_until_event(reader, "turn_end")
+                await frames_until("turn_end")
             assert not server.control._approvals.state.records
     finally:
         release.set() if "release" in locals() else None
