@@ -276,6 +276,20 @@ class CommandRuntimeMixin:
         log_path: Path,
     ) -> None:
         instance_id = f"macro:{call.id}"
+        cancellation: asyncio.Task[None] | None = None
+
+        async def cancel() -> None:
+            await self.loop.tool_registry.background_tasks.kill(
+                task_id,
+                cause="background macro canceled by the user",
+                tui_presented=True,
+            )
+
+        def request_cancel() -> asyncio.Task[None]:
+            nonlocal cancellation
+            if cancellation is None:
+                cancellation = asyncio.create_task(cancel())
+            return cancellation
 
         async def watch() -> None:
             try:
@@ -313,18 +327,16 @@ class CommandRuntimeMixin:
                     )
                 )
             finally:
-                self.loop._background_owner.unregister(instance_id)
+                try:
+                    if cancellation is not None:
+                        await cancellation
+                finally:
+                    self.loop._background_owner.unregister(instance_id)
 
         watcher = asyncio.create_task(watch())
         self.loop._background_owner.register(
             instance_id,
-            lambda: asyncio.create_task(
-                self.loop.tool_registry.background_tasks.kill(
-                    task_id,
-                    cause="background macro canceled by the user",
-                    tui_presented=True,
-                )
-            ),
+            request_cancel,
             watcher,
             description=f"/{command.name}",
         )
