@@ -21,6 +21,7 @@ from urllib.request import urlopen
 import httpx
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.cli.main import build_parser
 from zeta.core import login_flow
 from zeta.core.login_flow import LoginError, LoginProvider, run_login
@@ -213,7 +214,7 @@ async def test_cancelled_login_closes_listener_without_waiting_for_thread(
 
     def held_join(thread: threading.Thread, timeout: float | None = None) -> None:
         if thread.name == "zeta-login-redirect":
-            join_gate.wait()
+            join_gate.wait(timeout=10)
         else:
             original_join(thread, timeout)
 
@@ -225,7 +226,9 @@ async def test_cancelled_login_closes_listener_without_waiting_for_thread(
     port = int(urlsplit(callback_url).port or 0)
     task.cancel()
     try:
-        done, _ = await asyncio.wait({task}, timeout=10)
+        done, _ = await await_or_fail(
+            asyncio.wait({task}, timeout=10), what="login cancellation"
+        )
         assert task in done, "login cancellation waited for the listener thread"
         with pytest.raises(asyncio.CancelledError):
             task.result()
@@ -235,7 +238,9 @@ async def test_cancelled_login_closes_listener_without_waiting_for_thread(
         assert not list(tmp_path.iterdir())
     finally:
         join_gate.set()
-        await asyncio.gather(task, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(task, return_exceptions=True), what="login cleanup"
+        )
 
 
 def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:

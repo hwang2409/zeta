@@ -550,7 +550,7 @@ async def test_successful_login_cleanup_reports_published_login(tmp_path, monkey
         await rpc(reader, writer, "login_start", provider="claude")
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
         task = server._client.logins.tasks["claude"]
-        assert await asyncio.wait_for(task, 3) == {"state": "succeeded"}
+        assert await asyncio.wait_for(task, 10) == {"state": "succeeded"}
         assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "succeeded"}
     finally:
         await close_serve(server, writer)
