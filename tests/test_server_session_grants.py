@@ -447,7 +447,7 @@ async def test_always_tool_grant_survives_external_end_during_approve_settlement
         ), frames
     finally:
         release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
