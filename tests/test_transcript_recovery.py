@@ -15,6 +15,7 @@ from zeta.protocol.types import (
     TextContent,
     with_message_origin,
 )
+from zeta.storage_format import WriterLease, open_writer
 
 
 def _recovery():
@@ -47,8 +48,23 @@ def _diagnosed_store(
     return root, damaged, raised.value
 
 
-def _strict_reopen(root: Path, session_id: str) -> None:
-    reopened = ConversationStore(root, session_id=session_id, _read_only=True)
+@pytest.fixture
+def home_lease(tmp_path: Path):
+    """Retain the home lease before a test holds a session scope.
+
+    A store opened inside that scope reuses it instead of taking the format rank.
+    """
+    lease = open_writer(tmp_path)
+    try:
+        yield lease
+    finally:
+        lease.close()
+
+
+def _strict_reopen(root: Path, session_id: str, lease: WriterLease) -> None:
+    reopened = ConversationStore(
+        root, session_id=session_id, _read_only=True, _storage_lease=lease
+    )
     reopened.close()
 
 
@@ -80,6 +96,7 @@ def test_semantic_diagnosis_retains_only_rows_before_first_bad_link(
 
 def test_transaction_preserves_complete_evidence_and_strictly_reopens(
     tmp_path: Path,
+    home_lease: WriterLease,
 ) -> None:
     root, damaged, diagnosis = _diagnosed_store(tmp_path)
     recovery = _recovery()
@@ -89,7 +106,7 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
             directory_fd,
             target,
             diagnosis._source_facts,
-            strict_reopen=lambda: _strict_reopen(root, "damaged"),
+            strict_reopen=lambda: _strict_reopen(root, "damaged", home_lease),
             memory_review_required=True,
         )
         payload_before = (
@@ -107,7 +124,7 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
         assert recovery.reconcile_pending(
             directory_fd,
             target,
-            strict_reopen=lambda: _strict_reopen(root, "damaged"),
+            strict_reopen=lambda: _strict_reopen(root, "damaged", home_lease),
         ) == (record,)
         status_after = recovery.recovery_status(directory_fd, target)
 
@@ -133,7 +150,7 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
 
 
 def test_repair_retries_short_warning_write_and_strictly_reopens(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, home_lease: WriterLease
 ) -> None:
     root, _, diagnosis = _diagnosed_store(tmp_path)
     recovery = _recovery()
@@ -154,11 +171,11 @@ def test_repair_retries_short_warning_write_and_strictly_reopens(
             directory_fd,
             recovery.RepairTarget("damaged"),
             diagnosis._source_facts,
-            strict_reopen=lambda: _strict_reopen(root, "damaged"),
+            strict_reopen=lambda: _strict_reopen(root, "damaged", home_lease),
             memory_review_required=False,
         )
     assert shortened
-    _strict_reopen(root, "damaged")
+    _strict_reopen(root, "damaged", home_lease)
 
 
 @pytest.mark.parametrize(
@@ -175,6 +192,7 @@ def test_repair_retries_short_warning_write_and_strictly_reopens(
 )
 def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
     tmp_path: Path,
+    home_lease: WriterLease,
     monkeypatch: pytest.MonkeyPatch,
     step: str,
     active_replaced: bool,
@@ -190,25 +208,29 @@ def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
 
     # test-contract: seam inject each durable transaction boundary
     monkeypatch.setattr(recovery, "_after_recovery_step", stop_at)
-    with session_directory(root, step) as (_, directory_fd):
-        with pytest.raises(OSError, match=f"fault at {step}"):
-            recovery.repair_transcript(
-                directory_fd,
-                target,
-                diagnosis._source_facts,
-                strict_reopen=lambda: _strict_reopen(root, step),
-                memory_review_required=False,
-            )
-        active = (root / step / "conversation.jsonl").read_bytes()
-        if active_replaced:
-            assert active != damaged
+    with (
+        session_directory(root, step) as (_, directory_fd),
+        pytest.raises(OSError, match=f"fault at {step}"),
+    ):
+        recovery.repair_transcript(
+            directory_fd,
+            target,
+            diagnosis._source_facts,
+            strict_reopen=lambda: _strict_reopen(root, step, home_lease),
+            memory_review_required=False,
+        )
+    # A writable reopen takes session execution, so it runs outside the shape scope.
+    active = (root / step / "conversation.jsonl").read_bytes()
+    if active_replaced:
+        assert active != damaged
+        reopened = ConversationStore(root, session_id=step)
+        reopened.close()
+    else:
+        assert active == damaged
+        with pytest.raises(TranscriptLoadError):
             reopened = ConversationStore(root, session_id=step)
             reopened.close()
-        else:
-            assert active == damaged
-            with pytest.raises(TranscriptLoadError):
-                reopened = ConversationStore(root, session_id=step)
-                reopened.close()
+    with session_directory(root, step) as (_, directory_fd):
         evidence_files = list((root / step).glob("conversation.quarantine.*.json"))
         payload_files = list((root / step).glob("conversation.quarantine.*.jsonl"))
         assert bool(evidence_files) is evidence_published
@@ -226,7 +248,7 @@ def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
                 record = recovery.reconcile_pending(
                     directory_fd,
                     target,
-                    strict_reopen=lambda: _strict_reopen(root, step),
+                    strict_reopen=lambda: _strict_reopen(root, step, home_lease),
                 )[0]
             expected = "committed" if active_replaced else "abandoned"
             assert record.state == expected
@@ -234,7 +256,7 @@ def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
 
 @pytest.mark.parametrize("change", ["digest", "identity"])
 def test_source_identity_change_refuses_before_creating_evidence(
-    tmp_path: Path, change: str
+    tmp_path: Path, change: str, home_lease: WriterLease
 ) -> None:
     root, damaged, diagnosis = _diagnosed_store(tmp_path)
     recovery = _recovery()
@@ -254,7 +276,7 @@ def test_source_identity_change_refuses_before_creating_evidence(
                 directory_fd,
                 recovery.RepairTarget("damaged"),
                 diagnosis._source_facts,
-                strict_reopen=lambda: _strict_reopen(root, "damaged"),
+                strict_reopen=lambda: _strict_reopen(root, "damaged", home_lease),
                 memory_review_required=False,
             )
         assert (
@@ -275,7 +297,7 @@ def test_source_identity_change_refuses_before_creating_evidence(
     ],
 )
 def test_record_parser_rejects_illegal_state_memory_pairs(
-    tmp_path: Path, state: str, memory_step: str
+    tmp_path: Path, state: str, memory_step: str, home_lease: WriterLease
 ) -> None:
     root, _, diagnosis = _diagnosed_store(tmp_path)
     recovery = _recovery()
@@ -284,7 +306,7 @@ def test_record_parser_rejects_illegal_state_memory_pairs(
             directory_fd,
             recovery.RepairTarget("damaged"),
             diagnosis._source_facts,
-            strict_reopen=lambda: _strict_reopen(root, "damaged"),
+            strict_reopen=lambda: _strict_reopen(root, "damaged", home_lease),
             memory_review_required=False,
         )
         value = recovery.read_recovery_record(
@@ -298,7 +320,9 @@ def test_record_parser_rejects_illegal_state_memory_pairs(
         recovery.parse_recovery_record(value)
 
 
-def test_record_parser_rejects_unknown_fields(tmp_path: Path) -> None:
+def test_record_parser_rejects_unknown_fields(
+    tmp_path: Path, home_lease: WriterLease
+) -> None:
     root, _, diagnosis = _diagnosed_store(tmp_path)
     recovery = _recovery()
     target = recovery.RepairTarget("damaged")
@@ -307,7 +331,7 @@ def test_record_parser_rejects_unknown_fields(tmp_path: Path) -> None:
             directory_fd,
             target,
             diagnosis._source_facts,
-            strict_reopen=lambda: _strict_reopen(root, "damaged"),
+            strict_reopen=lambda: _strict_reopen(root, "damaged", home_lease),
             memory_review_required=False,
         )
         value = recovery.read_evidence_manifest(
