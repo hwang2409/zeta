@@ -253,9 +253,8 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
     monkeypatch.setattr(process_module, "_terminate_process", terminate_after_archive)
     monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
     waiter = asyncio.create_task(registry.wait(task_id))
-    killer = asyncio.create_task(
-        registry.kill(task_id, cause="test requested task stop")
-    )
+    cause = "test requested task stop"
+    killer = asyncio.create_task(registry.kill(task_id, cause=cause))
     try:
         await asyncio.wait_for(archive_entered.wait(), 10)
         await asyncio.wait_for(monitor_cancelled.wait(), 10)
@@ -264,6 +263,7 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
         status = await asyncio.wait_for(waiter, 10)
         assert status["running"] is False
         await asyncio.wait_for(killer, 10)
+        assert registry.snapshot()[0].note == cause
     finally:
         release_archive.set()
         await asyncio.wait_for(
@@ -327,6 +327,31 @@ async def test_canceled_monitor_propagates_when_record_already_stopped() -> None
 
 async def _collect(events):
     return [event async for event in events]
+
+
+@pytest.mark.asyncio
+async def test_archive_failure_does_not_replace_task_kill_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry = BackgroundTaskRegistry()
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    cause = "test requested task stop"
+
+    async def fail_archive(record, log_handle) -> None:
+        log_handle.close()
+        record.log_fd = None
+        raise OSError("injected archive failure")
+
+    # test-contract: seam force output archiving to fail after the kill cause is durable
+    monkeypatch.setattr(registry, "_archive_record", fail_archive)
+    try:
+        with pytest.raises(OSError, match="injected archive failure"):
+            await asyncio.wait_for(registry.kill(task_id, cause=cause), 10)
+
+        assert registry.snapshot()[0].note == cause
+        assert "failed to archive background task output" in caplog.text
+    finally:
+        await asyncio.wait_for(registry.close(), 10)
 
 
 @pytest.mark.asyncio
