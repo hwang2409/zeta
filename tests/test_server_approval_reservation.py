@@ -541,17 +541,14 @@ async def test_serve_bound_approval_writes_only_through_settlement(
             )
 
         writers: list[tuple[str, ...]] = []
-        original_commit = store._commit_method_async
+        original_commit = store.resolve_approval_async
 
-        async def record_writer(
-            method: object, *args: object, **kwargs: object
-        ) -> object:
-            if method.__name__ == "resolve_approval":
-                writers.append(tuple(frame.function for frame in inspect.stack()))
-            return await original_commit(method, *args, **kwargs)
+        async def record_writer(*args: object, **kwargs: object) -> object:
+            writers.append(tuple(frame.function for frame in inspect.stack()))
+            return await original_commit(*args, **kwargs)
 
         # test-contract: seam records the settlement-owned durable write
-        monkeypatch.setattr(store, "_commit_method_async", record_writer)
+        monkeypatch.setattr(store, "resolve_approval_async", record_writer)
         assert abort() is None
         await asyncio.sleep(0)
         await server.control.wait_for_approval_settlement()
@@ -630,7 +627,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             expected_generation: int,
         ) -> object:
             nonlocal writes
-            if command.method.__name__ == "resolve_approval":
+            if type(command).__name__ == "_ResolveApprovalCommand":
                 writes += 1
                 if writes <= 2:
                     raise OSError("injected settlement failure")
@@ -680,9 +677,8 @@ async def _make_unhealthy(
     server: ZetaServer, call: ToolCall, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await server.control._event(_start_event(call))
-    store = server.runtime.opened.store
     monkeypatch.setattr(
-        store,
+        ConversationStore,
         "resolve_approval",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
     )
@@ -1205,9 +1201,8 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
             "abort",
             lambda **kwargs: aborted.append(True),
         )
-        store = server.runtime.opened.store
         monkeypatch.setattr(
-            store,
+            ConversationStore,
             "resolve_approval",
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
         )
@@ -1277,7 +1272,7 @@ async def test_persistent_failure_removes_many_live_child_approvals(
                 background=True,
             )
             monkeypatch.setattr(
-                store,
+                ConversationStore,
                 "resolve_approval",
                 lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
             )

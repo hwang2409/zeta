@@ -933,7 +933,7 @@ async def test_async_appends_encode_only_new_rows(
 ) -> None:
     store = ConversationStore(tmp_path, session_id="installed-append-cost")
     store.append_many([("warning", {"message": str(index)}) for index in range(400)])
-    await store._commit_method_async(store._warm_step_delivery_writer)
+    await store.warm_step_delivery_writer()
     original_encode = store._encoded_entry_line
     encoded_rows = 0
 
@@ -947,9 +947,8 @@ async def test_async_appends_encode_only_new_rows(
         ConversationStore, "_encoded_entry_line", staticmethod(tracked_encode)
     )
     for index in range(25):
-        await store._commit_method_async(
-            store._commit_delivery_input,
-            PromptInput(f"prompt-{index}", MessageOrigin.AGENT_SEND, None),
+        await store.commit_delivery_input(
+            PromptInput(f"prompt-{index}", MessageOrigin.AGENT_SEND, None)
         )
 
     assert encoded_rows == 25
@@ -1740,14 +1739,9 @@ async def test_async_writes_reuse_one_detached_store_open(
 
     await await_or_fail(
         asyncio.gather(
-            store._commit_method_async(store.append_pending_prompt, "follow up"),
-            store._commit_method_async(
-                store.append_agent_notification,
-                "root:1",
-                child_session_path="/child",
-                description="child",
-                status="completed",
-                text="done",
+            store.append_pending_prompt_async("follow up"),
+            store.append_message_async(
+                message(MessageRole.ASSISTANT, "done")
             ),
         ),
         what="test await",
@@ -1783,8 +1777,8 @@ async def test_async_write_failure_discards_writer_before_next_write(
 
     with patch("zeta.core.store._log.os.fsync", side_effect=fail_once):
         with pytest.raises(OSError, match="injected fsync failure"):
-            await store._commit_method_async(store.append_pending_prompt, "failed")
-        await store._commit_method_async(store.append_pending_prompt, "succeeds")
+            await store.append_pending_prompt_async("failed")
+        await store.append_pending_prompt_async("succeeds")
 
     assert open_count == 2
     assert [entry.data["text"] for entry in store._entries] == ["failed", "succeeds"]
@@ -1801,7 +1795,7 @@ async def test_mixed_async_writes_keep_fifo_order(tmp_path: Path) -> None:
                     message(MessageRole.USER, "first"), MessageOrigin.USER
                 )
             ),
-            store._commit_method_async(store.append_pending_prompt, "second"),
+            store.append_pending_prompt_async("second"),
             store.append_message_async(
                 with_message_origin(
                     message(MessageRole.USER, "third"), MessageOrigin.USER
@@ -1828,7 +1822,7 @@ async def test_async_write_cancelled_before_worker_start_writes_nothing(
     # test-contract: seam proves cancellation prevents worker submission
     monkeypatch.setattr(store, "_start_committed_mutation", block_start)
     task = asyncio.create_task(
-        store._commit_method_async(store.append_pending_prompt, "nope")
+        store.append_pending_prompt_async("nope")
     )
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1851,7 +1845,7 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
         task = asyncio.create_task(
-            store._commit_method_async(store.append_pending_prompt, "durable")
+            store.append_pending_prompt_async("durable")
         )
         assert await asyncio.to_thread(fsync_started.wait, 2)
         task.cancel()
@@ -1865,7 +1859,7 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
 @pytest.mark.asyncio
 async def test_close_drains_and_releases_persistent_writer(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="close-writer")
-    await store._commit_method_async(store.append_pending_prompt, "durable")
+    await store.append_pending_prompt_async("durable")
 
     store.close()
 
@@ -1883,15 +1877,8 @@ async def test_async_publish_matches_fresh_load_after_interleaved_appends(
         foreign.append_message(message(MessageRole.ASSISTANT, f"foreign {index}"))
         await store.append_message_async(message(MessageRole.ASSISTANT, f"own {index}"))
 
-    await store._commit_method_async(store.append_pending_prompt, "follow up")
-    await store._commit_method_async(
-        store.append_agent_notification,
-        "root:1",
-        child_session_path="/child",
-        description="child",
-        status="completed",
-        text="done",
-    )
+    await store.append_pending_prompt_async("follow up")
+    await store.append_message_async(message(MessageRole.ASSISTANT, "done"))
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries

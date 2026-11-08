@@ -765,11 +765,10 @@ class ApprovalLifecycle:
         async def persist() -> dict[str, str] | None:
             write_failed = False
             try:
-                await target.store._commit_method_async(
-                    target.store.resolve_approval,
+                await target.store.resolve_approval_async(
                     target.store_request_id,
                     decision,
-                    **({"reason": reason} if decision == "abort" and reason else {}),
+                    reason=reason if decision == "abort" else None,
                 )
             except OSError:
                 write_failed = True
@@ -779,8 +778,7 @@ class ApprovalLifecycle:
             if not write_failed:
                 return None
             try:
-                await target.store._commit_method_async(
-                    target.store.resolve_approval,
+                await target.store.resolve_approval_async(
                     target.store_request_id,
                     "abort",
                     reason=reason or "turn_canceled",

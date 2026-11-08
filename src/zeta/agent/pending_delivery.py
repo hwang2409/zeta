@@ -178,9 +178,7 @@ class StepDeliveryFlow:
             return
         async with self._initialize_lock:
             if not self._initialized:
-                await self.store._commit_method_async(
-                    self.store._warm_step_delivery_writer
-                )
+                await self.store.warm_step_delivery_writer()
                 self._initialized = True
 
     async def produce(self, item: DeliveryInput, /) -> ProducerResult:
@@ -193,17 +191,13 @@ class StepDeliveryFlow:
             else None
         )
         try:
-            result = await self.store._commit_method_async(
-                self.store._commit_delivery_input, item
-            )
+            result = await self.store.commit_delivery_input(item)
         except PendingPromptWriterReloadedError:
             if not isinstance(item, PromptInput) or item.deadline is None:
                 raise
             assert commit_window is not None
             retry = replace(item, deadline=time.monotonic() + commit_window)
-            result = await self.store._commit_method_async(
-                self.store._commit_delivery_input, retry
-            )
+            result = await self.store.commit_delivery_input(retry)
         if result.changed and not (
             isinstance(item, NotificationInput)
             and (
@@ -290,20 +284,12 @@ class StepDeliveryFlow:
             raise ValueError("unknown request cause")
         self._edges.clear()
         if assembler is None:
-            staged = await self.store._commit_method_async(
-                self.store._stage_delivery_request,
-                None,
-                None,
-                _select_notification_delivery,
-                notification_context,
+            staged = await self.store.stage_delivery_request(
+                None, None, _select_notification_delivery, notification_context
             )
         else:
-            staged = await self.store._commit_method_async(
-                self.store._stage_delivery_request,
-                0,
-                assembler.estimate_messages,
-                _select_notification_delivery,
-                None,
+            staged = await self.store.stage_delivery_request(
+                0, assembler.estimate_messages, _select_notification_delivery, None
             )
         self._active = staged
         self._active_steering = steering
@@ -499,8 +485,7 @@ class StepDeliveryFlow:
         )
         selected = staged
         if capacity > 0:
-            selected = await self.store._commit_method_async(
-                self.store._stage_delivery_request,
+            selected = await self.store.stage_delivery_request(
                 capacity,
                 assembler.estimate_messages,
                 _select_notification_delivery,
@@ -600,10 +585,8 @@ class StepDeliveryFlow:
         active = self._active
         if active is None:
             return DeliveryPublications()
-        publications = await self.store._commit_method_async(
-            self.store._acknowledge_staged_delivery,
-            active.prompt_id,
-            active.notification_ids,
+        publications = await self.store.acknowledge_staged_delivery(
+            active.prompt_id, active.notification_ids
         )
         active_ids = active.notification_ids + (
             () if active.prompt_id is None else (active.prompt_id,)
@@ -666,9 +649,7 @@ class StepDeliveryFlow:
             "nudge",
         }:
             raise ValueError("unknown terminal intent")
-        pending, closed = await self.store._commit_method_async(
-            self.store._admit_step_delivery_terminal, intent
-        )
+        pending, closed = await self.store.admit_step_delivery_terminal(intent)
         prompt_pending = bool(self.store._active_pending_prompt_entries)
         if self._low_capacity_notifications and not prompt_pending:
             pending = False

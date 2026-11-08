@@ -174,7 +174,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         )
         message = (
             result[0].result.notification_message
-            if command.method.__name__ == "_stage_delivery_request"
+            if type(command).__name__ == "_StageDeliveryRequestCommand"
             else None
         )
         if (
@@ -265,7 +265,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         )
         message = (
             result[0].result.notification_message
-            if command.method.__name__ == "_stage_delivery_request"
+            if type(command).__name__ == "_StageDeliveryRequestCommand"
             else None
         )
         if (

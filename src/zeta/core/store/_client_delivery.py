@@ -19,6 +19,11 @@ from ...protocol.types import (
     TextContent,
     require_new_message_origin,
 )
+from ._mutation_commands import (
+    _AppendClientDeliveryCommand,
+    _DeliverClientSteeringCommand,
+    _DropClientSteeringCommand,
+)
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
@@ -304,15 +309,16 @@ class ClientDeliveryMixin:
     ) -> ClientDelivery:
         """Append off-loop, then run the effect callback after publication."""
 
-        return await self._commit_method_async(
-            self.append_client_delivery,
-            delivery_id,
-            method,
-            status,
-            outcome,
-            message=message,
-            accepted_message=accepted_message,
-            _on_persisted=on_persisted,
+        return await self._commit_storage_command(
+            _AppendClientDeliveryCommand(
+                delivery_id=delivery_id,
+                method=method,
+                status=status,
+                outcome=outcome,
+                message=message,
+                accepted_message=accepted_message,
+                callback=on_persisted,
+            )
         )
 
     def queue_client_steering(
@@ -343,7 +349,9 @@ class ClientDeliveryMixin:
     ) -> None:
         """Publish a dispatched steering batch as one durable append."""
 
-        await self._commit_method_async(self._deliver_client_steering, batch)
+        await self._commit_storage_command(
+            _DeliverClientSteeringCommand(batch=batch)
+        )
         for expected in batch._queued:
             if not self._client_steering or self._client_steering[0] != expected:
                 raise RuntimeError("client steering queue changed during delivery")
@@ -417,8 +425,8 @@ class ClientDeliveryMixin:
         """Commit queued drops off-loop, then release their queue ownership."""
 
         queued = tuple(self._client_steering)
-        entries = await self._commit_method_async(
-            self._drop_client_steering, queued, reason
+        entries = await self._commit_storage_command(
+            _DropClientSteeringCommand(queued=queued, reason=reason)
         )
         messages = {
             item.delivery_id: without_client_delivery_marker(item.message)

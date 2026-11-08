@@ -14,33 +14,24 @@ from ..checkpoints.mutation import (
     CommittedDelta,
     ConversationGenerationConflict,
     ConversationMutation,
-    _MethodMutation,
     execute_mutation,
 )
-from ._pending_prompts import PendingPromptWriterReloadedError
-
-_REFRESH_PATCH_FIELDS = (
-    "cwd",
-    "_active_approval_requests",
-    "_active_approval_resolutions",
-    "_active_tool_results",
-    "_active_agent_call_ids",
-    "_active_agent_receipts",
-    "_notification_ids",
-    "_active_notifications",
-    "_active_completion_notifications",
-    "_active_notification_presentations",
-    "_pending_prompt_ids",
-    "_active_pending_prompt_entries",
-    "_active_pending_prompt_messages",
-    "_active_notification_delivery_message",
-    "_active_last_message",
-    "_active_last_turn_end",
-    "_task_notification_ids",
-    "_sent_message_receipts",
-    "_client_deliveries",
-    "_client_delivery_outcomes",
+from ._mutation_commands import (
+    _AcceptExplicitFinishCommand,
+    _AcknowledgeStagedDeliveryCommand,
+    _AdmitStepDeliveryTerminalCommand,
+    _AppendPendingPromptCommand,
+    _CancelExplicitChildCommand,
+    _CommitDeliveryInputCommand,
+    _ExplicitFinishReportCommand,
+    _IdleNudgeEligibleCommand,
+    _RefreshCommand,
+    _ResolveApprovalCommand,
+    _StageDeliveryRequestCommand,
+    _StoreMutationCommand,
+    _WarmStepDeliveryCommand,
 )
+from ._pending_prompts import PendingPromptWriterReloadedError
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
@@ -73,38 +64,43 @@ class AsyncDurableWritesMixin:
         self._durable_writes_in_flight = 0
         self._durable_writer: ConversationStore | None = None
         self._durable_writer_snapshot: tuple[int, _DetachedLogState] | None = None
+        self._address_commit_waiters = 0
 
     @property
     def conversation_generation(self: ConversationStore) -> int:
         return self._log_offset
 
-    def _install_committed_delta(
+    def _rebase_committed_entries(
         self: ConversationStore, delta: CommittedDelta[Any]
-    ) -> tuple[ConversationEntry, ...] | str:
-        self._assert_owner_thread()
-        if delta.duplicate:
-            return ()
-        entries_to_install = delta.entries_to_install
+    ) -> tuple[ConversationEntry, ...] | None:
+        entries = delta.entries_to_install
         if (
-            self.conversation_generation != delta.generation_before
-            and not delta._resident_patch.replace_entries
+            self.conversation_generation == delta.generation_before
+            or delta._resident_patch.replace_entries
         ):
-            existing_ids = {entry.id for entry in self._entries}
-            missing = next(
-                (
-                    index
-                    for index, entry in enumerate(entries_to_install)
-                    if entry.id not in existing_ids
-                ),
-                len(entries_to_install),
+            return entries
+        existing_ids = {entry.id for entry in self._entries}
+        missing = next(
+            (
+                index
+                for index, entry in enumerate(entries)
+                if entry.id not in existing_ids
+            ),
+            len(entries),
+        )
+        if missing == len(entries):
+            return None
+        if any(entry.id in existing_ids for entry in entries[missing:]):
+            raise ConversationIntegrityError(
+                "resident generation changed before committed delta installation"
             )
-            if missing == len(entries_to_install):
-                return ()
-            if any(entry.id in existing_ids for entry in entries_to_install[missing:]):
-                raise ConversationIntegrityError(
-                    "resident generation changed before committed delta installation"
-                )
-            entries_to_install = entries_to_install[missing:]
+        return entries[missing:]
+
+    def _install_delta_entries(
+        self: ConversationStore,
+        entries_to_install: tuple[ConversationEntry, ...],
+        delta: CommittedDelta[Any],
+    ) -> list[ConversationEntry]:
         entries = (
             list(entries_to_install)
             if delta._resident_patch.replace_entries
@@ -122,6 +118,18 @@ class AsyncDurableWritesMixin:
             else:
                 self._install_validated_linear_entries(entries)
                 self._record_client_delivery_entries(entries)
+        return entries
+
+    def _install_committed_delta(
+        self: ConversationStore, delta: CommittedDelta[Any]
+    ) -> tuple[ConversationEntry, ...] | str:
+        self._assert_owner_thread()
+        if delta.duplicate:
+            return ()
+        entries_to_install = self._rebase_committed_entries(delta)
+        if entries_to_install is None:
+            return ()
+        entries = self._install_delta_entries(entries_to_install, delta)
         for field, value in delta._resident_patch.values.items():
             if getattr(self, field) == delta._resident_patch.expected[field]:
                 setattr(self, field, copy.deepcopy(value))
@@ -151,11 +159,8 @@ class AsyncDurableWritesMixin:
             self._publish_entries_installed("reset")
         elif delta.entries_to_install:
             self._publish_entries_installed(delta.entries_to_install)
-        if (
-            isinstance(command, _MethodMutation)
-            and command.persisted_callback is not None
-        ):
-            command.persisted_callback()
+        if isinstance(command, _StoreMutationCommand):
+            command.after_persisted()
         return delta
 
     def _before_committed_mutation(self: ConversationStore) -> None:
@@ -175,7 +180,7 @@ class AsyncDurableWritesMixin:
                 self._durable_writer = writer
             self._before_committed_mutation()
             if cancelled_before_write.is_set() and not isinstance(
-                command, _MethodMutation
+                command, _StoreMutationCommand
             ):
                 raise asyncio.CancelledError
             cancelled_before_write.write_started.set()
@@ -271,68 +276,46 @@ class AsyncDurableWritesMixin:
             self._publish_entries_installed("reset")
         elif installed:
             self._publish_prepared_entries_installed(installed)
-        if (
-            isinstance(command, _MethodMutation)
-            and command.persisted_callback is not None
-        ):
-            command.persisted_callback()
+        if isinstance(command, _StoreMutationCommand):
+            command.after_persisted()
         if cancelled:
             raise asyncio.CancelledError
         return delta
 
+    def _address_commit_queued(self: ConversationStore) -> None:
+        """Test seam after an address commit joins the resident lock queue."""
+
     async def _commit_address_async(
         self: ConversationStore, command: ConversationMutation[Any]
     ) -> CommittedDelta[Any]:
-        async with self._async_write_lock:
-            return await self._commit_async_unlocked(
-                command, self.conversation_generation
-            )
+        self._address_commit_waiters += 1
+        self._address_commit_queued()
+        try:
+            async with self._async_write_lock:
+                return await self._commit_async_unlocked(
+                    command, self.conversation_generation
+                )
+        finally:
+            self._address_commit_waiters -= 1
 
-    async def _commit_method_async(
-        self: ConversationStore,
-        method: Callable[..., Any],
-        /,
-        *args: Any,
-        _patch_fields: tuple[str, ...] = _REFRESH_PATCH_FIELDS
-        + (
-            "_agent_counter",
-            "_agent_children",
-            "_agent_parent",
-            "_agent_canceled",
-            "_agent_lifecycle",
-        ),
-        _on_persisted: Callable[[], None] | None = None,
-        _accept_external_generation: bool = False,
-        _method_accepts_store: bool | None = None,
-        **kwargs: Any,
+    async def _commit_storage_command(
+        self: ConversationStore, command: _StoreMutationCommand
     ) -> Any:
         async with self._async_write_lock:
-            is_bound_method = getattr(method, "__self__", None) is not None
-            unbound = getattr(method, "__func__", method)
-            command = _MethodMutation(
-                method=unbound,
-                method_accepts_store=(
-                    is_bound_method
-                    if _method_accepts_store is None
-                    else _method_accepts_store
-                ),
-                args=args,
-                kwargs=kwargs,
-                patch_fields=_patch_fields,
-                persisted_callback=_on_persisted,
-                accept_external_generation=_accept_external_generation,
+            command = replace(
+                command,
                 baseline_count=len(self._entries),
                 baseline_digest=self._entry_prefix_digest,
                 baseline_patch={
                     field: copy.deepcopy(getattr(self, field))
-                    for field in _patch_fields
+                    for field in command.patch_fields
                 },
             )
             resident_generation = self.conversation_generation
             try:
                 delta = await self._commit_async_unlocked(command, resident_generation)
             except ConversationGenerationConflict:
-                if _accept_external_generation:
+                if command.accept_external_generation:
                     raise
                 if self.conversation_generation != resident_generation:
                     command = replace(
@@ -344,26 +327,101 @@ class AsyncDurableWritesMixin:
                             for field in command.patch_fields
                         },
                     )
-                command = replace(command, accept_external_generation=True)
                 delta = await self._commit_async_unlocked(
-                    command, self.conversation_generation
+                    replace(command, accept_external_generation=True),
+                    self.conversation_generation,
                 )
             return delta.result
 
     async def _refresh_off_loop(self: ConversationStore) -> None:
-        await self._commit_method_async(
-            type(self).refresh,
-            _patch_fields=_REFRESH_PATCH_FIELDS
-            + (
-                "_agent_counter",
-                "_agent_children",
-                "_agent_parent",
-                "_agent_canceled",
-                "_agent_lifecycle",
-            ),
-            _accept_external_generation=True,
-            _method_accepts_store=True,
+        await self._commit_storage_command(
+            _RefreshCommand(accept_external_generation=True)
         )
+
+    async def warm_step_delivery_writer(self: ConversationStore) -> None:
+        await self._commit_storage_command(_WarmStepDeliveryCommand())
+
+    async def commit_delivery_input(self: ConversationStore, item: Any) -> Any:
+        return await self._commit_storage_command(_CommitDeliveryInputCommand(item=item))
+
+    async def stage_delivery_request(
+        self: ConversationStore,
+        notification_budget: int | None,
+        token_counter: Any,
+        notification_selector: Any,
+        notification_context: Any,
+    ) -> Any:
+        return await self._commit_storage_command(
+            _StageDeliveryRequestCommand(
+                notification_budget=notification_budget,
+                token_counter=token_counter,
+                notification_selector=notification_selector,
+                notification_context=notification_context,
+            )
+        )
+
+    async def acknowledge_staged_delivery(
+        self: ConversationStore,
+        prompt_id: str | None,
+        notification_ids: tuple[str, ...],
+    ) -> Any:
+        return await self._commit_storage_command(
+            _AcknowledgeStagedDeliveryCommand(
+                prompt_id=prompt_id, notification_ids=notification_ids
+            )
+        )
+
+    async def admit_step_delivery_terminal(
+        self: ConversationStore, intent: Any
+    ) -> Any:
+        return await self._commit_storage_command(
+            _AdmitStepDeliveryTerminalCommand(intent=intent)
+        )
+
+    async def accept_explicit_finish(
+        self: ConversationStore,
+        report: dict[str, object],
+        notification_ids: frozenset[str],
+        prompt_id: str | None,
+    ) -> Any:
+        return await self._commit_storage_command(
+            _AcceptExplicitFinishCommand(
+                report=report,
+                notification_ids=notification_ids,
+                prompt_id=prompt_id,
+            )
+        )
+
+    async def cancel_explicit_child(self: ConversationStore) -> bool:
+        return await self._commit_storage_command(_CancelExplicitChildCommand())
+
+    async def explicit_finish_report(self: ConversationStore) -> Any:
+        return await self._commit_storage_command(_ExplicitFinishReportCommand())
+
+    async def idle_nudge_eligible(
+        self: ConversationStore, notification_ids: frozenset[str]
+    ) -> bool:
+        return await self._commit_storage_command(
+            _IdleNudgeEligibleCommand(notification_ids=notification_ids)
+        )
+
+    async def resolve_approval_async(
+        self: ConversationStore,
+        request_id: str,
+        decision: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        await self._commit_storage_command(
+            _ResolveApprovalCommand(
+                request_id=request_id, decision=decision, reason=reason
+            )
+        )
+
+    async def append_pending_prompt_async(
+        self: ConversationStore, text: str
+    ) -> Any:
+        return await self._commit_storage_command(_AppendPendingPromptCommand(text=text))
 
     async def _to_thread_store(self: ConversationStore, function: Any, /) -> Any:
         """Run one resident-store lease operation off-loop despite cancellation."""

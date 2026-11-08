@@ -1320,7 +1320,9 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
             command, expected_generation, cancelled_before_write
         )
         message = (
-            command.args[0] if command.method.__name__ == "append_message" else None
+            command.message
+            if type(command).__name__ == "_AppendMessageCommand"
+            else None
         )
         if (
             message is not None

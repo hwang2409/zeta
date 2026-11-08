@@ -9781,7 +9781,7 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
         result = original_durable_write(
             self, command, expected_generation, cancelled_before_write
         )
-        if command.method.__name__ == "_acknowledge_staged_delivery":
+        if type(command).__name__ == "_AcknowledgeStagedDeliveryCommand":
             ack_committed.set()
             assert release_ack.wait(timeout=5)
         return result

@@ -25,6 +25,13 @@ from .agent_progress import (
 )
 from .checkpoints import ConversationIntegrityError, _now
 from .session_files import child_directory, write_session_file
+from .store._mutation_commands import (
+    _FinishAgentChildCommand,
+    _FinishAgentLifecycleCommand,
+    _FinishAgentParentCommand,
+    _MarkAgentCanceledCommand,
+    _RegisterAgentChildCommand,
+)
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
 
@@ -687,42 +694,48 @@ class AgentStateMixin:
 
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
-            await self._commit_method_async(
-                self.mark_agent_canceled, canceled_tool_call_id
+            await self._commit_storage_command(
+                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id)
             )
         else:
             for marker_key, marker in self.agent_children().items():
                 tool_call = ToolCall.from_dict(marker["tool_call"])
-                await parent_store._commit_method_async(
-                    parent_store.register_agent_child,
-                    tool_call,
-                    child_session_path=marker["child_session_path"],
-                    description=marker["description"],
-                    agent_type=marker.get("agent_type"),
-                    background=marker.get("background", False),
-                    child_instance_id=marker.get("child_instance_id"),
-                    accepts_follow_ups=marker.get("accepts_follow_ups", False) is True,
-                    explicit_finish=marker.get("explicit_finish", False) is True,
-                    turns_used=(
-                        marker.get("turns_used", 0)
-                        if type(marker.get("turns_used", 0)) is int
-                        else 0
-                    ),
+                await parent_store._commit_storage_command(
+                    _RegisterAgentChildCommand(
+                        tool_call=tool_call,
+                        child_session_path=marker["child_session_path"],
+                        description=marker["description"],
+                        agent_type=marker.get("agent_type"),
+                        background=marker.get("background", False),
+                        child_instance_id=marker.get("child_instance_id"),
+                        accepts_follow_ups=(
+                            marker.get("accepts_follow_ups", False) is True
+                        ),
+                        explicit_finish=marker.get("explicit_finish", False) is True,
+                        turns_used=(
+                            marker.get("turns_used", 0)
+                            if type(marker.get("turns_used", 0)) is int
+                            else 0
+                        ),
+                    )
                 )
-                await self._commit_method_async(self.finish_agent_child, marker_key)
+                await self._commit_storage_command(
+                    _FinishAgentChildCommand(marker_key=marker_key)
+                )
                 child_instance_id = marker.get("child_instance_id")
                 if type(child_instance_id) is str:
                     transferred.append(child_instance_id)
-            await self._commit_method_async(self.finish_agent_parent)
-        await self._commit_method_async(
-            self.finish_agent_lifecycle,
-            terminal_state,
-            final_result=final_result,
-            turns_used=turns_used,
-            killed_task_ids=killed_task_ids,
-            killed_task_count=killed_task_count,
-            killed_task_ids_truncated=killed_task_ids_truncated,
-            canonical_receipt=True,
+            await self._commit_storage_command(_FinishAgentParentCommand())
+        await self._commit_storage_command(
+            _FinishAgentLifecycleCommand(
+                state=terminal_state,
+                final_result=final_result,
+                turns_used=turns_used,
+                killed_task_ids=killed_task_ids,
+                killed_task_count=killed_task_count,
+                killed_task_ids_truncated=killed_task_ids_truncated,
+                canonical_receipt=True,
+            )
         )
         return tuple(transferred)
 

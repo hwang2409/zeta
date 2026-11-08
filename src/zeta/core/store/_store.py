@@ -78,6 +78,7 @@ from ._incremental_validation import (
 )
 from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
+from ._mutation_commands import _AppendMessageCommand
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,  # noqa: F401 - re-exported by store facade
@@ -695,9 +696,10 @@ class ConversationStore(
         on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         """Append off-loop and run ``on_persisted`` before deferred cancellation."""
-        kwargs = {"parent_id": parent_id} if parent_id is not None else {}
-        return await self._commit_method_async(
-            self.append_message, message, _on_persisted=on_persisted, **kwargs
+        return await self._commit_storage_command(
+            _AppendMessageCommand(
+                message=message, parent_id=parent_id, callback=on_persisted
+            )
         )
 
     def append_compaction_marker(

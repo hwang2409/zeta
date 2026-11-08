@@ -805,7 +805,7 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         result = original_durable_write(
             self, command, expected_generation, cancelled_before_write
         )
-        if command.method.__name__ == "_acknowledge_staged_delivery":
+        if type(command).__name__ == "_AcknowledgeStagedDeliveryCommand":
             ack_committed.set()
             assert release_ack.wait(timeout=5)
         return result

@@ -580,10 +580,9 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
             self, command, expected_generation, cancelled_before_write
         )
         if (
-            command.method.__name__ == "_append_row"
-            and command.args[0] == "turn_end"
-            and command.args[1].get("reason") == "completed"
-            and isinstance(command.args[1].get("turn_id"), str)
+            type(command).__name__ == "_AppendTurnEndCommand"
+            and command.data.get("reason") == "completed"
+            and isinstance(command.data.get("turn_id"), str)
         ):
             committed.set()
             assert release.wait(timeout=5)

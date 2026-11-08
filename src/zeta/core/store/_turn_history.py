@@ -6,6 +6,8 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Literal
 
+from ._mutation_commands import _AppendTurnEndCommand
+
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
     from ._store import ConversationStore
@@ -36,4 +38,4 @@ class TurnHistoryMixin:
     ) -> None:
         data = {"turn_id": turn_id, "reason": reason}
         validate_turn_end_data(data)
-        await self._commit_method_async(self._append_row, "turn_end", data)
+        await self._commit_storage_command(_AppendTurnEndCommand(data=data))

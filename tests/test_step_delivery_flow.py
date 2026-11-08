@@ -29,8 +29,12 @@ class _Store:
         self.calls.append((item, threading.get_ident()))
         return ProducerResult((), True, 1)
 
-    async def _commit_method_async(self, callback, *args):
-        result = await asyncio.to_thread(callback, *args)
+    async def warm_step_delivery_writer(self) -> None:
+        await asyncio.to_thread(self._warm_step_delivery_writer)
+        self.installed = True
+
+    async def commit_delivery_input(self, item: object) -> ProducerResult:
+        result = await asyncio.to_thread(self._commit_delivery_input, item)
         self.installed = True
         return result
 

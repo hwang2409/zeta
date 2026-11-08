@@ -9,6 +9,11 @@ from typing import TYPE_CHECKING, Any
 from ...agent.receipt import valid_killed_task_fields
 from ...protocol.types import Message, MessageOrigin, ToolUseContent
 from ..checkpoints import ConversationEntry
+from ._mutation_commands import (
+    _AcknowledgeNotificationsCommand,
+    _PresentNotificationsCommand,
+    _RecordNotificationDeliveryCommand,
+)
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     CHILD_IDLE_NOTIFICATION_KIND,
@@ -539,11 +544,12 @@ class NotificationStateMixin:
         acknowledged: bool = False,
     ) -> None:
         """Persist delivery state off the event loop and in async call order."""
-        await self._commit_method_async(
-            self.record_agent_notification_delivery,
-            notification_id,
-            presented=presented,
-            acknowledged=acknowledged,
+        await self._commit_storage_command(
+            _RecordNotificationDeliveryCommand(
+                notification_id=notification_id,
+                presented=presented,
+                acknowledged=acknowledged,
+            )
         )
 
     def mark_agent_notifications_presented_to_tui(
@@ -582,8 +588,8 @@ class NotificationStateMixin:
     ) -> None:
         """Persist a presentation batch off the event loop."""
 
-        await self._commit_method_async(
-            self.mark_agent_notifications_presented_to_tui, notification_ids
+        await self._commit_storage_command(
+            _PresentNotificationsCommand(notification_ids=notification_ids)
         )
 
     def mark_agent_notification_presented_to_tui(
@@ -633,8 +639,8 @@ class NotificationStateMixin:
     ) -> None:
         """Consume one claimed notification batch off the event loop."""
 
-        await self._commit_method_async(
-            self.acknowledge_agent_notifications, notification_ids
+        await self._commit_storage_command(
+            _AcknowledgeNotificationsCommand(notification_ids=notification_ids)
         )
 
     def acknowledge_agent_notification(

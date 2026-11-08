@@ -6,6 +6,8 @@ import re
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from ._mutation_commands import _AppendChildRunStartedCommand
+
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
     from ._store import ConversationStore
@@ -110,12 +112,13 @@ class ChildRunStoreMixin:
         on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         """Append the spawn row off-loop and publish it before returning."""
-        return await self._commit_method_async(
-            self.append_child_run_started,
-            run_id,
-            parent_run_id,
-            name,
-            task,
-            started_at,
-            _on_persisted=on_persisted,
+        return await self._commit_storage_command(
+            _AppendChildRunStartedCommand(
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                name=name,
+                task=task,
+                started_at=started_at,
+                callback=on_persisted,
+            )
         )
