@@ -29,6 +29,7 @@ from zeta.runtime.project_registry_state import (
     ProjectRegistryUnavailable,
     load_project_registry,
 )
+from zeta.server.runtime import ServerRuntime
 from zeta.server.server import ZetaServer
 from zeta.tui.app import create_app
 
@@ -304,7 +305,7 @@ async def test_new_tui_keeps_healthy_project_context(
     _case: str,
     corrupt: Callable[[Path, Path, Path], None],
 ) -> None:
-    home, repository, healthy_id, malformed_id = await asyncio.to_thread(
+    home, repository, healthy_id, _malformed_id = await asyncio.to_thread(
         _project_context_isolation_case, tmp_path, corrupt
     )
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -319,10 +320,7 @@ async def test_new_tui_keeps_healthy_project_context(
         assert "DAMAGED-B-MEMORY" not in prompt
         assert "project" in app.loop.tool_registry.registered_names
         status = app.slash_status()
-        assert status.project_context_health == (
-            f"malformed_project ({malformed_id}/project.json): "
-            "project metadata is malformed"
-        )
+        assert status.project_context_health is None
         assert healthy_id in prompt
     finally:
         await app.close()
@@ -713,6 +711,96 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
                 30,
             )
         await _drain(asyncio.create_task(app.close(), name="app.close()"), 30)
+
+
+@pytest.mark.asyncio
+async def test_custom_serve_resume_recovers_when_project_memory_disappears(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    home = tmp_path / "home"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    await asyncio.to_thread(
+        subprocess.run, ["git", "init", "-q", str(repository)], check=True
+    )
+    registry = ProjectRegistry(home / "projects")
+    project = await asyncio.to_thread(
+        registry.create_project, "healthy", "git", repository
+    )
+    memory_path = registry.root / project.project_id / "memory" / "state.md"
+    memory_path.write_bytes(b"\xff")
+    old_memory = "OLD-MEMORY"
+    prompt = f"CUSTOM-BEFORE\n{old_memory}\nCUSTOM-AFTER"
+    manager = await asyncio.to_thread(SessionManager, home)
+    opened = await asyncio.to_thread(
+        manager.create,
+        provider="codex",
+        model="gpt-5.6-luna",
+        cwd=repository,
+        project_id=project.project_id,
+        auto_project=False,
+        system_prompt=prompt,
+        project_memory_offset=prompt.index(old_memory),
+        project_memory_length=len(old_memory),
+        project_memory_digest=hashlib.sha256(old_memory.encode()).hexdigest(),
+        prompt_recipe="custom",
+        prompt_components={
+            "project_memory": {
+                "offset": prompt.index(old_memory),
+                "length": len(old_memory),
+                "digest": hashlib.sha256(old_memory.encode()).hexdigest(),
+            }
+        },
+    )
+    session_id = opened.store.session_id
+    opened.store.close()
+    runtime = ServerRuntime(
+        home, cwd=repository, provider="codex", auto_memory=False
+    )
+    await runtime.resume_session(session_id)
+    loop = runtime.loop
+    assert loop is not None
+    loop.backend = FakeBackend(
+        [ScriptedTurn(content=[TextContent("ok")]) for _ in range(3)]
+    )
+
+    async def join_recovery_task(task: asyncio.Task[Any] | None) -> None:
+        if task is None:
+            return
+        done, pending = await asyncio.wait({task}, timeout=10)
+        assert done == {task} and not pending, "project-context recovery did not finish"
+
+    async def turn(text: str) -> None:
+        await _collect_turn(loop, text)
+
+    try:
+        assert loop.project_context_health is not None
+        assert loop.project_context_health.code == "malformed_memory"
+        shutil.rmtree(registry.root / project.project_id)
+        caplog.clear()
+
+        await turn("start recovery read")
+        await join_recovery_task(loop._project_context_read_task)
+        await turn("start recovery preparation")
+        await join_recovery_task(loop._project_context_prepare_task)
+        await turn("commit recovered context")
+
+        assert loop.project_context_health is not None
+        assert loop.project_context_health.code == "project_not_found"
+        memory_component = loop._runtime_prompt.prompt_components["project_memory"]
+        assert memory_component["length"] == 0
+        assert not any(
+            record.getMessage() == "project context preparation failed"
+            for record in caplog.records
+        )
+        recreated_project = registry.root / project.project_id
+        assert not (recreated_project / "memory").exists()
+        assert not (recreated_project / "memory-current.json").exists()
+    finally:
+        await _drain(
+            asyncio.create_task(runtime.close(), name="server runtime close"), 30
+        )
 
 
 async def _drain(task: asyncio.Task[Any], timeout: float) -> None:

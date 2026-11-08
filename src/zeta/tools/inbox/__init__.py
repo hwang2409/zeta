@@ -12,8 +12,8 @@ from ...project_inbox import (
     LOCAL_ORIGIN,
     InboxError,
     ProjectInbox,
-    SentMessageTracker,
 )
+from ...project_inbox_sent import SentMessageTracker
 from ...project_registry import ProjectRegistryError, resolve_project_ref
 from ...protocol.types import StructuredToolResult
 from .._results import _success_result, text_block
@@ -170,79 +170,118 @@ def _bound(registry: ToolRegistry) -> tuple[ProjectInbox, str, str]:
             projects,
             sessions_root=projects.root.parent / "sessions",
             sent_tracker=tracker,
+            receipts=store.sent_message_receipts(),
         ),
         registry.project_id,
         store.session_id,
     )
 
 
+def _send(
+    inbox: ProjectInbox,
+    project_id: str,
+    session_id: str,
+    arguments: dict[str, Any],
+) -> StructuredToolResult:
+    message_id, sent_outcome = inbox.send_with_outcome(
+        from_project=project_id,
+        from_session=session_id,
+        to_project=arguments["project"],
+        kind=arguments["kind"],
+        title=arguments["title"],
+        body=arguments["body"],
+        in_reply_to=arguments.get("in_reply_to"),
+        message_id=arguments.get("id"),
+    )
+    result = {
+        "id": message_id,
+        "sent_health": sent_outcome.health.as_dict(),
+    }
+    if sent_outcome.warning:
+        result["warning"] = sent_outcome.warning
+    return _result("send", project_id, result)
+
+
+def _done(
+    inbox: ProjectInbox,
+    project_id: str,
+    session_id: str,
+    arguments: dict[str, Any],
+) -> StructuredToolResult:
+    message, sent_outcome = inbox.done_with_outcome(
+        project_id,
+        arguments["id"],
+        session_id,
+        arguments["outcome"],
+        reply=arguments.get("reply"),
+    )
+    if sent_outcome is None and inbox.sent_tracker is not None:
+        sent_outcome = inbox.sent_tracker.health()
+    result = {"message": message}
+    if sent_outcome is not None:
+        result["sent_health"] = sent_outcome.health.as_dict()
+        if sent_outcome.warning:
+            result["warning"] = sent_outcome.warning
+    return _result("done", project_id, result)
+
+
+def _run_inbox(
+    registry: ToolRegistry, arguments: dict[str, Any]
+) -> StructuredToolResult:
+    state = getattr(registry, "project_registry_state", None)
+    if state is not None and state.unavailable is not None:
+        return _error(
+            "project registry is temporarily unavailable; try again later",
+            kind="project_registry_unavailable",
+        )
+    action = _validate_action(arguments)
+    inbox, project_id, session_id = _bound(registry)
+    if action == "projects":
+        return _result(
+            "projects", project_id, {"projects": inbox.known_projects()}
+        )
+    if action == "send":
+        return _send(inbox, project_id, session_id, arguments)
+    if action == "list":
+        status = arguments.get("status", "new")
+        listed = inbox.list(project_id, session_id=session_id)
+        messages = listed[status]
+        invalid = [
+            item for item in listed["invalid"] if item["status"] == status
+        ]
+        return _result(
+            "list",
+            project_id,
+            {"status": status, "messages": messages, "invalid": invalid},
+        )
+    if action == "sent":
+        page = inbox.sent(
+            project_id,
+            session_id=session_id,
+            offset=arguments.get("offset", 0),
+            limit=arguments.get("limit", 50),
+        )
+        return _result("sent", project_id, page)
+    if action == "claim":
+        message = inbox.claim(project_id, arguments["id"], session_id)
+        if message is None:
+            raise InboxError("message is not new or was claimed by another session")
+        return _result("claim", project_id, {"message": message})
+    return _done(inbox, project_id, session_id, arguments)
+
+
 async def _inbox(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
-        state = getattr(registry, "project_registry_state", None)
-        if state is not None and state.unavailable is not None:
-            return _error(
-                "project registry is temporarily unavailable; try again later",
-                kind="project_registry_unavailable",
-            )
-        action = _validate_action(arguments)
-        inbox, project_id, session_id = _bound(registry)
-        if action == "projects":
-            known_projects = await asyncio.to_thread(inbox.known_projects)
-            return _result("projects", project_id, {"projects": known_projects})
-        if action == "send":
-            target_id = arguments["project"]
-            message_id = await asyncio.to_thread(
-                inbox.send,
-                from_project=project_id,
-                from_session=session_id,
-                to_project=target_id,
-                kind=arguments["kind"],
-                title=arguments["title"],
-                body=arguments["body"],
-                in_reply_to=arguments.get("in_reply_to"),
-                message_id=arguments.get("id"),
-            )
-            return _result("send", project_id, {"id": message_id})
-        if action == "list":
-            status = arguments.get("status", "new")
-            state = await asyncio.to_thread(
-                inbox.list, project_id, session_id=session_id
-            )
-            messages = state[status]
-            invalid = [item for item in state["invalid"] if item["status"] == status]
-            return _result(
-                "list",
-                project_id,
-                {"status": status, "messages": messages, "invalid": invalid},
-            )
-        if action == "sent":
-            page = await asyncio.to_thread(
-                inbox.sent,
-                project_id,
-                session_id=session_id,
-                offset=arguments.get("offset", 0),
-                limit=arguments.get("limit", 50),
-            )
-            return _result("sent", project_id, page)
-        if action == "claim":
-            message = await asyncio.to_thread(
-                inbox.claim, project_id, arguments["id"], session_id
-            )
-            if message is None:
-                raise InboxError("message is not new or was claimed by another session")
-            return _result("claim", project_id, {"message": message})
-        message = await asyncio.to_thread(
-            inbox.done,
-            project_id,
-            arguments["id"],
-            session_id,
-            arguments["outcome"],
-            reply=arguments.get("reply"),
-        )
-        return _result("done", project_id, {"message": message})
-    except (InboxError, ProjectRegistryError, OSError, KeyError, TypeError) as exc:
+        return await asyncio.to_thread(_run_inbox, registry, arguments)
+    except (
+        ProjectRegistryError,
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
         return _error(str(exc))
 
 

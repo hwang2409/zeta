@@ -210,6 +210,8 @@ class ProjectContextProjectionMixin:
                     ),
                     None,
                 ) or _health("project_not_found", session_project_id)
+            elif session_project_id is not None:
+                finding = memory_health
             else:
                 finding = memory_health or (malformed[0] if malformed else None)
             return ProjectContextProjection(

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import stat
+import sys
 import threading
 from pathlib import Path
 
@@ -12,16 +14,25 @@ import zeta.project_inbox as project_inbox_module
 from zeta.agent.receipt import receipt_tool_result
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
-from zeta.project_inbox import ProjectInbox
+from zeta.project_inbox import ProjectInbox, ProjectInboxScanner, SentMessageTracker
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.skills import SkillCatalog
-from zeta.storage_format import open_writer
+from zeta.storage_format import WriterLease, open_writer
 from zeta.tools.inbox import _inbox, _model_visible, _validate_action
 from zeta.tools.registry import ToolRegistry
+
+project_inbox_sent_module = sys.modules[SentMessageTracker.__module__]
 
 
 @pytest.fixture(autouse=True)
@@ -482,6 +493,455 @@ async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
         assert done["outcome"] == "complete"
         assert done["reply_id"] is None
         assert "done_at" in done
+    finally:
+        await registry.close()
+        store.close()
+
+async def _exercise_repair_after_guarded_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    bound = await _inbox(registry, {"action": "projects"})
+    assert bound.get("isError") is not True
+    ledger = store.session_dir / "project-inbox-sent.json"
+    repaired = json.dumps({"schema_version": 1, "records": []}).encode()
+    ledger.write_bytes(repaired)
+    assert registry.sent_message_tracker is not None
+    registry.sent_message_tracker.health()
+    refresh_finished = threading.Event()
+    corruption_finished = threading.Event()
+    guarded_failure_finished = threading.Event()
+    repair_finished = threading.Event()
+    real_refresh = SentMessageTracker._refresh
+    real_publish_records = WriterLease.publish_records
+
+    def gated_refresh(self):
+        real_refresh(self)
+        refresh_finished.set()
+        assert corruption_finished.wait(timeout=10)
+
+    def gated_publish_records(self, *args, **kwargs):
+        try:
+            return real_publish_records(self, *args, **kwargs)
+        except ValueError:
+            guarded_failure_finished.set()
+            assert repair_finished.wait(timeout=10)
+            raise
+
+    def corrupt_then_repair() -> None:
+        if not refresh_finished.wait(timeout=10):
+            return
+        ledger.write_bytes(b"{")
+        corruption_finished.set()
+        if not guarded_failure_finished.wait(timeout=10):
+            return
+        ledger.write_bytes(repaired)
+        repair_finished.set()
+
+    # test-contract: seam force stale state before guarded public tool publication
+    monkeypatch.setattr(SentMessageTracker, "_refresh", gated_refresh)
+    monkeypatch.setattr(
+        WriterLease,
+        "publish_records",
+        gated_publish_records,
+    )
+    repairer = threading.Thread(target=corrupt_then_repair)
+    repairer.start()
+    try:
+        result = await _inbox(
+            registry,
+            {
+                "action": "send",
+                "project": beta.project_id,
+                "kind": "info",
+                "title": "repair after guarded failure",
+                "body": "delivered",
+                "id": "f" * 32,
+            },
+        )
+        assert result.get("isError") is not True
+        assert repair_finished.is_set()
+        repairer.join(10)
+        assert not repairer.is_alive()
+        structured = result["structuredContent"]
+        assert structured["sent_health"]["state"] == "broken"
+        assert "history is incomplete" in structured["warning"]
+        assert ledger.read_bytes() == repaired
+    finally:
+        refresh_finished.set()
+        corruption_finished.set()
+        guarded_failure_finished.set()
+        repair_finished.set()
+        repairer.join(10)
+        await registry.close()
+        store.close()
+
+
+async def _exercise_concurrent_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    bound = await _inbox(registry, {"action": "projects"})
+    assert bound.get("isError") is not True
+    ledger = store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    repaired = json.dumps({"schema_version": 1, "records": []}).encode()
+    record_finished = threading.Event()
+    repair_finished = threading.Event()
+    real_record = SentMessageTracker.record
+
+    def gated_record(self, *args, **kwargs):
+        outcome = real_record(self, *args, **kwargs)
+        record_finished.set()
+        assert repair_finished.wait(timeout=10)
+        return outcome
+
+    def repair() -> None:
+        if not record_finished.wait(timeout=10):
+            return
+        ledger.write_bytes(repaired)
+        repair_finished.set()
+
+    monkeypatch.setattr(SentMessageTracker, "record", gated_record)
+    repairer = threading.Thread(target=repair)
+    repairer.start()
+    try:
+        result = await _inbox(
+            registry,
+            {
+                "action": "send",
+                "project": beta.project_id,
+                "kind": "info",
+                "title": "repair race",
+                "body": "delivered",
+                "id": "c" * 32,
+            },
+        )
+        assert result.get("isError") is not True
+        assert repair_finished.is_set()
+        repairer.join(10)
+        assert not repairer.is_alive()
+        structured = result["structuredContent"]
+        assert structured["sent_health"]["state"] == "broken"
+        assert "history is incomplete" in structured["warning"]
+        assert ledger.read_bytes() == repaired
+    finally:
+        record_finished.set()
+        repair_finished.set()
+        repairer.join(10)
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "record-message",
+        "record-ledger",
+        "mark-ledger",
+        "projection-restart",
+        "record-concurrent-repair",
+        "record-repair-after-guard",
+        "record-cancel",
+    ),
+)
+async def test_guarded_sent_operation_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    if scenario == "record-concurrent-repair":
+        await _exercise_concurrent_repair(tmp_path, monkeypatch)
+        return
+    if scenario == "record-repair-after-guard":
+        await _exercise_repair_after_guarded_failure(tmp_path, monkeypatch)
+        return
+    if scenario == "record-cancel":
+        await _exercise_cancelled_send(tmp_path, monkeypatch)
+        return
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    message_id = "d" * 32
+    arguments = {
+        "action": "send",
+        "project": beta.project_id,
+        "kind": "info",
+        "title": "retry",
+        "body": "same input",
+        "id": message_id,
+    }
+    scanner = None
+    if scenario in ("mark-ledger", "projection-restart"):
+        sent = await _inbox(registry, arguments)
+        assert sent.get("isError") is not True
+    if scenario == "mark-ledger":
+        ProjectInbox(
+            projects, sessions_root=projects.root.parent / "sessions"
+        ).claim(beta.project_id, message_id, "b" * 32)
+        assert registry.sent_message_tracker is not None
+        scanner = ProjectInboxScanner(
+            projects,
+            registry.project_id,
+            sessions_root=projects.root.parent / "sessions",
+            session_id=store.session_id,
+            tracker=registry.sent_message_tracker,
+        )
+    if scenario == "record-message":
+        real_publish = ProjectInbox._publish_record
+
+        def fail_once(self, *args, **kwargs):
+            # test-contract: seam inject one failure at the message publish seam
+            monkeypatch.setattr(ProjectInbox, "_publish_record", real_publish)
+            raise OSError("message publish failed")
+
+        # test-contract: seam exercise failure through the public tool
+        monkeypatch.setattr(ProjectInbox, "_publish_record", fail_once)
+    elif scenario in ("record-ledger", "mark-ledger"):
+        real_publish = project_inbox_sent_module.atomic_publish_file
+
+        def fail_once(*args, **kwargs):
+            monkeypatch.setattr(
+                project_inbox_sent_module, "atomic_publish_file", real_publish
+            )
+            raise OSError("ledger publish failed")
+
+        monkeypatch.setattr(
+            project_inbox_sent_module, "atomic_publish_file", fail_once
+        )
+    try:
+        if scenario == "projection-restart":
+            projected = await _inbox(registry, {"action": "sent"})
+            duplicate_projection = await _inbox(registry, {"action": "sent"})
+            assert projected.get("isError") is not True
+            assert projected["structuredContent"].get("state") == "healthy"
+            assert duplicate_projection == projected
+        elif scanner is None:
+            failed = await _inbox(registry, arguments)
+            assert failed["isError"] is True
+            retried = await _inbox(registry, arguments)
+            duplicate = await _inbox(registry, arguments)
+            assert retried.get("isError") is not True
+            assert duplicate.get("isError") is not True
+            health = retried["structuredContent"].get("sent_health", {})
+            assert health.get("state") == "healthy"
+        else:
+            statuses = ((message_id, "claimed"),)
+            with pytest.raises(ValueError, match="unsafe or unavailable"):
+                await asyncio.to_thread(scanner.mark_reported, iter(statuses))
+            await asyncio.to_thread(scanner.mark_reported, iter(statuses))
+            await asyncio.to_thread(scanner.mark_reported, iter(statuses))
+
+        registry.sent_message_tracker = None
+        restarted = await _inbox(registry, {"action": "sent"})
+        assert restarted["structuredContent"].get("state") == "healthy"
+        rows = restarted["structuredContent"]["messages"]
+        assert [row["id"] for row in rows] == [message_id]
+        if scenario == "mark-ledger":
+            assert rows[0]["reported"] == ["claimed"]
+    finally:
+        await registry.close()
+        store.close()
+
+
+async def _exercise_cancelled_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    bound = await _inbox(registry, {"action": "projects"})
+    assert bound.get("isError") is not True
+    ledger = store.session_dir / "project-inbox-sent.json"
+    corrupt = b"{"
+    ledger.write_bytes(corrupt)
+    publish_entered = threading.Event()
+    release_publish = threading.Event()
+    publish_finished = threading.Event()
+    tracker_read = threading.Event()
+    owner_thread = threading.get_ident()
+    real_publish = ProjectInbox._publish_record
+    real_read = project_inbox_sent_module.read_session_file
+
+    def observed_read(*args, **kwargs):
+        assert threading.get_ident() != owner_thread
+        tracker_read.set()
+        return real_read(*args, **kwargs)
+
+    def gated_publish(self, *args, **kwargs):
+        publish_entered.set()
+        try:
+            assert threading.get_ident() != owner_thread
+            assert release_publish.wait(timeout=10)
+            return real_publish(self, *args, **kwargs)
+        finally:
+            publish_finished.set()
+
+    monkeypatch.setattr(
+        project_inbox_sent_module, "read_session_file", observed_read
+    )
+    # test-contract: seam hold the real message publication boundary
+    monkeypatch.setattr(ProjectInbox, "_publish_record", gated_publish)
+    message_id = "e" * 32
+    operation = asyncio.create_task(
+        _inbox(
+            registry,
+            {
+                "action": "send",
+                "project": beta.project_id,
+                "kind": "info",
+                "title": "cancelled caller",
+                "body": "still delivered",
+                "id": message_id,
+            },
+        )
+    )
+    try:
+        assert await asyncio.wait_for(
+            asyncio.to_thread(publish_entered.wait), 10
+        )
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 10)
+        release_publish.set()
+        assert await asyncio.wait_for(
+            asyncio.to_thread(publish_finished.wait), 10
+        )
+        assert await asyncio.wait_for(
+            asyncio.to_thread(tracker_read.wait, 10), 11
+        )
+        listed = ProjectInbox(
+            projects, sessions_root=projects.root.parent / "sessions"
+        ).list(beta.project_id)
+        assert [item["id"] for item in listed["new"]] == [message_id]
+        sent = await _inbox(registry, {"action": "sent"})
+        assert sent.get("isError") is not True
+        assert [
+            item["id"] for item in sent["structuredContent"]["messages"]
+        ] == [message_id]
+        assert ledger.read_bytes() == corrupt
+    finally:
+        release_publish.set()
+        if not operation.done():
+            operation.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(operation, return_exceptions=True), 10
+            )
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_sent_ledger_keeps_every_model_inbox_action_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
+    incoming_id = inbox.send(
+        from_project=beta.project_id,
+        from_session="b" * 32,
+        to_project=registry.project_id or "",
+        kind="question",
+        title="incoming",
+        body="answer me",
+    )
+    ledger = store.session_dir / "project-inbox-sent.json"
+    corrupt = b'{"schema_version":1,"records":"broken"}'
+    ledger.write_bytes(corrupt)
+    owner_thread = threading.get_ident()
+    ledger_read_threads: list[int] = []
+    real_read = project_inbox_sent_module.read_session_file
+
+    def checked_read(*args, **kwargs):
+        ledger_read_threads.append(threading.get_ident())
+        assert threading.get_ident() != owner_thread
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(project_inbox_sent_module, "read_session_file", checked_read)
+    send_id = "c" * 32
+    try:
+        projects_result = await _inbox(registry, {"action": "projects"})
+        list_result = await _inbox(registry, {"action": "list"})
+        send_result = await _inbox(
+            registry,
+            {
+                "action": "send",
+                "project": beta.project_id,
+                "kind": "info",
+                "title": "outgoing",
+                "body": "body",
+                "id": send_id,
+            },
+        )
+        claim_result = await _inbox(
+            registry, {"action": "claim", "id": incoming_id}
+        )
+        assert claim_result.get("isError") is not True
+        done_result = await _inbox(
+            registry,
+            {
+                "action": "done",
+                "id": incoming_id,
+                "outcome": "answered",
+                "reply": "reply body",
+            },
+        )
+        reply_id = done_result["structuredContent"]["message"]["reply_id"]
+        store.append_message(
+            Message(
+                MessageRole.USER,
+                [TextContent("status")],
+                metadata={
+                    "zeta_event": "project_inbox_sent_status",
+                    "zeta.origin": MessageOrigin.HARNESS_NUDGE.value,
+                    "sent_statuses": [
+                        {"message_id": send_id, "status": "claimed"}
+                    ],
+                },
+            )
+        )
+        sent_result = await _inbox(registry, {"action": "sent"})
+
+        for result in (
+            projects_result,
+            list_result,
+            send_result,
+            done_result,
+            sent_result,
+        ):
+            assert result.get("isError") is not True
+        assert [
+            item["id"] for item in list_result["structuredContent"]["messages"]
+        ] == [incoming_id]
+        assert ledger.read_bytes() == corrupt
+        for result in (send_result, done_result):
+            structured = result["structuredContent"]
+            assert structured["sent_health"]["state"] == "broken"
+            assert structured["sent_health"]["history_complete"] is False
+            assert structured["sent_health"]["reason"] == "invalid_records"
+            warning = structured["warning"]
+            assert "history is incomplete" in warning
+            assert "file was not changed" in warning
+            assert "unless the repaired ledger includes their IDs" in warning
+        sent = sent_result["structuredContent"]
+        assert sent["history_complete"] is False
+        assert {item["id"] for item in sent["messages"]} == {send_id, reply_id}
+        send_row = next(item for item in sent["messages"] if item["id"] == send_id)
+        assert send_row["reported"] == ["claimed"]
+        assert ledger_read_threads
+        assert set(ledger_read_threads).isdisjoint({owner_thread})
     finally:
         await registry.close()
         store.close()
