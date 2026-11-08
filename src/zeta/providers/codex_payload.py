@@ -33,6 +33,10 @@ from .payload_common import (
 )
 
 
+class _CodexImageURL(str):
+    """marks a validated image URL for the large-image request encoder."""
+
+
 def _image_input_block(image: ToolImageBlock) -> dict[str, Any] | None:
     data = decoded_image_bytes(image)
     if (
@@ -43,7 +47,9 @@ def _image_input_block(image: ToolImageBlock) -> dict[str, Any] | None:
         return None
     return {
         "type": "input_image",
-        "image_url": f"data:{image['mimeType']};base64,{image['data']}",
+        "image_url": _CodexImageURL(
+            f"data:{image['mimeType']};base64,{image['data']}"
+        ),
     }
 
 
