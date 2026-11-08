@@ -103,11 +103,11 @@ def _decisions_app(home: Path, opened) -> TUIApp:
 @pytest.mark.asyncio
 async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
     other = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
-    _request(current, project.project_id, "Current", "This one.")
-    _request(other, project.project_id, "Other", "Not this one.")
+    await asyncio.to_thread(_request, current, project.project_id, "Current", "This one.")
+    await asyncio.to_thread(_request, other, project.project_id, "Other", "Not this one.")
 
     app = _decisions_app(tmp_path, current)
     child = ConversationStore(current.store.session_dir / "agents", session_id="child")
@@ -125,14 +125,15 @@ async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
     other = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
-    _request(other, project.project_id, "Other", "Not this one.")
+    await asyncio.to_thread(_request, other, project.project_id, "Other", "Not this one.")
     anchor = current.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
     )
-    record = _request(
+    record = await asyncio.to_thread(
+        _request,
         current,
         project.project_id,
         "Current",
@@ -200,7 +201,7 @@ def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
     other = await asyncio.to_thread(_session, tmp_path, project.project_id)
     await asyncio.to_thread(
