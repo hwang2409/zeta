@@ -645,6 +645,7 @@ async def stall_watchdog[T](
     *,
     seconds: float,
     on_stall: Callable[[float], BaseException],
+    wait_for: Callable[..., Awaitable[Any]] | None = None,
     on_model_stall: Callable[[float], BaseException] | None = None,
     is_finished: Callable[[], bool] | None = None,
     progress: StreamProgress | None = None,
@@ -652,6 +653,7 @@ async def stall_watchdog[T](
     """Raise on transport silence or, when tracked, missing model progress."""
 
     iterator = source.__aiter__()
+    wait = wait_for or asyncio.wait_for
     deadlines = _StreamDeadlines(seconds, progress)
     finished = is_finished or (lambda: False)
     try:
@@ -659,7 +661,7 @@ async def stall_watchdog[T](
             remaining, limit, model_stall = deadlines.next()
             try:
                 timeout = None if seconds <= 0 else max(0, remaining)
-                item = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+                item = await wait(iterator.__anext__(), timeout=timeout)
             except StopAsyncIteration:
                 return
             except TimeoutError as exc:
