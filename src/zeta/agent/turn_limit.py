@@ -129,6 +129,28 @@ def project_notification_data(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def project_tool_result_data(result: dict[str, Any]) -> dict[str, Any]:
+    """Project a persisted tool result through the same epoch-free marker."""
+    structured = result.get("structured_content")
+    if not isinstance(structured, dict) or structured.get("status") != "completed":
+        return result
+    child_path = structured.get("child_session_path")
+    if type(child_path) is not str:
+        return result
+    projection = parse_turn_limit_result(result.get("content"), child_path)
+    if projection is None:
+        return result
+    return {
+        **result,
+        "content": projection.readable_text,
+        "structured_content": {
+            **structured,
+            "status": projection.status,
+            "handoff_path": projection.handoff_path,
+        },
+    }
+
+
 def project_payload(payload: dict[str, object], child_session_path: str) -> dict[str, object]:
     """Return the public non-error payload for a live turn-limit completion."""
     projected = dict(payload)

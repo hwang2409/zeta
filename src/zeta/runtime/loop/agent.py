@@ -1207,19 +1207,16 @@ class AgentLoop(
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             await self._check_project_inbox()
-            exhausted = (
+            if self.child_turn_control is not None:
                 self.child_turn_control.finish_completion()
-                if self.child_turn_control is not None
-                else False
-            )
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,
                 data={"turn": turn_number, "tool_calls": len(calls)},
             )
-            if exhausted:
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
+        if self.child_turn_control is not None and self.child_turn_control.exhausted:
+            yield StreamEvent(StreamEventType.AGENT_END)
+            return
         yield StreamEvent(
             StreamEventType.ERROR,
             error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),

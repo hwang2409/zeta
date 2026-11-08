@@ -4,6 +4,7 @@ import asyncio
 import json
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -12,6 +13,7 @@ import zeta.agent.runner as agent_runner_module
 from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent import pending_delivery as pending_delivery_module
+from zeta.agent.background import BackgroundAgentOwner, finish_background_child
 from zeta.agent.receipt import build_agent_receipt, has_agent_receipt_suffix
 from zeta.agent.turn_limit import (
     ChildTurnControl,
@@ -375,6 +377,48 @@ async def test_finish_gate_with_one_lifetime_completion_left_uses_only_one(
         await loop.close()
 
 
+@pytest.mark.asyncio
+async def test_top_level_pending_followup_still_runs_after_soft_max_turns(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([]), ScriptedTurn([TextContent("final visible answer")])]
+    )
+    store = ConversationStore(tmp_path / "top-level")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        empty_nudge_started = len(backend.calls) == 2
+        assert empty_nudge_started is True
+        assert len(backend.calls) == 2
+        assert any(
+            event.message is not None
+            and event.message.role.value == "assistant"
+            and any(
+                isinstance(block, TextContent)
+                and block.text == "final visible answer"
+                for block in event.message.content
+            )
+            for event in events
+        )
+        assert not any(
+            event.type is StreamEventType.ERROR
+            and event.error is not None
+            and event.error.code == "max_turns"
+            for event in events
+        )
+    finally:
+        await loop.close()
+        store.close()
+
+
 async def _run_limited_background(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[ConversationStore, AgentLoop, dict[str, object]]:
@@ -484,6 +528,134 @@ async def test_tui_replay_renders_turn_limit_and_handoff(
     finally:
         await loop.close()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_limit_finalization_defers_cancel_at_each_await(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(tmp_path / "child")
+    call = ToolCall("child-call", "agent", {"description": "limited"})
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="limited",
+        child_instance_id="child-1",
+    )
+    child_store.mark_agent_parent(call.id)
+    child_store.start_agent_lifecycle(
+        handle="child-1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="limited",
+    )
+    owner = BackgroundAgentOwner(parent_store)
+    owner.conversation_channel.register_delivery_flow(
+        None, pending_delivery_module.StepDeliveryFlow(parent_store)
+    )
+    owner.conversation_channel.register_delivery_flow(
+        "child-1", pending_delivery_module.StepDeliveryFlow(child_store)
+    )
+    control = ChildTurnControl(1, str(child_store.session_dir))
+    control.begin_completion()
+    control.finish_completion()
+    child_loop = SimpleNamespace(
+        child_turn_control=control,
+        tool_registry=SimpleNamespace(
+            background_tasks=SimpleNamespace(snapshot=lambda: ())
+        ),
+    )
+    publish_started = asyncio.Event()
+    release_publish = asyncio.Event()
+    handoff_exists_at_publish = False
+    original_publish = owner.conversation_channel.publish_completion
+
+    async def pause_publish(**kwargs):
+        nonlocal handoff_exists_at_publish
+        handoff_exists_at_publish = (
+            child_store.session_dir / "turn-limit-handoff.md"
+        ).exists()
+        publish_started.set()
+        await asyncio.wait_for(release_publish.wait(), timeout=10)
+        return await original_publish(**kwargs)
+
+    monkeypatch.setattr(owner.conversation_channel, "publish_completion", pause_publish)
+
+    async def close_child(_cause: str) -> tuple[()]:
+        return ()
+
+    def terminal_result(
+        text: str, error: bool, status: str, stats=None, **kwargs
+    ):
+        state = status if status in {"completed", "failed", "canceled"} else "completed"
+        return build_agent_receipt(
+            state,
+            text,
+            stats,
+            structured_content={"status": status},
+        )
+
+    watcher = asyncio.create_task(
+        finish_background_child(
+            child_task=asyncio.create_task(
+                asyncio.sleep(
+                    0,
+                    result=terminal_result(
+                        "done",
+                        False,
+                        "completed",
+                        stats={"turns_used": 1, "elapsed": 0.0, "tool_calls": 0},
+                    ),
+                )
+            ),
+            child_store=child_store,
+            parent_store=parent_store,
+            tool_call=call,
+            child_instance_id="child-1",
+            child_path=str(child_store.session_dir),
+            description="limited",
+            child_turns=lambda: 1,
+            build_result=terminal_result,
+            validate_result=lambda result, tool_call_id: ToolResult(
+                tool_call_id,
+                result["content"][0]["text"],
+                is_error=result["isError"],
+                structured_content=result["structuredContent"],
+            ),
+            publish_event=lambda event: None,
+            cleanup=lambda: owner.unregister("child-1"),
+            close_child=close_child,
+            error_message=str,
+            background_owner=owner,
+            child_loop=child_loop,
+            finish_gate_state=SimpleNamespace(terminal_admitted=True),
+        )
+    )
+    owner.register("child-1", watcher.cancel, watcher, parent_store)
+    try:
+        await asyncio.wait_for(publish_started.wait(), timeout=10)
+        watcher.cancel()
+        release_publish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(watcher, timeout=10)
+        assert handoff_exists_at_publish is True
+        lifecycle = child_store.agent_lifecycle()
+        assert lifecycle is not None and lifecycle["state"] == "completed"
+        assert parse_turn_limit_result(
+            lifecycle["final_result"], str(child_store.session_dir)
+        ) is not None
+        assert len(parent_store.agent_notifications(pending_only=False)) == 1
+    finally:
+        release_publish.set()
+        if not watcher.done():
+            watcher.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(watcher, return_exceptions=True), timeout=10
+            )
+        child_store.close()
+        parent_store.close()
 
 
 def test_profile_max_turns_validation_and_snapshot(tmp_path: Path) -> None:
