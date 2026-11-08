@@ -72,6 +72,7 @@ async def _approve_after_external_end(
         return result
 
     monkeypatch.setattr(approval_module, "persist_durably", gated_persist)
+    # test-contract: seam force the ExternalEnd ownership interleaving
     monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
     approve = asyncio.create_task(
         _request(
@@ -93,7 +94,19 @@ async def _approve_after_external_end(
         await await_or_fail(external_end, what="external approval end")
         release.set()
         approve_frames = await await_or_fail(approve, what="approve response")
-        return approve_frames, list(_buffer(reader))
+        response = approve_frames[-1]["result"]
+        assert response["request_id"] == approval_request_id
+        assert response["scope"] == "always_tool"
+        buffered = list(_buffer(reader))
+        grant_events = [
+            frame
+            for frame in buffered
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+        ]
+        assert len(grant_events) == 1, buffered
+        assert grant_events[0]["params"]["data"]["change"] == "grant"
+        assert grant_events[0]["params"]["data"]["changed"] == ["bash"]
+        return approve_frames, buffered
     finally:
         release.set()
 
