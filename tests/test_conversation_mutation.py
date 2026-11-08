@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.core.checkpoints import mutation as mutation_module
 from zeta.core.store import (
     AppendConversationRows,
@@ -721,8 +722,13 @@ async def test_address_concurrent_resident_commits_are_serialized(
         await asyncio.wait_for(queued.wait(), 10)
         assert store._address_commit_waiters == 8
         release.set()
-        results = await asyncio.wait_for(asyncio.gather(*tasks), 20)
-        assert len(results) == 8
+        results = await await_or_fail(
+            asyncio.gather(*tasks, return_exceptions=True),
+            what="resident address commits",
+        )
+        assert not [
+            result for result in results if isinstance(result, BaseException)
+        ]
         messages = [entry.data["message"] for entry in store.entries]
         assert sorted(messages) == [f"resident-{i}" for i in range(8)]
         generation = store.conversation_generation
@@ -789,7 +795,13 @@ async def test_address_transient_waiter_retries_after_owner_release(
         await asyncio.wait_for(waiting.wait(), 10)
         assert not waiter.done()
         release.set()
-        await asyncio.wait_for(asyncio.gather(owner, waiter), 20)
+        outcomes = await await_or_fail(
+            asyncio.gather(owner, waiter, return_exceptions=True),
+            what="transient owner and waiter",
+        )
+        assert not [
+            outcome for outcome in outcomes if isinstance(outcome, BaseException)
+        ]
     finally:
         release.set()
         for task in (owner, waiter):
@@ -933,8 +945,8 @@ async def test_transient_owner_failure_wakes_waiter(
         assert not waiter.done()
         release.set()
         with pytest.raises(ConversationIntegrityError, match="forced owner failure"):
-            await asyncio.wait_for(owner, 10)
-        await asyncio.wait_for(waiter, 20)
+            await await_or_fail(owner, what="failing transient reservation owner")
+        await await_or_fail(waiter, what="waiter after transient owner failure")
     finally:
         release.set()
         for task in tasks:
@@ -997,8 +1009,8 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
         assert waiter is not None and not waiter.done()
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(owner, 20)
-        await asyncio.wait_for(waiter, 20)
+            await await_or_fail(owner, what="cancelled transient reservation owner")
+        await await_or_fail(waiter, what="waiter after transient owner cancellation")
     finally:
         release.set()
         tasks = (owner,) if waiter is None else (owner, waiter)
