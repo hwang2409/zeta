@@ -769,7 +769,14 @@ def _direct_case(
     )
 
 
-def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str, str]:
+def _train_case(
+    r: Path,
+    *,
+    newer: bool,
+    depth: int = 1,
+    plain: bool = False,
+    synced_pr: bool = False,
+) -> tuple[str, str, str, str]:
     _api_repo(r)
     initial = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
@@ -811,6 +818,13 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
         )
         (r / "src/pr.py").write_text("def pr(): pass\n")
         commit(r, "older pr")
+        if synced_pr:
+            # the PR branch merges main, then adds a plain commit (#1050's shape).
+            subprocess.run(
+                ["git", "merge", "--no-ff", "--no-edit", base], cwd=r, check=True
+            )
+            (r / "src/pr_fix.py").write_text("def pr_fix(): pass\n")
+            commit(r, "pr fix after main merge")
         pr_base = "pr-side"
     subprocess.run(
         ["git", "update-ref", "refs/remotes/origin/main", origin_main],
@@ -835,6 +849,10 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
             check=True,
         )
         commit(r, f"train merge {index + 1}")
+    if plain:
+        # a plain fix commit on the train between merges (train #1053's 72a6596d).
+        (r / "src/train_fix.py").write_text("def train_fix(): pass\n")
+        commit(r, "train plain fix")
     train_merge = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
@@ -1269,6 +1287,10 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
         ("train-older", 0, False),
         ("train-newer", 0, False),
         ("train-newer-wrong", None, True),
+        ("train-plain", 0, False),
+        ("train-plain-newer", 0, False),
+        ("train-plain-synced-pr", 0, False),
+        ("train-plain-wrong", None, True),
         ("both", None, True),
         ("neither", None, True),
         ("wrong", None, True),
@@ -1283,8 +1305,10 @@ def test_parent_selection_table(
         r = repo(tmp_path)
         merge, p1, p2, loss = _train_case(
             r,
-            newer=shape in {"train-newer", "train-newer-wrong"},
+            newer=shape in {"train-newer", "train-newer-wrong", "train-plain-newer"},
             depth=1 if shape == "train-1" else 2,
+            plain=shape.startswith("train-plain"),
+            synced_pr=shape == "train-plain-synced-pr",
         )
     else:
         r = repo(tmp_path)
@@ -1319,7 +1343,7 @@ def test_parent_selection_table(
         subprocess.run(
             ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
         )
-    if shape == "train-newer-wrong":
+    if shape in {"train-newer-wrong", "train-plain-wrong"}:
         args = ("--main-sha", p2)
     elif shape == "wrong":
         # guard: this direct-shape refusal already held on 707549ed.
@@ -1334,7 +1358,7 @@ def test_parent_selection_table(
         if shape == "wrong":
             assert f"disagrees with the identified main parent {p2}" in result.stderr
             assert "main parent:" not in result.stdout
-        elif shape == "train-newer-wrong":
+        elif shape in {"train-newer-wrong", "train-plain-wrong"}:
             assert f"disagrees with the identified main parent {p1}" in result.stderr
             assert "main parent:" not in result.stdout
         else:

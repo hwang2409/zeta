@@ -441,19 +441,27 @@ def _is_ancestor(ancestor: str, descendant: str) -> bool:
     return result.returncode == 0
 
 
-def _train_parent_qualifies(parent: str, first_parent_chain: set[str]) -> bool:
-    """Return whether a parent is the head of a no-ff train chain."""
-    current = parent
-    while True:
+def _train_parent_qualifies(
+    parent: str, first_parent_chain: set[str], origin_main: str
+) -> bool:
+    """Return whether a parent is the head of a no-ff train chain.
+
+    Plain fix commits and merges of main may sit on the train's first-parent
+    path, but at least one merge on it must bring in a side origin/main lacks
+    (a PR head). A PR branch only merges main, so it never qualifies.
+    """
+    current, brings_side = parent, False
+    while current not in first_parent_chain:
         try:
             parents = git("rev-list", "--parents", "-n", "1", current).split()[1:]
         except subprocess.CalledProcessError:
             return False
-        if len(parents) != 2:
+        if not parents:
             return False
-        if current in first_parent_chain:
-            return True
+        if len(parents) == 2 and not _is_ancestor(parents[1], origin_main):
+            brings_side = True
         current = parents[0]
+    return brings_side
 
 
 def _direct_main_parent(
@@ -484,7 +492,7 @@ def _train_chain_parent(
     matches = [
         index
         for index, parent in enumerate(parents)
-        if _train_parent_qualifies(parent, first_parent_chain)
+        if _train_parent_qualifies(parent, first_parent_chain, origin_main)
     ]
     if len(matches) == 1:
         return matches[0], "the selected parent is the train merge chain"
@@ -516,7 +524,8 @@ def _identify_main_parent(
     train_matches = [
         parent
         for parent in parents
-        if origin_main and _train_parent_qualifies(parent, first_parent_chain)
+        if origin_main
+        and _train_parent_qualifies(parent, first_parent_chain, origin_main)
     ]
     details = (
         "both parents qualify" if len(train_matches) > 1 else "neither parent qualifies"
