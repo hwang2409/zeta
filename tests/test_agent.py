@@ -7526,7 +7526,10 @@ async def test_resume_cancels_gated_nested_tree_without_duplicate_notifications(
     resumed_grandchild = ConversationStore(
         resumed_child.session_dir / "agents", session_id="1"
     )
-    assert resumed_child.agent_notifications() == []
+    assert {
+        entry.data["child_instance_id"]
+        for entry in resumed_child.agent_notifications(pending_only=False)
+    } == {"root:1:1"}
     assert {
         entry.data["child_instance_id"]
         for entry in resumed.agent_notifications(pending_only=False)
@@ -13086,6 +13089,63 @@ def _first_tool_result(store: ConversationStore) -> ToolResult:
     return next(
         message.tool_result for message in store.messages() if message.tool_result
     )
+
+
+@pytest.mark.asyncio
+async def test_first_turn_mcp_setup_does_not_recreate_removed_shell_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_cwd = tmp_path / "removed-cwd"
+    session_cwd.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=session_cwd)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("removed-cwd", "bash", {"command": "pwd"})]
+            ),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    probe_entered = threading.Event()
+    loop_ready = threading.Event()
+    release_probe = threading.Event()
+    ready_before_release = False
+    original_is_dir = Path.is_dir
+
+    def held_is_dir(path: Path) -> bool:
+        if path == session_cwd:
+            probe_entered.set()
+            assert release_probe.wait(10)
+        return original_is_dir(path)
+
+    event_loop = asyncio.get_running_loop()
+
+    def check_loop_readiness() -> None:
+        nonlocal ready_before_release
+        assert probe_entered.wait(10)
+        event_loop.call_soon_threadsafe(loop_ready.set)
+        ready_before_release = loop_ready.wait(1)
+        release_probe.set()
+
+    monkeypatch.setattr(Path, "is_dir", held_is_dir)
+    readiness_thread = threading.Thread(target=check_loop_readiness)
+    readiness_thread.start()
+    try:
+        session_cwd.rmdir()
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.to_thread(readiness_thread.join, 10)
+
+        assert ready_before_release
+        result = _first_tool_result(store)
+        assert result.is_error is False
+        assert result.structured_content["stdout"].strip() == str(tmp_path)
+        assert not session_cwd.exists()
+    finally:
+        release_probe.set()
+        await asyncio.to_thread(readiness_thread.join, 10)
+        await loop.close()
 
 
 @pytest.mark.asyncio
@@ -18885,6 +18945,170 @@ def test_events_after_terminal_state_emit_no_second_receipt(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "no crash",
+        "crash after root write",
+        "crash after parent write",
+        "crash after both writes before marker cleanup",
+        "crash after recovery queued before commit",
+        "duplicate recovery",
+        "root is parent",
+        "concurrent live publisher",
+    ],
+)
+async def test_completion_recovery_is_durable_for_every_recipient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    parent = (
+        root
+        if scenario == "root is parent"
+        else ConversationStore(root.session_dir / "agents", session_id="1")
+    )
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    child_id = "root:1" if parent is root else "root:1:1"
+    if parent is not root:
+        root.register_agent_child(
+            _run_agent_call("parent-call"),
+            child_session_path=str(parent.session_dir),
+            description="parent",
+            background=False,
+            child_instance_id="root:1",
+        )
+    parent.register_agent_child(
+        _run_agent_call("child-call"),
+        child_session_path=str(child.session_dir),
+        description="child",
+        background=True,
+        child_instance_id=child_id,
+    )
+
+    def append_completion(store: ConversationStore, *, display_only: bool) -> None:
+        store.append_agent_notification(
+            child_id,
+            child_session_path=str(child.session_dir),
+            description="child",
+            status="completed",
+            text="done",
+            display_only=display_only,
+        )
+
+    if scenario in {
+        "crash after root write",
+        "crash after both writes before marker cleanup",
+    }:
+        append_completion(root, display_only=parent is not root)
+    if scenario in {
+        "crash after parent write",
+        "crash after both writes before marker cleanup",
+    }:
+        append_completion(parent, display_only=False)
+
+    original_append = ConversationStore.append_agent_notification_if_absent
+    recovery_at_root = threading.Event()
+    live_write_done = threading.Event()
+    if scenario == "concurrent live publisher":
+        recovery_thread: int | None = None
+
+        def racing_append(
+            store: ConversationStore, *args: object, **kwargs: object
+        ) -> tuple[ConversationEntry, bool]:
+            nonlocal recovery_thread
+            if store.session_id == "root" and recovery_thread is None:
+                recovery_thread = threading.get_ident()
+                recovery_at_root.set()
+                assert live_write_done.wait(10)
+            return original_append(store, *args, **kwargs)
+
+        monkeypatch.setattr(
+            ConversationStore,
+            "append_agent_notification_if_absent",
+            racing_append,
+        )
+
+    if parent is not root:
+        parent.close()
+    child.close()
+
+    def recovery_loop(store: ConversationStore) -> SimpleNamespace:
+        return SimpleNamespace(
+            store=store,
+            _background_owner=BackgroundAgentOwner(store),
+            _existing_tool_result=lambda _call_id: False,
+        )
+
+    async def recover(store: ConversationStore) -> None:
+        task = asyncio.create_task(
+            asyncio.to_thread(recover_agent_children, recovery_loop(store))
+        )
+        if scenario == "concurrent live publisher":
+            try:
+                assert await asyncio.wait_for(
+                    asyncio.to_thread(recovery_at_root.wait, 10), timeout=10
+                )
+                original_append(
+                    root,
+                    child_id,
+                    child_session_path=str(child.session_dir),
+                    description="child",
+                    status="completed",
+                    text="done",
+                    display_only=True,
+                )
+            finally:
+                live_write_done.set()
+        return await asyncio.wait_for(task, timeout=10)
+
+    try:
+        await recover(root)
+        if scenario in {
+            "crash after recovery queued before commit",
+            "duplicate recovery",
+        }:
+            root.close()
+            root = ConversationStore(tmp_path, session_id="root")
+            await recover(root)
+
+        recovered_parent = (
+            root
+            if parent is root
+            else ConversationStore(root.session_dir / "agents", session_id="1")
+        )
+        try:
+            root_completions = [
+                entry
+                for entry in root.agent_notifications(pending_only=False)
+                if entry.data.get("child_instance_id") == child_id
+            ]
+            parent_completions = [
+                entry
+                for entry in recovered_parent.agent_notifications(
+                    pending_only=False
+                )
+                if entry.data.get("child_instance_id") == child_id
+            ]
+            assert len(root_completions) == 1
+            assert len(parent_completions) == 1
+            assert root_completions[0].data.get("display_only") is (
+                True if parent is not root else None
+            )
+            assert recovered_parent.agent_children() == {}
+            assert root.agent_children() == {}
+        finally:
+            if recovered_parent is not root:
+                recovered_parent.close()
+    finally:
+        live_write_done.set()
+        root.close()
+        parent.close()
+        child.close()
+
+
+@pytest.mark.asyncio
 async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     tmp_path: Path,
 ) -> None:
@@ -18913,11 +19137,8 @@ async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     )
     child.close()
     owner = BackgroundAgentOwner(parent)
-    flow = pending_delivery_module.StepDeliveryFlow(parent)
-    owner.conversation_channel.register_delivery_flow(None, flow)
     loop = SimpleNamespace(store=parent, _background_owner=owner)
-    for item in await asyncio.to_thread(recover_agent_children, loop):
-        await flow.produce(item)
+    await asyncio.to_thread(recover_agent_children, loop)
     notices = [
         item
         for item in parent.agent_notifications(pending_only=False)
@@ -18925,8 +19146,7 @@ async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     ]
     assert len(notices) == 1
     assert notices[0].data["summary"] == "recovered"
-    for item in await asyncio.to_thread(recover_agent_children, loop):
-        await flow.produce(item)
+    await asyncio.to_thread(recover_agent_children, loop)
     assert (
         len(
             [
