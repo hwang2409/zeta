@@ -788,12 +788,12 @@ class CompletionRun(AsyncIterator[StreamEvent]):
     ) -> Any:
         if deadline is None and abort is None:
             return await step
-        step_task = asyncio.ensure_future(step)
         timer_task = (
             asyncio.create_task(self._clock.wait_until(deadline))
             if deadline is not None
             else None
         )
+        step_task = asyncio.ensure_future(step)
         abort_task = asyncio.create_task(abort.wait()) if abort is not None else None
         tasks = tuple(
             task for task in (step_task, timer_task, abort_task) if task is not None

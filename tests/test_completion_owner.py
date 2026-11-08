@@ -44,12 +44,16 @@ class _ManualClock(DeadlineClock):
     def now(self) -> float:
         return self.current
 
-    async def wait_until(self, deadline: float) -> None:
-        if deadline <= self.current:
-            return
+    def add_waiter(self, deadline: float) -> asyncio.Future[None]:
         future = asyncio.get_running_loop().create_future()
         self.waiters.append((deadline, future))
         self.waiter_added.set()
+        return future
+
+    async def wait_until(self, deadline: float) -> None:
+        if deadline <= self.current:
+            return
+        future = self.add_waiter(deadline)
         try:
             await await_or_fail(future, what="future")
         finally:
@@ -510,7 +514,13 @@ async def test_transport_only_activity_does_not_reset_model_progress_deadline() 
 class _BlockingCloseAttempt(_SequenceAttempt):
     """One stream item, then a response-context close that blocks."""
 
-    def __init__(self, *, slow_cancel: asyncio.Event | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        slow_cancel: asyncio.Event | None = None,
+        clock: _ManualClock | None = None,
+        deadline: float = 0.0,
+    ) -> None:
         super().__init__(
             AttemptSignal(
                 TransportActivity.MODEL_PROGRESS,
@@ -518,20 +528,37 @@ class _BlockingCloseAttempt(_SequenceAttempt):
             )
         )
         self.slow_cancel = slow_cancel
+        self.clock = clock
+        self.deadline = deadline
         self.close_started = asyncio.Event()
+        self.deadline_observed = asyncio.Event()
+        self.release = asyncio.Event()
         self.close_cancelled = asyncio.Event()
         self.close_finished = asyncio.Event()
 
     async def aclose(self) -> None:
+        waiter = self.clock.add_waiter(self.deadline) if self.clock is not None else None
         self.close_started.set()
         try:
-            await await_or_fail(asyncio.Event().wait(), what="blocking response close")
+            if waiter is None:
+                await await_or_fail(
+                    asyncio.Event().wait(), what="blocking response close"
+                )
+            else:
+                await await_or_fail(waiter, what="response close deadline")
+                self.deadline_observed.set()
+                await await_or_fail(self.release.wait(), what="release response close")
         except asyncio.CancelledError:
             self.close_cancelled.set()
+            self.deadline_observed.set()
             if self.slow_cancel is not None:
                 await await_or_fail(self.slow_cancel.wait(), what="slow close cancellation")
             raise
         finally:
+            if waiter is not None and self.clock is not None:
+                self.clock.waiters = [
+                    item for item in self.clock.waiters if item[1] is not waiter
+                ]
             self.close_finished.set()
 
 
@@ -547,7 +574,7 @@ def _deadline_control(task_deadline: float) -> CompletionControl:
 @pytest.mark.asyncio
 async def test_task_deadline_bounds_the_stream_close() -> None:
     clock = _ManualClock()
-    attempt = _BlockingCloseAttempt()
+    attempt = _BlockingCloseAttempt(clock=clock, deadline=30.0)
     backend = _AttemptBackend([attempt], clock)
     completion = backend.complete([], [], control=_deadline_control(30.0))
     event = await _within(completion.__anext__())
@@ -555,11 +582,12 @@ async def test_task_deadline_bounds_the_stream_close() -> None:
     closing = asyncio.create_task(completion.aclose())
     try:
         await _within(attempt.close_started.wait())
-        await _within(clock.waiter_added.wait())
         clock.advance(30.0)
-        with pytest.raises(TaskDeadlineExceeded):
-            await _within(closing)
+        await _within(attempt.deadline_observed.wait())
+        attempt.release.set()
+        outcome = (await _within(asyncio.gather(closing, return_exceptions=True)))[0]
         assert attempt.close_cancelled.is_set()
+        assert isinstance(outcome, TaskDeadlineExceeded)
         assert attempt.close_finished.is_set()
         assert not backend.client_close_started
     finally:
@@ -609,7 +637,6 @@ async def test_outer_cancel_during_task_deadline_drain_waits_for_close() -> None
         clock.advance(30.0)
         await _within(attempt.close_cancelled.wait())
         closing.cancel()
-        await asyncio.sleep(0)
         assert not closing.done()
         slow_cancel.set()
         with pytest.raises(asyncio.CancelledError):
