@@ -31,14 +31,6 @@ def _valid_persisted_reasoning_receipt_metadata(value: Mapping[str, object]) -> 
     return set(value) == {"context_evicted", "source_seq"}
 
 
-def _valid_persisted_reasoning_receipt_metadata(value: Mapping[str, object]) -> bool:
-    try:
-        reject_unknown_keys(value, "eviction_reasoning_receipt_metadata")
-    except ValueError:
-        return False
-    return set(value) == {"context_evicted", "source_seq"}
-
-
 def _persisted_reasoning_receipt(
     message: Message,
     seq: int,

@@ -585,6 +585,8 @@ def state_from_bytes(payload: bytes) -> MemoryState:
             marker = _exact_dict(item, {"id", "missing"}, "missing memory entry")
             entries[entry_id] = MissingEntry(str(marker["id"]))
             continue
+        if isinstance(item, dict):
+            reject_unknown_keys(item, "memory_entry")
         if isinstance(item, dict) and set(item) == entry_fields - {"expiry_is_default"}:
             value = dict(item)
             value["expiry_is_default"] = None

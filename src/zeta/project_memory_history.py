@@ -323,7 +323,13 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         self, blobs_fd: int, manifest: Mapping[str, object], key: str = "snapshot"
     ) -> dict[str, str]:
         files = manifest.get(key)
-        if not isinstance(files, dict) or set(files) != set(PROJECT_MEMORY_FILES):
+        if not isinstance(files, dict):
+            raise ProjectRegistryError("project memory version is malformed")
+        try:
+            reject_unknown_keys(files, "legacy_memory_snapshot")
+        except ValueError as exc:
+            raise ProjectRegistryError("project memory version is malformed") from exc
+        if set(files) != set(PROJECT_MEMORY_FILES):
             raise ProjectRegistryError("project memory version is malformed")
         result: dict[str, str] = {}
         for name in PROJECT_MEMORY_FILES:

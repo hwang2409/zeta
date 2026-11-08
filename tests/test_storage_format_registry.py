@@ -50,6 +50,11 @@ from zeta.remote_sync.memory import (
     _valid_entry_transition,
     _valid_state,
 )
+from zeta.remote_sync.project_publish import (
+    ProjectPublicationError,
+    _manifest_payloads,
+    _validate_format_two_payload,
+)
 from zeta.storage_format import (
     ACCEPTED_KEY_SETS,
     _read_manifest,
@@ -77,7 +82,7 @@ def _assert_invalid(
 ) -> None:
     try:
         result = validator(payload)
-    except (KeyError, OSError, TypeError, ValueError):
+    except (KeyError, OSError, ProjectPublicationError, TypeError, ValueError):
         return
     assert result is False, f"{context}: validator accepted an invalid persisted shape"
 
@@ -230,6 +235,52 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
             if "incomplete" in str(exc):
                 return True
             raise
+        return True
+
+    publication_root = tmp_path / "publication"
+    publication_blobs = publication_root / "memory-versions" / "blobs"
+    publication_blobs.mkdir(parents=True)
+    legacy_payload = b""
+    legacy_digest = hashlib.sha256(legacy_payload).hexdigest()
+    (publication_blobs / legacy_digest).write_bytes(legacy_payload)
+    state = {
+        "format": 2,
+        "project_id": "p_" + "a" * 32,
+        "generation": 0,
+        "schema": {},
+        "entries": {},
+        "compacted_through_version": None,
+    }
+    state_payload = json.dumps(state).encode()
+    state_digest = hashlib.sha256(state_payload).hexdigest()
+    (publication_blobs / state_digest).write_bytes(state_payload)
+
+    def published_snapshot_reference(payload: dict[str, object]) -> object:
+        manifest = {
+            "format": 2,
+            "snapshot": {key: state_digest for key in payload},
+        }
+        return _manifest_payloads(publication_root, manifest, "snapshot")
+
+    def published_legacy_snapshot(payload: dict[str, object]) -> object:
+        manifest = {
+            "format": 1,
+            "snapshot": {key: legacy_digest for key in payload},
+        }
+        return _manifest_payloads(publication_root, manifest, "snapshot")
+
+    def history_legacy_snapshot(payload: dict[str, object]) -> object:
+        directory_fd = os.open(publication_blobs, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            manifest = {"snapshot": {key: legacy_digest for key in payload}}
+            return ProjectMemoryHistoryMixin._contents_from_manifest(
+                None, directory_fd, manifest
+            )
+        finally:
+            os.close(directory_fd)
+
+    def published_state_root(payload: dict[str, object]) -> object:
+        _validate_format_two_payload(json.dumps(payload).encode())
         return True
 
     digest = hashlib.sha256(b"").hexdigest()
@@ -535,6 +586,24 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
             frozenset({"state"}),
         ),
         ShapeCase(
+            "entry_memory_snapshot_reference",
+            published_snapshot_reference,
+            {"state": state_digest},
+            frozenset({"state"}),
+        ),
+        ShapeCase(
+            "legacy_memory_snapshot",
+            published_legacy_snapshot,
+            {name: legacy_digest for name in ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")},
+            frozenset({"brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"}),
+        ),
+        ShapeCase(
+            "legacy_memory_snapshot",
+            history_legacy_snapshot,
+            {name: legacy_digest for name in ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")},
+            frozenset({"brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"}),
+        ),
+        ShapeCase(
             "eviction_reasoning_receipt_metadata",
             _valid_persisted_reasoning_receipt_metadata,
             {"context_evicted": True, "source_seq": 1},
@@ -626,6 +695,12 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
                     "compacted_through_version",
                 }
             ),
+        ),
+        ShapeCase(
+            "memory_state_root",
+            published_state_root,
+            state,
+            frozenset(state),
         ),
         ShapeCase(
             "memory_schema",
@@ -958,7 +1033,6 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
 
     try:
         assert {case.name for case in cases} == set(ACCEPTED_KEY_SETS)
-        assert len(cases) == len(ACCEPTED_KEY_SETS)
         for case in cases:
             result = case.validator(dict(case.valid))
             assert result is not False, case.name

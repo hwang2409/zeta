@@ -69,6 +69,9 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "account_publication_marker": frozenset({"provider", "name", "sha256"}),
     "memory_history_provenance": frozenset({"session_id", "seq_start", "seq_end", "fragment_start", "fragment_end", "model", "usage"}),
     "entry_memory_snapshot_reference": frozenset({"state"}),
+    "legacy_memory_snapshot": frozenset(
+        {"brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"}
+    ),
     "eviction_reasoning_receipt_metadata": frozenset({"context_evicted", "source_seq"}),
     'todo_item': frozenset({'content', 'status'}),
     'response_action': frozenset({'action'}),
