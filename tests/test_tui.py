@@ -12847,17 +12847,19 @@ async def test_dup_failure_is_reported_not_success(
     loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
     try:
         persistence.schedule("first")
-        await asyncio.sleep(0)
         with pytest.raises(OSError, match="Too many open files"):
             await persistence.flush_pending()
         assert DraftPersistence(tmp_path / "draft").load() == ""
         assert persistence.pending_text == "first"
         fail_dup = False
         await persistence.flush_pending()
+        persistence.schedule("first")
     finally:
-        os.close(directory_fd)
-        await persistence.shutdown_pending()
-        storage_lease.close()
+        try:
+            await persistence.shutdown_pending()
+        finally:
+            os.close(directory_fd)
+            storage_lease.close()
 
     assert exceptions == []
     assert (
