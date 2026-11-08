@@ -64,10 +64,11 @@ pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 async def test_empty_completion_ends_with_classification(
     tmp_path: Path, stop_reason: str
 ) -> None:
+    store = ConversationStore(tmp_path)
     events = await collect(
         AgentLoop(
             FakeBackend([ScriptedTurn(stop_reason=stop_reason)]),
-            ConversationStore(tmp_path),
+            store,
             skill_catalog=SkillCatalog.empty(),
         ).run_turn("hello", origin=MessageOrigin.USER)
     )
@@ -76,7 +77,15 @@ async def test_empty_completion_ends_with_classification(
     assert turn_end.data["completion"] == (
         stop_reason if stop_reason in {"refusal", "content_filter"} else "empty"
     )
-    assert not any(event.type is StreamEventType.RETRY for event in events)
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    if stop_reason == "end_turn":
+        assert nudges
+    else:
+        assert not nudges
 
 
 def test_empty_completion_classification_preserves_provider_reason() -> None:
