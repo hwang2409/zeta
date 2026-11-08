@@ -10,6 +10,7 @@ import pytest
 
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
     build_agent_receipt,
@@ -924,7 +925,7 @@ async def test_concurrent_status_calls_cannot_regress_projection(
     lock = threading.Lock()
     calls = 0
 
-    def controlled_read(*args: object) -> bytes:
+    def controlled_read(*args: object) -> agent_tools.LoadedAgentLifecycle:
         nonlocal calls
         with lock:
             calls += 1
@@ -932,31 +933,28 @@ async def test_concurrent_status_calls_cannot_regress_projection(
         if call == 1:
             older_started.set()
             assert release_older.wait(1)
-            return json.dumps(older).encode()
+            return agent_tools.LoadedAgentLifecycle(older)
         release_older.set()
-        return json.dumps(newer).encode()
+        return agent_tools.LoadedAgentLifecycle(newer)
 
-    monkeypatch.setattr(agent_tools, "_read_child_file", controlled_read)
-    first = asyncio.create_task(
-        asyncio.to_thread(
-            agent_tools._project_agent_status,
-            object(),
-            "parent:1",
-            child.session_dir,
-            notifications=(),
+    # test-contract: seam forces overlapping lifecycle reads
+    monkeypatch.setattr(agent_tools, "read_agent_lifecycle_state", controlled_read)
+
+    def read_status() -> dict[str, object]:
+        lifecycle_read, _owner_state = agent_tools._read_child_lifecycle(
+            child, child.session_dir
         )
-    )
+        assert isinstance(lifecycle_read, agent_tools.LoadedAgentLifecycle)
+        return agent_tools._project_agent_status(
+            lifecycle_read.value, "parent:1", notifications=()
+        )
+
+    first = asyncio.create_task(asyncio.to_thread(read_status))
     assert await asyncio.to_thread(older_started.wait, 1)
-    second = asyncio.create_task(
-        asyncio.to_thread(
-            agent_tools._project_agent_status,
-            object(),
-            "parent:1",
-            child.session_dir,
-            notifications=(),
-        )
+    second = asyncio.create_task(asyncio.to_thread(read_status))
+    newer_result, older_result = await await_or_fail(
+        asyncio.gather(second, first), what="overlapping lifecycle reads"
     )
-    newer_result, older_result = await asyncio.gather(second, first)
     assert newer_result["tool_calls"] == 2
     assert older_result["tool_calls"] == 1
     rendered = AgentCard.render_receipt(event)
