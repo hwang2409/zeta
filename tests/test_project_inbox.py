@@ -1685,7 +1685,7 @@ def test_stale_loaded_process_adopts_broken_ledger_without_republishing(
 async def test_inbox_activation_reads_broken_ledger_off_owner_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home, projects, project_a, _project_b = _projects(tmp_path)
+    home, projects, project_a, _project_b = await asyncio.to_thread(_projects, tmp_path)
     store = ConversationStore(
         home / "sessions", session_id="a" * 32, cwd=tmp_path
     )

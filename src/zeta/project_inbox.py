@@ -485,9 +485,14 @@ class ProjectInbox:
                                 "project": source_project,
                                 "session": source_session,
                             }:
-                                rows.append(self._broken_row(record, status, project_id, source_session, receipt_map))
+                                rows.append(self._broken_row(record, status, project_id, project_name, source_session, receipt_map))
             except _InboxNotFound:
                 return
+        # Identity ranks before the inbox lock, so resolve the name first.
+        try:
+            project_name = self.registry.show_project(project_id).name
+        except ProjectNotFoundError:
+            project_name = project_id
         with self._lock(project_id, exclusive=False) as project_fd:
             read(project_fd)
         return rows
@@ -497,13 +502,10 @@ class ProjectInbox:
         record: dict[str, Any],
         status: str,
         project_id: str,
+        project_name: str,
         source_session: str,
         receipt_map: dict[str, set[str]],
     ) -> dict[str, Any]:
-        try:
-            project_name = self.registry.show_project(project_id).name
-        except ProjectNotFoundError:
-            project_name = project_id
         row = {
             "id": record["id"],
             "status": status,
