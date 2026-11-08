@@ -3023,7 +3023,10 @@ async def test_background_task_stays_running_for_detached_group_member(
     finally:
         if not killing.done():
             os.kill(child_pid, signal.SIGKILL)
-        await asyncio.gather(killing, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(killing, return_exceptions=True),
+            what="detached group cleanup",
+        )
         await tasks.close()
 
 
