@@ -345,13 +345,15 @@ class SessionExecutionLease:
             if owned.refs:
                 return
             owned.state = "releasing"
+            fd = owned.fd
+            try:
+                os.ftruncate(fd, 0)
+            except OSError:
+                pass
+            fcntl.flock(fd, fcntl.LOCK_UN)
             if _REGISTRY.get(owned.identity) is owned:
                 del _REGISTRY[owned.identity]
-            fd, owned.fd = owned.fd, -1
-        try:
-            os.ftruncate(fd, 0)
-        except OSError:
-            pass
+            owned.fd = -1
         os.close(fd)
 
 
