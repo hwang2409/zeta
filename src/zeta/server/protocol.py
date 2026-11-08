@@ -255,6 +255,7 @@ class MethodDescriptor(Enum):
     STATUS = ("status", None, None, Access.READ)
     RENAME_SESSION = ("rename_session", "1.1", None, Access.SESSION_MUTATION)
     DELETE_SESSION = ("delete_session", "1.1", None, Access.CONTROLLER_WRITE)
+    REPAIR_TRANSCRIPT = ("repair_transcript", "1.1", None, Access.SESSION_MUTATION)
     SESSION_TREE = ("session_tree", "1.1", None, Access.READ)
     SESSION_HISTORY = ("session_history", "1.1", None, Access.READ)
     CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)
@@ -340,6 +341,7 @@ _ERGONOMICS_METHODS = frozenset(
     for name in (
         "RENAME_SESSION",
         "DELETE_SESSION",
+        "REPAIR_TRANSCRIPT",
         "SESSION_TREE",
         "SESSION_HISTORY",
         "CONTENT_READ",
