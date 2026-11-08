@@ -304,6 +304,7 @@ def compose_runtime(
             root_project_id=metadata.project_id,
             parent_session_id=metadata.parent_session_id,
             project_registry=project_registry,
+            project_discovery=project_discovery,
             max_agent_depth=config.agents_max_depth,
             **loop_kwargs,
         )

@@ -8,8 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import zeta.agent.child_context as child_context_module
 from zeta.agent.runner import _child_base_system_prompt
-from zeta.core.project_context import load_project_context
+from zeta.core.project_context import discover_project, load_project_context
 from zeta.core.session import SessionManager
 from zeta.memory.entry_store import (
     AddOperation,
@@ -21,6 +22,7 @@ from zeta.memory.entry_store import (
 )
 from zeta.memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
 from zeta.project_registry import ProjectRegistry
+from zeta.runtime.prompt import RuntimePrompt
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
@@ -332,6 +334,88 @@ def test_same_cwd_child_inherits_parent_memory_snapshot(tmp_path: Path) -> None:
         _child_base_system_prompt(loop, str(symlink_cwd)).system_prompt is parent_prompt
     )
     assert "new memory" not in parent_prompt
+
+
+def test_same_cwd_child_reuses_parent_project_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, workspace, registry, project_id = _entry_project(tmp_path)
+    _add(registry, project_id, (AddOperation("state", "current memory", _source(1)),))
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        **_context_projects(registry, project_id),
+    )
+    discovery = discover_project(workspace, user_home=home.parent)
+    loop = SimpleNamespace(
+        context_assembler=SimpleNamespace(system_prompt=context.system_prompt),
+        store=SimpleNamespace(cwd=str(workspace)),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project_id,
+        project_registry=registry,
+        project_discovery=discovery,
+        _skill_prompt_base=lambda: RuntimePrompt(
+            context.system_prompt, context.prompt_components
+        ),
+    )
+
+    def unexpected_discovery(*args: object, **kwargs: object):
+        raise AssertionError("same-cwd child performed a fresh project discovery")
+
+    monkeypatch.setattr(child_context_module, "discover_project", unexpected_discovery)
+    child = _child_base_system_prompt(loop, str(workspace))
+
+    assert child.system_prompt == context.system_prompt
+
+
+def test_child_registry_cwd_does_not_reuse_parent_project_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, workspace, registry, project_id = _entry_project(tmp_path)
+    _add(registry, project_id, (AddOperation("state", "current memory", _source(1)),))
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        **_context_projects(registry, project_id),
+    )
+    discovery = discover_project(workspace, user_home=home.parent)
+    other_cwd = tmp_path / "other-worktree"
+    other_cwd.mkdir()
+    calls = 0
+    real_discover = child_context_module.discover_project
+
+    def tracked_discovery(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return real_discover(*args, **kwargs)
+
+    loop = SimpleNamespace(
+        context_assembler=SimpleNamespace(system_prompt=context.system_prompt),
+        store=SimpleNamespace(cwd=str(workspace)),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project_id,
+        project_registry=registry,
+        project_discovery=discovery,
+        _skill_prompt_base=lambda: RuntimePrompt(
+            context.system_prompt, context.prompt_components
+        ),
+    )
+    child_registry = SimpleNamespace(
+        cwd=str(other_cwd),
+        skill_catalog=SkillCatalog.empty(),
+        verify_cwd_identity=lambda: None,
+    )
+    monkeypatch.setattr(child_context_module, "discover_project", tracked_discovery)
+
+    _child_base_system_prompt(loop, None, child_registry)
+
+    assert calls == 1
 
 
 def test_fresh_cwd_child_loads_current_memory(
