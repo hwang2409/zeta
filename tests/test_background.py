@@ -3037,13 +3037,16 @@ def test_loop_teardown_cancels_owner_waiting_for_detached_group(
 ) -> None:
     owner_polling = threading.Event()
     cancellation_started = threading.Event()
-    group_exited = threading.Event()
     teardown_finished = threading.Event()
     errors: list[BaseException] = []
+    leader_pids: list[int] = []
+    group_exists = owner_module._group_exists
 
-    def group_exists(_pid: int) -> bool:
-        owner_polling.set()
-        return not group_exited.is_set()
+    def track_live_group(pid: int) -> bool:
+        exists = group_exists(pid)
+        if exists:
+            owner_polling.set()
+        return exists
 
     original_cancel_all = asyncio.runners._cancel_all_tasks
 
@@ -3051,14 +3054,29 @@ def test_loop_teardown_cancels_owner_waiting_for_detached_group(
         cancellation_started.set()
         original_cancel_all(loop)
 
-    monkeypatch.setattr(owner_module, "_group_exists", group_exists)
+    # test-contract: seam observe the real process-group probe reaching a live member
+    monkeypatch.setattr(owner_module, "_group_exists", track_live_group)
+    # test-contract: seam observe public asyncio.run teardown starting cancellation
     monkeypatch.setattr(asyncio.runners, "_cancel_all_tasks", track_cancel_all)
 
     async def leave_owner_for_loop_teardown() -> None:
+        child = (
+            "import os,time; print(os.getpid(), flush=True); time.sleep(300)"
+        )
         tasks = BackgroundTaskRegistry()
-        await tasks.start(_python("pass"), tmp_path)
+        _task_id, leader_pid = await tasks.start(
+            _python(
+                "import pathlib,subprocess,sys; "
+                f"child=subprocess.Popen([sys.executable, '-c', {child!r}], "
+                "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True); "
+                f"pathlib.Path({str(tmp_path / 'detached-loop-child')!r})"
+                ".write_text(child.stdout.readline())"
+            ),
+            tmp_path,
+        )
+        leader_pids.append(leader_pid)
         assert await asyncio.to_thread(owner_polling.wait, 10), (
-            "owner did not reach the detached group probe"
+            "owner did not reach the live detached group probe"
         )
 
     def run_loop() -> None:
@@ -3078,7 +3096,8 @@ def test_loop_teardown_cancels_owner_waiting_for_detached_group(
         )
         assert not errors
     finally:
-        group_exited.set()
+        for leader_pid in leader_pids:
+            kill_group_if_present(leader_pid)
         thread.join(10)
         assert not thread.is_alive(), "background owner survived test cleanup"
 
