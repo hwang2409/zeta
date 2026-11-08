@@ -237,6 +237,66 @@ def test_polling_spin_requires_a_deadline(
         )
 
 
+@pytest.mark.parametrize("module, primitive", [
+    ("asyncio", "sleep"),
+    ("anyio", "sleep"),
+    ("itertools", "count"),
+    ("itertools", "cycle"),
+    ("builtins", "iter"),
+])
+@pytest.mark.parametrize("import_style", ["plain", "alias", "from", "from_alias"])
+def test_polling_spin_resolves_import_spellings(
+    tmp_path: Path, module: str, primitive: str, import_style: str
+) -> None:
+    visible = {"plain": module, "alias": "mod", "from": primitive, "from_alias": "item"}[import_style]
+    if import_style == "plain":
+        statement, call = f"import {module}", f"{visible}.{primitive}"
+    elif import_style == "alias":
+        statement, call = f"import {module} as mod", f"{visible}.{primitive}"
+    elif import_style == "from":
+        statement, call = f"from {module} import {primitive}", visible
+    else:
+        statement, call = f"from {module} import {primitive} as item", visible
+    if primitive == "sleep":
+        body = f"while not ready:\n        await {call}(0)"
+    else:
+        iterator = f"for _ in {call}()" if primitive != "iter" else f"for _ in {call}(lambda: 1, 0)"
+        body = f"{iterator}:\n        await asyncio.sleep(0)"
+    source = f"{statement}\n\nasync def test_spin():\n    {body}\n"
+    findings = _lint(tmp_path, source)
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 4)]
+
+
+def test_one_argument_iter_is_finite_and_nested_definitions_are_scoped(
+    tmp_path: Path,
+) -> None:
+    source = """async def test_outer():
+    for _ in iter([1, 2]):
+        await asyncio.sleep(0)
+    while not ready:
+        async def nested():
+            await asyncio.sleep(0)
+        break
+
+async def test_nested_spin():
+    def nested():
+        while not ready:
+            await asyncio.sleep(0)
+"""
+    findings = _lint(tmp_path, source)
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 11)]
+
+
+def test_deadline_aliases_accept_each_import_spelling(tmp_path: Path) -> None:
+    sources = [
+        "import asyncio as aio\nasync def test_spin():\n    async with aio.timeout(10):\n        while not ready:\n            await aio.sleep(0)\n",
+        "from asyncio import timeout as limit, sleep as tick\nasync def test_spin():\n    async with limit(10):\n        while not ready:\n            await tick(0)\n",
+        "from tests.support.owned import await_or_fail as guard\nasync def test_spin():\n    while not ready:\n        await guard(asyncio.sleep(0), what=\"tick\")\n",
+    ]
+    for index, source in enumerate(sources):
+        assert _lint(tmp_path / str(index), source) == []
+
+
 def test_await_deadline_rule_catches_pr_765_original_bare_task_await(
     tmp_path: Path,
 ) -> None:

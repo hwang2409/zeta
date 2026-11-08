@@ -186,8 +186,6 @@ def _contains_timing_reference(node: ast.AST) -> bool:
             "time.perf_counter",
             "monotonic",
             "perf_counter",
-            "loop.time",
-            "self.loop.time",
         }:
             return True
         if isinstance(child, (ast.Name, ast.Attribute)):
@@ -398,32 +396,98 @@ def _enclosing_nodes(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> list[ast
     return ancestors
 
 
-def _finite_timeout_call(call: ast.Call) -> bool:
+def _enclosing_function_touches_added_line(
+    node: ast.AST, added: set[int], parents: dict[ast.AST, ast.AST]
+) -> bool:
+    return any(
+        _touches_added_line(ancestor, added)
+        for ancestor in _enclosing_nodes(node, parents)
+        if isinstance(ancestor, (ast.AsyncFunctionDef, ast.FunctionDef))
+    )
+
+
+class _ImportResolver:
+    def __init__(self, tree: ast.AST) -> None:
+        self._scope: dict[ast.AST, ast.AST] = {}
+        self._parent_scope: dict[ast.AST, ast.AST | None] = {}
+        self._bindings: dict[ast.AST, dict[str, str]] = {}
+        self._build(tree, tree, None)
+
+    def _build(self, node: ast.AST, scope: ast.AST, parent: ast.AST | None) -> None:
+        self._scope[node] = scope
+        self._parent_scope.setdefault(scope, parent)
+        if isinstance(node, ast.Import):
+            bindings = self._bindings.setdefault(scope, {})
+            for imported in node.names:
+                local = imported.asname or imported.name.split('.')[0]
+                bindings[local] = imported.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            bindings = self._bindings.setdefault(scope, {})
+            for imported in node.names:
+                if imported.name != '*':
+                    bindings[imported.asname or imported.name] = (
+                        f"{node.module}.{imported.name}"
+                    )
+        for child in ast.iter_child_nodes(node):
+            child_scope = child if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+            ) else scope
+            self._build(child, child_scope, scope if child_scope is not scope else parent)
+
+    def resolve(self, node: ast.AST) -> str:
+        value = _name(node)
+        if not value:
+            return value
+        parts = value.split('.')
+        scope = self._scope.get(node)
+        while scope is not None:
+            binding = self._bindings.get(scope, {}).get(parts[0])
+            if binding is not None:
+                return '.'.join([binding, *parts[1:]])
+            scope = self._parent_scope.get(scope)
+        return value
+
+
+def _scoped_walk(node: ast.AST) -> list[ast.AST]:
+    result: list[ast.AST] = []
+
+    class Visitor(ast.NodeVisitor):
+        def generic_visit(self, current: ast.AST) -> None:
+            result.append(current)
+            for child in ast.iter_child_nodes(current):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    continue
+                self.visit(child)
+
+    Visitor().visit(node)
+    return result
+
+
+def _finite_timeout_call(call: ast.Call, resolver: _ImportResolver) -> bool:
     return (
-        _name(call.func) in {
-            "asyncio.timeout",
-            "asyncio.timeout_at",
-            "timeout",
-            "timeout_at",
-        }
+        resolver.resolve(call.func) in {"asyncio.timeout", "asyncio.timeout_at"}
         and bool(call.args)
         and not (isinstance(call.args[0], ast.Constant) and call.args[0].value is None)
     )
 
 
-def _inside_timeout_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+def _inside_timeout_context(
+    node: ast.AST, parents: dict[ast.AST, ast.AST], resolver: _ImportResolver
+) -> bool:
     return any(
         isinstance(ancestor, ast.AsyncWith)
         and any(
             isinstance(item.context_expr, ast.Call)
-            and _finite_timeout_call(item.context_expr)
+            and _finite_timeout_call(item.context_expr, resolver)
             for item in ancestor.items
         )
         for ancestor in _enclosing_nodes(node, parents)
     )
 
 
-def _inside_deadline_argument(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+def _inside_deadline_argument(
+    node: ast.AST, parents: dict[ast.AST, ast.AST], resolver: _ImportResolver
+) -> bool:
     child = node
     for ancestor in _enclosing_nodes(node, parents):
         if not isinstance(ancestor, ast.Call) or not any(
@@ -433,10 +497,10 @@ def _inside_deadline_argument(node: ast.AST, parents: dict[ast.AST, ast.AST]) ->
                 return False
             child = ancestor
             continue
-        function = _name(ancestor.func)
-        if function == "await_or_fail":
+        function = resolver.resolve(ancestor.func)
+        if function == "tests.support.owned.await_or_fail":
             return True
-        if function in {"asyncio.wait_for", "wait_for"}:
+        if function in {"asyncio.wait_for"}:
             return (
                 len(ancestor.args) > 1
                 and not (
@@ -449,90 +513,50 @@ def _inside_deadline_argument(node: ast.AST, parents: dict[ast.AST, ast.AST]) ->
     return False
 
 
-def _enclosing_function_touches_added_line(
-    node: ast.AST, added: set[int], parents: dict[ast.AST, ast.AST]
-) -> bool:
-    return any(
-        _touches_added_line(ancestor, added)
-        for ancestor in _enclosing_nodes(node, parents)
-        if isinstance(ancestor, (ast.AsyncFunctionDef, ast.FunctionDef))
-    )
-
-
-def _imported_loop_names(tree: ast.AST) -> tuple[set[str], set[str]]:
-    sleep_names = {"asyncio.sleep", "anyio.sleep"}
-    iterator_names = {"itertools.count", "itertools.cycle", "iter"}
-    modules = {"asyncio", "anyio", "itertools"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name in modules:
-                    modules.add(alias.asname or alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module in {
-            "asyncio",
-            "anyio",
-            "itertools",
-        }:
-            module = node.module
-            for alias in node.names:
-                name = alias.asname or alias.name
-                if alias.name == "sleep" and module in {"asyncio", "anyio"}:
-                    sleep_names.add(name)
-                elif alias.name in {"count", "cycle"} and module == "itertools":
-                    iterator_names.add(name)
-    for module in modules:
-        if module in {"asyncio", "anyio"}:
-            sleep_names.add(f"{module}.sleep")
-        elif module == "itertools":
-            iterator_names.update({f"{module}.count", f"{module}.cycle"})
-    return sleep_names, iterator_names
-
-
-def _contains_async_sleep(node: ast.AST, sleep_names: set[str]) -> bool:
+def _contains_async_sleep(node: ast.AST, resolver: _ImportResolver) -> bool:
     return any(
         isinstance(child, ast.Await)
         and isinstance(child.value, ast.Call)
-        and _name(child.value.func) in sleep_names
-        for child in ast.walk(node)
+        and resolver.resolve(child.value.func) in {"asyncio.sleep", "anyio.sleep"}
+        for child in _scoped_walk(node)
     )
 
 
-def _is_unbounded_iterator(node: ast.For, iterator_names: set[str]) -> bool:
+def _is_unbounded_iterator(node: ast.For, resolver: _ImportResolver) -> bool:
     if not isinstance(node.iter, ast.Call):
         return False
-    name = _name(node.iter.func)
-    return name in iterator_names or (name == "iter" and len(node.iter.args) == 2)
+    name = resolver.resolve(node.iter.func)
+    return name in {"itertools.count", "itertools.cycle"} or (
+        name == "builtins.iter" and len(node.iter.args) == 2
+    ) or (name == "iter" and len(node.iter.args) == 2)
 
 
 def _is_unbounded_polling_loop(
     node: ast.AST,
     parents: dict[ast.AST, ast.AST],
-    sleep_names: set[str],
-    iterator_names: set[str],
+    resolver: _ImportResolver,
     lines: list[str],
 ) -> bool:
     if not (
         isinstance(node, ast.While)
-        or isinstance(node, ast.For)
-        and _is_unbounded_iterator(node, iterator_names)
+        or isinstance(node, ast.For) and _is_unbounded_iterator(node, resolver)
     ):
         return False
-    if not _contains_async_sleep(node, sleep_names):
+    if not _contains_async_sleep(node, resolver):
         return False
     if _has_marker(lines, node.lineno, set(CONTRACT_KINDS)):
         return False
-    if _inside_timeout_context(node, parents) or _inside_deadline_argument(
-        node, parents
+    if _inside_timeout_context(node, parents, resolver) or _inside_deadline_argument(
+        node, parents, resolver
     ):
         return False
     return not any(
         isinstance(child, ast.Await)
-        and _inside_deadline_argument(child, parents)
-        for child in ast.walk(node)
+        and _inside_deadline_argument(child, parents, resolver)
+        for child in _scoped_walk(node)
     )
 
-
-def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST], resolver: _ImportResolver) -> bool:
     return (
         isinstance(node, ast.Call)
         and not node.args
@@ -543,7 +567,7 @@ def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> b
             isinstance(ancestor, ast.Await)
             for ancestor in _enclosing_nodes(node, parents)
         )
-        and not _inside_deadline_argument(node, parents)
+        and not _inside_deadline_argument(node, parents, resolver)
     )
 
 
@@ -616,12 +640,9 @@ def _deadline_findings(
     node: ast.AST,
     lines: list[str],
     parents: dict[ast.AST, ast.AST],
-    sleep_names: set[str],
-    iterator_names: set[str],
+    resolver: _ImportResolver,
 ) -> list[Finding]:
-    if _is_unbounded_polling_loop(
-        node, parents, sleep_names, iterator_names, lines
-    ):
+    if _is_unbounded_polling_loop(node, parents, resolver, lines):
         return [
             Finding(
                 path,
@@ -632,7 +653,7 @@ def _deadline_findings(
                 "asyncio.timeout(...) or wait on an event",
             )
         ]
-    if _is_unbounded_sync_wait(node, parents):
+    if _is_unbounded_sync_wait(node, parents, resolver):
         return (
             []
             if _has_marker(lines, node.lineno, CONTRACT_KINDS)
@@ -664,8 +685,8 @@ def _deadline_findings(
         not violates
         or _has_marker(lines, node.lineno, CONTRACT_KINDS)
         or _bounded_asyncio_wait(value)
-        or _inside_timeout_context(node, parents)
-        or _inside_deadline_argument(node, parents)
+        or _inside_timeout_context(node, parents, resolver)
+        or _inside_deadline_argument(node, parents, resolver)
     ):
         return []
     return [
@@ -701,12 +722,12 @@ def _scan_deadline_nodes(
     parents: dict[ast.AST, ast.AST],
     tree: ast.AST,
 ) -> list[Finding]:
-    sleep_names, iterator_names = _imported_loop_names(tree)
+    resolver = _ImportResolver(tree)
     return [
         finding
         for node in nodes
         for finding in _deadline_findings(
-            path, node, lines, parents, sleep_names, iterator_names
+            path, node, lines, parents, resolver
         )
     ]
 
@@ -976,11 +997,11 @@ def _scan_deadline_findings(
             for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
         }
-        sleep_names, iterator_names = _imported_loop_names(tree)
+        resolver = _ImportResolver(tree)
         for node in ast.walk(tree):
             findings.extend(
                 _deadline_findings(
-                    path, node, lines, parents, sleep_names, iterator_names
+                    path, node, lines, parents, resolver
                 )
             )
     return findings, trees
