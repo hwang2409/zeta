@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,9 +46,24 @@ def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
     return lines
 
 
+def _test_files() -> list[Path]:
+    root = _TESTS_ROOT.parent
+    result = subprocess.run(
+        ["git", "ls-files", "--", "tests/*.py", "tests/**/*.py"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if not result.stdout.splitlines():
+        raise RuntimeError("no tracked test files found")
+    return [root / path for path in result.stdout.splitlines()]
+
+
 def test_close_serve_is_never_called_under_a_condition() -> None:
     offenders: list[str] = []
-    for path in sorted(_TESTS_ROOT.rglob("*.py")):
+    for path in _test_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         root = _TESTS_ROOT.parent
         offenders.extend(
@@ -58,6 +74,42 @@ def test_close_serve_is_never_called_under_a_condition() -> None:
         "close_serve must not be nested inside an if/elif/else body "
         f"({', '.join(offenders)}): {_CLOSE_SERVE_CONDITION_FIX}"
     )
+
+
+def test_close_serve_guard_ignores_untracked_runtime_probe() -> None:
+    probe = _TESTS_ROOT / "test_zz_probe_tmp.py"
+    probe.write_text("def test_probe():\n    pass\n", encoding="utf-8")
+    try:
+        files = _test_files()
+        assert _TESTS_ROOT / "test_serve_close.py" in files
+        assert probe not in files
+    finally:
+        probe.unlink()
+
+
+def test_test_files_fails_on_git_listing_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(1, command, stderr="git listing failed")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        _test_files()
+    assert error.value.stderr == "git listing failed"
+
+
+def test_test_files_rejects_empty_git_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="no tracked test files found"):
+        _test_files()
 
 
 @dataclass

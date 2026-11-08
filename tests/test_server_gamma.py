@@ -16,6 +16,7 @@ import pytest
 from PIL import Image
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
@@ -27,6 +28,7 @@ from tests.test_server import (
     _request,
 )
 from zeta.core.session import SessionMetadata
+from zeta.mcp.management import MCPManagementService
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
@@ -223,11 +225,52 @@ async def test_resume_runs_tools_in_the_session_cwd(
 
 
 @pytest.mark.asyncio
-async def test_resume_rejects_a_session_whose_cwd_was_removed(tmp_path: Path) -> None:
+async def test_resume_rejects_a_session_whose_cwd_was_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     original = tmp_path / "original"
     original.mkdir()
-    session_id = await _create_session_in(tmp_path, original)
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_acquire = MCPManagementService._acquire_locks
+
+    def gated_acquire(self, paths):
+        if any(path.parent == original / ".zeta" for path in paths):
+            entered.set()
+            closed = getattr(self, "_closed", None)
+            if closed is not None:
+                if not closed.wait(10):
+                    raise AssertionError("management close did not begin")
+            elif not release.wait(10):
+                raise AssertionError("MCP writer gate was not released")
+            try:
+                return original_acquire(self, paths)
+            finally:
+                finished.set()
+        return original_acquire(self, paths)
+
+    # test-contract: seam MCP transaction worker has no public readiness hook
+    monkeypatch.setattr(MCPManagementService, "_acquire_locks", gated_acquire)
+    first_server = _server(tmp_path, None, original)
+    first_reader, first_writer = await _connect(first_server)
+    try:
+        await _legacy_hello(first_reader, first_writer)
+        created = await _request(first_reader, first_writer, 2, "new_session", {})
+        session_id = created[-1]["result"]["session"]["session_id"]
+        assert await await_or_fail(
+            asyncio.to_thread(entered.wait, 10), what="MCP writer gate"
+        )
+    finally:
+        await close_serve(first_server, first_writer)
+
     shutil.rmtree(original)
+    release.set()
+    assert await await_or_fail(
+        asyncio.to_thread(finished.wait, 10), what="MCP transaction worker"
+    )
+    assert not (original / ".zeta").exists()
+
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -241,6 +284,7 @@ async def test_resume_rejects_a_session_whose_cwd_was_removed(tmp_path: Path) ->
         status = (await _request(reader, writer, 4, "status"))[-1]["result"]
         assert status["session"]["session_id"] == active["session"]["session_id"]
     finally:
+        release.set()
         await close_serve(server, writer)
 
 
