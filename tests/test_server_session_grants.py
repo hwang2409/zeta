@@ -35,7 +35,7 @@ from tests.test_server_websocket import (
 )
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
-from zeta.server import ZetaServer, approval_lifecycle
+from zeta.server import ZetaServer, approval_lifecycle, approval_settlement
 from zeta.server.approval_lifecycle import ExternalEnd
 from zeta.tui.app import TUIApp
 
@@ -388,7 +388,7 @@ async def test_always_tool_grant_survives_external_end_during_approve_settlement
     committed = asyncio.Event()
     release = asyncio.Event()
     external_entered = asyncio.Event()
-    original_persist = approval_lifecycle.persist_durably
+    original_persist = approval_settlement.persist_durably
     original_finish = server.control._approvals._finish_record
 
     async def gated_finish(record: object, resolution: dict[str, str]) -> None:
@@ -401,7 +401,7 @@ async def test_always_tool_grant_survives_external_end_during_approve_settlement
         await asyncio.wait_for(release.wait(), 10)
         return result
 
-    monkeypatch.setattr(approval_lifecycle, "persist_durably", gated_persist)
+    monkeypatch.setattr(approval_settlement, "persist_durably", gated_persist)
     # test-contract: seam force the ExternalEnd ownership interleaving
     monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
     try:
