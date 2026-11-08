@@ -4143,7 +4143,7 @@ class RepeatedTimeoutBackend(PostCapBudgetBackend):
         super().__init__()
         self.fresh_calls = 0
         self.third_fresh_call = asyncio.Event()
-        self.on_fresh_call: Callable[[], None] = lambda: None
+        self.on_fresh_call: Callable[[], bool] = lambda: False
 
     @owned_completion
     async def complete(
@@ -4155,9 +4155,13 @@ class RepeatedTimeoutBackend(PostCapBudgetBackend):
             self.fresh_calls += 1
             if self.fresh_calls == 3:
                 self.third_fresh_call.set()
-            # the model bound expires before the provider sends anything, so
-            # nothing is committed and the gate dispatches the same request again.
-            self.on_fresh_call()
+            if self.on_fresh_call():
+                # the model bound expired before the provider sent anything:
+                # nothing is committed and the gate dispatches the same request
+                # again. block so the cancel always lands before any output.
+                await await_or_fail(
+                    asyncio.Event().wait(), what="model bound cancels the call"
+                )
         async for event in PostCapBudgetBackend.complete.__wrapped__(
             self, messages, tool_schemas
         ):
@@ -4209,9 +4213,11 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             for state, _configured_timeout in deadlines.started
             if deadlines._wakes[id(state)][1] == child_handle
         )
-        def expire_turn() -> None:
+        def expire_turn() -> bool:
             if timeouts == "every_fresh_call" or backend.fresh_calls == 1:
                 deadlines._expire_active(state)
+                return True
+            return False
 
         backend.on_fresh_call = expire_turn
         await send_to_run(
@@ -4223,11 +4229,15 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
         terminal = asyncio.create_task(
             await_or_fail(terminal_published.wait(), what="terminal publication")
         )
-        third = asyncio.create_task(
-            await_or_fail(backend.third_fresh_call.wait(), what="third provider call")
-        )
+        # only the stopped row has a third identical call to race; in the other
+        # row the handoff's tool result legitimately asks the model once more.
+        races = {terminal}
+        if timeouts == "every_fresh_call":
+            races.add(asyncio.create_task(
+                await_or_fail(backend.third_fresh_call.wait(), what="third provider call")
+            ))
         done, pending = await await_or_fail(
-            asyncio.wait({terminal, third}, return_when=asyncio.FIRST_COMPLETED),
+            asyncio.wait(races, return_when=asyncio.FIRST_COMPLETED),
             what="terminal publication or a third identical provider call",
         )
         for task in pending:
@@ -4235,9 +4245,10 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
         await await_or_fail(
             asyncio.gather(*pending, return_exceptions=True), what="race cleanup"
         )
-        assert backend.fresh_calls == 2, (
-            f"identical provider calls with nothing committed: {backend.fresh_calls}"
-        )
+        if timeouts == "every_fresh_call":
+            assert backend.fresh_calls == 2, (
+                f"identical provider calls with nothing committed: {backend.fresh_calls}"
+            )
         assert terminal in done
         flow = loop._background_owner.conversation_channel._delivery_targets[
             child_handle
@@ -4264,7 +4275,7 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             assert stopped == []
             assert published[0][1].startswith("Handed off running background work.")
     finally:
-        backend.on_fresh_call = lambda: None
+        backend.on_fresh_call = lambda: False
         backend.release_grandchild.set()
         # a child that keeps re-waking must not hide the assertion above.
         owner.cancel_all()
