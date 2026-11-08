@@ -1380,9 +1380,10 @@ async def test_session_replay_join_admits_response_before_held_events(
     async def gated(client: _Client, payload: bytes) -> bool:
         if b'"id":3' in payload:
             entered.set()
-            await release.wait()
+            await await_or_fail(release.wait(), what="release gated response")
         return await original(client, payload)
 
+    # test-contract: seam — gate the real transport writer without replacing the output owner.
     monkeypatch.setattr(_Client, "_write_physical", gated)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1", "features": ["session_replay_seq"]})
@@ -1390,10 +1391,10 @@ async def test_session_replay_join_admits_response_before_held_events(
         join = asyncio.create_task(_request(reader, writer, 3, "session_history_and_subscribe", {"session_id": session["session_id"]}))
         await await_or_fail(entered.wait(), what="join response write")
         for _ in range(3):
-            await server.control._notify(EventDescriptor.TURN_START, session["session_id"], data={})
+            await await_or_fail(server.control._notify(EventDescriptor.TURN_START, session["session_id"], data={}), what="publish replay event")
         release.set()
-        assert (await join)[-1]["result"]["replay"]["history_seq"] == 0
-        events = [await _event(reader, "turn_start") for _ in range(3)]
+        assert (await await_or_fail(join, what="join response"))[-1]["result"]["replay"]["history_seq"] == 0
+        events = [await await_or_fail(_event(reader, "turn_start"), what="replay event") for _ in range(3)]
         assert [event["seq"] for event in events] == [1, 2, 3]
     finally:
         release.set()
