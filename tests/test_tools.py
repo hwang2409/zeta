@@ -77,15 +77,19 @@ def _descendant_command(
 
 
 @asynccontextmanager
-async def _owned_descendant(pid_file: Path):
+async def _owned_descendant(
+    pid_file: Path, release_path: Path | None = None
+):
     try:
         yield
     finally:
+        if release_path is not None:
+            release_path.touch()
         if pid_file.exists():
             pid = int(pid_file.read_text())
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
-                await wait_pid_exited(pid)
+            await wait_pid_exited(pid)
 
 
 async def _collect_loop(loop: AgentLoop) -> list[object]:
@@ -1637,7 +1641,7 @@ async def test_bash_timeout_kills_and_reaps_descendants(
     monkeypatch.setattr(bash_module.asyncio, "sleep", wait_for_readiness)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    async with _owned_descendant(child_pid):
+    async with _owned_descendant(child_pid, release_path):
         execution = asyncio.create_task(
             registry.execute(
                 ToolCall(
