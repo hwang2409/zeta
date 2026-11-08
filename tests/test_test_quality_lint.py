@@ -148,14 +148,6 @@ def test_await_deadline_rule_rejects_unbounded_waits(
     )
 
 
-def test_transport_marker_does_not_excuse_a_missing_deadline(tmp_path: Path) -> None:
-    source = "async def test_wait():\n    await ready.wait()  # test-contract: transport x\n"
-
-    findings = _lint(tmp_path, source)
-
-    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
-
-
 def test_await_deadline_rule_catches_pr_765_original_bare_task_await(
     tmp_path: Path,
 ) -> None:
@@ -1409,3 +1401,11 @@ def test_raw_serve_socket_reads_must_use_the_shared_client(
         and "'# test-contract: transport <reason>'" in finding.message
         for finding in findings
     )
+
+
+def test_transport_marker_does_not_excuse_a_missing_deadline(tmp_path: Path) -> None:
+    source = "async def test_wait():\n    await ready.wait()  # test-contract: transport x\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]

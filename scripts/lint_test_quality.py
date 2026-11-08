@@ -98,6 +98,13 @@ AWAIT_DEADLINE_ERROR = (
 SYNC_DEADLINE_ERROR = "blocking wait without a deadline: pass timeout=10"
 AWAIT_DEADLINE_CODE = "TQ004"
 RATCHET_PATH = Path("tests/test_quality_ratchet.txt")
+GLOBAL_BOOTSTRAP_ALLOWLIST = {
+    "ZETA_TEST_PARENT_PID",  # harness identity for child-process ownership checks
+    "ZETA_STALL_WATCHDOG",  # disables an unrelated watchdog during test setup
+    "ZETA_TEST_AUDIT_LEDGER",  # passes the fixture's audit destination to children
+    "ZETA_TEST_LIVE_HOME",  # identifies the guarded live-home fixture
+    "ZETA_TEST_OWNERSHIP_TOKEN",  # authenticates writes from guarded children
+}
 RAW_SERVE_READ_CODE = "TQ008"
 RAW_SERVE_READ_ERROR = (
     "raw serve-socket read bypasses the shared client: use "
@@ -110,13 +117,6 @@ RAW_SERVE_READ_ERROR = (
 # shared client can replace; readuntil/readexactly read HTTP or websocket framing.
 RAW_SERVE_READ_METHODS = {"readline"}
 SERVE_CLIENT_MODULE = Path("tests/support/server_client.py")
-GLOBAL_BOOTSTRAP_ALLOWLIST = {
-    "ZETA_TEST_PARENT_PID",  # harness identity for child-process ownership checks
-    "ZETA_STALL_WATCHDOG",  # disables an unrelated watchdog during test setup
-    "ZETA_TEST_AUDIT_LEDGER",  # passes the fixture's audit destination to children
-    "ZETA_TEST_LIVE_HOME",  # identifies the guarded live-home fixture
-    "ZETA_TEST_OWNERSHIP_TOKEN",  # authenticates writes from guarded children
-}
 
 
 @dataclass(frozen=True)
