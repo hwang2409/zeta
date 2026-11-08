@@ -24,6 +24,7 @@ from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.agent_progress import (
+    live_agent_lifecycle,
     publish_live_agent_lifecycle,
     remove_live_agent_lifecycle,
 )
@@ -82,7 +83,7 @@ async def _status(
 
 @pytest.mark.asyncio
 async def test_child_tool_count_is_cumulative_across_follow_up_segments(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     child_call = ToolCall(
         "background-agent",
@@ -121,6 +122,16 @@ async def test_child_tool_count_is_cumulative_across_follow_up_segments(
         await asyncio.wait_for(backend.child_started["first work"].wait(), timeout=10)
         handle = next(iter(store.agent_children()))
         child_path = Path(store.agent_children()[handle]["child_session_path"])
+        child_store = loop._agent_child_stores[child_call.id]
+        first_tool_seen = asyncio.Event()
+        original_update = child_store.update_agent_lifecycle
+
+        def observe_tool_count(**kwargs: object) -> None:
+            original_update(**kwargs)
+            if kwargs.get("tool_calls") == 1:
+                first_tool_seen.set()
+
+        monkeypatch.setattr(child_store, "update_agent_lifecycle", observe_tool_count)
         assert await send_to_run(
             store,
             handle,
@@ -128,6 +139,10 @@ async def test_child_tool_count_is_cumulative_across_follow_up_segments(
             channel=loop._background_owner.conversation_channel,
         ) is None
         backend.release_children.set()
+        await asyncio.wait_for(first_tool_seen.wait(), timeout=10)
+        live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
+        assert live is not None
+        assert live["tool_calls"] == 1
         await wait_background_owner(loop)
 
         status = await _status(loop, handle)
