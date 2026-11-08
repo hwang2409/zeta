@@ -37,13 +37,10 @@ async def provider_events(
     completion: AsyncIterator[StreamEvent],
     on_started: Callable[[], Awaitable[None]],
 ) -> AsyncIterator[StreamEvent]:
-    """Run ``on_started`` once the provider's first event arrives."""
+    """Run ``on_started`` when provider consumption starts."""
 
-    started = False
+    await on_started()
     async for event in completion:
-        if not started:
-            started = True
-            await on_started()
         yield event
 
 
@@ -52,11 +49,7 @@ def observed_completion(
     store: ConversationStore,
     steering: ClientSteeringBatch | None,
 ) -> AsyncIterator[StreamEvent]:
-    """Publish steering once the provider answers, without changing event order.
-
-    a request that fails or is aborted before any provider event leaves the
-    steering queued, so the turn outcome decides its terminal status.
-    """
+    """Publish steering when provider consumption starts, keeping event order."""
 
     if steering is None:
         return completion
