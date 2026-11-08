@@ -652,7 +652,10 @@ async def test_controller_stream_reads_deny_response_written_after_turn_end(
     monkeypatch.setattr(_Client, "_write", response_after_turn_end)
     # test-contract: seam no public event says a frame reached the socket
     monkeypatch.setattr(_Client, "_write_physical", mark_turn_end)
-    actual = await _controller_event_stream(tmp_path, monkeypatch, observer=False)
+    try:
+        actual = await _controller_event_stream(tmp_path, monkeypatch, observer=False)
+    finally:
+        turn_end_written.set()  # never leave the id-4 write parked at teardown
     assert_raw_frames_preserved(actual, _controller_fixture_frames())
 
 

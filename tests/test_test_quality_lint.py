@@ -148,6 +148,14 @@ def test_await_deadline_rule_rejects_unbounded_waits(
     )
 
 
+def test_transport_marker_does_not_excuse_a_missing_deadline(tmp_path: Path) -> None:
+    source = "async def test_wait():\n    await ready.wait()  # test-contract: transport x\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
 def test_await_deadline_rule_catches_pr_765_original_bare_task_await(
     tmp_path: Path,
 ) -> None:
@@ -1348,9 +1356,33 @@ async def _read_raw_until(reader, frames, predicate):
         ("tests/test_server_observers.py", _PAST_RAW_SERVE_READ, True),
         (
             "tests/test_x.py",
+            "async def f(self):\n    return await self.replay_reader.readline()\n",
+            True,
+        ),
+        # Websocket and HTTP framing reads are not newline JSON-RPC frames.
+        (
+            "tests/test_x.py",
             (
                 "async def f(replay_reader):\n"
                 "    return await replay_reader.readexactly(4)\n"
+            ),
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "async def f(reader):\n"
+                "    # test-contract: transport fake HTTP server request line\n"
+                "    return await reader.readline()\n"
+            ),
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "async def f(reader):\n"
+                "    # test-contract: seam wrong kind for a reader\n"
+                "    return await reader.readline()\n"
             ),
             True,
         ),
@@ -1374,5 +1406,6 @@ def test_raw_serve_socket_reads_must_use_the_shared_client(
     assert bool(findings) is flagged
     assert all(
         "use tests/support/server_client.py read helpers" in finding.message
+        and "'# test-contract: transport <reason>'" in finding.message
         for finding in findings
     )

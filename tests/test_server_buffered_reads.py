@@ -248,3 +248,18 @@ async def test_ok(reader):
     frame = await _read(reader)
 """
     assert _unbuffered_reader_reads(source, "ok") == []
+
+
+@pytest.mark.asyncio
+async def test_request_after_send_clears_the_buffered_response_id() -> None:
+    reader = _Reader(
+        {"id": 4, "result": {}}, {"id": 5, "result": {}}, _event_frame("turn_end", 1)
+    )
+    writer = _Writer()
+    await send(reader, writer, 4, "deny")
+    # request() buffers the id-4 response while it waits for its own id 5.
+    assert await request(reader, writer, 5, "status") == [{"id": 5, "result": {}}]
+
+    frames = await read_until(reader, _is_turn_end, what="turn_end")
+
+    assert [frame.get("id") for frame in frames] == [4, None]

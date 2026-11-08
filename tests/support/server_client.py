@@ -17,8 +17,12 @@ _TURN_EVENTS = {"turn_start", "turn_end"}
 _buffers: weakref.WeakKeyDictionary[asyncio.StreamReader, deque[dict[str, Any]]] = (
     weakref.WeakKeyDictionary()
 )
-# Request ids sent with send() whose response has not been read from the socket.
+# Request ids sent with send() whose response no read helper has returned yet.
 _unanswered: weakref.WeakKeyDictionary[asyncio.StreamReader, set[str | int]] = (
+    weakref.WeakKeyDictionary()
+)
+# The reader that receives the responses to send() requests on each writer.
+_reader_of: weakref.WeakKeyDictionary[asyncio.StreamWriter, asyncio.StreamReader] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -40,7 +44,10 @@ def _pending(reader: asyncio.StreamReader) -> set[str | int]:
 async def read(reader: asyncio.StreamReader) -> dict[str, Any]:
     buffered = _buffer(reader)
     if buffered:
-        return buffered.popleft()
+        # request() buffers frames without clearing their ids; clear them here.
+        frame = buffered.popleft()
+        _pending(reader).discard(frame.get("id"))
+        return frame
     line = await asyncio.wait_for(reader.readline(), TIMEOUT)
     assert line, "server closed the socket"
     frame = RawFrame(json.loads(line))
@@ -63,7 +70,7 @@ async def send(
     method: str,
     params: dict[str, object] | None = None,
 ) -> None:
-    """Write a request; later read helpers do not return before its response."""
+    """Write a request; later read helpers and close_serve read its response."""
     writer.write(
         (
             json.dumps(
@@ -78,7 +85,26 @@ async def send(
         ).encode()
     )
     _pending(reader).add(request_id)
+    _reader_of[writer] = reader
     await asyncio.wait_for(writer.drain(), TIMEOUT)
+
+
+def expect_no_response(reader: asyncio.StreamReader, request_id: str | int) -> None:
+    """Declare that the server never answers this sent request (it closes first)."""
+    _pending(reader).remove(request_id)
+
+
+async def read_sent_responses(writer: asyncio.StreamWriter) -> None:
+    """Teardown check: read until each request sent on this writer has its response."""
+    reader = _reader_of.get(writer)
+    if reader is None or not _pending(reader):
+        return
+    frames: list[dict[str, Any]] = []
+    try:
+        async with asyncio.timeout(10):
+            await _read_sent_responses(reader, frames)
+    except TimeoutError:
+        raise AssertionError(_no_response(_pending(reader), frames)) from None
 
 
 async def _read_sent_responses(
