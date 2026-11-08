@@ -642,9 +642,7 @@ class _Client:
                 )
                 return self.server.connections.replay.finish_join(self, history)
             except BaseException:
-                self.server.connections.invalidate_replay_connection(
-                    self, reason="rejoined"
-                )
+                self.server.connections.invalidate_replay_connection(self, reason="rejoined")
                 raise
         if descriptor is MethodDescriptor.LIST_SESSIONS:
             result, _page_ids = await self.connections.run_read(
