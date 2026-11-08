@@ -44,6 +44,7 @@ import fcntl, pathlib, sys, tarfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
 ident = sys.argv[2]
 if pathlib.Path(ident).parts != (ident,): sys.exit(45)
+def _reject(reason): print(f"zeta-remote: {reason}", file=sys.stderr); sys.exit(46)
 parent = home / "sessions"
 if not parent.is_dir(): sys.exit(44)
 root = parent / ident
@@ -56,11 +57,11 @@ try:
     with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as archive:
         for path in [root, *sorted(root.rglob("*"))]:
             relative = path.relative_to(root)
-            if path.is_symlink(): sys.exit(46)
+            if path.is_symlink(): _reject(f"{path.relative_to(home)}: symlink in session")
             if path.name in {".lock", ".spill.lock", "runtime.lease"}: continue
             if path.is_dir() or path.is_file():
                 archive.add(path, arcname=str(pathlib.Path("payload") / relative), recursive=False)
-            else: sys.exit(46)
+            else: _reject(f"{path.relative_to(home)}: not a file or directory")
 finally:
     for handle in reversed(locks): handle.close()
 '''
@@ -72,6 +73,8 @@ _P06_FEATURE_EPOCH = {P06_FEATURE_EPOCH}
 _WRITER_EPOCH = {WRITER_EPOCH}
 _GATED_HOME_PATHS = {tuple(pattern for pattern, _owner in GATED_HOME_PATHS)!r}
 _LEASE = None
+
+def _reject(reason): print(f"zeta-remote: {{reason}}", file=sys.stderr); sys.exit(46)
 
 def _has_gated_state(home):
     for pattern in _GATED_HOME_PATHS:
@@ -130,12 +133,12 @@ def _writer_epoch(home):
 def _lock_file(directory_fd, name, operation):
     try:
         fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
-    except OSError:
-        sys.exit(46)
+    except OSError as exc:
+        _reject(f"lock {{name}}: cannot open ({{exc.strerror}})")
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         os.close(fd)
-        sys.exit(46)
+        _reject(f"lock {{name}}: not a regular single-link file")
     os.fchmod(fd, 0o600)
     try:
         fcntl.flock(fd, operation)
@@ -152,7 +155,7 @@ def _validate_project(project_fd, ident):
     except (OSError, ValueError):
         sys.exit(44)
     if record.get("project_id") != ident:
-        sys.exit(46)
+        _reject(f"projects/{{ident}}/project.json: project_id does not match")
 
 def _project_fd(projects_fd, ident):
     try:
@@ -221,11 +224,11 @@ with _project_authority(home, ident, identity=False, exclusive=False, nonblockin
     with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as archive:
         for path in [root, *sorted(root.rglob("*"))]:
             relative = path.relative_to(root)
-            if path.is_symlink(): sys.exit(46)
+            if path.is_symlink(): _reject(f"{path.relative_to(home)}: symlink in project")
             if path.name in {".lock", ".memory.lock", ".sessions.lock", ".spill.lock", "runtime.lease"}: continue
             if path.is_dir() or path.is_file():
                 archive.add(path, arcname=str(pathlib.Path("payload") / relative), recursive=False)
-            else: sys.exit(46)
+            else: _reject(f"{path.relative_to(home)}: not a file or directory")
 '''
 
 _IDENTITY_SCRIPT = r'''
@@ -268,6 +271,7 @@ home = pathlib.Path(sys.argv[1]).expanduser().resolve()
 ident, expected = sys.argv[2], sys.argv[3]
 max_members, max_bytes = int(sys.argv[4]), int(sys.argv[5])
 if pathlib.Path(ident).parts != (ident,): sys.exit(45)
+def _reject(reason): print(f"zeta-remote: {reason}", file=sys.stderr); sys.exit(46)
 parent = home / "sessions"; parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 destination = parent / ident
 lease = None
@@ -279,7 +283,7 @@ def digest(root):
     value = hashlib.sha256()
     if not root.exists(): return "missing"
     for path in sorted(root.rglob("*")):
-        if path.is_symlink(): sys.exit(46)
+        if path.is_symlink(): _reject(f"{path.relative_to(home)}: symlink in session")
         if path.is_file() and path.name not in {".lock", ".memory.lock", ".sessions.lock", ".spill.lock", "runtime.lease"}:
             value.update(path.relative_to(root).as_posix().encode() + b"\0")
             with path.open("rb") as stream:
@@ -293,34 +297,34 @@ try:
         for member in archive:
             members += 1
             if members > max_members: sys.exit(49)
-            if member.size < 0: sys.exit(46)
+            if member.size < 0: _reject(f"archive member {member.name}: negative size")
             declared += member.size
             if declared > max_bytes: sys.exit(50)
             if shutil.disk_usage(parent).free < declared - extracted: sys.exit(51)
             parts = pathlib.PurePosixPath(member.name).parts
-            if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): sys.exit(46)
+            if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): _reject(f"archive member {member.name}: unsafe path or link")
             target = staging.joinpath(*parts[1:])
-            if target.name == "runtime.lease": sys.exit(46)
+            if target.name == "runtime.lease": _reject(f"archive member {member.name}: runtime lease")
             if member.isdir(): target.mkdir(parents=True, exist_ok=True, mode=0o700)
             elif member.isfile():
                 target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 source = archive.extractfile(member)
-                if source is None: sys.exit(46)
+                if source is None: _reject(f"archive member {member.name}: unreadable")
                 with target.open("wb") as output:
                     remaining = member.size
                     while remaining:
                         chunk = source.read(min(1024 * 1024, remaining))
-                        if not chunk: sys.exit(46)
+                        if not chunk: _reject(f"archive member {member.name}: truncated")
                         extracted += len(chunk); remaining -= len(chunk)
                         if extracted > max_bytes: sys.exit(50)
                         output.write(chunk)
                     if source.read(1): sys.exit(50)
                 target.chmod(0o600)
-            else: sys.exit(46)
+            else: _reject(f"archive member {member.name}: not a file or directory")
     manifest = json.loads((staging / "transfer.json").read_text())
     resume_cwd = pathlib.Path(manifest.get("resume_cwd", ""))
     expected_cwd = home / "remote-workspaces" / ident
-    if resume_cwd != expected_cwd: sys.exit(46)
+    if resume_cwd != expected_cwd: _reject("transfer.json: resume_cwd does not match the remote workspace")
     expected_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
     backup = parent / f".{ident}.replaced-{os.getpid()}"
     if backup.exists(): shutil.rmtree(backup)
@@ -351,25 +355,25 @@ with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as tempor
         for member in archive:
             members += 1
             if members > max_members: sys.exit(49)
-            if member.size < 0: sys.exit(46)
+            if member.size < 0: _reject(f"archive member {member.name}: negative size")
             declared += member.size
             if declared > max_bytes: sys.exit(50)
             if shutil.disk_usage(home).free < declared - extracted: sys.exit(51)
             parts = tuple(member.name.split("/"))
-            if not member.isfile() or len(parts) < 2 or parts[0] != "payload": sys.exit(46)
+            if not member.isfile() or len(parts) < 2 or parts[0] != "payload": _reject(f"archive member {member.name}: not a payload file")
             try: _canonical_snapshot_path(parts[1:])
             except ProjectPublicationError as exc:
-                print(str(exc), file=sys.stderr); sys.exit(46)
+                _reject(f"archive member {member.name}: {exc}")
             target = staging.joinpath(*parts[1:])
-            if target.exists(): sys.exit(46)
+            if target.exists(): _reject(f"archive member {member.name}: duplicate")
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             source = archive.extractfile(member)
-            if source is None: sys.exit(46)
+            if source is None: _reject(f"archive member {member.name}: unreadable")
             with target.open("xb") as output:
                 remaining = member.size
                 while remaining:
                     chunk = source.read(min(1024 * 1024, remaining))
-                    if not chunk: sys.exit(46)
+                    if not chunk: _reject(f"archive member {member.name}: truncated")
                     extracted += len(chunk); remaining -= len(chunk)
                     if extracted > max_bytes: sys.exit(50)
                     output.write(chunk)
@@ -377,7 +381,7 @@ with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as tempor
             target.chmod(0o600)
     for directory in staging.rglob("*"):
         if directory.is_dir(): directory.chmod(0o700)
-    if transfer_digest(staging) != transfer: sys.exit(46)
+    if transfer_digest(staging) != transfer: _reject("archive does not match its transfer digest")
     try:
         publish_local_project(home, ident, staging, expected_digest=expected)
     except ProjectPublicationError as exc:
