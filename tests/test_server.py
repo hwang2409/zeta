@@ -83,6 +83,7 @@ from zeta.protocol.types import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
     with_message_origin,
 )
@@ -100,6 +101,7 @@ from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
+    tool_end,
 )
 from zeta.server.protocol import (
     MAX_FRAME_BYTES,
@@ -552,6 +554,34 @@ def test_serve_maps_account_state_unknown() -> None:
         STREAM_EVENT_WIRE_EVENTS[StreamEventType.ACCOUNT_STATE_UNKNOWN]
         == "account_state_unknown"
     )
+
+
+def test_agent_status_lost_reason_survives_serve_tool_mapping() -> None:
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=ToolCall("status-1", "agent_status", {"handle": "root:1"}),
+        tool_result=ToolResult(
+            tool_call_id="status-1",
+            content="child root:1: state: failed; reason: lost: owner process exited",
+            structured_content={
+                "children": [
+                    {
+                        "handle": "root:1",
+                        "state": "failed",
+                        "reason": "lost: owner process exited",
+                    }
+                ]
+            },
+        ),
+    )
+
+    mapped = tool_end(event, fidelity=True)
+
+    assert mapped["tool_result"]["structured_content"]["children"][0] == {
+        "handle": "root:1",
+        "state": "failed",
+        "reason": "lost: owner process exited",
+    }
 
 
 def test_server_sends_only_wire_map_event_names() -> None:
@@ -10045,12 +10075,203 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
                 "row": 2,
                 "repairable": True,
                 "session_id": session_id,
-                "actions": [],
+                "actions": [
+                    {
+                        "method": "repair_transcript",
+                        "session_id": session_id,
+                        "requires_confirmation": True,
+                    }
+                ],
             },
         }
         assert "must-not-leak" not in json.dumps(response)
         assert str(path) not in json.dumps(response)
         assert path.read_bytes() == damaged
+
+        refusal = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "repair_transcript",
+                {"session_id": session_id, "confirm": False},
+            )
+        )[-1]
+        assert refusal["error"]["message"] == "repair_transcript requires confirm=true"
+        repaired = (
+            await _request(
+                reader,
+                writer,
+                6,
+                "repair_transcript",
+                {"session_id": session_id, "confirm": True},
+            )
+        )[-1]["result"]
+        quarantine_id = repaired["quarantine_id"]
+        assert repaired == {
+            "session_id": session_id,
+            "child_run_id": None,
+            "quarantine_id": quarantine_id,
+            "retained_last_sequence": 0,
+            "memory_review_required": False,
+            "overlapping_memory_versions": [],
+        }
+        assert (
+            path.with_name(
+                f"conversation.quarantine.{quarantine_id}.jsonl"
+            ).read_bytes()
+            == damaged
+        )
+        resumed = (
+            await _request(reader, writer, 7, "resume", {"session_id": session_id})
+        )[-1]
+        assert resumed["result"]["session"]["session_id"] == session_id
+        history = (
+            await _request(
+                reader,
+                writer,
+                8,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        recovery = history[-1]["transcript_recovery"]
+        assert recovery["quarantine_id"] == quarantine_id
+        assert recovery["session_id"] == session_id
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_current_session_repair_updates_live_memory_owner(
+    tmp_path: Path,
+) -> None:
+    from tests.support.owned import await_or_fail
+    from zeta.project_registry import ProjectRegistry
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("recovery", "test", workspace)
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=workspace,
+        port=0,
+        provider="codex",
+        auto_memory=True,
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    assert server.runtime.opened is not None
+    assert server.runtime.loop is not None
+    root = server.runtime.opened.store
+    reconciler = server.runtime.loop.memory_reconciler
+    assert reconciler is not None
+    assert reconciler.session_id == session_id
+    root.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("retained")]),
+            MessageOrigin.USER,
+        )
+    )
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=registry.memory_digest(project.project_id),
+        updates={"state.md": "automatic\n"},
+        provenance={
+            "session_id": session_id,
+            "seq_start": 1,
+            "seq_end": 2,
+            "model": "offline",
+        },
+    )
+    transcript = root.path
+    transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
+    try:
+        repaired = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "repair_transcript",
+                {"session_id": session_id, "confirm": True},
+            )
+        )[-1]["result"]
+        quarantine_id = repaired["quarantine_id"]
+        assert repaired["memory_review_required"] is True
+
+        await await_or_fail(
+            asyncio.to_thread(
+                reconciler.state.record_scanner_failure,
+                seq=2,
+                cause="delayed live publication",
+                occurred_at="2026-01-01T00:00:00Z",
+            ),
+            what="publish delayed live memory failure",
+        )
+        memory_state = json.loads(
+            (transcript.parent / "memory-reconcile.json").read_text(encoding="utf-8")
+        )
+        assert reconciler.state.generation == memory_state["generation"] == 1
+        assert (
+            reconciler.state.recovery_quarantine_id
+            == memory_state["recovery_quarantine_id"]
+            == quarantine_id
+        )
+        assert reconciler.state.recovery_cutoff == memory_state["recovery_cutoff"] == 1
+        assert reconciler.state.paused_for_recovery is True
+        assert memory_state["recovery_paused"] is True
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    assert server.runtime.opened is not None
+    root = server.runtime.opened.store
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    child.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("retained")]),
+            MessageOrigin.USER,
+        )
+    )
+    child.close()
+    transcript = root.session_dir / "agents" / "1" / "conversation.jsonl"
+    transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
+    try:
+        repaired = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "repair_transcript",
+                {
+                    "session_id": session_id,
+                    "child_run_id": f"{session_id}:1",
+                    "confirm": True,
+                },
+            )
+        )[-1]["result"]
+        assert repaired["child_run_id"] == f"{session_id}:1"
+        assert repaired["memory_review_required"] is False
+
+        reopened = ConversationStore(root.session_dir / "agents", session_id="1")
+        try:
+            reopened.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent("usable")]),
+                    MessageOrigin.USER,
+                )
+            )
+            assert [message.content[0].text for message in reopened.messages()] == [
+                "retained",
+                "usable",
+            ]
+        finally:
+            reopened.close()
+        assert len(root.agent_notifications()) == 1
     finally:
         await close_serve(server, writer)
 
