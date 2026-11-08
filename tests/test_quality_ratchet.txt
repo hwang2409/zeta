@@ -150,6 +150,7 @@ tests/test_agent_cwd_fd.py::test_delegated_shell_executes_in_open_approved_direc
 tests/test_agent_navigation.py::reject
 tests/test_agent_navigation.py::send
 tests/test_agent_navigation.py::test_child_todo_refresh_coalesces_pending_requests
+tests/test_agent_output.py::heartbeat
 tests/test_agent_output.py::run_child
 tests/test_agent_output.py::test_background_notification_carries_structured_stats
 tests/test_agent_output.py::test_concurrent_status_calls_cannot_regress_projection

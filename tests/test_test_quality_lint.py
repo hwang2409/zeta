@@ -257,8 +257,9 @@ def test_polling_spin_requires_a_deadline(
     ("builtins", "iter"),
 ])
 @pytest.mark.parametrize("import_style", ["plain", "alias", "from", "from_alias"])
+@pytest.mark.parametrize("bounded", [False, True])
 def test_polling_spin_resolves_import_spellings(
-    tmp_path: Path, module: str, primitive: str, import_style: str
+    tmp_path: Path, module: str, primitive: str, import_style: str, bounded: bool
 ) -> None:
     visible = {"plain": module, "alias": "mod", "from": primitive, "from_alias": "item"}[import_style]
     if import_style == "plain":
@@ -274,9 +275,16 @@ def test_polling_spin_resolves_import_spellings(
     else:
         iterator = f"for _ in {call}()" if primitive != "iter" else f"for _ in {call}(lambda: 1, 0)"
         body = f"{iterator}:\n        await asyncio.sleep(0)"
-    source = f"{statement}\n\nasync def test_spin():\n    {body}\n"
+    if bounded:
+        body = "async with asyncio.timeout(10):\n" + "\n".join(
+            "    " + line for line in body.splitlines()
+        )
+    source = f"{statement}\n\nasync def test_spin():\n" + "\n".join(
+        "    " + line for line in body.splitlines()
+    ) + "\n"
     findings = _lint(tmp_path, source)
-    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 4)]
+    expected = [] if bounded else [("TQ004", 4)]
+    assert [(finding.code, finding.line) for finding in findings] == expected
 
 
 def test_one_argument_iter_is_finite_and_nested_definitions_are_scoped(
