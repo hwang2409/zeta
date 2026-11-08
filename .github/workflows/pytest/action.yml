@@ -41,16 +41,18 @@ runs:
         # DIAG ONLY: after 11 min, dump every process tree and every python stack.
         pip install --quiet py-spy || true
         (
-          sleep 660
+          sleep 600
           for round in 1 2; do
             echo "=== DIAG round $round $(date -u +%T) ==="
             ps -eo pid,ppid,pgid,sid,stat,wchan:32,etime,args --forest | grep -v ' ps -eo'
-            for pid in $(pgrep -f python); do
+            for pid in $(pgrep -f 'exec\(eval') $(pgrep -f 'bin/pytest -q'); do
               echo "--- DIAG pid $pid stat=$(cut -d' ' -f3 /proc/$pid/stat 2>/dev/null) ---"
               tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null; echo
-              sudo cat /proc/$pid/stack 2>/dev/null | head -20
               for t in /proc/$pid/task/*; do echo "task ${t##*/} $(cat $t/comm) wchan=$(cat $t/wchan 2>/dev/null) state=$(cut -d' ' -f3 $t/stat)"; done
-              sudo env "PATH=$PATH" py-spy dump --native --pid $pid 2>&1 | head -200
+              sudo ls -l /proc/$pid/fd 2>/dev/null | head -60
+              sudo timeout 60 env "PATH=$PATH" py-spy dump --locals --pid $pid 2>&1 | head -400
+              echo "--- DIAG children of $pid ---"
+              for c in $(pgrep -P $pid); do tr '\0' ' ' < /proc/$c/cmdline; echo; sudo timeout 30 env "PATH=$PATH" py-spy dump --pid $c 2>&1 | head -60; done
             done
             sleep 60
           done

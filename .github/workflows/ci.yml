@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"os":"ubuntu-latest","python-version":"3.14","rep":1},{"os":"ubuntu-latest","python-version":"3.14","rep":2},{"os":"ubuntu-latest","python-version":"3.14","rep":3}]' || (github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'macos')) && '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"}]' || '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"}]') }}
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"os":"ubuntu-latest","python-version":"3.14","rep":1},{"os":"ubuntu-latest","python-version":"3.14","rep":2}]' || (github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'macos')) && '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"}]' || '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"}]') }}
     # Main keeps one running macOS job and only the newest pending commit.
     # Other matrix jobs use a unique group and cannot replace it.
     concurrency:
