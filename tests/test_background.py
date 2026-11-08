@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,9 +24,11 @@ from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
-from tests.support.completion import completion_control
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.owned import await_or_fail
+from tests.support.fake_backend import (
+    FakeBackend,
+    PerActorFakeBackend,
+    ScriptedTurn,
+)
 from tests.support.processes import (
     kill_group_if_present,
     read_pid_file,
@@ -44,11 +46,9 @@ from zeta.protocol.types import (
     StreamEvent,
     TextContent,
     ToolCall,
-    ToolSchema,
     ToolUseContent,
     with_message_origin,
 )
-from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -332,34 +332,6 @@ async def test_canceled_monitor_propagates_when_record_already_stopped() -> None
 
 async def _collect(events):
     return [event async for event in events]
-
-
-class _GatedFakeBackend(FakeBackend):
-    def __init__(self, turns: Sequence[ScriptedTurn], gated_prompt: str) -> None:
-        super().__init__(turns)
-        self.gated_prompt = gated_prompt
-        self.completion_started = asyncio.Event()
-        self.completion_gate = asyncio.Event()
-
-    @owned_completion
-    async def complete(
-        self,
-        messages: Sequence[Message],
-        tool_schemas: Sequence[ToolSchema],
-    ) -> AsyncIterator[StreamEvent]:
-        gated = any(
-            block.text == self.gated_prompt
-            for message in messages
-            for block in message.content
-            if isinstance(block, TextContent)
-        )
-        if gated:
-            self.completion_started.set()
-            await await_or_fail(self.completion_gate.wait(), what="self.completion_gate.wait()")
-        async for event in super().complete(
-            messages, tool_schemas, control=completion_control()
-        ):
-            yield event
 
 
 @pytest.mark.asyncio
@@ -1067,8 +1039,14 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         "agent",
         {"prompt": "child", "description": "background", "background": True},
     )
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    backend = PerActorFakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ],
+        {"child": [ScriptedTurn([TextContent("done")])]},
+        parent_prompt="start",
+        gated_child_prompts=set(),
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -1106,13 +1084,14 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
             "background": True,
         },
     )
-    backend = _GatedFakeBackend(
-        [
-            ScriptedTurn(tool_calls=[foreground]),
-            ScriptedTurn(tool_calls=[grandchild]),
-            ScriptedTurn([TextContent("done")]),
-        ],
-        gated_prompt="grandchild",
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[foreground])],
+        {
+            "child": [ScriptedTurn(tool_calls=[grandchild])],
+            "grandchild": [ScriptedTurn([TextContent("done")])],
+        },
+        parent_prompt="start",
+        gated_child_prompts={"grandchild"},
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -1144,7 +1123,7 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
                 os.fstat(child_store.directory_fd)
         assert store.directory_fd >= 0
     finally:
-        backend.completion_gate.set()
+        backend.release_children.set()
         try:
             await loop.close()
         finally:
