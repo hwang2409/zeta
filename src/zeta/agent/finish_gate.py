@@ -240,8 +240,17 @@ class FinishGateState:
                 finally:
                     close = getattr(events, "aclose", None)
                     if close is not None:
-                        await close()
+                        close_task = asyncio.create_task(close())
+                        if loop.time() >= self._task_deadline():
+                            close_task.cancel()
+                            # test-contract: seam canceled completion close must drain
+                            await asyncio.gather(close_task, return_exceptions=True)
+                        else:
+                            # test-contract: seam timeout_at owns the close deadline
+                            await close_task
         except TimeoutError:
+            if task_running_at_entry and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if (
                 flow is not None
@@ -291,6 +300,8 @@ class FinishGateState:
         loop = asyncio.get_running_loop()
         deadline = self._task_deadline() if tasks_running else self._child_deadline()
         if loop.time() >= deadline:
+            if tasks_running and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if (
                 flow is not None
@@ -300,10 +311,13 @@ class FinishGateState:
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
         try:
             async with asyncio.timeout_at(deadline):
+                # test-contract: seam timeout_at owns the transition deadline
                 await child_loop._background_owner.conversation_channel.wait(
                     child_loop.agent_instance_id or ""
                 )
         except TimeoutError:
+            if tasks_running and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if (
                 flow is not None
@@ -346,6 +360,10 @@ class FinishGateState:
         assert self.child_deadline is not None
         return self.child_deadline
 
+    def completion_task_deadline(self, child_loop: AgentLoop) -> float | None:
+        """Bound a gate turn's provider completion while tasks still run."""
+        return self._task_deadline() if self.owned_tasks(child_loop) else None
+
     def _task_deadline(self) -> float:
         assert self.task_deadline is not None
         return self.task_deadline
@@ -368,6 +386,7 @@ async def await_owned_work(
             return
         try:
             async with asyncio.timeout_at(deadline):
+                # test-contract: seam timeout_at owns the transition deadline
                 await child_loop._background_owner.conversation_channel.wait(
                     child_loop.agent_instance_id or ""
                 )
@@ -414,7 +433,10 @@ async def _run_finish_gate(
     try:
         result = await state.run_model_turn(
             child_loop,
-            child_loop.run_harness_notice_turn(finish_gate_message(children, tasks)),
+            child_loop.run_harness_notice_turn(
+                finish_gate_message(children, tasks),
+                task_deadline=state.completion_task_deadline(child_loop),
+            ),
             consume_events,
         )
         if result is not None:
@@ -493,7 +515,9 @@ async def _handle_pending_notification(
             return await state.wait_transition(child_loop, tasks_running=tasks_running)
     return await state.run_model_turn(
         child_loop,
-        child_loop.run_notification_turn(),
+        child_loop.run_notification_turn(
+            task_deadline=state.completion_task_deadline(child_loop)
+        ),
         consume_events,
         episode,
     )

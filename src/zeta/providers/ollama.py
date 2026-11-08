@@ -24,6 +24,17 @@ from ..protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from .completion import (
+    CompletionControl,
+    CompletionRun,
+    IteratorProviderAttempt,
+    ProviderAttempt,
+    TransportActivity,
+    report_transport_activity,
+)
+from .completion import (
+    complete as own_completion,
+)
 from .payload_common import (
     HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
     is_harness_notification,
@@ -33,14 +44,8 @@ from .transport import (
     DEFAULT_STREAM_STALL_SECONDS,
     HTTPClientLease,
     cleanup_transport,
-    close_resource,
     close_transport_resources,
-    provider_retry_notice,
     retry_after_seconds,
-    retry_provider_completion,
-    stall_retry_kwargs,
-    stall_watchdog,
-    wait_for_response_headers,
 )
 from .usage import normalize_usage
 
@@ -73,6 +78,7 @@ async def _bounded_stream_lines(response: httpx.Response) -> AsyncIterator[bytes
     buffer = bytearray()
     chunks = response.aiter_bytes()
     async for chunk in chunks:
+        report_transport_activity()
         start = 0
         while start < len(chunk):
             newline = chunk.find(b"\n", start)
@@ -273,31 +279,22 @@ class OllamaBackend(CompletionBackend):
         self.token_budget = token_budget or DEFAULT_OLLAMA_TOKEN_BUDGET
 
     def complete(
-        self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
-    ) -> AsyncIterator[StreamEvent]:
-        return self._complete(messages, tool_schemas)
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+        *,
+        control: CompletionControl,
+    ) -> CompletionRun:
+        return own_completion(self, messages, tool_schemas, control=control)
 
-    async def _complete(
-        self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
-    ) -> AsyncIterator[StreamEvent]:
-        async def refresh() -> str:
-            return ""
-
-        attempts = retry_provider_completion(
-            lambda: self._complete_once(messages, tool_schemas),
-            lambda _token: self._complete_once(messages, tool_schemas),
-            refresh,
-            lambda _error: False,
-            lambda error: error,
-            provider_retry_notice,
-            lambda _error, _retries: None,
-            **stall_retry_kwargs(self.stall_retries),
-        )
-        try:
-            async for event in attempts:
-                yield event
-        finally:
-            await close_resource(attempts)
+    def create_attempt(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+        token: str | None = None,
+    ) -> ProviderAttempt:
+        del token
+        return IteratorProviderAttempt(self._complete_once(messages, tool_schemas))
 
     @property
     def connection_setup_count(self) -> int:
@@ -316,10 +313,12 @@ class OllamaBackend(CompletionBackend):
         self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
         async with self._lease.borrow() as client:
-            async for event in self._complete_once_with_client(
-                client, messages, tool_schemas
-            ):
-                yield event
+            events = self._complete_once_with_client(client, messages, tool_schemas)
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                await events.aclose()
 
     async def _complete_once_with_client(
         self,
@@ -350,18 +349,13 @@ class OllamaBackend(CompletionBackend):
             stream = client.stream(
                 "POST", f"{self.base_url}/api/chat", json=payload, timeout=self.timeout
             )
-            response = await wait_for_response_headers(
-                stream.__aenter__(), self.stall_seconds, "Ollama", OllamaError
-            )
+            response = await stream.__aenter__()
             entered = True
             try:
                 if response.status_code >= 400:
                     body = bytearray()
-                    async for chunk in stall_watchdog(
-                        response.aiter_bytes(),
-                        seconds=self.stall_seconds,
-                        on_stall=stall_error,
-                    ):
+                    async for chunk in response.aiter_bytes():
+                        report_transport_activity()
                         body.extend(chunk[: 500 - len(body)])
                         if len(body) >= 500:
                             break
@@ -379,11 +373,7 @@ class OllamaBackend(CompletionBackend):
                 usage: dict[str, Any] = {}
                 stop_reason: str | None = None
                 done = False
-                async for line in stall_watchdog(
-                    _bounded_stream_lines(response),
-                    seconds=self.stall_seconds,
-                    on_stall=stall_error,
-                ):
+                async for line in _bounded_stream_lines(response):
                     if not line.strip():
                         continue
                     try:
@@ -394,6 +384,7 @@ class OllamaBackend(CompletionBackend):
                         ) from exc
                     if not isinstance(item, Mapping):
                         raise OllamaError("Ollama stream item must be an object")
+                    report_transport_activity(TransportActivity.MODEL_PROGRESS)
                     if "error" in item:
                         raise OllamaError(f"Ollama error: {item['error']}")
                     message = item.get("message")
