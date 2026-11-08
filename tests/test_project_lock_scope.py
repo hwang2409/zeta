@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import socket
@@ -653,3 +654,36 @@ def test_p06_8_rank_guard_rejects_inversions_and_unsorted_domains() -> None:
         domain_lock("p_a", "memory"),
     ):
         pass
+
+
+async def test_p06_8_tui_workspace_lifetime_closes_and_deletes_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # guard: the cached workspace store pins its session with a lifetime lease,
+    # so it leaves no session-shape rank on the event-loop thread while it lives
+    # (a short-shape pin makes the second checkpoint raise a rank inversion).
+    from zeta.cli.main import build_parser
+    from zeta.tui.app import create_app
+
+    home = tmp_path / "home"
+    await asyncio.to_thread(
+        subprocess.run, ["git", "init", "-q", str(tmp_path)], check=True
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
+    session_id = app.loop.store.session_id
+    try:
+        # The first checkpoint caches the store; the second runs while it is alive.
+        for label in ("first", "second"):
+            result = await app._slash_commands.dispatch_async(
+                app, f"/checkpoint {label}"
+            )
+            assert result is not None, label
+            assert result.startswith(f"checkpoint '{label}'"), result
+            assert "skipped" not in result, result
+    finally:
+        await app.close()
+    SessionManager(home).delete(session_id)
