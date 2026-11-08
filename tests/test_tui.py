@@ -15303,3 +15303,57 @@ async def test_history_finder_does_not_cross_session_boundaries(
     assert len(batches) == 1
     assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "content", "structured_content", "expected"),
+    [
+        (
+            "finish",
+            "finish accepted; no more work or prose is needed",
+            {
+                "status": "done",
+                "summary": "summary-" + "x" * 180,
+                "verdict": "pass",
+                "head_sha": "abcdef1234567",
+            },
+            ("summary-" + "x" * 180, "verdict: pass"),
+        ),
+        (
+            "agent_handoff",
+            "background child agents handed off; reason: "
+            + "reason-"
+            + "y" * 180
+            + "; outputs: output details",
+            None,
+            ("reason-" + "y" * 180, "outputs:"),
+        ),
+    ],
+)
+def test_finish_and_handoff_cards_wrap_complete_detail(
+    tool_name: str,
+    content: str,
+    structured_content: dict[str, str] | None,
+    expected: tuple[str, str],
+) -> None:
+    call = ToolCall(f"{tool_name}-detail", tool_name, {})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                content,
+                structured_content=structured_content,
+            ),
+        )
+    )
+
+    assert rendered is not None
+    output = StringIO()
+    _test_console(output, width=100).print(rendered)
+    snapshot = Text.from_ansi(output.getvalue()).plain.rstrip()
+    plain = renderable_plain(rendered)
+    assert expected[0] in plain
+    assert expected[1] in plain
+    assert "…" not in snapshot

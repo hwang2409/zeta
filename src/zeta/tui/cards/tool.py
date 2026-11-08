@@ -15,6 +15,7 @@ from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
 from .. import theme
 from .base import (
     header_with_status,
+    safe_text,
     strip_terminal_controls,
     tool_body,
     tool_card,
@@ -451,6 +452,49 @@ def todo_tool_card(event: StreamEvent, running: bool) -> RenderableType:
         else None
     )
     return tool_panel(call, body, header=header)
+
+
+def _wrapped_detail_card(
+    call: ToolCall, detail: str, *, header: RenderableType | None = None
+) -> RenderableType:
+    return tool_panel(
+        call,
+        Group(safe_text(detail, style=theme.BODY, wrap=True)),
+        header=header,
+    )
+
+
+def finish_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None or running or event.tool_result is None:
+        return tool_card(event, running=running)
+    structured = event.tool_result.structured_content
+    if not isinstance(structured, dict):
+        return tool_card(event)
+    detail = "\n".join(
+        f"{key}: {structured[key]}"
+        for key in ("status", "summary", "verdict", "head_sha")
+        if key in structured
+    )
+    if not detail:
+        return tool_card(event)
+    return _wrapped_detail_card(call, detail)
+
+
+def agent_handoff_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None or running or event.tool_result is None:
+        return tool_card(event, running=running)
+    detail = tool_content(event)
+    if not detail:
+        return tool_card(event)
+    return _wrapped_detail_card(call, detail)
+
+
+SPECIAL_TOOL_CARD_RENDERERS = {
+    "finish": finish_tool_card,
+    "agent_handoff": agent_handoff_tool_card,
+}
 
 
 @register_tool_card("skill")
