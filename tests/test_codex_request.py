@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import tracemalloc
 
 import httpx
 import pytest
@@ -28,6 +29,29 @@ async def test_large_codex_body_is_exact_replayable_json() -> None:
     second = b"".join([part async for part in prepared.content])
     assert first == expected == second
     assert prepared.headers["Content-Length"] == str(len(expected))
+
+
+@pytest.mark.asyncio
+async def test_large_codex_body_does_not_copy_images_during_prepare_or_iteration() -> None:
+    image = _large_image()
+    payload = _payload(_CodexImageURL(image), _CodexImageURL(image))
+    tracemalloc.start()
+    try:
+        prepared = prepare_large_image_request(payload)
+        assert prepared is not None
+        retained, _ = tracemalloc.get_traced_memory()
+        assert retained < 2 * 1024 * 1024
+        total = 0
+        max_chunk = 0
+        async for chunk in prepared.content:
+            total += len(chunk)
+            max_chunk = max(max_chunk, len(chunk))
+        _, peak_after_iteration = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert total == int(prepared.headers["Content-Length"])
+    assert max_chunk <= 64 * 1024
+    assert peak_after_iteration < 2 * 1024 * 1024
 
 
 @pytest.mark.asyncio

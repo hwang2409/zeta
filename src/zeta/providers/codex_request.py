@@ -26,9 +26,8 @@ class _Body(httpx.AsyncByteStream):
                 if part:
                     yield part
                 continue
-            encoded = part.encode("ascii")
-            for start in range(0, len(encoded), _CHUNK):
-                yield encoded[start : start + _CHUNK]
+            for start in range(0, len(part), _CHUNK):
+                yield part[start : start + _CHUNK].encode("ascii")
 
     async def aclose(self) -> None:
         return None
@@ -102,7 +101,7 @@ def _attempt(payload: dict[str, Any], images: list[str]) -> PreparedCodexRequest
     parts: list[bytes | str] = []
     cursor = 0
     for start, end, image in offsets:
-        parts.extend((encoded[cursor:start], '"' + image + '"'))
+        parts.extend((encoded[cursor:start], b'"', image, b'"'))
         cursor = end
     parts.append(encoded[cursor:])
     length = sum(map(len, parts))
