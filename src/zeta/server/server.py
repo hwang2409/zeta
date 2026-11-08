@@ -869,16 +869,23 @@ class _Client:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self
             )
-        await self.server.control.require_idle()
         if method == "slash_run":
+            text = _required_string(params, "text")
+            if (
+                self.server.control.turn_busy()
+                and not await slash_commands.can_run_while_busy(runtime, text)
+            ):
+                await self.server.control.require_idle()
             register = self.server.control.model_input_registrar(self.features)
             return await slash_commands.run_command(
                 runtime,
-                _required_string(params, "text"),
+                text,
                 register_model_input=register,
                 approval_control=self.server.control,
                 run_blocking=self.server.control._run_blocking,
+                busy=self.server.control.turn_busy(),
             )
+        await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if method == "set_settings":
             model = _required_string(params, "model")
