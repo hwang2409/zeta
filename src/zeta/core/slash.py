@@ -1000,8 +1000,37 @@ def _has_args(args: str) -> bool:
     return bool(args.strip())
 
 
+def _no_args(args: str) -> bool:
+    return not args.strip()
+
+
+def _never_mutates(_args: str) -> bool:
+    return False
+
+
+def _memory_mutates(args: str) -> bool:
+    action = args.strip()
+    return action == "undo" or action.startswith(
+        ("retry ", "undo ", "accept ", "resolve ")
+    )
+
+
+def _memory_read_only(args: str) -> bool:
+    action = args.strip()
+    return action in {"", "retry", "log"} or action.startswith("log ")
+
+
+def _mcp_read_only(_args: str) -> bool:
+    # MCP status can initialize and reconcile the live mount on the event loop.
+    return False
+
+
 def _vim_mutates(args: str) -> bool:
     return args.strip().lower() in {"on", "off", "toggle"}
+
+
+def _plan_mutates(args: str) -> bool:
+    return bool(args.strip())
 
 
 def _project_mutates(args: str) -> bool:
@@ -1016,6 +1045,9 @@ def _mcp_mutates(args: str) -> bool:
         "disable",
         "trust",
         "untrust",
+        "auth",
+        "logout",
+        "reconnect",
     }
 
 
@@ -1039,7 +1071,12 @@ def create_slash_registry(
     )
     project_root = None if project_eligible is False else private_project_root
     registry.register(
-        SlashCommand("status", _run_status, "show session status", ServeSlash())
+        SlashCommand(
+            "status",
+            _run_status,
+            "show session status",
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+        )
     )
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
     registry.register(
@@ -1047,7 +1084,10 @@ def create_slash_registry(
             "mcp",
             _run_mcp,
             "show MCP server status",
-            ServeSlash(mutates=_mcp_mutates),
+            ServeSlash(
+                mutates=_mcp_mutates,
+                runs_while_busy=_mcp_read_only,
+            ),
         )
     )
     registry.register(
@@ -1055,12 +1095,21 @@ def create_slash_registry(
             "model",
             _run_model,
             "pick a model or switch to one: /model [name]",
-            ServeSlash(mutates=_has_args),
+            ServeSlash(
+                mutates=_has_args,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
         SlashCommand(
-            "vim", _run_vim, "show or change vim mode", ServeSlash(mutates=_vim_mutates)
+            "vim",
+            _run_vim,
+            "show or change vim mode",
+            ServeSlash(
+                mutates=_vim_mutates,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
@@ -1068,7 +1117,7 @@ def create_slash_registry(
             "plan",
             _run_plan,
             "show or change plan mode",
-            ServeSlash(mutates=lambda _: True),
+            ServeSlash(mutates=_plan_mutates, runs_while_busy=_no_args),
         )
     )
     registry.register(
@@ -1140,18 +1189,26 @@ def create_slash_registry(
             "project",
             _run_project,
             "show or initialize the current project",
-            ServeSlash(mutates=_project_mutates),
+            ServeSlash(
+                mutates=_project_mutates,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
-        SlashCommand("inbox", _run_inbox, "list this project's inbox", ServeSlash())
+        SlashCommand(
+            "inbox",
+            _run_inbox,
+            "list this project's inbox",
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+        )
     )
     registry.register(
         SlashCommand(
             "memory",
             _run_memory,
             "show, retry, or undo automatic memory updates",
-            ServeSlash(),
+            ServeSlash(mutates=_memory_mutates, runs_while_busy=_memory_read_only),
         )
     )
     registry.register(
@@ -1172,7 +1229,7 @@ def create_slash_registry(
             "help",
             lambda _session, _args: registry.help_text(),
             "list commands",
-            ServeSlash(),
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
         )
     )
     registry.register(SlashCommand("approve", _run_approve, "/approve [key]"))
@@ -1189,7 +1246,10 @@ def create_slash_registry(
             "accounts",
             _run_accounts,
             "list, switch, or label accounts",
-            ServeSlash(mutates=_has_args),
+            ServeSlash(
+                mutates=_has_args,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(

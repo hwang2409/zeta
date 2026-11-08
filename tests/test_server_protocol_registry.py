@@ -72,6 +72,37 @@ def _documented_slash_error_codes(document: str) -> set[str]:
     return set(re.findall(r"^\| `([a-z_]+)` \|", section, re.MULTILINE))
 
 
+def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
+    registry = create_slash_registry(skill_catalog=SkillCatalog(()), surface="serve")
+    safe = {
+        command.name
+        for command in registry.builtin_commands
+        if command.serve is not None and command.serve.can_run_while_busy("")
+    }
+    assert safe == {
+        "accounts",
+        "help",
+        "inbox",
+        "memory",
+        "model",
+        "plan",
+        "project",
+        "status",
+        "vim",
+    }
+    assert all(
+        command.serve is not None and command.serve.mutates is not None
+        for command in registry.builtin_commands
+        if command.name in safe
+    )
+    assert registry.command_for("memory").serve.can_run_while_busy("")
+    assert not registry.command_for("memory").serve.can_run_while_busy("undo")
+    assert registry.command_for("plan").serve.can_run_while_busy("")
+    assert not registry.command_for("plan").serve.can_run_while_busy("on")
+    assert not registry.command_for("plan").serve.can_run_while_busy("write a plan")
+    assert not registry.command_for("implement").serve.can_run_while_busy("")
+
+
 def test_protocol_registry_matches_documented_errors_and_events() -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     documented_errors = _documented_errors(document)

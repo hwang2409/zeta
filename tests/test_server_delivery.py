@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event as _event
 from tests.support.server_client import frames_until_event as _frames_until_event
@@ -52,10 +53,6 @@ async def _connect(server: ZetaServer):
     )
 
 
-async def _close(server: ZetaServer, writer: asyncio.StreamWriter) -> None:
-    writer.close()
-    await writer.wait_closed()
-    await server.close()
 
 
 class BlockingBackend:
@@ -109,7 +106,7 @@ async def test_max_turns_emits_terminal_error(tmp_path: Path) -> None:
         assert (await _event(reader, "agent_end"))["event"] == "agent_end"
         assert len(backend.calls) == 1
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -300,7 +297,7 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
         assert server.runtime.opened.store.client_delivery("real-1") is not None
         backend.release.set()
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -347,7 +344,7 @@ async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
         backend.release.set()
         await _event(reader, "agent_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -424,7 +421,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
         ]
         assert texts.count("also this") == 1
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -439,24 +436,26 @@ async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> No
         ),
     )
     reader, writer = await _connect(first_server)
-    await _request(
-        reader,
-        writer,
-        1,
-        "hello",
-        {"protocol_version": "1.1", "features": ["delivery_id"]},
-    )
-    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    session_id = created[-1]["result"]["session"]["session_id"]
-    await _request(
-        reader,
-        writer,
-        3,
-        "send",
-        {"text": "once", "delivery_id": "restart-1"},
-    )
-    await _event(reader, "agent_end")
-    await _close(first_server, writer)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = created[-1]["result"]["session"]["session_id"]
+        await _request(
+            reader,
+            writer,
+            3,
+            "send",
+            {"text": "once", "delivery_id": "restart-1"},
+        )
+        await _event(reader, "agent_end")
+    finally:
+        await close_serve(first_server, writer)
 
     second_backend = FakeBackend([])
     second_server = ZetaServer(provider="codex",
@@ -491,7 +490,7 @@ async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> No
         }
         assert second_backend.calls == []
     finally:
-        await _close(second_server, writer)
+        await close_serve(second_server, writer)
 
 
 @pytest.mark.asyncio
@@ -510,7 +509,7 @@ async def test_delivery_status_unknown_and_feature_gate(tmp_path: Path) -> None:
         )
         assert rejected[-1]["error"]["code"] == -32602
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     server = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-status"))
     reader, writer = await _connect(server)
@@ -545,7 +544,7 @@ async def test_delivery_status_unknown_and_feature_gate(tmp_path: Path) -> None:
         }
         assert invalid[-1]["error"]["code"] == -32602
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -703,7 +702,7 @@ async def test_evicted_delivery_status_and_send_reuse_are_distinct(
         }
         assert backend.calls == 0
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -751,7 +750,7 @@ async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
         }
         assert not server.runtime.loop.has_pending_steering
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -765,10 +764,12 @@ async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None
         "hello",
         {"protocol_version": "1.1", "features": ["delivery_id"]},
     )
-    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    session_id = created[-1]["result"]["session"]["session_id"]
-    _evict_delivery(first.runtime.opened.store, "restart-old")
-    await _close(first, writer)
+    try:
+        created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = created[-1]["result"]["session"]["session_id"]
+        _evict_delivery(first.runtime.opened.store, "restart-old")
+    finally:
+        await close_serve(first, writer)
 
     resumed = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-resumed"))
     reader, writer = await _connect(resumed)
@@ -790,7 +791,7 @@ async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None
             "outcome": "delivered",
         }
     finally:
-        await _close(resumed, writer)
+        await close_serve(resumed, writer)
 
 
 def test_delivery_record_accepts_tagged_user_message_atomically(tmp_path: Path) -> None:
@@ -853,7 +854,7 @@ async def test_session_abort_marks_accepted_steering_dropped(tmp_path: Path) -> 
         assert status[-1]["result"]["status"] == "dropped"
         assert server.runtime.opened.store.client_delivery("drop-me").reason == "abort"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -880,7 +881,7 @@ async def test_clear_steering_marks_delivery_dropped_and_duplicate_rejected(
         backend.release.set()
         await _event(reader, "agent_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -909,7 +910,7 @@ async def test_disconnect_marks_accepted_steering_dropped(tmp_path: Path) -> Non
         assert status[-1]["result"]["status"] == "dropped"
         assert server.runtime.opened.store.client_delivery("drop-me").reason == "disconnect"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -924,7 +925,7 @@ async def test_tool_less_turn_end_marks_late_steering_dropped(tmp_path: Path) ->
         assert status[-1]["result"]["status"] == "dropped"
         assert server.runtime.opened.store.client_delivery("drop-me").reason == "turn_end"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -932,9 +933,11 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
     first = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-1"))
     reader, writer = await _connect(first)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
-    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    session_id = created[-1]["result"]["session"]["session_id"]
-    await _close(first, writer)
+    try:
+        created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = created[-1]["result"]["session"]["session_id"]
+    finally:
+        await close_serve(first, writer)
 
     store = ConversationStore(tmp_path / "sessions", session_id=session_id)
     accepted_message = with_message_origin(
@@ -1002,7 +1005,7 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
             {"type": "text", "text": "resume this exact steer"}
         ]
     finally:
-        await _close(resumed, writer)
+        await close_serve(resumed, writer)
 
 
 @pytest.mark.asyncio
@@ -1031,7 +1034,7 @@ async def test_orphan_steer_is_rejected_without_acceptance(tmp_path: Path) -> No
         assert rejected[-1]["error"]["code"] == -32005
         assert status[-1]["result"]["status"] == "unknown"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 def test_steer_acceptance_keeps_legacy_delivery_shape_without_text(
@@ -1176,13 +1179,13 @@ async def test_all_history_fidelity_rows_open_and_replay_with_origin_main_reader
         ] == [{"type": "text", "text": "steer dropped: abort"}]
 
         await _request(reader, writer, 3, "send", {"text": "stop this turn"})
-        await backend.started.wait()
+        await asyncio.wait_for(backend.started.wait(), 10)
         await _request(reader, writer, 4, "abort")
         await _event(reader, "turn_aborted")
         await _request(reader, writer, 5, "send", {"text": "fail this turn"})
         await _event(reader, "error")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     session_root = tmp_path / "sessions"
     result = await asyncio.to_thread(
@@ -1290,7 +1293,7 @@ async def test_failed_turn_drops_queued_steering_before_next_turn(tmp_path: Path
             for block in message.content
         )
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1334,7 +1337,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             calls += 1
             if calls == 2:
                 entered.set()
-                await release.wait()
+                await asyncio.wait_for(release.wait(), 10)
             return await original(*args, **kwargs)
 
         server.runtime.loop.context_assembler.assemble = blocked_assemble
@@ -1361,7 +1364,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
                 await asyncio.sleep(0.01)
     finally:
         release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     resumed = ZetaServer(provider="codex",
         home=crash_home,
@@ -1390,7 +1393,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             for message in resumed.runtime.opened.store.messages()
         )
     finally:
-        await _close(resumed, writer)
+        await close_serve(resumed, writer)
 class _Store:
     def __init__(self) -> None:
         self.rows: dict[str, SimpleNamespace] = {}
