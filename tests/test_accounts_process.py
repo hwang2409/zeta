@@ -306,76 +306,69 @@ def test_start_with_a_loaded_registry_still_sweeps_an_orphan_directory(
     assert _account_files(tmp_path) == kept
 
 
-_LEGACY_TOKENS = OAuthTokens("legacy-access", "legacy-refresh", 9_999_999_999)
+_OLD = {"access_token": "old-access", "refresh_token": "old-refresh"}
+_NEW = {"access_token": "new-access", "refresh_token": "new-refresh"}
+# expiries stay in the future, so no start tries a network token refresh
+_TOKEN_CHOICES = {
+    # name: (legacy file, account file or None, which file migration keeps)
+    "account-missing": (_NEW | {"expires_at": 9.5e9}, None, "legacy"),
+    "legacy-expires-later": (_NEW | {"expires_at": 9.5e9}, _OLD | {"expires_at": 9e9}, "legacy"),
+    "account-expires-later": (_OLD | {"expires_at": 9e9}, _NEW | {"expires_at": 9.5e9}, "account"),
+    "tie": (_NEW | {"expires_at": 9.5e9}, _OLD | {"expires_at": 9.5e9}, "both"),
+    "legacy-expiry-unreadable": (_NEW | {"expires_at": "later"}, _OLD | {"expires_at": 9e9}, "both"),
+    # a missing expires_at reads as 0; on the legacy side, so no start refreshes it
+    "legacy-expiry-missing": (_NEW, _OLD | {"expires_at": 9e9}, "both"),
+    "account-unparseable": (_NEW | {"expires_at": 9.5e9}, "{not json", "both"),
+}
 
 
-def _legacy_and_account_files(
-    home: Path, *, registry: bool, account_file: bool, legacy_newer: bool
-) -> tuple[Path, Path]:
+@pytest.mark.parametrize("registry", [False, True], ids=("registry-missing", "registry-loaded"))
+@pytest.mark.parametrize("legacy_mtime_newer", [False, True], ids=("account-mtime-newer", "legacy-mtime-newer"))
+@pytest.mark.parametrize("choice", list(_TOKEN_CHOICES))
+def test_start_keeps_the_login_that_expires_later_and_never_trusts_mtime(
+    tmp_path: Path, choice: str, legacy_mtime_newer: bool, registry: bool
+) -> None:
+    legacy_value, account_value, kept = _TOKEN_CHOICES[choice]
     account = AccountId("codex", "default")
     store = build_account_home(
-        home,
-        (account,),
-        available=(account,) if account_file else (),
-        defaults=(account,),
+        tmp_path, (account,), available=(account,) if account_value else (), defaults=(account,)
     )
+    registry_bytes = store.registry.read_bytes()
     if not registry:
         store.registry.unlink()
-    legacy = home / "codex-oauth.json"
-    legacy.write_text(json.dumps(_LEGACY_TOKENS.to_dict()))
     destination = store.credential_path(account)
+    legacy = tmp_path / "codex-oauth.json"
+    legacy.write_text(json.dumps(legacy_value))
+    if isinstance(account_value, dict):
+        destination.write_text(json.dumps(account_value))
+    elif account_value is not None:
+        destination.write_text(account_value)
     base = 1_700_000_000_000_000_000
-    legacy_mtime, account_mtime = (base + 10**9, base) if legacy_newer else (base, base + 10**9)
-    os.utime(legacy, ns=(legacy_mtime, legacy_mtime))
-    if account_file:
-        os.utime(destination, ns=(account_mtime, account_mtime))
-    return legacy, destination
-
-
-@pytest.mark.parametrize("legacy_newer", [False, True], ids=("legacy-older", "legacy-newer"))
-def test_start_without_registry_never_replaces_an_existing_account_token(
-    tmp_path: Path, legacy_newer: bool
-) -> None:
-    legacy, destination = _legacy_and_account_files(
-        tmp_path, registry=False, account_file=True, legacy_newer=legacy_newer
-    )
-    kept, legacy_bytes = destination.read_bytes(), legacy.read_bytes()
+    newer, older = base + 10**9, base
+    os.utime(legacy, ns=(newer, newer) if legacy_mtime_newer else (older, older))
+    if account_value is not None:
+        os.utime(destination, ns=(older, older) if legacy_mtime_newer else (newer, newer))
+    account_bytes = destination.read_bytes() if account_value is not None else None
+    legacy_bytes = legacy.read_bytes()
 
     result = _headless_start(tmp_path)
 
-    assert destination.read_bytes() == kept, result.stderr
-    assert legacy.read_bytes() == legacy_bytes
-    warning = "kept accounts/codex/default/oauth.json; legacy codex-oauth.json was not imported"
-    assert result.stderr.count(warning) == 1, result.stderr
-
-
-def test_start_without_registry_imports_legacy_token_into_missing_account_file(
-    tmp_path: Path,
-) -> None:
-    legacy, destination = _legacy_and_account_files(
-        tmp_path, registry=False, account_file=False, legacy_newer=True
+    warning = (
+        f"kept {destination} and {legacy}: could not tell which login is newer; "
+        "delete the one you do not want, then restart zeta"
     )
-
-    result = _headless_start(tmp_path)
-
-    assert json.loads(destination.read_text()) == _LEGACY_TOKENS.to_dict(), result.stderr
-    assert not legacy.exists()
-    assert AccountStore(tmp_path).default("codex") == AccountId("codex", "default")
-
-
-@pytest.mark.parametrize("legacy_newer", [False, True], ids=("legacy-older", "legacy-newer"))
-def test_start_with_registry_keeps_the_newer_of_legacy_and_account_token(
-    tmp_path: Path, legacy_newer: bool
-) -> None:
-    legacy, destination = _legacy_and_account_files(
-        tmp_path, registry=True, account_file=True, legacy_newer=legacy_newer
-    )
-    kept = destination.read_bytes()
-
-    result = _headless_start(tmp_path)
-
-    if legacy_newer:
-        assert json.loads(destination.read_text()) == _LEGACY_TOKENS.to_dict(), result.stderr
+    if kept == "legacy":
+        imported = OAuthTokens.from_mapping(legacy_value, error_type=RuntimeError)
+        assert json.loads(destination.read_text()) == imported.to_dict(), result.stderr
     else:
-        assert destination.read_bytes() == kept, result.stderr
-    assert not legacy.exists()
+        assert destination.read_bytes() == account_bytes, result.stderr
+    assert legacy.exists() is (kept == "both"), result.stderr
+    assert result.stderr.count(warning) == (kept == "both"), result.stderr
+    if kept == "both":
+        assert legacy.read_bytes() == legacy_bytes
+        if registry:
+            assert store.registry.read_bytes() == registry_bytes
+        else:
+            assert not store.registry.exists()
+    else:
+        assert AccountStore(tmp_path).default("codex") == account

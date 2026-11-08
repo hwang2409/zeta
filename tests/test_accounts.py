@@ -958,7 +958,7 @@ def test_migration_is_noop_when_already_migrated(tmp_path: Path) -> None:
     )
 
 
-def test_migration_does_not_delete_legacy_file_newer_than_migrated_copy(
+def test_migration_does_not_lose_a_legacy_login_that_expires_later_than_migrated_copy(
     tmp_path: Path,
 ) -> None:
     _write_legacy(tmp_path, "codex")
@@ -969,8 +969,9 @@ def test_migration_does_not_delete_legacy_file_newer_than_migrated_copy(
     newer = OAuthTokens("newer-access", "newer-refresh", 10_000_000_000.0)
     legacy = tmp_path / "codex-oauth.json"
     legacy.write_text(json.dumps(newer.to_dict()))
-    newer_mtime = destination_mtime + 1_000_000_000
-    os.utime(legacy, ns=(newer_mtime, newer_mtime))
+    # a restored copy: the newer login carries the older mtime
+    older_mtime = destination_mtime - 1_000_000_000
+    os.utime(legacy, ns=(older_mtime, older_mtime))
 
     store.migrate()
 
