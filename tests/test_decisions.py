@@ -219,7 +219,7 @@ async def test_resolve_attention_event_refreshes_rendered_count_immediately(
     refreshed = asyncio.Event()
     try:
         await app._decisions_tick()
-        assert "1 decision" in _rendered_decisions_status(app)
+        assert "1 attention item" in _rendered_decisions_status(app)
         app._invalidate_prompt = lambda: (
             refreshed.set() if "● " not in _rendered_decisions_status(app) else None
         )
@@ -273,7 +273,7 @@ async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
 
     try:
         await app._decisions_tick()
-        assert "1 decision" in _rendered_decisions_status(app)
+        assert "1 attention item" in _rendered_decisions_status(app)
         app._invalidate_prompt = lambda: (
             recovered.set() if "● " not in _rendered_decisions_status(app) else None
         )
@@ -382,7 +382,7 @@ async def test_child_resolution_event_refreshes_rendered_count(
     refreshed = asyncio.Event()
     try:
         await app._decisions_tick()
-        assert "1 decision" in _rendered_decisions_status(app)
+        assert "1 attention item" in _rendered_decisions_status(app)
         app._invalidate_prompt = lambda: (
             refreshed.set() if "● " not in _rendered_decisions_status(app) else None
         )
@@ -450,7 +450,7 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
 
     try:
         await app._decisions_tick()
-        assert "1 decision" in _rendered_decisions_status(app)
+        assert "1 attention item" in _rendered_decisions_status(app)
         session = app._make_session()
         app._active_session = session
         app._install_full_screen_layout(session)
@@ -470,13 +470,13 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
 
         rendered = _rendered_decisions_status(app)
         assert calls == 1
-        assert "decisions unavailable: TimeoutError" in rendered and "1 decision" not in rendered
+        assert "decisions unavailable: TimeoutError" in rendered and "1 attention item" not in rendered
 
         recovered.clear()
         release.set()
         await await_or_fail(recovered.wait(), what="late decision scan recovery")
         assert calls == 1
-        assert "1 decision" in _rendered_decisions_status(app)
+        assert "1 attention item" in _rendered_decisions_status(app)
     finally:
         release.set()
         await _stop_decisions(app)
