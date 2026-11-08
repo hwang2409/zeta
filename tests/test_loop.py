@@ -171,21 +171,15 @@ def test_finish_gate_message_bounds_long_details_by_utf8_bytes(detail: str) -> N
 
 
 def test_finish_gate_message_bounds_deep_generated_handles() -> None:
-    children = tuple(
-        (
-            "root:"
-            + ":".join(
-                f"child-{depth:08x}-0000-0000-0000-000000000000"
-                for depth in range(100)
-            ),
-            "worker",
-        )
-        for _ in range(20)
+    handle = "root:" + ":".join(
+        f"child-{depth:08x}-0000-0000-0000-000000000000" for depth in range(100)
     )
+    children = tuple((handle, "worker") for _ in range(20))
 
     text = finish_gate_message(children, ()).content[0].text
 
     assert len(text.encode()) < 5_000
+    assert handle in text
 
 
 @pytest.mark.parametrize(
@@ -220,6 +214,23 @@ def test_finish_gate_message_detail_budget_table(
     assert len(text.encode()) < 5_000
     assert expected in text
     assert text == finish_gate_message(children, tasks).content[0].text
+
+
+def test_finish_gate_message_exact_entry_boundary() -> None:
+    def message_for(handle: str) -> str:
+        return finish_gate_message(((handle, "worker"),), ()).content[0].text
+
+    fitting = "root:"
+    while fitting in message_for(fitting):
+        fitting += "x"
+    too_large = fitting
+    fitting = fitting[:-1]
+
+    assert len(message_for(fitting).encode()) < 5_000
+    assert fitting in message_for(fitting)
+    assert len(message_for(too_large).encode()) < 5_000
+    assert too_large not in message_for(too_large)
+    assert "1 more sub-agents omitted; use agent_status" in message_for(too_large)
 
 
 def _harness_notice_conversation() -> list[Message]:

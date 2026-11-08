@@ -55,20 +55,34 @@ def _format_finish_gate_details(
     )
     for _ in range(limit):
         group_index = next(
-            (index for index, (items, *_rest) in enumerate(groups) if selected[index] < min(_FINISH_GATE_DETAIL_CAP, len(items))),
+            (
+                index
+                for index, (items, *_rest) in enumerate(groups)
+                if selected[index] < min(_FINISH_GATE_DETAIL_CAP, len(items))
+            ),
             None,
         )
         if group_index is None:
             break
         selected[group_index] += 1
         candidate = _render_finish_gate_details(groups, selected)
-        if len(_finish_gate_text(candidate, stop_choices).encode()) >= _FINISH_GATE_MESSAGE_BYTES:
+        candidate_text = _finish_gate_text(candidate, stop_choices)
+        if (
+            len(
+                harness_notice("finish gate", candidate_text, event="agent_finish_gate")
+                .content[0]
+                .text.encode()
+            )
+            >= _FINISH_GATE_MESSAGE_BYTES
+        ):
             selected[group_index] -= 1
             break
     return _render_finish_gate_details(groups, selected)
 
 
-def _render_finish_gate_details(groups: list[tuple[tuple[tuple[str, str], ...], str, str, str]], selected: list[int]) -> list[str]:
+def _render_finish_gate_details(
+    groups: list[tuple[tuple[tuple[str, str], ...], str, str, str]], selected: list[int]
+) -> list[str]:
     running = []
     for (items, label, omitted_label, guidance), count in zip(groups, selected):
         if not items:
