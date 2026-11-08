@@ -85,6 +85,7 @@ def _styles(panel: BackgroundTasksPanel) -> list[tuple[str, str]]:
         pytest.param("ab", 2, ["ab"], id="exact-width"),
         pytest.param("abcdefgh", 3, ["abc", "def", "gh"], id="long-token"),
         pytest.param("ab界cd", 4, ["ab界", "cd"], id="wide-cjk-boundary"),
+        pytest.param("你", 1, ["你", ""], id="cjk-wider-than-width"),
         pytest.param("ab🙂cd", 4, ["ab🙂", "cd"], id="emoji-boundary"),
         pytest.param("alpha   ", 5, ["alpha"], id="trailing-spaces"),
         pytest.param("a/b", 1, ["a", "/", "b"], id="width-one"),
@@ -101,6 +102,27 @@ def test_wrap_by_cells_prefers_boundaries_without_splitting_cells(
     text: str, width: int, expected: list[str]
 ) -> None:
     assert wrap_by_cells(text, width) == expected
+
+
+def test_tasks_panel_normalizes_whitespace_only_command() -> None:
+    panel = BackgroundTasksPanel()
+    panel.set_tasks([_info("task-empty", command="   ")], now=1.0)
+    assert panel.open_details() is not None
+    assert _text(panel) == [
+        "Shell details",
+        "\x00overlay-rule\x00",
+        "Status  running",
+        "Runtime 1s",
+        "PID     100",
+        "",
+        "Command",
+        "  ",
+        "",
+        "Output  showing 0 of 0 lines",
+        "  (no output yet)",
+        "",
+        "↑/↓ scroll · esc back",
+    ]
 
 
 def test_format_runtime_is_compact() -> None:
