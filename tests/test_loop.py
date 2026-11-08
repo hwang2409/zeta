@@ -131,6 +131,37 @@ def test_harness_guidance_has_non_user_authorship(notice: Message) -> None:
     assert "user asked" not in notice.content[0].text.casefold()
 
 
+def test_finish_gate_message_caps_details_and_reports_omissions() -> None:
+    children = tuple((f"root:{i}", f"child-{i}") for i in range(25))
+    tasks = tuple((f"task-{i}", f"task-{i}") for i in range(24))
+
+    message = finish_gate_message(children, tasks)
+    text = message.content[0].text
+
+    assert "25 background sub-agents still running" in text
+    assert "24 background tasks still running" in text
+    assert "root:19: child-19" in text
+    assert "root:20: child-20" not in text
+    assert "task-19: task-19" in text
+    assert "task-20: task-20" not in text
+    assert "5 more sub-agents omitted; use agent_status" in text
+    assert "4 more tasks omitted; use task_list" in text
+    assert "cancel sub-agents with agent_cancel" in text
+    assert "stop tasks with task_kill" in text
+    assert "hand off with agent_handoff" in text
+
+    assert text == finish_gate_message(children, tasks).content[0].text
+
+
+def test_finish_gate_message_has_bounded_detail_bytes() -> None:
+    children = tuple((f"root:{i}", "child") for i in range(1_000))
+    tasks = tuple((f"task-{i}", "task") for i in range(1_000))
+
+    text = finish_gate_message(children, tasks).content[0].text
+
+    assert len(text.encode()) < 5_000
+
+
 def _harness_notice_conversation() -> list[Message]:
     call = ToolCall("call-1", "read", {"path": "README.md"})
     return [

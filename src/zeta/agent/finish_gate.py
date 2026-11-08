@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 FinishGateOutcome = Literal["completed", "handed_off", "task_safety_expired"]
 POST_CAP_CAUSAL_TURNS = 3
+_FINISH_GATE_DETAIL_CAP = 20
 ConsumeEvents = Callable[
     [AsyncIterator[StreamEvent], "FinishGateControl | None"], Awaitable[None]
 ]
@@ -30,14 +31,30 @@ def finish_gate_message(
     running: list[str] = []
     if children:
         child_list = ", ".join(
-            f"{handle}: {description}" for handle, description in children
+            f"{handle}: {description}"
+            for handle, description in children[:_FINISH_GATE_DETAIL_CAP]
+        )
+        omitted = len(children) - _FINISH_GATE_DETAIL_CAP
+        child_details = (
+            f"{child_list}; {omitted} more sub-agents omitted; use agent_status"
+            if omitted > 0
+            else child_list
         )
         running.append(
-            f"{len(children)} background sub-agents still running: {child_list}"
+            f"{len(children)} background sub-agents still running: {child_details}"
         )
     if tasks:
-        task_list = ", ".join(f"{task_id}: {headline}" for task_id, headline in tasks)
-        running.append(f"{len(tasks)} background tasks still running: {task_list}")
+        task_list = ", ".join(
+            f"{task_id}: {headline}"
+            for task_id, headline in tasks[:_FINISH_GATE_DETAIL_CAP]
+        )
+        omitted = len(tasks) - _FINISH_GATE_DETAIL_CAP
+        task_details = (
+            f"{task_list}; {omitted} more tasks omitted; use task_list"
+            if omitted > 0
+            else task_list
+        )
+        running.append(f"{len(tasks)} background tasks still running: {task_details}")
     stop_choices = []
     if children:
         stop_choices.append("cancel sub-agents with agent_cancel")
