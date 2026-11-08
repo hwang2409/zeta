@@ -156,9 +156,9 @@ def publish_local_project(
     _validate_snapshot(snapshot, project_id)
     side_file_payloads = validated_side_file_payloads(snapshot)
     projects = home / "projects"
+    registry = ProjectRegistry(projects)
     projects.mkdir(parents=True, exist_ok=True, mode=0o700)
     project = projects / project_id
-    registry = ProjectRegistry(projects)
     authority = (
         registry._identity_write()
         if expected_digest == _MISSING
@@ -256,6 +256,7 @@ def atomic_publish_file(
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
+        temporary.chmod(0o600)
         os.replace(temporary, directory / name)
         if sync_directory:
             _fsync_directory(directory)

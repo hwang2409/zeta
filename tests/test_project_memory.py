@@ -1971,6 +1971,7 @@ def test_pending_index_fsyncs_root_dir_before_record_session(
         events.append("update_sessions")
         return real_update(*args, **kwargs)
 
+    # test-contract: seam observe one registry rewrite for the child batch
     monkeypatch.setattr(registry, "_update_sessions_locked", spy_update)
 
     child_id = f"{root_id}:1"

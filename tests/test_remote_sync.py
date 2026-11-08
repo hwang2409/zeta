@@ -751,9 +751,9 @@ def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
         real_atomic_write(payload, destination)
 
     def acquire_fetch_lock(file: object, operation: int) -> object:
-        if threading.current_thread() is main_thread and operation & fcntl.LOCK_EX:
+        if threading.current_thread() is main_thread and operation & fcntl.LOCK_NB:
             try:
-                return real_flock(file, operation | fcntl.LOCK_NB)
+                return real_flock(file, operation)
             except BlockingIOError:
                 release_sync_copy.set()
         return real_flock(file, operation)
@@ -822,6 +822,9 @@ def test_oversized_side_file_is_rejected_before_target_lock(
     conflict.parent.mkdir(exist_ok=True)
     conflict.write_bytes(b"x" * (MAX_MEMORY_FILE_SIZE + 1))
     original = list(project_path.rglob("*"))
+    expected_export = memory_module._materialize_memory_export(
+        project_path, project.project_id
+    )
 
     @contextmanager
     def target_lock(
@@ -841,9 +844,7 @@ def test_oversized_side_file_is_rejected_before_target_lock(
         memory_module._publish_memory_snapshot(
             project_path,
             publication,
-            expected_export=memory_module._materialize_memory_export(
-                project_path, project.project_id
-            ),
+            expected_export=expected_export,
             provenance={"source": "test"},
         )
 
@@ -1869,7 +1870,7 @@ def test_ssh_pull_rejects_semantically_invalid_initial_format_two_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     snapshot, project_id = _format_two_project_snapshot(tmp_path, invalid=True)
-    remote = tmp_path / "remote"
+    remote = initialize_storage_home(tmp_path / "remote")
     projects = remote / "projects"
     projects.mkdir(parents=True)
     snapshot.rename(projects / project_id)

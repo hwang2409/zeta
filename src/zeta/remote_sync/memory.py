@@ -390,26 +390,25 @@ def fetch_local_project(
     project = home / "projects" / project_id
     registry = project_registry(home / "projects")
 
-    def snapshot(_project_fd: int) -> str:
-        if not project.is_dir():
-            return _MISSING
-        for name in MEMORY_FILES:
-            path = project / "memory" / name
-            if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
-                raise RemoteSyncError(f"memory file {name} is too large")
-        digest = project_digest(project)
-        copy_project_snapshot(project, destination)
-        return digest
-
     try:
-        with registry._project_lock(
-            project_id, "memory", exclusive=False
-        ) as project_fd:
-            return snapshot(project_fd)
+        with registry._project_lock(project_id, "memory", exclusive=False):
+            if not project.is_dir():
+                return _MISSING
+            for name in MEMORY_FILES:
+                path = project / "memory" / name
+                if (
+                    path.is_file()
+                    and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE
+                ):
+                    raise RemoteSyncError(f"memory file {name} is too large")
+            pinned = _pin_project_snapshot(project)
     except ProjectRegistryError as exc:
         if isinstance(exc.__cause__, FileNotFoundError):
             return _MISSING
         raise RemoteSyncError(f"project registry busy on {peer}; retry") from exc
+
+    _copy_pinned_project_snapshot(pinned, destination)
+    return project_digest(destination)
 
 
 def publish_local_project(
@@ -429,6 +428,69 @@ def publish_local_project(
             )
     except ProjectPublicationError as exc:
         raise RemoteSyncError(str(exc)) from exc
+
+
+def _pin_project_snapshot(source: Path) -> list[tuple[Path, int]]:
+    try:
+        payload = synchronized_payload_paths(source)
+    except ProjectPublicationError as exc:
+        raise RemoteSyncError(str(exc)) from exc
+    if source / "project.json" not in payload:
+        raise RemoteSyncError("project record is missing or unsafe")
+    pinned: list[tuple[Path, int]] = []
+    try:
+        for path in payload:
+            relative = path.relative_to(source)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                os.close(fd)
+                raise RemoteSyncError("project snapshot file is unsafe")
+            if (
+                relative.parent == Path("memory")
+                and relative.name in MEMORY_FILES
+                and info.st_size > MAX_MEMORY_MIRROR_FILE_SIZE
+            ):
+                os.close(fd)
+                raise RemoteSyncError(f"memory file {relative.name} is too large")
+            pinned.append((relative, fd))
+        return pinned
+    except BaseException:
+        for _relative, fd in pinned:
+            os.close(fd)
+        raise
+
+
+def _copy_pinned_project_snapshot(
+    pinned: list[tuple[Path, int]], destination: Path
+) -> None:
+    try:
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directories = {
+            parent
+            for relative, _fd in pinned
+            for parent in relative.parents
+            if parent != Path(".")
+        }
+        for relative in sorted(
+            directories, key=lambda item: (len(item.parts), item.parts)
+        ):
+            directory = destination / relative
+            directory.mkdir(mode=0o700)
+            directory.chmod(0o700)
+        memory = destination / "memory"
+        memory.mkdir(mode=0o700, exist_ok=True)
+        memory.chmod(0o700)
+        for relative, fd in pinned:
+            target = destination / relative
+            with os.fdopen(os.dup(fd), "rb") as source, target.open("xb") as output:
+                shutil.copyfileobj(source, output)
+            target.chmod(0o600)
+    finally:
+        for _relative, fd in pinned:
+            os.close(fd)
 
 
 def copy_project_snapshot(source: Path, destination: Path) -> None:

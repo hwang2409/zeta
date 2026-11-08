@@ -381,9 +381,7 @@ def _project_install_script() -> str:
     publisher_filename = project_publish.__file__
     if None in {schema_filename, migration_filename, publisher_filename}:
         raise RemoteSyncError("project publication module source is unavailable")
-    schema_source = Path(schema_filename).read_text(encoding="utf-8").replace(
-        "from __future__ import annotations\n\n", "", 1
-    )
+    schema_source = Path(schema_filename).read_text(encoding="utf-8")
     accepted = {
         "entry_memory_snapshot_reference": sorted(
             ACCEPTED_KEY_SETS["entry_memory_snapshot_reference"]
@@ -425,9 +423,9 @@ def _project_install_script() -> str:
     for dependency in dependencies:
         publisher_source = publisher_source.replace(dependency, "", 1)
     return (
-        "from __future__ import annotations\n\n"
+        schema_source
+        + "\n"
         + _PROJECT_AUTHORITY
-        + schema_source
         + "\nproject_schema = sys.modules[__name__]\n"
         + migration_source
         + publisher_source
