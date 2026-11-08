@@ -5477,6 +5477,7 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
         assert (await rpc("session_settings"))["result"] == {
             "model": "gpt-5.6-luna",
             "approval_mode": "ask",
+            "plan_mode": False,
         }
         for model, mode in (("invalid", "ask"), ("gpt-5.6-luna", "invalid")):
             assert (await rpc("set_settings", model=model, approval_mode=mode))[
@@ -5484,6 +5485,35 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
             ]["code"] == -32602
         settings = {"model": "gpt-5.6-sol", "approval_mode": "deny"}
         assert (await rpc("set_settings", **settings))["result"] == settings
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-on",
+                "slash_run",
+                {"session_id": sid, "text": "/plan on"},
+            )
+        )[-1]["result"]["kind"] == "output"
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is True
+        await _request(reader, writer, "new-plan", "new_session", {"provider": "codex"})
+        await _request(reader, writer, "resume-plan", "resume", {"session_id": sid})
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is True
+        assert (
+            await _request(
+                reader,
+                writer,
+                "implement",
+                "slash_run",
+                {"session_id": sid, "text": "/implement"},
+            )
+        )[-1]["result"]["kind"] == "model_input"
+        await _request(
+            reader, writer, "new-implement", "new_session", {"provider": "codex"}
+        )
+        await _request(
+            reader, writer, "resume-implement", "resume", {"session_id": sid}
+        )
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is False
         assert server.runtime.metadata.model_fallback == (
             "codex",
             "gpt-5.6-luna",
@@ -5495,7 +5525,10 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
         assert (await rpc("set_settings", **settings))["error"]["code"] == -32003
         assert server.runtime.policy.default.value == "ask"
         await _request(reader, writer, "resume", "resume", {"session_id": sid})
-        assert (await rpc("session_settings"))["result"] == settings
+        assert (await rpc("session_settings"))["result"] == {
+            **settings,
+            "plan_mode": False,
+        }
         assert not (tmp_path / "settings.json").exists()
     finally:
         await close_serve(server, writer)
@@ -8149,6 +8182,8 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "init",
             "review",
             "greet",
+            "plan",
+            "implement",
         } <= set(runnable_by_name)
         assert {
             "always",
@@ -8158,7 +8193,6 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "keys",
             "local",
             "permissions",
-            "plan",
             "restart",
             "shell",
             "theme",
@@ -8174,6 +8208,86 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         )
         assert runnable_by_name["review"]["source"] == "project"
         assert runnable_by_name["greet"]["kind"] == "skill"
+
+        plan_mode = (
+            await _request(
+                reader, writer, "plan-settings", "session_settings", {"session_id": sid}
+            )
+        )[-1]["result"]
+        assert plan_mode["plan_mode"] is False
+        bare = (
+            await _request(
+                reader,
+                writer,
+                "plan-bare",
+                "slash_run",
+                {"session_id": sid, "text": "/plan"},
+            )
+        )[-1]["result"]
+        assert bare == {
+            "kind": "output",
+            "text": "plan mode: on (read-only tools; deliver the plan as your answer)",
+        }
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-bare-settings",
+                "session_settings",
+                {"session_id": sid},
+            )
+        )[-1]["result"]["plan_mode"] is True
+        await _request(
+            reader,
+            writer,
+            "plan-off",
+            "slash_run",
+            {"session_id": sid, "text": "/plan off"},
+        )
+        enabled = (
+            await _request(
+                reader,
+                writer,
+                "plan-on",
+                "slash_run",
+                {"session_id": sid, "text": "/plan on"},
+            )
+        )[-1]["result"]
+        assert enabled == {
+            "kind": "output",
+            "text": "plan mode: on (read-only tools; deliver the plan as your answer)",
+        }
+        prompt = (
+            await _request(
+                reader,
+                writer,
+                "plan-prompt",
+                "slash_run",
+                {"session_id": sid, "text": "/plan write a plan"},
+            )
+        )[-1]["result"]
+        assert prompt["kind"] == "model_input"
+        assert prompt["text"] == "write a plan"
+        implemented = (
+            await _request(
+                reader,
+                writer,
+                "implement",
+                "slash_run",
+                {"session_id": sid, "text": "/implement"},
+            )
+        )[-1]["result"]
+        assert implemented["kind"] == "model_input"
+        assert implemented["text"] == "implement the plan you proposed above"
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-settings-2",
+                "session_settings",
+                {"session_id": sid},
+            )
+        )[-1]["result"]["plan_mode"] is False
 
         documented_kinds = set(
             re.findall(
@@ -8305,6 +8419,43 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             )
         )[-1]["error"]
         assert wrong_session["code"] == -32003
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_plan_prompt_returns_opaque_input_id(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path / "home", port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        hello = (
+            await _request(
+                reader,
+                writer,
+                "hello",
+                "hello",
+                {"protocol_version": "1.1", "features": ["model_input_ids"]},
+            )
+        )[-1]["result"]
+        assert "model_input_ids" in hello["capabilities"]["features"]
+        sid = (
+            await _request(reader, writer, "new", "new_session", {"provider": "codex"})
+        )[-1]["result"]["session"]["session_id"]
+        await _request(
+            reader, writer, "on", "slash_run", {"session_id": sid, "text": "/plan on"}
+        )
+        result = (
+            await _request(
+                reader,
+                writer,
+                "prompt",
+                "slash_run",
+                {"session_id": sid, "text": "/plan write a plan"},
+            )
+        )[-1]["result"]
+        assert result["kind"] == "model_input"
+        assert result["input_id"]
+        assert "text" not in result
     finally:
         await close_serve(server, writer)
 
@@ -9530,6 +9681,21 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
             for line in fixture.read_text().splitlines()
             if line and not line.startswith("#")
         ]
+        # These rows are explicit because the base fixture was captured before
+        # /plan was a serve command and must never be captured from the head.
+        rows.extend(
+            [
+                {"text": "/plan", "error_code": -32004},
+                {"text": "/plan on", "error_code": -32004},
+                {"text": "/plan write a plan", "error_code": -32004},
+                {"text": "/implement", "error_code": -32004},
+            ]
+        )
+        before = (
+            await _request(
+                reader, writer, "before-plan", "session_settings", {"session_id": sid}
+            )
+        )[-1]["result"]["plan_mode"]
         for request_id, row in enumerate(rows, start=4):
             text = row["text"]
             response = await _request(
@@ -9540,6 +9706,17 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
                 {"session_id": sid, "text": text},
             )
             message = response[-1]
+            if text == "/plan":
+                after = (
+                    await _request(
+                        reader,
+                        writer,
+                        "after-plan",
+                        "session_settings",
+                        {"session_id": sid},
+                    )
+                )[-1]["result"]["plan_mode"]
+                assert after is before
             if "result" in row:
                 assert "result" in message and "error" not in message, message
                 assert message["result"] == row["result"]

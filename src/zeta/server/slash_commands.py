@@ -18,6 +18,7 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
@@ -157,6 +158,43 @@ class ServerSlashSession:
             f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
             for item in items
         )
+
+    @property
+    def plan_mode(self) -> bool:
+        return self._runtime.loop.plan_mode if self._runtime.loop is not None else False
+
+    @property
+    def active(self) -> bool:
+        return False
+
+    @property
+    def pending_approvals(self) -> tuple[str, ...]:
+        if self._approval_control is None:
+            return ()
+        return self._approval_control.pending_approval_labels()
+
+    def set_plan_mode(self, enabled: bool):
+        if self._runtime.loop is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        return self._runtime.loop.set_plan_mode(enabled)
+
+    def invalidate_prompt(self) -> None:
+        return None
+
+    def plan_mode_background_blocker(self) -> str | None:
+        work = tuple(getattr(self._runtime.loop, "background_work_descriptions", ()))
+        if not work:
+            return None
+        return (
+            "plan mode unchanged: background work is active: "
+            f"{', '.join(work)}; stop it or wait"
+        )
+
+    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
+        return await run_plan_command(self, args)
+
+    async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
+        return await run_implement_command(self, args)
 
     def slash_status_command(self, args: str) -> str | Awaitable[str]:
         del args
