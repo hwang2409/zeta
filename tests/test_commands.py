@@ -2206,16 +2206,15 @@ async def test_background_macro_start_preflight_failure_closes_created_log(
 async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    log_opened = asyncio.Event()
-    real_open_log = bash_module.open_log_off_loop
+    spawn_entered = asyncio.Event()
+    real_spawn_background = bash_module.spawn_background
 
-    async def open_log(opener: Any) -> Any:
-        handle = await real_open_log(opener)
-        log_opened.set()
-        return handle
+    async def spawn_background(*args: Any, **kwargs: Any) -> Any:
+        spawn_entered.set()
+        return await real_spawn_background(*args, **kwargs)
 
-    # test-contract: seam abort only after the macro owns its process log
-    monkeypatch.setattr(bash_module, "open_log_off_loop", open_log)
+    # test-contract: seam macro owns its log before entering process spawn
+    monkeypatch.setattr(bash_module, "spawn_background", spawn_background)
     home = tmp_path / "home"
     _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30\n")
     output = StringIO()
@@ -2237,7 +2236,8 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
         # test-contract: seam no public event reports active provider-turn completion.
         task = app._active_task
         assert task is not None
-        await await_or_fail(log_opened.wait(), what="macro log ownership")
+        await await_or_fail(spawn_entered.wait(), what="macro process spawn entry")
+        assert spawn_entered.is_set(), "macro process spawn seam was not reached"
         app.abort_active()
         await asyncio.wait_for(task, timeout=10)
 
