@@ -234,7 +234,7 @@ class AgentNotificationMixin:
         finally:
             try:
                 await stream.aclose()
-            except BaseException:  # noqa: BLE001 - preserve turn cleanup
+            except BaseException:  # noqa: BLE001, S110 - preserve turn cleanup
                 pass
             self._turn_active = False
             self._delivering_prompt_id = None
