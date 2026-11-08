@@ -288,7 +288,7 @@ class ZetaServer:
     async def close(self) -> None:
         try:
             if self._client is not None:
-                await self._client.close()
+                await self._client.close(graceful=True)
         finally:
             self._client = None
             self._client_active = False
@@ -359,6 +359,9 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._local_close = False
+        self._controller_release: asyncio.Task[None] | None = None
+        self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
@@ -366,10 +369,13 @@ class _Client:
         )
 
     async def run(self) -> None:
+        graceful = True
         try:
             while True:
                 line = await self._read_frame()
                 if not line:
+                    self._release_dead_connection()
+                    graceful = False
                     break
                 await self.connections.wait_until_settled(self)
                 try:
@@ -399,6 +405,8 @@ class _Client:
                             exc.data,
                         )
                     )
+                    if not self.handshaken:
+                        self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     descriptor, message, data = project_request_error(exc)
                     await self._write(
@@ -452,7 +460,7 @@ class _Client:
                 if not self.handshaken:
                     break
         finally:
-            await self.close()
+            await self.close(graceful=graceful and not self._transport_failed)
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -492,19 +500,37 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
-    async def close(self) -> None:
+    def _begin_controller_release(self) -> asyncio.Task[None] | None:
+        if self._controller_release is not None:
+            return self._controller_release
+        if self.role == "controller" and self.connections.is_controller(self):
+            self._controller_release = self.server.control.begin_controller_release(
+                reconnect="approval_reconnect" in self.features
+            )
+        return self._controller_release
+
+    def _release_dead_connection(self) -> None:
+        if self._local_close:
+            return
+        self._begin_controller_release()
+        self.connections.release(self)
+
+    async def close(self, *, graceful: bool = False) -> None:
         async with self._close_lock:
             if self._closed:
                 return
-            if self.role == "controller" and self.connections.is_controller(self):
-                await self.server.control.controller_released(
-                    reconnect="approval_reconnect" in self.features
-                )
+            release = self._begin_controller_release()
+            if release is not None:
+                await asyncio.shield(release)
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
+            if graceful:
+                await self.connections.flush(self)
+            self._local_close = True
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
+            self.connections.release(self)
             self._closed = True
 
     async def _route_request(
@@ -513,13 +539,20 @@ class _Client:
         if method == "hello":
             result = self._hello(params)
             if self.role == "controller":
-                self.server._client_active = True
-                self.server._client = self
                 reconnect = "approval_reconnect" in self.features
-                await self.server.control.controller_claimed(
+                claimed = await self.server.control.controller_claimed(
                     reconnect=reconnect,
                     require_host_binding="session_host_commands" in self.features,
                 )
+                if not claimed:
+                    self.handshaken = False
+                    raise ProtocolError(
+                        ErrorDescriptor.CONNECTION_CAPACITY,
+                        "another client is already connected",
+                    )
+                self.server._client_active = True
+                self.server._client = self
+                self.connections.activate_controller(self)
                 if not reconnect:
                     await self.server.control.controller_ready()
             return True, result
@@ -908,16 +941,23 @@ class _Client:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self
             )
-        await self.server.control.require_idle()
         if method == "slash_run":
+            text = _required_string(params, "text")
+            if (
+                self.server.control.turn_busy()
+                and not await slash_commands.can_run_while_busy(runtime, text)
+            ):
+                await self.server.control.require_idle()
             register = self.server.control.model_input_registrar(self.features)
             return await slash_commands.run_command(
                 runtime,
-                _required_string(params, "text"),
+                text,
                 register_model_input=register,
                 approval_control=self.server.control,
                 run_blocking=self.server.control._run_blocking,
+                busy=self.server.control.turn_busy(),
             )
+        await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if method == "set_settings":
             model = _required_string(params, "model")
@@ -1098,7 +1138,10 @@ class _Client:
         }, page_ids
 
     async def _write(self, payload: _Frame) -> bool:
-        return await self.connections.send(self, payload)
+        written = await self.connections.send(self, payload)
+        if not written:
+            self._transport_failed = True
+        return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
         async with self._write_lock:

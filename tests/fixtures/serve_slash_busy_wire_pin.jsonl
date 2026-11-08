@@ -1,0 +1,15 @@
+# busy slash_run rows: result/error payloads only; rpc ids and session ids are transport-local
+{"text":"/approve","result":{"kind":"client_only","name":"approve"}}
+{"text":"/status","result_kind":"output"}
+{"text":"/help","result_kind":"output"}
+{"text":"/mcp status","error_code":-32004}
+{"text":"/mcp add example http://example.com","error_code":-32004}
+{"text":"/mcp auth example","error_code":-32004}
+{"text":"/mcp resources example uri","error_code":-32004}
+{"text":"/vim on","error_code":-32004}
+{"text":"/project init","error_code":-32004}
+{"text":"/project","result_kind":"output"}
+{"text":"/memory undo","error_code":-32004}
+{"text":"/memory","result_kind":"output"}
+{"text":"/compact","error_code":-32004}
+{"text":"/init","error_code":-32004}
