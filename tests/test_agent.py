@@ -1443,6 +1443,143 @@ class NestedBackgroundBackend(CompletionBackend):
         )
 
 
+class IdleParentRoutingBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls = {"root": 0, "lead": 0, "worker": 0}
+        self.release_worker_question = asyncio.Event()
+        self.lead_follow_up_seen = asyncio.Event()
+        self.lead_question_seen = asyncio.Event()
+        self.lead_completion_seen = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        prompts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        actor = (
+            "worker"
+            if "worker prompt" in prompts
+            else "lead"
+            if "lead prompt" in prompts
+            else "root"
+        )
+        self.calls[actor] += 1
+        call = self.calls[actor]
+        if actor == "root" and call == 1:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "start-lead",
+                        "agent",
+                        {
+                            "prompt": "lead prompt",
+                            "description": "lead",
+                            "agent_type": "run",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif actor == "lead" and call == 1:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "start-worker",
+                        "agent",
+                        {
+                            "prompt": "worker prompt",
+                            "description": "worker",
+                            "agent_type": "run",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif actor == "lead" and call == 2:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "refused-lead-finish",
+                        "finish",
+                        {"status": "done", "summary": "lead complete"},
+                    )
+                )
+            ]
+        elif actor == "worker" and call == 1:
+            await asyncio.wait_for(self.release_worker_question.wait(), 10)
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "ask-lead",
+                        "ask_parent",
+                        {"question": "should i continue?"},
+                    )
+                )
+            ]
+        elif actor == "worker" and call == 2:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "finish-worker",
+                        "finish",
+                        {"status": "done", "summary": "worker complete"},
+                    )
+                )
+            ]
+        else:
+            question = actor == "lead" and any(
+                message.metadata.get("zeta_event") == "agent_notifications"
+                and any(
+                    isinstance(block, TextContent)
+                    and "asks: should i continue?" in block.text
+                    for block in message.content
+                )
+                for message in messages
+            )
+            completion = actor == "lead" and any(
+                message.metadata.get("zeta_event") == "agent_notifications"
+                and any(
+                    isinstance(block, TextContent) and "worker complete" in block.text
+                    for block in message.content
+                )
+                for message in messages
+            )
+            follow_up = actor == "lead" and any(
+                isinstance(block, TextContent) and block.text == "follow up"
+                for message in messages
+                if message.role is MessageRole.USER
+                for block in message.content
+            )
+            if completion:
+                self.lead_completion_seen.set()
+            new_question = question and not self.lead_question_seen.is_set()
+            new_follow_up = follow_up and not self.lead_follow_up_seen.is_set()
+            if new_question:
+                self.lead_question_seen.set()
+            elif new_follow_up:
+                self.lead_follow_up_seen.set()
+            blocks = (
+                [TextContent("WAIT")]
+                if actor == "lead" and (call == 3 or new_question or new_follow_up)
+                else []
+            )
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class ForegroundNestedBackgroundBackend(CompletionBackend):
     def __init__(self, *, background_child: bool = False) -> None:
         self.background_child = background_child
@@ -17183,6 +17320,105 @@ def test_child_idle_then_terminal_receipt_is_appended_and_delivered_once(
         "child_idle",
         "agent_completion",
     ]
+
+
+@pytest.mark.asyncio
+async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = IdleParentRoutingBackend()
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    lead_idle = asyncio.Event()
+    lead_idle_count = 0
+    transition_idle = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        nonlocal lead_idle_count
+        transition_idle(child_store)
+        lifecycle = child_store.agent_lifecycle() or {}
+        handle = lifecycle.get("handle")
+        if isinstance(handle, str) and handle.count(":") == 1:
+            lead_idle_count += 1
+            lead_idle.set()
+
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        max_agent_depth=3,
+    )
+    loop.explicit_finish = True
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(lead_idle.wait(), 10)
+        lead_handle = _run_handle_from_receipt(store)
+        worker_handle = next(
+            handle
+            for handle in loop._background_owner.active_instance_ids
+            if handle.startswith(f"{lead_handle}:")
+        )
+        lead_store = loop._background_owner.parent_store(worker_handle, store)
+        refused_finish = lead_store.tool_result("refused-lead-finish")
+        assert refused_finish is not None and refused_finish.is_error
+        marker = store.agent_children()[lead_handle]
+        assert marker["background"] is True
+        assert marker["accepts_follow_ups"] is True
+        assert lead_handle in loop._background_owner.active_instance_ids
+
+        status = await loop.tool_registry.execute(
+            ToolCall("lead-status", "agent_status", {"handle": lead_handle})
+        )
+        assert status["structuredContent"]["children"][0]["state"] == "idle"
+
+        lead_idle.clear()
+        sent = await loop.tool_registry.execute(
+            ToolCall(
+                "send-follow-up",
+                "agent_send",
+                {"child_instance_id": lead_handle, "message": "follow up"},
+            )
+        )
+        assert sent["isError"] is False, sent
+        await asyncio.wait_for(backend.lead_follow_up_seen.wait(), 10)
+        await asyncio.wait_for(lead_idle.wait(), 10)
+        assert lead_idle_count >= 2
+
+        backend.release_worker_question.set()
+        await asyncio.wait_for(backend.lead_question_seen.wait(), 10)
+        await asyncio.wait_for(backend.lead_completion_seen.wait(), 10)
+        questions = [
+            entry
+            for entry in lead_store.replay()
+            if entry.type == "notification"
+            and entry.data.get("kind") == "child_question"
+        ]
+        assert len(questions) == 1
+        assert questions[0].data.get("routing_note") is None
+        assert not any(
+            entry.type == "notification" and entry.data.get("kind") == "child_question"
+            for entry in store.replay()
+        )
+
+        canceled = await loop.tool_registry.execute(
+            ToolCall("cancel-lead", "agent_cancel", {"handle": lead_handle})
+        )
+        assert canceled["isError"] is False
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        terminal = await loop.tool_registry.execute(
+            ToolCall("dead-lead-status", "agent_status", {"handle": lead_handle})
+        )
+        assert terminal["structuredContent"]["children"][0]["state"] != "idle"
+    finally:
+        backend.release_worker_question.set()
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
