@@ -8216,10 +8216,12 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         )[-1]["result"]
         assert replied["kind"] == "output"
         inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
-        message_ids = inbox.new_ids(project_id, session_id=session_id)
+        message_ids = await asyncio.to_thread(
+            inbox.new_ids, project_id, session_id=session_id
+        )
         assert len(message_ids) == 1
-        message = inbox.claim(
-            project_id, message_ids[0], session_id
+        message = await asyncio.to_thread(
+            inbox.claim, project_id, message_ids[0], session_id
         )
         assert message is not None
         assert "follow up" in message["body"]

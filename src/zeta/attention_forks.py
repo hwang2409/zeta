@@ -8,7 +8,7 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +16,13 @@ from .attention_records import (
     AttentionRecord,
     AttentionStore,
     read_bounded_session_json,
+    resolved_record,
 )
 from .config.tool_policy import ToolPolicy
 from .core.checkpoints import ConversationEntry
 from .core.session import SessionManager
 from .core.session_files import (
+    SessionNotFoundError,
     child_directory,
     open_session_file,
     session_directory,
@@ -119,6 +121,9 @@ def validate_attention_fork(
     return ValidatedAttentionFork(fork, record)
 
 
+_RESOLUTION_ATTEMPTS = 5
+
+
 def attention_decision_message_id(attention_id: str) -> str:
     """Return the stable inbox identity for one attention reply."""
     return hashlib.sha256(f"attention-decision:{attention_id}".encode()).hexdigest()[
@@ -145,34 +150,44 @@ def deliver_attention_decision(
     if registry is None:
         raise ValueError("project registry is unavailable")
     inbox = ProjectInbox(registry, sessions_root=Path(home) / "sessions")
-
-    def send(current: AttentionRecord) -> None:
-        if current.project_id is None:
+    for _attempt in range(_RESOLUTION_ATTEMPTS):
+        # Lock order: project identity/inbox first, then source shape plus
+        # `.resolution.lock`, so read a tentative record without the inbox.
+        with store.holding(record.id, session_id=record.session_id) as (tentative, _):
+            pass
+        if tentative.status == "resolved":
+            return message_id, tentative, True
+        if tentative.project_id is None:
             raise ValueError("attention record has no project")
-        label = "Decision" if current.kind == "decision" else "Reply"
-        body = (
-            f"User {label.lower()} relayed from session {from_session}. "
-            f"The question was asked at {current.created_at}; check whether the "
-            f"situation has changed before acting.\n\n{label}: {decision}"
-        )
-        inbox.send(
-            from_project=current.project_id,
-            from_session=from_session,
-            to_project=current.project_id,
-            to_session=current.session_id,
-            kind="reply",
-            title=f"{'Decision' if current.kind == 'decision' else 'Reply'}: {current.title}",
-            body=body,
-            message_id=message_id,
-        )
-
-    resolved, already_resolved = store.resolve(
-        record.id,
-        session_id=record.session_id,
-        decision=decision,
-        before_commit=send,
-    )
-    return message_id, resolved, already_resolved
+        label = "Decision" if tentative.kind == "decision" else "Reply"
+        with (
+            inbox.holding(tentative.project_id) as held,
+            store.holding(record.id, session_id=record.session_id) as (
+                current,
+                write,
+            ),
+        ):
+            if current != tentative:
+                continue
+            held.send(
+                from_project=current.project_id,
+                from_session=from_session,
+                to_project=current.project_id,
+                to_session=current.session_id,
+                kind="reply",
+                title=f"{label}: {current.title}",
+                body=(
+                    f"User {label.lower()} relayed from session {from_session}. "
+                    f"The question was asked at {current.created_at}; check "
+                    "whether the situation has changed before acting.\n\n"
+                    f"{label}: {decision}"
+                ),
+                message_id=message_id,
+            )
+            resolved = resolved_record(current, decision)
+            write(resolved)
+        return message_id, resolved, False
+    raise ValueError("attention record kept changing during resolution; try again")
 
 
 def release_discussion_fork(
@@ -195,15 +210,9 @@ def release_discussion_fork(
         raise ValueError("session is not a discussion fork")
     store = AttentionStore(manager.sessions_dir / fork.forked_from_session)
     try:
-        record = store.get(fork.attention_id)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        record = None
-    if (
-        record is not None
-        and record.status != "resolved"
-        and record.fork_session_id == fork_session_id
-    ):
-        store.replace(replace(record, fork_session_id=None))
+        store.release_fork(fork.attention_id, fork_session_id)
+    except (SessionNotFoundError, FileNotFoundError):
+        pass  # The source session or its attention records are gone.
     return fork.forked_from_session
 
 

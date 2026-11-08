@@ -178,10 +178,7 @@ class AttentionStore:
     def dismiss(
         self, attention_id: str, *, session_id: str
     ) -> tuple[AttentionRecord, bool]:
-        with self._resolution_lock():
-            current = self.get(attention_id)
-            if current.session_id != session_id:
-                raise ValueError("attention record does not belong to this session")
+        with self.holding(attention_id, session_id=session_id) as (current, write):
             if current.status == "resolved":
                 return current, True
             if current.kind == "decision":
@@ -189,14 +186,11 @@ class AttentionStore:
             dismissed = replace(
                 current, status="resolved", resolved_at=_now(), decision=None
             )
-            self.replace(dismissed)
+            write(dismissed)
             return dismissed, False
 
     def get(self, attention_id: str) -> AttentionRecord:
-        if len(attention_id) != 32 or any(
-            character not in "0123456789abcdef" for character in attention_id
-        ):
-            raise ValueError("invalid attention id")
+        _check_id(attention_id)
         value = _bounded_json(self.directory / f"{attention_id}.json")
         if not isinstance(value, dict):
             raise TypeError("attention record must be a JSON object")
@@ -208,31 +202,45 @@ class AttentionStore:
         *,
         session_id: str,
         decision: str,
-        before_commit: Callable[[AttentionRecord], None] | None = None,
     ) -> tuple[AttentionRecord, bool]:
-        """Resolve one owned record, running winner-only delivery before its commit."""
+        """Resolve one owned record without delivering anything."""
         decision = decision.strip()
         if not decision:
             raise ValueError("decision must be nonempty")
-        with self._resolution_lock():
-            current = self.get(attention_id)
-            if current.session_id != session_id:
-                raise ValueError("attention record does not belong to this session")
+        with self.holding(attention_id, session_id=session_id) as (current, write):
             if current.status == "resolved":
                 return current, True
-            if before_commit is not None:
-                before_commit(current)
-            resolved = replace(
-                current,
-                status="resolved",
-                resolved_at=_now(),
-                decision=decision,
-            )
-            self.replace(resolved)
+            resolved = resolved_record(current, decision)
+            write(resolved)
             return resolved, False
 
     @contextmanager
-    def _resolution_lock(self) -> Iterator[None]:
+    def holding(
+        self, attention_id: str, *, session_id: str
+    ) -> Iterator[tuple[AttentionRecord, Callable[[AttentionRecord], None]]]:
+        """Hold session shape plus `.resolution.lock` over one owned record.
+
+        Yields the record and a writer that uses the already-held lock. Every
+        mutation of an existing record goes through this lock.
+        """
+        with self._resolution_lock() as attention_fd:
+            current = self._read_at(attention_fd, attention_id)
+            if current.session_id != session_id:
+                raise ValueError("attention record does not belong to this session")
+            yield current, lambda record: self._write_at(attention_fd, record)
+
+    def release_fork(self, attention_id: str, fork_session_id: str) -> None:
+        """Clear an open record's binding to `fork_session_id`, if it still has it."""
+        with self._resolution_lock() as attention_fd:
+            try:
+                record = self._read_at(attention_fd, attention_id)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return
+            if record.status != "resolved" and record.fork_session_id == fork_session_id:
+                self._write_at(attention_fd, replace(record, fork_session_id=None))
+
+    @contextmanager
+    def _resolution_lock(self) -> Iterator[int]:
         with (
             session_directory(self.session_dir.parent, self.session_dir.name) as (
                 _,
@@ -249,7 +257,7 @@ class AttentionStore:
                 fcntl.flock(attention_fd, fcntl.LOCK_UN)
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                yield
+                yield attention_fd
             finally:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
@@ -281,14 +289,38 @@ class AttentionStore:
                 session_fd, "attention", create=create_directory
             ) as attention_fd,
         ):
-            write_session_file(
-                attention_fd,
-                f"{record.id}.json",
-                (
-                    json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":"))
-                    + "\n"
-                ).encode(),
-            )
+            self._write_at(attention_fd, record)
+
+    @staticmethod
+    def _read_at(attention_fd: int, attention_id: str) -> AttentionRecord:
+        _check_id(attention_id)
+        value = read_bounded_session_json(attention_fd, f"{attention_id}.json")
+        if not isinstance(value, dict):
+            raise TypeError("attention record must be a JSON object")
+        return AttentionRecord.from_dict(value)
+
+    @staticmethod
+    def _write_at(attention_fd: int, record: AttentionRecord) -> None:
+        write_session_file(
+            attention_fd,
+            f"{record.id}.json",
+            (
+                json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode(),
+        )
+
+
+def resolved_record(record: AttentionRecord, decision: str) -> AttentionRecord:
+    """Return `record` resolved with an already-validated `decision`."""
+    return replace(record, status="resolved", resolved_at=_now(), decision=decision)
+
+
+def _check_id(attention_id: str) -> None:
+    if len(attention_id) != 32 or any(
+        character not in "0123456789abcdef" for character in attention_id
+    ):
+        raise ValueError("invalid attention id")
 
 
 def _read_bounded_json_fd(fd: int) -> dict[str, Any] | list[Any]:
