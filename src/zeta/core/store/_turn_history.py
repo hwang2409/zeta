@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Literal
 
+from ...storage_format import reject_unknown_keys
 from ._async_writes import _AppendTurnEndCommand
 
 if TYPE_CHECKING:
@@ -18,10 +19,10 @@ _TURN_ID = re.compile(r"[0-9a-f]{32}").fullmatch
 
 
 def validate_turn_end_data(data: Mapping[str, object]) -> None:
+    reject_unknown_keys(data, "turn_history")
     turn_id = data.get("turn_id")
     if (
-        set(data) != {"turn_id", "reason"}
-        or not isinstance(turn_id, str)
+        not isinstance(turn_id, str)
         or _TURN_ID(turn_id) is None
         or data.get("reason") not in _TURN_END_REASONS
     ):

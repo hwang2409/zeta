@@ -13,6 +13,7 @@ from ...protocol.types import (
     ToolUseContent,
     is_passive_harness_message,
 )
+from ...storage_format import reject_unknown_keys
 
 
 class EntryValidationContext(Protocol):
@@ -182,8 +183,7 @@ def _notification_ack(_context: EntryValidationContext, entry: Any) -> None:
 
 def _notification_tui_presented(_context: EntryValidationContext, entry: Any) -> None:
     _notification_ack(_context, entry)
-    if set(entry.data) != {"notification_id"}:
-        raise ValueError("notification marker has unexpected fields")
+    reject_unknown_keys(entry.data, "notification_marker")
 
 
 def _pending_prompt(_context: EntryValidationContext, entry: Any) -> None:
@@ -203,8 +203,7 @@ def _pending_prompt_ack(_context: EntryValidationContext, entry: Any) -> None:
 
 
 def _pending_queue_closed(_context: EntryValidationContext, entry: Any) -> None:
-    if entry.data != {}:
-        raise ValueError("pending queue closed marker takes no fields")
+    reject_unknown_keys(entry.data, "pending_queue_closed")
 
 
 def _terminal_transition(_context: EntryValidationContext, entry: Any) -> None:
