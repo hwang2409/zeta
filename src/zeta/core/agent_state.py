@@ -723,7 +723,6 @@ class AgentStateMixin:
                         tool_call=tool_call, **registration_values
                     )
                 )
-                )
                 await self._commit_storage_command(
                     _FinishAgentChildCommand(marker_key=marker_key)
                 )
