@@ -288,17 +288,16 @@ def read_output_result(
     limit: int | None,
     max_bytes: int,
 ) -> dict[str, object]:
-    from . import _read_agent_output_at_path
+    from . import _read_agent_output
 
     path = _discover(store, requested_handle)[requested_handle]
-    return _read_agent_output_at_path(
-        store,
+    return _read_agent_output(
         path,
         requested_handle=requested_handle,
         offset=offset,
         limit=limit,
         max_bytes=max_bytes,
-    )
+    )[3]
 
 
 def read_status_result(
@@ -308,18 +307,27 @@ def read_status_result(
     offset: int,
     limit: int | None,
     max_bytes: int,
+    running_handles: frozenset[str] | None = None,
 ) -> dict[str, object]:
     from . import (
+        _NONTERMINAL_AGENT_STATES,
+        BrokenAgentLifecycle,
+        LoadedAgentLifecycle,
+        MissingAgentLifecycle,
         _agent_error,
         _fit_status_row,
         _is_finished_agent_status,
+        _lost_agent_status,
         _project_agent_status,
-        _read_agent_output_at_path,
+        _read_agent_transcript,
+        _read_child_lifecycle,
         _sanitize_status_reason,
         _status_response,
-        _unknown_agent_status,
+        _unreadable_agent_status,
         encode_json,
         idle_resource_usage,
+        live_agent_lifecycle,
+        select_legacy_child_lifecycle,
         text_block,
     )
 
@@ -332,23 +340,42 @@ def read_status_result(
     children = []
     for handle, child_path in receipts.items():
         try:
-            _read_agent_output_at_path(
-                store,
-                child_path,
-                requested_handle=handle,
-                offset=0,
-                limit=1,
-                max_bytes=max_bytes,
-            )
-            item = _project_agent_status(
-                store,
-                handle,
-                child_path,
-                notifications=notifications,
-                requested_handle=requested_handle,
-            )
+            _read_agent_transcript(child_path, None)
+            lifecycle_read, owner_state = _read_child_lifecycle(store, child_path)
+            if isinstance(lifecycle_read, MissingAgentLifecycle):
+                item = _unreadable_agent_status(
+                    handle, reason="missing lifecycle record"
+                )
+            elif isinstance(lifecycle_read, BrokenAgentLifecycle):
+                item = _unreadable_agent_status(
+                    handle, reason=lifecycle_read.reason
+                )
+            elif isinstance(lifecycle_read, LoadedAgentLifecycle):
+                live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
+                lifecycle = select_legacy_child_lifecycle(
+                    lifecycle_read.value, live
+                )
+                item = _project_agent_status(
+                    lifecycle,
+                    handle,
+                    notifications=notifications,
+                    requested_handle=requested_handle,
+                )
+                if (
+                    running_handles is not None
+                    and handle not in running_handles
+                    and owner_state in {None, "recovery"}
+                    and item["state"] in _NONTERMINAL_AGENT_STATES
+                ):
+                    item = _lost_agent_status(
+                        item, requested=requested_handle is not None
+                    )
+            else:
+                raise TypeError("unknown lifecycle read result")
         except Exception as exc:  # noqa: BLE001 - damage is isolated per leaf
-            item = _unknown_agent_status(handle, reason=_sanitize_status_reason(exc))
+            item = _unreadable_agent_status(
+                handle, reason=_sanitize_status_reason(exc)
+            )
         children.append(item)
     children.sort(key=lambda child: str(child["started_at"]))
 

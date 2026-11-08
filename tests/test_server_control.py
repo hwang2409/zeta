@@ -16,15 +16,19 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
-    _close,
     _connect,
     _read_raw,
     _request,
 )
 from tests.test_server_observers import _controller_event_stream
+from zeta.agent.finish_gate import FinishGateState
+from zeta.agent.run_consumer import consume_run
+from zeta.agent.terminal_fence import TerminalTransitionFence
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -34,11 +38,13 @@ from zeta.protocol.types import (
     TextContent,
     ToolSchema,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
+from zeta.skills import SkillCatalog
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -384,7 +390,7 @@ async def test_release_after_physical_write_reports_delivered() -> None:
 
 
 @pytest.mark.asyncio
-async def test_controller_release_completes_queued_frames_like_base() -> None:
+async def test_controller_release_fences_queued_frames() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop())
     connection = _ControllerConnection()
     registry.register(connection)
@@ -407,7 +413,7 @@ async def test_controller_release_completes_queued_frames_like_base() -> None:
     registry.release(connection)
     release_write.set()
 
-    assert await asyncio.wait_for(asyncio.gather(head, tail), 10) == [True, True]
+    assert await asyncio.wait_for(asyncio.gather(head, tail), 10) == [False, False]
 
 
 @pytest.mark.asyncio
@@ -588,6 +594,7 @@ async def _replace_registry_controller(
         replacement.features,
     )
     replacement.handshaken = True
+    server.connections.activate_controller(replacement)
     frame = replacement.codec.notification(
         EventDescriptor.ASSISTANT_DELTA, "session", delta="hello"
     )
@@ -619,6 +626,121 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
         await server.close()
 
 
+@pytest.mark.parametrize("child_instance_id", ["root:1", "root:1:1"])
+@pytest.mark.asyncio
+async def test_display_only_idle_reaches_serve_without_parent_turn(
+    tmp_path: Path,
+    child_instance_id: str,
+) -> None:
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(reader, writer, 2, "new_session", {})
+        root_loop = server.runtime.loop
+        assert root_loop is not None
+        server_sink = root_loop._background_event_sink
+        assert server_sink is not None
+        idle_events: list[StreamEvent] = []
+
+        def forward(event: StreamEvent) -> None:
+            idle_events.append(event)
+            server_sink(event)
+
+        root_loop.set_background_event_sink(forward)
+        child_store = ConversationStore(tmp_path / f"child-{child_instance_id}")
+        child_loop = AgentLoop(
+            FakeBackend([]),
+            child_store,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+            background_owner=root_loop._background_owner,
+            agent_instance_id=child_instance_id,
+            agent_depth=child_instance_id.count(":"),
+        )
+        child_loop.explicit_finish = True
+        child_loop.set_background_event_sink(root_loop._publish_background_event)
+        child_store.start_agent_lifecycle(
+            handle=child_instance_id,
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=child_instance_id.count(":"),
+            agent_type="worker",
+            description="idle worker",
+        )
+        child_loop._terminal_transition_fence = TerminalTransitionFence(
+            child_store,
+            owned_work=lambda: (),
+            delivering_prompt_id=lambda: None,
+        )
+        root_loop._background_owner.conversation_channel.register_loop(
+            child_instance_id
+        )
+        await child_loop._ensure_step_delivery()
+        idle_waiting = asyncio.Event()
+
+        async def child_result(*args: object, **kwargs: object) -> dict[str, object]:
+            return {
+                "content": [{"type": "text", "text": ""}],
+                "isError": False,
+                "structuredContent": {"status": "running"},
+            }
+
+        async def wait_idle(*args: object) -> bool:
+            idle_waiting.set()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
+            return True
+
+        class OwnedFinishGate(FinishGateState):
+            def can_wake_again(self, loop: object) -> bool:
+                return True
+
+        run = asyncio.create_task(
+            consume_run(
+                child_result,
+                child_loop,
+                "work",
+                child_store=child_store,
+                child_turns=lambda: 1,
+                child_path=str(child_store.session_dir),
+                explicit_finish_metadata={
+                    "child_instance_id": child_instance_id,
+                    "description": "idle worker",
+                },
+                finish_gate_state=OwnedFinishGate(),
+                idle_wait=wait_idle,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            if run.done():
+                run.result()
+            await asyncio.wait_for(idle_waiting.wait(), 10)
+            assert len(idle_events) == 1
+            frame = json.loads(await _read_raw(reader))
+            assert frame["params"]["event"] == "child_idle"
+            assert frame["params"]["data"]["child_instance_id"] == child_instance_id
+            assert frame["params"]["data"]["text"] == "child is idle"
+            assert backend.calls == []
+        finally:
+            run.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(run, return_exceptions=True), 10
+            )
+            await asyncio.wait_for(child_loop.close(), 10)
+            child_store.close()
+    finally:
+        await close_serve(server, writer)
+
+
 @pytest.mark.asyncio
 async def test_detached_turn_uses_current_controller_projection(tmp_path: Path) -> None:
     backend = _GatedBackend()
@@ -647,7 +769,7 @@ async def test_detached_turn_uses_current_controller_projection(tmp_path: Path) 
         backend.release.set()
         if replacement is not None:
             await replacement.close()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -691,7 +813,7 @@ async def test_post_turn_wake_runs_without_controller(tmp_path: Path) -> None:
         await asyncio.wait_for(backend.later_woke.wait(), TIMEOUT)
     finally:
         backend.release_finalization.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -709,27 +831,31 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
     client = server._client
     assert client is not None and server.connections is not None
-    released = asyncio.Event()
+    reference = weakref.ref(client)
+    cleanup_finished = asyncio.Event()
     original_release = server.connections.release
     client_id = id(client)
+    release_count = 0
+    loop = asyncio.get_running_loop()
 
     def release(connection: Any) -> None:
+        nonlocal release_count
         original_release(connection)
         if id(connection) == client_id:
-            released.set()
+            release_count += 1
+            if release_count == 2:
+                loop.call_soon(cleanup_finished.set)
 
+    # test-contract: seam observe the accept callback after early physical release
     server.connections.release = release  # type: ignore[method-assign]
-    reference = weakref.ref(client)
     writer.close()
     await writer.wait_closed()
-    await asyncio.wait_for(released.wait(), TIMEOUT)
+    await asyncio.wait_for(cleanup_finished.wait(), TIMEOUT)
+    await server.close()
     del client
     gc.collect()
 
-    try:
-        assert server.runtime._background_event_sink is not None
-        assert server.runtime._memory_notice_sink is not None
-        assert server.runtime._background_wake_sink is not None
-        assert reference() is None
-    finally:
-        await server.close()
+    assert server.runtime._background_event_sink is not None
+    assert server.runtime._memory_notice_sink is not None
+    assert server.runtime._background_wake_sink is not None
+    assert reference() is None

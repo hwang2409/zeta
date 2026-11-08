@@ -31,13 +31,25 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...core.agent_progress import live_agent_lifecycle
+from ...core.agent_state import (
+    BrokenAgentLifecycle,
+    LoadedAgentLifecycle,
+    MissingAgentLifecycle,
+    read_agent_lifecycle_state,
+)
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
     load_session_json,
 )
 from ...core.child_lifecycle import select_legacy_child_lifecycle
-from ...core.session_files import child_directory, read_session_file
+from ...core.session_execution import execution_owner_state
+from ...core.session_files import (
+    child_directory,
+    open_session_file,
+    read_session_file,
+    session_root,
+)
 from ...core.store import ConversationStore
 from ...models.catalog import known_model_names
 from ...protocol.types import (
@@ -78,6 +90,8 @@ _STATUS_ROW_STRING_FIELDS = (
     "cwd",
 )
 _MISSING = object()
+_AGENT_OUTPUT_CACHE_MAX_ENTRIES = 4
+_AGENT_OUTPUT_CACHE_MAX_CHARS = 32 * 1024 * 1024
 
 
 def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
@@ -298,17 +312,38 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
         return read_session_file(directory_fd, name)
 
 
-def _read_agent_output_at_path(
-    store: ConversationStore,
+def _read_child_lifecycle(
+    store: ConversationStore, child_path: Path
+) -> tuple[object, str | None]:
+    with ExitStack() as cleanup:
+        directory_fd = store.directory_fd
+        for component in child_path.relative_to(store.session_dir.absolute()).parts:
+            directory_fd = cleanup.enter_context(
+                child_directory(directory_fd, component)
+            )
+        return (
+            read_agent_lifecycle_state(
+                directory_fd, child_path / "agent_lifecycle.json"
+            ),
+            execution_owner_state(directory_fd),
+        )
+
+
+def _read_agent_transcript(
     child_path: Path,
-    *,
-    requested_handle: str,
-    offset: int,
-    limit: int | None,
-    max_bytes: int,
-) -> dict[str, object]:
+    cached: tuple[tuple[int, int, int], str] | None,
+) -> tuple[tuple[int, int, int], str, bool]:
     try:
-        raw = _read_child_file(store, child_path, "conversation.jsonl")
+        with session_root(child_path) as directory_fd:
+            fd = open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY)
+            with os.fdopen(fd, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                key = (before.st_ino, before.st_size, before.st_mtime_ns)
+                if cached is not None and cached[0] == key:
+                    return (*cached, True)
+                raw = handle.read()
+                after = os.fstat(handle.fileno())
+            after_key = (after.st_ino, after.st_size, after.st_mtime_ns)
         rows = raw.splitlines(keepends=True)
         entries: list[ConversationEntry] = []
         for index, line in enumerate(rows):
@@ -353,8 +388,21 @@ def _read_agent_output_at_path(
             if entry.type == "message"
         ]
         output = _serialize_agent_transcript(messages)
+        return after_key, output, after_key == key
     except (OSError, ValueError, ConversationIntegrityError) as exc:
         raise ValueError("could not read child transcript") from exc
+
+
+def _read_agent_output(
+    child_path: Path,
+    *,
+    requested_handle: str,
+    offset: int,
+    limit: int | None,
+    max_bytes: int,
+    cached: tuple[tuple[int, int, int], str] | None = None,
+) -> tuple[tuple[int, int, int], str, bool, dict[str, object]]:
+    identity, output, cacheable = _read_agent_transcript(child_path, cached)
     result = _agent_output_page(
         output,
         handle=requested_handle,
@@ -364,47 +412,51 @@ def _read_agent_output_at_path(
     )
     if result is None:
         raise ValueError("transcript page exceeds response limit")
-    return result
+    return identity, output, cacheable, result
 
 
-def _unknown_agent_status(
+def _unreadable_agent_status(
     handle: str, *, reason: str, started_at: object = None
 ) -> dict[str, StructuredContentValue]:
     return {
         "handle": handle,
-        "state": "unknown",
+        "state": "failed",
         "started_at": (started_at if type(started_at) is str else "unknown"),
-        "finished_at": None,
+        "finished_at": "unknown",
         "elapsed": 0.0,
         "turns_used": 0,
         "tool_calls": 0,
-        "current_step": "unknown",
+        "current_step": "unreadable",
         "depth": 0,
         "agent_type": "general",
         "description": "",
-        "reason": reason,
+        "reason": f"unreadable: {reason}",
     }
 
 
+def _lost_agent_status(
+    item: dict[str, StructuredContentValue], *, requested: bool
+) -> dict[str, StructuredContentValue]:
+    lost = dict(item)
+    lost.update(
+        state="failed",
+        finished_at="unknown",
+        elapsed=0.0,
+        current_step="lost",
+        reason="lost: owner process exited",
+    )
+    if requested:
+        lost["final_result"] = "lost: owner process exited"
+    return lost
+
+
 def _project_agent_status(
-    store: object,
+    lifecycle: object,
     handle: str,
-    child_path: Path,
     *,
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
 ) -> dict[str, StructuredContentValue]:
-    live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
-    try:
-        durable = load_session_json(
-            _read_child_file(store, child_path, "agent_lifecycle.json")
-        )
-    except (OSError, ValueError) as exc:
-        if live is None:
-            raise ValueError("could not read child state") from exc
-        lifecycle = live
-    else:
-        lifecycle = select_legacy_child_lifecycle(durable, live)
     if type(lifecycle) is not dict:
         raise ValueError("lifecycle data is not an object")
     if lifecycle.get("handle") != handle:
@@ -473,16 +525,23 @@ def _project_agent_status(
         if finished_at is not None
         else ""
     )
+    if state == "failed" and final_result.startswith(("lost:", "unreadable:")):
+        item["reason"] = final_result
     if finished_at is not None and requested_handle is not None:
         item["final_result"] = final_result
     return item
 
 
 def _is_finished_agent_status(child: dict[str, StructuredContentValue]) -> bool:
+    reason = child.get("reason")
     return (
         type(child.get("state")) is str
         and child.get("state") in _TERMINAL_AGENT_STATES
         and child.get("finished_at") is not None
+        and not (
+            isinstance(reason, str)
+            and reason.startswith(("lost:", "unreadable:"))
+        )
     )
 
 
@@ -521,7 +580,7 @@ def _status_response(
             "child {handle}: state: {state}; started_at: {started_at}; "
             "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
             "turns_used: {turns_used}; step: {current_step}; "
-            "{cwd_field}result: {final_result}{report_status_field}{unknown_reason}"
+            "{cwd_field}result: {final_result}{report_status_field}{reason_field}"
         ).format(
             **{
                 **child,
@@ -534,10 +593,8 @@ def _status_response(
                     if child.get("report_status")
                     else ""
                 ),
-                "unknown_reason": (
-                    f"; reason: {child['reason']}"
-                    if child.get("state") == "unknown"
-                    else ""
+                "reason_field": (
+                    f"; reason: {child['reason']}" if child.get("reason") else ""
                 ),
             }
         )
@@ -654,7 +711,7 @@ def _fit_status_row(
         if not changed:
             break
 
-    minimal = _unknown_agent_status(
+    minimal = _unreadable_agent_status(
         str(row.get("handle", "")),
         reason="row too large",
     )
@@ -701,6 +758,7 @@ def _read_agent_status(
     store: object,
     *,
     requested_handle: str | None = None,
+    running_handles: frozenset[str] | None = None,
 ) -> list[dict[str, StructuredContentValue]]:
     session_dir = getattr(store, "session_dir", None)
     if not isinstance(session_dir, Path):
@@ -717,16 +775,42 @@ def _read_agent_status(
         if requested_handle is not None and handle != requested_handle:
             continue
         try:
-            item = _project_agent_status(
-                store,
-                handle,
-                child_path,
-                notifications=notifications,
-                requested_handle=requested_handle,
-            )
+            lifecycle_read, owner_state = _read_child_lifecycle(store, child_path)
+            if isinstance(lifecycle_read, MissingAgentLifecycle):
+                item = _unreadable_agent_status(
+                    handle, reason="missing lifecycle record"
+                )
+            elif isinstance(lifecycle_read, BrokenAgentLifecycle):
+                item = _unreadable_agent_status(
+                    handle, reason=lifecycle_read.reason
+                )
+            elif isinstance(lifecycle_read, LoadedAgentLifecycle):
+                live = live_agent_lifecycle(
+                    child_path / "agent_lifecycle.json"
+                )
+                lifecycle = select_legacy_child_lifecycle(
+                    lifecycle_read.value, live
+                )
+                item = _project_agent_status(
+                    lifecycle,
+                    handle,
+                    notifications=notifications,
+                    requested_handle=requested_handle,
+                )
+                if (
+                    running_handles is not None
+                    and handle not in running_handles
+                    and owner_state in {None, "recovery"}
+                    and item["state"] in _NONTERMINAL_AGENT_STATES
+                ):
+                    item = _lost_agent_status(
+                        item, requested=requested_handle is not None
+                    )
+            else:
+                raise TypeError("unknown lifecycle read result")
         except Exception as exc:  # noqa: BLE001 - every child needs a safe row
             children.append(
-                _unknown_agent_status(
+                _unreadable_agent_status(
                     handle,
                     reason=_sanitize_status_reason(exc),
                 )
@@ -754,6 +838,8 @@ async def _agent_status(
         return _agent_error("offset must be a nonnegative integer", max_bytes)
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
+    owner = registry._agent_owner
+    running_handles = owner.active_instance_ids if owner is not None else None
     from .subtree import read_status_result
 
     try:
@@ -764,6 +850,7 @@ async def _agent_status(
             offset=offset,
             limit=limit,
             max_bytes=max_bytes,
+            running_handles=running_handles,
         )
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)
@@ -788,16 +875,35 @@ async def _agent_output(
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
     try:
-        from .subtree import read_output_result
+        from .subtree import _discover
 
-        return await asyncio.to_thread(
-            read_output_result,
-            registry.session_store,
+        child_path = (
+            await asyncio.to_thread(_discover, registry.session_store, handle)
+        )[handle]
+        cached = registry._agent_output_cache.get(child_path)
+        identity, output, cacheable, result = await asyncio.to_thread(
+            _read_agent_output,
+            child_path,
             requested_handle=handle,
             offset=offset,
             limit=limit,
             max_bytes=max_bytes,
+            cached=cached,
         )
+        previous = registry._agent_output_cache.pop(child_path, None)
+        if previous is not None:
+            registry._agent_output_cache_chars -= len(previous[1])
+        if cacheable and len(output) <= _AGENT_OUTPUT_CACHE_MAX_CHARS:
+            registry._agent_output_cache[child_path] = (identity, output)
+            registry._agent_output_cache_chars += len(output)
+            registry._agent_output_cache.move_to_end(child_path)
+            while (
+                len(registry._agent_output_cache) > _AGENT_OUTPUT_CACHE_MAX_ENTRIES
+                or registry._agent_output_cache_chars > _AGENT_OUTPUT_CACHE_MAX_CHARS
+            ):
+                _, evicted = registry._agent_output_cache.popitem(last=False)
+                registry._agent_output_cache_chars -= len(evicted[1])
+        return _bounded_agent_result(result, max_bytes)
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)
 
@@ -966,8 +1072,9 @@ def register(registry: ToolRegistry) -> None:
         binding="shared",
         description=(
             "Inspect child agents from this session. Pass a child handle for "
-            "one child, or omit it to list unfinished children. Finished children "
-            "are omitted from list responses; query by handle for their results. "
+            "one child, or omit it to list unfinished children plus terminal "
+            "lost or unreadable records. Other finished children are omitted from "
+            "list responses; query by handle for their results. "
             "Completion is announced automatically. Use this for on-demand "
             "inspection, not polling."
         ),

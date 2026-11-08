@@ -66,6 +66,35 @@ async def await_or_fail[T](
         raise failure from timeout_error
 
 
+async def close_owned_app(app: TUIApp) -> None:
+    """Cancel an app's active task, then close the app."""
+    # test-contract: seam test cleanup owns the private active provider task.
+    task = app._active_task
+    pending_closed_loop_error: AssertionError | None = None
+    if task is not None and not task.done():
+        current_loop = asyncio.get_running_loop()
+        if task.get_loop() is current_loop:
+            await _cancel_and_drain(
+                [task],
+                timeout=10,
+                what="owned app active task",
+            )
+        elif not task.get_loop().is_closed():
+            task.cancel()
+        else:
+            traceback = getattr(task, "_source_traceback", None)
+            site = "unknown"
+            if traceback:
+                site = traceback.format()[-1].strip()
+            pending_closed_loop_error = AssertionError(
+                "TUIApp active task still pending on a closed event loop: "
+                f"{task!r} (created at {site})"
+            )
+    await app.close()
+    if pending_closed_loop_error is not None:
+        raise pending_closed_loop_error
+
+
 class AppOwner:
     def __init__(self, app: TUIApp | None) -> None:
         self._apps = [app] if app is not None else []
@@ -104,21 +133,16 @@ class AppOwner:
         for release in self._release:
             await attempt(release)
 
-        tasks = list(self._tasks)
-        for app in self._apps:
-            # test-contract: seam test cleanup owns the private active provider task.
-            if app._active_task is not None:
-                tasks.append(app._active_task)
         await attempt(
             lambda: _cancel_and_drain(
-                tasks,
+                self._tasks,
                 timeout=10,
                 what="owned app tasks",
             )
         )
         await attempt(self._contexts.close)
         for app in reversed(self._apps):
-            await attempt(app.close)
+            await attempt(lambda app=app: close_owned_app(app))
 
         if first_error is not None:
             raise first_error

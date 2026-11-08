@@ -11,7 +11,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import pytest
 
 from tests.support.login import block_loop_until_publication_decision_expires
-from tests.test_server import _close, _connect, _request
+from tests.support.serve_close import close_serve
+from tests.test_server import _connect, _request
 from zeta.accounts import AccountStore
 from zeta.core import login_flow
 from zeta.core.login_flow import LoginPortInUseError
@@ -80,7 +81,7 @@ async def test_login_is_hidden_and_rejected_for_legacy_protocol(tmp_path, server
             assert result["error"]["code"] == -32601
         assert not server._client.logins.tasks
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
@@ -122,12 +123,12 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         await asyncio.wait_for(server._client.logins.tasks[provider], 3)
         assert (await rpc(reader, writer, "login_status", provider=provider))["result"] == {"state": "succeeded"}
         saved = await asyncio.to_thread(credential_store, provider, home=server.home)
-        assert await asyncio.to_thread(saved.read) == expected
+        assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert next(row for row in rows if row["provider"] == provider)["credentials_present"]
         assert (await rpc(reader, writer, "status"))["result"]["state"] == "idle"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.parametrize("outcome", ["cancel", "disconnect", "timeout", "exchange_timeout", "state", "denied", "exchange", "start"])
@@ -140,7 +141,7 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
         return "https://authorize.invalid/"
     async def exchange(*args):
         if outcome == "exchange_timeout":
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
         raise RuntimeError("SECRET_TOKEN")
     monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
     monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
@@ -161,7 +162,7 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
             result = (await rpc(reader, writer, "login_cancel", provider="claude"))["result"]
             assert result == {"state": "cancelled"}
         elif outcome == "disconnect":
-            await _close(server, writer)
+            await server.close()
             assert not manager.tasks
         else:
             result = await asyncio.wait_for(manager.tasks["claude"], 3)
@@ -176,13 +177,13 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
         listener.close()
         await listener.wait_closed()
         saved = await asyncio.to_thread(credential_store, "claude", home=server.home)
-        assert await asyncio.to_thread(saved.read) is None
+        assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) is None
         if outcome != "disconnect":
             monkeypatch.setattr(providers, "build_anthropic_authorization_url", lambda *args: "https://authorize.invalid/")
             retry = (await rpc(reader, writer, "login_start", provider="claude"))["result"]
             assert retry["state"] == "pending"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 async def test_serve_login_publication_does_not_block_event_loop(
@@ -319,7 +320,7 @@ async def test_serve_login_decision_expiry_reports_failure_and_releases_locks(
 
         await asyncio.wait_for(asyncio.to_thread(acquire_locks), 1)
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 async def test_cancelled_serve_login_never_publishes_and_releases_locks(
@@ -444,7 +445,7 @@ async def test_unknown_provider_rejected_and_idle_cancel_is_safe(tmp_path):
                 assert (await rpc(reader, writer, method, provider=provider))["error"]["code"] == -32602
         assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "idle"}
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.parametrize("version,provider_error,background,status,expected", [
@@ -480,7 +481,7 @@ async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, v
                 "codex" if status is None else "claude"
             )
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 async def test_cancel_during_provider_lock_release_reports_success(
@@ -526,10 +527,10 @@ async def test_cancel_during_provider_lock_release_reports_success(
         assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "succeeded"}
         assert task.cancelling() == 0
         saved = await asyncio.to_thread(credential_store, "claude", home=server.home)
-        assert await asyncio.to_thread(saved.read) == expected
+        assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
     finally:
         release_exit.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, monkeypatch):
@@ -581,4 +582,4 @@ async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, m
         await listener.wait_closed()
     finally:
         release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
