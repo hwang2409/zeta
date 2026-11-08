@@ -30,3 +30,16 @@ def pytest_sessionfinish() -> None:
             flush=True,
         )
 
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    # DIAG ONLY: name a failure at once; a teardown hang hides the summary.
+    if report.failed:
+        worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+        print(
+            f"DIAG failed worker={worker} pid={os.getpid()} when={report.when} "
+            f"nodeid={report.nodeid}\n{report.longreprtext}",
+            file=sys.__stderr__,
+            flush=True,
+        )
