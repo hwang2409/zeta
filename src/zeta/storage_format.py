@@ -13,6 +13,7 @@ import secrets
 import stat
 import sys
 import threading
+import weakref
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -324,7 +325,9 @@ PublishBytes = Callable[[int, str, bytes], None]
 # lock could deadlock. A finalizer only queues the release with release_later
 # and never runs it. Normal code runs the queue at safe points with
 # drain_releases: after the last registry lock in the process is released,
-# before a lease is acquired, after an explicit close, and at exit.
+# before a lease is acquired, after an explicit close, and at exit. An explicit
+# close releases its own leases with release_now, never through the queue, so
+# its locks are free when it returns even if another thread is draining.
 # Release callbacks may take only RegistryLock locks.
 
 
@@ -365,6 +368,16 @@ def drain_releases() -> None:
                 sys.excepthook(*sys.exc_info())
     finally:
         _STATE.draining = False
+
+
+def release_now(finalizer: weakref.finalize) -> None:
+    """Explicit close: run the owner's own release here, at most once, then drain the queue."""
+
+    detached = finalizer.detach()  # the finalizer can no longer queue it too
+    if detached is not None:
+        _owner, _release_later, (close, *args), _kwargs = detached
+        close(*args)
+    drain_releases()
 
 
 atexit.register(drain_releases)

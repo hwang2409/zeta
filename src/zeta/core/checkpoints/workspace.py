@@ -34,10 +34,10 @@ from typing import Any, Literal
 
 from ...storage_format import (
     WriterLease,
-    drain_releases,
     mapping_mutations,
     open_writer,
     release_later,
+    release_now,
 )
 from ..process_env import subprocess_env
 from ..session_files import (
@@ -551,8 +551,7 @@ class WorkspaceSnapshotStore:
         storage_lease.close()
 
     def close(self) -> None:
-        self._release_lease()
-        drain_releases()
+        release_now(self._release_lease)
 
     @contextmanager
     def _shadow_workspace(self, *, write: bool = False):

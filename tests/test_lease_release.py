@@ -14,7 +14,13 @@ import pytest
 from zeta.core import session_execution
 from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
 from zeta.core.session import SessionManager
-from zeta.storage_format import WRITER_EPOCH, RegistryLock, open_writer, release_later
+from zeta.storage_format import (
+    WRITER_EPOCH,
+    RegistryLock,
+    drain_releases,
+    open_writer,
+    release_later,
+)
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "zeta"
 _DEADLINE_SECONDS = 10
@@ -227,33 +233,105 @@ def test_gc_finalizer_on_another_thread_queues_while_a_registry_lock_is_held(
 
 
 def test_gc_during_a_drain_queues_without_recursion_and_all_closes_run() -> None:
-    ran: list[str] = []
+    ran: list[tuple[str, int]] = []
+    depth = [0]
     registry = RegistryLock()
 
     class Owner:
         pass
 
+    def drained(call: Callable[..., None]) -> Callable[..., None]:
+        def run(*args: object) -> None:
+            depth[0] += 1
+            try:
+                call(*args)
+            finally:
+                depth[0] -= 1
+
+        return run
+
     def close(name: str) -> None:
         with registry:  # this exit is inside the drain and must not drain again
-            ran.append(name)
+            ran.append((name, depth[0]))
 
     def close_that_collects() -> None:
         owner = Owner()
         owner.cycle = owner  # type: ignore[attr-defined]
-        weakref.finalize(owner, release_later, close, "collected")
+        weakref.finalize(owner, release_later, drained(close), "collected")
         del owner
-        release_later(close, "queued")
+        release_later(drained(close), "queued")
         gc.collect()
         close("first")
 
     def queue_under_lock() -> None:
         with registry:
-            release_later(close_that_collects)
+            release_later(drained(close_that_collects))
 
     _run_bounded(queue_under_lock)
-    assert ran == ["first", "queued", "collected"], (
-        "closes queued during a drain must run after it, in order, without recursion"
+    assert ran == [("first", 1), ("queued", 1), ("collected", 1)], (
+        "closes queued during a drain must run after it, in order, never nested "
+        "inside another queued close"
     )
+
+
+def test_explicit_close_frees_its_locks_while_another_thread_is_draining(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_close = session_execution.close_store_leases
+    drainer_running = threading.Event()
+    open_drainer = threading.Event()
+    drainer_moved = threading.Event()
+    release_on_drainer = threading.Event()
+    drainer_ident: list[int] = []
+
+    def close_store_leases(*args: object) -> None:
+        if threading.get_ident() in drainer_ident:
+            drainer_moved.set()
+            release_on_drainer.wait(_DEADLINE_SECONDS)
+        real_close(*args)
+
+    def gated_close() -> None:
+        # Holding a registry lock keeps other threads' lock exits from draining.
+        with RegistryLock():
+            drainer_running.set()
+            open_drainer.wait(_DEADLINE_SECONDS)
+
+    def drain_on_another_thread() -> None:
+        drainer_ident.append(threading.get_ident())
+        release_later(gated_close)
+        drain_releases()
+        drainer_moved.set()
+
+    def hand_over_to_drainer() -> None:
+        open_drainer.set()
+        drainer_moved.wait(_DEADLINE_SECONDS)
+
+    monkeypatch.setattr(session_execution, "close_store_leases", close_store_leases)
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
+    store = opened.store
+    session_dir = home / "sessions" / opened.metadata.session_id
+    drainer = threading.Thread(target=drain_on_another_thread, daemon=True)
+    try:
+        drainer.start()
+        assert drainer_running.wait(_DEADLINE_SECONDS), "the drainer never started"
+        release_later(hand_over_to_drainer)  # queued ahead of the store's release
+        store.close()
+        fd = os.open(session_dir, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pytest.fail("explicit close returned before its own lease was released")
+        finally:
+            os.close(fd)
+    finally:
+        open_drainer.set()
+        release_on_drainer.set()
+        drainer.join(_DEADLINE_SECONDS)
+        manager._release_storage_lease()
+    assert not drainer.is_alive(), "the drainer never finished"
 
 
 def test_next_lease_acquire_runs_releases_queued_with_no_lock_held(
