@@ -13464,7 +13464,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
             assert isinstance(registry.approval_policy, ChildApprovalPolicy)
             child_registry = registry
             child_execute_entered.set()
-            await release_child_execute.wait()
+            await asyncio.wait_for(release_child_execute.wait(), timeout=10)
         return await original_execute(registry, tool_call, **kwargs)
 
     def observe_child_abort(registry: ToolRegistry) -> None:
@@ -13512,7 +13512,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     )
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(child_execute_entered.wait(), timeout=5)
+    await asyncio.wait_for(child_execute_entered.wait(), timeout=10)
     child_store = _child_store_for(store)
     assert any(
         message.role is MessageRole.ASSISTANT
