@@ -182,6 +182,7 @@ class SlashHandlerMixin:
             {item.account: item.detail for item in displays if item.detail},
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
+            {item.account for item in displays if not item.available},
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
