@@ -1346,7 +1346,6 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 async def gated_durable(*args: object, **kwargs: object) -> object:
                     result = await original_durable(*args, **kwargs)
                     # test-contract: seam gate the named production await
-                    # test-contract: seam gate the named production await
                     entered.set()
                     await await_or_fail(release.wait(), what="durable settlement")
                     return result
@@ -1378,7 +1377,6 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 async def gated_publish(
                     publication: GrantPublication, rule: str
                 ) -> None:
-                    # test-contract: seam gate the named production await
                     # test-contract: seam gate the named production await
                     entered.set()
                     await await_or_fail(release.wait(), what="grant publication")
