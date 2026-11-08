@@ -1344,6 +1344,8 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
 
                 async def gated_durable(*args: object, **kwargs: object) -> object:
                     result = await original_durable(*args, **kwargs)
+                    # test-contract: seam gate the named production await
+                    # test-contract: seam gate the named production await
                     entered.set()
                     await await_or_fail(release.wait(), what="durable settlement")
                     return result
@@ -1361,6 +1363,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     committed: bool,
                     event_published: bool,
                 ) -> tuple[bool, bool]:
+                    # test-contract: seam gate the named production await
                     entered.set()
                     await await_or_fail(release.wait(), what="grant finish")
                     return await original_finish(
@@ -1374,6 +1377,8 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 async def gated_publish(
                     publication: GrantPublication, rule: str
                 ) -> None:
+                    # test-contract: seam gate the named production await
+                    # test-contract: seam gate the named production await
                     entered.set()
                     await await_or_fail(release.wait(), what="grant publication")
                     await original_publish(publication, rule)
@@ -1386,6 +1391,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     store: ConversationStore, payload: dict[str, object]
                 ) -> object:
                     result = await original_history(store, payload)
+                    # test-contract: seam gate the named production await
                     entered.set()
                     await await_or_fail(release.wait(), what="approval history")
                     return result
@@ -1403,10 +1409,12 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
 
                 async def gated_write(payload: bytes) -> bool:
                     if b"session_grants_changed" in payload:
+                        # test-contract: seam gate the named production await
                         entered.set()
                         await await_or_fail(release.wait(), what="grant physical write")
                     return await original_write(payload)
 
+                # test-contract: seam gate the real physical-write await
                 monkeypatch.setattr(
                     controller.connection, "_write_physical", gated_write
                 )
@@ -1414,6 +1422,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 original_grant_publish = server.control.publish_session_grant_change
 
                 async def gated_grant_publish(change: Any) -> None:
+                    # test-contract: seam gate the named production await
                     entered.set()
                     await await_or_fail(release.wait(), what="grant publication")
                     await original_grant_publish(change)
