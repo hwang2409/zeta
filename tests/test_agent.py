@@ -17418,7 +17418,7 @@ async def test_question_close_keeps_recipient_targets_stable_during_cleanup(
         child_instance_id="root:2", question_id="question", question="done?"
     )
     owner = BackgroundAgentOwner(parent)
-    owner.track_store(second_child)
+    owner.lease_store(second_child)
     channel = owner.conversation_channel
     first_flow = pending_delivery_module.StepDeliveryFlow(parent)
     flows = {

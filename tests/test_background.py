@@ -1030,9 +1030,9 @@ async def test_agent_store_closes_after_each_foreground_completion(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     child_stores = []
     owner = loop._background_owner
-    track_store = owner.track_store
-    owner.track_store = lambda child_store: (
-        child_stores.append(child_store), track_store(child_store)
+    lease_store = owner.lease_store
+    owner.lease_store = lambda child_store: (
+        child_stores.append(child_store), lease_store(child_store)
     )
 
     try:
@@ -1069,7 +1069,7 @@ async def test_successful_store_close_releases_root_lease_and_closes_once(
     store = LeaseStore()
     owner = BackgroundAgentOwner(notification_store)
     owner.lease_store(store)
-    owner.track_store(store)
+    owner.lease_store(store)
     owner.mark_store_finished(store)
     reference = weakref.ref(store)
 
@@ -1092,7 +1092,7 @@ async def test_successful_store_close_releases_root_lease_and_closes_once(
 async def test_successful_store_close_is_removed_without_root_shutdown(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store)
-    owner.track_store(store)
+    owner.lease_store(store)
     owner.mark_store_finished(store)
 
     try:
@@ -1117,7 +1117,7 @@ async def test_successful_store_close_is_removed_without_root_shutdown(tmp_path:
 async def test_cancelled_store_close_is_retained_for_root_wait(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store)
-    owner.track_store(store)
+    owner.lease_store(store)
     owner.mark_store_finished(store)
 
     try:
@@ -1156,7 +1156,7 @@ async def test_failed_store_close_is_retained_for_retry(tmp_path: Path) -> None:
         original_close()
 
     store.close = flaky_close  # type: ignore[method-assign]
-    owner.track_store(store)
+    owner.lease_store(store)
     owner.mark_store_finished(store)
     owner.release_unused_stores()
 
@@ -1188,7 +1188,7 @@ async def test_unobserved_failed_store_close_is_not_retried(tmp_path: Path) -> N
 
     store.close = flaky_close  # type: ignore[method-assign]
     owner.lease_store(store)
-    owner.track_store(store)
+    owner.lease_store(store)
     owner.mark_store_finished(store)
     owner.release_unused_stores()
     (task,) = tuple(owner._store_close_tasks)
@@ -1256,9 +1256,9 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
 
     child_stores = []
     owner = loop._background_owner
-    track_store = owner.track_store
-    owner.track_store = lambda child_store: (
-        child_stores.append(child_store), track_store(child_store)
+    lease_store = owner.lease_store
+    owner.lease_store = lambda child_store: (
+        child_stores.append(child_store), lease_store(child_store)
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(owner.wait(), timeout=10)
@@ -1301,15 +1301,15 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
     tracked = []
     tracked_ready = asyncio.Event()
     owner = loop._background_owner
-    track_stores = owner.track_store
+    lease_stores = owner.lease_store
 
-    def track(child_store):
+    def lease(child_store):
         tracked.append(child_store)
-        track_stores(child_store)
+        lease_stores(child_store)
         if len(tracked) == 2:
             tracked_ready.set()
 
-    owner.track_store = track
+    owner.lease_store = lease
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
