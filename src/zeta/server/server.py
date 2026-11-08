@@ -20,7 +20,7 @@ from ..core.transcript_recovery.runtime import (
     repair_transcript_for_runtime,
 )
 from ..project_errors import ProjectRegistryBusyError
-from ..storage_format import drain_releases
+from ..storage_format import drain_releases, pending_releases
 from . import (
     abort_scope,
     accounts,
@@ -71,6 +71,8 @@ IDLE_DRAIN_INTERVAL = 1.0
 async def _drain_released_leases() -> None:
     while True:
         await asyncio.sleep(IDLE_DRAIN_INTERVAL)
+        if not pending_releases():
+            continue
         try:
             # a release may wait on a registry lock another thread holds
             await asyncio.to_thread(drain_releases)

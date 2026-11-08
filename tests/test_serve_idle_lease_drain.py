@@ -44,10 +44,16 @@ class _DrainProbe:
         self._loop = loop
         self._count = 0
         self._waiters: list[tuple[int, asyncio.Future[None]]] = []
+        self.fail_next = False
 
     def __call__(self) -> None:
-        drain_releases()
-        self._loop.call_soon_threadsafe(self._ran)
+        try:
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("drain failed")
+            drain_releases()
+        finally:
+            self._loop.call_soon_threadsafe(self._ran)
 
     def _ran(self) -> None:
         self._count += 1
@@ -55,11 +61,11 @@ class _DrainProbe:
             if self._count >= target and not waiter.done():
                 waiter.set_result(None)
 
-    async def idle_ticks(self) -> None:
-        """Wait for two drains: the first may have started before the caller."""
+    async def drains(self, calls: int) -> None:
+        """Wait for ``calls`` more drains; serve drains only when a release is queued."""
 
         waiter = self._loop.create_future()
-        self._waiters.append((self._count + 2, waiter))
+        self._waiters.append((self._count + calls, waiter))
         # on the base no drain runs; the release assertion that follows fails
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(waiter, _DEADLINE_SECONDS)
@@ -70,7 +76,7 @@ def _failing_release() -> None:
 
 
 def test_idle_serve_releases_gc_dropped_session_to_another_process(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The base fails at the first release assertion: serve keeps the flock."""
 
@@ -97,7 +103,7 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
                 "the finalizer must defer the release, not run it"
             )
 
-            await probe.idle_ticks()
+            await probe.drains(1)
             assert _exclusive_flock_free(lease_path), (
                 "an idle serve kept a GC-released session lease"
             )
@@ -113,15 +119,17 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
                 result_send.close()
             assert result[0] == "opened", result
 
-            # the tick survived the failed release and keeps draining
+            # a drain that raises is logged and the next tick retries
             again = manager.open(session_id).store
             again._cycle = again
             del again
+            probe.fail_next = True
             gc.collect()
-            await probe.idle_ticks()
+            await probe.drains(2)
             assert _exclusive_flock_free(lease_path), (
-                "the idle drain stopped after a failed release"
+                "the idle drain stopped after a failed drain"
             )
+            assert "draining released leases failed" in caplog.text
         finally:
             drain = getattr(server, "_idle_drain", None)
             await asyncio.wait_for(server.close(), _DEADLINE_SECONDS)
