@@ -71,6 +71,13 @@ class IncrementalValidationMixin:
 
     def _accept_incremental_entries(self, entries: list[ConversationEntry]) -> bool:
         """Validate a tail against staged state, then publish it as one update."""
+        if getattr(self, "_discard_on_incremental_validation_failure", False):
+            for entry in entries:
+                if not self._accept_incremental_entry(entry):
+                    return False
+            self._record_client_delivery_entries(entries)
+            return True
+
         staged = copy.copy(self)
         staged._entries = list(self._entries)
         staged._entry_ids = set(self._entry_ids)

@@ -84,7 +84,7 @@ class AsyncDurableWritesMixin:
             self._durable_writer_snapshot = None
             if prepared is not None and prepared[0] != self._transcript_generation:
                 prepared = None
-        return type(self)(
+        writer = type(self)(
             self.root_dir,
             session_id=self.session_id,
             _must_exist=True,
@@ -93,6 +93,8 @@ class AsyncDurableWritesMixin:
             _storage_lease=self._storage_lease,
             _execution_lease=self.execution_lease,
         )
+        writer._discard_on_incremental_validation_failure = True
+        return writer
 
     def _run_durable_write(
         self: ConversationStore,
@@ -190,6 +192,21 @@ class AsyncDurableWritesMixin:
         delta = self._installed_delta_from_baseline(state.log.entries, baseline)
         return replace(state, log=replace(state.log, installed_delta=delta))
 
+    @classmethod
+    def _worker_prefix_matches_baseline(
+        cls,
+        entries: list[ConversationEntry],
+        writer_baseline: tuple[int, bytes],
+        owner_baseline: tuple[int, bytes],
+    ) -> bool:
+        writer_count, digest = writer_baseline
+        owner_count, expected_digest = owner_baseline
+        if writer_count > owner_count or owner_count - writer_count > 64:
+            return False
+        for entry in entries[writer_count:owner_count]:
+            digest = cls._next_entry_prefix_digest(digest, cls._encoded_entry_line(entry))
+        return digest == expected_digest
+
     @staticmethod
     def _linear_suffix(entries: list[ConversationEntry], baseline_count: int) -> bool:
         previous = entries[baseline_count - 1] if baseline_count else None
@@ -207,15 +224,27 @@ class AsyncDurableWritesMixin:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         baseline: tuple[int, bytes],
+        owner_log: tuple[tuple[int, int, int], int],
     ) -> tuple[Any, Any, Any]:
         result, writer, receipts, writer_baseline, reloaded = self._run_durable_write(
             method_name, args, kwargs
         )
-        if writer_baseline == baseline and not reloaded:
-            suffix = tuple(writer._entries[writer_baseline[0] :])
-            if len(suffix) <= 64 and self._linear_suffix(
-                writer._entries, writer_baseline[0]
-            ):
+        owner_identity, owner_offset = owner_log
+        starts_at_owner_prefix = bool(
+            receipts
+            and receipts[0].start_offset == owner_offset
+            and (receipts[0].source_device, receipts[0].source_inode)
+            == owner_identity[:2]
+        )
+        if (
+            not reloaded
+            and starts_at_owner_prefix
+            and self._worker_prefix_matches_baseline(
+                writer._entries, writer_baseline, baseline
+            )
+        ):
+            suffix = tuple(writer._entries[baseline[0] :])
+            if len(suffix) <= 64 and self._linear_suffix(writer._entries, baseline[0]):
                 return (
                     result,
                     _DurableLogDelta(
@@ -415,6 +444,7 @@ class AsyncDurableWritesMixin:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         baseline: tuple[int, bytes],
+        owner_log: tuple[tuple[int, int, int], int],
     ) -> asyncio.Future[Any]:
         with self._durable_write_condition:
             if self._closing or self._closed:
@@ -428,6 +458,7 @@ class AsyncDurableWritesMixin:
                 args,
                 kwargs,
                 baseline,
+                owner_log,
             )
         except BaseException:
             with self._durable_write_condition:
@@ -501,7 +532,10 @@ class AsyncDurableWritesMixin:
                 return function(*args, **kwargs)
             generation = self._transcript_generation
             baseline = (len(self._entries), self._entry_prefix_digest)
-            worker = self._start_durable_write(method_name, args, kwargs, baseline)
+            owner_log = (self._log_identity, self._log_offset)
+            worker = self._start_durable_write(
+                method_name, args, kwargs, baseline, owner_log
+            )
             outcome, cancelled = await self._await_started_worker(worker)
             result, state, receipts = outcome
             if self._transcript_generation == generation:

@@ -950,8 +950,13 @@ async def test_async_linear_append_does_not_snapshot_complete_history(
     entry = await store.append_message_async(
         message(MessageRole.ASSISTANT, "published delta")
     )
+    store.append_message(message(MessageRole.ASSISTANT, "owner suffix"))
+    caught_up = await store.append_message_async(
+        message(MessageRole.ASSISTANT, "published after owner suffix")
+    )
 
-    assert store.entries[-1] == entry
+    assert store.entries[-3].id == entry.id
+    assert store.entries[-1].id == caught_up.id
 
 
 @pytest.mark.asyncio
@@ -1286,6 +1291,31 @@ async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_c
     assert owner_thread not in load_threads
     assert snapshot_threads
     assert owner_thread not in snapshot_threads
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+    assert store.entries == fresh.entries
+
+
+@pytest.mark.asyncio
+async def test_async_linear_foreign_append_uses_full_state_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="foreign-linear-fallback")
+    await store.append_message_async(message(MessageRole.ASSISTANT, "owner"))
+    foreign = ConversationStore(tmp_path, session_id=store.session_id)
+    foreign.append_message(message(MessageRole.ASSISTANT, "foreign"))
+    foreign.close()
+    snapshot_threads: list[int] = []
+    original_snapshot = ConversationStore._snapshot_log_state
+
+    def observed_snapshot(candidate: ConversationStore):
+        snapshot_threads.append(threading.get_ident())
+        return original_snapshot(candidate)
+
+    monkeypatch.setattr(ConversationStore, "_snapshot_log_state", observed_snapshot)
+
+    await store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
+
+    assert snapshot_threads
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries
 
