@@ -1070,7 +1070,7 @@ async def test_cancelled_store_close_is_retained_for_root_wait(tmp_path: Path) -
         (task,) = tuple(owner._store_close_tasks)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(asyncio.shield(task), 10)
         await asyncio.sleep(0)
 
         assert store in owner._stores
