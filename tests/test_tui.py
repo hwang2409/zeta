@@ -6893,6 +6893,19 @@ def test_truncated_response_notice_is_dim() -> None:
     assert not _contains_background_sgr(escaped)
 
 
+def test_turn_end_completion_classification_is_visible() -> None:
+    for completion, expected in (
+        ("refusal", "model refused to answer"),
+        ("content_filter", "model response blocked by content filter"),
+        ("empty", "model returned an empty response"),
+    ):
+        rendered = render_event(
+            StreamEvent(StreamEventType.TURN_END, data={"completion": completion})
+        )
+        assert rendered is not None
+        assert expected in rendered.plain
+
+
 def test_retry_notice_is_dim() -> None:
     rendered = render_event(
         StreamEvent(

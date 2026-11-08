@@ -49,6 +49,7 @@ from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.empty_turn import (
     build_nudge_message,
     build_tool_limit_recovery_message,
+    completion_classification,
     empty_turn_error,
     empty_turn_tool_error,
 )
@@ -56,6 +57,34 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["refusal", "content_filter", "end_turn"])
+async def test_empty_completion_ends_with_classification(
+    tmp_path: Path, stop_reason: str
+) -> None:
+    events = await collect(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(stop_reason=stop_reason)]),
+            ConversationStore(tmp_path),
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("hello", origin=MessageOrigin.USER)
+    )
+
+    turn_end = next(event for event in events if event.type is StreamEventType.TURN_END)
+    assert turn_end.data["completion"] == (
+        stop_reason if stop_reason in {"refusal", "content_filter"} else "empty"
+    )
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+
+
+def test_empty_completion_classification_preserves_provider_reason() -> None:
+    message = Message(MessageRole.ASSISTANT, [])
+
+    assert completion_classification(message, stop_reason="refusal") == "refusal"
+    assert completion_classification(message, stop_reason="content_filter") == "content_filter"
+    assert completion_classification(message, stop_reason="end_turn") == "empty"
 
 
 def test_empty_turn_tool_error_reports_success_state() -> None:
