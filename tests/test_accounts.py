@@ -796,6 +796,7 @@ def test_migration_happy_path_anthropic(tmp_path: Path) -> None:
 def test_migration_bounds_refused_directory_warnings(tmp_path: Path) -> None:
     # a long home path (as on CI runners) must not hide the account name
     home = initialize_storage_home(tmp_path / ("h" * 150))
+    _write_empty_registry(home)
     provider_root = home / "accounts" / "codex"
     provider_root.mkdir(parents=True)
     for index in range(20):
@@ -2136,8 +2137,16 @@ def test_logout_crash_partway_through_cleanup_is_swept(tmp_path: Path) -> None:
     assert not (tmp_path / "account-locks" / account.provider / account.name).exists()
 
 
+def _write_empty_registry(home: Path) -> None:
+    (home / "accounts.json").write_text(
+        json.dumps({"version": 1, "accounts": {}, "defaults": {}, "labels": {}})
+        + "\n"
+    )
+
+
 def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
     initialize_storage_home(tmp_path)
+    _write_empty_registry(tmp_path)
     path = tmp_path / "accounts" / "codex" / ".logout-deadbeef" / "oauth.json"
     path.parent.mkdir(parents=True)
     os.chmod(path.parent, 0o700)
@@ -2146,6 +2155,23 @@ def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
     AccountStore(tmp_path).migrate()
 
     assert not path.parent.exists()
+
+
+def test_login_refuses_to_create_a_registry_that_orphans_existing_accounts(
+    tmp_path: Path,
+) -> None:
+    existing = AccountId("codex", "work")
+    build_account_home(tmp_path, (existing,), available=(existing,))
+    (tmp_path / "accounts.json").unlink()
+    credential = AccountStore(tmp_path).credential_path(existing)
+    before = credential.read_bytes()
+
+    with pytest.raises(AccountError, match="accounts.json is missing"):
+        named_account_credentials(tmp_path, "anthropic", "new").save(tokens())
+    AccountStore(tmp_path).migrate()
+
+    assert credential.read_bytes() == before
+    assert not (tmp_path / "accounts.json").exists()
 
 
 def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> None:

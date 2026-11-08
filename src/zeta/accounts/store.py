@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -19,6 +20,7 @@ from contextlib import (
     contextmanager,
 )
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -64,9 +66,26 @@ from .files import (
 )
 from .publication import atomic_publish, publish_mapping
 
+logger = logging.getLogger(__name__)
 _PROVIDERS = cast(frozenset[str], CLOSED_VARIANTS["account.provider"])
 _MAX_SWEEP_WARNING_PATHS = 5
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+
+class _Registry(Enum):
+    """How accounts.json read; only LOADED may drive a destructive sweep."""
+
+    MISSING = "missing"
+    LOADED = "loaded"
+    BROKEN = "broken"
+
+
+_UNSAFE_REGISTRY_WARNINGS = {
+    _Registry.MISSING: "accounts.json is missing; kept every account directory and "
+    "skipped account cleanup; restore accounts.json, then restart zeta",
+    _Registry.BROKEN: "accounts.json is invalid; kept it and every account directory "
+    "and skipped account cleanup; fix or restore accounts.json, then restart zeta",
+}
 
 
 def _account_label(value: str) -> str:
@@ -505,6 +524,15 @@ class AccountStore:
         value = value or self._read_registry(home_fd)
         self._check_reference_available(value, account, account.name)
         key = str(account)
+        # a new registry that omits existing account dirs makes the next sweep delete them
+        state, _ = self._load_registry(home_fd)
+        if state is _Registry.MISSING and self._has_unregistered_account_directories(
+            home_fd, {key}
+        ):
+            raise AccountError(
+                "accounts.json is missing but other account directories exist; "
+                "restore accounts.json before adding an account"
+            )
         value["accounts"][key] = {
             "provider": account.provider,
             "name": account.name,
@@ -528,7 +556,18 @@ class AccountStore:
                 return ()
             with self._lock_at(home_fd, ".accounts-migration.lock"):
                 with self._registry_guard(home_fd):
-                    self._sweep_orphan_directories(home_fd, warnings)
+                    state, value = self._load_registry(home_fd)
+                    if state is _Registry.LOADED:
+                        self._sweep_orphan_directories(
+                            home_fd, set(value["accounts"]), warnings
+                        )
+                    elif (
+                        state is _Registry.BROKEN
+                        or self._has_unregistered_account_directories(home_fd, set())
+                    ):
+                        warning = _UNSAFE_REGISTRY_WARNINGS[state]
+                        logger.warning("%s", warning)
+                        return (warning,)
                 for provider in ("anthropic", "codex"):
                     self._migrate_provider(home_fd, provider)
         return tuple(warnings)
@@ -570,6 +609,14 @@ class AccountStore:
                 continue
         return orphans
 
+    def _has_unregistered_account_directories(
+        self, home_fd: int, registered: set[str]
+    ) -> bool:
+        return any(
+            root == "accounts"
+            for root, *_ in self._list_orphan_directories(home_fd, registered)
+        )
+
     def _orphan_is_pending_publication(
         self, home_fd: int, root: str, provider: str, name: str
     ) -> bool:
@@ -603,8 +650,10 @@ class AccountStore:
             return sweep_warning_path(self.home / root / provider / name)
         return None
 
-    def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
-        registered, refused = set(self._read_registry(home_fd)["accounts"]), []
+    def _sweep_orphan_directories(
+        self, home_fd: int, registered: set[str], warnings: list[str]
+    ) -> None:
+        refused: list[str] = []
         for root, provider, name, allowed in self._list_orphan_directories(
             home_fd, registered
         ):
@@ -660,6 +709,20 @@ class AccountStore:
             _unlink_legacy(home_fd, legacy_name)
 
     def _read_registry(self, home_fd: int) -> dict[str, Any]:
+        state, value = self._load_registry(home_fd)
+        if state is _Registry.BROKEN:
+            raise AccountError("accounts.json is invalid; use /accounts")
+        return value
+
+    def _load_registry(self, home_fd: int) -> tuple[_Registry, dict[str, Any]]:
+        """Read accounts.json; the value is an empty registry unless LOADED."""
+
+        empty: dict[str, Any] = {
+            "version": 1,
+            "accounts": {},
+            "defaults": {},
+            "labels": {},
+        }
         try:
             for attempt in range(5):
                 try:
@@ -669,7 +732,7 @@ class AccountStore:
                     if attempt == 4:
                         raise
             if raw is None:
-                return {"version": 1, "accounts": {}, "defaults": {}, "labels": {}}
+                return _Registry.MISSING, empty
             value = json.loads(raw)
             if (
                 not isinstance(value, Mapping)
@@ -698,9 +761,9 @@ class AccountStore:
                 require_closed_variant("account.provider", provider)
                 if key not in accounts or not key.startswith(f"{provider}:"):
                     raise ValueError
-            return normalized
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise AccountError("accounts.json is invalid; use /accounts") from exc
+            return _Registry.LOADED, normalized
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return _Registry.BROKEN, empty
 
     def _stage_account_tokens(
         self, account_fd: int, account: AccountId, tokens: OAuthTokens
