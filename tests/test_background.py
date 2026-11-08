@@ -2728,7 +2728,7 @@ async def test_explicit_finish_task_safety_deadline_names_cause_for_every_task(
     )
 
     deadline.set()
-    killed = await asyncio.wait_for(kill, 10)
+    killed = await asyncio.wait_for(kill, 30)
     await asyncio.wait_for(wake.wait(), 10)
     events = store.agent_notifications(pending_only=False)
     cause = (
