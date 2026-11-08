@@ -56,6 +56,7 @@ class ReplayClient:
         # a write to a connection the server closed surfaces on the next read
         try:
             if not self.websocket:
+                # test-contract: transport replay transport reads unix and websocket serve frames
                 line = await await_or_fail(self.reader.readline(), what="unix replay frame")
                 return json.loads(line) if line else None
             first, second = await await_or_fail(self.reader.readexactly(2), what="websocket replay header")
