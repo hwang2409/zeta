@@ -945,26 +945,6 @@ def _public_line_case(
     return merge, final
 
 
-def test_final_group_marker_filters_after_restored_rows_are_removed(tmp_path: Path) -> None:
-    r = tmp_path / "final_group_marker"
-    r.mkdir()
-    merge, final = _public_line_case(
-        r,
-        "def check():\n    return 1\n",
-        "def check():\n    added = 2\n    added = 3\n    return 1\n",
-        "def check():\n    return 3\n",
-        "def check():\n    return 3\n",
-        "def check():\n    added = 2\n    return 3\n",
-    )
-    result = run(r, merge, "--final", final)
-    marker = next(
-        line for line in result.stdout.splitlines() if line.startswith("suggested override: ")
-    )
-    body = r / "body"
-    body.write_text(marker.removeprefix("suggested override: ").replace("<reason>", "intentional"))
-    assert run(r, merge, "--final", final, "--pr-body-file", str(body)).returncode == 0
-
-
 def test_pr_line_final_multiset_and_insertion_table(tmp_path: Path) -> None:
     cases = [
         (
@@ -1017,15 +997,54 @@ def test_pr_line_final_multiset_and_insertion_table(tmp_path: Path) -> None:
             0,
             "clean merge",
         ),
+        (
+            "pr already on main through train",
+            "def check():\n    anchor()\n    tail()\n",
+            "def check():\n    anchor()\n    emit()\n    tail()\n",
+            "def check():\n    anchor()\n    tail()\n    emit()\n",
+            "def check():\n    anchor()\n    tail()\n    emit()\n",
+            "def check():\n    anchor()\n    tail()\n    emit()\n",
+            0,
+            "clean merge",
+        ),
+        (
+            "restored by final with marker",
+            "def check():\n    return 1\n",
+            "def check():\n    added = 2\n    added = 3\n    return 1\n",
+            "def check():\n    return 3\n",
+            "def check():\n    return 3\n",
+            "def check():\n    added = 2\n    return 3\n",
+            1,
+            "suggested override:",
+        ),
     ]
     for name, base, branch, main, merge_text, final, expected, needle in cases:
         r = tmp_path / name.replace(" ", "_")
         r.mkdir()
         merge, final_revision = _public_line_case(r, base, branch, main, merge_text, final)
-        result = run(r, merge, "--final", final_revision)
+        checker_args = (
+            (r, merge)
+            if name == "pr already on main through train"
+            else (r, merge, "--final", final_revision)
+        )
+        result = run(*checker_args)
         output = result.stdout + result.stderr
         assert result.returncode == expected, name
         assert needle in output, name
+        if name == "restored by final with marker":
+            marker = next(
+                line for line in output.splitlines()
+                if line.startswith("suggested override: ")
+            )
+            body = r / "body"
+            body.write_text(
+                marker.removeprefix("suggested override: ").replace(
+                    "<reason>", "intentional"
+                )
+            )
+            assert run(
+                r, merge, "--final", final_revision, "--pr-body-file", str(body)
+            ).returncode == 0
 
 
 def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> None:
