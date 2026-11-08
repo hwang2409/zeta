@@ -136,6 +136,38 @@ class _RetryableError(RuntimeError):
 
 
 
+class _DeadlineBlockedStep:
+    def __init__(self, clock: _ManualClock, deadline: float) -> None:
+        self.clock = clock
+        self.deadline = deadline
+        self.started = asyncio.Event()
+        self.deadline_observed = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def __call__(self, _delay: float | None = None) -> str:
+        self.started.set()
+        try:
+            await self.clock.wait_until(self.deadline)
+            self.deadline_observed.set()
+            await await_or_fail(self.release.wait(), what="release blocked policy step")
+            return "refreshed-token"
+        except asyncio.CancelledError:
+            self.cancelled = True
+            self.deadline_observed.set()
+            raise
+
+
+class _BlockedRefreshAttempt(_SequenceAttempt):
+    def __init__(self, refresh: _DeadlineBlockedStep) -> None:
+        unauthorized = RuntimeError("expired token")
+        unauthorized.status_code = 401  # type: ignore[attr-defined]
+        super().__init__(unauthorized)
+        self.refresh = refresh
+
+    async def refresh_auth(self) -> str:
+        return await self.refresh()
+
 def _control(
     *,
     reset: ResetPolicy = ResetPolicy.NO_RESET,
@@ -266,6 +298,78 @@ async def test_retry_after_and_shared_attempt_budget_are_owner_policy() -> None:
     assert backend.created == 5
     assert len(delays) == 4
     assert all(attempt.closed == 1 for attempt in errors)
+
+
+@pytest.mark.asyncio
+async def test_task_deadline_bounds_blocked_retry_waiter() -> None:
+    clock = _ManualClock()
+    retry_wait = _DeadlineBlockedStep(clock, 30.0)
+    backend = _AttemptBackend(
+        [
+            _SequenceAttempt(_RetryableError("busy")),
+            _SequenceAttempt(
+                AttemptSignal(
+                    TransportActivity.MODEL_PROGRESS,
+                    StreamEvent(StreamEventType.MESSAGE_END),
+                )
+            ),
+        ],
+        clock,
+        wait=retry_wait,
+    )
+    completion = backend.complete([], [], control=_deadline_control(30.0))
+    next_event: asyncio.Task[StreamEvent] | None = None
+    try:
+        retry = await _within(completion.__anext__())
+        assert retry.type is StreamEventType.RETRY
+        next_event = asyncio.create_task(completion.__anext__())
+        await _within(retry_wait.started.wait())
+        clock.advance(30.0)
+        await _within(retry_wait.deadline_observed.wait())
+        retry_wait.release.set()
+        outcome = (await _within(asyncio.gather(next_event, return_exceptions=True)))[0]
+        assert retry_wait.cancelled
+        assert isinstance(outcome, TaskDeadlineExceeded)
+    finally:
+        retry_wait.release.set()
+        if next_event is not None and not next_event.done():
+            next_event.cancel()
+            await _within(asyncio.gather(next_event, return_exceptions=True))
+        await _within(completion.aclose())
+
+
+@pytest.mark.asyncio
+async def test_task_deadline_bounds_blocked_auth_refresh() -> None:
+    clock = _ManualClock()
+    refresh = _DeadlineBlockedStep(clock, 30.0)
+    backend = _AttemptBackend(
+        [
+            _BlockedRefreshAttempt(refresh),
+            _SequenceAttempt(
+                AttemptSignal(
+                    TransportActivity.MODEL_PROGRESS,
+                    StreamEvent(StreamEventType.MESSAGE_END),
+                )
+            ),
+        ],
+        clock,
+    )
+    completion = backend.complete([], [], control=_deadline_control(30.0))
+    next_event = asyncio.create_task(completion.__anext__())
+    try:
+        await _within(refresh.started.wait())
+        clock.advance(30.0)
+        await _within(refresh.deadline_observed.wait())
+        refresh.release.set()
+        outcome = (await _within(asyncio.gather(next_event, return_exceptions=True)))[0]
+        assert refresh.cancelled
+        assert isinstance(outcome, TaskDeadlineExceeded)
+    finally:
+        refresh.release.set()
+        if not next_event.done():
+            next_event.cancel()
+            await _within(asyncio.gather(next_event, return_exceptions=True))
+        await _within(completion.aclose())
 
 
 @pytest.mark.asyncio

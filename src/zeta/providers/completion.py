@@ -563,8 +563,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 error = PrematureCompletionError(
                     "provider stream ended before completion"
                 )
-                retry = await self._retry(error)
-                await self._finish_attempt(error)
+                retry = await self._retry_and_finish(error)
                 if retry:
                     continue
                 self._closed = True
@@ -585,8 +584,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 context = getattr(error, "diagnostic_context", None)
                 if isinstance(context, dict):
                     context["max_progress_gap_s"] = self._maximum_progress_gap
-                retry = await self._retry(error)
-                await self._finish_attempt(error)
+                retry = await self._retry_and_finish(error)
                 if retry:
                     continue
                 self._closed = True
@@ -617,8 +615,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 if isinstance(usage, Mapping):
                     self._retry_usage = dict(usage)
             if event.type is StreamEventType.ERROR and event.error is not None:
-                retry = await self._retry(event.error, event.data)
-                await self._finish_attempt(event.error)
+                retry = await self._retry_and_finish(event.error, event.data)
                 if retry:
                     continue
                 self._closed = True
@@ -647,18 +644,13 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             self._model_deadline,
             float("inf") if task_deadline is None else task_deadline,
         )
-        read_task = asyncio.create_task(attempt.__anext__())
-        timer_task = asyncio.create_task(self._clock.wait_until(deadline))
-        try:
-            done, _ = await asyncio.wait(
-                (read_task, timer_task), return_when=asyncio.FIRST_COMPLETED
+        if task_deadline is not None and task_deadline <= min(
+            self._transport_deadline, self._model_deadline
+        ):
+            deadline_error: BaseException = TaskDeadlineExceeded(
+                "finish-gate task safety bound expired"
             )
-            if read_task in done:
-                return read_task.result()
-            if task_deadline is not None and task_deadline <= min(
-                self._transport_deadline, self._model_deadline
-            ):
-                raise TaskDeadlineExceeded("finish-gate task safety bound expired")
+        else:
             kind = (
                 "model progress"
                 if self._model_deadline < self._transport_deadline
@@ -669,12 +661,15 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 if kind == "model progress"
                 else self._transport_idle
             )
-            raise ProviderStallError(kind, seconds)
-        finally:
-            for task in (read_task, timer_task):
-                if not task.done():
-                    task.cancel()
-            await self._drain_preserving_cancellation(read_task, timer_task)
+            deadline_error = ProviderStallError(kind, seconds)
+        return await self._await_step(
+            attempt.__anext__(),
+            deadline=deadline,
+            deadline_error=deadline_error,
+            deadline_wins_tie=(
+                task_deadline is not None and task_deadline == deadline
+            ),
+        )
 
     def _observe(self, event: StreamEvent) -> None:
         public_output = (
@@ -701,6 +696,16 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         ):
             self.commit()
 
+    async def _retry_and_finish(
+        self,
+        error: BaseException | object,
+        event_data: Mapping[str, Any] | None = None,
+    ) -> bool:
+        try:
+            return await self._retry(error, event_data)
+        finally:
+            await self._finish_attempt(error)
+
     async def _retry(
         self,
         error: BaseException | object,
@@ -723,7 +728,13 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 self._attempt, AuthCapableProviderAttempt
             ):
                 return False
-            self._token = await self._attempt.refresh_auth()
+            self._token = await self._await_step(
+                self._attempt.refresh_auth(),
+                deadline=self._control.task_deadline,
+                deadline_error=TaskDeadlineExceeded(
+                    "finish-gate task safety bound expired"
+                ),
+            )
             self._refreshed = True
             return True
         retryable = retryable_provider_error(error, event_data)
@@ -757,15 +768,45 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         return True
 
     async def _wait_for_retry(self, delay: float) -> None:
-        wait_task = asyncio.create_task(self._wait(delay))
-        abort = self._control.abort
+        await self._await_step(
+            self._wait(delay),
+            deadline=self._control.task_deadline,
+            deadline_error=TaskDeadlineExceeded(
+                "finish-gate task safety bound expired"
+            ),
+            abort=self._control.abort,
+        )
+
+    async def _await_step(
+        self,
+        step: Awaitable[Any],
+        *,
+        deadline: float | None,
+        deadline_error: BaseException,
+        abort: AbortSignal | None = None,
+        deadline_wins_tie: bool = True,
+    ) -> Any:
+        if deadline is None and abort is None:
+            return await step
+        step_task = asyncio.ensure_future(step)
+        timer_task = (
+            asyncio.create_task(self._clock.wait_until(deadline))
+            if deadline is not None
+            else None
+        )
         abort_task = asyncio.create_task(abort.wait()) if abort is not None else None
-        tasks = (wait_task,) if abort_task is None else (wait_task, abort_task)
+        tasks = tuple(
+            task for task in (step_task, timer_task, abort_task) if task is not None
+        )
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if timer_task is not None and timer_task in done and (
+                deadline_wins_tie or step_task not in done
+            ):
+                raise deadline_error
             if abort_task is not None and abort_task in done:
                 raise asyncio.CancelledError
-            await wait_task
+            return step_task.result()
         finally:
             for task in tasks:
                 if not task.done():
@@ -895,25 +936,13 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             raise selected
 
     async def _close_attempt(self, attempt: ProviderAttempt) -> None:
-        deadline = self._control.task_deadline
-        if deadline is None:
-            await attempt.aclose()
-            return
-        close_task = asyncio.create_task(attempt.aclose())
-        timer_task = asyncio.create_task(self._clock.wait_until(deadline))
-        try:
-            done, _ = await asyncio.wait(
-                (close_task, timer_task), return_when=asyncio.FIRST_COMPLETED
-            )
-            if timer_task in done and close_task not in done:
-                close_task.cancel()
-                await self._drain_preserving_cancellation(close_task)
-                raise TaskDeadlineExceeded("finish-gate task safety bound expired")
-            await close_task
-        finally:
-            if not timer_task.done():
-                timer_task.cancel()
-            await self._drain_preserving_cancellation(timer_task)
+        await self._await_step(
+            attempt.aclose(),
+            deadline=self._control.task_deadline,
+            deadline_error=TaskDeadlineExceeded(
+                "finish-gate task safety bound expired"
+            ),
+        )
 
     async def aclose(self) -> None:
         if self._closed and self._attempt is None:
