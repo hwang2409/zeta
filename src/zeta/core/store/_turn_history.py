@@ -6,7 +6,7 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Literal
 
-from ._mutation_commands import _AppendTurnEndCommand
+from ._async_writes import _AppendTurnEndCommand
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry

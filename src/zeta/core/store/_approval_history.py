@@ -8,8 +8,8 @@ from typing import Any
 from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
 from ._approval_display import validated_approval_display
+from ._async_writes import _AppendApprovalHistoryCommand
 from ._incremental_validation import APPROVAL_RESOLUTION_REASONS
-from ._mutation_commands import _AppendApprovalHistoryCommand
 
 
 def validate_approval_history_data(data: Mapping[str, Any]) -> None:

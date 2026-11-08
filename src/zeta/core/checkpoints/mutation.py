@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Protocol
 from ..session_execution import SessionOwnedError
 from ..session_files import read_session_file, session_directory
 from ..store._incremental_validation import TASK_EXITED_NOTIFICATION_KIND
-from ..store._mutation_commands import _StoreMutationCommand
 from . import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -50,6 +49,16 @@ class ConversationDedupeKey:
 
 class ConversationMutation[ResultT](Protocol):
     """Immutable command accepted by the conversation mutation seam."""
+
+
+class _ConditionalStoreMutation[ResultT](Protocol):
+    baseline_count: int | None
+    baseline_digest: bytes | None
+    baseline_patch: Mapping[str, object] | None
+    patch_fields: tuple[str, ...]
+    accept_external_generation: bool
+
+    def apply(self, store: ConversationStore) -> ResultT: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,7 +415,7 @@ def _execute_append[ResultT](
 
 def _execute_store_command[ResultT](
     store: ConversationStore,
-    command: _StoreMutationCommand,
+    command: _ConditionalStoreMutation[ResultT],
     expected_generation: int,
 ) -> CommittedDelta[ResultT]:
     if (
@@ -481,9 +490,7 @@ def execute_mutation[ResultT](
     try:
         if isinstance(command, AppendConversationRows):
             return _execute_append(store, command, expected_generation)  # type: ignore[return-value]
-        if isinstance(command, _StoreMutationCommand):
-            return _execute_store_command(store, command, expected_generation)
-        raise TypeError(f"unsupported conversation mutation: {type(command).__name__}")
+        return _execute_store_command(store, command, expected_generation)  # type: ignore[arg-type]
     finally:
         store.on_entries_installed = installed_callback
 

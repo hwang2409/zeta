@@ -68,7 +68,7 @@ from ._approval_display import (
     normalize_approval_requests,
 )
 from ._approval_history import ApprovalHistoryStoreMixin
-from ._async_writes import AsyncDurableWritesMixin
+from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
 from ._execution_owner import ExecutionOwnerStoreMixin
@@ -78,7 +78,6 @@ from ._incremental_validation import (
 )
 from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
-from ._mutation_commands import _AppendMessageCommand
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,  # noqa: F401 - re-exported by store facade
