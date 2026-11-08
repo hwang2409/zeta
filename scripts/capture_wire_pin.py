@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +15,7 @@ sys.path.insert(0, str(Path.cwd()))
 
 from tests.support.serve_contract import ServeContract
 from zeta.core import session as session_module
+from zeta.storage_format import WRITER_EPOCH, advance
 
 ERGONOMICS_ROWS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("rename_session", {"session_id": "missing", "name": "renamed"}),
@@ -99,7 +102,25 @@ async def _capture(fixture: Path) -> list[dict[str, Any]]:
     session_module.uuid.uuid4 = lambda: session_module.uuid.UUID(
         "00000000-0000-0000-0000-000000000002"
     )
-    contract = await ServeContract.start(Path("/tmp/serve-wire-pin-capture"), "unix")
+    root = Path("/tmp/serve-wire-pin-capture")
+    shutil.rmtree(root, ignore_errors=True)
+    account_home = root / "account-home"
+    account_home.mkdir(parents=True)
+    os.environ["ZETA_ACCOUNT_HOME"] = str(account_home)
+    advance(account_home, expected_epoch=0, target_epoch=WRITER_EPOCH)
+    (account_home / "accounts.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "accounts": {"codex:pin": {"provider": "codex", "name": "pin"}},
+                "defaults": {"codex": "codex:pin"},
+                "labels": {},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    contract = await ServeContract.start(root, "unix")
     try:
         client = await contract.connect("controller")
         await client.request_raw(

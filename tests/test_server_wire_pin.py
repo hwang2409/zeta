@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.serve_contract import ServeContract
+from zeta.storage_format import WRITER_EPOCH, advance
 
 PIN = Path(__file__).parent / "fixtures" / "serve_wire_pin.jsonl"
 PIN_BASE_SHA = "ded830c144474addcf17f950a55540912cb37c53"
@@ -134,7 +135,9 @@ async def test_wire_pin_hello_rows(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
+async def test_real_unix_wire_pin_allows_only_w4_deltas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     metadata, pins = _pin()
     _assert_fixture_shape(metadata, pins)
     groups: dict[tuple[str, str, tuple[str, ...]], list[dict[str, object]]] = {}
@@ -148,6 +151,14 @@ async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
         )
         groups.setdefault(key, []).append(pin)
     for group_index, ((role, version, features), group) in enumerate(groups.items()):
+        account_home = tmp_path / f"account-home-{group_index}"
+        account_home.mkdir()
+        advance(account_home, expected_epoch=0, target_epoch=WRITER_EPOCH)
+        (account_home / "accounts.json").write_text(
+            '{"version":1,"accounts":{"codex:pin":{"provider":"codex","name":"pin"}},'
+            '"defaults":{"codex":"codex:pin"},"labels":{}}\n'
+        )
+        monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(account_home))
         contract = await ServeContract.start(
             tmp_path / f"wire-pin-{group_index}", "unix"
         )
