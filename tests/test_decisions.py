@@ -6,6 +6,7 @@ from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from threading import Event as ThreadEvent
+from threading import Lock as ThreadLock
 from threading import Thread
 from types import SimpleNamespace
 
@@ -434,14 +435,24 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
     unavailable = asyncio.Event()
     recovered = asyncio.Event()
     calls = 0
+    active = 0
+    max_active = 0
+    counter_lock = ThreadLock()
     loop = asyncio.get_running_loop()
 
     def hung_open(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        loop.call_soon_threadsafe(entered.set)
-        release.wait(timeout=10)
-        return real_open(*args, **kwargs)
+        nonlocal calls, active, max_active
+        with counter_lock:
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=10)
+            return real_open(*args, **kwargs)
+        finally:
+            with counter_lock:
+                active -= 1
 
     try:
         await app._decisions_tick()
@@ -470,7 +481,9 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
         recovered.clear()
         release.set()
         await await_or_fail(recovered.wait(), what="late decision scan recovery")
-        assert calls == 1
+        # a panel open that arrives after the shared scan ends may start a new scan;
+        # the invariant is that scans never overlap.
+        assert max_active == 1
         assert "1 attention item" in _rendered_decisions_status(app)
     finally:
         release.set()
