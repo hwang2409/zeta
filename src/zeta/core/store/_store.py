@@ -35,7 +35,7 @@ from ...protocol.types import (
     ToolUseContent,
     require_new_message_origin,
 )
-from ...storage_format import WriterLease, open_writer
+from ...storage_format import WriterLease, open_writer, release_later
 from .. import session_execution
 from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
@@ -250,6 +250,7 @@ class ConversationStore(
                     self._strict_snapshot_sync = False
                 self._release_lease = weakref.finalize(
                     self,
+                    release_later,
                     session_execution.close_store_leases,
                     self._runtime_lease,
                     lease.pop_all(),
