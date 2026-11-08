@@ -8538,6 +8538,38 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         await close_serve(server, writer)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/tmp",
+        "/tmp is full",
+        "/Users/henry/x.py is broken",
+        "/this is pasted prose\nsecond line",
+        "//foo",
+    ],
+)
+@pytest.mark.asyncio
+async def test_serve_slash_run_keeps_slash_like_model_text(
+    tmp_path: Path, text: str
+) -> None:
+    server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "slash-model-text",
+                "slash_run",
+                {"session_id": sid, "text": text},
+            )
+        )[-1]["result"]
+        name = text.split("\n", 1)[0][1:].split(maxsplit=1)[0]
+        assert result == {"kind": "unknown", "name": name}
+    finally:
+        await close_serve(server, writer)
+
+
 @pytest.mark.asyncio
 async def test_serve_plan_prompt_returns_opaque_input_id(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path / "home", port=0, provider="codex")
@@ -9263,9 +9295,18 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         result = (await run("/fork"))["result"]
         assert result == {"kind": "client_only", "name": "fork"}
 
-        # Unknown commands are rejected structurally, never posted to the model.
-        result = (await run("/nosuchcommand"))["result"]
-        assert result == {"kind": "unknown", "name": "nosuchcommand"}
+        # Unknown slash-safe commands return a visible error, never model input.
+        result = (await run("/statu"))["result"]
+        assert result == {
+            "kind": "error",
+            "text": (
+                "unknown command /statu. type // to send it as text. "
+                "did you mean /status?"
+            ),
+        }
+        # Paths remain unhandled by the shared slash dispatcher.
+        result = (await run("/Users/henry/x"))["result"]
+        assert result["kind"] == "unknown"
 
         # Text that does not start with `/` is a shape error, not a passthrough.
         error = (await run("hello"))["error"]
@@ -10567,6 +10608,102 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(
                 await asyncio.sleep(0)
         assert len(backend.calls) == 1
         assert store.agent_notifications() == []
+    finally:
+        await close_serve(server, writer)
+
+
+def _persisted_home_bytes(home: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(home)): path.read_bytes()
+        for path in home.rglob("*")
+        if path.is_file() and not path.name.startswith(".storage-format")
+    }
+
+
+@pytest.mark.parametrize("bad_row", [b'{"broken":\n', b'{"broken":'])
+@pytest.mark.asyncio
+async def test_epoch_two_serve_does_not_offer_or_run_transcript_repair(
+    tmp_path: Path,
+    bad_row: bytes,
+) -> None:
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    assert server.runtime.opened is not None
+    transcript = server.runtime.opened.store.path
+    active_session_id = (
+        await _request(reader, writer, 3, "new_session", {"provider": "codex"})
+    )[-1]["result"]["session"]["session_id"]
+    transcript.write_bytes(transcript.read_bytes() + bad_row)
+    unchanged = _persisted_home_bytes(tmp_path)
+    expected_error = {
+        "code": -32013,
+        "message": (
+            "transcript repair needs the stored-format upgrade "
+            "(home epoch 2, needs 4)"
+        ),
+        "data": {
+            "code": "transcript_repair_requires_upgrade",
+            "home_epoch": 2,
+            "required_epoch": 4,
+        },
+    }
+    try:
+        commands = (
+            await _request(
+                reader, writer, 4, "slash_list", {"session_id": active_session_id}
+            )
+        )[-1]["result"]["commands"]
+        assert "repair-transcript" not in {command["name"] for command in commands}
+
+        direct = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "repair_transcript",
+                {"session_id": session_id, "confirm": True},
+            )
+        )[-1]
+        assert direct == {"jsonrpc": "2.0", "id": 5, "error": expected_error}
+
+        slash = (
+            await _request(
+                reader,
+                writer,
+                6,
+                "slash_run",
+                {
+                    "session_id": active_session_id,
+                    "text": f"/repair-transcript {session_id} confirm",
+                },
+            )
+        )[-1]
+        assert slash == {"jsonrpc": "2.0", "id": 6, "error": expected_error}
+        assert _persisted_home_bytes(tmp_path) == unchanged
+
+        if bad_row.endswith(b"\n"):
+            corrupt = (
+                await _request(
+                    reader, writer, 7, "resume", {"session_id": session_id}
+                )
+            )[-1]["error"]
+            assert corrupt == {
+                "code": -32000,
+                "message": (
+                    "transcript terminated invalid conversation row at row 2 "
+                    f"(session {session_id})"
+                ),
+                "data": {
+                    "code": "corrupt_transcript",
+                    "kind": "invalid_row",
+                    "row": 2,
+                    "repairable": True,
+                    "session_id": session_id,
+                    "actions": [],
+                },
+            }
+            assert _persisted_home_bytes(tmp_path) == unchanged
     finally:
         await close_serve(server, writer)
 

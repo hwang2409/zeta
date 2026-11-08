@@ -28,7 +28,10 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
-from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
+from ..core.transcript_recovery.runtime import (
+    repair_transcript_for_runtime,
+    transcript_repair_available,
+)
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
@@ -496,7 +499,14 @@ async def list_commands(
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
-    entries = _entries_from_registry(registry, include_unavailable=include_unavailable)
+    repair_available = transcript_repair_available(runtime.manager)
+    entries = [
+        entry
+        for entry in _entries_from_registry(
+            registry, include_unavailable=include_unavailable
+        )
+        if repair_available or entry.name != "repair-transcript"
+    ]
     return {
         "commands": [entry.to_dict() for entry in entries],
         "notices": list(registry.notices),
@@ -542,7 +552,7 @@ async def run_command(
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
-    if not text.startswith("/") or text.startswith("//"):
+    if not text.startswith("/"):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must start with '/'")
     first_line = text.split("\n", 1)[0]
     parts = first_line[1:].split(maxsplit=1)
