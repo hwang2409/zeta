@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import gc
 import multiprocessing
@@ -20,7 +21,7 @@ from tests.test_session_execution_owner import (
 from zeta.core.session import SessionManager
 from zeta.server import server as server_module
 from zeta.server.server import ZetaServer
-from zeta.storage_format import release_later
+from zeta.storage_format import drain_releases, release_later
 
 _DEADLINE_SECONDS = 10
 
@@ -36,14 +37,32 @@ def _exclusive_flock_free(path: Path) -> bool:
     return True
 
 
-async def _released_while_idle(path: Path) -> bool:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _DEADLINE_SECONDS
-    while loop.time() < deadline:
-        if _exclusive_flock_free(path):
-            return True
-        await asyncio.sleep(0.01)
-    return False
+class _DrainProbe:
+    """Counts serve's idle drains so the test waits on them, not on a clock."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._count = 0
+        self._waiters: list[tuple[int, asyncio.Future[None]]] = []
+
+    def __call__(self) -> None:
+        drain_releases()
+        self._loop.call_soon_threadsafe(self._ran)
+
+    def _ran(self) -> None:
+        self._count += 1
+        for target, waiter in self._waiters:
+            if self._count >= target and not waiter.done():
+                waiter.set_result(None)
+
+    async def idle_ticks(self) -> None:
+        """Wait for two drains: the first may have started before the caller."""
+
+        waiter = self._loop.create_future()
+        self._waiters.append((self._count + 2, waiter))
+        # on the base no drain runs; the release assertion that follows fails
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(waiter, _DEADLINE_SECONDS)
 
 
 def _failing_release() -> None:
@@ -63,6 +82,8 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
     manager = SessionManager(home, owner_surface="serve")
 
     async def exercise() -> None:
+        probe = _DrainProbe(asyncio.get_running_loop())
+        monkeypatch.setattr(server_module, "drain_releases", probe, raising=False)
         server = ZetaServer(home=home, port=0, provider="codex")
         await server.start()
         try:
@@ -76,7 +97,8 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
                 "the finalizer must defer the release, not run it"
             )
 
-            assert await _released_while_idle(lease_path), (
+            await probe.idle_ticks()
+            assert _exclusive_flock_free(lease_path), (
                 "an idle serve kept a GC-released session lease"
             )
 
@@ -96,7 +118,8 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
             again._cycle = again
             del again
             gc.collect()
-            assert await _released_while_idle(lease_path), (
+            await probe.idle_ticks()
+            assert _exclusive_flock_free(lease_path), (
                 "the idle drain stopped after a failed release"
             )
         finally:

@@ -74,7 +74,7 @@ async def _drain_released_leases() -> None:
         try:
             # a release may wait on a registry lock another thread holds
             await asyncio.to_thread(drain_releases)
-        except Exception:  # noqa: BLE001 - a failed drain must not stop serve
+        except Exception:  # a failed drain must not stop serve
             logger.exception("draining released leases failed")
 
 
