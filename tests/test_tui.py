@@ -77,6 +77,8 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
+from zeta.attention_decisions import DecisionItem
+from zeta.attention_records import AttentionRecord
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -101,6 +103,7 @@ from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
+from zeta.tools._shared.process import BackgroundTaskInfo
 from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
@@ -160,6 +163,8 @@ from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
+from zeta.tui.cards.decisions import DecisionsPanel
+from zeta.tui.cards.tasks_panel import BackgroundTasksPanel
 from zeta.tui.cards.tool import TOOL_CARD_REGISTRY
 from zeta.tui.layout import (
     QueuedPanel,
@@ -169,6 +174,7 @@ from zeta.tui.layout import (
     queued_lines,
     queued_panel,
 )
+from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import (
     STREAM_EVENTS_HANDLED_ELSEWHERE,
     STREAM_EVENTS_HIDDEN,
@@ -4959,6 +4965,75 @@ def test_agent_rendering_stays_on_one_status_line() -> None:
     assert isinstance(progress, Panel)
 
 
+def _render_overlay_at_80(lines: list[list[tuple[str, str]]]) -> list[str]:
+    control = OverlayControl()
+    control.set_lines(lines)
+    content = control.create_content(width=72, height=30)
+    return [
+        "".join(fragment[1] for fragment in content.get_line(index)).rstrip()
+        for index in range(content.line_count)
+    ]
+
+
+def test_decisions_panel_wraps_long_paths_at_a_separator() -> None:
+    path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
+    record = AttentionRecord(
+        id="a" * 32,
+        created_at="2026-01-01T00:00:00Z",
+        session_id="1" * 32,
+        project_id="p_test",
+        entry_id=None,
+        entry_seq=None,
+        lane="orchestrator",
+        title="Choose path",
+        why=f"{path}verylongfilenamewithoutbreaks",
+        options=(),
+        recommendation=None,
+        status="open",
+    )
+    panel = DecisionsPanel()
+    panel.set_items([DecisionItem(record.session_id, "p_test", "project", record)])
+
+    rendered = _render_overlay_at_80(panel.render_lines())
+    content = [line.strip("│ ") for line in rendered]
+
+    assert f"Why: {path}" in content
+    assert "verylongfilenamewithoutbreaks" in content
+    assert all(cell_len(line) <= 72 for line in rendered)
+
+
+def test_tasks_panel_wraps_long_commands_at_a_separator() -> None:
+    path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
+    panel = BackgroundTasksPanel()
+    panel.set_tasks(
+        [
+            BackgroundTaskInfo(
+                task_id="task-path",
+                command=f"python {path}verylongfilenamewithoutbreaks",
+                pid=42,
+                owner="run_background",
+                running=True,
+                exit_code=None,
+                note=None,
+                terminal_phase=None,
+                started_at=0.0,
+                ended_at=None,
+                output_bytes=0,
+                output_lines=0,
+            )
+        ],
+        now=1.0,
+    )
+    assert panel.open_details() is not None
+
+    rendered = _render_overlay_at_80(panel.render_lines())
+    content = [line.strip("│ ") for line in rendered]
+
+    assert path in content
+    assert "verylongfilenamewithoutbreaks" in content
+    assert all(cell_len(line) <= 72 for line in rendered)
+
+
 def test_idle_agent_card_reports_count_fd_floor_and_warning(tmp_path: Path) -> None:
     from zeta.tui.cards.agent_sync import AgentTranscriptTreeSnapshot
 
@@ -6577,6 +6652,64 @@ async def test_status_card_wraps_complete_project_context_health(
         )
 
         assert expected in compact
+        assert all(cell_len(line) <= width for line in rendered_lines)
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+async def test_status_card_wraps_long_path_at_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    width = 40
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    path = "/Users/henry/zeta/wrap-word-boundary/long-token"
+    status = SlashStatus(
+        session_id="status-wrap",
+        provider="codex",
+        model="offline",
+        retained_tail=0,
+        tokens_used_this_session=0,
+        tokens_in_current_context=None,
+        compaction_marker_count=0,
+        pending_approvals=(),
+        context_files=(path,),
+    )
+    monkeypatch.setattr(app, "slash_status", lambda: status)
+
+    try:
+        app.slash_status_command("")
+        screen = render_full_screen(session, width, height=60)
+        with set_app(session.app):
+            screen.draw_all_floats()
+        rendered_lines = [
+            "".join(screen.data_buffer[row][column].char for column in range(width)).rstrip()
+            for row in range(60)
+        ]
+        path_lines = [
+            line.strip(" │")
+            for line in rendered_lines
+            if "INSERT" not in line
+            and any(part in line for part in ("Users", "wrap-word-boundary", "long-token"))
+        ]
+
+        assert path_lines
+        assert "long-token" in "".join(path_lines)
+        if width == 40:
+            assert path_lines[0] == "context_files: /Users/henry/zeta/"
+        else:
+            assert path_lines == [f"context_files: {path}"]
         assert all(cell_len(line) <= width for line in rendered_lines)
     finally:
         await app.close()
