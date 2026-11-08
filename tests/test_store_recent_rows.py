@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from zeta.core.store import ConversationStore
-from zeta.core.store.recent_rows import (
+from zeta.core.store import (
     RECENT_ROW_WINDOW,
     ApprovalHistory,
     ApprovalRequest,
     ApprovalResolution,
     AssistantResponseAfter,
+    ConversationStore,
     DeliveredMessage,
     ToolResult,
     UserTurnMessageAfter,

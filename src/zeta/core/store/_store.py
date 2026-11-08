@@ -72,7 +72,6 @@ from ._approval_display import (
     ApprovalAuditRequest,
     normalize_approval_requests,
 )
-from ._approval_history import ApprovalHistoryStoreMixin
 from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
@@ -91,6 +90,7 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._row_history import ApprovalHistoryStoreMixin, RecentRowsMixin
 from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin
 from ._step_delivery import StepDeliveryStoreMixin
@@ -101,7 +101,6 @@ from ._validation import (
     NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
 )
-from .recent_rows import RecentRowsMixin
 
 
 class ConversationStore(
