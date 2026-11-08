@@ -1708,9 +1708,7 @@ async def test_off_loop_refresh_cancellation_finalizes_submitted_work(
     # test-contract: seam blocks the worker before write ownership
     monkeypatch.setattr(ConversationStore, "_before_committed_mutation", blocked_load)
     # test-contract: seam observes the selected cancellation policy
-    monkeypatch.setattr(
-        store, "_submitted_mutation_cancelled", observe_cancellation
-    )
+    monkeypatch.setattr(store, "_submitted_mutation_cancelled", observe_cancellation)
     refresh = asyncio.create_task(store._refresh_off_loop())
     assert await asyncio.to_thread(started.wait, 10)
     refresh.cancel()
@@ -1749,9 +1747,7 @@ async def test_async_writes_reuse_one_detached_store_open(
     await await_or_fail(
         asyncio.gather(
             store.append_pending_prompt_async("follow up"),
-            store.append_message_async(
-                message(MessageRole.ASSISTANT, "done")
-            ),
+            store.append_message_async(message(MessageRole.ASSISTANT, "done")),
         ),
         what="test await",
     )
@@ -1829,10 +1825,8 @@ async def test_async_write_cancelled_before_worker_start_writes_nothing(
         raise AssertionError("worker started")
 
     # test-contract: seam proves cancellation prevents worker submission
-    monkeypatch.setattr(store, "_start_committed_mutation", block_start)
-    task = asyncio.create_task(
-        store.append_pending_prompt_async("nope")
-    )
+    monkeypatch.setattr(store, "_run_committed_mutation", block_start)
+    task = asyncio.create_task(store.append_pending_prompt_async("nope"))
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await await_or_fail(task, what="test await")
@@ -1853,9 +1847,7 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
         assert release_fsync.wait(timeout=5)
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
-        task = asyncio.create_task(
-            store.append_pending_prompt_async("durable")
-        )
+        task = asyncio.create_task(store.append_pending_prompt_async("durable"))
         assert await asyncio.to_thread(fsync_started.wait, 2)
         task.cancel()
         release_fsync.set()
