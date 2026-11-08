@@ -737,7 +737,7 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
             await asyncio.wait_for(child_loop.close(), 10)
             child_store.close()
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
