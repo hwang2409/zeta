@@ -1183,13 +1183,12 @@ def main() -> int:
         == git("rev-parse", f"{final_revision}^{{commit}}").strip()
     ):
         final_revision = None
-    if final_revision:
+    final_items = {}
+    final_sources = {}
+    final_error_path = None
+    final_lines = []
+    if error and final_revision:
         final_items, final_sources, final_error_path, final_lines = _final_index(final_revision)
-    else:
-        final_items = {}
-        final_sources = {}
-        final_error_path = None
-        final_lines = []
     if error:
         return _parse_error_status(
             error,
@@ -1210,7 +1209,8 @@ def main() -> int:
         _element_findings(old_items, main_items, branch_items, merge_items, unresolved)
     )
     findings.extend(line_findings)
-    if final_revision:
+    if final_revision and findings:
+        final_items, final_sources, final_error_path, final_lines = _final_index(final_revision)
         findings = _report_final_moves(findings, final_items, final_lines)
     findings = _filter_findings(findings, text)
     if findings:
