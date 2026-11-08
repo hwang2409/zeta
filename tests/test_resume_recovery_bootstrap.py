@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.support.fake_backend import FakeBackend
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.conversation_channel import ConversationChannel
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.session import SessionManager
@@ -23,7 +23,9 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.server.runtime import ServerRuntime
+from zeta.skills import SkillCatalog
 
 
 def _runtime(home: Path, cwd: Path) -> ServerRuntime:
@@ -64,6 +66,65 @@ def _seed_session(home: Path, cwd: Path, *, children: int = 0) -> str:
     session_id = store.session_id
     store.close()
     return session_id
+
+
+@pytest.mark.asyncio
+async def test_resume_activation_and_stage_reads_do_not_encode_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="read-only-delivery")
+    for index in range(200):
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"historical-{index}")]),
+                MessageOrigin.USER,
+            )
+        )
+    historical_ids = {entry.id for entry in store.entries}
+    store._prepare_durable_writer_snapshot()
+    historical_encodes = 0
+    original_encode = ConversationStore._encoded_entry_line
+
+    def count_historical(entry):
+        nonlocal historical_encodes
+        if entry.id in historical_ids:
+            historical_encodes += 1
+        return original_encode(entry)
+
+    backend_counts: list[int] = []
+
+    def serialize(_messages, _tool_schemas) -> bytes:
+        backend_counts.append(historical_encodes)
+        return b"request"
+
+    monkeypatch.setattr(
+        ConversationStore, "_encoded_entry_line", staticmethod(count_historical)
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")]),
+            ScriptedTurn([TextContent("second")]),
+        ],
+        request_serializer=serialize,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        skill_catalog=SkillCatalog.empty(),
+        max_turns=2,
+        skip_mcp_mount=True,
+    )
+    try:
+        await loop.activate()
+        activation_encodes = historical_encodes
+        for prompt in ("first turn", "second turn"):
+            async for _event in loop.run_turn(prompt, origin=MessageOrigin.USER):
+                pass
+    finally:
+        await loop.close(background_task_cause="test cleanup")
+
+    assert activation_encodes == 0, "activation encoded historical rows"
+    assert backend_counts == [0, 0], "delivery staging encoded historical rows"
 
 
 @pytest.mark.asyncio

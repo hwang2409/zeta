@@ -935,6 +935,31 @@ def test_installed_hook_serializes_two_threads_in_durable_order(
 
 
 @pytest.mark.asyncio
+async def test_async_linear_append_does_not_snapshot_complete_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="async-delta-publication")
+    store.append_many([("warning", {"message": str(index)}) for index in range(400)])
+    store._prepare_durable_writer_snapshot()
+
+    def reject_snapshot(_store: ConversationStore) -> None:
+        raise AssertionError("ordinary async append copied complete store state")
+
+    monkeypatch.setattr(ConversationStore, "_snapshot_log_state", reject_snapshot)
+
+    entry = await store.append_message_async(
+        message(MessageRole.ASSISTANT, "published delta")
+    )
+    store.append_message(message(MessageRole.ASSISTANT, "owner suffix"))
+    caught_up = await store.append_message_async(
+        message(MessageRole.ASSISTANT, "published after owner suffix")
+    )
+
+    assert store.entries[-3].id == entry.id
+    assert store.entries[-1].id == caught_up.id
+
+
+@pytest.mark.asyncio
 async def test_async_appends_encode_only_new_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

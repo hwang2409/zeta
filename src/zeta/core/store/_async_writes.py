@@ -18,6 +18,19 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
+class _DurableLogDelta:
+    """Small worker-validated suffix plus the durable log facts it produced."""
+
+    entries: tuple[ConversationEntry, ...]
+    installed_delta: InstalledEntriesDelta
+    entry_prefix_digest: bytes
+    log_identity: tuple[int, int, int]
+    log_offset: int
+    log_mtime_ns: int
+    log_prefix_fingerprint: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class _DetachedConversationState:
     """Durable fields that child recovery can change."""
 
@@ -83,7 +96,7 @@ class AsyncDurableWritesMixin:
             self._durable_writer_snapshot = None
             if prepared is not None and prepared[0] != self._transcript_generation:
                 prepared = None
-        return type(self)(
+        writer = type(self)(
             self.root_dir,
             session_id=self.session_id,
             _must_exist=True,
@@ -92,6 +105,8 @@ class AsyncDurableWritesMixin:
             _storage_lease=self._storage_lease,
             _execution_lease=self.execution_lease,
         )
+        writer._discard_on_incremental_validation_failure = True
+        return writer
 
     def _run_durable_write(
         self: ConversationStore,
@@ -112,10 +127,9 @@ class AsyncDurableWritesMixin:
             )
             full_reload_count = writer._full_reload_count
             result = getattr(writer, method_name)(*args, **kwargs)
-            state = writer._snapshot_log_state()
             return (
                 result,
-                state,
+                writer,
                 writer.take_persisted_appends(),
                 writer_baseline,
                 writer._full_reload_count != full_reload_count,
@@ -190,6 +204,21 @@ class AsyncDurableWritesMixin:
         delta = self._installed_delta_from_baseline(state.log.entries, baseline)
         return replace(state, log=replace(state.log, installed_delta=delta))
 
+    @classmethod
+    def _worker_prefix_matches_baseline(
+        cls,
+        entries: list[ConversationEntry],
+        writer_baseline: tuple[int, bytes],
+        owner_baseline: tuple[int, bytes],
+    ) -> bool:
+        writer_count, digest = writer_baseline
+        owner_count, expected_digest = owner_baseline
+        if writer_count > owner_count or owner_count - writer_count > 64:
+            return False
+        for entry in entries[writer_count:owner_count]:
+            digest = cls._next_entry_prefix_digest(digest, cls._encoded_entry_line(entry))
+        return digest == expected_digest
+
     @staticmethod
     def _linear_suffix(entries: list[ConversationEntry], baseline_count: int) -> bool:
         previous = entries[baseline_count - 1] if baseline_count else None
@@ -207,16 +236,43 @@ class AsyncDurableWritesMixin:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         baseline: tuple[int, bytes],
+        owner_log: tuple[tuple[int, int, int], int],
     ) -> tuple[Any, Any, Any]:
-        result, state, receipts, writer_baseline, reloaded = self._run_durable_write(
+        result, writer, receipts, writer_baseline, reloaded = self._run_durable_write(
             method_name, args, kwargs
         )
-        if writer_baseline == baseline and not reloaded:
-            delta = self._owned_installed_delta(
-                tuple(state.entries[writer_baseline[0] :])
+        owner_identity, owner_offset = owner_log
+        starts_at_owner_prefix = bool(
+            receipts
+            and receipts[0].start_offset == owner_offset
+            and (receipts[0].source_device, receipts[0].source_inode)
+            == owner_identity[:2]
+        )
+        if (
+            not reloaded
+            and starts_at_owner_prefix
+            and self._worker_prefix_matches_baseline(
+                writer._entries, writer_baseline, baseline
             )
-        else:
-            delta = self._installed_delta_from_baseline(state.entries, baseline)
+        ):
+            suffix = tuple(writer._entries[baseline[0] :])
+            if len(suffix) <= 64 and self._linear_suffix(writer._entries, baseline[0]):
+                return (
+                    result,
+                    _DurableLogDelta(
+                        entries=self._owned_installed_delta(suffix),
+                        installed_delta=self._owned_installed_delta(suffix),
+                        entry_prefix_digest=writer._entry_prefix_digest,
+                        log_identity=writer._log_identity,
+                        log_offset=writer._log_offset,
+                        log_mtime_ns=writer._log_mtime_ns,
+                        log_prefix_fingerprint=writer._log_prefix_fingerprint,
+                    ),
+                    receipts,
+                )
+
+        state = writer._snapshot_log_state()
+        delta = self._installed_delta_from_baseline(state.entries, baseline)
         if delta != "reset" and (
             len(delta) > 64 or not self._linear_suffix(state.entries, baseline[0])
         ):
@@ -303,38 +359,46 @@ class AsyncDurableWritesMixin:
 
     def _publish_log_state(
         self: ConversationStore,
-        state: _DetachedLogState,
+        state: _DetachedLogState | _DurableLogDelta,
         generation: int,
         receipts: Any,
-    ) -> tuple[_DetachedLogState, InstalledEntriesDelta]:
+    ) -> tuple[_DetachedLogState | _DurableLogDelta, InstalledEntriesDelta]:
         """Publish one durable write unless a newer owner snapshot is authoritative."""
-        released_log = state
-        installed_delta = ()
+        released_log: _DetachedLogState | _DurableLogDelta = state
+        installed_delta: InstalledEntriesDelta = ()
         with self._durable_write_condition:
             if self._closing or self._closed:
                 return released_log, installed_delta
             if self._transcript_generation == generation:
                 installed_delta = state.installed_delta
-                publication_delta = state.publication_delta
-                if publication_delta == "reset":
-                    released_log = self._install_log_state(state)
-                else:
-                    entries = list(publication_delta)
+                if isinstance(state, _DurableLogDelta):
+                    entries = list(state.entries)
                     if entries:
                         self._before_incremental_state_install()
                         self._install_validated_linear_entries(entries)
                         self._record_client_delivery_entries(entries)
                         self._transcript_generation += 1
-                    self._entry_prefix_digest = state.entry_prefix_digest
-                    self._log_identity = state.log_identity
-                    self._log_offset = state.log_offset
-                    self._log_mtime_ns = state.log_mtime_ns
-                    self._log_prefix_fingerprint = state.log_prefix_fingerprint
+                elif state.publication_delta == "reset":
+                    released_log = self._install_log_state(state)
+                else:
+                    entries = list(state.publication_delta)
+                    if entries:
+                        self._before_incremental_state_install()
+                        self._install_validated_linear_entries(entries)
+                        self._record_client_delivery_entries(entries)
+                        self._transcript_generation += 1
+                self._entry_prefix_digest = state.entry_prefix_digest
+                self._log_identity = state.log_identity
+                self._log_offset = state.log_offset
+                self._log_mtime_ns = state.log_mtime_ns
+                self._log_prefix_fingerprint = state.log_prefix_fingerprint
             self._accept_persisted_appends(receipts)
         return released_log, installed_delta
 
     @staticmethod
-    def _release_detached_log_state(state: _DetachedLogState) -> None:
+    def _release_detached_log_state(
+        state: _DetachedLogState | _DurableLogDelta,
+    ) -> None:
         """Drop superseded transcript objects on a worker thread."""
         del state
 
@@ -349,7 +413,7 @@ class AsyncDurableWritesMixin:
                 cancelled = True
 
     async def _release_log_state_off_loop(
-        self: ConversationStore, state: _DetachedLogState
+        self: ConversationStore, state: _DetachedLogState | _DurableLogDelta
     ) -> bool:
         loop = asyncio.get_running_loop()
         release = loop.run_in_executor(None, self._release_detached_log_state, state)
@@ -392,6 +456,7 @@ class AsyncDurableWritesMixin:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         baseline: tuple[int, bytes],
+        owner_log: tuple[tuple[int, int, int], int],
     ) -> asyncio.Future[Any]:
         with self._durable_write_condition:
             if self._closing or self._closed:
@@ -405,6 +470,7 @@ class AsyncDurableWritesMixin:
                 args,
                 kwargs,
                 baseline,
+                owner_log,
             )
         except BaseException:
             with self._durable_write_condition:
@@ -478,7 +544,10 @@ class AsyncDurableWritesMixin:
                 return function(*args, **kwargs)
             generation = self._transcript_generation
             baseline = (len(self._entries), self._entry_prefix_digest)
-            worker = self._start_durable_write(method_name, args, kwargs, baseline)
+            owner_log = (self._log_identity, self._log_offset)
+            worker = self._start_durable_write(
+                method_name, args, kwargs, baseline, owner_log
+            )
             outcome, cancelled = await self._await_started_worker(worker)
             result, state, receipts = outcome
             if self._transcript_generation == generation:
