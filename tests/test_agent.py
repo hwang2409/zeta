@@ -14,7 +14,7 @@ from functools import wraps
 from io import StringIO
 from itertools import pairwise
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -1665,14 +1665,15 @@ class FinishGateBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
-        yield StreamEvent(
-            StreamEventType.MESSAGE_END,
-            message=Message(MessageRole.ASSISTANT, blocks),
-        )
+        # the completion owner closes the stream at MESSAGE_END; signal first.
         if gate is not None:
             self.gate_response_completed.set()
             if self.gate_calls == 3:
                 self.model_bound_reached.set()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
 
 
 class PostCapBudgetBackend(CompletionBackend):
@@ -1754,12 +1755,13 @@ class PostCapBudgetBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        # the completion owner closes the stream at MESSAGE_END; signal first.
+        if gate and self.gate_calls == 4:
+            self.post_cap_exhausted.set()
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
         )
-        if gate and self.gate_calls == 4:
-            self.post_cap_exhausted.set()
 
 
 class FollowUpFinishGateBackend(CompletionBackend):
@@ -11207,8 +11209,11 @@ async def test_subagent_pending_delivery_wins_at_recovery_cap(
             super().__init__(turns)
             self.loop: AgentLoop | None = None
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
-            async for event in super().complete(messages, tool_schemas):
+            async for event in FakeBackend.complete.__wrapped__(
+                self, messages, tool_schemas
+            ):
                 if len(self.calls) == 8 and event.type is StreamEventType.MESSAGE_END:
                     assert self.loop is not None
                     flow = await self.loop._ensure_step_delivery()
@@ -13930,16 +13935,17 @@ async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
         description="owned child",
         parent_instance_id="root:1",
     )
-    original_complete = backend.complete
+    raw_complete = FakeBackend.complete.__wrapped__
 
-    async def release_owned_work(messages, tool_schemas):
+    @owned_completion
+    async def release_owned_work(self, messages, tool_schemas):
         if len(backend.calls) == 1:
             loop._background_owner.unregister("root:1:1")
             owned.cancel()
-        async for event in original_complete(messages, tool_schemas):
+        async for event in raw_complete(self, messages, tool_schemas):
             yield event
 
-    backend.complete = release_owned_work
+    backend.complete = MethodType(release_owned_work, backend)
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.AGENT_PROMPT))
         assert len(backend.calls) == 2

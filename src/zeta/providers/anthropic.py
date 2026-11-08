@@ -46,6 +46,7 @@ from .completion import (
     CompletionRun,
     ProviderAttempt,
     complete as own_completion,
+    is_completion_sentinel,
     report_provider_record,
 )
 from .stream_diagnostics import Cause, StreamDiagnostics
@@ -547,6 +548,7 @@ class AnthropicBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         stream_context = None
         entered = False
+        completed = False
         primary_exception: BaseException | None = None
         try:
             token = token if token is not None else await self.token_store.access_token(client)
@@ -605,11 +607,15 @@ class AnthropicBackend(CompletionBackend):
                     stream_started_at=stream_started_at,
                     stall_seconds=self.stall_seconds,
                 ):
+                    completed = is_completion_sentinel(event)
                     yield event
             except AnthropicBackendError as exc:
                 primary_exception = exc
             except httpx.HTTPError as exc:
                 primary_exception = request_error(exc, AnthropicHTTPError)
+            except GeneratorExit as exc:
+                # the owner closes a completed response: the success path.
+                primary_exception = None if completed else exc
             except BaseException as exc:
                 if task_is_cancelling() and not is_control_exception(exc):
                     primary_exception = asyncio.CancelledError()

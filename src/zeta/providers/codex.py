@@ -36,6 +36,7 @@ from .completion import (
     CompletionRun,
     ProviderAttempt,
     complete as own_completion,
+    is_completion_sentinel,
     report_provider_record,
 )
 from .codex_payload import (
@@ -243,6 +244,7 @@ class CodexBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         stream_context: Any = None
         entered = False
+        completed = False
         primary_exception: BaseException | None = None
         try:
             access_token = (
@@ -287,11 +289,15 @@ class CodexBackend(CompletionBackend):
                     self.stall_seconds,
                     diagnostics_path=self.diagnostics_path,
                 ):
+                    completed = is_completion_sentinel(event)
                     yield event
             except CodexBackendError as exc:
                 primary_exception = exc
             except httpx.HTTPError as exc:
                 primary_exception = request_error(exc, CodexHTTPError)
+            except GeneratorExit as exc:
+                # the owner closes a completed response: the success path.
+                primary_exception = None if completed else exc
             except BaseException as exc:
                 if task_is_cancelling() and not is_control_exception(exc):
                     primary_exception = asyncio.CancelledError()
@@ -397,6 +403,15 @@ async def _decode_response(
     reassembly = _ReassemblyState()
     finished = StreamFinished()
     progress = StreamProgressDiagnostics()
+
+    def record_mismatches() -> None:
+        # the completion owner closes the stream at MESSAGE_END, so record
+        # reassembly diagnostics before publishing it.
+        if diagnostics_path is not None and reassembly.mismatches:
+            StreamDiagnostics.record_reassembly_mismatches(
+                diagnostics_path, provider="codex", count=reassembly.mismatches
+            )
+
     async for line in sse_lines(
         response,
         stall_seconds,
@@ -425,6 +440,7 @@ async def _decode_response(
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 finished.value = True
+                record_mismatches()
             yield translated
     record = decoder.finish()
     if record is not None:
@@ -445,6 +461,7 @@ async def _decode_response(
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 finished.value = True
+                record_mismatches()
             yield translated
     if response_state != "stopped":
         if any(
@@ -456,10 +473,6 @@ async def _decode_response(
             )
         raise CodexStreamError(
             "Codex stream ended before response completion", retryable=True
-        )
-    if diagnostics_path is not None and reassembly.mismatches:
-        StreamDiagnostics.record_reassembly_mismatches(
-            diagnostics_path, provider="codex", count=reassembly.mismatches
         )
 
 

@@ -87,9 +87,13 @@ class _PostTurnBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         self.calls += 1
         if self.calls == 1:
-            yield StreamEvent(StreamEventType.MESSAGE_END)
-            self.finalization_entered.set()
-            await self.release_finalization.wait()
+            # the completion owner closes the stream at MESSAGE_END; hold
+            # turn finalization inside that close.
+            try:
+                yield StreamEvent(StreamEventType.MESSAGE_END)
+            finally:
+                self.finalization_entered.set()
+                await self.release_finalization.wait()
             return
         if self.calls == 2:
             self.woke.set()

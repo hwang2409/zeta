@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import random
 import time
 from collections import deque
@@ -304,6 +305,14 @@ def report_provider_record(event_type: str) -> None:
     report_transport_activity(activity)
 
 
+def is_completion_sentinel(event: StreamEvent) -> bool:
+    """Return whether ``event`` ends a completion; a truncated end is a salvage."""
+    return (
+        event.type is StreamEventType.MESSAGE_END
+        and event.data.get("truncated") is not True
+    )
+
+
 _ATTEMPT_END = object()
 
 
@@ -369,7 +378,15 @@ class IteratorProviderAttempt:
         self._closed = True
         if self._producer is not None and not self._producer.done():
             self._producer.cancel()
-        if self._producer is not None:
+            await asyncio.gather(self._producer, return_exceptions=True)
+            # this close cancelled the producer; a bare cancellation is not a
+            # source outcome (a chained one still carries the source error).
+            if (
+                isinstance(self._producer_error, asyncio.CancelledError)
+                and self._producer_error.__cause__ is None
+            ):
+                self._producer_error = None
+        elif self._producer is not None:
             await asyncio.gather(self._producer, return_exceptions=True)
         close = getattr(self._source, "aclose", None)
         if close is not None:
@@ -492,6 +509,9 @@ class ProviderStallError(RuntimeError):
         self.stall_seconds = seconds
 
 
+_ABANDONED = object()
+
+
 class CompletionRun(AsyncIterator[StreamEvent]):
     """Public handle for one owner-managed completion."""
 
@@ -521,9 +541,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._committed = False
         self._emitted = False
         self._closed = False
-        self._attempt_completed = False
-        self._attempt_truncated = False
-        self._attempt_stop_reason: str | None = None
+        self._attempt_salvaged = False
         self._pending: deque[StreamEvent] = deque()
         self._pending_retry: RetryPlan | None = None
         self._transport_deadline = 0.0
@@ -560,15 +578,10 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             if self._attempt is None:
                 await self._open_attempt()
             assert self._attempt is not None
-            if self._attempt_completed:
-                if await self._finish_completed_attempt():
-                    continue
-                self._closed = True
-                raise StopAsyncIteration
             try:
                 signal = await self._read_signal(self._attempt)
             except StopAsyncIteration:
-                if self._attempt_completed:
+                if self._attempt_salvaged:
                     await self._finish_attempt()
                     self._closed = True
                     raise
@@ -618,17 +631,13 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             event = signal.event
             if event is None:
                 continue
-            terminal_event = event.type is StreamEventType.MESSAGE_END and not (
-                event.data.get("truncated") is True
-                and event.data.get("stop_reason") != "max_tokens"
-            )
-            if terminal_event:
-                self._attempt_completed = True
-                self._attempt_truncated = event.data.get("truncated") is True
-                stop_reason = event.data.get("stop_reason")
-                self._attempt_stop_reason = (
-                    stop_reason if isinstance(stop_reason, str) else None
-                )
+            # an untruncated MESSAGE_END is the provider completion sentinel:
+            # publish it and close the attempt without another read. a
+            # truncated one is a salvage: it stands only if the attempt then
+            # ends cleanly; a later failure is planned like any other.
+            terminal_event = is_completion_sentinel(event)
+            if event.type is StreamEventType.MESSAGE_END:
+                self._attempt_salvaged = not terminal_event
                 usage = event.data.get("usage")
                 if isinstance(usage, Mapping):
                     self._retry_usage = dict(usage)
@@ -649,7 +658,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         if not self._control.budget.start_attempt(self._adapter.provider, now):
             self._closed = True
             raise RuntimeError("provider retry budget exhausted")
-        self._attempt_completed = False
+        self._attempt_salvaged = False
         self._attempt = self._adapter.create_attempt(
             self._messages, self._tool_schemas, self._token
         )
@@ -932,7 +941,9 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         if self._closed and self._attempt is None:
             return
         self._closed = True
-        await self._finish_attempt()
+        # the caller abandoned an unfinished attempt: an ordinary cleanup
+        # failure is reported, a control exception still propagates.
+        await self._finish_attempt(_ABANDONED)
 
     @staticmethod
     def _is_unauthorized(error: object) -> bool:
@@ -960,11 +971,18 @@ def complete(
 
 def transient_network_error(error: BaseException | object) -> bool:
     current = error if isinstance(error, BaseException) else None
+    transient = False
     while current is not None:
-        if isinstance(current, (ConnectionError, TimeoutError, httpx.TransportError)):
-            return True
+        if isinstance(current, PermissionError) or (
+            isinstance(current, OSError) and current.errno in {errno.EACCES, errno.EPERM}
+        ):
+            # a denied permission does not heal on retry, whatever wraps it.
+            return False
+        transient = transient or isinstance(
+            current, (ConnectionError, TimeoutError, httpx.TransportError)
+        )
         current = current.__cause__
-    return False
+    return transient
 
 
 def retryable_provider_error(
