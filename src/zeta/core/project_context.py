@@ -39,7 +39,7 @@ import os
 import shlex
 import subprocess
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from html import escape
 from pathlib import Path
@@ -52,6 +52,7 @@ from ..project_context.projection import (
     ProjectContextProjection,
 )
 from ..project_errors import UnsupportedMemoryFormatError
+from ..project_memory_history import MemoryContextEntry
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import (
     load_identity_fragment,
@@ -590,6 +591,35 @@ def _format_section(path: Path, content: str) -> str:
     )
 
 
+def budget_memory_block(
+    home: Path, project_id: str, entries: Iterable[MemoryContextEntry], budget: int
+) -> tuple[str, list[Path], list[str]]:
+    """Admit memory files in order while the whole rendered block fits ``budget``.
+
+    Returns the block, the admitted file paths, and the skipped file names.
+    """
+
+    manual: list[str] = []
+    automatic: list[str] = []
+    admitted: list[Path] = []
+    skipped: list[str] = []
+    for entry in entries:
+        path = home / "projects" / project_id / "memory" / entry.name
+        candidate_manual = list(manual)
+        candidate_automatic = list(automatic)
+        target = candidate_automatic if entry.automatic else candidate_manual
+        target.append(_format_section(path, entry.content))
+        candidate = _render_memory_block(
+            project_id, candidate_manual, candidate_automatic
+        )
+        if len(candidate.encode("utf-8")) <= budget:
+            manual, automatic = candidate_manual, candidate_automatic
+            admitted.append(path)
+        else:
+            skipped.append(entry.name)
+    return _render_memory_block(project_id, manual, automatic), admitted, skipped
+
+
 def _default_stop_at(cwd: Path, home: Path) -> Path:
     """Bound the walk at ``$HOME`` when cwd is inside it; otherwise cwd."""
 
@@ -929,8 +959,6 @@ def load_project_context(
                 )
                 if available_registry is None and project_projection is None:
                     raise ProjectRegistryError("project registry is unavailable")
-                manual_memory_sections: list[str] = []
-                automatic_memory_sections: list[str] = []
                 # Budget the complete envelope on every trial admission: the
                 # delimiters, the ``project-id`` line, and every inter-section
                 # separator are all counted, so admitted memory can never push
@@ -988,41 +1016,19 @@ def load_project_context(
                             )
                             memory_block = entry_projection.block
                         else:
-                            for entry in context_entries:
-                                path = (
-                                    home
-                                    / "projects"
-                                    / project.project_id
-                                    / "memory"
-                                    / entry.name
-                                )
-                                section = _format_section(path, entry.content)
-                                candidate_manual = list(manual_memory_sections)
-                                candidate_automatic = list(automatic_memory_sections)
-                                target = (
-                                    candidate_automatic
-                                    if entry.automatic
-                                    else candidate_manual
-                                )
-                                target.append(section)
-                                candidate = _render_memory_block(
+                            memory_block, admitted, skipped_memory = (
+                                budget_memory_block(
+                                    home,
                                     project.project_id,
-                                    candidate_manual,
-                                    candidate_automatic,
+                                    context_entries,
+                                    budget_for_memory,
                                 )
-                                if len(candidate.encode("utf-8")) <= budget_for_memory:
-                                    manual_memory_sections = candidate_manual
-                                    automatic_memory_sections = candidate_automatic
-                                    loaded.append(path)
-                                else:
-                                    notices.append(
-                                        "context · project memory exceeded "
-                                        f"{byte_cap} byte cap; skipped {entry.name}"
-                                    )
-                            memory_block = _render_memory_block(
-                                project.project_id,
-                                manual_memory_sections,
-                                automatic_memory_sections,
+                            )
+                            loaded.extend(admitted)
+                            notices.extend(
+                                "context · project memory exceeded "
+                                f"{byte_cap} byte cap; skipped {name}"
+                                for name in skipped_memory
                             )
                     if memory_block is not None:
                         memory_index = len(sections)

@@ -12,7 +12,7 @@ from ..core.project_context import (
     CONTEXT_BYTE_CAP,
     ProjectContext,
     _format_section,
-    _render_memory_block,
+    budget_memory_block,
     load_project_context,
 )
 from ..core.session import SessionManager, SessionMetadata
@@ -66,25 +66,9 @@ def _projected_memory_block(
             now=utc_now(),
             byte_cap=min(MEMORY_PROMPT_BYTE_CAP, remaining),
         ).block
-    kept_manual: list[str] = []
-    kept_automatic: list[str] = []
-    for entry in projection.memory:
-        section = _format_section(
-            home / "projects" / project_id / "memory" / entry.name,
-            entry.content,
-        )
-        candidate_manual = list(kept_manual)
-        candidate_automatic = list(kept_automatic)
-        target = candidate_automatic if entry.automatic else candidate_manual
-        target.append(section)
-        candidate = _render_memory_block(
-            project_id, candidate_manual, candidate_automatic
-        )
-        if len((prefix + candidate + suffix).encode()) > CONTEXT_BYTE_CAP:
-            break
-        kept_manual = candidate_manual
-        kept_automatic = candidate_automatic
-    return _render_memory_block(project_id, kept_manual, kept_automatic)
+    return budget_memory_block(
+        home, project_id, projection.memory, remaining
+    )[0]
 
 
 def _conservative_context(
