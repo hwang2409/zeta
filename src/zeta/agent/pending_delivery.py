@@ -192,9 +192,15 @@ class StepDeliveryFlow:
                 if isinstance(item, PromptInput) and item.deadline is not None
                 else None
             )
+            return_committed_on_cancel = (
+                isinstance(item, PromptInput)
+                and item.origin is MessageOrigin.AGENT_SEND
+            )
             try:
                 result = await self.store._to_thread_durable(
-                    self.store._commit_delivery_input, item
+                    self.store._commit_delivery_input,
+                    item,
+                    _return_committed_on_cancel=return_committed_on_cancel,
                 )
             except PendingPromptWriterReloadedError:
                 if not isinstance(item, PromptInput) or item.deadline is None:
@@ -202,7 +208,9 @@ class StepDeliveryFlow:
                 assert commit_window is not None
                 retry = replace(item, deadline=time.monotonic() + commit_window)
                 result = await self.store._to_thread_durable(
-                    self.store._commit_delivery_input, retry
+                    self.store._commit_delivery_input,
+                    retry,
+                    _return_committed_on_cancel=return_committed_on_cancel,
                 )
             if result.changed and not (
                 isinstance(item, NotificationInput)

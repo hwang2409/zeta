@@ -29,7 +29,7 @@ class _Store:
         self.calls.append((item, threading.get_ident()))
         return ProducerResult((), True, 1)
 
-    async def _to_thread_durable(self, callback, *args):
+    async def _to_thread_durable(self, callback, *args, **_kwargs):
         result = await asyncio.to_thread(callback, *args)
         self.installed = True
         return result

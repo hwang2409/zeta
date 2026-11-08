@@ -10619,8 +10619,9 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     await asyncio.sleep(0)
     assert not task.done()
     release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    result = await await_or_fail(task, what="committed agent_send result")
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("queued a follow-up")
 
     assert [
         entry.data["text"]
@@ -10700,8 +10701,8 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
 
 
 @pytest.mark.asyncio
-async def test_agent_send_aborts_before_append_when_store_lock_is_held(
-    tmp_path: Path,
+async def test_agent_send_cancellation_reports_durable_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent_store = ConversationStore(tmp_path / "parent")
     child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
@@ -10726,6 +10727,35 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
     await delivery_flow.initialize()
     owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
     registry._agent_owner = owner
+    canceled = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "agent-send-canceled-before-admission",
+                "agent_send",
+                {"child_instance_id": "parent:1", "message": "not sent"},
+            )
+        )
+    )
+    canceled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(canceled, 10)
+    assert await asyncio.to_thread(child_store.pending_prompts) == []
+
+    entered_commit = threading.Event()
+    committed = threading.Event()
+    original_commit = step_delivery_store_module._commit_delivery_input
+
+    def observe_commit(store, item):
+        entered_commit.set()
+        try:
+            return original_commit(store, item)
+        finally:
+            committed.set()
+
+    # test-contract: seam observe the real durable commit admission point.
+    monkeypatch.setattr(
+        step_delivery_store_module, "_commit_delivery_input", observe_commit
+    )
     lock = child_store._append_lock()
     lock.__enter__()
     try:
@@ -10738,15 +10768,22 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
                 )
             )
         )
-        await asyncio.sleep(0)
+        await await_or_fail(
+            asyncio.to_thread(entered_commit.wait, 10),
+            what="agent_send commit to start",
+        )
         task.cancel()
-        await asyncio.sleep(0)
         assert not task.done()
     finally:
         lock.__exit__(None, None, None)
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=2)
+    await await_or_fail(
+        asyncio.to_thread(committed.wait, 10),
+        what="agent_send commit to finish",
+    )
+    result = await await_or_fail(task, what="committed agent_send result")
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("queued a follow-up")
     assert [
         entry.data["text"]
         for entry in await asyncio.to_thread(child_store.pending_prompts)
