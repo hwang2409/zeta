@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 
 from zeta.storage_format import StorageFormatError, compare_registry_dumps
 
 PROBE_PATHS = ("src/zeta/storage_format.py", "tests/compatibility/storage_probe.py")
+ROUNDTRIP = Path(__file__).resolve().parents[1] / "tests/compatibility/storage_roundtrip.py"
 CLASSIFIER_PREFIXES = ("src/zeta/", "tests/compatibility/", ".github/workflows/", "scripts/")
 CLASSIFIER_FILES = {"pyproject.toml", "uv.lock"}
 
@@ -38,6 +42,98 @@ def select_predecessor(*, event: str, head: str, base: str) -> tuple[str, list[s
     if predecessor is None:
         raise RuntimeError(f"no qualifying predecessor at or before {anchor}")
     return predecessor, commits[commits.index(predecessor):]
+
+def _digest_tree(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+        and path.name != ".storage-format.lock"
+        and ".storage-format-shape-locks" not in path.parts
+    }
+
+
+def _assert_mutation_delta(before: dict[str, str], after: dict[str, str], allowed: Iterable[str]) -> None:
+    changed = {path for path in set(before) | set(after) if before.get(path) != after.get(path)}
+    unexpected = changed - set(allowed)
+    if unexpected:
+        raise RuntimeError(f"old-writer mutation changed undeclared paths: {sorted(unexpected)!r}")
+
+
+def _assert_roundtrip_delta(before: dict[str, str], after: dict[str, str]) -> None:
+    changed = {path for path in set(before) | set(after) if before.get(path) != after.get(path)}
+    allowed_prefix = "sessions/format-roundtrip/"
+    unexpected = {
+        path for path in changed if path != "meta.json" and not path.startswith(allowed_prefix)
+    }
+    if unexpected:
+        raise RuntimeError(f"old-writer mutation changed undeclared paths: {sorted(unexpected)!r}")
+    recovery_files = {
+        Path(path).name
+        for path in changed
+        if path.startswith(allowed_prefix)
+        and (".recovery." in path or ".quarantine." in path)
+    }
+    if not any(name.startswith("conversation.recovery.") for name in recovery_files):
+        raise RuntimeError("old writer did not publish a transcript recovery record")
+    if not any(name.endswith(".jsonl") and name.startswith("conversation.quarantine.") for name in recovery_files):
+        raise RuntimeError("old writer did not publish transcript quarantine payload")
+
+
+def _run_roundtrips(source: Path, predecessor_epoch: int) -> None:
+    with tempfile.TemporaryDirectory(prefix="storage-format-roundtrip-") as temporary, tempfile.TemporaryDirectory(prefix="storage-format-uv-cache-") as cache:
+        home = Path(temporary)
+        environment = {**os.environ, "UV_CACHE_DIR": cache}
+        (home / "storage-format.json").write_text(json.dumps({"writer_epoch": predecessor_epoch}) + "\n")
+        (home / "meta.json").write_text(json.dumps({"owned": "before", "future": {"keep": True}}) + "\n")
+        (home / ".storage-format.lock").touch()
+        high = home / "higher"
+        shutil.copytree(home, high)
+        (high / "storage-format.json").write_text(json.dumps({"writer_epoch": predecessor_epoch + 1}) + "\n")
+        before_high = _digest_tree(high)
+        result = subprocess.run(
+            ("uv", "run", "--frozen", "python", str(ROUNDTRIP), "--home", str(high), "--mode", "write"),
+            cwd=source, env={**environment, "PYTHONPATH": str(source / "src")},
+            text=True, capture_output=True, check=False,
+        )
+        if result.returncode == 0:
+            raise RuntimeError("old writer accepted a higher-epoch home")
+        if _digest_tree(high) != before_high:
+            raise RuntimeError("old writer mutated a higher-epoch home")
+        before = _digest_tree(home)
+        result = subprocess.run(
+            ("uv", "run", "--frozen", "python", str(ROUNDTRIP), "--home", str(home), "--mode", "write"),
+            cwd=source, env={**environment, "PYTHONPATH": str(source / "src")},
+            text=True, capture_output=True, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"old-writer round trip failed: {result.stderr or result.stdout}")
+        _assert_roundtrip_delta(before, _digest_tree(home))
+        candidate = subprocess.run(
+            ("uv", "run", "--frozen", "python", str(ROUNDTRIP), "--home", str(home), "--mode", "reopen"),
+            cwd=ROUNDTRIP.parents[1],
+            text=True, capture_output=True,
+            env={**environment, "PYTHONPATH": str(ROUNDTRIP.parents[1] / "src")},
+            check=False,
+        )
+        if candidate.returncode:
+            raise RuntimeError(f"candidate could not reopen old-writer data: {candidate.stderr or candidate.stdout}")
+    print("::notice::selected predecessor old-writer round trips passed")
+
+
+def _writer_epoch(source: Path) -> int:
+    tree = ast.parse((source / "src/zeta/storage_format.py").read_text())
+    for node in tree.body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "WRITER_EPOCH"
+            and isinstance(node.value, ast.Constant)
+            and type(node.value.value) is int
+        ):
+            return node.value.value
+    raise RuntimeError("predecessor WRITER_EPOCH is not a literal integer")
+
 
 def _probe_source(source: Path, output: Path) -> None:
     env = os.environ.copy()
@@ -76,16 +172,21 @@ def main() -> int:
         candidate.write_text(json.dumps(json.loads(result.stdout), sort_keys=True, separators=(",", ":")) + "\n")
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"candidate probe emitted malformed json: {exc}") from exc
-    if not has_probe(predecessor):
-        if any(has_probe(commit) for commit in earlier[1:] if qualifying(commit)):
-            raise RuntimeError(f"selected predecessor {predecessor} is missing the compatibility probe")
-        print(f"::notice::bootstrap predecessor {predecessor}: registry comparison starts with this predecessor")
-        return 0
+    bootstrap = not has_probe(predecessor)
+    if bootstrap and any(has_probe(commit) for commit in earlier[1:] if qualifying(commit)):
+        raise RuntimeError(f"selected predecessor {predecessor} is missing the compatibility probe")
     with tempfile.TemporaryDirectory(prefix="storage-format-predecessor-") as temporary:
         source = Path(temporary)
         subprocess.run(("tar", "xf", str(output / "predecessor.tar"), "-C", str(source)), check=True)
-        _probe_source(source, output / "storage-format-predecessor.json")
-    compare_registry_dumps(json.loads((output / "storage-format-predecessor.json").read_text()), json.loads(candidate.read_text()))
+        if bootstrap:
+            predecessor_epoch = _writer_epoch(source)
+            print(f"::notice::bootstrap predecessor {predecessor}: registry comparison starts with this predecessor")
+        else:
+            _probe_source(source, output / "storage-format-predecessor.json")
+            predecessor_registry = json.loads((output / "storage-format-predecessor.json").read_text())
+            compare_registry_dumps(predecessor_registry, json.loads(candidate.read_text()))
+            predecessor_epoch = predecessor_registry["writer_epoch"]
+        _run_roundtrips(source, predecessor_epoch)
     return 0
 
 if __name__ == "__main__":
