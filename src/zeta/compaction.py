@@ -117,7 +117,6 @@ from .protocol.types import (
 
 SUMMARY_SOURCE_TOKEN_LIMIT = 64_000
 SUMMARY_RETRIES = 2
-RETRYABLE_SUMMARY_STREAM_ERRORS = {"Codex output item completed with open blocks"}
 _logger = logging.getLogger(__name__)
 
 
@@ -555,10 +554,7 @@ class CompactionPolicy:
                             else min(max_chars, fallback_max_chars)
                         ),
                     )
-                if not empty and not (
-                    getattr(exc, "code", None) == "stream_error"
-                    and str(exc) in RETRYABLE_SUMMARY_STREAM_ERRORS
-                ):
+                if not empty:
                     raise
                 if on_retry is not None:
                     on_retry()
@@ -574,6 +570,13 @@ class CompactionPolicy:
         on_retry: Callable[[], None] | None,
         retry: bool,
     ) -> str:
+        from .providers.completion import (
+            CompletionCleanupError,
+            CompletionControl,
+            CompletionRetryBudget,
+            ResetPolicy,
+        )
+
         completion_backend = backend or self.backend
         if completion_backend is None:
             raise SummaryCompletionError("compaction requires a completion backend")
@@ -596,7 +599,16 @@ class CompactionPolicy:
         completion = None
         try:
             try:
-                completion = completion_backend.complete(summary_messages, [])
+                completion = completion_backend.complete(
+                    summary_messages,
+                    [],
+                    control=CompletionControl(
+                        abort=None,
+                        reset=ResetPolicy.NO_RESET,
+                        budget=CompletionRetryBudget(),
+                        task_deadline=None,
+                    ),
+                )
                 async for event in completion:
                     if event.type is StreamEventType.ASSISTANT_RESET:
                         partial.clear()
@@ -642,7 +654,14 @@ class CompactionPolicy:
                     ):
                         completed = event.message
             except Exception as exc:
-                if isinstance(exc, (SummaryCompletionError, RequestBudgetExceeded)):
+                if isinstance(
+                    exc,
+                    (
+                        CompletionCleanupError,
+                        SummaryCompletionError,
+                        RequestBudgetExceeded,
+                    ),
+                ):
                     raise
                 code = getattr(exc, "code", None)
                 if type(code) is str:
@@ -681,6 +700,7 @@ class CompactionPolicy:
         if on_success is not None:
             success_result = on_success()
             if inspect.isawaitable(success_result):
+                # test-contract: seam caller owns the compaction callback
                 await success_result
         return summary
 

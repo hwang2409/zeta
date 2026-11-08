@@ -18,7 +18,9 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.providers.completion as completion_module
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import BudgetExceeded, ContextAssembler
 from zeta.core.store import ConversationStore
@@ -36,6 +38,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop._completion import _error_info
 from zeta.skills import SkillCatalog
@@ -63,6 +66,7 @@ class SteerToolBackend(CompletionBackend):
         self.turn1_streaming = asyncio.Event()
         self.release_turn1 = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -367,6 +371,7 @@ class _NotificationBackend(CompletionBackend):
         self.call_started = [asyncio.Event() for _ in range(5)]
         self.release = [asyncio.Event() for _ in range(5)]
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         index = len(self.calls)
@@ -377,10 +382,12 @@ class _NotificationBackend(CompletionBackend):
         if error := self.exceptions.get(index):
             raise error
         if index in self.failures or index in self.errors:
+            # an unclassified stream_error escapes the completion owner (it is
+            # not provider-retryable), so the notification retry seam sees it.
             yield StreamEvent(
                 StreamEventType.ERROR,
                 error=self.errors.get(
-                    index, ErrorInfo("transport_error", "provider stopped")
+                    index, ErrorInfo("stream_error", "provider stopped")
                 ),
             )
             return
@@ -396,6 +403,7 @@ class _RefusalNotificationBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         self.calls.append(list(messages))
@@ -414,6 +422,7 @@ class _BlockingNotificationBackend(CompletionBackend):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         index = len(self.calls)
@@ -421,12 +430,12 @@ class _BlockingNotificationBackend(CompletionBackend):
         if index == 0:
             yield StreamEvent(
                 StreamEventType.ERROR,
-                error=ErrorInfo("transport_error", "provider stopped"),
+                error=ErrorInfo("stream_error", "provider stopped"),
             )
             return
         self.started.set()
         yield StreamEvent(StreamEventType.MESSAGE_START)
-        await self.release.wait()
+        await await_or_fail(self.release.wait(), what="self.release.wait()")
 
 
 def _notification_app(tmp_path: Path, backend: CompletionBackend) -> TUIApp:
@@ -692,18 +701,14 @@ async def test_transient_notification_failure_is_retried(
     monkeypatch: pytest.MonkeyPatch,
     failure: ErrorInfo | BaseException,
 ) -> None:
-    backend: CompletionBackend
     if isinstance(failure, ErrorInfo):
-        backend = _NotificationBackend(errors={0: failure})
-    else:
-        backend = _NotificationBackend()
-    app = _notification_app(tmp_path, backend)
-    if isinstance(failure, BaseException):
-        monkeypatch.setattr(
-            app.loop,
-            "run_notification_turn",
-            lambda **kwargs: _raise_notification_failure(failure, **kwargs),
+        backend = _NotificationBackend(
+            failures=set(range(10)), errors=dict.fromkeys(range(10), failure)
         )
+    else:
+        backend = _NotificationBackend(exceptions=dict.fromkeys(range(10), failure))
+    app = _notification_app(tmp_path, backend)
+    monkeypatch.setattr(completion_module, "retry_wait_seconds", lambda *_args: 0.0)
     timers, captured = _capture_notification_timers(monkeypatch)
 
     # test-contract: seam notification wake has no public completion future
@@ -1094,6 +1099,7 @@ class TextOnlyBackend(CompletionBackend):
         if not block_turn2:
             self.release_turn2.set()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
