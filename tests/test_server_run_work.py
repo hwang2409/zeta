@@ -39,7 +39,6 @@ async def test_run_work_lists_and_cancels_real_task_and_publishes_todo(
                 {"protocol_version": "1.2", "features": ["run_work"]},
             )
         )[-1]
-        assert "run_work" in hello["result"]["capabilities"]["features"]
         session = (
             await request(
                 reader, writer, "new", "new_session", {"provider": "codex"}
@@ -52,6 +51,29 @@ async def test_run_work_lists_and_cancels_real_task_and_publishes_todo(
             + shlex.quote("import sys; sys.stdin.buffer.read()")
         )
         task_id, _pid = await registry.start(command, tmp_path)
+        todo = [{"content": "finish transport proof", "status": "in_progress"}]
+        server.runtime.opened.store.set_todo_items(todo)
+
+        list_response = (
+            await request(
+                reader,
+                writer,
+                "list",
+                "run_work_list",
+                {"session_id": session_id},
+            )
+        )[-1]
+        assert isinstance(list_response.get("result"), dict), (
+            f"run_work_list returned no snapshot: {list_response}"
+        )
+        listed = list_response["result"]
+        assert listed["todo"] == todo
+        assert listed["background_tasks"][0]["id"] == task_id
+        assert listed["background_tasks"][0]["status"] == "running"
+        assert listed["background_tasks"][0]["cancelable"] is True
+        assert listed["background_tasks"][0]["elapsed_seconds"] >= 0
+        assert "run_work" in hello["result"]["capabilities"]["features"]
+
         started = await event(reader, "background_task_updated")
         assert started["task"] == {
             "id": task_id,
@@ -61,25 +83,7 @@ async def test_run_work_lists_and_cancels_real_task_and_publishes_todo(
             "cancelable": True,
         }
         assert started["task"]["elapsed_seconds"] >= 0
-
-        todo = [{"content": "finish transport proof", "status": "in_progress"}]
-        server.runtime.opened.store.set_todo_items(todo)
         assert (await event(reader, "todo_updated"))["todo"] == todo
-
-        listed = (
-            await request(
-                reader,
-                writer,
-                "list",
-                "run_work_list",
-                {"session_id": session_id},
-            )
-        )[-1]["result"]
-        assert listed["todo"] == todo
-        assert listed["background_tasks"][0]["id"] == task_id
-        assert listed["background_tasks"][0]["status"] == "running"
-        assert listed["background_tasks"][0]["cancelable"] is True
-        assert listed["background_tasks"][0]["elapsed_seconds"] >= 0
 
         canceled = (
             await request(
