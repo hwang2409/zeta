@@ -1041,12 +1041,9 @@ async def test_turn_limit_recovery_after_lifecycle_commit_publishes_once(
     child.close()
 
     owner = BackgroundAgentOwner(parent)
-    flow = pending_delivery_module.StepDeliveryFlow(parent)
-    owner.conversation_channel.register_delivery_flow(None, flow)
     loop = SimpleNamespace(store=parent, _background_owner=owner)
     try:
-        for item in await asyncio.to_thread(recover_agent_children, loop):
-            await flow.produce(item)
+        recover_agent_children(loop)
         notifications = parent.agent_notifications(pending_only=False)
         assert len(notifications) == 1
         from zeta.agent.turn_limit import project_notification_data
@@ -1057,12 +1054,13 @@ async def test_turn_limit_recovery_after_lifecycle_commit_publishes_once(
             child.session_dir / "turn-limit-handoff.md"
         )
         assert not parent.agent_children()
+        assert child.agent_lifecycle()["state"] == "completed"
+        assert "[zeta:turn-limit:v1]" in child.agent_lifecycle()["final_result"]
         assert (
             child.session_dir / "turn-limit-handoff.md"
         ).read_bytes() == handoff_bytes
 
-        for item in await asyncio.to_thread(recover_agent_children, loop):
-            await flow.produce(item)
+        recover_agent_children(loop)
         assert len(parent.agent_notifications(pending_only=False)) == 1
         assert (
             child.session_dir / "turn-limit-handoff.md"
@@ -1115,10 +1113,12 @@ def test_nested_turn_limit_recovery_matches_existing_mid_publication_behavior(
     owner = BackgroundAgentOwner(root)
     loop = SimpleNamespace(store=parent, _background_owner=owner)
     try:
-        assert recover_agent_children(loop) == ()
+        recover_agent_children(loop)
         assert len(root.agent_notifications(pending_only=False)) == 1
-        assert parent.agent_notifications(pending_only=False) == []
+        assert len(parent.agent_notifications(pending_only=False)) == 1
         assert not parent.agent_children()
+        assert child.agent_lifecycle()["state"] == "completed"
+        assert "[zeta:turn-limit:v1]" in child.agent_lifecycle()["final_result"]
         assert (
             child.session_dir / "turn-limit-handoff.md"
         ).read_bytes() == handoff_bytes

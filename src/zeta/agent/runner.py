@@ -65,7 +65,7 @@ from .terminal_fence import TerminalTransitionFence
 from .turn_limit import (
     ChildTurnControl,
     finalize_exhausted_child,
-    finish_foreground_turn_limit,
+    make_finish_limited_child_turn,
 )
 
 logger = logging.getLogger(__name__)
@@ -943,16 +943,17 @@ async def run_agent_tool(
                     content[0]["text"], canonical_receipt=True
                 )
         return payload
-    def finish_turn_limit(readable_text: str) -> dict[str, object]:
-        turns_used = child_turns()
-        return finish_foreground_turn_limit(
-            store=child_store,
-            child_session_path=child_path,
-            readable_text=readable_text,
-            turns_used=turns_used,
-            stats=agent_stats(child_store.agent_lifecycle(), turns_used=turns_used),
-            build_result=child_result,
-        )
+
+    finish_turn_limit = make_finish_limited_child_turn(
+        store=child_store,
+        child_session_path=child_path,
+        turns_used=child_turns,
+        stats=lambda turns: agent_stats(
+            child_store.agent_lifecycle(), turns_used=turns
+        ),
+        build_result=child_result,
+    )
+
     def publish_lifecycle(
         kind: str,
         call: ToolCall | None,
@@ -983,12 +984,15 @@ async def run_agent_tool(
             )
         elif lifecycle_sink is not None:
             lifecycle_sink(kind, call, data, tool_result)
+
     def update_turns(turns: int) -> None:
         loop._agent_child_turns[tool_call.id] = turns
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
+
     def update_tool_calls(tool_calls: int) -> None:
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
+
     consume = consume_run if follow_up_loop else consume_child
     loop._background_owner.causal_episodes.associate_new_member(
         child_instance_id, loop.agent_instance_id

@@ -299,6 +299,28 @@ def finish_foreground_turn_limit(
     return payload
 
 
+def make_finish_limited_child_turn(
+    *,
+    store: ConversationStore,
+    child_session_path: str,
+    turns_used: Callable[[], int],
+    stats: Callable[[int], dict[str, object]],
+    build_result: Callable[..., dict[str, object]],
+) -> Callable[[str], dict[str, object]]:
+    def finish(readable_text: str) -> dict[str, object]:
+        used = turns_used()
+        return finish_foreground_turn_limit(
+            store=store,
+            child_session_path=child_session_path,
+            readable_text=readable_text,
+            turns_used=used,
+            stats=stats(used),
+            build_result=build_result,
+        )
+
+    return finish
+
+
 def fallback_handoff(
     *,
     control: ChildTurnControl,
