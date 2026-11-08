@@ -127,9 +127,7 @@ class CausalEpisodeRegistry:
         self._by_member[instance_id] = episode
         episode.member_instance_ids.add(instance_id)
 
-    def associate_member(
-        self, instance_id: str, staged_ids: Iterable[str]
-    ) -> None:
+    def associate_member(self, instance_id: str, staged_ids: Iterable[str]) -> None:
         episode = self._by_member.get(instance_id)
         if episode is None:
             return
@@ -206,6 +204,21 @@ class FinishGateState:
             if task.running
         )
 
+    def can_wake_again(self, child_loop: AgentLoop) -> bool:
+        """Return whether this idle child still owns a future wake source."""
+
+        instance_id = child_loop.agent_instance_id
+        flow = getattr(child_loop, "step_delivery", None)
+        owned_children = bool(self.owned_children(child_loop))
+        owned_tasks = bool(self.owned_tasks(child_loop))
+        pending_question = instance_id is not None and (
+            child_loop._background_owner.conversation_channel.has_pending_question(
+                instance_id
+            )
+        )
+        pending_delivery = flow is not None and flow.has_model_visible_delivery
+        return any((owned_children, owned_tasks, pending_question, pending_delivery))
+
     async def run_model_turn(
         self,
         child_loop: AgentLoop,
@@ -243,9 +256,10 @@ class FinishGateState:
             if task_running_at_entry and loop.time() >= self._task_deadline():
                 return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
-            if flow is not None and (
-                await flow.admit_terminal("finish_gate_timeout")
-            ).pending:
+            if (
+                flow is not None
+                and (await flow.admit_terminal("finish_gate_timeout")).pending
+            ):
                 return None
             task_existed = (
                 task_running_at_entry
@@ -294,9 +308,10 @@ class FinishGateState:
             if tasks_running and loop.time() >= self._task_deadline():
                 return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
-            if flow is not None and (
-                await flow.admit_terminal("finish_gate_timeout")
-            ).pending:
+            if (
+                flow is not None
+                and (await flow.admit_terminal("finish_gate_timeout")).pending
+            ):
                 return None
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
         try:
@@ -308,9 +323,10 @@ class FinishGateState:
             if tasks_running and loop.time() >= self._task_deadline():
                 return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
-            if flow is not None and (
-                await flow.admit_terminal("finish_gate_timeout")
-            ).pending:
+            if (
+                flow is not None
+                and (await flow.admit_terminal("finish_gate_timeout")).pending
+            ):
                 return None
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
         if tasks_running and loop.time() >= self._child_deadline():
@@ -334,7 +350,10 @@ class FinishGateState:
         self.turns_exhausted_with_task = False
 
     def note_task_outlived_child_bound(self, tasks_running: bool) -> None:
-        if tasks_running and asyncio.get_running_loop().time() >= self._child_deadline():
+        if (
+            tasks_running
+            and asyncio.get_running_loop().time() >= self._child_deadline()
+        ):
             self.task_outlived_child_bound = True
 
     def _control(self) -> FinishGateControl:
@@ -413,9 +432,7 @@ async def _run_finish_gate(
     try:
         result = await state.run_model_turn(
             child_loop,
-            child_loop.run_harness_notice_turn(
-                finish_gate_message(children, tasks)
-            ),
+            child_loop.run_harness_notice_turn(finish_gate_message(children, tasks)),
             consume_events,
         )
         if result is not None:
@@ -444,8 +461,7 @@ async def _wait_for_finish(
         pending_notification = child_loop.notification_system_message() is not None
         flow = getattr(child_loop, "step_delivery", None)
         delivery_pending = bool(
-            flow is not None
-            and (await flow.admit_terminal("finish_gate_wait")).pending
+            flow is not None and (await flow.admit_terminal("finish_gate_wait")).pending
         )
         terminal = await _terminal_transition(
             child_loop,
@@ -466,9 +482,7 @@ async def _wait_for_finish(
                 tasks_running=bool(tasks),
             )
         else:
-            result = await state.wait_transition(
-                child_loop, tasks_running=bool(tasks)
-            )
+            result = await state.wait_transition(child_loop, tasks_running=bool(tasks))
         if result is not None:
             return result
     return FinishGateResult("completed")
@@ -494,9 +508,7 @@ async def _handle_pending_notification(
             child_loop._background_owner.conversation_channel.clear_wake(
                 child_loop.agent_instance_id or ""
             )
-            return await state.wait_transition(
-                child_loop, tasks_running=tasks_running
-            )
+            return await state.wait_transition(child_loop, tasks_running=tasks_running)
     return await state.run_model_turn(
         child_loop,
         child_loop.run_notification_turn(),

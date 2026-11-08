@@ -438,24 +438,26 @@ async def test_server_restart_keeps_delivery_deduplication(tmp_path: Path) -> No
         ),
     )
     reader, writer = await _connect(first_server)
-    await _request(
-        reader,
-        writer,
-        1,
-        "hello",
-        {"protocol_version": "1.1", "features": ["delivery_id"]},
-    )
-    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    session_id = created[-1]["result"]["session"]["session_id"]
-    await _request(
-        reader,
-        writer,
-        3,
-        "send",
-        {"text": "once", "delivery_id": "restart-1"},
-    )
-    await _event(reader, "agent_end")
-    await close_serve(first_server, writer)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = created[-1]["result"]["session"]["session_id"]
+        await _request(
+            reader,
+            writer,
+            3,
+            "send",
+            {"text": "once", "delivery_id": "restart-1"},
+        )
+        await _event(reader, "agent_end")
+    finally:
+        await close_serve(first_server, writer)
 
     second_backend = FakeBackend([])
     second_server = ZetaServer(provider="codex",
@@ -764,10 +766,12 @@ async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None
         "hello",
         {"protocol_version": "1.1", "features": ["delivery_id"]},
     )
-    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    session_id = created[-1]["result"]["session"]["session_id"]
-    _evict_delivery(first.runtime.opened.store, "restart-old")
-    await close_serve(first, writer)
+    try:
+        created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = created[-1]["result"]["session"]["session_id"]
+        _evict_delivery(first.runtime.opened.store, "restart-old")
+    finally:
+        await close_serve(first, writer)
 
     resumed = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-resumed"))
     reader, writer = await _connect(resumed)
@@ -931,9 +935,11 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
     first = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-1"))
     reader, writer = await _connect(first)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
-    created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    session_id = created[-1]["result"]["session"]["session_id"]
-    await close_serve(first, writer)
+    try:
+        created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = created[-1]["result"]["session"]["session_id"]
+    finally:
+        await close_serve(first, writer)
 
     store = ConversationStore(tmp_path / "sessions", session_id=session_id)
     accepted_message = with_message_origin(
