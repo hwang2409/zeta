@@ -185,10 +185,15 @@ def discover_project(
         ],
         deadline=deadline,
     )
-    lines = geometry.stdout.splitlines() if geometry is not None else []
+    lines = getattr(geometry, "stdout", "").splitlines()
     if len(lines) != 3:
         ordinary_directory = geometry_error == "non-repository"
         eligible = ordinary_directory and directory not in {home, root}
+        if geometry is not None and lines:
+            logging.getLogger(__name__).warning(
+                "git project discovery failed for %s: incomplete repository geometry",
+                directory,
+            )
         return ProjectDiscovery(directory, directory, None, None, home, root, eligible)
     repo_root, git_dir, common_dir = (
         Path(line).expanduser().resolve() for line in lines

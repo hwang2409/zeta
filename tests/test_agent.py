@@ -13835,7 +13835,7 @@ def test_child_startup_runs_one_git_discovery_in_repo_subdirectory(
 
     _child_base_system_prompt(loop, str(child_cwd))
 
-    assert len(commands) == 3
+    assert len(commands) == 1
 
 
 @pytest.mark.asyncio

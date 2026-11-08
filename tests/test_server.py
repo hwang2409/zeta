@@ -9977,7 +9977,7 @@ async def test_serve_linked_worktree_runs_one_git_discovery(
     runtime = ServerRuntime(home, cwd=worktree, provider="codex")
     try:
         await runtime.create_session()
-        assert len(commands) == 3
+        assert len(commands) == 2
     finally:
         await runtime.close()
 
@@ -10036,7 +10036,7 @@ async def test_server_uses_only_existing_project_after_one_git_discovery(
     runtime = ServerRuntime(home, cwd=cwd, provider="codex")
     try:
         metadata = await runtime.create_session()
-        assert calls == 3
+        assert calls == 1
         assert metadata.project_id == (
             existing.project_id if existing is not None else None
         )
