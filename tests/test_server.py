@@ -31,6 +31,7 @@ from websockets.asyncio.client import connect
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.core.slash as core_slash
 import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
@@ -64,6 +65,7 @@ from zeta.attention_records import AttentionStore
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata, persist_metadata_change
+from zeta.core.slash import compaction_history as original_history
 from zeta.core.store import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -8906,7 +8908,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
 
         # test-contract: seam hold the real synchronous transcript projection
         monkeypatch.setattr(
-            server.runtime.loop.context_assembler, "token_counter", blocked_counter
+            core_slash,
+            "compaction_history",
+            lambda entries, _counter: original_history(entries, blocked_counter),
         )
         probe_ready = threading.Event()
         probe_frames: list[dict[str, Any]] = []
@@ -8995,9 +8999,11 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             )
         )
         request_task.cancel()
+        # A cancelled /status waits for its started worker before it re-raises,
+        # so release the worker before awaiting the cancelled request.
+        release.set()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(request_task, 10)
-        release.set()
         assert await asyncio.to_thread(worker_completed.wait, 10)
         assert not worker_errors
         frames = await _frames_until_eof(reader)
@@ -9054,7 +9060,9 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
 
     # test-contract: seam hold the real synchronous transcript projection
     monkeypatch.setattr(
-        server.runtime.loop.context_assembler, "token_counter", blocked_counter
+        core_slash,
+        "compaction_history",
+        lambda entries, _counter: original_history(entries, blocked_counter),
     )
     assert server.connections is not None
     loop = server.connections.loop

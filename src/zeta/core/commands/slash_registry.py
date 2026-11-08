@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, fields, replace
@@ -95,11 +96,14 @@ class SlashLock:
         waiting: Callable[[str], None] = _ignore,
         # Both receive the holder label, such as "/status".
         late_output: Callable[[object], None] = _ignore,
+        offload: Callable[[Callable[[], Any]], Awaitable[Any]] = asyncio.to_thread,
     ) -> None:
         self._lock = asyncio.Lock()
         self._contended = contended
         self._waiting = waiting
         self.late_output = late_output
+        # Runs worker steps off the loop; serve uses its shutdown-aware reader.
+        self.offload = offload
         self._owner: asyncio.Task[Any] | None = None
         self._holder: str | None = None
         self._state = "running"
@@ -264,7 +268,15 @@ class SlashCommand:
             return result
         inputs = policy.prepare(session, args)
         _check_frozen(inputs, self.name)
-        worker = asyncio.ensure_future(asyncio.to_thread(policy.run, inputs))
+        returned = threading.Event()
+
+        def run_worker() -> object:
+            try:
+                return policy.run(inputs)
+            finally:
+                returned.set()
+
+        worker = asyncio.ensure_future(lock.offload(run_worker))
         cancelled = False
         while True:
             try:
@@ -272,6 +284,10 @@ class SlashCommand:
                 break
             except asyncio.CancelledError:
                 if worker.done() and worker.cancelled():
+                    raise
+                if returned.is_set() and not worker.done():
+                    # The worker already returned, so it writes nothing more; its
+                    # result may never reach this loop (shutdown), so do not wait.
                     raise
                 if not cancelled:
                     cancelled = True

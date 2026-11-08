@@ -123,7 +123,7 @@ class ServeControl:
         self.deliveries = DeliveryRequests(self)
         # Serve reads requests serially per connection and has one controller,
         # so this lock never contends today; status projects its holder.
-        self.slash_lock = SlashLock()
+        self.slash_lock = SlashLock(offload=self._run_blocking)
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
         self._host_binding_required = False
