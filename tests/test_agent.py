@@ -1443,6 +1443,143 @@ class NestedBackgroundBackend(CompletionBackend):
         )
 
 
+class IdleParentRoutingBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls = {"root": 0, "lead": 0, "worker": 0}
+        self.release_worker_question = asyncio.Event()
+        self.lead_follow_up_seen = asyncio.Event()
+        self.lead_question_seen = asyncio.Event()
+        self.lead_completion_seen = asyncio.Event()
+
+    @staticmethod
+    def _actor(messages: Sequence[Message]) -> str:
+        prompts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        if "worker prompt" in prompts:
+            return "worker"
+        if "lead prompt" in prompts:
+            return "lead"
+        return "root"
+
+    @staticmethod
+    def _start_agent(call_id: str, prompt: str, description: str) -> list[ToolUseContent]:
+        return [
+            ToolUseContent(
+                ToolCall(
+                    call_id,
+                    "agent",
+                    {
+                        "prompt": prompt,
+                        "description": description,
+                        "agent_type": "run",
+                        "background": True,
+                    },
+                )
+            )
+        ]
+
+    def _root_blocks(self, call: int) -> list[TextContent | ToolUseContent]:
+        if call == 1:
+            return self._start_agent("start-lead", "lead prompt", "lead")
+        return []
+
+    def _lead_blocks(
+        self, call: int, messages: Sequence[Message]
+    ) -> list[TextContent | ToolUseContent]:
+        if call == 1:
+            return self._start_agent("start-worker", "worker prompt", "worker")
+        if call == 2:
+            return [
+                ToolUseContent(
+                    ToolCall(
+                        "refused-lead-finish",
+                        "finish",
+                        {"status": "done", "summary": "lead complete"},
+                    )
+                )
+            ]
+        question = self._has_notification(messages, "asks: should i continue?")
+        completion = self._has_notification(messages, "worker complete")
+        follow_up = any(
+            isinstance(block, TextContent)
+            and block.text in {"after refused finish", "follow up"}
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+        )
+        if completion:
+            self.lead_completion_seen.set()
+        new_question = question and not self.lead_question_seen.is_set()
+        if new_question:
+            self.lead_question_seen.set()
+        if follow_up:
+            self.lead_follow_up_seen.set()
+        return [TextContent("WAIT")] if call == 3 or new_question or follow_up else []
+
+    async def _worker_blocks(self, call: int) -> list[TextContent | ToolUseContent]:
+        if call == 1:
+            await asyncio.wait_for(self.release_worker_question.wait(), 10)
+            return [
+                ToolUseContent(
+                    ToolCall(
+                        "ask-lead",
+                        "ask_parent",
+                        {"question": "should i continue?"},
+                    )
+                )
+            ]
+        if call == 2:
+            return [
+                ToolUseContent(
+                    ToolCall(
+                        "finish-worker",
+                        "finish",
+                        {"status": "done", "summary": "worker complete"},
+                    )
+                )
+            ]
+        return []
+
+    @staticmethod
+    def _has_notification(messages: Sequence[Message], text: str) -> bool:
+        return any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            and any(
+                isinstance(block, TextContent) and text in block.text
+                for block in message.content
+            )
+            for message in messages
+        )
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        actor = self._actor(messages)
+        self.calls[actor] += 1
+        call = self.calls[actor]
+        if actor == "root":
+            blocks = self._root_blocks(call)
+        elif actor == "lead":
+            blocks = self._lead_blocks(call, messages)
+        else:
+            blocks = await self._worker_blocks(call)
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class ForegroundNestedBackgroundBackend(CompletionBackend):
     def __init__(self, *, background_child: bool = False) -> None:
         self.background_child = background_child
@@ -2822,6 +2959,56 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
         "content": "tool execution canceled",
     }
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_abort_during_next_request_preparation_skips_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("first-tool", "echo", {})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("must not dispatch")]),
+        ]
+    )
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path),
+        tools={"echo": lambda _: "done"},
+        max_turns=2,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    request_preparation_started = asyncio.Event()
+    allow_request_preparation = asyncio.Event()
+    assemble_calls = 0
+    original_assemble = loop.context_assembler.assemble
+
+    async def pause_second_request(*args, **kwargs):
+        nonlocal assemble_calls
+        assemble_calls += 1
+        if assemble_calls == 2:
+            request_preparation_started.set()
+            await asyncio.wait_for(allow_request_preparation.wait(), 10)
+        return await original_assemble(*args, **kwargs)
+
+    # test-contract: seam force abort after turn admission and before provider dispatch
+    loop.context_assembler.assemble = pause_second_request  # type: ignore[method-assign]
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await asyncio.wait_for(request_preparation_started.wait(), 10)
+        loop.abort()
+        allow_request_preparation.set()
+        await asyncio.wait_for(run, 10)
+        assert len(backend.calls) == 1
+    finally:
+        allow_request_preparation.set()
+        if not run.done():
+            run.cancel()
+        await asyncio.wait_for(asyncio.gather(run, return_exceptions=True), 10)
+        await loop.close()
 
 
 @pytest.mark.asyncio
@@ -8529,6 +8716,47 @@ async def test_delegated_turn_count_stays_accurate_without_a_denominator(
     assert result.content.startswith("child done")
 
 
+class TerminalSendBackend(CompletionBackend):
+    def __init__(self, outcome: str) -> None:
+        self.outcome = outcome
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+        self.child_calls = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user == "start":
+            blocks = [ToolUseContent(_run_agent_call("terminal-child"))]
+        else:
+            self.child_calls += 1
+            self.child_started.set()
+            await asyncio.wait_for(self.release_child.wait(), 10)
+            if self.outcome == "failed":
+                raise RuntimeError("provider failed")
+            blocks = [TextContent("child complete")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class RunBackend(CompletionBackend):
     """Drive a long run whose first turn can be held open mid-flight."""
 
@@ -8921,8 +9149,10 @@ def test_pending_prompt_queue_round_trips(tmp_path: Path) -> None:
         store.acknowledge_pending_prompt("nonexistent")
 
 
-def test_close_pending_queue_if_empty_locks_out_new_prompts(tmp_path: Path) -> None:
-    """Once a run declares itself done, further follow-ups must be rejected."""
+def test_closed_pending_queue_allows_only_new_episode_before_terminal(
+    tmp_path: Path,
+) -> None:
+    """A live run can start a new episode; a terminal run cannot."""
 
     store = ConversationStore(tmp_path, session_id="run")
 
@@ -8940,6 +9170,16 @@ def test_close_pending_queue_if_empty_locks_out_new_prompts(tmp_path: Path) -> N
     other = ConversationStore(tmp_path, session_id="run")
     with pytest.raises(PendingPromptsClosedError):
         other.append_pending_prompt("also too late")
+
+    follow_up = other.pending_prompt_queue.append(
+        "new episode", starts_new_episode=True
+    )
+    other.acknowledge_pending_prompt(follow_up.id)
+    assert other.pending_prompt_queue.accept_explicit_finish(
+        {"status": "done", "summary": "done"}
+    ) is None
+    with pytest.raises(PendingPromptsClosedError):
+        other.pending_prompt_queue.append("after finish", starts_new_episode=True)
 
 
 @pytest.mark.asyncio
@@ -10161,8 +10401,10 @@ async def test_turn_boundary_close_races_agent_send_atomically(
     terminal = await asyncio.wait_for(close, timeout=10)
     assert terminal.pending is False
     assert terminal.closed_empty is True
-    error = await asyncio.wait_for(send, timeout=10)
-    assert error is not None and "no live run" in error
+    assert await asyncio.wait_for(send, timeout=10) is None
+    assert [
+        entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)
+    ] == ["close first"]
 
 
 @pytest.mark.asyncio
@@ -10494,8 +10736,10 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
 
 
 @pytest.mark.asyncio
-async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> None:
-    """The race the closed-queue marker prevents: a queued prompt after finish."""
+async def test_agent_send_starts_new_episode_after_previous_turn_closed(
+    tmp_path: Path,
+) -> None:
+    """A closed turn does not make its still-resident run unreachable."""
 
     from zeta.tools.agent import send_to_run
 
@@ -10507,8 +10751,8 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
 
-    # Simulate the race: parent looked at the marker before the run finished,
-    # then the run drained and closed its queue before the parent got here.
+    # Simulate the race: the previous turn closes its prompt episode after the
+    # parent sees the marker, while the background run remains resident.
     marker = store.agent_children()[handle]
     child_path = Path(str(marker["child_session_path"]))
     child_store = ConversationStore(
@@ -10520,13 +10764,17 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     assert terminal.closed_empty
     assert terminal.pending is False
 
-    error = await send_to_run(
-        store,
-        handle,
-        "too late",
-        channel=loop._background_owner.conversation_channel,
+    assert (
+        await send_to_run(
+            store,
+            handle,
+            "next episode",
+            channel=loop._background_owner.conversation_channel,
+        )
+        is None
     )
-    assert error is not None and "no live run" in error
+    prompts = await child_store._to_thread_durable(child_store.pending_prompts)
+    assert [entry.data["text"] for entry in prompts] == ["next episode"]
 
     backend.release_child.set()
     await wait_background_owner(loop)
@@ -10668,6 +10916,162 @@ async def test_a_run_with_an_empty_queue_finishes_normally(tmp_path: Path) -> No
     assert backend.child_prompts == ["work the big task"]
     assert not store.agent_children()
     await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_state", "expected_state"),
+    [
+        ("completed", "completed"),
+        ("canceled", "canceled"),
+        ("failed", "failed"),
+    ],
+)
+async def test_agent_send_rejects_every_real_terminal_child_without_revival(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_state: str,
+    expected_state: str,
+) -> None:
+    backend = TerminalSendBackend(terminal_state)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    wakes: list[str | None] = []
+    wake = loop._background_owner.conversation_channel.wake
+    def observe_wake(instance_id: str | None) -> None:
+        wakes.append(instance_id)
+        wake(instance_id)
+
+    # test-contract: seam counts wake attempts after public terminal rejection
+    monkeypatch.setattr(loop._background_owner.conversation_channel, "wake", observe_wake)
+    child_store: ConversationStore | None = None
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_started.wait(), 10)
+        handle = _run_handle_from_receipt(store)
+        child_path = Path(store.agent_children()[handle]["child_session_path"])
+
+        if terminal_state in {"completed", "failed"}:
+            backend.release_child.set()
+            await asyncio.wait_for(loop._background_owner.wait(), 10)
+        elif terminal_state == "canceled":
+            canceled = await loop.tool_registry.execute(
+                ToolCall("cancel-terminal", "agent_cancel", {"handle": handle})
+            )
+            assert canceled["isError"] is False
+            await asyncio.wait_for(loop._background_owner.wait(), 10)
+        status = await loop.tool_registry.execute(
+            ToolCall("terminal-status", "agent_status", {"handle": handle})
+        )
+        child_status = status["structuredContent"]["children"][0]
+        assert child_status["state"] == expected_state
+        child_store = ConversationStore(child_path)
+        rows_before = [
+            entry.type
+            for entry in child_store.replay()
+            if entry.type in {"pending_prompt", "pending_queue_closed"}
+        ]
+        calls_before = backend.child_calls
+        wakes_before = list(wakes)
+        rejected = await loop.tool_registry.execute(
+            ToolCall(
+                "send-terminal",
+                "agent_send",
+                {"child_instance_id": handle, "message": "do not revive"},
+            )
+        )
+        assert rejected["isError"] is True
+        assert "no live run/child" in rejected["content"][0]["text"]
+        assert backend.child_calls == calls_before
+        assert wakes == wakes_before
+        assert [
+            entry.type
+            for entry in child_store.replay()
+            if entry.type in {"pending_prompt", "pending_queue_closed"}
+        ] == rows_before
+    finally:
+        backend.release_child.set()
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        if child_store is not None:
+            child_store.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_send_rejects_child_after_owner_lease_is_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="root")
+    child = _seed_recoverable_child(store)
+    child_path = child.session_dir
+    child.close()
+    ready = tmp_path / "lease-ready"
+    stop = tmp_path / "lease-stop"
+    owner_process = _start_child_lease_holder(child, ready, stop)
+    owner_process.kill()
+    assert owner_process.wait(timeout=10) < 0
+    backend = FakeBackend([])
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    wakes: list[str | None] = []
+    wake = loop._background_owner.conversation_channel.wake
+
+    def observe_wake(instance_id: str | None) -> None:
+        wakes.append(instance_id)
+        wake(instance_id)
+
+    # test-contract: seam counts wake attempts after public lost-child rejection
+    monkeypatch.setattr(loop._background_owner.conversation_channel, "wake", observe_wake)
+    observed = ConversationStore(child_path)
+    try:
+        status = await loop.tool_registry.execute(
+            ToolCall("lost-status", "agent_status", {"handle": "root:1"})
+        )
+        child_status = status["structuredContent"]["children"][0]
+        assert child_status["state"] == "failed"
+        assert child_status["reason"] == "lost: owner process exited"
+        rows_before = [
+            entry.type
+            for entry in observed.replay()
+            if entry.type in {"pending_prompt", "pending_queue_closed"}
+        ]
+        calls_before = len(backend.calls)
+        wakes_before = list(wakes)
+
+        rejected = await loop.tool_registry.execute(
+            ToolCall(
+                "send-lost",
+                "agent_send",
+                {"child_instance_id": "root:1", "message": "do not revive"},
+            )
+        )
+
+        assert rejected["isError"] is True
+        assert "no live run/child" in rejected["content"][0]["text"]
+        assert len(backend.calls) == calls_before
+        assert wakes == wakes_before
+        assert [
+            entry.type
+            for entry in observed.replay()
+            if entry.type in {"pending_prompt", "pending_queue_closed"}
+        ] == rows_before
+    finally:
+        _reap_lease_holder(owner_process)
+        await loop.close()
+        observed.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -17186,6 +17590,165 @@ def test_child_idle_then_terminal_receipt_is_appended_and_delivered_once(
         "child_idle",
         "agent_completion",
     ]
+
+
+@pytest.mark.asyncio
+async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = IdleParentRoutingBackend()
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    lead_idle = asyncio.Event()
+    lead_idle_count = 0
+    transition_idle = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        nonlocal lead_idle_count
+        transition_idle(child_store)
+        lifecycle = child_store.agent_lifecycle() or {}
+        handle = lifecycle.get("handle")
+        if isinstance(handle, str) and handle.count(":") == 1:
+            lead_idle_count += 1
+            lead_idle.set()
+
+    # test-contract: seam observes the exact idle transition without a sleep
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        max_agent_depth=3,
+    )
+    loop.explicit_finish = True
+    wakes: list[str | None] = []
+    wake = loop._background_owner.conversation_channel.wake
+
+    def observe_wake(instance_id: str | None) -> None:
+        wakes.append(instance_id)
+        wake(instance_id)
+
+    # test-contract: seam counts wake attempts after public terminal rejection
+    monkeypatch.setattr(loop._background_owner.conversation_channel, "wake", observe_wake)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(lead_idle.wait(), 10)
+        lead_handle = _run_handle_from_receipt(store)
+        worker_handle = next(
+            handle
+            for handle in loop._background_owner.active_instance_ids
+            if handle.startswith(f"{lead_handle}:")
+        )
+        lead_store = loop._background_owner.parent_store(worker_handle, store)
+        refused_finish = lead_store.tool_result("refused-lead-finish")
+        assert refused_finish is not None and refused_finish.is_error
+        marker = store.agent_children()[lead_handle]
+        assert marker["background"] is True
+        assert marker["accepts_follow_ups"] is True
+        assert lead_handle in loop._background_owner.active_instance_ids
+        assert not any(
+            entry.type == "pending_queue_closed" for entry in lead_store.replay()
+        )
+
+        lead_idle.clear()
+        sent_after_refusal = await loop.tool_registry.execute(
+            ToolCall(
+                "send-after-refusal",
+                "agent_send",
+                {
+                    "child_instance_id": lead_handle,
+                    "message": "after refused finish",
+                },
+            )
+        )
+        assert sent_after_refusal["isError"] is False, sent_after_refusal
+        await asyncio.wait_for(backend.lead_follow_up_seen.wait(), 10)
+        await asyncio.wait_for(lead_idle.wait(), 10)
+        assert lead_idle_count >= 2
+
+        # A live explicit-finish consumer stays idle, so no public action closes its
+        # episode now that refused finish checks owned work first. This is the exact
+        # production segment transition that created the historical closed row.
+        segment_flow = pending_delivery_module.StepDeliveryFlow(lead_store)
+        terminal = await segment_flow.admit_terminal("segment_end")
+        assert terminal.closed_empty is True
+        status = await loop.tool_registry.execute(
+            ToolCall("lead-status", "agent_status", {"handle": lead_handle})
+        )
+        assert status["structuredContent"]["children"][0]["state"] == "idle"
+        assert any(entry.type == "pending_queue_closed" for entry in lead_store.replay())
+
+        backend.lead_follow_up_seen.clear()
+        lead_idle.clear()
+        sent = await loop.tool_registry.execute(
+            ToolCall(
+                "send-follow-up",
+                "agent_send",
+                {"child_instance_id": lead_handle, "message": "follow up"},
+            )
+        )
+        assert sent["isError"] is False, sent
+        await asyncio.wait_for(backend.lead_follow_up_seen.wait(), 10)
+        await asyncio.wait_for(lead_idle.wait(), 10)
+        assert lead_idle_count >= 3
+
+        backend.release_worker_question.set()
+        await asyncio.wait_for(backend.lead_question_seen.wait(), 10)
+        await asyncio.wait_for(backend.lead_completion_seen.wait(), 10)
+        questions = [
+            entry
+            for entry in lead_store.replay()
+            if entry.type == "notification"
+            and entry.data.get("kind") == "child_question"
+        ]
+        assert len(questions) == 1
+        assert questions[0].data.get("routing_note") is None
+        assert not any(
+            entry.type == "notification" and entry.data.get("kind") == "child_question"
+            for entry in store.replay()
+        )
+
+        canceled = await loop.tool_registry.execute(
+            ToolCall("cancel-lead", "agent_cancel", {"handle": lead_handle})
+        )
+        assert canceled["isError"] is False
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        terminal = await loop.tool_registry.execute(
+            ToolCall("dead-lead-status", "agent_status", {"handle": lead_handle})
+        )
+        assert terminal["structuredContent"]["children"][0]["state"] != "idle"
+        rows_before = [
+            entry.type
+            for entry in lead_store.replay()
+            if entry.type in {"pending_prompt", "pending_queue_closed"}
+        ]
+        calls_before = backend.calls["lead"]
+        wakes_before = list(wakes)
+        rejected = await loop.tool_registry.execute(
+            ToolCall(
+                "send-after-cancel",
+                "agent_send",
+                {"child_instance_id": lead_handle, "message": "do not revive"},
+            )
+        )
+        assert rejected["isError"] is True
+        assert "no live run/child" in rejected["content"][0]["text"]
+        assert backend.calls["lead"] == calls_before
+        assert wakes == wakes_before
+        assert [
+            entry.type
+            for entry in lead_store.replay()
+            if entry.type in {"pending_prompt", "pending_queue_closed"}
+        ] == rows_before
+    finally:
+        backend.release_worker_question.set()
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio

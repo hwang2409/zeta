@@ -93,9 +93,20 @@ def _cell_prefix(text: str, width: int) -> int:
     return len(text)
 
 
-def wrap_by_cells(text: str, width: int) -> list[str]:
-    """Wrap text by terminal cells, splitting words that exceed the width."""
+def _wrap_prefix(text: str, width: int, *, prefer_boundaries: bool) -> int:
+    split = _cell_prefix(text, width)
+    if not prefer_boundaries:
+        return split
+    separator = max(text.rfind(mark, 0, split) for mark in "/-_.")
+    if separator < 0:
+        return split
+    split = separator + 1
+    while split < len(text) and get_cwidth(text[split]) == 0:
+        split += 1
+    return split
 
+
+def _wrap_by_cells(text: str, width: int, *, prefer_boundaries: bool) -> list[str]:
     width = max(1, width)
     lines: list[str] = []
     for paragraph in text.splitlines() or [""]:
@@ -108,9 +119,21 @@ def wrap_by_cells(text: str, width: int) -> list[str]:
             if current:
                 lines.append(current)
             while get_cwidth(word) > width:
-                split = _cell_prefix(word, width)
+                split = _wrap_prefix(word, width, prefer_boundaries=prefer_boundaries)
                 lines.append(word[:split])
                 word = word[split:]
             current = word
         lines.append(current)
     return lines
+
+
+def wrap_by_cells(text: str, width: int) -> list[str]:
+    """Wrap text by terminal cells, preferring spaces and path separators."""
+
+    return _wrap_by_cells(text, width, prefer_boundaries=True)
+
+
+def hard_wrap_by_cells(text: str, width: int) -> list[str]:
+    """Wrap text by terminal cells without selecting word boundaries."""
+
+    return _wrap_by_cells(text, width, prefer_boundaries=False)
