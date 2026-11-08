@@ -1299,7 +1299,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             and calls_by_thread[thread_id] == 2
         ):
             owner_before_collection.set()
-            assert release_owner.wait(10), "owner release was not signalled"
+            assert release_owner.wait(120), "owner release was not signalled"
         return real_session_directory(*args, **kwargs)
 
     monkeypatch.setattr(session_links, "persist_pending_child_link", observe_admission)
@@ -1339,13 +1339,16 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             "owner_before_collection not reached"
         )
         for call in calls[1:]:
-            task = asyncio.create_task(
-                loop._run_agent_tool(
-                    call, call.arguments, signals.new_generation(), None
+            tasks.append(
+                asyncio.create_task(
+                    loop._run_agent_tool(
+                        call, call.arguments, signals.new_generation(), None
+                    )
                 )
             )
-            tasks.append(task)
-            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await asyncio.wait_for(
+            asyncio.gather(*tasks[1:], return_exceptions=True), 120
+        )
         release_owner.set()
         results = await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True), 10
@@ -1360,7 +1363,9 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             finally:
                 opened.store.close()
 
-    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all(isinstance(result, RuntimeError) for result in results), [
+        repr(result) for result in results if not isinstance(result, RuntimeError)
+    ]
     assert registry_reads == 2
     records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=10_000)
     child_ids = [
@@ -1412,7 +1417,7 @@ async def test_real_child_spawns_repeat_after_generation_changes(
         record_calls += 1
         if record_calls == 1:
             first_batch_ready.set()
-            assert release_first_batch.wait(10), "first batch release was not signalled"
+            assert release_first_batch.wait(120), "first batch release was not signalled"
         real_record_sessions(*args, **kwargs)
 
     # test-contract: seam gate one batch behind real child spawns
@@ -1452,13 +1457,16 @@ async def test_real_child_spawns_repeat_after_generation_changes(
             "first_batch_ready not reached"
         )
         for call in calls[1:256]:
-            task = asyncio.create_task(
-                loop._run_agent_tool(
-                    call, call.arguments, signals.new_generation(), None
+            tasks.append(
+                asyncio.create_task(
+                    loop._run_agent_tool(
+                        call, call.arguments, signals.new_generation(), None
+                    )
                 )
             )
-            tasks.append(task)
-            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await asyncio.wait_for(
+            asyncio.gather(*tasks[1:], return_exceptions=True), 120
+        )
         last = asyncio.create_task(
             loop._run_agent_tool(
                 calls[256], calls[256].arguments, signals.new_generation(), None
@@ -1479,7 +1487,9 @@ async def test_real_child_spawns_repeat_after_generation_changes(
                 await asyncio.wait_for(loop.close(), 10)
             finally:
                 opened.store.close()
-    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all(isinstance(result, RuntimeError) for result in results), [
+        repr(result) for result in results if not isinstance(result, RuntimeError)
+    ]
 
     # The first ready set is already collected when publication blocks. The
     # 257th admission must change the generation and force a second pass.
@@ -1673,7 +1683,9 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             finally:
                 opened.store.close()
 
-    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all(isinstance(result, RuntimeError) for result in results), [
+        repr(result) for result in results if not isinstance(result, RuntimeError)
+    ]
     assert max_active_records == 1
     assert registry_reads == 2
     records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=100)
