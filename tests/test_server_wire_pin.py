@@ -102,7 +102,9 @@ async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
                 actual = await client.request_raw(
                     pin["request_id"], pin["method"], pin["params"]
                 )
-                if pin["method"] == "model_catalog":
+                if pin.get("kind") == "ergonomics_valid":
+                    assert json.loads(actual) == json.loads(pin["response"])
+                elif pin["method"] == "model_catalog":
                     result = json.loads(actual)["result"]
                     assert set(result) == {"models", "providers"}
                     assert isinstance(result["models"], list)
