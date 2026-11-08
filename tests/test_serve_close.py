@@ -116,6 +116,78 @@ async def test_leaked_app(tmp_path):
     assert (pytester.path / "closed").read_text() == "closed"
 
 
+def test_app_owner_reports_pending_task_on_closed_loop(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_pending_task_outlives_loop(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    foreign_loop = asyncio.new_event_loop()
+    async def active():
+        await asyncio.Event().wait()
+    task = foreign_loop.create_task(active(), name="outlives-closed-loop")
+    foreign_loop.close()
+    app._active_task = task
+    original_close = app.close
+    async def close_and_prove():
+        await original_close()
+        Path("closed").write_text("closed")
+    app.close = close_and_prove
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(
+        ["*TUIApp active task still pending on a closed event loop: *outlives-closed-loop*created at *"]
+    )
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_app_owner_accepts_done_task_on_closed_loop(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import threading
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_done_task_outlives_loop(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    tasks = []
+    def finish_task():
+        foreign_loop = asyncio.new_event_loop()
+        task = foreign_loop.create_task(asyncio.sleep(0), name="done-closed-loop")
+        foreign_loop.run_until_complete(task)
+        foreign_loop.close()
+        tasks.append(task)
+    thread = threading.Thread(target=finish_task)
+    thread.start()
+    await asyncio.wait_for(asyncio.to_thread(thread.join), 10)
+    app._active_task = tasks[0]
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
 def test_app_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
     result = _run_owner_test(
         pytester,

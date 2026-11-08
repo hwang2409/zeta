@@ -70,7 +70,8 @@ async def close_owned_app(app: TUIApp) -> None:
     """Cancel an app's active task, then close the app."""
     # test-contract: seam test cleanup owns the private active provider task.
     task = app._active_task
-    if task is not None:
+    pending_closed_loop_error: AssertionError | None = None
+    if task is not None and not task.done():
         current_loop = asyncio.get_running_loop()
         if task.get_loop() is current_loop:
             await _cancel_and_drain(
@@ -80,7 +81,18 @@ async def close_owned_app(app: TUIApp) -> None:
             )
         elif not task.get_loop().is_closed():
             task.cancel()
+        else:
+            traceback = getattr(task, "_source_traceback", None)
+            site = "unknown"
+            if traceback:
+                site = traceback.format()[-1].strip()
+            pending_closed_loop_error = AssertionError(
+                "TUIApp active task still pending on a closed event loop: "
+                f"{task!r} (created at {site})"
+            )
     await app.close()
+    if pending_closed_loop_error is not None:
+        raise pending_closed_loop_error
 
 
 class AppOwner:
