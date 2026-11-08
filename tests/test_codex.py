@@ -4247,7 +4247,7 @@ async def test_consumer_aclose_finishes_without_leaking_cleanup(
         async def aiter_lines(self):
             for line in sse(message_stream()[:1]).splitlines():
                 yield line
-            await never.wait()
+            await asyncio.wait_for(never.wait(), 10)
 
     class Stream:
         async def __aenter__(self):
@@ -4288,7 +4288,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
 
         async def __aexit__(self, exc_type, exc_value, traceback):
             cleanup_started.set()
-            await never.wait()
+            await asyncio.wait_for(never.wait(), 10)
 
     class Client:
         def stream(self, method, url, *, headers, content):
@@ -4305,7 +4305,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
     await asyncio.wait_for(cleanup_started.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as raised:
-        await task
+        await asyncio.wait_for(task, 10)
     assert isinstance(raised.value.__cause__, CodexStreamError)
 
 
