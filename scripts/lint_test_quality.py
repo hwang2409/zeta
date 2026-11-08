@@ -26,7 +26,16 @@ CONTRACT_ERROR = (
     "'# test-contract: complexity <reason>', 'durability <reason>', or "
     "'seam <reason>' on this line or the line above"
 )
-CONTRACT_KINDS = {"bootstrap", "complexity", "durability", "latency", "seam"}
+CONTRACT_KINDS = {
+    "bootstrap",
+    "complexity",
+    "durability",
+    "latency",
+    "seam",
+    "transport",
+}
+# A transport marker only names a non-serve reader; it does not excuse a missing deadline.
+DEADLINE_MARKER_KINDS = CONTRACT_KINDS - {"transport"}
 ASYNC_BLOCKING_CODE = "TQ007"
 ASYNC_BLOCKING_ERROR = (
     "sync filesystem call {call} in async def {function} blocks the event loop; "
@@ -103,6 +112,18 @@ GLOBAL_BOOTSTRAP_ALLOWLIST = {
     "ZETA_TEST_LIVE_HOME",  # identifies the guarded live-home fixture
     "ZETA_TEST_OWNERSHIP_TOKEN",  # authenticates writes from guarded children
 }
+RAW_SERVE_READ_CODE = "TQ008"
+RAW_SERVE_READ_ERROR = (
+    "raw serve-socket read bypasses the shared client: use "
+    "tests/support/server_client.py read helpers (send + read_until), which keep "
+    "reading until every sent request has its response; mark a reader that is "
+    "not a newline JSON-RPC serve socket with "
+    "'# test-contract: transport <reason>' on this line or the line above"
+)
+# Serve frames on a socket are newline-framed, so readline is the only raw read the
+# shared client can replace; readuntil/readexactly read HTTP or websocket framing.
+RAW_SERVE_READ_METHODS = {"readline"}
+SERVE_CLIENT_MODULE = Path("tests/support/server_client.py")
 
 
 @dataclass(frozen=True)
@@ -824,7 +845,7 @@ def _deadline_findings(
     if _is_unbounded_sync_wait(node, parents):
         return (
             []
-            if _has_marker(lines, node.lineno, CONTRACT_KINDS)
+            if _has_marker(lines, node.lineno, DEADLINE_MARKER_KINDS)
             else [
                 Finding(
                     path,
@@ -851,7 +872,7 @@ def _deadline_findings(
     )
     if (
         not violates
-        or _has_marker(lines, node.lineno, CONTRACT_KINDS)
+        or _has_marker(lines, node.lineno, DEADLINE_MARKER_KINDS)
         or _bounded_asyncio_wait(value)
         or _inside_timeout_context(node, parents)
         or _inside_deadline_argument(node, parents)
@@ -881,7 +902,35 @@ def _scan_added_nodes(
         findings.extend(_timing_findings(path, node, lines))
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
         findings.extend(_contract_findings(path, node, lines, new_private_patches))
+        findings.extend(_raw_serve_read_findings(path, node, lines))
     return findings
+
+
+def _raw_serve_read_findings(
+    path: Path, node: ast.AST, lines: list[str]
+) -> list[Finding]:
+    """Flag line reads on a stream reader named like a serve socket reader."""
+    if (
+        path == SERVE_CLIENT_MODULE
+        or not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Attribute)
+        or node.func.attr not in RAW_SERVE_READ_METHODS
+    ):
+        return []
+    receiver = _name(node.func.value).rsplit(".", 1)[-1]
+    if (
+        receiver != "reader" and not receiver.endswith("_reader")
+    ) or _has_marker(lines, node.lineno, {"transport"}):
+        return []
+    return [
+        Finding(
+            path,
+            node.lineno,
+            node.col_offset + 1,
+            RAW_SERVE_READ_CODE,
+            RAW_SERVE_READ_ERROR,
+        )
+    ]
 
 
 def _scan_deadline_nodes(

@@ -1633,3 +1633,90 @@ def test_lint_diff_applies_rule_families_by_path(
     target.write_text(source)
 
     assert {finding.code for finding in lint_diff(_diff(path, source), tmp_path)} == codes
+
+
+# The pre-migration helper behind CI run 42502453427: it stopped at turn_end while
+# the deny response (id 4) was still on its way.
+_PAST_RAW_SERVE_READ = """
+import asyncio
+import json
+
+
+async def _read_raw_until(reader, frames, predicate):
+    while True:
+        frame = await asyncio.wait_for(reader.readline(), 10)
+        assert frame
+        frames.append(frame)
+        decoded = json.loads(frame)
+        if predicate(decoded):
+            return decoded
+"""
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "flagged"),
+    [
+        ("tests/test_server_observers.py", _PAST_RAW_SERVE_READ, True),
+        (
+            "tests/test_x.py",
+            "async def f(self):\n    return await self.replay_reader.readline()\n",
+            True,
+        ),
+        # Websocket and HTTP framing reads are not newline JSON-RPC frames.
+        (
+            "tests/test_x.py",
+            (
+                "async def f(replay_reader):\n"
+                "    return await replay_reader.readexactly(4)\n"
+            ),
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "async def f(reader):\n"
+                "    # test-contract: transport fake HTTP server request line\n"
+                "    return await reader.readline()\n"
+            ),
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "async def f(reader):\n"
+                "    # test-contract: seam wrong kind for a reader\n"
+                "    return await reader.readline()\n"
+            ),
+            True,
+        ),
+        ("tests/support/server_client.py", _PAST_RAW_SERVE_READ, False),
+        (
+            "tests/test_x.py",
+            "async def f(process):\n    return await process.stdout.readline()\n",
+            False,
+        ),
+    ],
+)
+def test_raw_serve_socket_reads_must_use_the_shared_client(
+    tmp_path: Path, path: str, source: str, flagged: bool
+) -> None:
+    findings = [
+        finding
+        for finding in _lint(tmp_path, source, path=path)
+        if finding.code == "TQ008"
+    ]
+
+    assert bool(findings) is flagged
+    assert all(
+        "use tests/support/server_client.py read helpers" in finding.message
+        and "'# test-contract: transport <reason>'" in finding.message
+        for finding in findings
+    )
+
+
+def test_transport_marker_does_not_excuse_a_missing_deadline(tmp_path: Path) -> None:
+    source = "async def test_wait():\n    await ready.wait()  # test-contract: transport x\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
