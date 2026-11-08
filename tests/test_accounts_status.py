@@ -65,6 +65,24 @@ def _run_json(home: Path, monkeypatch: pytest.MonkeyPatch, *args: str):
     return exit_code
 
 
+def test_accounts_status_reports_recovery_for_malformed_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    initialize_storage_home(tmp_path)
+    registry = tmp_path / "accounts.json"
+    original = b"not json\n"
+    registry.write_bytes(original)
+
+    assert _run_json(tmp_path, monkeypatch) == 1
+    assert capsys.readouterr().err == (
+        f"accounts.json is not valid: {registry}; move it aside to a backup, "
+        "then run login again or restore it from a backup\n"
+    )
+    assert registry.read_bytes() == original
+
+
 def test_accounts_status_reports_login_expiry_without_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
