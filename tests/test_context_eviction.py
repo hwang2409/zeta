@@ -118,6 +118,36 @@ def test_covered_rows_skip_message_decoding() -> None:
     assert from_dict.call_count == 1
 
 
+def test_covered_rows_with_invalid_metadata_keep_decoder_validation() -> None:
+    malformed = text(MessageRole.ASSISTANT, "malformed").to_dict()
+    malformed["metadata"] = []
+    entry = ConversationEntry(
+        seq=1,
+        id="1",
+        parent_id=None,
+        lane="main",
+        type="message",
+        data={"message": malformed},
+    )
+    marker = ConversationEntry(
+        seq=2,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 1,
+            "source_seq_end": 1,
+            "view": [{"seq": 1, "message": text(MessageRole.ASSISTANT, "1").to_dict()}],
+        },
+    )
+
+    assembler = object.__new__(ContextAssembler)
+    with pytest.raises(ValueError, match="message metadata must be an object"):
+        assembler._visible_items([entry, marker])
+
+
 def test_legacy_pinned_message_uses_original_source_order() -> None:
     request = text(MessageRole.USER, "request")
     entries = [

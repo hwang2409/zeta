@@ -1167,13 +1167,12 @@ class ContextAssembler(ContextMarkerMixin):
                 continue
             raw_message = entry.data["message"]
             raw_metadata = raw_message.get("metadata", {})
-            if not isinstance(raw_metadata, Mapping):
-                raw_metadata = {}
             covered = any(
                 start <= entry.seq <= end for start, end in compacted_ranges
             )
             if (
                 covered
+                and type(raw_metadata) is dict
                 and not raw_metadata.get(FAILED_TURN_MARKER)
                 and not self._is_pending_delivery_metadata(raw_metadata)
             ):
