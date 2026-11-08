@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 
 from tests.test_attention import _session
-from zeta import attention_records, storage_format
+from zeta import attention_records
 from zeta.attention_decisions import open_decisions
-from zeta.attention_records import AttentionStore
+from zeta.attention_records import ATTENTION_KIND_EPOCH, AttentionStore
 from zeta.skills import SkillCatalog
 from zeta.storage_format import (
     StorageFormatError,
@@ -123,18 +123,21 @@ def test_request_attention_kind_rules_use_registered_handler(tmp_path: Path) -> 
     opened.store.close()
 
 
-def test_non_decision_creation_waits_for_shared_cutover(tmp_path: Path) -> None:
+def test_non_decision_creation_waits_for_shared_cutover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(attention_records, "WRITER_EPOCH", 6)
     advance(tmp_path, expected_epoch=0)
     session = _session(tmp_path)
     try:
-        store = AttentionStore(session.store.session_dir, writer_epoch=2)
+        store = AttentionStore(session.store.session_dir, writer_epoch=4)
     except TypeError:
         store = AttentionStore(session.store.session_dir)
     decision = _record(store, session_id=session.store.session_id)
     assert store.get(decision.id).kind == "decision"
     with pytest.raises(
         ValueError,
-        match=rf"zeta storage-format advance --expected-epoch 2 --target-epoch {storage_format.WRITER_EPOCH}",
+        match=rf"zeta storage-format advance --expected-epoch 4 --target-epoch {ATTENTION_KIND_EPOCH}",
     ):
         _record(store, kind="answer", session_id=session.store.session_id)
     session.store.close()
