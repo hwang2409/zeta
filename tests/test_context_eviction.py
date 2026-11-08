@@ -114,6 +114,7 @@ def test_covered_rows_skip_message_decoding() -> None:
 
     # test-contract: seam _visible_items is the narrow projection seam under test
     assert [item.message.content[0].text for item in projected] == ["1"]
+    # test-contract: seam _visible_items is the narrow projection seam under test
     assert from_dict.call_count == 1
 
 
