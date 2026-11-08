@@ -138,7 +138,7 @@ def test_predecessor_writer_refuses_advanced_home_without_writes(
         if path.is_file()
     }
 
-    assert verify(tmp_path).writer_epoch == 3
+    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
         open_writer(tmp_path, capability=2)
 
@@ -256,7 +256,9 @@ def test_advanced_home_refuses_predecessor_before_transcript_parsing(
         if path.is_file()
     }
 
-    assert verify(tmp_path).writer_epoch == 3, "candidate advanced the home"
+    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH, (
+        "candidate advanced the home"
+    )
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
         open_writer(tmp_path, capability=2)
 
@@ -363,3 +365,54 @@ def test_publish_reads_locked_tree_before_writing(tmp_path: Path) -> None:
     assert json.loads((tmp_path / "state.json").read_text()) == {
         "known": {"value": 2, "future": "kept"}
     }
+
+
+def test_registry_matches_queued_steer_validator_shape() -> None:
+    from zeta.core.store._client_delivery import validate_client_delivery_data
+    from zeta.protocol.types import (
+        Message,
+        MessageOrigin,
+        MessageRole,
+        TextContent,
+        with_message_origin,
+    )
+
+    accepted = with_message_origin(
+        Message(MessageRole.USER, [TextContent("resume")]), MessageOrigin.USER
+    ).to_dict()
+    payload = {
+        "delivery_id": "d" * 8,
+        "method": "steer",
+        "status": "queued",
+        "outcome": {"accepted": True},
+        "accepted_message": accepted,
+    }
+    validate_client_delivery_data(payload, "session")
+    assert set(payload) == set(storage_format.ACCEPTED_KEY_SETS["client_delivery_queued_steer_acceptance_message"])
+
+
+def test_registry_dump_is_deterministic_and_detects_epoch_neutral_changes() -> None:
+    from zeta.storage_format import compare_registry_dumps, registry_dump
+
+    baseline = registry_dump()
+    changed = json.loads(json.dumps(baseline))
+    changed["accepted_key_sets"]["todo_item"].append("future")
+    with pytest.raises(ValueError, match="shape todo_item.*accepted key.*greater.*bump the epoch"):
+        compare_registry_dumps(baseline, changed)
+
+    changed["writer_epoch"] = baseline["writer_epoch"] + 1
+    compare_registry_dumps(baseline, changed)
+
+    for registry_name, shape, value in (
+        ("closed_variants", "account.provider", "future"),
+        ("accepted_key_sets", "todo_item", "removed"),
+    ):
+        mutated = json.loads(json.dumps(baseline))
+        if registry_name == "closed_variants":
+            mutated[registry_name][shape].append(value)
+        else:
+            mutated[registry_name][shape].remove("status")
+        with pytest.raises(ValueError, match="WRITER_EPOCH"):
+            compare_registry_dumps(baseline, mutated)
+        mutated["writer_epoch"] += 1
+        compare_registry_dumps(baseline, mutated)

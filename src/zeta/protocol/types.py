@@ -29,6 +29,7 @@ from ..media.images import (
     image_signature_matches,
     image_validation_status,
 )
+from ..storage_format import reject_unknown_keys
 
 
 class MessageRole(StrEnum):
@@ -291,14 +292,11 @@ def validate_tool_content_block(
 
 def _validate_text_block(prefix: str, block: dict[str, Any]) -> ToolTextBlock:
     required_keys = {"type", "text", "truncated", "full_size"}
-    allowed_keys = {
-        *required_keys,
-        "full_size_chars",
-        "next_offset",
-        "spill_path",
-        "annotations",
-    }
-    if not required_keys <= set(block) or not set(block) <= allowed_keys:
+    try:
+        reject_unknown_keys(block, "tool_result_text")
+    except ValueError:
+        raise ValueError(f"{prefix} has an invalid text shape") from None
+    if not required_keys <= set(block):
         raise ValueError(f"{prefix} has an invalid text shape")
     if type(block["text"]) is not str:
         raise ValueError(f"{prefix}.text must be a string")
@@ -339,16 +337,11 @@ def _validate_image_block(
     prefix: str, block: dict[str, Any], *, complete_image: bool
 ) -> ToolImageBlock:
     required_keys = {"type", "data", "mimeType"}
-    allowed_keys = {
-        *required_keys,
-        "annotations",
-        "caption",
-        "width",
-        "height",
-        "path",
-        "size",
-    }
-    if not required_keys <= set(block) or not set(block) <= allowed_keys:
+    try:
+        reject_unknown_keys(block, "tool_result_image")
+    except ValueError:
+        raise ValueError(f"{prefix} has an invalid image shape") from None
+    if not required_keys <= set(block):
         raise ValueError(f"{prefix} has an invalid image shape")
     if type(block.get("data")) is not str:
         raise ValueError(f"{prefix}.data must be a string")
@@ -396,12 +389,19 @@ def _validate_image_block(
 
 def _validate_resource_block(prefix: str, block: dict[str, Any]) -> ToolResourceBlock:
     required_keys = {"type", "resource"}
-    allowed_keys = {*required_keys, "annotations"}
-    if not required_keys <= set(block) or not set(block) <= allowed_keys:
+    try:
+        reject_unknown_keys(block, "tool_result_resource")
+    except ValueError:
+        raise ValueError(f"{prefix} has an invalid resource shape") from None
+    if not required_keys <= set(block):
         raise ValueError(f"{prefix} has an invalid resource shape")
     resource = block.get("resource")
     if type(resource) is not dict:
         raise ValueError(f"{prefix}.resource must be an object")
+    try:
+        reject_unknown_keys(resource, "tool_result_resource_contents")
+    except ValueError:
+        raise ValueError(f"{prefix}.resource has unsupported fields") from None
     resource_keys = {"uri", "mimeType", "text", "blob"}
     if not set(resource) <= resource_keys:
         raise ValueError(f"{prefix}.resource has unsupported fields")
@@ -438,6 +438,10 @@ def _validate_resource_block(prefix: str, block: dict[str, Any]) -> ToolResource
 def _validate_annotations(prefix: str, value: object) -> ToolAnnotations:
     if type(value) is not dict:
         raise ValueError(f"{prefix}.annotations must be an object")
+    try:
+        reject_unknown_keys(value, "tool_result_annotations")
+    except ValueError:
+        raise ValueError(f"{prefix}.annotations has unsupported fields") from None
     allowed_keys = {"audience", "priority", "lastModified"}
     if not set(value) <= allowed_keys:
         raise ValueError(f"{prefix}.annotations has unsupported fields")

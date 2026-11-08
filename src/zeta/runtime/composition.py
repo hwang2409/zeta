@@ -96,6 +96,7 @@ def compose_runtime(
     project_discovery: ProjectDiscovery | None = None,
     memory_notice: Callable[[str], None] | None = None,
     post_stream_provider_retry: bool = True,
+    require_selected_account: bool = True,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -159,6 +160,8 @@ def compose_runtime(
             cleanup.enter_context(opened.store)
         metadata = opened.metadata
         account_context = SessionAccountContext.load(home, manager, metadata)
+        if require_selected_account:
+            account_context.require_active_available(provider)
         backend_kwargs.update(account_context.backend_kwargs(provider))
         backend, selected_model = backend_builder(
             provider, session_model, **backend_kwargs
