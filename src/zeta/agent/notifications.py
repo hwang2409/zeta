@@ -166,6 +166,7 @@ class AgentNotificationMixin:
 
         if notice.role is not MessageRole.SYSTEM:
             raise ValueError("harness notice must have the system role")
+        self._abort_admitted = False
         return self._run_turn(
             "",
             origin=MessageOrigin.HARNESS_NUDGE,
@@ -185,6 +186,7 @@ class AgentNotificationMixin:
         host_instruction: str = "",
         allow_assistant_reset: bool = True,
     ) -> AsyncIterator[StreamEvent]:
+        self._abort_admitted = False
         return self._run_turn(
             user_text,
             origin=origin,
@@ -318,6 +320,7 @@ class AgentNotificationMixin:
             and not self.schedule_notification_turn()
         ):
             raise RuntimeError("no pending agent notifications")
+        self._abort_admitted = False
         return self._run_turn(
             "",
             origin=MessageOrigin.NOTIFICATION,

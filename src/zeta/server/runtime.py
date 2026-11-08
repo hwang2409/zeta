@@ -20,7 +20,12 @@ from ..core.project_context import (
     project_context_projection_for_discovery,
     resolve_project_context_from_projects,
 )
-from ..core.session import OpenedSession, SessionManager, SessionMetadata
+from ..core.session import (
+    OpenedSession,
+    SessionManager,
+    SessionMetadata,
+    persist_metadata_change,
+)
 from ..core.slash import (
     UsageTracker,
     effective_budget_for_model,
@@ -647,15 +652,45 @@ class ServerRuntime:
     def _compose(
         self, *, cwd: Path, project_id: str | None, **kwargs: object
     ) -> RuntimeComposition:
-        return compose_runtime(
+        metadata = (
+            kwargs["opened"].metadata
+            if isinstance(kwargs.get("opened"), OpenedSession)
+            else None
+        )
+
+        def persist_plan_mode(enabled: bool) -> asyncio.Task[None] | None:
+            if metadata is None:
+                return None
+            try:
+                event_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self.manager.record_plan_mode(metadata, enabled=enabled)
+                return None
+            return event_loop.create_task(
+                persist_metadata_change(
+                    self.manager,
+                    metadata,
+                    lambda candidate: self.manager.record_plan_mode(
+                        candidate, enabled=enabled
+                    ),
+                )
+            )
+
+        composition = compose_runtime(
             home=self.home,
             cwd=cwd,
             manager=self.manager,
             backend_builder=self._build_backend,
             auto_project=False,
             project_id=project_id,
+            on_plan_mode_change=persist_plan_mode,
+            require_selected_account=(
+                self.backend_factory is None and not self._test_scripted_provider
+            ),
             **kwargs,
         )
+        metadata = composition.opened.metadata
+        return composition
 
     def _build_backend(
         self,

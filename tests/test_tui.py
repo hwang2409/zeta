@@ -890,6 +890,34 @@ def test_other_background_notices_remain_visible() -> None:
     assert [item.plain for item in rendered] == ["background task task-1 killed"]
 
 
+@pytest.mark.asyncio
+async def test_status_renders_unavailable_accounts_through_tui(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.account_context = SimpleNamespace(unavailable_accounts=("codex:missing",))
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        rendered = await app._slash_commands.dispatch_async(app, "/status")
+        assert isinstance(rendered, str)
+        app._handle_slash_output(rendered)
+
+        assert "unavailable_accounts: codex:missing" in output.getvalue()
+    finally:
+        await loop.close()
+        loop.store.close()
+
+
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(
@@ -1197,7 +1225,7 @@ class QueueOrderBackend(CompletionBackend):
                 content=TextContent("| name | value |\n| --- | --- |"),
             )
             self.started.set()
-            await self.release.wait()
+            await await_or_fail(self.release.wait(), what="table response release")
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(
@@ -1247,7 +1275,9 @@ class AbortThenSuccessBackend(CompletionBackend):
                 content=TextContent("partial response"),
             )
             self.started.set()
-            await asyncio.Event().wait()
+            await await_or_fail(
+                asyncio.Event().wait(), what="interrupted response cancellation"
+            )
         response = "second response"
         yield StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
@@ -1325,7 +1355,7 @@ class WaitingFailureBackend(CompletionBackend):
             content=TextContent("partial response"),
         )
         self.started.set()
-        await self.release.wait()
+        await await_or_fail(self.release.wait(), what="failed response release")
         yield StreamEvent(
             StreamEventType.ERROR,
             error=ErrorInfo("transport_error", "network disconnected"),
@@ -4769,10 +4799,10 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     app._active_session = session
     task = asyncio.create_task(app._consume_turn("prompt"))
     app._active_task = task
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="draft response start")
     session.app.current_buffer.insert_text("draft while streaming")
     backend.release.set()
-    await task
+    await await_or_fail(task, what="draft response completion")
 
     assert session.app.current_buffer.text == "draft while streaming"
     failed_message = app.loop.store.messages()[-1]
@@ -6479,6 +6509,9 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         "".join(text for _style, text in line)
         for line in tui_app_module._status_card_lines(status)
     )
+
+    assert "unavailable_accounts: none\n" in rendered
+    rendered = rendered.replace("unavailable_accounts: none\n", "")
 
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
@@ -10909,12 +10942,12 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("first\r")
-        await backend.started.wait()
+        await await_or_fail(backend.started.wait(), what="queued response start")
         pipe.send_text("second\r")
         backend.release.set()
         await wait_until(lambda: len(store.messages()) == 4)
         pipe.send_text("\x04")
-        await run_task
+        await await_or_fail(run_task, what="queued TUI run")
 
     user_texts = [
         block.text
@@ -11020,7 +11053,7 @@ async def test_plain_approve_word_is_sent_to_model_from_prompt_session(
         pipe.send_text(f"{text}\r")
         await asyncio.sleep(0.05)
         pipe.send_text("\x04")
-        await run_task
+        await await_or_fail(run_task, what="submitted TUI run")
 
     assert [
         block.text
@@ -13413,11 +13446,13 @@ async def test_undo_restores_text_and_aborts_streaming_turn(tmp_path: Path) -> N
     app._active_session = session
     task = asyncio.create_task(app._consume_turn("sent message"))
     app._active_task = task
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="undo response start")
 
     app._undo_candidate = UndoCandidate("sent message")
     app.undo_sent_turn()
-    await asyncio.gather(task, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(task, return_exceptions=True), what="undo response cleanup"
+    )
 
     assert session.app.current_buffer.text == "sent message"
     assert app._loop_state == "interrupted"
@@ -13927,6 +13962,44 @@ async def test_tui_model_command_does_no_lock_work_on_loop(
 
 
 @pytest.mark.asyncio
+async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    missing = AccountId("codex", "missing")
+    for account in (current, missing):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    AccountStore(home).credential_path(missing).unlink()
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=80).print(rendered[0])
+        assert (
+            "codex:missing  unavailable: credentials missing"
+            in Text.from_ansi(output.getvalue()).plain
+        )
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -13981,9 +14054,9 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     app.accounts_picker_move(1)
     task = app.accounts_picker_select()
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
-    assert off_loop_calls == ["list"]
+    assert off_loop_calls == ["list", "list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
@@ -14733,6 +14806,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
         {"codex": account},
         {account: "henry@example.com"},
         {account: "henry"},
+        unavailable={account},
     )
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(picker.render())
@@ -14740,6 +14814,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
 
     assert "codex:henry" in plain
     assert "henry@example.com" in plain
+    assert "unavailable: credentials missing" in plain
     assert "n rename" in plain
 
 

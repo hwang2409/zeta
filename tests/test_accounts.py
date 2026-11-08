@@ -29,6 +29,7 @@ import zeta.oauth as oauth_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.login as provider_login_module
 import zeta.server.login as server_login
+from tests.support.account_homes import build_account_home
 from tests.support.account_processes import (
     crash_logout,
     hold_account_credential_lock,
@@ -1751,6 +1752,9 @@ async def test_live_child_websearch_ignores_later_parent_switch(
         named_account_credentials(home, "codex", "second").save, tokens()
     )
     await asyncio.to_thread(AccountStore(home).set_default, first)
+    await asyncio.to_thread(
+        named_account_credentials(home, "anthropic", "default").save, tokens()
+    )
     manager = SessionManager(home)
     opened = await asyncio.to_thread(
         manager.create, provider="claude", model="claude-sonnet-4-6", cwd=tmp_path
@@ -2456,6 +2460,36 @@ def test_list_display_enriches_list_catalog_without_reparsing_registry(
     assert [(item.account, item.label) for item in displayed] == [
         (item.account, item.label) for item in catalog
     ]
+
+
+def test_missing_credentials_are_derived_availability_not_migration_failure(
+    tmp_path: Path,
+) -> None:
+    current = AccountId("codex", "current")
+    missing = AccountId("codex", "missing")
+    other = AccountId("anthropic", "other")
+    store = build_account_home(
+        tmp_path,
+        (current, missing, other),
+        available=(current,),
+        defaults=(current,),
+    )
+
+    assert store.migrate() == ()
+    assert {item.account: item.available for item in store.list_display()} == {
+        current: True,
+        missing: False,
+        other: False,
+    }
+    assert store.resolve_account("codex") == current
+    with pytest.raises(
+        AccountError,
+        match=(
+            "account codex:missing is unavailable: credentials missing; "
+            "run 'zeta accounts login codex missing --replace'"
+        ),
+    ):
+        store.require_available(store.resolve_account("codex", missing))
 
 
 def test_codex_email_from_access_token_profile_claim(tmp_path: Path) -> None:

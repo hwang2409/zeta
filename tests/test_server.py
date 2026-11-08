@@ -928,6 +928,60 @@ class DelegatedApprovalBackend:
             yield event
 
 
+class NestedDelegatedApprovalBackend:
+    def __init__(self, target: Path) -> None:
+        child = ToolCall(
+            "child-agent",
+            "agent",
+            {"prompt": "child prompt", "description": "child", "background": True},
+        )
+        grandchild = ToolCall(
+            "grandchild-agent",
+            "agent",
+            {
+                "prompt": "grandchild prompt",
+                "description": "grandchild",
+                "background": True,
+            },
+        )
+        approval = ToolCall("grandchild-read", "read", {"path": str(target)})
+        self.parent = FakeBackend(
+            [ScriptedTurn(tool_calls=[child]), ScriptedTurn([TextContent("done")])]
+        )
+        self.child = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[grandchild]),
+                ScriptedTurn([TextContent("must not continue")]),
+            ]
+        )
+        self.grandchild = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[approval]),
+                ScriptedTurn([TextContent("must not continue")]),
+            ]
+        )
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        prompts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        if "grandchild prompt" in prompts:
+            backend = self.grandchild
+        elif "child prompt" in prompts:
+            backend = self.child
+        else:
+            backend = self.parent
+        async for event in backend.complete(
+            messages, tool_schemas, control=completion_control()
+        ):
+            yield event
+
+
 class BackgroundChildAndForegroundToolBackend:
     def __init__(self, command: str) -> None:
         self.command = command
@@ -1968,6 +2022,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         # test-contract: seam exact lifecycle cardinality is the protocol contract
         assert len(ends) == 1
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
+        assert len(backend.child.calls) == 1
     finally:
         test_error = sys.exception()
         parent_tool_end_release.set()
@@ -1990,6 +2045,48 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
                 if cleanup_error is None:
                     raise
                 cleanup_error.add_note(f"server cleanup failed: {close_error!r}")
+
+
+@pytest.mark.asyncio
+async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    backend = NestedDelegatedApprovalBackend(target)
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    child_watcher: asyncio.Task[object] | None = None
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        approval = await _event(reader, "approval_request")
+        grandchild_id = approval["agent_instance_id"]
+        child_id = grandchild_id.rsplit(":", 1)[0]
+        assert server.runtime.loop is not None
+        owner = server.runtime.loop._background_owner
+        child_watcher = owner._watchers[child_id]
+        assert owner.cancel(child_id)
+        frames = await _request(reader, writer, 4, "status")
+        async with asyncio.timeout(TIMEOUT):
+            while not any(
+                event["request_id"] == approval["request_id"]
+                for event in _named_events(frames, "approval_end")
+            ):
+                frames.append(await _read(reader))
+        await _request(reader, writer, 5, "status")
+        assert len(backend.grandchild.calls) == 1
+    finally:
+        if child_watcher is not None and not child_watcher.done():
+            child_watcher.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(child_watcher, return_exceptions=True), TIMEOUT
+            )
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2721,7 +2818,13 @@ async def test_abort_captures_turn_before_approval_end_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("approval-race", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    aborted_reply = "must not survive abort"
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent(aborted_reply)]),
+        ]
+    )
     server = ZetaServer(
         provider="codex",
         home=tmp_path,
@@ -2769,21 +2872,36 @@ async def test_abort_captures_turn_before_approval_end_write(
 
         response = await await_or_fail(abort, what="abort response")
         assert response[-1]["result"] == {"aborted": True}
-        frames = await await_or_fail(
-            _frames_until_event(reader, "turn_aborted"),
-            what="turn_aborted frame",
+        frames = list(response)
+        if not _named_events(frames, "turn_aborted"):
+            frames += await await_or_fail(
+                _frames_until_event(reader, "turn_aborted"),
+                what="turn_aborted frame",
+            )
+        sentinel = asyncio.Event()
+        asyncio.get_running_loop().call_soon(sentinel.set)
+        await await_or_fail(sentinel.wait(), what="post-abort sentinel")
+
+        names = [
+            frame.get("params", {}).get("event")
+            for frame in frames
+            if frame.get("params", {}).get("event") is not None
+        ]
+        approval_end_index = names.index("approval_end")
+        turn_aborted_index = names.index("turn_aborted")
+        assert names[approval_end_index : turn_aborted_index + 1] == [
+            "approval_end",
+            "tool_end",
+            "turn_aborted",
+        ]
+        canceled_tool_end = _named_events(frames, "tool_end")[-1]
+        assert canceled_tool_end["tool_call"]["id"] == call.id
+        assert canceled_tool_end["tool_result"]["is_canceled"] is True
+        assert len(backend.calls) == 1
+        history = server.runtime.opened.store.messages()
+        assert aborted_reply not in json.dumps(
+            [message.to_dict() for message in history]
         )
-        writer.write(b'{"jsonrpc":"2.0","id":5,"method":"status","params":{}}\n')
-        await await_or_fail(writer.drain(), what="status request write")
-        frames += await await_or_fail(
-            read_until(reader, lambda frame: frame.get("id") == 5, what="status response"),
-            what="status response frames",
-        )
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert names.count("approval_end") == 1
-        assert names.index("approval_end") < names.index("turn_aborted")
-        after_abort = names[names.index("turn_aborted") + 1 :]
-        assert not {"tool_start", "tool_end", "turn_start"}.intersection(after_abort)
     finally:
         allow_approval_end.set()
         if abort is not None and not abort.done():
@@ -3496,7 +3614,8 @@ async def test_socket_lock_prevents_replacement_during_owner_cleanup(
 
         thread = threading.Thread(target=run_contender)
         thread.start()
-        thread.join()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
         path_after_attempt = socket_path.exists()
         real_unlink(path, *args, **kwargs)
 
@@ -5476,6 +5595,7 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
         assert (await rpc("session_settings"))["result"] == {
             "model": "gpt-5.6-luna",
             "approval_mode": "ask",
+            "plan_mode": False,
         }
         for model, mode in (("invalid", "ask"), ("gpt-5.6-luna", "invalid")):
             assert (await rpc("set_settings", model=model, approval_mode=mode))[
@@ -5483,6 +5603,35 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
             ]["code"] == -32602
         settings = {"model": "gpt-5.6-sol", "approval_mode": "deny"}
         assert (await rpc("set_settings", **settings))["result"] == settings
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-on",
+                "slash_run",
+                {"session_id": sid, "text": "/plan on"},
+            )
+        )[-1]["result"]["kind"] == "output"
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is True
+        await _request(reader, writer, "new-plan", "new_session", {"provider": "codex"})
+        await _request(reader, writer, "resume-plan", "resume", {"session_id": sid})
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is True
+        assert (
+            await _request(
+                reader,
+                writer,
+                "implement",
+                "slash_run",
+                {"session_id": sid, "text": "/implement"},
+            )
+        )[-1]["result"]["kind"] == "model_input"
+        await _request(
+            reader, writer, "new-implement", "new_session", {"provider": "codex"}
+        )
+        await _request(
+            reader, writer, "resume-implement", "resume", {"session_id": sid}
+        )
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is False
         assert server.runtime.metadata.model_fallback == (
             "codex",
             "gpt-5.6-luna",
@@ -5494,7 +5643,10 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
         assert (await rpc("set_settings", **settings))["error"]["code"] == -32003
         assert server.runtime.policy.default.value == "ask"
         await _request(reader, writer, "resume", "resume", {"session_id": sid})
-        assert (await rpc("session_settings"))["result"] == settings
+        assert (await rpc("session_settings"))["result"] == {
+            **settings,
+            "plan_mode": False,
+        }
         assert not (tmp_path / "settings.json").exists()
     finally:
         await close_serve(server, writer)
@@ -7978,6 +8130,8 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "init",
             "review",
             "greet",
+            "plan",
+            "implement",
         } <= set(runnable_by_name)
         assert {
             "always",
@@ -7987,7 +8141,6 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "keys",
             "local",
             "permissions",
-            "plan",
             "restart",
             "shell",
             "theme",
@@ -8003,6 +8156,86 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         )
         assert runnable_by_name["review"]["source"] == "project"
         assert runnable_by_name["greet"]["kind"] == "skill"
+
+        plan_mode = (
+            await _request(
+                reader, writer, "plan-settings", "session_settings", {"session_id": sid}
+            )
+        )[-1]["result"]
+        assert plan_mode["plan_mode"] is False
+        bare = (
+            await _request(
+                reader,
+                writer,
+                "plan-bare",
+                "slash_run",
+                {"session_id": sid, "text": "/plan"},
+            )
+        )[-1]["result"]
+        assert bare == {
+            "kind": "output",
+            "text": "plan mode: on (read-only tools; deliver the plan as your answer)",
+        }
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-bare-settings",
+                "session_settings",
+                {"session_id": sid},
+            )
+        )[-1]["result"]["plan_mode"] is True
+        await _request(
+            reader,
+            writer,
+            "plan-off",
+            "slash_run",
+            {"session_id": sid, "text": "/plan off"},
+        )
+        enabled = (
+            await _request(
+                reader,
+                writer,
+                "plan-on",
+                "slash_run",
+                {"session_id": sid, "text": "/plan on"},
+            )
+        )[-1]["result"]
+        assert enabled == {
+            "kind": "output",
+            "text": "plan mode: on (read-only tools; deliver the plan as your answer)",
+        }
+        prompt = (
+            await _request(
+                reader,
+                writer,
+                "plan-prompt",
+                "slash_run",
+                {"session_id": sid, "text": "/plan write a plan"},
+            )
+        )[-1]["result"]
+        assert prompt["kind"] == "model_input"
+        assert prompt["text"] == "write a plan"
+        implemented = (
+            await _request(
+                reader,
+                writer,
+                "implement",
+                "slash_run",
+                {"session_id": sid, "text": "/implement"},
+            )
+        )[-1]["result"]
+        assert implemented["kind"] == "model_input"
+        assert implemented["text"] == "implement the plan you proposed above"
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-settings-2",
+                "session_settings",
+                {"session_id": sid},
+            )
+        )[-1]["result"]["plan_mode"] is False
 
         documented_kinds = set(
             re.findall(
@@ -8134,6 +8367,43 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             )
         )[-1]["error"]
         assert wrong_session["code"] == -32003
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_plan_prompt_returns_opaque_input_id(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path / "home", port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        hello = (
+            await _request(
+                reader,
+                writer,
+                "hello",
+                "hello",
+                {"protocol_version": "1.1", "features": ["model_input_ids"]},
+            )
+        )[-1]["result"]
+        assert "model_input_ids" in hello["capabilities"]["features"]
+        sid = (
+            await _request(reader, writer, "new", "new_session", {"provider": "codex"})
+        )[-1]["result"]["session"]["session_id"]
+        await _request(
+            reader, writer, "on", "slash_run", {"session_id": sid, "text": "/plan on"}
+        )
+        result = (
+            await _request(
+                reader,
+                writer,
+                "prompt",
+                "slash_run",
+                {"session_id": sid, "text": "/plan write a plan"},
+            )
+        )[-1]["result"]
+        assert result["kind"] == "model_input"
+        assert result["input_id"]
+        assert "text" not in result
     finally:
         await close_serve(server, writer)
 
@@ -8948,6 +9218,38 @@ async def test_serve_accounts_label_command(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_serve_accounts_slash_marks_missing_credentials_unavailable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    missing = AccountId("codex", "missing")
+    for account in (current, missing):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    AccountStore(home).credential_path(missing).unlink()
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "accounts-list",
+                "slash_run",
+                {"session_id": sid, "text": "/accounts"},
+            )
+        )[-1]["result"]
+        assert result["kind"] == "output"
+        assert "codex:missing  unavailable: credentials missing" in result["text"]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_account_logout_runs_store_off_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9004,6 +9306,12 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
         OAuthTokens("access", "refresh", 9_999_999_999),
     )
     store = AccountStore(home)
+    missing = AccountId("anthropic", "missing")
+    await asyncio.to_thread(
+        named_account_credentials(home, "anthropic", "missing").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
+    )
+    store.credential_path(missing).unlink()
     store._write_usage_bytes(
         account,
         json.dumps(
@@ -9055,10 +9363,12 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
                 {"session_id": sid},
             )
         )[-1]["result"]
-        row = listed["accounts"][0]
-        assert row["account"] == "codex:work"
+        rows = {row["account"]: row for row in listed["accounts"]}
+        row = rows["codex:work"]
+        assert row["available"] is True
         assert row["current"] is True
         assert row["default"] is True
+        assert rows["anthropic:missing"]["available"] is False
         assert row["usage"]["error"] == "internal refresh error; retry or restart zeta"
         assert row["usage"]["snapshot"]["windows"] == [
             {
@@ -9080,7 +9390,18 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
         )[-1]["result"]
         assert refreshed
         assert refreshed_list == listed
-        assert off_loop_reads == 2
+
+        status = (
+            await _request(
+                reader,
+                writer,
+                "accounts-status",
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]["result"]["text"]
+        assert "unavailable_accounts: anthropic:missing" in status.splitlines()
+        assert off_loop_reads == 3
     finally:
         await close_serve(server, writer)
 
@@ -9309,6 +9630,21 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
             for line in fixture.read_text().splitlines()
             if line and not line.startswith("#")
         ]
+        # These rows are explicit because the base fixture was captured before
+        # /plan was a serve command and must never be captured from the head.
+        rows.extend(
+            [
+                {"text": "/plan", "error_code": -32004},
+                {"text": "/plan on", "error_code": -32004},
+                {"text": "/plan write a plan", "error_code": -32004},
+                {"text": "/implement", "error_code": -32004},
+            ]
+        )
+        before = (
+            await _request(
+                reader, writer, "before-plan", "session_settings", {"session_id": sid}
+            )
+        )[-1]["result"]["plan_mode"]
         for request_id, row in enumerate(rows, start=4):
             text = row["text"]
             response = await _request(
@@ -9319,6 +9655,17 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
                 {"session_id": sid, "text": text},
             )
             message = response[-1]
+            if text == "/plan":
+                after = (
+                    await _request(
+                        reader,
+                        writer,
+                        "after-plan",
+                        "session_settings",
+                        {"session_id": sid},
+                    )
+                )[-1]["result"]["plan_mode"]
+                assert after is before
             if "result" in row:
                 assert "result" in message and "error" not in message, message
                 assert message["result"] == row["result"]
