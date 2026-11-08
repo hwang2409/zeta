@@ -908,11 +908,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             raise selected
 
     async def _close_attempt(self, attempt: ProviderAttempt) -> None:
-        close_task = asyncio.create_task(attempt.aclose())
         deadline = self._task_deadline()
         if deadline is None:
-            await close_task
+            await attempt.aclose()
             return
+        close_task = asyncio.create_task(attempt.aclose())
         timer_task = asyncio.create_task(self._clock.wait_until(deadline))
         try:
             done, _ = await asyncio.wait(
