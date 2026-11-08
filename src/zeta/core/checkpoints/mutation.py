@@ -10,8 +10,9 @@ import threading
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from ..session_execution import SessionOwnedError
 from ..session_files import read_session_file, session_directory
@@ -47,8 +48,15 @@ class ConversationDedupeKey:
     id: str
 
 
+class MutationCancellationPolicy(Enum):
+    ABORT_BEFORE_WRITE = "abort_before_write"
+    FINALIZE_ONCE_SUBMITTED = "finalize_once_submitted"
+
+
 class ConversationMutation[ResultT](Protocol):
     """Immutable command accepted by the conversation mutation seam."""
+
+    cancellation_policy: ClassVar[MutationCancellationPolicy]
 
 
 class _ConditionalStoreMutation[ResultT](Protocol):
@@ -63,6 +71,9 @@ class _ConditionalStoreMutation[ResultT](Protocol):
 
 @dataclass(frozen=True, slots=True)
 class AppendConversationRows[ResultT]:
+    cancellation_policy: ClassVar[MutationCancellationPolicy] = (
+        MutationCancellationPolicy.ABORT_BEFORE_WRITE
+    )
     rows: tuple[ConversationRow, ...]
     dedupe_key: ConversationDedupeKey | None = None
     result: ResultT | None = None

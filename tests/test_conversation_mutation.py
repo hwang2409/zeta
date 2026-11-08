@@ -24,6 +24,8 @@ from zeta.core.store import (
     ConversationTargetOwned,
     commit_conversation_async,
 )
+from zeta.core.store._step_delivery import PromptInput
+from zeta.protocol.types import Message, MessageOrigin, MessageRole, TextContent
 
 
 def _hold_conversation_owner(
@@ -293,6 +295,200 @@ async def test_commit_async_cancelled_before_write_changes_nothing(
         await asyncio.to_thread(store.close)
 
 
+@pytest.mark.parametrize("policy", ["abort_before_write", "finalize_once_submitted"])
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "success",
+        "queued",
+        "submitted",
+        "during_write",
+        "committed",
+        "publish",
+        "publish_failure",
+        "final_callback_failure",
+        "duplicate",
+    ],
+)
+@pytest.mark.asyncio
+async def test_mutation_cancellation_policy_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    phase: str,
+) -> None:
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    store = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (store.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    store.bind_owner_thread()
+    address = ConversationAddress("project", "root", "root")
+    publications: list[object] = []
+    final_callbacks = 0
+
+    def publish(delta: object) -> None:
+        publications.append(delta)
+        if phase in {"publish_failure", "final_callback_failure"}:
+            raise RuntimeError("policy-table publication failure")
+
+    def fail_final_callback() -> None:
+        nonlocal final_callbacks
+        final_callbacks += 1
+        raise RuntimeError("policy-table final callback failure")
+
+    store.on_entries_installed = publish
+    reached = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    worker_reached = threading.Event()
+    worker_release = threading.Event()
+    lock_held = False
+
+    def observe_cancellation(_policy: object) -> None:
+        cancellation_seen.set()
+
+    # test-contract: seam observes the shared cancellation-policy boundary
+    monkeypatch.setattr(
+        store, "_submitted_mutation_cancelled", observe_cancellation
+    )
+
+    async def submit(index: int = 1) -> object:
+        if policy == "abort_before_write":
+            return await commit_conversation_async(
+                address,
+                AppendConversationRows(
+                    (_warning(f"public-{index}"),),
+                    dedupe_key=ConversationDedupeKey("policy-table", str(index)),
+                ),
+            )
+        if phase == "final_callback_failure":
+            return await store.append_message_async(
+                Message(MessageRole.ASSISTANT, [TextContent(f"legacy-{index}")]),
+                on_persisted=fail_final_callback,
+            )
+        return await store.commit_delivery_input(
+            PromptInput(f"legacy-{index}", MessageOrigin.AGENT_SEND, None)
+        )
+
+    if phase == "queued":
+        await store._async_write_lock.acquire()
+        lock_held = True
+
+        def observe_queue() -> None:
+            reached.set()
+
+        # test-contract: seam observes real resident lock admission
+        monkeypatch.setattr(store, "_async_write_queued", observe_queue)
+    elif phase == "submitted":
+
+        def pause_before_write() -> None:
+            worker_reached.set()
+            assert worker_release.wait(10)
+
+        # test-contract: seam pauses after executor submission, before write ownership
+        monkeypatch.setattr(store, "_before_committed_mutation", pause_before_write)
+    elif phase == "during_write":
+
+        def pause_during_write() -> None:
+            worker_reached.set()
+            assert worker_release.wait(10)
+
+        # test-contract: seam pauses after write ownership becomes irrevocable
+        monkeypatch.setattr(
+            store, "_after_committed_mutation_started", pause_during_write
+        )
+    elif phase in {"committed", "publish"}:
+
+        async def pause_owner_phase() -> None:
+            reached.set()
+            assert await await_or_fail(
+                asyncio.to_thread(worker_release.wait, 10),
+                what=f"{phase} cancellation release",
+            )
+
+        seam = (
+            "_before_committed_install"
+            if phase == "committed"
+            else "_before_committed_publish"
+        )
+        # test-contract: seam pauses at the owner-side durable/install boundary
+        monkeypatch.setattr(store, seam, pause_owner_phase)
+
+    try:
+        if phase in {
+            "success",
+            "publish_failure",
+            "final_callback_failure",
+            "duplicate",
+        }:
+            if phase == "final_callback_failure" and policy == "finalize_once_submitted":
+                with pytest.raises(
+                    RuntimeError, match="policy-table final callback failure"
+                ):
+                    await submit()
+            else:
+                await submit()
+            if phase == "duplicate":
+                await submit()
+        else:
+            task = asyncio.create_task(submit())
+            if phase in {"queued", "committed", "publish"}:
+                await await_or_fail(
+                    reached.wait(), what=f"{policy} {phase} cancellation point"
+                )
+            else:
+                assert await await_or_fail(
+                    asyncio.to_thread(worker_reached.wait, 10),
+                    what=f"{policy} {phase} worker cancellation point",
+                )
+            task.cancel()
+            if phase != "queued":
+                await await_or_fail(
+                    cancellation_seen.wait(),
+                    what=f"{policy} {phase} policy cancellation",
+                )
+            worker_release.set()
+            if lock_held:
+                store._async_write_lock.release()
+                lock_held = False
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(
+                    task, what=f"{policy} {phase} cancellation outcome"
+                )
+
+        expected = 1
+        if phase == "queued" or (
+            policy == "abort_before_write" and phase == "submitted"
+        ):
+            expected = 0
+        elif phase == "duplicate" and policy == "finalize_once_submitted":
+            expected = 2
+        resident = tuple(entry.to_dict() for entry in store.entries)
+        assert len(resident) == expected
+        assert len(publications) == expected
+        assert final_callbacks == (
+            1
+            if phase == "final_callback_failure"
+            and policy == "finalize_once_submitted"
+            else 0
+        )
+    finally:
+        worker_release.set()
+        if lock_held:
+            store._async_write_lock.release()
+        await asyncio.to_thread(store.close)
+
+    reopened = await asyncio.to_thread(
+        ConversationStore, sessions, session_id="root"
+    )
+    try:
+        assert tuple(entry.to_dict() for entry in reopened.entries) == resident
+    finally:
+        await asyncio.to_thread(reopened.close)
+
+
 @pytest.mark.asyncio
 async def test_address_commit_uses_registered_resident_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -542,6 +738,14 @@ async def test_commit_async_cancel_before_lock_writes_nothing(
     store.bind_owner_thread()
     await store._async_write_lock.acquire()
     before = store.path.read_bytes()
+    queued = asyncio.Event()
+
+    def observe_queue() -> None:
+        queued.set()
+
+    # New-interface mutation: removing the signal times out at queue admission.
+    # test-contract: seam observes real resident lock admission
+    monkeypatch.setattr(store, "_async_write_queued", observe_queue)
     task = asyncio.create_task(
         store.commit_async(
             AppendConversationRows((_warning("not locked"),)),
@@ -549,7 +753,7 @@ async def test_commit_async_cancel_before_lock_writes_nothing(
         )
     )
     try:
-        await asyncio.sleep(0)
+        await await_or_fail(queued.wait(), what="public commit lock queue admission")
         task.cancel()
         store._async_write_lock.release()
         with pytest.raises(asyncio.CancelledError):

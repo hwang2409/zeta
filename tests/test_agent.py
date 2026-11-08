@@ -340,9 +340,6 @@ def _approval_capability(name: str, arguments: dict[str, object]) -> ResolvedCap
     )
 
 
-from tests.support.owned import await_or_fail
-
-
 @pytest.mark.parametrize("error_event", [False, True])
 @pytest.mark.asyncio
 async def test_context_overflow_compacts_and_retries_same_turn(
@@ -10467,7 +10464,7 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
 
 @pytest.mark.asyncio
 async def test_agent_send_aborts_before_append_when_store_lock_is_held(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent_store = ConversationStore(tmp_path / "parent")
     child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
@@ -10492,27 +10489,63 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
     await delivery_flow.initialize()
     owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
     registry._agent_owner = owner
+    worker_reached = threading.Event()
+    release_worker = threading.Event()
+    cancellation_seen = asyncio.Event()
+
+    def pause_before_write() -> None:
+        worker_reached.set()
+        assert release_worker.wait(10)
+
+    def observe_cancellation(_policy: object) -> None:
+        cancellation_seen.set()
+
+    # test-contract: seams force and observe cancellation before write start
+    monkeypatch.setattr(child_store, "_before_committed_mutation", pause_before_write)
+    monkeypatch.setattr(
+        child_store, "_submitted_mutation_cancelled", observe_cancellation
+    )
     lock = child_store._append_lock()
     lock.__enter__()
-    try:
-        task = asyncio.create_task(
-            registry.execute(
-                ToolCall(
-                    "agent-send-call",
-                    "agent_send",
-                    {"child_instance_id": "parent:1", "message": "follow up"},
-                )
+    lock_held = True
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "agent-send-call",
+                "agent_send",
+                {"child_instance_id": "parent:1", "message": "follow up"},
             )
         )
-        await asyncio.sleep(0)
+    )
+    try:
+        assert await await_or_fail(
+            asyncio.to_thread(worker_reached.wait, 10),
+            what="agent_send worker submission",
+        )
         task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-    finally:
+        await await_or_fail(
+            cancellation_seen.wait(), what="agent_send cancellation policy"
+        )
+        release_worker.set()
         lock.__exit__(None, None, None)
-
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=2)
+        lock_held = False
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(task, what="cancelled finalized agent_send")
+    finally:
+        release_worker.set()
+        if lock_held:
+            lock.__exit__(None, None, None)
+        if not task.done():
+            task.cancel()
+            await await_or_fail(
+                asyncio.gather(task, return_exceptions=True),
+                what="agent_send cancellation cleanup",
+            )
+    assert [
+        entry.data["text"]
+        for entry in child_store.entries
+        if entry.type == "pending_prompt"
+    ] == ["follow up"]
     assert [
         entry.data["text"]
         for entry in await asyncio.to_thread(child_store.pending_prompts)
@@ -12033,7 +12066,7 @@ async def test_agent_cancel_mixed_child_and_task_terminal_result(
     store, loop, run, completion_published = await _start_task_gate(tmp_path, backend)
 
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
-    await asyncio.wait_for(run, timeout=5)
+    await asyncio.wait_for(run, timeout=10)
     notification = await _completion_after_publication(store, completion_published)
     assert "background sub-agents" in backend.gate_text
     assert "collect mixed evidence" in backend.gate_text

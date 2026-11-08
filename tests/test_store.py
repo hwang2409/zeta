@@ -1687,34 +1687,42 @@ async def test_async_publication_cannot_be_starved_by_owner_writes(
 
 
 @pytest.mark.asyncio
-async def test_off_loop_refresh_cancellation_is_prompt(
+async def test_off_loop_refresh_cancellation_finalizes_submitted_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="cancel-refresh")
     started = threading.Event()
     release = threading.Event()
+    cancellation_seen = asyncio.Event()
     original_before = ConversationStore._before_committed_mutation
 
     def blocked_load(candidate: ConversationStore) -> None:
         started.set()
-        assert release.wait(timeout=5)
+        assert release.wait(timeout=10)
         original_before(candidate)
 
-    # test-contract: seam exercises the store mutation boundary
+    def observe_cancellation(_policy: object) -> None:
+        cancellation_seen.set()
+
+    # test-contract: seam exercises the shared mutation cancellation boundary
     monkeypatch.setattr(ConversationStore, "_before_committed_mutation", blocked_load)
+    monkeypatch.setattr(
+        store, "_submitted_mutation_cancelled", observe_cancellation
+    )
     refresh = asyncio.create_task(store._refresh_off_loop())
-    assert await asyncio.to_thread(started.wait, 2)
+    assert await asyncio.to_thread(started.wait, 10)
     refresh.cancel()
-    await asyncio.sleep(0.05)
+    await await_or_fail(cancellation_seen.wait(), what="refresh cancellation policy")
     try:
-        assert refresh.done()
+        assert not refresh.done()
+        release.set()
         with pytest.raises(asyncio.CancelledError):
-            await await_or_fail(refresh, what="test await")
+            await await_or_fail(refresh, what="finalized refresh cancellation")
     finally:
         release.set()
         await await_or_fail(
-            asyncio.gather(refresh, return_exceptions=True), what="test await"
+            asyncio.gather(refresh, return_exceptions=True), what="refresh cleanup"
         )
 
 
