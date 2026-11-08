@@ -2437,7 +2437,7 @@ async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
             await asyncio.sleep(0)
         while runner._seen_activity_generation < runner._activity_generation:
             await asyncio.sleep(0)
-        await runner._drained.wait()
+        await asyncio.wait_for(runner._drained.wait(), 10)
         clock.now += 30
     for _ in range(10):
         await asyncio.sleep(0)
