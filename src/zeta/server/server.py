@@ -479,7 +479,7 @@ class _Client:
                 prefix = bytes(self._read_buffer[:MAX_FRAME_BYTES])
                 self._read_buffer.clear()
                 return await self._discard_oversized_frame(prefix)
-            chunk = await self.reader.read(65_536)
+            chunk = await self._read_chunk()
             if not chunk:
                 if not self._read_buffer:
                     return None
@@ -488,10 +488,17 @@ class _Client:
                 return line
             self._read_buffer.extend(chunk)
 
+    async def _read_chunk(self) -> bytes:
+        try:
+            return await self.reader.read(65_536)
+        except ConnectionError:
+            # A failed write to a gone peer stores its error in the reader; that is EOF.
+            return b""
+
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""
         while True:
-            chunk = await self.reader.read(65_536)
+            chunk = await self._read_chunk()
             if not chunk:
                 return prefix + b"\n"
             newline = chunk.find(b"\n")
