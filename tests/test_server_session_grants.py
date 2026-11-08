@@ -12,6 +12,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.server_client import _buffer
 from tests.test_server import (
     TIMEOUT,
@@ -35,8 +36,7 @@ from tests.test_server_websocket import (
     _send_json,
 )
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
-from zeta.server import ZetaServer
-from zeta.server import approval_lifecycle
+from zeta.server import ZetaServer, approval_lifecycle
 from zeta.server.approval_lifecycle import ExternalEnd
 from zeta.tui.app import TUIApp
 
@@ -285,10 +285,11 @@ async def test_always_tool_grant_survives_external_end_during_approve_settlement
     async def gated_persist(*args: object, **kwargs: object) -> object:
         result = await original_persist(*args, **kwargs)
         committed.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return result
 
     monkeypatch.setattr(approval_lifecycle, "persist_durably", gated_persist)
+    # test-contract: seam force the ExternalEnd ownership interleaving
     monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
     try:
         _, session_id = await _hello_and_create(reader, writer)
@@ -304,16 +305,14 @@ async def test_always_tool_grant_survives_external_end_during_approve_settlement
                 {"request_id": "call-1", "scope": "always_tool"},
             )
         )
-        await committed.wait()
+        await await_or_fail(committed.wait(), what="durable approval commit")
         external_end = asyncio.create_task(
-            server.control._approvals.transition(
-                ExternalEnd("call-1", session_id, {})
-            )
+            server.control._approvals.transition(ExternalEnd("call-1", session_id, {}))
         )
-        await external_entered.wait()
-        await external_end
+        await await_or_fail(external_entered.wait(), what="external approval finish")
+        await await_or_fail(external_end, what="external approval end")
         release.set()
-        approve_frames = await approve
+        approve_frames = await await_or_fail(approve, what="approve response")
         assert approve_frames[-1]["result"]["decision"] == "approve"
         buffered = list(_buffer(reader))
         grant_events = [
