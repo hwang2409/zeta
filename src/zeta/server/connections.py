@@ -174,10 +174,6 @@ class ConnectionRegistry(ReplayOutput):
                 "another client is already connected",
             ) from exc
         connection.role = role
-        if role == "controller":
-            connection.server.runtime.set_post_stream_provider_retry(
-                "assistant_reset" in features
-            )
         return role
 
     def _claim(

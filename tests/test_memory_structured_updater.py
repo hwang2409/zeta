@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.memory import entry_request, entry_store
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import (
@@ -129,7 +130,7 @@ async def _run(
 ):
     prompts: list[str] = []
 
-    async def invoke(prompt: str) -> str | ReconciliationResponse:
+    async def invoke(prompt: str, budget) -> str | ReconciliationResponse:
         prompts.append(prompt)
         return responses.pop(0)
 
@@ -1085,7 +1086,7 @@ async def test_oversized_memory_indexes_every_active_entry_and_allows_targeting(
     assert indexed
     target = indexed[-1].split()[1]
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         assert f"INDEX {target} " in prompt
         return _proposal(
             {
@@ -1831,7 +1832,7 @@ async def test_cas_retry_regenerates_against_new_entry_state(
     registry, project_id = _registry(tmp_path)
     prompts: list[str] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         prompts.append(prompt)
         return _proposal(_add("brief", "The intended fact survives."))
 
@@ -1938,7 +1939,7 @@ async def test_completed_direct_user_turn_queues_early_format_two_update(
 ) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return _proposal(_add("brief", "The project uses SQLite."))
@@ -1973,7 +1974,7 @@ async def test_completed_direct_user_turn_queues_early_format_two_update(
 async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return _proposal()
@@ -2021,7 +2022,7 @@ async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -
 async def test_user_turns_ninety_seconds_apart_make_two_requests(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return _proposal()
@@ -2050,7 +2051,7 @@ async def test_user_turns_ninety_seconds_apart_make_two_requests(tmp_path: Path)
 async def test_notification_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return _proposal()
@@ -2077,7 +2078,7 @@ async def test_notification_does_not_retrigger_consumed_user_turn(tmp_path: Path
 async def test_restart_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return _proposal()
@@ -2114,7 +2115,7 @@ async def test_repeated_validation_failure_advances_only_after_terminal_receipt(
 ) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> ReconciliationResponse:
+    async def invoke(_prompt: str, budget) -> ReconciliationResponse:
         nonlocal calls
         calls += 1
         return ReconciliationResponse("{}", {"input_tokens": 1})
@@ -2140,7 +2141,7 @@ async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
 ) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         database = "SQLite" if calls == 1 else "Postgres"
@@ -2416,7 +2417,7 @@ async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
     fired_at: list[float] = []
     clock = _MutableClock()
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         fired_at.append(clock.now)
         return _proposal()
 
@@ -2433,7 +2434,7 @@ async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
             await asyncio.sleep(0)
         while runner._seen_activity_generation < runner._activity_generation:
             await asyncio.sleep(0)
-        await runner._drained.wait()
+        await await_or_fail(runner._drained.wait(), what="runner._drained.wait()")
         clock.now += 30
     for _ in range(10):
         await asyncio.sleep(0)
