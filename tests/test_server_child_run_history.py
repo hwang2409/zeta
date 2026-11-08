@@ -10,6 +10,8 @@ import pytest
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
 
 
@@ -66,5 +68,46 @@ async def test_child_history_requires_negotiated_feature_and_valid_run_id(
             )
         )[-1]
         assert reply["error"]["code"] == -32602
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_reads_newest_and_continuation_over_unix_socket(
+    tmp_path: Path,
+) -> None:
+    server, reader, writer, session_id = await _open(
+        tmp_path, ["child_run_history", "session_history_fidelity"]
+    )
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("one")]))
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("two")]))
+    child.close()
+    try:
+        newest = (
+            await request(
+                reader,
+                writer,
+                3,
+                "child_run_history",
+                {"session_id": session_id, "run_id": f"{session_id}:1"},
+            )
+        )[-1]["result"]
+        assert [row["content"][0]["text"] for row in newest["messages"]] == [
+            "one",
+            "two",
+        ]
+        assert newest.get("next_before") is None
     finally:
         await close_serve(server, writer)
