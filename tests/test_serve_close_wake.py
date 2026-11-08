@@ -3,7 +3,8 @@
 scripts/bench/bench.py's serve probe resumes a session with an undelivered child
 notification, so resume starts a wake turn, and then closes the server. These
 tests hold that wake turn mid-stream and prove close still returns, ends the
-turn's stream, and frees the session for the next owner.
+turn's stream, and frees the session for the next owner. The last test pins
+the order that does hang (strict xfail until the provider fix lands).
 """
 
 from __future__ import annotations
@@ -30,8 +31,9 @@ from zeta.protocol.types import (
     StreamEventType,
     ToolSchema,
 )
-from zeta.providers.completion import owned_completion
+from zeta.providers.completion import IteratorProviderAttempt, owned_completion
 from zeta.providers.ollama import OllamaBackend
+from zeta.providers.transport import HTTPClientLease
 from zeta.server import ZetaServer
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -187,3 +189,41 @@ async def test_close_during_resume_wake_turn_ends_turn_and_releases_session(
             writer.close()
         if not closed:
             await await_or_fail(server.close(), timeout=30, what="serve cleanup close")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "serve close hangs: a cancelled IteratorProviderAttempt.aclose leaves the "
+        "source generator holding its HTTP lease borrow, so HTTPClientLease.aclose "
+        "waits forever at transport.py `_close_owned` `await self._drained.wait()`"
+    ),
+)
+@pytest.mark.asyncio
+async def test_cancelled_attempt_close_still_releases_the_lease_borrow() -> None:
+    # The shape the bench serve probe hung in (4 of 286 local runs): the wake
+    # turn's Ollama stream reached MESSAGE_END, then a second cancellation hit
+    # the attempt's close. The lease close then waited on a borrow nobody held.
+    lease = HTTPClientLease(None)
+
+    async def source() -> AsyncIterator[StreamEvent]:
+        async with lease.borrow():  # as OllamaBackend._complete_once does
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(StreamEventType.MESSAGE_END)
+
+    attempt = IteratorProviderAttempt(source())
+    try:
+        await await_or_fail(attempt.__anext__(), what="first event")
+        await await_or_fail(attempt.__anext__(), what="last event")
+        closing = asyncio.create_task(attempt.aclose())
+        await asyncio.sleep(0)  # one step: close has cancelled the producer and waits on it
+        closing.cancel()
+        await await_or_fail(
+            asyncio.gather(closing, return_exceptions=True), what="cancelled close"
+        )
+        await await_or_fail(attempt.aclose(), what="retried close")
+
+        assert lease._active_borrows == 0, "the source still holds its lease borrow"
+    finally:
+        lease.retire()
+        await lease.client.aclose()
