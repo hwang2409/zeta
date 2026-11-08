@@ -12,12 +12,12 @@ crashed worker with a stack instead of a silent hang.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import faulthandler
 import io
 import os
 import sys
 import threading
-import time
 from collections.abc import Generator
 
 import pytest
@@ -26,16 +26,20 @@ import pytest
 # durations of any CI job), so this only fires on a real hang.
 EXIT_WATCHDOG_SECONDS = 120
 
-# Disarmed, the dump thread only wakes on arm(); this bounds each idle wait.
-_IDLE_RECHECK_SECONDS = 3600.0
-
 _stderr_fd: int | None = None
 _seconds = float(EXIT_WATCHDOG_SECONDS)
+
+# Bound at import: tests patch these globals (for example `time.monotonic` with a
+# fake clock), and the watchdog thread runs during their setup and teardown.
+_os_write = os.write
+_enumerate_threads = threading.enumerate
+_current_frames = sys._current_frames
+_all_tasks = asyncio.all_tasks
 
 
 def _write(text: str) -> None:
     assert _stderr_fd is not None
-    os.write(_stderr_fd, text.encode(errors="replace"))
+    _os_write(_stderr_fd, text.encode(errors="replace"))
 
 
 class _TaskDumper:
@@ -45,50 +49,69 @@ class _TaskDumper:
     thread names on every Python version nor asyncio tasks. faulthandler stays
     the backstop: it still fires when a C call holds the GIL and this thread
     cannot run.
+
+    The thread reads no clock: `Event.wait(timeout)` times the deadline, and a
+    generation number tells a timeout apart from a later arm or disarm.
     """
 
     def __init__(self) -> None:
-        self._changed = threading.Condition()
-        self._deadline: float | None = None
+        self._lock = threading.Lock()
+        self._changed = threading.Event()
+        self._generation = 0
+        self._seconds: float | None = None
         self._thread: threading.Thread | None = None
+        self._reported_failure = False
 
     def arm(self, seconds: float) -> None:
-        with self._changed:
-            self._deadline = time.monotonic() + seconds
+        with self._lock:
+            self._generation += 1
+            self._seconds = seconds
             if self._thread is None:
                 self._thread = threading.Thread(
                     target=self._run, name="zeta-test-watchdog", daemon=True
                 )
                 self._thread.start()
-            self._changed.notify()
+        self._changed.set()
 
     def disarm(self) -> None:
-        with self._changed:
-            self._deadline = None
-            self._changed.notify()
+        with self._lock:
+            self._generation += 1
+            self._seconds = None
+        self._changed.set()
 
     def _run(self) -> None:
-        with self._changed:
-            while True:
-                if self._deadline is None:
-                    remaining = _IDLE_RECHECK_SECONDS
-                else:
-                    remaining = self._deadline - time.monotonic()
-                if remaining > 0:
-                    self._changed.wait(timeout=remaining)
-                    continue
-                self._deadline = None
-                _write(_describe_threads_and_tasks())
+        while True:
+            try:
+                self._wait_and_dump()
+            # Never raise into pytest, and never die silently.
+            except Exception as error:  # noqa: BLE001
+                if not self._reported_failure:
+                    self._reported_failure = True
+                    with contextlib.suppress(Exception):
+                        _write(f"\nzeta test watchdog: broken: {error!r}\n")
+
+    def _wait_and_dump(self) -> None:
+        self._changed.wait()
+        with self._lock:
+            self._changed.clear()
+            generation, seconds = self._generation, self._seconds
+        if seconds is None or self._changed.wait(seconds):
+            return
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._seconds = None
+        _write(_describe_threads_and_tasks())
 
 
 def _describe_threads_and_tasks() -> str:
     out = io.StringIO()
     out.write("\nzeta test watchdog: hang, threads (faulthandler stack follows):\n")
-    for thread in threading.enumerate():
+    for thread in _enumerate_threads():
         out.write(f"  0x{thread.ident or 0:016x} {thread.name} daemon={thread.daemon}\n")
     for loop in _running_loops():
         try:
-            tasks = asyncio.all_tasks(loop)
+            tasks = _all_tasks(loop)
         except RuntimeError as error:  # the loop thread changed the task set
             out.write(f"tasks of {loop!r} unavailable: {error}\n")
             continue
@@ -100,7 +123,7 @@ def _describe_threads_and_tasks() -> str:
 
 def _running_loops() -> list[asyncio.AbstractEventLoop]:
     loops: list[asyncio.AbstractEventLoop] = []
-    for frame in sys._current_frames().values():
+    for frame in _current_frames().values():
         while frame is not None:
             if frame.f_code.co_name == "run_forever":
                 loop = frame.f_locals.get("self")

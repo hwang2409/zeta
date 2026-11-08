@@ -134,6 +134,95 @@ def test_teardown_watchdog_dumps_a_hung_loop_close(tmp_path: Path) -> None:
     assert "in resist_cancellation" in output, output
 
 
+# A test patches the global clock with a function that raises, and the patch
+# stays active through the teardown the watchdog arms around (a fake
+# `time.monotonic` clock in test_tui.py once raised in the watchdog thread).
+_PATCHED_CLOCK = """
+import time
+
+import pytest
+
+
+def broken_clock():
+    raise RuntimeError("patched clock")
+
+
+@pytest.fixture
+def patched_clock(monkeypatch):
+    monkeypatch.setattr(time, "monotonic", broken_clock)
+
+
+def test_patches_the_clock(patched_clock):
+    pass
+"""
+
+
+def test_watchdog_ignores_a_patched_clock(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytester.makepyfile(_PATCHED_CLOCK)
+    result = _run_with_watchdog(
+        pytester, monkeypatch, "-W", "error::pytest.PytestUnhandledThreadExceptionWarning"
+    )
+
+    output = "\n".join(result.outlines + result.errlines)
+    assert "patched clock" not in output, output
+    assert "zeta-test-watchdog" not in output, output
+    assert "zeta test watchdog" not in output, output
+    assert result.ret == pytest.ExitCode.OK, output
+
+
+# A teardown hangs in an event loop whose repr raises, which breaks the
+# watchdog's thread and task dump.
+_BROKEN_DUMP_THEN_HANG = """
+import asyncio
+
+import pytest
+
+
+class BadReprLoop(asyncio.SelectorEventLoop):
+    def __repr__(self):
+        raise RuntimeError("bad loop repr")
+
+
+@pytest.fixture
+def hang_in_teardown():
+    yield
+    loop = BadReprLoop()
+    loop.run_until_complete(asyncio.Event().wait())
+
+
+def test_hangs_in_teardown(hang_in_teardown):
+    pass
+"""
+
+
+def test_broken_watchdog_says_so_once_and_faulthandler_still_fires(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_TEST_EXIT_WATCHDOG_SECONDS", "2")
+    pytester.makepyfile(_BROKEN_DUMP_THEN_HANG)
+    result = _run_with_watchdog(pytester, monkeypatch)
+
+    output = "\n".join(result.outlines + result.errlines)
+    assert "Timeout (0:00:02)!" in output, output
+    assert output.count("zeta test watchdog: broken:") == 1, output
+    assert "bad loop repr" in output, output
+
+
+def _run_with_watchdog(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, *args: str
+) -> pytest.RunResult:
+    # The child loads the real repository conftest, which installs the watchdog.
+    monkeypatch.setenv("PYTHONPATH", str(_REPOSITORY_ROOT))
+    try:
+        return pytester.runpytest_subprocess(
+            "-p", "tests.conftest", "-p", "no:cacheprovider", *args, timeout=60
+        )
+    except pytester.TimeoutExpired:
+        pytest.fail("child pytest still hung after 60 s")
+
+
 def _text(stream: bytes | str | None) -> str:
     if isinstance(stream, bytes):
         return stream.decode(errors="replace")
