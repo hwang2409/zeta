@@ -63,7 +63,11 @@ from zeta.protocol.types import (
     ThinkingContent,
 )
 from zeta.providers.codex import CodexBackend
-from zeta.providers.completion import owned_completion, retryable_provider_error
+from zeta.providers.completion import (
+    MAX_ACCOUNT_LOCK_ATTEMPTS,
+    owned_completion,
+    retryable_provider_error,
+)
 from zeta.providers.factory import build_backend, credential_store
 from zeta.runtime.loop import AgentLoop
 from zeta.server.login import Logins
@@ -390,9 +394,17 @@ async def test_registry_lock_timeout_reaches_tui_turn_error_card(
             if False:
                 yield
 
+    waits: list[float] = []
+
+    async def retry_now(delay: float) -> None:
+        waits.append(delay)
+
+    backend = TurnSetupBackend()
+    # the turn retries the lock wait; skip only the backoff sleep, not the lock attempts
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(TurnSetupBackend(), store, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="gpt-5.4",
         console=Console(file=StringIO(), force_terminal=False),
@@ -409,13 +421,17 @@ async def test_registry_lock_timeout_reaches_tui_turn_error_card(
     holder.start()
     try:
         assert ready.wait(timeout=5)
-        await asyncio.wait_for(app._consume_turn("hello"), timeout=1)
+        await asyncio.wait_for(app._consume_turn("hello"), timeout=10)
         output = StringIO()
         console = Console(file=output, force_terminal=False, width=100)
         for item in rendered:
             console.print(item)
         plain = Text.from_ansi(output.getvalue()).plain
-        assert "account busy · account_lock_timeout" in plain
+        assert len(waits) == MAX_ACCOUNT_LOCK_ATTEMPTS - 1
+        assert plain.count("waiting for account lock") == len(waits)
+        assert plain.index("waiting for account lock") < plain.index(
+            "account busy · account_lock_timeout"
+        )
         assert "retry: ctrl+y" in plain
     finally:
         release.set()

@@ -175,7 +175,8 @@ class CompletionRetryBudget:
 
     def start_attempt(self, owner: str, now: float, *, is_stall: bool = False) -> bool:
         del is_stall
-        if self.attempts >= self.max_attempts + MAX_ACCOUNT_LOCK_ATTEMPTS - 1:
+        # lock waits have their own bound in _plan_account_lock; they do not use provider attempts
+        if self.attempts - self.account_lock_attempts >= self.max_attempts:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return False
