@@ -40,6 +40,14 @@ def __getattr__(name: str) -> object:
         from ..core.login_flow import run_login
 
         return run_login
+    if name == "patch_stdout":
+        from prompt_toolkit.patch_stdout import patch_stdout
+
+        return patch_stdout
+    if name == "TerminalRenderError":
+        from ..tui.errors import TerminalRenderError
+
+        return TerminalRenderError
     if name == "OAUTH_REFRESH_TIMEOUT_SECONDS":
         from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 
@@ -896,10 +904,18 @@ def _run_tui_lifecycle(
             restart_cancels_work = False
             new_session_requested = False
             try:
-                from prompt_toolkit.patch_stdout import patch_stdout
+                from prompt_toolkit.patch_stdout import (
+                    patch_stdout as default_patch_stdout,
+                )
 
-                from ..tui.errors import TerminalRenderError
+                from ..tui.errors import (
+                    TerminalRenderError as default_terminal_render_error,
+                )
 
+                patch_stdout = globals().get("patch_stdout") or default_patch_stdout
+                terminal_render_error = (
+                    globals().get("TerminalRenderError") or default_terminal_render_error
+                )
                 with patch_stdout(raw=True):
                     restart_requested, restart_cancels_work = asyncio.run(
                         _run_tui(run_app, args)
@@ -910,7 +926,7 @@ def _run_tui_lifecycle(
                     app = None
                     args.continue_session = False
                     args.resume = None
-            except TerminalRenderError as exc:
+            except terminal_render_error as exc:
                 print(f"zeta: {exc}", file=sys.stderr)
                 _print_exit_hint(app)
                 exit_status = 1
