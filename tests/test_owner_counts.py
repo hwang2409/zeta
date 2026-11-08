@@ -12,6 +12,10 @@ import pytest
 from tests.support.owner_counts import OwnerCounts, merge_rows
 
 
+class _Owner:
+    pass
+
+
 def _row(action):
     recorder = OwnerCounts()
     recorder.node_start("self")
@@ -22,7 +26,7 @@ def _row(action):
 
 def test_explicit_close_has_exact_row() -> None:
     def action(recorder):
-        owner = object()
+        owner = _Owner()
         recorder.constructed(owner, "Explicit")
         recorder.closed(owner)
 
@@ -30,7 +34,7 @@ def test_explicit_close_has_exact_row() -> None:
 
 
 def test_intentionally_open_has_exact_row() -> None:
-    assert _row(lambda recorder: recorder.constructed(object(), "Open")) == (
+    assert _row(lambda recorder: recorder.constructed(_Owner(), "Open")) == (
         "self",
         "Open",
         1,
@@ -40,7 +44,7 @@ def test_intentionally_open_has_exact_row() -> None:
 def test_thread_open_close_has_exact_row() -> None:
     def action(recorder):
         def worker():
-            owner = object()
+            owner = _Owner()
             recorder.constructed(owner, "Thread")
             recorder.closed(owner)
 
@@ -54,7 +58,7 @@ def test_thread_open_close_has_exact_row() -> None:
 
 def test_async_close_has_exact_row() -> None:
     async def run(recorder):
-        owner = object()
+        owner = _Owner()
         recorder.constructed(owner, "Async")
         recorder.closed(owner)
 

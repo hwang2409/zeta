@@ -3,7 +3,9 @@ from __future__ import annotations
 import inspect
 import sys
 import threading
+import weakref
 from collections import defaultdict
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +26,8 @@ OwnerRow = tuple[str, str, int]
 class OwnerCounts:
     def __init__(self) -> None:
         self.active_node: str | None = None
-        self._records: dict[int, tuple[Any, str, str]] = {}
+        # Weak refs only: a test may rely on an unclosed owner being collected.
+        self._records: dict[int, tuple[weakref.ref[Any], str, str]] = {}
         self._counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
         self._rows: list[OwnerRow] = []
         self._originals: list[tuple[type[Any], str, Any]] = []
@@ -52,13 +55,13 @@ class OwnerCounts:
         if nodeid is None:
             return
         with self._lock:
-            self._records[id(obj)] = (obj, nodeid, kind)
+            self._records[id(obj)] = (weakref.ref(obj), nodeid, kind)
             self._counts[(nodeid, kind)][0] += 1
 
     def closed(self, obj: Any) -> None:
         with self._lock:
             record = self._records.get(id(obj))
-            if record is None or record[1] != self.active_node:
+            if record is None or record[0]() is not obj or record[1] != self.active_node:
                 return
             if not _closed_by_cleanup_fixture():
                 self._counts[record[1:]][1] += 1
@@ -92,6 +95,7 @@ class OwnerCounts:
             original_init = cls.__init__
             self._originals.append((cls, "__init__", original_init))
 
+            @wraps(original_init)
             def init(
                 obj: Any,
                 *args: Any,
@@ -107,6 +111,7 @@ class OwnerCounts:
             self._originals.append((cls, close_name, original_close))
             if inspect.iscoroutinefunction(original_close):
 
+                @wraps(original_close)
                 async def close(
                     obj: Any,
                     *args: Any,
@@ -119,6 +124,7 @@ class OwnerCounts:
 
             else:
 
+                @wraps(original_close)
                 def close(
                     obj: Any,
                     *args: Any,
