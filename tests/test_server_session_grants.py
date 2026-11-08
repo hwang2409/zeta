@@ -13,6 +13,7 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.serve_close import close_serve
+from tests.support.server_client import approve_and_collect_grant, read
 from tests.test_server import (
     TIMEOUT,
     _connect,
@@ -111,6 +112,127 @@ class _GatedBackend(FakeBackend):
             yield event
 
 
+@pytest.mark.asyncio
+async def test_approve_collector_reports_structured_error_frame() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "error": {
+                        "code": -32000,
+                        "message": "approval request is no longer pending",
+                    },
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    with pytest.raises(AssertionError) as failure:
+        await approve_and_collect_grant(
+            reader, _Writer(), 4, "call-1", "always_tool", ["bash"]
+        )
+    message = str(failure.value)
+    assert "approve response" in message
+    assert "approval request is no longer pending" in message
+    assert "all observed frames" in message
+
+
+@pytest.mark.asyncio
+async def test_approve_collector_reports_response_without_grant_event() -> None:
+    reader = asyncio.StreamReader()
+    response = {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "result": {
+            "accepted": True,
+            "decision": "approve",
+            "request_id": "call-1",
+            "scope": "always_tool",
+        },
+    }
+    turn_end = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"event": "turn_end", "data": {"turn_id": "turn-1"}},
+    }
+    reader.feed_data((json.dumps(response) + "\n").encode())
+    reader.feed_data((json.dumps(turn_end) + "\n").encode())
+    reader.feed_eof()
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    with pytest.raises(AssertionError) as failure:
+        await approve_and_collect_grant(
+            reader, _Writer(), 4, "call-1", "always_tool", ["bash"]
+        )
+    message = str(failure.value)
+    assert "approve response without session_grants_changed" in message
+    assert repr(response) in message
+    assert repr(turn_end) in message
+    assert "all observed frames" in message
+
+
+@pytest.mark.asyncio
+async def test_approve_collector_restores_unrelated_frames() -> None:
+    reader = asyncio.StreamReader()
+    turn_end = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"event": "turn_end", "data": {"turn_id": "turn-1"}},
+    }
+    response = {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "result": {
+            "accepted": True,
+            "decision": "approve",
+            "request_id": "call-1",
+            "scope": "always_tool",
+        },
+    }
+    grant = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "event": "session_grants_changed",
+            "data": {"change": "grant", "changed": ["bash"]},
+        },
+    }
+    reader.feed_data(
+        (
+            "\n".join(json.dumps(frame) for frame in (turn_end, response, grant)) + "\n"
+        ).encode()
+    )
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    await approve_and_collect_grant(
+        reader, _Writer(), 4, "call-1", "always_tool", ["bash"]
+    )
+    assert await asyncio.wait_for(read(reader), 10) == turn_end
+
+
 async def _wait_idle(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request_id: int
 ) -> int:
@@ -189,16 +311,9 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
 
         await _request(reader, writer, 3, "send", {"text": "first"})
         assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {"request_id": "call-1", "scope": "always_tool"},
+        await approve_and_collect_grant(
+            reader, writer, 4, "call-1", "always_tool", ["bash"]
         )
-        grant_event = await _event(reader, "session_grants_changed")
-        assert grant_event["data"]["change"] == "grant"
-        assert grant_event["data"]["changed"] == ["bash"]
 
         snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
         assert snapshot == {
@@ -423,17 +538,9 @@ async def test_revoking_grant_leaves_matching_pending_approval_unchanged(
             _event(reader, "approval_request"), TIMEOUT
         )
         assert first_approval["request_id"] == "call-1"
-        await asyncio.wait_for(
-            _request(
-                reader,
-                writer,
-                4,
-                "approve",
-                {"request_id": "call-1", "scope": "always_tool"},
-            ),
-            TIMEOUT,
+        await approve_and_collect_grant(
+            reader, writer, 4, "call-1", "always_tool", ["bash"]
         )
-        await asyncio.wait_for(_event(reader, "session_grants_changed"), TIMEOUT)
         await asyncio.wait_for(_frames_until_event(reader, "turn_end"), TIMEOUT)
         await asyncio.wait_for(_wait_idle(reader, writer, 5), TIMEOUT)
 
@@ -553,23 +660,14 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         # test-contract: seam gate the real observer transport write
         monkeypatch.setattr(observer_connection, "_write_physical", block_observer)
         approve = asyncio.create_task(
-            _request(
-                reader,
-                writer,
-                4,
-                "approve",
-                {"request_id": "call-1", "scope": "always_tool"},
+            approve_and_collect_grant(
+                reader, writer, 4, "call-1", "always_tool", ["bash"]
             )
         )
         await asyncio.wait_for(observer_blocked.wait(), 10)
-        approve_frames = await _assert_completes_in_ready_turns(approve)
-        assert approve_frames[-1]["result"] == {
-            "accepted": True,
-            "decision": "approve",
-            "request_id": "call-1",
-            "scope": "always_tool",
-        }
-        controller_event = await _event(reader, "session_grants_changed")
+        controller_event = await asyncio.wait_for(
+            _assert_completes_in_ready_turns(approve), 10
+        )
         release_observer.set()
         observer_event = await _event(observer_reader, "session_grants_changed")
         assert observer_event["data"] == controller_event["data"]
@@ -587,7 +685,9 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
             )
         )
         await asyncio.wait_for(observer_blocked.wait(), 10)
-        revoke_frames = await _assert_completes_in_ready_turns(revoke)
+        revoke_frames = await asyncio.wait_for(
+            _assert_completes_in_ready_turns(revoke), 10
+        )
         assert revoke_frames[-1]["result"]["removed"] == ["bash"]
         release_observer.set()
         revoke_event = await _event(observer_reader, "session_grants_changed")
@@ -656,9 +756,13 @@ async def test_observer_write_failure_does_not_block_approved_tool_resume(
     observer_writer: asyncio.StreamWriter | None = None
     try:
         await _hello_and_create(reader, writer)
-        _observer_reader, observer_writer = await _observer(
+        observer_reader, observer_writer = await _observer(
             server, 10, features=["serve_observers", "session_grants"]
         )
+        observer_snapshot = (
+            await _request(observer_reader, observer_writer, 11, "session_grants")
+        )[-1]["result"]
+        assert observer_snapshot["session_grants"] == []
         await _request(reader, writer, 3, "send", {"text": "run"})
         await _event(reader, "approval_request")
         assert server.connections is not None
@@ -915,14 +1019,9 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
         await _hello_and_create(reader, writer)
         await _request(reader, writer, 3, "send", {"text": "grant"})
         await _event(reader, "approval_request")
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {"request_id": "parent-bash", "scope": "always_tool"},
+        await approve_and_collect_grant(
+            reader, writer, 4, "parent-bash", "always_tool", ["bash"]
         )
-        await _event(reader, "session_grants_changed")
         await _frames_until_event(reader, "turn_end")
         await _wait_idle(reader, writer, 20)
 
@@ -983,14 +1082,9 @@ async def test_duplicate_grant_emits_no_event_before_positive_fifo_sentinel(
         await _hello_and_create(reader, writer)
         await _request(reader, writer, 3, "send", {"text": "first call"})
         first = await _event(reader, "approval_request")
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {"request_id": first["request_id"], "scope": "always_tool"},
+        await approve_and_collect_grant(
+            reader, writer, 4, first["request_id"], "always_tool", ["bash"]
         )
-        await _event(reader, "session_grants_changed")
         await _frames_until_event(reader, "turn_end")
         assert server.runtime.opened is not None
         server.runtime.opened.store.append_approval_request("call-2", calls[1])
@@ -1050,14 +1144,9 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         await _hello_and_create(reader, writer)
         await _request(reader, writer, 3, "send", {"text": "grant"})
         await _event(reader, "approval_request")
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {"request_id": "call-1", "scope": "always_tool"},
+        await approve_and_collect_grant(
+            reader, writer, 4, "call-1", "always_tool", ["bash"]
         )
-        await _event(reader, "session_grants_changed")
         await _frames_until_event(reader, "turn_end")
 
         assert server.connections is not None
@@ -1071,7 +1160,7 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         monkeypatch.setattr(server.connections, "release", release)
         writer.close()
         await writer.wait_closed()
-        await asyncio.wait_for(released.wait(), 10)
+        await asyncio.wait_for(released.wait(), TIMEOUT)
 
         replacement_reader, replacement_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
