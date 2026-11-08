@@ -39,6 +39,15 @@ from ..transcript_recovery import (
     reconcile_pending,
     repair_transcript,
 )
+from ..transcript_recovery.stream import (
+    PhysicalRow as _PhysicalRow,
+)
+from ..transcript_recovery.stream import (
+    StreamingTranscript as _StreamingTranscript,
+)
+from ..transcript_recovery.stream import (
+    TranscriptFailureKind,
+)
 from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
@@ -69,15 +78,6 @@ MAX_PENDING_APPEND_RECEIPTS = 256
 type InstalledEntriesDelta = tuple[ConversationEntry, ...] | Literal["reset"]
 
 _LOGGER = logging.getLogger(__name__)
-
-
-TranscriptFailureKind = Literal[
-    "torn_tail",
-    "invalid_row",
-    "broken_links",
-    "unsupported_format",
-    "unrecoverable_header",
-]
 
 
 class TranscriptLoadError(ConversationIntegrityError):
@@ -186,148 +186,6 @@ class _DetachedLogState:
     log_prefix_fingerprint: bytes
     installed_delta: InstalledEntriesDelta = ()
     publication_delta: InstalledEntriesDelta = ()
-
-
-@dataclass(frozen=True, slots=True)
-class _PhysicalRow:
-    row_number: int
-    byte_offset: int
-    prefix_digest: str
-    value: dict[str, Any] | None
-    terminated: bool
-    torn: bool = False
-
-
-class _StreamingTranscript:
-    """Read and fingerprint one transcript generation without retaining its bytes."""
-
-    def __init__(self, store: ConversationStore, fd: int, stat: os.stat_result) -> None:
-        self.store = store
-        self.fd = fd
-        self.stat = stat
-        self._handle = os.fdopen(fd, "rb", buffering=64 * 1024, closefd=False)
-        self._digest = hashlib.sha256()
-        self._complete = False
-
-    def _finish_digest(self) -> str:
-        while not self._complete:
-            chunk = self._handle.read(1024 * 1024)
-            if not chunk:
-                self._complete = True
-                break
-            self._digest.update(chunk)
-        current = os.fstat(self.fd)
-        expected = (
-            self.stat.st_dev,
-            self.stat.st_ino,
-            self.stat.st_size,
-            self.stat.st_mtime_ns,
-            self.stat.st_ctime_ns,
-        )
-        observed = (
-            current.st_dev,
-            current.st_ino,
-            current.st_size,
-            current.st_mtime_ns,
-            current.st_ctime_ns,
-        )
-        if observed != expected:
-            raise ConversationIntegrityError(
-                f"transcript changed during validation: {self.store.path}"
-            )
-        return self._digest.hexdigest()
-
-    def error(
-        self,
-        row: _PhysicalRow | None,
-        *,
-        kind: TranscriptFailureKind,
-        reason_code: str,
-        repairable: bool,
-        validated_prefix: ValidatedPrefix | None = None,
-    ) -> TranscriptLoadError:
-        source_digest = self._finish_digest()
-        return self.store._transcript_error(
-            kind=kind,
-            row_number=None if row is None else row.row_number,
-            byte_offset=None if row is None else row.byte_offset,
-            valid_prefix_end=(
-                None if row is None or row.row_number == 1 else row.byte_offset
-            ),
-            reason_code=reason_code,
-            repairable=repairable,
-            stat=self.stat,
-            prefix_digest=(
-                hashlib.sha256().hexdigest() if row is None else row.prefix_digest
-            ),
-            source_digest=source_digest,
-            validated_prefix=validated_prefix,
-        )
-
-    def rows(self) -> Iterator[_PhysicalRow]:
-        offset = 0
-        row_number = 0
-        while True:
-            line = self._handle.readline()
-            if not line:
-                self._complete = True
-                return
-            row_number += 1
-            if row_number > 1 and (row_number - 1) % 64 == 0:
-                time.sleep(0.0001)
-            row_offset = offset
-            prefix_digest = self._digest.hexdigest()
-            self._digest.update(line)
-            offset += len(line)
-            terminated = line.endswith(b"\n")
-            if not terminated:
-                self._complete = True
-            try:
-                value = load_session_json(line)
-            except ConversationIntegrityError as exc:
-                torn = not terminated and isinstance(
-                    exc.__cause__, (json.JSONDecodeError, UnicodeError)
-                )
-                row = _PhysicalRow(
-                    row_number,
-                    row_offset,
-                    prefix_digest,
-                    None,
-                    terminated,
-                    torn=torn,
-                )
-                if torn and not self.store._read_only:
-                    yield row
-                    return
-                raise self.error(
-                    row,
-                    kind=(
-                        "unrecoverable_header"
-                        if row_number == 1
-                        else "torn_tail"
-                        if torn
-                        else "invalid_row"
-                    ),
-                    reason_code="invalid_json",
-                    repairable=row_number > 1,
-                ) from exc
-            row = _PhysicalRow(
-                row_number,
-                row_offset,
-                prefix_digest,
-                value if isinstance(value, dict) else None,
-                terminated,
-            )
-            if not isinstance(value, dict):
-                raise self.error(
-                    row,
-                    kind=("unrecoverable_header" if row_number == 1 else "invalid_row"),
-                    reason_code="row_not_object",
-                    repairable=row_number > 1,
-                )
-            yield row
-            if not terminated:
-                return
 
 
 class _FullLoadValidator:
@@ -1004,10 +862,12 @@ class ConversationLogMixin:
         )
 
     def _iter_physical_rows(
-        self: ConversationStore, source: _StreamingTranscript
+        self: ConversationStore,
+        source: _StreamingTranscript,
+        validated_prefix: Callable[[int], ValidatedPrefix],
     ) -> Iterator[_PhysicalRow]:
         """Yield decoded physical rows and one marker for a writable torn tail."""
-        yield from source.rows()
+        yield from source.rows(validated_prefix)
 
     def _repair_explicit_load_error(
         self: ConversationStore, error: TranscriptLoadError
@@ -1048,7 +908,7 @@ class ConversationLogMixin:
             device=source.stat.st_dev,
             inode=source.stat.st_ino,
             size=source.stat.st_size,
-            source_digest=source._finish_digest(),
+            source_digest=source.finish_digest(),
             prefix_digest=torn_row.prefix_digest,
             first_bad_row=torn_row.row_number,
             first_bad_offset=torn_offset,
@@ -1087,7 +947,9 @@ class ConversationLogMixin:
             torn_row: _PhysicalRow | None = None
             last_row: _PhysicalRow | None = None
             try:
-                for physical_row in self._iter_physical_rows(source):
+                for physical_row in self._iter_physical_rows(
+                    source, validator.validated_prefix
+                ):
                     last_row = physical_row
                     if physical_row.torn:
                         torn_row = physical_row
@@ -1106,7 +968,7 @@ class ConversationLogMixin:
             )
             if self._repair_torn_row(torn_row, validator, source, delta):
                 return
-            source._finish_digest()
+            source.finish_digest()
             if not self._read_only and last_row is not None and not last_row.terminated:
                 self._write_bytes(b"\n")
                 self._publish_entries_installed(delta)
@@ -1209,14 +1071,16 @@ class ConversationLogMixin:
         try:
             source = _StreamingTranscript(self, fd, os.fstat(fd))
             validator = _FullLoadValidator(self, source)
-            for physical_row in self._iter_physical_rows(source):
+            for physical_row in self._iter_physical_rows(
+                source, validator.validated_prefix
+            ):
                 if physical_row.torn:
                     raise ConversationIntegrityError(
                         f"invalid conversation row {physical_row.row_number}: {self.path}"
                     )
                 validator.accept(physical_row)
             validator.finish()
-            source._finish_digest()
+            source.finish_digest()
         finally:
             os.close(fd)
 
