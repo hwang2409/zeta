@@ -1093,12 +1093,10 @@ async def test_session_grant_exactness_noops_feature_gate_and_fifo_sentinels(
         await close_serve(server, writer)
 
 
-async def _collect_second_delegated_approval(
+async def _collect_second_parent_terminal(
     reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
     release_child: asyncio.Event,
-    publication_attempted: asyncio.Event,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str]:
+) -> tuple[list[dict[str, Any]], str]:
     frames: list[dict[str, Any]] = []
     while True:
         buffered = _buffer(reader)
@@ -1107,34 +1105,12 @@ async def _collect_second_delegated_approval(
         else:
             line = await reader.readline()
             if not line:
-                return None, frames, "socket eof"
+                return frames, "socket eof"
             frame = json.loads(line)
         frames.append(frame)
-        params = frame.get("params", {})
-        if params.get("event") == "agent_end":
+        if frame.get("params", {}).get("event") == "agent_end":
             release_child.set()
-            break
-
-    # test-contract: seam the owning journey supplies the one deadline.
-    await publication_attempted.wait()
-    sentinel = await _request(reader, writer, 32, "session_grants")
-    buffered = _buffer(reader)
-    frames.extend(buffered)
-    buffered.clear()
-    frames.extend(sentinel)
-    approval = next(
-        (
-            frame["params"]
-            for frame in frames
-            if frame.get("params", {}).get("event") == "approval_request"
-            and frame.get("params", {}).get("tool_call", {}).get("id")
-            == "child-bash-2"
-        ),
-        None,
-    )
-    return approval, frames, (
-        "delegated approval" if approval is not None else "publication sentinel"
-    )
+            return frames, "parent agent end"
 
 
 @pytest.mark.asyncio
@@ -1203,11 +1179,30 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
                 "result"
             ]
             assert snapshot["session_grants"] == []
-            approval, frames, terminal = await _collect_second_delegated_approval(
-                reader,
-                writer,
-                backend.release_child_two,
-                publication_attempted,
+            frames, terminal = await _collect_second_parent_terminal(
+                reader, backend.release_child_two
+            )
+            # test-contract: seam this coroutine is the await_or_fail argument.
+            await publication_attempted.wait()
+            sentinel = await _request(reader, writer, 32, "session_grants")
+            buffered = _buffer(reader)
+            frames.extend(buffered)
+            buffered.clear()
+            frames.extend(sentinel)
+            approval = next(
+                (
+                    frame["params"]
+                    for frame in frames
+                    if frame.get("params", {}).get("event") == "approval_request"
+                    and frame.get("params", {}).get("tool_call", {}).get("id")
+                    == "child-bash-2"
+                ),
+                None,
+            )
+            terminal = (
+                "delegated approval"
+                if approval is not None
+                else "publication sentinel"
             )
             assert approval is not None, (
                 "child-bash-2 did not request delegated approval; "
