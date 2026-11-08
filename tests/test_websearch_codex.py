@@ -528,7 +528,7 @@ async def test_codex_deadline_covers_credential_acquisition(monkeypatch, registr
     release_acquisition = asyncio.Event()
     acquisition_finished = asyncio.Event()
 
-    async def blocked_access_token(_store, _client):
+    async def blocked_access_token(_store, _client, **_kwargs):
         acquisition_started.set()
         await release_acquisition.wait()
         acquisition_finished.set()
@@ -564,7 +564,7 @@ async def test_concurrent_searches_share_one_credential_acquisition(
     release_acquisition = asyncio.Event()
     acquisitions_finished = asyncio.Event()
 
-    async def slow_access_token(_store, _client):
+    async def slow_access_token(_store, _client, **_kwargs):
         nonlocal acquisition_calls, active_acquisitions
         acquisition_calls += 1
         active_acquisitions += 1
@@ -643,7 +643,7 @@ async def test_codex_deadline_does_not_cancel_token_refresh(monkeypatch, registr
     refresh_persisted = asyncio.Event()
     refresh_cancelled = False
 
-    async def blocked_access_token(_store, _client):
+    async def blocked_access_token(_store, _client, **_kwargs):
         nonlocal refresh_cancelled
         refresh_started.set()
         try:
@@ -685,7 +685,7 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
     refresh_persisted = asyncio.Event()
     refresh_cancelled = False
 
-    async def slow_access_token(_store, _client):
+    async def slow_access_token(_store, _client, **_kwargs):
         nonlocal refresh_cancelled
         refresh_started.set()
         try:
