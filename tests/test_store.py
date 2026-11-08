@@ -489,15 +489,16 @@ def test_reopened_running_lifecycle_uses_last_durable_transition(
     store.update_agent_lifecycle(
         current_step="turn 4: running", turns_used=4, tool_calls=2
     )
+    store.checkpoint_agent_lifecycle()
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     lifecycle = reopened.agent_lifecycle()
     assert lifecycle is not None
     assert lifecycle["state"] == "running"
-    assert lifecycle["current_step"] == "starting"
-    assert lifecycle["turns_used"] == 0
-    assert lifecycle["tool_calls"] == 0
+    assert lifecycle["current_step"] == "turn 4: running"
+    assert lifecycle["turns_used"] == 4
+    assert lifecycle["tool_calls"] == 2
 
 
 def test_cancel_transition_persists_live_counters(tmp_path: Path) -> None:

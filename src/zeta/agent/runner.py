@@ -972,8 +972,8 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
 
-    def update_tool_calls(tool_calls: int) -> None:
-        child_store.update_agent_lifecycle(tool_calls=tool_calls)
+    def update_tool_calls(_segment_tool_calls: int) -> None:
+        child_store.update_agent_lifecycle(tool_calls=1)
 
     consume = consume_run if follow_up_loop else consume_child
     loop._background_owner.causal_episodes.associate_new_member(

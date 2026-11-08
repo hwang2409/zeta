@@ -96,13 +96,15 @@ async def test_child_tool_count_is_cumulative_across_follow_up_segments(
     )
     todo_one = ToolCall("todo-one", "todo", {"items": []})
     todo_two = ToolCall("todo-two", "todo", {"items": []})
+    todo_three = ToolCall("todo-three", "todo", {"items": []})
+    todo_four = ToolCall("todo-four", "todo", {"items": []})
     backend = PerActorFakeBackend(
         [ScriptedTurn(tool_calls=[child_call])],
         {
             "first work": [
-                ScriptedTurn(tool_calls=[todo_one]),
+                ScriptedTurn(tool_calls=[todo_one, todo_two]),
                 ScriptedTurn(content=[TextContent("first segment")]),
-                ScriptedTurn(tool_calls=[todo_two]),
+                ScriptedTurn(tool_calls=[todo_three, todo_four]),
                 ScriptedTurn(content=[TextContent("second segment")]),
             ]
         },
@@ -131,11 +133,11 @@ async def test_child_tool_count_is_cumulative_across_follow_up_segments(
         status = await _status(loop, handle)
         child = status["structuredContent"]["children"][0]
         assert backend.child_calls["first work"] == 4
-        assert child["tool_calls"] == 3
+        assert child["tool_calls"] == 4
         durable = json.loads(
             (child_path / "agent_lifecycle.json").read_text(encoding="utf-8")
         )
-        assert durable["tool_calls"] == 3
+        assert durable["tool_calls"] == 4
 
         rendered = AgentCard.render_receipt(
             StreamEvent(
@@ -150,7 +152,7 @@ async def test_child_tool_count_is_cumulative_across_follow_up_segments(
             lifecycle=child,
         )
         assert rendered is not None
-        assert "3 tool calls" in rendered.plain
+        assert "4 tool calls" in rendered.plain
     finally:
         backend.release_children.set()
         await loop.close()
