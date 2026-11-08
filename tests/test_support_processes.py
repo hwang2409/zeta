@@ -190,9 +190,12 @@ def test_read_pty_until_names_early_exit_and_output() -> None:
         stdout=slave,
         stderr=slave,
     )
-    process.wait(timeout=10)
-    output = bytearray(os.read(master, 4096))
+    output = bytearray()
     try:
+        process.wait(timeout=10)
+        read_pty_until(
+            master, b"partial", process=process, output=output, timeout=10
+        )
         os.close(slave)
         slave = -1
         with pytest.raises(AssertionError, match="partial"):
