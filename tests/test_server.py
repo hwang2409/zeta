@@ -3119,7 +3119,7 @@ async def test_clear_steering_requires_abort_scope_feature(tmp_path: Path) -> No
     try:
         frames = await _request(reader, writer, 3, "clear_steering")
         assert frames[-1]["error"] == {
-            "code": -32602,
+            "code": -32601,
             "message": "clear_steering requires the negotiated abort_scope feature",
         }
     finally:
