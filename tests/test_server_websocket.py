@@ -721,3 +721,27 @@ async def test_websocket_child_history_requires_negotiation(tmp_path: Path) -> N
     finally:
         await close_serve(server, writer)
 
+
+
+@pytest.mark.asyncio
+async def test_websocket_child_history_reads_child(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    metadata = await server.runtime.create_session(provider="codex", model="offline", cwd=tmp_path)
+    root = server.runtime.opened.store
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import Message, MessageRole
+    child = ConversationStore(root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease)
+    child.start_agent_lifecycle(handle=f"{metadata.session_id}:1", started_at="2026-01-01T00:00:00+00:00", depth=1, agent_type="worker", description="child")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("websocket-child")]))
+    child.close()
+    await server.start()
+    reader, writer, status, _ = await _connect(server, token=server._websocket.token, protocol_fields=["zeta.v1"])
+    assert status == 101
+    try:
+        await _send_json(writer, {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2", "features": ["child_run_history"]}})
+        await _read_json(reader)
+        await _send_json(writer, {"jsonrpc": "2.0", "id": 2, "method": "child_run_history", "params": {"session_id": metadata.session_id, "run_id": f"{metadata.session_id}:1"}})
+        result = (await _read_json(reader))["result"]
+        assert result["messages"][0]["content"][0]["text"] == "websocket-child"
+    finally:
+        await close_serve(server, writer)
