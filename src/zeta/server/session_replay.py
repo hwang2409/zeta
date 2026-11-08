@@ -166,24 +166,42 @@ class SessionReplay:
         self._subscriptions[connection] = _Subscription(pending.scope, pending.stream_id)
         return pending.frames
 
-    def publish(self, connection: Any, scope: ReplayScopeId, event: Any, fields: dict[str, object], frame_size: int) -> PublishedSessionEvent | None:
+    def prepare(self, connection: Any, scope: ReplayScopeId) -> PublishedSessionEvent | None:
         subscription = self._subscriptions.get(connection)
         pending = self._pending.get(connection)
         target = subscription if subscription is not None else pending
-        if target is None or target.scope != scope or not self._reserve(scope, frame_size):
+        if target is None or target.scope != scope:
             return None
-        seq = self._next_sequences.get(connection, 1)
-        self._next_sequences[connection] = seq + 1
+        return PublishedSessionEvent(
+            target.stream_id, self._next_sequences.get(connection, 1), scope, 0
+        )
+
+    def commit(
+        self,
+        connection: Any,
+        event: Any,
+        fields: dict[str, object],
+        published: PublishedSessionEvent,
+        frame_size: int,
+    ) -> PublishedSessionEvent | None:
+        if self._next_sequences.get(connection, 1) != published.seq:
+            return None
+        if not self._reserve(published.scope, frame_size):
+            return None
+        self._next_sequences[connection] = published.seq + 1
         payload = {
-            "stream_id": target.stream_id,
-            "seq": seq,
-            "_replay_scope": scope,
+            "stream_id": published.stream_id,
+            "seq": published.seq,
+            "_replay_scope": published.scope,
             "_replay_size": frame_size,
             **fields,
         }
+        pending = self._pending.get(connection)
         if pending is not None:
             pending.frames.append((event, payload))
-        return PublishedSessionEvent(target.stream_id, seq, scope, frame_size)
+        return PublishedSessionEvent(
+            published.stream_id, published.seq, published.scope, frame_size
+        )
 
     def release(self, scope: ReplayScopeId, size: int) -> None:
         owner = self._scopes.get(scope)

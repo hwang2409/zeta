@@ -74,6 +74,7 @@ class _OutputFrame:
     replay_stream_id: str | None = None
     replay_scope: ReplayScopeId | None = None
     replay_size: int = 0
+    join_response: bool = False
 
 
 @dataclass
@@ -321,6 +322,21 @@ class ConnectionRegistry:
         for scope in self.replay.take_invalidated():
             self._discard_replay_scope(scope)
 
+    def _discard_connection_replay(self, connection: Any) -> None:
+        state = self._connections.get(connection)
+        if state is None or state.output is None:
+            return
+        output = state.output
+        kept: deque[_OutputFrame] = deque()
+        while output.queue:
+            item = output.queue.popleft()
+            if item.replay_scope is not None:
+                self._finish_frame_accounting(output, item)
+            else:
+                kept.append(item)
+        output.queue = kept
+        self._assert_retained_accounting(output)
+
     def _discard_replay_scope(self, scope: ReplayScopeId) -> None:
         for state in tuple(self._connections.values()):
             output = state.output
@@ -347,27 +363,29 @@ class ConnectionRegistry:
         if "session_replay_seq" not in state.features or session_id is None:
             return False
         scope = ReplayScopeId.top(session_id)
-        published = self.replay.publish(
+        prepared = self.replay.prepare(state.connection, scope)
+        if prepared is None or state.output is None:
+            return False
+        payload = {"stream_id": prepared.stream_id, "seq": prepared.seq, **fields}
+        frame = state.connection.codec.notification(event, session_id, **payload)
+        if frame is None:
+            return False
+        published = self.replay.commit(
             state.connection,
-            scope,
             event,
             {**fields, "_session_id": session_id},
-            frame_size,
+            prepared,
+            len(frame),
         )
         for invalidated in self.replay.take_invalidated():
             self._discard_replay_scope(invalidated)
         if published is None:
             return False
-        payload = {"stream_id": published.stream_id, "seq": published.seq, **fields}
-        replay_scope = published.scope
-        replay_size = published.size
-        payload.pop("_session_id", None)
-        frame = state.connection.codec.notification(event, session_id, **payload)
-        if frame is None or state.output is None:
-            return False
         pending = self.replay._pending.get(state.connection)
         if pending is not None:
             return True
+        replay_scope = published.scope
+        replay_size = published.size
         if not self._admit(state, frame):
             self.replay.connection_closed(state.connection)
             return False
@@ -384,9 +402,13 @@ class ConnectionRegistry:
 
     async def admit_join_response(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
-        if state is None or state.output is None or not self._admit(state, frame):
+        if state is None or state.output is None:
+            self.replay.connection_closed(connection)
             return False
         output = state.output
+        if output.phase not in {"claimed_buffering", "flushing", "ready"}:
+            self.replay.connection_closed(connection)
+            return False
         held = self.replay.pending_tail(connection)
         items: list[_OutputFrame] = [_OutputFrame(frame)]
         for event, fields in held:
@@ -394,7 +416,7 @@ class ConnectionRegistry:
             replay_scope = fields.pop("_replay_scope", None)
             replay_size = fields.pop("_replay_size", 0)
             payload = connection.codec.notification(event, session_id, **fields)
-            if payload is None or not self._admit(state, payload):
+            if payload is None:
                 self.replay.connection_closed(connection)
                 return False
             items.append(
@@ -405,6 +427,16 @@ class ConnectionRegistry:
                     replay_size=replay_size,
                 )
             )
+        if (
+            output.retained_bytes
+            + sum(len(item.payload) for item in items)
+            + len(output.overflow_frame or b"")
+            > OUTPUT_MAX_BYTES
+            or output.retained_frames + len(items) + 1 > OUTPUT_MAX_FRAMES
+        ):
+            self.replay.connection_closed(connection)
+            return False
+        items[0].join_response = True
         for item in items:
             self._enqueue(output, item, wake=False)
         self.replay.activate_join(connection)
@@ -656,6 +688,9 @@ class ConnectionRegistry:
             output.current_write = None
         self._finish_frame_accounting(output, item)
         self._finish_future(item.future, result)
+        if not result and item.join_response:
+            self.replay.connection_closed(state.connection)
+            self._discard_connection_replay(state.connection)
         if not result and output.phase == "flushing":
             self._reset_flush(output, False)
 
