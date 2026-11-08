@@ -569,6 +569,32 @@ async def test_task_deadline_bounds_the_stream_close() -> None:
 
 
 @pytest.mark.asyncio
+async def test_outer_cancel_during_stream_close_drains_attempt() -> None:
+    clock = _ManualClock()
+    slow_cancel = asyncio.Event()
+    attempt = _BlockingCloseAttempt(slow_cancel=slow_cancel)
+    backend = _AttemptBackend([attempt], clock)
+    completion = backend.complete([], [], control=_deadline_control(30.0))
+    await _within(completion.__anext__())
+    closing = asyncio.create_task(completion.aclose())
+    try:
+        await _within(attempt.close_started.wait())
+        closing.cancel()
+        await _within(attempt.close_cancelled.wait())
+        assert not closing.done()
+        slow_cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _within(closing)
+        assert attempt.close_finished.is_set()
+        assert not backend.client_close_started
+    finally:
+        slow_cancel.set()
+        if not closing.done():
+            closing.cancel()
+        await _within(asyncio.gather(closing, return_exceptions=True))
+
+
+@pytest.mark.asyncio
 async def test_outer_cancel_during_task_deadline_drain_waits_for_close() -> None:
     clock = _ManualClock()
     slow_cancel = asyncio.Event()
