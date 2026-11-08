@@ -17343,6 +17343,7 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
             lead_idle_count += 1
             lead_idle.set()
 
+    # test-contract: seam observes the exact idle transition without a sleep
     monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
