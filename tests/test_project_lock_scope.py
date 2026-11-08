@@ -7,7 +7,8 @@ import socket
 import subprocess
 import sys
 import threading
-from contextlib import contextmanager
+from collections.abc import Awaitable
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from zeta.core.session_links import (
     reconcile_child_links,
 )
 from zeta.core.store import ConversationStore
+from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.storage_format import WRITER_EPOCH, advance
@@ -131,7 +133,46 @@ def _hold_identity_publication(home: str, _project_id: str, channel: socket.sock
     _send(channel, "identity-done")
 
 
+def _send_inbox_message(home: str, registry: ProjectRegistry, project_id: str) -> str:
+    return ProjectInbox(registry, sessions_root=Path(home) / "sessions").send(
+        from_project=project_id,
+        from_session="c" * 32,
+        to_project=project_id,
+        kind="info",
+        title="p06-1",
+        body="unrelated inbox publication",
+    )
+
+
+def _hold_inbox_publication(home: str, project_id: str, channel: socket.socket) -> None:
+    registry = ProjectRegistry(Path(home) / "projects")
+    original = registry._acquire_lock
+
+    def gated(fd: int, mode: int) -> None:
+        original(fd, mode)
+        if mode == fcntl.LOCK_EX:
+            _send(channel, "acquired")
+            if _receive(channel) != "release":
+                raise AssertionError("release signal was not sent")
+
+    registry._acquire_lock = gated  # type: ignore[method-assign]
+    _send_inbox_message(home, registry, project_id)
+    _send(channel, "a-done")
+
+
+def _publish_other_inbox(home: str, project_id: str, channel: socket.socket) -> None:
+    registry = ProjectRegistry(Path(home) / "projects")
+    message_id = _send_inbox_message(home, registry, project_id)
+    listed = ProjectInbox(registry, sessions_root=Path(home) / "sessions").list(
+        project_id
+    )
+    published = any(item["id"] == message_id for item in listed["new"])
+    _send(channel, "b-done" if published else "b-missing")
+
+
 _WORKERS = {
+    "hold-inbox": _hold_inbox_publication,
+    "publish-inbox": _publish_other_inbox,
     "hold-memory": _hold_memory_publication,
     "hold-identity": _hold_identity_publication,
     "hold-sessions": _hold_sessions_publication,
@@ -193,8 +234,13 @@ if __name__ == "__main__":
     finally:
         channel.close()
 
+@pytest.mark.parametrize(
+    ("holder_kind", "other_kind"),
+    [("hold-memory", "publish-memory"), ("hold-inbox", "publish-inbox")],
+    ids=["memory", "inbox"],
+)
 def test_p06_1_unrelated_projects_publish_without_root_lock_serialization(
-    tmp_path: Path,
+    tmp_path: Path, holder_kind: str, other_kind: str
 ) -> None:
     home = tmp_path / ".zeta"
     advance(home, expected_epoch=0)
@@ -206,9 +252,9 @@ def test_p06_1_unrelated_projects_publish_without_root_lock_serialization(
 
     _run_while_lock_is_held(
         home,
-        holder_kind="hold-memory",
+        holder_kind=holder_kind,
         holder_project=project_a.project_id,
-        other_kind="publish-memory",
+        other_kind=other_kind,
         other_project=project_b.project_id,
         expected="b-done",
     )
@@ -751,3 +797,310 @@ def test_p06_installed_callbacks_drain_in_append_order_after_rank_release(
         if thread_b.ident is not None:
             thread_b.join(timeout=10)
         store.close()
+
+
+def _held_authority(registry: ProjectRegistry, project_id: str, domain: str):
+    if domain == "identity":
+        identity_write = getattr(registry, "_identity_write", None)
+        if identity_write is not None:
+            return identity_write()
+    else:
+        project_lock = getattr(registry, "_project_lock", None)
+        if project_lock is not None:
+            return project_lock(project_id, domain, exclusive=True)
+    return registry._locked(write=True)
+
+
+@asynccontextmanager
+async def _held_production_lock(
+    monkeypatch: pytest.MonkeyPatch, home: Path, project_id: str, domain: str
+):
+    """Hold one real project authority in a thread until a loop sentinel runs.
+
+    The sentinel is scheduled on the event loop when a public operation first
+    finds the held lock contended. It records whether that lock wait was still
+    pending, then lets the holder release.
+    """
+    loop = asyncio.get_running_loop()
+    acquired = threading.Event()
+    contended = threading.Event()
+    wait_ended = threading.Event()
+    sentinel_ran = threading.Event()
+    observed: list[str] = []
+
+    def sentinel() -> None:
+        observed.append(
+            "sentinel" if not wait_ended.is_set() else "sentinel after the lock wait"
+        )
+        sentinel_ran.set()
+
+    def hold() -> None:
+        try:
+            registry = ProjectRegistry(home / "projects")
+            with _held_authority(registry, project_id, domain):
+                acquired.set()
+                if contended.wait(10):
+                    loop.call_soon_threadsafe(sentinel)
+                    sentinel_ran.wait(10)
+                observed.append("released")
+        except Exception as exc:  # noqa: BLE001 - reported through observed
+            observed.append(f"holder failed: {exc!r}")
+        finally:
+            acquired.set()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert await asyncio.to_thread(acquired.wait, 10), "holder did not start"
+        assert observed == [], observed
+        original = ProjectRegistry._acquire_lock
+
+        def gated(lock_fd: int, mode: int) -> None:
+            try:
+                fcntl.flock(lock_fd, mode | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                contended.set()
+            try:
+                original(lock_fd, mode)
+            finally:
+                wait_ended.set()
+
+        # test-contract: seam observe the first contended wait on the held lock
+        monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(gated))
+        yield observed
+    finally:
+        contended.set()
+        sentinel_ran.set()
+        await asyncio.to_thread(holder.join, 10)
+        assert not holder.is_alive(), "lock holder did not exit"
+
+
+async def _settle[T](operation: Awaitable[T]) -> T | BaseException:
+    try:
+        return await asyncio.wait_for(operation, 30)
+    except Exception as exc:  # noqa: BLE001 - the sentinel order is asserted first
+        return exc
+
+
+_LOOP_BLOCKED = "loop sentinel did not run before the held production lock was released"
+
+
+def _git_project(tmp_path: Path, home: Path) -> tuple[Path, str]:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "demo", repository)
+    registry.initialize_memory(project.project_id)
+    return repository, project.project_id
+
+
+async def test_p06_2_child_lineage_stays_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support.fake_backend import FakeBackend
+    from zeta.core.abort import AbortGenerationRegistry
+    from zeta.protocol.types import ToolCall
+    from zeta.runtime.loop import AgentLoop
+    from zeta.skills import SkillCatalog
+
+    home = tmp_path / ".zeta"
+    repository, project_id = await asyncio.to_thread(_git_project, tmp_path, home)
+    registry = ProjectRegistry(home / "projects")
+    opened = await asyncio.to_thread(
+        SessionManager(home).create, provider="codex", model="fake", cwd=repository
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project_id,
+        project_registry=registry,
+    )
+
+    async def stop_after_publication(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("stop after lineage publication")
+
+    # test-contract: seam stop the real spawn right after lineage publication
+    monkeypatch.setattr(
+        loop.store, "append_child_run_started_async", stop_after_publication
+    )
+    call = ToolCall("child", "agent", {"prompt": "work", "description": "child"})
+    try:
+        async with _held_production_lock(
+            monkeypatch, home, project_id, "sessions"
+        ) as observed:
+            outcome = await _settle(
+                loop._run_agent_tool(
+                    call, call.arguments, AbortGenerationRegistry().new_generation(), None
+                )
+            )
+        assert observed == ["sentinel", "released"], _LOOP_BLOCKED
+        assert isinstance(outcome, RuntimeError), repr(outcome)
+        links = await asyncio.to_thread(registry.list_session_links, project_id)
+        assert f"{opened.store.session_id}:1" in {
+            row["session_id"] for row in links
+        }
+    finally:
+        try:
+            await asyncio.wait_for(loop.close(), 10)
+        finally:
+            opened.store.close()
+
+
+def _tool_registry(home: Path, project_id: str):
+    from zeta.skills import SkillCatalog
+    from zeta.tools.registry import ToolRegistry
+
+    store = ConversationStore(home / "sessions", session_id="a" * 32, cwd=home)
+    tools = ToolRegistry(
+        home,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project_id,
+        project_registry=ProjectRegistry(home / "projects"),
+        inbox_enabled=True,
+    )
+    tools.bind_session_store(store)
+    return tools, store
+
+
+async def _tool_stays_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    arguments: dict[str, object],
+    domain: str,
+) -> None:
+    from zeta.protocol.types import ToolCall
+
+    home = tmp_path / ".zeta"
+    _, project_id = await asyncio.to_thread(_git_project, tmp_path, home)
+    tools, store = await asyncio.to_thread(_tool_registry, home, project_id)
+    try:
+        async with _held_production_lock(
+            monkeypatch, home, project_id, domain
+        ) as observed:
+            result = await _settle(tools.execute(ToolCall("call", tool, arguments)))
+        assert observed == ["sentinel", "released"], _LOOP_BLOCKED
+        assert isinstance(result, dict), repr(result)
+        assert result["isError"] is False, result
+        return result["structuredContent"]
+    finally:
+        await tools.close()
+        store.close()
+
+
+async def test_p06_2_project_tool_stays_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = await _tool_stays_off_event_loop(
+        tmp_path, monkeypatch, "project", {"action": "inspect"}, "memory"
+    )
+    assert content["project"]["name"] == "demo"
+    assert "memory" in content
+
+
+async def test_p06_2_inbox_tool_stays_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = await _tool_stays_off_event_loop(
+        tmp_path, monkeypatch, "inbox", {"action": "list"}, "inbox"
+    )
+    assert content["status"] == "new"
+    assert content["messages"] == []
+
+
+_SLASH_CASES = {
+    "/project": "identity",
+    "/memory": "memory",
+    "/inbox": "inbox",
+}
+
+
+def _assert_slash_output(command: str, output: object) -> None:
+    assert isinstance(output, str), repr(output)
+    if command == "/project":
+        assert "demo" in output, output
+    elif command == "/memory":
+        assert not output.startswith("memory:"), output
+    else:
+        assert json.loads(output)["new"] == [], output
+
+
+@pytest.mark.parametrize("command", list(_SLASH_CASES))
+async def test_p06_2_tui_project_surfaces_stay_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    from zeta.cli.main import build_parser
+    from zeta.tui.app import create_app
+
+    home = tmp_path / ".zeta"
+    repository, project_id = await asyncio.to_thread(_git_project, tmp_path, home)
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(repository)
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
+    try:
+        assert app.loop.session_metadata.project_id == project_id
+        async with _held_production_lock(
+            monkeypatch, home, project_id, _SLASH_CASES[command]
+        ) as observed:
+            output = await _settle(app._slash_commands.dispatch_async(app, command))
+        assert observed == ["sentinel", "released"], _LOOP_BLOCKED
+        _assert_slash_output(command, output)
+    finally:
+        await asyncio.wait_for(app.close(), 30)
+
+
+@pytest.mark.parametrize("command", ["/memory", "/inbox"])
+async def test_p06_2_serve_project_surfaces_stay_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    from tests.support.serve_close import close_serve
+    from tests.support.server_client import request
+    from zeta.server import ZetaServer
+
+    home = tmp_path / "home"
+    repository, project_id = await asyncio.to_thread(_git_project, tmp_path, home)
+    server = ZetaServer(home=home, cwd=repository, port=0, provider="codex")
+    await asyncio.wait_for(server.start(), 30)
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection("127.0.0.1", server.port), 30
+    )
+    try:
+        await request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0", "client_version": "1.1"},
+        )
+        session = (
+            await request(reader, writer, 2, "new_session", {"provider": "codex"})
+        )[-1]["result"]["session"]
+        assert session["project_id"] == project_id, session
+        async with _held_production_lock(
+            monkeypatch, home, project_id, _SLASH_CASES[command]
+        ) as observed:
+            frames = await _settle(
+                request(
+                    reader,
+                    writer,
+                    3,
+                    "slash_run",
+                    {"session_id": session["session_id"], "text": command},
+                )
+            )
+        assert observed == ["sentinel", "released"], _LOOP_BLOCKED
+        assert isinstance(frames, list), repr(frames)
+        result = frames[-1]["result"]
+        assert result["kind"] == "output", result
+        _assert_slash_output(command, result["text"])
+    finally:
+        await close_serve(server, writer)
