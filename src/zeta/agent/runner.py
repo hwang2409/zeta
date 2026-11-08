@@ -65,6 +65,7 @@ from .terminal_fence import TerminalTransitionFence
 from .turn_limit import (
     ChildTurnControl,
     finalize_exhausted_child,
+    make_child_progress_callbacks,
     make_finish_limited_child_turn,
 )
 
@@ -985,13 +986,12 @@ async def run_agent_tool(
         elif lifecycle_sink is not None:
             lifecycle_sink(kind, call, data, tool_result)
 
-    def update_turns(turns: int) -> None:
-        loop._agent_child_turns[tool_call.id] = turns
-        child_store.update_agent_lifecycle(turns_used=turns)
-        loop.store.update_agent_child_turns(child_marker_key, turns)
-
-    def update_tool_calls(tool_calls: int) -> None:
-        child_store.update_agent_lifecycle(tool_calls=tool_calls)
+    update_turns, update_tool_calls = make_child_progress_callbacks(
+        loop=loop,
+        child_store=child_store,
+        child_marker_key=child_marker_key,
+        child_tool_call_id=tool_call.id,
+    )
 
     consume = consume_run if follow_up_loop else consume_child
     loop._background_owner.causal_episodes.associate_new_member(

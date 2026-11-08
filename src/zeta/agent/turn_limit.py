@@ -299,6 +299,24 @@ def finish_foreground_turn_limit(
     return payload
 
 
+def make_child_progress_callbacks(
+    *,
+    loop: Any,
+    child_store: Any,
+    child_marker_key: str,
+    child_tool_call_id: str,
+) -> tuple[Callable[[int], None], Callable[[int], None]]:
+    def update_turns(turns: int) -> None:
+        loop._agent_child_turns[child_tool_call_id] = turns
+        child_store.update_agent_lifecycle(turns_used=turns)
+        loop.store.update_agent_child_turns(child_marker_key, turns)
+
+    def update_tool_calls(tool_calls: int) -> None:
+        child_store.update_agent_lifecycle(tool_calls=tool_calls)
+
+    return update_turns, update_tool_calls
+
+
 def make_finish_limited_child_turn(
     *,
     store: ConversationStore,
