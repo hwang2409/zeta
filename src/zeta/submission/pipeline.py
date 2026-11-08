@@ -1116,6 +1116,8 @@ class SubmissionPipeline:
     def _abort_entry(self, entry: _Entry) -> None:
         if entry.signal is not None:
             entry.signal.abort()
+        if entry is self._provider_entry:
+            self._host.loop.abort(foreground_only=True)
         self._abort_approvals(entry)
         if entry is self._provider_entry:
             if self._provider_task is not None and not self._provider_task.done():
