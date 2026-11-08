@@ -35,7 +35,7 @@ from ...protocol.types import (
     ToolUseContent,
     require_new_message_origin,
 )
-from ...storage_format import WriterLease, open_writer
+from ...storage_format import WriterLease, open_writer, reject_unknown_keys
 from .. import session_execution
 from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
@@ -590,8 +590,7 @@ class ConversationStore(
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:
                     raise ValueError("notification id must be a nonempty string")
-                if set(entry.data) != {"notification_id"}:
-                    raise ValueError("notification marker has unexpected fields")
+                reject_unknown_keys(entry.data, "notification_marker")
             elif entry.type == "pending_prompt":
                 text = entry.data.get("text")
                 if type(text) is not str or not text:
@@ -603,8 +602,7 @@ class ConversationStore(
                 if type(prompt_id) is not str or not prompt_id:
                     raise ValueError("pending prompt id must be a nonempty string")
             elif entry.type == "pending_queue_closed":
-                if entry.data != {}:
-                    raise ValueError("pending queue closed marker takes no fields")
+                reject_unknown_keys(entry.data, "pending_queue_closed")
             elif entry.type == "terminal_transition":
                 validate_terminal_transition_data(entry.data)
             else:
