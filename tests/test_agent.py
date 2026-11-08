@@ -17063,6 +17063,7 @@ async def test_explicit_finish_never_enters_run_finish_gate(
             )
 
     loop = Child(registry)
+    # test-contract: seam task intentionally stays live until owner cancellation
     watcher = asyncio.create_task(asyncio.Event().wait())
     loop._background_owner.register(
         "root:1:1",
@@ -17099,7 +17100,9 @@ async def test_explicit_finish_never_enters_run_finish_gate(
     )
     assert result["structuredContent"]["status"] == "running"
     watcher.cancel()
-    await asyncio.gather(watcher, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(watcher, return_exceptions=True), what="watcher cancellation"
+    )
     loop._background_owner.unregister("root:1:1")
     await registry.close()
     store.close()
@@ -17124,6 +17127,7 @@ async def test_setting_off_preserves_legacy_finish_gate(
     registry.bind_session_store(store)
     loop = Child(registry)
     loop.explicit_finish = False
+    # test-contract: seam task intentionally stays live until owner cancellation
     watcher = asyncio.create_task(asyncio.Event().wait())
     loop._background_owner.register(
         "root:1:1",
@@ -17161,7 +17165,9 @@ async def test_setting_off_preserves_legacy_finish_gate(
     )
     assert called is True
     watcher.cancel()
-    await asyncio.gather(watcher, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(watcher, return_exceptions=True), what="watcher cancellation"
+    )
     loop._background_owner.unregister("root:1:1")
     await registry.close()
     store.close()
