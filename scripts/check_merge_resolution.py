@@ -1218,7 +1218,16 @@ def _borrow_skip_reason(pull: dict, author: str) -> str | None:
         return f"base {base.get('ref')}"
     if (pull.get("user") or {}).get("login") != author:
         return "other author"
+    # An abandoned PR's body is no longer a reviewed statement.
+    if pull.get("state") == "closed" and not pull.get("merged_at"):
+        return "closed without merge"
     return None
+
+
+def _matching_lines(body: str, findings: list[Item], remaining: list[Item]) -> list[str]:
+    return sorted(
+        {line for line in body.splitlines() if any(marker(line, item, findings) for item in remaining)}
+    )
 
 
 def _candidate_lines(
@@ -1229,16 +1238,11 @@ def _candidate_lines(
     # The PR being checked always contains its own merges; its body is already applied.
     for pull in (pull for pull in data["pulls"] if pull.get("number") != data["pr"]):
         skip = _borrow_skip_reason(pull, data["author"])
-        lines = sorted(
-            {
-                line
-                for line in (pull.get("body") or "").splitlines()
-                if any(marker(line, item, findings) for item in remaining)
-            }
-        )
         if skip:
             skipped.append(f"#{pull.get('number')} ({skip})")
-        elif lines:
+            continue
+        lines = _matching_lines(pull.get("body") or "", findings, remaining)
+        if lines:
             found[pull["number"]] = lines
     return found, skipped
 

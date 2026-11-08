@@ -1377,6 +1377,8 @@ def _pull(number: int, body: str, **changes: str) -> dict:
         "user": {"login": changes.get("author", "hwang2409")},
         "base": {"ref": changes.get("base", "main"), "repo": {"full_name": "hwang2409/zeta"}},
         "head": {"repo": {"full_name": head_repo}},
+        "state": changes.get("state", "open"),
+        "merged_at": changes.get("merged_at"),
     }
 
 
@@ -1391,6 +1393,8 @@ OVERRIDE = "merge-resolution: src/a.py def newer -> dropped on purpose in #972"
         ("fork head", 1, "did not borrow overrides: no PR with a matching override line; skipped: #972 (fork head)"),
         ("other author", 1, "skipped: #972 (other author)"),
         ("base not main", 1, "skipped: #972 (base feature)"),
+        ("closed without merge", 1, "skipped: #972 (closed without merge)"),
+        ("merged lender", 0, "borrowed overrides: override lines from #972"),
         ("lookup for another commit", 1, "did not borrow overrides: lookup is for commit {main}, not {merge}"),
         ("api error 403", 1, "did not borrow overrides: PR lookup failed: gh api exit 1: API rate limit exceeded"),
         ("conflicting candidates", 1, "did not borrow overrides: conflicting override lines in #972, #973"),
@@ -1409,6 +1413,10 @@ def test_stacked_pr_borrows_override_from_base_pr(
         pulls = [own, _pull(972, OVERRIDE, author="someone")]
     elif case == "base not main":
         pulls = [own, _pull(972, OVERRIDE, base="feature")]
+    elif case == "closed without merge":
+        pulls = [own, _pull(972, OVERRIDE, state="closed")]
+    elif case == "merged lender":
+        pulls = [own, _pull(972, OVERRIDE, state="closed", merged_at="2026-11-08T00:00:00Z")]
     elif case == "lookup for another commit":
         lookup_commit = main_sha
     elif case == "api error 403":
