@@ -1339,6 +1339,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
             entered = asyncio.Event()
             release = asyncio.Event()
             settlement: asyncio.Task[object] | None = None
+            all_frames: list[dict[str, Any]] = []
             if case in {"cancel_settle", "external_end"}:
                 original_durable = ConversationStore._to_thread_durable
 
@@ -1467,9 +1468,11 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 cancel_target.cancel()
                 release.set()
                 frames = await await_or_fail(approve, what=f"{case} approve response")
+                all_frames.extend(frames)
                 assert frames[-1]["result"]["decision"] == "approve"
             else:
                 frames = await await_or_fail(approve, what="approve response")
+                all_frames.extend(frames)
                 assert frames[-1]["result"]["decision"] == "approve"
 
             if cancel:
@@ -1493,6 +1496,33 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 )[-1]
                 assert status["result"]["state"] == "idle", (
                     f"{case} live controller did not remain connected: {status!r}"
+                )
+                snapshot_frames = await _request(reader, writer, 11, "session_grants")
+                all_frames.extend(snapshot_frames)
+                snapshot = snapshot_frames[-1]
+                assert snapshot["result"]["session_grants"] == ["bash"]
+                send_frames = await _request(
+                    reader, writer, 12, "send", {"text": "ask again"}
+                )
+                all_frames.extend(send_frames)
+                send_response = send_frames[-1]
+                assert send_response.get("result", {}).get("accepted") is True
+                next_turn = await await_or_fail(
+                    _frames_until_event(reader, "turn_end"),
+                    what=f"{case} next turn end",
+                )
+                all_frames.extend(next_turn)
+                assert not any(
+                    frame.get("params", {}).get("event") == "approval_request"
+                    for frame in next_turn
+                )
+                changed = [
+                    frame
+                    for frame in [*all_frames, *_buffer(reader)]
+                    if frame.get("params", {}).get("event") == "session_grants_changed"
+                ]
+                assert len(changed) == 1, (
+                    f"{case} must publish exactly one grant-change event; observed {changed!r}"
                 )
                 assert not server.control._approvals.state.records, (
                     f"{case} left an approval record after grant settlement"
