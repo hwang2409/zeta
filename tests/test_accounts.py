@@ -823,7 +823,7 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
             assert ticks > 1
     finally:
         stop.set()
-        await ticker_task
+        await await_or_fail(ticker_task, what="event-loop ticker")
 
 
 def test_resolve_account_does_not_migrate(

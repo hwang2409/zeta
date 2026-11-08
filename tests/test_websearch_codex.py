@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.codex import CodexLoginRequiredError
 from zeta.core.abort import AbortSignal
 from zeta.protocol.types import ToolCall
@@ -612,7 +613,7 @@ async def test_inflight_acquisition_cleared_after_completion(monkeypatch, regist
         nonlocal acquisition_calls
         acquisition_calls += 1
         if acquisition_calls == 1:
-            await release_first.wait()
+            await await_or_fail(release_first.wait(), what="first token release")
             first_finished.set()
         return "test-token"
 
