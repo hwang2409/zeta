@@ -20,6 +20,7 @@ from tempfile import TemporaryDirectory
 from typing import Mapping
 
 from ..skills import SkillCatalog
+from ..lease_release import release_later
 from ..storage_format import advance, mapping_mutations, open_writer
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
@@ -131,7 +132,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self.home = Path(home) if home is not None else env_home()
         self._owner_surface = owner_surface
         self._storage_lease = open_writer(self.home)
-        self._release_storage_lease = weakref.finalize(self, self._storage_lease.close)
+        self._release_storage_lease = weakref.finalize(
+            self, release_later, self._storage_lease.close
+        )
         self.user_home = (
             (Path(user_home) if user_home is not None else Path.home())
             .expanduser()

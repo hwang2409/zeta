@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Self  # noqa: F401 - re-exported by the store facade
 
 from ...agent.receipt import encode_json
+from ...lease_release import release_later
 from ...protocol.types import (
     Message,
     MessageRole,
@@ -244,6 +245,7 @@ class ConversationStore(
                     self._strict_snapshot_sync = False
                 self._release_lease = weakref.finalize(
                     self,
+                    release_later,
                     session_execution.close_store_leases,
                     self._runtime_lease,
                     lease.pop_all(),

@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from ...lease_release import release_later
 from ...storage_format import WriterLease, mapping_mutations, open_writer
 from ..process_env import subprocess_env
 from ..session_files import (
@@ -486,7 +487,7 @@ class WorkspaceSnapshotStore:
                 )
                 self._load()
                 self._release_lease = weakref.finalize(
-                    self, self._close_leases, lease.pop_all(), self._storage_lease
+                    self, release_later, self._close_leases, lease.pop_all(), self._storage_lease
                 )
             storage_ownership.pop_all()
 

@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
+from .lease_release import RegistryLock
+
 WRITER_EPOCH: Final = 5
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
@@ -324,7 +326,7 @@ class _RegistryEntry:
 
 
 _REGISTRY: dict[Path, _RegistryEntry] = {}
-_REGISTRY_LOCK = threading.RLock()
+_REGISTRY_LOCK = RegistryLock()
 
 
 @contextmanager

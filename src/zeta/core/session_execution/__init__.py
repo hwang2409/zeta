@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
+from ...lease_release import RegistryLock
 from ...storage_format import WriterLease
 from ..checkpoints import ConversationIntegrityError
 from ..fsio import write_all
@@ -71,7 +72,7 @@ class _OwnedLease:
 
 
 _REGISTRY: dict[tuple[int, int], _OwnedLease] = {}
-_REGISTRY_LOCK = threading.Lock()
+_REGISTRY_LOCK = RegistryLock()
 
 
 def _read_owner_hint(fd: int) -> tuple[str | None, int | None, str | None]:
