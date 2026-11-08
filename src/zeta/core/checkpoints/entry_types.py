@@ -64,13 +64,18 @@ class ConversationEntrySpec:
 
 
 def _message(_context: EntryValidationContext, entry: Any) -> None:
-    from ..store._approval_display import validated_approval_display
-
     message = entry.data.get("message")
     if type(message) is not dict:
         raise ValueError("message entry payload must contain an object")
     parsed_message = Message.from_dict(message)
-    approval_requests = entry.data.get("approval_requests", [])
+    _message_approval_requests(parsed_message, entry.data.get("approval_requests", []))
+
+
+def _message_approval_requests(
+    parsed_message: Message, approval_requests: object
+) -> None:
+    from ..store._approval_display import validated_approval_display
+
     if type(approval_requests) is not list:
         raise ValueError("message approval_requests must be an array")
     request_ids: set[str] = set()

@@ -326,10 +326,14 @@ def _build_append_entries(
     for index, row in enumerate(rows):
         if index == 0 and row.parent_id is not None:
             if row.parent_id not in prior_ids:
-                raise ConversationIntegrityError(f"missing prior parent {row.parent_id}")
+                raise ConversationIntegrityError(
+                    f"missing prior parent {row.parent_id}"
+                )
             parent_id = row.parent_id
         elif index > 0 and row.parent_id is not None and row.parent_id != parent_id:
-            raise ConversationIntegrityError("conversation row batch has conflicting parent")
+            raise ConversationIntegrityError(
+                "conversation row batch has conflicting parent"
+            )
         entry_id = (
             deterministic_ids[index] if deterministic_ids else os.urandom(16).hex()
         )
@@ -423,6 +427,7 @@ def _execute_append[ResultT](
             dedupe_key=key,
             duplicate=False,
         )
+
 
 def _execute_store_command[ResultT](
     store: ConversationStore,
@@ -520,9 +525,11 @@ async def commit_conversation_async[ResultT](
     token = target
     try:
 
-        def commit_transient() -> CommittedDelta[ResultT]:
+        def commit_transient(cancellation: object) -> CommittedDelta[ResultT]:
+            from ..store._async_writes import _MutationCancellation
             from ..store._store import ConversationStore
 
+            assert isinstance(cancellation, _MutationCancellation)
             try:
                 target = ConversationStore(
                     root_dir,
@@ -544,7 +551,9 @@ async def commit_conversation_async[ResultT](
                 for _attempt in range(4):
                     expected = target.conversation_generation
                     try:
-                        return target.commit(command, expected)
+                        return target.commit(
+                            command, expected, _cancellation=cancellation
+                        )
                     except ConversationGenerationConflict as exc:
                         last_conflict = exc
                 assert last_conflict is not None
@@ -552,21 +561,15 @@ async def commit_conversation_async[ResultT](
             finally:
                 target.close()
 
-        worker = loop.run_in_executor(None, commit_transient)
-        result, cancelled = await resident_await_started(worker)
-        if cancelled:
-            raise asyncio.CancelledError
-        return result
+        from ..store._async_writes import _submit_durable_mutation
+
+        async def finish_transient(
+            result: CommittedDelta[ResultT],
+        ) -> CommittedDelta[ResultT]:
+            return result
+
+        return await _submit_durable_mutation(
+            command, commit_transient, finish_transient
+        )
     finally:
         _release_transient_target(path, token)
-
-
-async def resident_await_started[ResultT](
-    worker: asyncio.Future[ResultT],
-) -> tuple[ResultT, bool]:
-    cancelled = False
-    while True:
-        try:
-            return await asyncio.shield(worker), cancelled
-        except asyncio.CancelledError:
-            cancelled = True

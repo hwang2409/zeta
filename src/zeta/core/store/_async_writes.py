@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -237,9 +237,7 @@ class _AcknowledgeStagedDeliveryCommand(_StoreMutationCommand):
     notification_ids: tuple[str, ...]
 
     def apply(self, store: Any) -> Any:
-        return store._acknowledge_staged_delivery(
-            self.prompt_id, self.notification_ids
-        )
+        return store._acknowledge_staged_delivery(self.prompt_id, self.notification_ids)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -396,6 +394,64 @@ class _MutationCancellation:
         return self.cancelled.wait(timeout)
 
 
+def _mutation_cancellation_observed(
+    policy: MutationCancellationPolicy,
+) -> None:
+    """Test seam after caller cancellation reaches the shared policy boundary."""
+
+
+async def _submit_durable_mutation[DurableT, ResultT](
+    command: ConversationMutation[Any],
+    worker: Callable[[_MutationCancellation], DurableT],
+    finish: Callable[[DurableT], Awaitable[ResultT]],
+    *,
+    before_submit: Callable[[], None] | None = None,
+    submission_failed: Callable[[], None] | None = None,
+    cancelled: Callable[[MutationCancellationPolicy], None] | None = None,
+) -> ResultT:
+    """Submit one durable mutation and enforce its cancellation policy."""
+    cancellation = _MutationCancellation()
+    if before_submit is not None:
+        before_submit()
+    try:
+        worker_future = asyncio.get_running_loop().run_in_executor(
+            None, worker, cancellation
+        )
+    except BaseException:
+        if submission_failed is not None:
+            submission_failed()
+        raise
+
+    async def finish_operation() -> ResultT:
+        return await finish(await worker_future)
+
+    operation = asyncio.create_task(finish_operation())
+    was_cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(operation)
+            break
+        except asyncio.CancelledError:
+            was_cancelled = True
+            _mutation_cancellation_observed(command.cancellation_policy)
+            if cancelled is not None:
+                cancelled(command.cancellation_policy)
+            if (
+                command.cancellation_policy
+                is MutationCancellationPolicy.ABORT_BEFORE_WRITE
+                and cancellation.abort_before_write()
+            ):
+                result = await asyncio.shield(operation)
+                break
+            if operation.done():
+                result = operation.result()
+                break
+    task = asyncio.current_task()
+    if was_cancelled or (task is not None and task.cancelling() > 0):
+        raise asyncio.CancelledError
+    return result
+
+
 class _AsyncWriteLock(asyncio.Lock):
     def __init__(self, queued: Callable[[], None]) -> None:
         super().__init__()
@@ -504,9 +560,14 @@ class AsyncDurableWritesMixin:
         self: ConversationStore,
         command: ConversationMutation[Any],
         expected_generation: int,
+        *,
+        _cancellation: _MutationCancellation | None = None,
     ) -> CommittedDelta[Any]:
         self._assert_owner_thread()
         with self._mutation_lock:
+            if _cancellation is not None:
+                self._before_committed_mutation()
+                _cancellation.begin_write()
             delta = execute_mutation(self, command, expected_generation)
         if delta._resident_patch.replace_entries:
             self._publish_entries_installed("reset")
@@ -550,55 +611,21 @@ class AsyncDurableWritesMixin:
                 self._durable_writes_in_flight -= 1
                 self._durable_write_condition.notify_all()
 
-    def _start_committed_mutation(
-        self: ConversationStore,
-        command: ConversationMutation[Any],
-        expected_generation: int,
-        cancelled_before_write: _MutationCancellation,
-    ) -> asyncio.Future[Any]:
+    def _before_mutation_submit(self: ConversationStore) -> None:
         with self._durable_write_condition:
             if self._closing or self._closed:
                 raise ValueError("session store is closed")
             self._durable_writes_in_flight += 1
-        try:
-            return asyncio.get_running_loop().run_in_executor(
-                None,
-                self._run_committed_mutation,
-                command,
-                expected_generation,
-                cancelled_before_write,
-            )
-        except BaseException:
-            with self._durable_write_condition:
-                self._durable_writes_in_flight -= 1
-                self._durable_write_condition.notify_all()
-            raise
+
+    def _mutation_submission_failed(self: ConversationStore) -> None:
+        with self._durable_write_condition:
+            self._durable_writes_in_flight -= 1
+            self._durable_write_condition.notify_all()
 
     def _submitted_mutation_cancelled(
         self: ConversationStore, policy: MutationCancellationPolicy
     ) -> None:
         """Test seam after owner cancellation reaches the policy boundary."""
-
-    async def _await_submitted_mutation(
-        self: ConversationStore,
-        operation: asyncio.Task[CommittedDelta[Any]],
-        cancellation: _MutationCancellation,
-        policy: MutationCancellationPolicy,
-    ) -> tuple[CommittedDelta[Any], bool]:
-        cancelled = False
-        while True:
-            try:
-                return await asyncio.shield(operation), cancelled
-            except asyncio.CancelledError:
-                cancelled = True
-                self._submitted_mutation_cancelled(policy)
-                if (
-                    policy is MutationCancellationPolicy.ABORT_BEFORE_WRITE
-                    and cancellation.abort_before_write()
-                ):
-                    return await asyncio.shield(operation), cancelled
-                if operation.done():
-                    return operation.result(), cancelled
 
     def _async_write_queued(self: ConversationStore) -> None:
         """Test seam when a mutation joins the resident lock queue."""
@@ -623,13 +650,9 @@ class AsyncDurableWritesMixin:
     async def _finish_submitted_mutation(
         self: ConversationStore,
         command: ConversationMutation[Any],
-        expected_generation: int,
-        cancellation: _MutationCancellation,
+        committed: tuple[CommittedDelta[Any], Any],
     ) -> CommittedDelta[Any]:
-        worker = self._start_committed_mutation(
-            command, expected_generation, cancellation
-        )
-        delta, receipts = await worker
+        delta, receipts = committed
         await self._before_committed_install()
         installed: tuple[ConversationEntry, ...] | str = ()
         with self._durable_write_condition:
@@ -650,17 +673,16 @@ class AsyncDurableWritesMixin:
         command: ConversationMutation[Any],
         expected_generation: int,
     ) -> CommittedDelta[Any]:
-        cancellation = _MutationCancellation()
-        operation = asyncio.create_task(
-            self._finish_submitted_mutation(command, expected_generation, cancellation)
+        return await _submit_durable_mutation(
+            command,
+            lambda cancellation: self._run_committed_mutation(
+                command, expected_generation, cancellation
+            ),
+            lambda committed: self._finish_submitted_mutation(command, committed),
+            before_submit=self._before_mutation_submit,
+            submission_failed=self._mutation_submission_failed,
+            cancelled=self._submitted_mutation_cancelled,
         )
-        delta, cancelled = await self._await_submitted_mutation(
-            operation, cancellation, command.cancellation_policy
-        )
-        task = asyncio.current_task()
-        if cancelled or (task is not None and task.cancelling() > 0):
-            raise asyncio.CancelledError
-        return delta
 
     def _address_commit_queued(self: ConversationStore) -> None:
         """Test seam after an address commit joins the resident lock queue."""
@@ -722,7 +744,9 @@ class AsyncDurableWritesMixin:
         await self._commit_storage_command(_WarmStepDeliveryCommand())
 
     async def commit_delivery_input(self: ConversationStore, item: Any) -> Any:
-        return await self._commit_storage_command(_CommitDeliveryInputCommand(item=item))
+        return await self._commit_storage_command(
+            _CommitDeliveryInputCommand(item=item)
+        )
 
     async def stage_delivery_request(
         self: ConversationStore,
@@ -751,9 +775,7 @@ class AsyncDurableWritesMixin:
             )
         )
 
-    async def admit_step_delivery_terminal(
-        self: ConversationStore, intent: Any
-    ) -> Any:
+    async def admit_step_delivery_terminal(self: ConversationStore, intent: Any) -> Any:
         return await self._commit_storage_command(
             _AdmitStepDeliveryTerminalCommand(intent=intent)
         )
@@ -798,10 +820,10 @@ class AsyncDurableWritesMixin:
             )
         )
 
-    async def append_pending_prompt_async(
-        self: ConversationStore, text: str
-    ) -> Any:
-        return await self._commit_storage_command(_AppendPendingPromptCommand(text=text))
+    async def append_pending_prompt_async(self: ConversationStore, text: str) -> Any:
+        return await self._commit_storage_command(
+            _AppendPendingPromptCommand(text=text)
+        )
 
     @staticmethod
     async def _await_store_worker(worker: asyncio.Future[Any]) -> tuple[Any, bool]:

@@ -22,8 +22,10 @@ from zeta.core.store import (
     ConversationRow,
     ConversationStore,
     ConversationTargetOwned,
+    _async_writes,
     commit_conversation_async,
 )
+from zeta.core.store._async_writes import _CommitDeliveryInputCommand
 from zeta.core.store._step_delivery import PromptInput
 from zeta.protocol.types import Message, MessageOrigin, MessageRole, TextContent
 
@@ -245,22 +247,17 @@ async def test_commit_async_cancelled_before_write_changes_nothing(
     store.bind_owner_thread()
     reached = threading.Event()
     release = threading.Event()
-    cancellation_seen: threading.Event | None = None
-    original_start = store._start_committed_mutation
+    cancellation_seen = asyncio.Event()
 
-    def capture_cancellation(
-        command: object, generation: int, cancelled: threading.Event
-    ):
-        nonlocal cancellation_seen
-        cancellation_seen = cancelled
-        return original_start(command, generation, cancelled)
+    def observe_cancellation(_policy: object) -> None:
+        cancellation_seen.set()
 
     def pause_before_write() -> None:
         reached.set()
         assert release.wait(10)
 
-    # test-contract: seam records the worker's cancellation gate
-    monkeypatch.setattr(store, "_start_committed_mutation", capture_cancellation)
+    # test-contract: seam observes the shared cancellation-policy boundary
+    monkeypatch.setattr(store, "_submitted_mutation_cancelled", observe_cancellation)
     # test-contract: seam pauses the worker before its first durable write
     monkeypatch.setattr(store, "_before_committed_mutation", pause_before_write)
     before = (
@@ -277,8 +274,9 @@ async def test_commit_async_cancelled_before_write_changes_nothing(
     try:
         assert await asyncio.wait_for(asyncio.to_thread(reached.wait, 10), 11)
         task.cancel()
-        assert cancellation_seen is not None
-        assert await asyncio.wait_for(asyncio.to_thread(cancellation_seen.wait, 10), 11)
+        await await_or_fail(
+            cancellation_seen.wait(), what="pre-write cancellation policy"
+        )
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
@@ -350,9 +348,7 @@ async def test_mutation_cancellation_policy_table(
         cancellation_seen.set()
 
     # test-contract: seam observes the shared cancellation-policy boundary
-    monkeypatch.setattr(
-        store, "_submitted_mutation_cancelled", observe_cancellation
-    )
+    monkeypatch.setattr(store, "_submitted_mutation_cancelled", observe_cancellation)
 
     async def submit(index: int = 1) -> object:
         if policy == "abort_before_write":
@@ -423,7 +419,10 @@ async def test_mutation_cancellation_policy_table(
             "final_callback_failure",
             "duplicate",
         }:
-            if phase == "final_callback_failure" and policy == "finalize_once_submitted":
+            if (
+                phase == "final_callback_failure"
+                and policy == "finalize_once_submitted"
+            ):
                 with pytest.raises(
                     RuntimeError, match="policy-table final callback failure"
                 ):
@@ -454,9 +453,7 @@ async def test_mutation_cancellation_policy_table(
                 store._async_write_lock.release()
                 lock_held = False
             with pytest.raises(asyncio.CancelledError):
-                await await_or_fail(
-                    task, what=f"{policy} {phase} cancellation outcome"
-                )
+                await await_or_fail(task, what=f"{policy} {phase} cancellation outcome")
 
         expected = 1
         if phase == "queued" or (
@@ -470,8 +467,7 @@ async def test_mutation_cancellation_policy_table(
         assert len(publications) == expected
         assert final_callbacks == (
             1
-            if phase == "final_callback_failure"
-            and policy == "finalize_once_submitted"
+            if phase == "final_callback_failure" and policy == "finalize_once_submitted"
             else 0
         )
     finally:
@@ -480,11 +476,107 @@ async def test_mutation_cancellation_policy_table(
             store._async_write_lock.release()
         await asyncio.to_thread(store.close)
 
-    reopened = await asyncio.to_thread(
-        ConversationStore, sessions, session_id="root"
-    )
+    reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
         assert tuple(entry.to_dict() for entry in reopened.entries) == resident
+    finally:
+        await asyncio.to_thread(reopened.close)
+
+
+@pytest.mark.parametrize("target_kind", ["resident", "transient"])
+@pytest.mark.parametrize("policy", ["abort_before_write", "finalize_once_submitted"])
+@pytest.mark.asyncio
+async def test_mutation_target_cancellation_policy_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    target_kind: str,
+) -> None:
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    store = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (store.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    store.bind_owner_thread()
+    address = ConversationAddress("project", "root", "root")
+    worker_reached = threading.Event()
+    worker_release = threading.Event()
+    cancellation_seen = asyncio.Event()
+
+    def pause_before_write() -> None:
+        worker_reached.set()
+        assert worker_release.wait(10)
+
+    if target_kind == "resident":
+        # test-contract: seam pauses the resident worker before write ownership
+        monkeypatch.setattr(store, "_before_committed_mutation", pause_before_write)
+    else:
+        await asyncio.to_thread(store.close)
+        original_commit = ConversationStore.commit
+
+        def pause_transient_commit(
+            self: ConversationStore,
+            command: object,
+            generation: int,
+            **kwargs: object,
+        ) -> object:
+            pause_before_write()
+            return original_commit(self, command, generation, **kwargs)
+
+        # test-contract: seam pauses the transient public commit before its first mutation
+        monkeypatch.setattr(ConversationStore, "commit", pause_transient_commit)
+
+    # test-contract: seam observes the one shared cancellation-policy owner
+    monkeypatch.setattr(
+        _async_writes,
+        "_mutation_cancellation_observed",
+        lambda _policy: cancellation_seen.set(),
+    )
+
+    async def submit() -> object:
+        item = PromptInput("policy target", MessageOrigin.AGENT_SEND, None)
+        if policy == "finalize_once_submitted":
+            if target_kind == "resident":
+                return await store.commit_delivery_input(item)
+            return await commit_conversation_async(
+                address, _CommitDeliveryInputCommand(item=item)
+            )
+        return await commit_conversation_async(
+            address, AppendConversationRows((_warning("policy target"),))
+        )
+
+    task = asyncio.create_task(submit())
+    try:
+        assert await await_or_fail(
+            asyncio.to_thread(worker_reached.wait, 10),
+            what=f"{target_kind} {policy} worker entry",
+        )
+        task.cancel()
+        await await_or_fail(
+            cancellation_seen.wait(),
+            what=f"{target_kind} {policy} cancellation policy",
+        )
+        worker_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(
+                task, what=f"{target_kind} {policy} cancellation outcome"
+            )
+    finally:
+        worker_release.set()
+        if not task.done():
+            task.cancel()
+            await await_or_fail(
+                asyncio.gather(task, return_exceptions=True),
+                what=f"{target_kind} {policy} task cleanup",
+            )
+        if target_kind == "resident":
+            await asyncio.to_thread(store.close)
+
+    reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    try:
+        assert len(reopened.entries) == (0 if policy == "abort_before_write" else 1)
     finally:
         await asyncio.to_thread(reopened.close)
 
@@ -856,14 +948,17 @@ async def test_transient_address_retries_conflict_off_loop(
     loop_thread = threading.get_ident()
 
     def conflict_once(
-        self: ConversationStore, command: object, generation: int
+        self: ConversationStore,
+        command: object,
+        generation: int,
+        **kwargs: object,
     ) -> object:
         nonlocal calls
         assert threading.get_ident() != loop_thread
         calls += 1
         if calls == 1:
             raise ConversationGenerationConflict(generation, generation + 1)
-        return original(self, command, generation)
+        return original(self, command, generation, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "commit", conflict_once)
     delta = await commit_conversation_async(
@@ -930,9 +1025,7 @@ async def test_address_concurrent_resident_commits_are_serialized(
             asyncio.gather(*tasks, return_exceptions=True),
             what="resident address commits",
         )
-        assert not [
-            result for result in results if isinstance(result, BaseException)
-        ]
+        assert not [result for result in results if isinstance(result, BaseException)]
         messages = [entry.data["message"] for entry in store.entries]
         assert sorted(messages) == [f"resident-{i}" for i in range(8)]
         generation = store.conversation_generation
@@ -971,14 +1064,19 @@ async def test_address_transient_waiter_retries_after_owner_release(
     original = ConversationStore.commit
     calls = 0
 
-    def hold_owner(self: ConversationStore, command: object, generation: int) -> object:
+    def hold_owner(
+        self: ConversationStore,
+        command: object,
+        generation: int,
+        **kwargs: object,
+    ) -> object:
         nonlocal calls
         calls += 1
         if calls == 1:
             entered.set()
             # test-contract: seam holds the worker at an explicit event
             assert release.wait(10)
-        return original(self, command, generation)
+        return original(self, command, generation, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "commit", hold_owner)
     # test-contract: seam observes transient reservation admission
@@ -1042,13 +1140,18 @@ async def test_transient_waiter_cancellation_does_not_release_owner(
     original = ConversationStore.commit
     calls = 0
 
-    def hold_owner(self: ConversationStore, command: object, generation: int) -> object:
+    def hold_owner(
+        self: ConversationStore,
+        command: object,
+        generation: int,
+        **kwargs: object,
+    ) -> object:
         nonlocal calls
         calls += 1
         if calls == 1:
             entered.set()
             assert release.wait(10)
-        return original(self, command, generation)
+        return original(self, command, generation, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "commit", hold_owner)
     # test-contract: seam observes transient reservation admission
@@ -1116,14 +1219,19 @@ async def test_transient_owner_failure_wakes_waiter(
     original = ConversationStore.commit
     calls = 0
 
-    def fail_owner(self: ConversationStore, command: object, generation: int) -> object:
+    def fail_owner(
+        self: ConversationStore,
+        command: object,
+        generation: int,
+        **kwargs: object,
+    ) -> object:
         nonlocal calls
         calls += 1
         if calls == 1:
             entered.set()
             assert release.wait(10)
             raise ConversationIntegrityError("forced owner failure")
-        return original(self, command, generation)
+        return original(self, command, generation, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "commit", fail_owner)
     # test-contract: seam observes transient reservation admission
@@ -1182,13 +1290,18 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
     original = ConversationStore.commit
     calls = 0
 
-    def hold_owner(self: ConversationStore, command: object, generation: int) -> object:
+    def hold_owner(
+        self: ConversationStore,
+        command: object,
+        generation: int,
+        **kwargs: object,
+    ) -> object:
         nonlocal calls
         calls += 1
         if calls == 1:
             entered.set()
             assert release.wait(10)
-        return original(self, command, generation)
+        return original(self, command, generation, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "commit", hold_owner)
     # test-contract: seam observes transient reservation admission
@@ -1221,9 +1334,7 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True), 10
-        )
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
         assert [entry.data["message"] for entry in reopened.entries] == [
