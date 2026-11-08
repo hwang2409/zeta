@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from ..core._async_close import close_transport_resources
+from ..runtime._async_close import close_transport_resources
 
 _MAX_IDLE_ANONYMOUS_CLIENTS = 8
 

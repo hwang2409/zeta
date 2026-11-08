@@ -14,7 +14,8 @@ from typing import Any, ClassVar, TypeVar
 
 import httpx
 
-from ..core._async_close import (
+from ..protocol.types import StreamEvent, StreamEventType
+from ..runtime._async_close import (
     CloseFailureReporter,
     CloseOutcome,  # noqa: F401 - preserve the provider transport import
     close_resource,
@@ -23,16 +24,15 @@ from ..core._async_close import (
     merge_exception,
     task_is_cancelling,
 )
-from ..core._async_close import (
+from ..runtime._async_close import (
     cleanup_failure_context as _cleanup_failure_context,
 )
-from ..core._async_close import (
+from ..runtime._async_close import (
     report_loop_cleanup_failure as _report_loop_cleanup_failure,
 )
-from ..core._async_close import (
+from ..runtime._async_close import (
     retain_background_closes as _retain_background_closes,
 )
-from ..protocol.types import StreamEvent, StreamEventType
 from .retry_policy import (
     MAX_PROVIDER_ATTEMPTS,
     ProviderRetryBudget,
