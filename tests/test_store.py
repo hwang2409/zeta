@@ -1406,6 +1406,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
             assert release_snapshot.wait(timeout=5)
         return state
 
+    # test-contract: seam blocks the worker snapshot to prove owner-write publication ordering
     monkeypatch.setattr(
         ConversationStore, "_detach_log_state", block_first_worker_snapshot
     )
@@ -1415,7 +1416,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     assert await asyncio.to_thread(snapshot_ready.wait, 2)
     store.append_message(message(MessageRole.ASSISTANT, "owner"))
     release_snapshot.set()
-    await write
+    await asyncio.wait_for(write, 10)
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
