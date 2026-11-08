@@ -43,7 +43,14 @@ def _is_repository_test_path(path: Path) -> bool:
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 
+_OWNER_COUNTS = None
+_OWNER_COUNT_GROUPS = []
+_OWNER_COUNT_ERRORS = []
+_OWNER_LEAK_BASELINE = _TEST_SITE_PACKAGES / "owner_leak_ratchet.txt"
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
+    global _OWNER_COUNTS
     if not _IS_REPOSITORY_TESTS:
         return
     import zeta
@@ -56,6 +63,15 @@ def pytest_sessionstart(session: pytest.Session) -> None:
             f"run uv run pytest from the worktree root or set PYTHONPATH={source}",
             returncode=2,
         )
+    is_xdist_controller = (
+        bool(getattr(session.config.option, "numprocesses", None))
+        and not hasattr(session.config, "workerinput")
+    )
+    if not is_xdist_controller:
+        from tests.support.owner_counts import OwnerCounts
+
+        _OWNER_COUNTS = OwnerCounts()
+        _OWNER_COUNTS.install()
 
 
 def pytest_collection_modifyitems(
@@ -525,6 +541,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     """Report retained fds and stop workers before they approach FD_SETSIZE."""
     del nextitem
     global _FD_RETAINED_MAX, _FD_START_COUNT
+    if _OWNER_COUNTS is not None:
+        _OWNER_COUNTS.node_start(item.nodeid)
     before = _open_file_descriptors()
     if _FD_START_COUNT is None:
         _FD_START_COUNT = len(before)
@@ -533,6 +551,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
             for descriptor, description in before.items()
         )
     yield
+    if _OWNER_COUNTS is not None:
+        _OWNER_COUNTS.node_finish(item.nodeid)
     after = _open_file_descriptors()
     previous_count = _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
     if previous_count is not None and len(after) > previous_count:
@@ -601,6 +621,29 @@ def _fd_summary() -> str:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    from tests.support.owner_counts import gate_failures, merge_rows, print_record
+
+    if _OWNER_COUNTS is not None:
+        owner_rows = _OWNER_COUNTS.rows()
+        _OWNER_COUNTS.uninstall()
+    else:
+        try:
+            owner_rows = merge_rows(_OWNER_COUNT_GROUPS)
+        except ValueError as exc:
+            _OWNER_COUNT_ERRORS.append(str(exc))
+            owner_rows = []
+    worker_output = getattr(session.config, "workeroutput", None)
+    if worker_output is not None:
+        worker_output["owner_count_rows"] = owner_rows
+    elif not _OWNER_LEAK_BASELINE.exists():
+        print_record(owner_rows)
+    else:
+        _OWNER_COUNT_ERRORS.extend(gate_failures(owner_rows, _OWNER_LEAK_BASELINE))
+        for failure in _OWNER_COUNT_ERRORS:
+            print(failure, flush=True)
+        if _OWNER_COUNT_ERRORS:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
     gc.collect()
     end = _open_file_descriptors()
     _update_fd_owners(end, "session-finish")
@@ -631,6 +674,9 @@ def pytest_testnodedown(node, error) -> None:
     del error
     # A crashed worker goes down without workeroutput; xdist reports the crash.
     worker_output = getattr(node, "workeroutput", None) or {}
+    owner_rows = worker_output.get("owner_count_rows")
+    if owner_rows is not None:
+        _OWNER_COUNT_GROUPS.append(owner_rows)
     summary = worker_output.get("fd_summary")
     if summary is not None:
         print(summary, flush=True)
