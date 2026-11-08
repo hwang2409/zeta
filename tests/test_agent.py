@@ -19742,7 +19742,6 @@ async def test_idle_child_wake_tool_count_is_cumulative(tmp_path: Path, monkeypa
     )
     parent_store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, parent_store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    loop.explicit_finish = True
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         await await_or_fail(
