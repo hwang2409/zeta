@@ -98,9 +98,7 @@ class BackgroundAgentOwner:
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
         self._store_close_stores: dict[asyncio.Task[Any], ConversationStore] = {}
-        self._store_close_tasks_by_store: dict[
-            ConversationStore, asyncio.Task[Any]
-        ] = {}
+        self._store_close_tasks_by_store: dict[ConversationStore, asyncio.Task[Any]] = {}
         self._observed_close_failures: set[asyncio.Task[Any]] = set()
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
@@ -266,22 +264,13 @@ class BackgroundAgentOwner:
         self._pending_stores.add(store)
 
     def release_unused_stores(self) -> None:
-        """Close stores no longer needed by an active adopted descendant.
-
-        The owner ExitStack remains the final safety net for shutdown. Normally,
-        however, completed children must release their descriptor immediately;
-        a nested descendant keeps its ancestor store pinned until adoption or
-        that descendant's own completion.
-        """
-
+        """Close stores no longer needed by an active adopted descendant."""
         referenced = set(self._parent_stores.values())
         for stores in self._active_stores.values():
             referenced.update(stores)
         for store in tuple(self._pending_stores - referenced):
             existing = self._store_close_tasks_by_store.get(store)
             if existing is not None:
-                # Retry only a failure that wait_for_store_closes already raised;
-                # an unobserved failure must still reach its waiter.
                 if existing not in self._observed_close_failures:
                     continue
                 self._observed_close_failures.discard(existing)
@@ -298,17 +287,15 @@ class BackgroundAgentOwner:
             close_task.add_done_callback(self._finish_store_close)
 
     def _finish_store_close(self, task: asyncio.Task[Any]) -> None:
-        """Forget a successfully closed store without hiding close failures."""
         if task.cancelled() or task.exception() is not None:
             return
         store = self._store_close_stores.pop(task, None)
-        self._store_close_tasks.discard(task)
         if store is None:
             return
+        self._store_close_tasks.discard(task)
         self._store_close_tasks_by_store.pop(store, None)
         self._pending_stores.discard(store)
         self._stores.discard(store)
-
     def register(
         self,
         instance_id: str,
