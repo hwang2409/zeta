@@ -308,7 +308,7 @@ def make_publish_child_lifecycle(
     child_store: Any,
     child_instance_id: str,
     child_depth: int,
-    agent_type: str,
+    preset: Any,
     description: str,
     child_cwd: str,
 ) -> Callable[[], None]:
@@ -329,7 +329,7 @@ def make_publish_child_lifecycle(
                 handle=child_instance_id,
                 started_at=_now(),
                 depth=child_depth,
-                agent_type=agent_type,
+                agent_type=preset.name,
                 description=description,
                 cwd=child_cwd,
                 selected_accounts={

@@ -771,7 +771,7 @@ async def run_agent_tool(
         child_store=child_store,
         child_instance_id=child_instance_id,
         child_depth=child_depth,
-        agent_type=preset.name,
+        preset=preset,
         description=description,
         child_cwd=child_cwd,
     )
