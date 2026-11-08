@@ -378,6 +378,7 @@ class ContextAssembler(ContextMarkerMixin):
     ) -> bool:
         if reserved_estimator_tokens < 0:
             raise ValueError("reserved estimator tokens must be non-negative")
+        self._preparation_owner._prepare = self._prepare_assembly
         return await self._preparation_owner.prepare(
             force=force,
             reserved_estimator_tokens=reserved_estimator_tokens,
@@ -414,6 +415,7 @@ class ContextAssembler(ContextMarkerMixin):
                 branch, preparation = prepared
                 branch_id = self._branch_id(branch)
                 break
+            self._preparation_owner._prepare = self._prepare_assembly
             await self._preparation_owner.prepare(
                 force=force,
                 reserved_estimator_tokens=reserved_estimator_tokens,
@@ -1217,9 +1219,7 @@ class ContextAssembler(ContextMarkerMixin):
                 items.extend(self._marker_items(marker, active_source_seqs, entries))
         return items
 
-    @staticmethod
-    def _branch_id(entries: Sequence[ConversationEntry]) -> str | None:
-        return entries[-1].id if entries else None
+    def _branch_id(self, entries: Sequence[ConversationEntry]) -> str | None: return entries[-1].id if entries else None
 
     def _tail_boundary(self, items: Sequence[_ContextItem]) -> int:
         tail_start = max(0, len(items) - self.retained_tail)
