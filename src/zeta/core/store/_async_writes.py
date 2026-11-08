@@ -467,6 +467,7 @@ class AsyncDurableWritesMixin:
         /,
         *args: Any,
         _on_persisted: Callable[[], None] | None = None,
+        _return_committed_on_cancel: bool = False,
         **kwargs: Any,
     ) -> Any:
         """Serialize one blocking commit and one bounded owner publication."""
@@ -517,6 +518,6 @@ class AsyncDurableWritesMixin:
                     _on_persisted()
             finally:
                 self._publish_prepared_entries_installed(installed_delta)
-            if cancelled:
+            if cancelled and not _return_committed_on_cancel:
                 raise asyncio.CancelledError
             return result
