@@ -25,7 +25,6 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
-import zeta.tools._shared.background_task_owner as owner_module
 import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
@@ -3032,52 +3031,51 @@ async def test_background_task_stays_running_for_detached_group_member(
         await tasks.close()
 
 
-def test_loop_teardown_cancels_owner_waiting_for_detached_group(
+def test_loop_teardown_cancels_owner_before_detached_leader_exits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    owner_polling = threading.Event()
     cancellation_started = threading.Event()
     teardown_finished = threading.Event()
     errors: list[BaseException] = []
     leader_pids: list[int] = []
-    group_exists = owner_module._group_exists
-
-    def track_live_group(pid: int) -> bool:
-        exists = group_exists(pid)
-        if exists:
-            owner_polling.set()
-        return exists
-
+    child_ready = tmp_path / "detached-loop-child"
     original_cancel_all = asyncio.runners._cancel_all_tasks
 
-    def track_cancel_all(loop: asyncio.AbstractEventLoop) -> None:
+    def cancel_owner_then_release_leader(loop: asyncio.AbstractEventLoop) -> None:
+        if cancellation_started.is_set():
+            original_cancel_all(loop)
+            return
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
         cancellation_started.set()
-        original_cancel_all(loop)
+        loop.call_soon(os.kill, leader_pids[0], signal.SIGUSR1)
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
-    # test-contract: seam observe the real process-group probe reaching a live member
-    monkeypatch.setattr(owner_module, "_group_exists", track_live_group)
-    # test-contract: seam observe public asyncio.run teardown starting cancellation
-    monkeypatch.setattr(asyncio.runners, "_cancel_all_tasks", track_cancel_all)
+    # test-contract: seam force public asyncio.run teardown before the leader exits
+    monkeypatch.setattr(
+        asyncio.runners, "_cancel_all_tasks", cancel_owner_then_release_leader
+    )
 
     async def leave_owner_for_loop_teardown() -> None:
-        child = (
-            "import os,time; print(os.getpid(), flush=True); time.sleep(300)"
+        child = "import os,time; print(os.getpid(), flush=True); time.sleep(300)"
+        leader = (
+            "import pathlib,signal,subprocess,sys\n"
+            "released = False\n"
+            "def release(*_):\n"
+            "    global released\n"
+            "    released = True\n"
+            "signal.signal(signal.SIGUSR1, release)\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {child!r}], "
+            "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
+            f"pathlib.Path({str(child_ready)!r}).write_text(child.stdout.readline())\n"
+            "while not released:\n"
+            "    signal.pause()\n"
         )
         tasks = BackgroundTaskRegistry()
-        _task_id, leader_pid = await tasks.start(
-            _python(
-                "import pathlib,subprocess,sys; "
-                f"child=subprocess.Popen([sys.executable, '-c', {child!r}], "
-                "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True); "
-                f"pathlib.Path({str(tmp_path / 'detached-loop-child')!r})"
-                ".write_text(child.stdout.readline())"
-            ),
-            tmp_path,
-        )
+        _task_id, leader_pid = await tasks.start(_python(leader), tmp_path)
         leader_pids.append(leader_pid)
-        assert await asyncio.to_thread(owner_polling.wait, 10), (
-            "owner did not reach the live detached group probe"
-        )
+        await read_pid_file(child_ready)
 
     def run_loop() -> None:
         try:

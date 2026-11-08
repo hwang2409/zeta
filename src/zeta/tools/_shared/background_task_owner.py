@@ -145,7 +145,7 @@ class _BackgroundTaskOwner:
                     drain_finished.cancel()
                 # test-contract: durability canceled drain gates are fully drained
                 await asyncio.gather(drain_finished, return_exceptions=True)
-            while self.kill_cause is None and _group_exists(process.pid):
+            while not cancelled and self.kill_cause is None and _group_exists(process.pid):
                 # test-contract: latency cancellation bounds detached group probing
                 await asyncio.sleep(0.01)
         finally:
