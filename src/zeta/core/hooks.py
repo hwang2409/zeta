@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from ..storage_format import reject_unknown_keys
 from .process_env import subprocess_env
 
 
@@ -101,11 +102,10 @@ def load_hooks_for_provider(home: str | Path, provider: str) -> HookManager:
 def _parse_hooks(document: object, path: Path) -> tuple[Hook, ...]:
     if type(document) is not dict:
         raise HookConfigError(f"invalid hook config {path}: expected a table")
-    unknown_document_keys = set(document) - {"hook"}
-    if unknown_document_keys:
-        raise HookConfigError(
-            f"invalid hook config {path}: unknown keys {sorted(unknown_document_keys)}"
-        )
+    try:
+        reject_unknown_keys(document, "hook_config")
+    except ValueError as exc:
+        raise HookConfigError(f"invalid hook config {path}: {exc}") from exc
     entries = document.get("hook", [])
     if type(entries) is not list:
         raise HookConfigError(f"invalid hook config {path}: hook must be an array")
@@ -113,12 +113,12 @@ def _parse_hooks(document: object, path: Path) -> tuple[Hook, ...]:
     for index, entry in enumerate(entries):
         if type(entry) is not dict:
             raise HookConfigError(f"invalid hook config {path}: hook {index} must be a table")
-        unknown_keys = set(entry) - {"event", "command", "timeout_seconds", "tools", "on_error"}
-        if unknown_keys:
+        try:
+            reject_unknown_keys(entry, "hook_record")
+        except ValueError as exc:
             raise HookConfigError(
-                f"invalid hook config {path}: hook {index} has unknown keys "
-                f"{sorted(unknown_keys)}"
-            )
+                f"invalid hook config {path}: hook {index}: {exc}"
+            ) from exc
         event = entry.get("event")
         command = entry.get("command")
         if type(event) is not str or event not in HOOK_EVENTS:
