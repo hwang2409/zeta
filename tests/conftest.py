@@ -621,7 +621,7 @@ def _fd_summary() -> str:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
-    from tests.support.owner_counts import gate_failures, merge_rows, print_record
+    from tests.support.owner_counts import gate_failures, merge_rows, write_rows
 
     if _OWNER_COUNTS is not None:
         owner_rows = _OWNER_COUNTS.rows()
@@ -635,10 +635,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     worker_output = getattr(session.config, "workeroutput", None)
     if worker_output is not None:
         worker_output["owner_count_rows"] = owner_rows
-    elif not _OWNER_LEAK_BASELINE.exists():
-        print_record(owner_rows)
     else:
-        _OWNER_COUNT_ERRORS.extend(gate_failures(owner_rows, _OWNER_LEAK_BASELINE))
+        if observed_path := os.environ.get("ZETA_OWNER_COUNTS"):
+            write_rows(Path(observed_path), owner_rows)
+        if _OWNER_LEAK_BASELINE.exists():  # record phase; removed with the baseline
+            _OWNER_COUNT_ERRORS.extend(gate_failures(owner_rows, _OWNER_LEAK_BASELINE))
         for failure in _OWNER_COUNT_ERRORS:
             print(failure, flush=True)
         if _OWNER_COUNT_ERRORS:

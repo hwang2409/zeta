@@ -2,17 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pytest
 
-from tests.support.owner_counts import (
-    BASELINE_END,
-    BASELINE_START,
-    OwnerCounts,
-    refresh_baseline,
-)
+from tests.support.owner_counts import OwnerCounts, merge_rows
 
 
 def _row(action):
@@ -66,6 +63,15 @@ def test_async_close_has_exact_row() -> None:
         "Async",
         0,
     )
+
+
+def test_worker_rows_merge_independent_of_worker_order() -> None:
+    first = [("a", "AgentLoop", 1)]
+    second = [("b", "ConversationStore", 0)]
+
+    assert merge_rows([first, second]) == merge_rows([second, first])
+    with pytest.raises(ValueError, match="duplicate owner-count row: a::AgentLoop"):
+        merge_rows([first, first])
 
 
 def _run_store_test(
@@ -140,7 +146,7 @@ def test_new_conversation_store_leak_fails_with_named_fix(
             (
                 "*owner leak ratchet: test_owner.py::test_owner left 1 "
                 "ConversationStore owner(s) unclosed (baseline 0); "
-                "close the owner with store.close() or use the conftest owner helper*"
+                "close the owner with store.close()*"
             )
         ]
     )
@@ -160,13 +166,23 @@ def test_lower_count_passes_and_refresh_lowers_baseline(
     assert result.ret == pytest.ExitCode.OK
 
     baseline = pytester.path / "baseline.txt"
-    observed = pytester.path / "observed.log"
-    observed.write_text(
-        f"{BASELINE_START}\n"
-        "test_owner.py::test_owner::ConversationStore=1\n"
-        f"{BASELINE_END}\n"
+    baseline.write_text(
+        "test_owner.py::test_owner::ConversationStore=2\n"
+        "test_other.py::test_other::AgentLoop=1\n"
     )
-    assert refresh_baseline(baseline, observed) == 1
+    observed = pytester.path / "observed.txt"
+    observed.write_text(
+        "test_owner.py::test_owner::ConversationStore=1\n"
+        "test_other.py::test_other::AgentLoop=3\n"
+        "test_new.py::test_new::ToolRegistry=4\n"
+    )
+    script = Path(__file__).resolve().parents[1] / "scripts/refresh_owner_leak_baseline.py"
+    subprocess.run(
+        [sys.executable, str(script), str(observed), "--baseline", str(baseline)],
+        check=True,
+        timeout=60,
+    )
     assert baseline.read_text() == (
+        "test_other.py::test_other::AgentLoop=1\n"
         "test_owner.py::test_owner::ConversationStore=1\n"
     )

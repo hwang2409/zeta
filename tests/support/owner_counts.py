@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import inspect
+import sys
 import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-BASELINE_START = "owner-leak-baseline-start"
-BASELINE_END = "owner-leak-baseline-end"
 CLOSE_GUIDANCE = {
     "AgentLoop": "await loop.close()",
-    "ConversationStore": "store.close() or use the conftest owner helper",
+    "ConversationStore": "store.close()",
     "AutoMemoryReconciler": "await reconciler.close()",
     "WorkspaceSnapshotStore": "workspace.close()",
     "ToolRegistry": "await registry.close()",
@@ -61,10 +60,7 @@ class OwnerCounts:
             record = self._records.get(id(obj))
             if record is None or record[1] != self.active_node:
                 return
-            if not any(
-                frame.function == "close_direct_test_runtime_owners"
-                for frame in inspect.stack(context=0)
-            ):
+            if not _closed_by_cleanup_fixture():
                 self._counts[record[1:]][1] += 1
             self._records.pop(id(obj), None)
 
@@ -140,6 +136,16 @@ class OwnerCounts:
             setattr(cls, name, original)
 
 
+def _closed_by_cleanup_fixture() -> bool:
+    """Closes done by conftest's safety-net fixture do not count as test closes."""
+    frame = sys._getframe(2)
+    while frame is not None:
+        if frame.f_code.co_name == "close_direct_test_runtime_owners":
+            return True
+        frame = frame.f_back
+    return False
+
+
 def merge_rows(groups: list[list[OwnerRow]]) -> list[OwnerRow]:
     merged: dict[tuple[str, str], int] = {}
     for rows in groups:
@@ -162,14 +168,6 @@ def read_baseline(path: Path) -> dict[tuple[str, str], int]:
     return baseline
 
 
-def baseline_lines(rows: list[OwnerRow]) -> list[str]:
-    return [
-        f"{nodeid}::{kind}={unclosed}"
-        for nodeid, kind, unclosed in rows
-        if unclosed > 0
-    ]
-
-
 def gate_failures(rows: list[OwnerRow], baseline_path: Path) -> list[str]:
     baseline = read_baseline(baseline_path)
     failures = []
@@ -185,47 +183,25 @@ def gate_failures(rows: list[OwnerRow], baseline_path: Path) -> list[str]:
     return failures
 
 
-def print_record(rows: list[OwnerRow]) -> None:
-    print(BASELINE_START, flush=True)
-    for nodeid, kind, unclosed in rows:
-        print(f"{nodeid}::{kind}={unclosed}", flush=True)
-    print(BASELINE_END, flush=True)
+def write_rows(path: Path, rows: list[OwnerRow]) -> None:
+    """Write every observed row, zeros included, so a refresh can lower to 0."""
+    path.write_text(
+        "".join(f"{nodeid}::{kind}={unclosed}\n" for nodeid, kind, unclosed in rows),
+        encoding="utf-8",
+    )
 
 
 def refresh_baseline(baseline_path: Path, observed_path: Path) -> int:
-    observed = _read_observed(observed_path)
-    if not baseline_path.exists():
-        refreshed = {key: count for key, count in observed.items() if count > 0}
-    else:
-        current = read_baseline(baseline_path)
-        refreshed = {
-            key: min(count, observed.get(key, count))
-            for key, count in current.items()
-            if min(count, observed.get(key, count)) > 0
-        }
+    """Lower baseline counts to the observed ones; never raise or add a count."""
+    observed = read_baseline(observed_path)
+    refreshed = {
+        key: min(count, observed.get(key, count))
+        for key, count in read_baseline(baseline_path).items()
+    }
     lines = [
         f"{nodeid}::{kind}={count}"
         for (nodeid, kind), count in sorted(refreshed.items())
+        if count > 0
     ]
-    baseline_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    baseline_path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
     return len(lines)
-
-
-def _read_observed(path: Path) -> dict[tuple[str, str], int]:
-    inside = False
-    observed = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line == BASELINE_START:
-            inside = True
-            continue
-        if line == BASELINE_END:
-            break
-        if not inside or "::" not in line or "=" not in line:
-            continue
-        label, raw_count = line.rsplit("=", 1)
-        nodeid, kind = label.rsplit("::", 1)
-        observed[(nodeid, kind)] = int(raw_count)
-    if not observed and not inside:
-        raise ValueError(f"no {BASELINE_START} marker in {path}")
-    return observed

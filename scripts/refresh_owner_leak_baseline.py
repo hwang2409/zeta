@@ -2,16 +2,25 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.support.owner_counts import refresh_baseline
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="lower the owner-leak baseline from a recorded pytest log"
+        description=(
+            "lower tests/owner_leak_ratchet.txt to observed unclosed-owner counts; "
+            "never raises a count"
+        )
     )
-    parser.add_argument("observed", type=Path)
+    parser.add_argument(
+        "observed",
+        type=Path,
+        help="owner-counts.txt from a CI artifact or ZETA_OWNER_COUNTS=<path> pytest",
+    )
     parser.add_argument(
         "--baseline",
         type=Path,

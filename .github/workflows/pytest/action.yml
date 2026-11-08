@@ -35,4 +35,15 @@ runs:
     # Report slow tests so future bottlenecks are visible in the CI logs.
     - name: Run the suite
       shell: bash
+      env:
+        ZETA_OWNER_COUNTS: ${{ runner.temp }}/owner-counts.txt
       run: uv run ${{ inputs.python-version != '' && format('--python "{0}" ', inputs.python-version) || '' }}--frozen pytest -q -n 4 --dist worksteal --durations=25
+
+    # Observed unclosed-owner counts; feed to scripts/refresh_owner_leak_baseline.py.
+    - name: Archive owner counts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: owner-counts-${{ runner.os }}-py${{ inputs.python-version || 'default' }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/owner-counts.txt
+        if-no-files-found: ignore
