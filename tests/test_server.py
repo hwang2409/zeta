@@ -8171,7 +8171,7 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
     rows = fixture.read_text().splitlines()
     assert rows[0] == (
         "# baseline origin/main 66c084d8; accepted deltas: "
-        "W1, W2, W3, W5, text->output, decisions"
+        "W1, W2, W3, W5, text->output, decisions, runs_while_busy"
     )
     assert observed == rows[1:]
 
