@@ -198,7 +198,10 @@ ROUTES: dict[tuple[EventDescriptor, str], Source] = {
     (EventDescriptor.USER_MESSAGE, "delivered"): lambda fields, facts: DeliveredMessage(
         str(facts.delivery_id)
     ),
-    # the queued steer row is not in history; its delivered row has no live event
+    # known gap G1, deferred to slice S3 (not settled): the queued steer row is not
+    # in history, but its delivered/dropped client_delivery row is, with the steer
+    # text (ergonomics.py `_history_entry_rows`), and has no live event. A
+    # join whose history read spans the delivery sees the steer twice.
     (EventDescriptor.USER_MESSAGE, "steer"): LIVE,
     (EventDescriptor.USER_MESSAGE, "undelivered"): PublishFirst(_user_turn),
     (EventDescriptor.ASSISTANT_MESSAGE, ""): PublishFirst(
@@ -227,6 +230,12 @@ ROUTES: dict[tuple[EventDescriptor, str], Source] = {
     **{(event, "display"): LIVE for event in _NOTIFICATION_EVENTS},
     (EventDescriptor.DELIVERY_STATUS, ""): CARRIED,
 }
+
+
+# events with a publish-first variant: routed even before any stream exists
+PUBLISH_FIRST_EVENTS = frozenset(
+    event for (event, _variant), source in ROUTES.items() if isinstance(source, PublishFirst)
+)
 
 
 class UnroutedEvent(LookupError):

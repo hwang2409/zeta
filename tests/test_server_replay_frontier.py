@@ -662,8 +662,9 @@ async def test_row_older_than_lookup_window_ends_older_streams_only(
         later = await serve.client()
         history = (await serve.join(later))["messages"]
         await _publish_tool_end(serve, "late-call")
-        ended = await serve.observer.event("replay_stream_ended")
-        assert (ended["stream_id"], ended["reason"]) == (old_stream, "evicted")
+        frames = await serve.live(serve.observer)
+        ended = [(f["stream_id"], f["reason"]) for f in frames if f["event"] == "replay_stream_ended"]
+        assert ended == [(old_stream, "evicted")], frames
         in_history = sum(
             (row.get("tool_result") or {}).get("tool_call_id") == "late-call" for row in history
         )
@@ -700,4 +701,51 @@ async def test_store_reset_ends_streams_instead_of_dropping_renumbered_rows(
         ]
         assert (_texts(history) + live).count("after-reset") == 1
     finally:
+        await _close(serve)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_store_reset_during_join_read_fails_the_join(tmp_path: Path, transport: Transport) -> None:
+    """J3: a reset between a join's start and its end renumbers rows; the join is stale."""
+    serve = await _serve(tmp_path, transport, _text_backend("ok"))
+    connections = serve.server.connections
+    assert connections is not None
+    run_read = connections.run_read
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await await_or_fail(release.wait(), what="release held history read")
+        return await run_read(*args, **kwargs)
+
+    try:
+        for index in range(6):
+            serve.store.append_task_notification(task_id=f"before-{index}", command="true", exit_code=0)
+        generation = serve.store.reset_generation()
+        # test-contract: seam hold the join's history read after the join began
+        connections.run_read = held  # type: ignore[method-assign]
+        join = asyncio.create_task(
+            serve.observer.request(
+                serve.request_id(), "session_history_and_subscribe", {"session_id": serve.session_id}
+            )
+        )
+        await await_or_fail(entered.wait(), what="join history read held")
+        connections.run_read = run_read  # type: ignore[method-assign]
+        log = serve.store.path
+        # an external rewrite drops the newest rows; the next write reloads and renumbers
+        log.write_bytes(b"".join(log.read_bytes().splitlines(keepends=True)[:3]))
+        serve.store.append_task_notification(task_id="after-reset", command="true", exit_code=0)
+        assert serve.store.reset_generation() != generation
+        release.set()
+        response = await await_or_fail(join, what="join response")
+        assert response.get("error", {}).get("code") == -32009, response
+        later = await serve.client()
+        history = (await serve.join(later))["messages"]
+        ids = [row["id"] for row in history]
+        assert len(ids) == len(set(ids)), ids
+        assert sum("after-reset" in str(row) for row in history) == 1, history
+    finally:
+        release.set()
+        connections.run_read = run_read  # type: ignore[method-assign]
         await _close(serve)

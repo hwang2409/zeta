@@ -65,7 +65,13 @@ class ReplayOutput:
         if session_id is None:
             return None
         self.release_deferred_replay(session_id)
+        if rows.ROUTES.get((event, "")) is rows.LIVE:
+            return None
         scope = ReplayScopeId.top(session_id)
+        store = self._replay_store(scope)
+        # a publish-first record is kept with no stream: a join can start before its row
+        if store is None and event not in rows.PUBLISH_FIRST_EVENTS:
+            return None
         facts = replay_row or rows.RowFacts()
         try:
             source = rows.route(event, fields, facts)
@@ -80,7 +86,6 @@ class ReplayOutput:
                     source.key(facts), FrameCodec().serialized_size(fields),
                 )
             )
-        store = self._replay_store(scope)
         if store is None:
             return None
         return rows.covers(event, source, store, fields, facts)
