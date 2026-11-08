@@ -15701,10 +15701,12 @@ async def test_idle_child_is_running_during_wake_turn(
     first_idle = asyncio.Event()
     wake_started = asyncio.Event()
     release_wake = asyncio.Event()
+    second_idle = asyncio.Event()
+    second_idle_lifecycle: dict[str, object] | None = None
     calls = 0
 
     async def fake_consume(_loop, _prompt, **kwargs):
-        nonlocal calls
+        nonlocal calls, second_idle_lifecycle
         await _ack_fake_delivery(child_store, kwargs)
         if not _prompt and loop.step_delivery.has_prompt_edge:
             await loop.step_delivery.prepare_request("terminal_fallback", [], None)
@@ -15712,12 +15714,15 @@ async def test_idle_child_is_running_during_wake_turn(
         calls += 1
         if calls == 2:
             wake_started.set()
-            await asyncio.wait_for(release_wake.wait(), 10)
+            await await_or_fail(release_wake.wait(), what="wake turn release")
         kwargs["finish_lifecycle"]("idle", "WAIT")
         if calls == 1:
             first_idle.set()
+        elif calls == 2:
+            second_idle_lifecycle = child_store.agent_lifecycle()
+            second_idle.set()
         return {
-            "content": [{"type": "text", "text": "WAIT"}],
+            "content": [{"type": "text", "text": ""}],
             "isError": False,
             "structuredContent": {"status": "running"},
         }
@@ -15733,38 +15738,39 @@ async def test_idle_child_is_running_during_wake_turn(
         )
     )
     owner.register("parent:1", task.cancel, task, parent_store=parent_store)
-    await asyncio.wait_for(first_idle.wait(), timeout=10)
-    first_idle_since = child_store.agent_lifecycle()["idle_since"]
-    assert await send_to_run(
-        parent_store,
-        "parent:1",
-        "continue",
-        owner=owner,
-        channel=owner.conversation_channel,
-    ) is None
-    await asyncio.wait_for(wake_started.wait(), timeout=10)
-    assert child_store.agent_lifecycle()["state"] == "running"
+    try:
+        await await_or_fail(first_idle.wait(), what="first idle transition")
+        assert (
+            await send_to_run(
+                parent_store,
+                "parent:1",
+                "continue",
+                owner=owner,
+                channel=owner.conversation_channel,
+            )
+            is None
+        )
+        await await_or_fail(wake_started.wait(), what="external wake turn start")
+        assert child_store.agent_lifecycle()["state"] == "running"
 
-    release_wake.set()
-
-    async def wait_for_new_idle() -> None:
-        while (
-            child_store.agent_lifecycle().get("state") != "idle"
-            or child_store.agent_lifecycle().get("idle_since") == first_idle_since
-        ):
-            await asyncio.sleep(0)
-
-    await asyncio.wait_for(wait_for_new_idle(), timeout=2)
-    assert child_store.agent_lifecycle()["state"] == "idle"
-    assert child_store.agent_lifecycle()["idle_since"] > first_idle_since
-
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
-    owner.conversation_channel.unregister_loop("parent:1")
-    await registry.close()
-    child_store.close()
-    parent_store.close()
+        release_wake.set()
+        try:
+            await await_or_fail(second_idle.wait(), what="second idle transition")
+        except pytest.fail.Exception as failure:
+            failure.add_note(f"child lifecycle: {child_store.agent_lifecycle()!r}")
+            raise
+        assert second_idle_lifecycle is not None
+        assert second_idle_lifecycle["state"] == "idle"
+        assert second_idle_lifecycle["idle_since"] is not None
+    finally:
+        release_wake.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(task, what="cancelled wake run")
+        owner.conversation_channel.unregister_loop("parent:1")
+        await registry.close()
+        child_store.close()
+        parent_store.close()
 
 
 @pytest.mark.asyncio
