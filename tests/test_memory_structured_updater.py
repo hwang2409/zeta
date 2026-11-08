@@ -1307,6 +1307,46 @@ async def test_exact_literal_validation_ignores_cited_tool_output(
 
 
 @pytest.mark.asyncio
+async def test_cited_code_literal_containing_letter_n_is_required(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, prompts = await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "Use `run_background` for long builds.")),
+        [
+            _proposal(_add("decisions", "Use background tasks for long builds.")),
+            _proposal(_add("decisions", "Use `run_background` for long builds.")),
+        ],
+        key="code-literal-with-n",
+    )
+    assert any(
+        "omits cited exact code literal(s): run_background" in prompt
+        for prompt in prompts
+    )
+    assert len(prompts) == 2
+    assert result.changed_entry_ids
+    assert next(iter(_entries(registry, project_id))).text == (
+        "Use `run_background` for long builds."
+    )
+
+
+@pytest.mark.asyncio
+async def test_code_literal_does_not_span_lines(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    result, prompts = await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "Keep `alpha\nbeta` apart; use `run_background`.")),
+        [_proposal(_add("decisions", "Use `run_background` for builds."))],
+        key="code-literal-multiline",
+    )
+    assert len(prompts) == 1
+    assert result.changed_entry_ids
+
+
+@pytest.mark.asyncio
 async def test_repeated_opaque_fact_does_not_create_duplicate_entry(
     tmp_path: Path,
 ) -> None:
