@@ -18,6 +18,7 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
+from .session_replay import ReplayScopeId, SessionReplay
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
@@ -27,6 +28,7 @@ OBSERVER_REQUESTS = frozenset(
         "status",
         "session_tree",
         "session_history",
+        "session_history_and_subscribe",
         "content_read",
         "model_catalog",
         "session_settings",
@@ -112,6 +114,7 @@ class ConnectionRegistry:
         self._controller_output_paused = False
         self._observers: list[_Connection] = []
         self._closed = False
+        self.replay = SessionReplay()
         self._read_condition = threading.Condition()
         self._read_jobs: deque[tuple[Callable[[], Any], asyncio.Future[Any]]] = deque()
         self._read_stopping = False
@@ -274,6 +277,10 @@ class ConnectionRegistry:
         )
         if outcome.kind != "admitted" or frame is None or output is None:
             return outcome
+        if self._publish_replay(
+            self._controller, event, session_id, dict(fields), len(frame) + 64
+        ):
+            return outcome
         if not self._admit(self._controller, frame):
             return Admission("capacity_rejected")
         self._enqueue(
@@ -282,6 +289,65 @@ class ConnectionRegistry:
             wake=True,
         )
         return outcome
+
+    def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
+        self.replay.begin_join(connection, scope)
+
+    async def finish_replay_join(
+        self,
+        connection: Any,
+        history_snapshot: dict[str, object],
+    ) -> dict[str, object]:
+        return self.replay.finish_join(connection, history_snapshot)
+
+    def replay_session_replaced(self) -> None:
+        self.replay.session_replaced()
+
+    def _publish_replay(
+        self,
+        state: _Connection,
+        event: EventDescriptor,
+        session_id: str | None,
+        fields: dict[str, object],
+        frame_size: int,
+    ) -> bool:
+        if "session_replay_seq" not in state.features or session_id is None:
+            return False
+        published = self.replay.publish(
+            state.connection,
+            ReplayScopeId.top(session_id),
+            event,
+            {**fields, "_session_id": session_id},
+            frame_size,
+        )
+        if published is None:
+            return False
+        payload = {"stream_id": published.stream_id, "seq": published.seq, **fields}
+        payload.pop("_session_id", None)
+        frame = state.connection.codec.notification(event, session_id, **payload)
+        if frame is None or state.output is None:
+            return False
+        subscription = self.replay._subscriptions.get(state.connection)
+        pending = self.replay._pending.get(state.connection)
+        if pending is not None and subscription is None:
+            return True
+        if not self._admit(state, frame):
+            self.replay.connection_closed(state.connection)
+            return False
+        self._enqueue(state.output, _OutputFrame(frame))
+        return True
+
+    def drain_replay(self, connection: Any) -> None:
+        state = self._connections.get(connection)
+        if state is None or state.output is None:
+            return
+        for event, fields in self.replay.response_written(connection):
+            session_id = fields.pop("_session_id", None)
+            frame = connection.codec.notification(event, session_id, **fields)
+            if frame is None or not self._admit(state, frame):
+                self.replay.connection_closed(connection)
+                return
+            self._enqueue(state.output, _OutputFrame(frame))
 
     async def publish_controller(
         self,
@@ -302,6 +368,24 @@ class ConnectionRegistry:
             return False
         state = self._controller
         assert state is not None
+        replay_fields = dict(fields)
+        for observer in tuple(self._observers):
+            if required_feature is not None and required_feature not in observer.features:
+                continue
+            observer_frame = observer.connection.codec.notification(
+                event, session_id, **replay_fields
+            )
+            if observer_frame is not None:
+                self._publish_replay(
+                    observer,
+                    event,
+                    session_id,
+                    replay_fields,
+                    len(observer_frame) + 64,
+                )
+        replayed = self._publish_replay(state, event, session_id, replay_fields, len(frame) + 64)
+        if replayed:
+            return True
         if not self._admit(state, frame):
             return False
         if output.phase in {"claimed_buffering", "flushing"}:
@@ -333,12 +417,15 @@ class ConnectionRegistry:
             frame = state.connection.codec.notification(event, session_id, data=data)
             if frame is None:
                 continue
+            if self._publish_replay(state, event, session_id, {"data": data}, len(frame) + 64):
+                continue
             if state is self._controller:
                 await self.send(state.connection, frame)
             else:
                 self._publish_observer(state, frame)
 
     def release(self, connection: Any) -> None:
+        self.replay.connection_closed(connection)
         state = self._connections.pop(connection, None)
         if state is None:
             return
@@ -760,6 +847,30 @@ class ConnectionRegistry:
             raise ProtocolError(
                 ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
             )
+        return result
+
+    async def read_replay_history(
+        self, connection: Any, params: dict[str, Any]
+    ) -> dict[str, object]:
+        target = capture_read(connection, "session_history", params)
+        features = self._connections[connection].features
+        result = await self.run_read(
+            connection,
+            lambda: perform_read(
+                "session_history",
+                target,
+                params,
+                include_delivery_id={
+                    "delivery_id", "user_message_event", "user_message_delivery_id"
+                } <= features,
+                backward_enabled=True,
+                fidelity=True,
+                content_read="content_read" in features,
+                served_turn_end="served_turn_end" in features,
+            ),
+            session_id=target[0],
+        )
+        assert isinstance(result, dict)
         return result
 
     async def read_session(

@@ -155,6 +155,7 @@ feature. Observer connections receive only methods with `read` access.
 | `repair_transcript` | `1.1` | `none` | `session_mutation` |
 | `session_tree` | `1.1` | `none` | `read` |
 | `session_history` | `1.1` | `none` | `read` |
+| `session_history_and_subscribe` | `1.1` | `session_replay_seq` | `read` |
 | `content_read` | `1.1` | `content_read` | `read` |
 | `switch_branch` | `1.1` | `none` | `session_mutation` |
 | `fork_message` | `1.1` | `none` | `session_mutation` |
@@ -1021,6 +1022,7 @@ Error descriptors are:
 | `approval_unavailable` | `-32006` | none | approval request is missing, resolved, or reserved |
 | `frame_too_large` | `-32007` | none | outbound frame exceeds the size limit |
 | `history_snapshot_stale` | `-32009` | `stale_history_snapshot` | session history snapshot is stale |
+| `stale_event_sequence` | `-32009` | `stale_event_sequence` | replay continuity was invalidated |
 | `delivery_id_evicted` | `-32010` | none | delivery ID details were evicted |
 | `controller_output_overflow` | `-32011` | none | controller output overflow |
 | `observer_output_overflow` | `-32011` | none | observer output overflow |
@@ -1304,6 +1306,16 @@ error code and message. Provider status and origin remain internal.
 - `switch_branch`: takes `head_id`, an existing leaf. Calls `switch_to_branch`
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
+- `session_history_and_subscribe`: with `session_replay_seq`, takes exactly one
+  active `session_id` and atomically returns the newest bounded history page plus
+  `replay: {"stream_id": "...", "history_seq": 0}`. Events admitted after the
+  join carry that opaque stream id and monotonically increasing `seq`, starting at
+  1. A second join replaces the connection's prior stream. Session replacement,
+  controller handoff, replay pressure, or a lost frontier ends the stream with
+  `-32009` and data code `stale_event_sequence`; clients must perform a new join.
+  The server retains at most 64 records/1 MiB per scope and 256 records/4 MiB
+  globally, evicting the largest scope first. Older pages continue to use
+  `session_history` and do not change the live stream.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns
@@ -1581,6 +1593,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
+| `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, and visible live events include `stream_id` and `seq` |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 

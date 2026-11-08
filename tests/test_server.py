@@ -1231,6 +1231,48 @@ def _history_event_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+async def test_session_history_and_subscribe_joins_live_sequence_on_unix_socket(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader, writer = await _connect(server)
+    try:
+        hello = (
+            await _request(
+                reader,
+                writer,
+                1,
+                "hello",
+                {"protocol_version": "1.1", "features": ["session_replay_seq"]},
+            )
+        )[-1]["result"]
+        assert "session_history_and_subscribe" in hello["capabilities"]["requests"]
+        session = (
+            await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        )[-1]["result"]["session"]
+        result = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "session_history_and_subscribe",
+                {"session_id": session["session_id"]},
+            )
+        )[-1]["result"]
+        assert result["replay"]["history_seq"] == 0
+        await server.control._notify(
+            EventDescriptor.TURN_START, session["session_id"], data={}
+        )
+        event = await _event(reader, "turn_start")
+        assert event["stream_id"] == result["replay"]["stream_id"]
+        assert event["seq"] == 1
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("decision", ["allow", "deny", "abort"])
 async def test_session_history_matches_live_approval_lifecycle(
     tmp_path: Path, decision: str

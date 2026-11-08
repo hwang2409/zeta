@@ -54,6 +54,7 @@ from .protocol import (
     protocol_error,
 )
 from .runtime import BackendFactory, ServerRuntime
+from .session_replay import ReplayScopeId
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
@@ -413,6 +414,8 @@ class _Client:
                             exc.data,
                         )
                     )
+                    if request["method"] == "session_history_and_subscribe":
+                        self.connections.replay.connection_closed(self)
                     if not self.handshaken:
                         self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
@@ -458,6 +461,8 @@ class _Client:
                     )
                 else:
                     written = await self._write(self.codec.response(request_id, result))
+                    if written and request["method"] == "session_history_and_subscribe":
+                        self.connections.drain_replay(self)
                     if (
                         written
                         and request["method"] == "hello"
@@ -648,6 +653,25 @@ class _Client:
                 params,
                 features=self.features,
             )
+        if descriptor is MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE:
+            if set(params) != {"session_id"} or not isinstance(
+                params.get("session_id"), str
+            ) or not params["session_id"]:
+                raise ProtocolError(
+                    ErrorDescriptor.INVALID_PARAMS,
+                    "session_history_and_subscribe requires session_id",
+                )
+            session_id = params["session_id"]
+            if self.server.runtime.session_id != session_id:
+                raise ProtocolError(
+                    ErrorDescriptor.NO_ACTIVE_SESSION,
+                    "session is not active",
+                )
+            self.server.connections.begin_replay_join(
+                self, ReplayScopeId.top(session_id)
+            )
+            history = await self.server.connections.read_replay_history(self, params)
+            return await self.server.connections.finish_replay_join(self, history)
         if descriptor is MethodDescriptor.LIST_SESSIONS:
             result, _page_ids = await self.connections.run_read(
                 self, lambda: self._list_sessions(request_id, params)
@@ -664,6 +688,7 @@ class _Client:
                     model_selection.validate(initial_model, initial_mode)
                 candidate = self._host_commands(params)
                 with self.server.control.reserve_session_swap():
+                    self.server.connections.replay_session_replaced()
                     cwd = None
                     if "cwd" in params:
                         self._require_feature("session_cwd", "cwd")
@@ -696,6 +721,7 @@ class _Client:
             try:
                 candidate = self._host_commands(params)
                 with self.server.control.reserve_session_swap():
+                    self.server.connections.replay_session_replaced()
                     session_id = _required_string(params, "session_id")
                     unhealthy_same_session = (
                         self.server.control.unhealthy()
