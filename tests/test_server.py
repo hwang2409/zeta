@@ -2812,17 +2812,17 @@ async def test_abort_mid_stream(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scope", ["session", "foreground"])
-async def test_abort_captures_turn_before_approval_end_write(
+async def test_new_run_after_approval_abort_runs_normally(
     tmp_path: Path,
     scope: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("approval-race", "read", {"path": str(tmp_path / "input")})
-    aborted_reply = "must not survive abort"
+    next_reply = "the next serve run completed"
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[call]),
-            ScriptedTurn([TextContent(aborted_reply)]),
+            ScriptedTurn([TextContent(next_reply)]),
         ]
     )
     server = ZetaServer(
@@ -2899,9 +2899,31 @@ async def test_abort_captures_turn_before_approval_end_write(
         assert canceled_tool_end["tool_result"]["is_canceled"] is True
         assert len(backend.calls) == 1
         history = server.runtime.opened.store.messages()
-        assert aborted_reply not in json.dumps(
+        assert next_reply not in json.dumps(
             [message.to_dict() for message in history]
         )
+
+        next_frames = await _request(
+            reader, writer, 5, "send", {"text": "run after abort"}
+        )
+        if not _named_events(next_frames, "turn_end"):
+            try:
+                next_frames += await asyncio.wait_for(
+                    _frames_until_event(reader, "turn_end"), 10
+                )
+            except TimeoutError:
+                assert len(backend.calls) == 2
+                raise
+        next_names = [
+            frame.get("params", {}).get("event")
+            for frame in next_frames
+            if frame.get("params", {}).get("event") is not None
+        ]
+        assert [
+            name for name in next_names if name in {"turn_start", "turn_end"}
+        ] == ["turn_start", "turn_end"]
+        history = server.runtime.opened.store.messages()
+        assert next_reply in json.dumps([message.to_dict() for message in history])
     finally:
         allow_approval_end.set()
         if abort is not None and not abort.done():
