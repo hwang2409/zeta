@@ -287,6 +287,44 @@ def test_polling_spin_resolves_import_spellings(
     assert [(finding.code, finding.line) for finding in findings] == expected
 
 
+def test_python_scope_rules_resolve_polling_aliases(tmp_path: Path) -> None:
+    cases = [
+        """import asyncio as aio
+
+class TestThing:
+    import json as aio
+
+    async def test_spin(self):
+        while not ready:
+            await aio.sleep(0)
+""",
+        """import asyncio.tasks
+
+async def test_spin():
+    while not ready:
+        await asyncio.sleep(0)
+""",
+        """async def outer():
+    import asyncio as aio
+
+    async def inner():
+        while not ready:
+            await aio.sleep(0)
+""",
+        """import asyncio as aio
+
+async def test_spin():
+    import json as aio
+    while not ready:
+        await aio.sleep(0)
+""",
+    ]
+    expected = [[("TQ004", 7)], [("TQ004", 4)], [("TQ004", 5)], []]
+    for index, (source, expected_findings) in enumerate(zip(cases, expected)):
+        findings = _lint(tmp_path / str(index), source)
+        assert [(finding.code, finding.line) for finding in findings] == expected_findings
+
+
 def test_one_argument_iter_is_finite_and_nested_definitions_are_scoped(
     tmp_path: Path,
 ) -> None:

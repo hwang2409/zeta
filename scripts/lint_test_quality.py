@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+import symtable
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -497,45 +498,78 @@ def _enclosing_function_touches_added_line(
 
 
 class _ImportResolver:
-    def __init__(self, tree: ast.AST) -> None:
+    def __init__(self, tree: ast.AST, source: str) -> None:
         self._scope: dict[ast.AST, ast.AST] = {}
         self._parent_scope: dict[ast.AST, ast.AST | None] = {}
         self._bindings: dict[ast.AST, dict[str, str]] = {}
+        self._symbols: dict[ast.AST, symtable.SymbolTable] = {}
+        self._module = symtable.symtable(source, "<source>", "exec")
+        self._module_ast = tree
+        self._match_tables(tree, self._module)
         self._build(tree, tree, None)
+
+    def _match_tables(self, node: ast.AST, table: symtable.SymbolTable) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            name = "lambda" if isinstance(node, ast.Lambda) else node.name
+            children = [child for child in table.get_children() if child.get_name() == name]
+            match = next((child for child in children if child.get_lineno() == node.lineno), None)
+            if match is None:
+                return
+            table = match
+            self._symbols[node] = table
+        for child in ast.iter_child_nodes(node):
+            self._match_tables(child, table)
 
     def _build(self, node: ast.AST, scope: ast.AST, parent: ast.AST | None) -> None:
         self._scope[node] = scope
         self._parent_scope.setdefault(scope, parent)
-        if isinstance(node, ast.Import):
+        if isinstance(node, ast.Import) and not isinstance(scope, ast.ClassDef):
             bindings = self._bindings.setdefault(scope, {})
             for imported in node.names:
                 local = imported.asname or imported.name.split('.')[0]
-                bindings[local] = imported.name
-        elif isinstance(node, ast.ImportFrom) and node.module:
+                bindings[local] = imported.name if imported.asname else local
+        elif isinstance(node, ast.ImportFrom) and node.module and not isinstance(scope, ast.ClassDef):
             bindings = self._bindings.setdefault(scope, {})
             for imported in node.names:
                 if imported.name != '*':
-                    bindings[imported.asname or imported.name] = (
-                        f"{node.module}.{imported.name}"
-                    )
+                    bindings[imported.asname or imported.name] = f"{node.module}.{imported.name}"
         for child in ast.iter_child_nodes(node):
-            child_scope = child if isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
-            ) else scope
-            self._build(child, child_scope, scope if child_scope is not scope else parent)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                child_parent = scope if not isinstance(scope, ast.ClassDef) else parent
+                self._build(child, child, child_parent)
+            elif isinstance(child, ast.ClassDef):
+                self._build(child, child, parent if isinstance(scope, ast.ClassDef) else scope)
+            else:
+                self._build(child, scope, parent)
 
     def resolve(self, node: ast.AST) -> str:
         value = _name(node)
         if not value:
             return value
-        parts = value.split('.')
-        scope = self._scope.get(node)
-        while scope is not None:
-            binding = self._bindings.get(scope, {}).get(parts[0])
-            if binding is not None:
-                return '.'.join([binding, *parts[1:]])
+        root, *parts = value.split('.')
+        scope = self._scope.get(node, self._module)
+        table = self._symbols.get(scope, self._module) if scope is not self._module else self._module
+        if table.get_type() == "class":
             scope = self._parent_scope.get(scope)
-        return value
+            table = self._symbols.get(scope, self._module) if scope is not None else self._module
+        try:
+            symbol = table.lookup(root)
+        except KeyError:
+            symbol = None
+        if symbol is not None and (symbol.is_local() or symbol.is_imported()):
+            binding = self._bindings.get(scope, {}).get(root)
+        elif symbol is not None and symbol.is_free():
+            binding = None
+            parent = self._parent_scope.get(scope)
+            while parent is not None:
+                parent_table = self._symbols.get(parent, self._module)
+                if parent_table.get_type() != "class" and root in self._bindings.get(parent, {}):
+                    binding = self._bindings[parent][root]
+                    break
+                parent = self._parent_scope.get(parent)
+        else:
+            binding = self._bindings.get(self._module_ast, {}).get(root)
+        return '.'.join([binding or root, *parts])
 
 
 def _scoped_walk(node: ast.AST) -> list[ast.AST]:
@@ -812,8 +846,9 @@ def _scan_deadline_nodes(
     lines: list[str],
     parents: dict[ast.AST, ast.AST],
     tree: ast.AST,
+    source: str,
 ) -> list[Finding]:
-    resolver = _ImportResolver(tree)
+    resolver = _ImportResolver(tree, source)
     return [
         finding
         for node in nodes
@@ -1038,7 +1073,7 @@ def lint_source(
         serialized_names,
         new_private_patches,
     )
-    findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents, tree))
+    findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents, tree, source))
     findings.extend(_global_bootstrap_findings(path, tree, source, added))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
@@ -1101,7 +1136,7 @@ def _scan_deadline_findings(
             for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
         }
-        resolver = _ImportResolver(tree)
+        resolver = _ImportResolver(tree, source)
         for node in ast.walk(tree):
             findings.extend(
                 _deadline_findings(
