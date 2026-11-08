@@ -100,27 +100,19 @@ class ExternalEnd:
     session_id: str | None
     data: Mapping[str, object]
     suppress_write_errors: bool = False
-
-
 @dataclass(frozen=True, slots=True)
 class Cancel:
     request_id: str
     child_instance_id: str | None = None
     reason: str = "turn_canceled"
-
-
 @dataclass(frozen=True, slots=True)
 class CleanupChild:
     child_instance_id: str
-
-
 @dataclass(frozen=True, slots=True)
 class Terminate:
     foreground_only: bool = False
     suppress_write_errors: bool = False
     reason: str = "controller_disconnected"
-
-
 @dataclass(frozen=True, slots=True)
 class BeginGrace:
     pass
@@ -263,7 +255,6 @@ class ApprovalLifecycle:
                 disposition="active",
                 settlement=None,
                 publication_owner=None,
-                grant=None,
             )
         )
 
@@ -717,8 +708,7 @@ class ApprovalLifecycle:
                 ErrorDescriptor.APPROVAL_UNAVAILABLE,
                 f"approval request not found or already resolved: {request_id}",
             )
-        if scope == "always_tool":
-            record = self._change(record, grant=pending)
+        record = self._change(record, grant=pending) if scope == "always_tool" else record
         settlement = asyncio.create_task(self._settle_record(record, decision))
         self._change(record, settlement=settlement)
         try:
@@ -1002,13 +992,12 @@ class ApprovalLifecycle:
         ):
             return
         record = self._change(current, publication_owner=owner)
-        if resolution["decision"] == "allow" and record.grant is not None:
-            policy = self._policy()
-            if policy is not None:
-                before = policy.session_allow
-                rule = policy.remember_allow(record.grant)
-                if rule not in before and self._grant_published is not None:
-                    await self._grant_published(str(rule))
+        policy = self._policy()
+        if resolution["decision"] == "allow" and record.grant is not None and policy is not None:
+            before = policy.session_allow
+            rule = policy.remember_allow(record.grant)
+            if rule not in before and self._grant_published is not None:
+                await self._grant_published(str(rule))
         data: dict[str, object] = {
             key: value for key, value in resolution.items() if key != "request_id"
         }
@@ -1060,7 +1049,6 @@ class ApprovalLifecycle:
                     self._remove(record.target.key)
         if isinstance(history_outcome, asyncio.CancelledError):
             raise history_outcome
-
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
     ) -> None:
