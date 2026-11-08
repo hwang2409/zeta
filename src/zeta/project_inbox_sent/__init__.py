@@ -10,17 +10,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .core.session_files import (
+from ..core.session_files import (
     SessionError,
     atomic_publish_file,
     child_directory,
     read_session_file,
     session_root,
 )
-from .storage_format import open_writer, require_closed_variant
+from ..storage_format import open_writer, require_closed_variant
 
 if TYPE_CHECKING:
-    from .project_inbox import ProjectInbox
+    from ..project_inbox import ProjectInbox
 
 
 _ID = re.compile(r"[0-9a-f]{32}\Z")
