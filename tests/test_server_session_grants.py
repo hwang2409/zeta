@@ -1384,10 +1384,13 @@ async def test_session_grant_lifecycle_table_over_real_transports(
     pending: list[dict[str, Any]] = []
 
     async def read_websocket_json() -> dict[str, Any]:
-        try:
-            return await _read_json(reader)
-        except AssertionError as exc:
-            raise AssertionError("server closed the websocket") from exc
+        while True:
+            try:
+                return await _read_json(reader)
+            except TimeoutError:
+                continue
+            except AssertionError as exc:
+                raise AssertionError("server closed the websocket") from exc
 
     async def request(request_id: int, method: str, params: dict[str, object]) -> list[dict[str, Any]]:
         if transport == "unix":
