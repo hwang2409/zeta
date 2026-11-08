@@ -14,6 +14,7 @@ from .protocol import (
     EventDescriptor,
     FrameCodec,
     FrameWriteCancelled,
+    MethodDescriptor,
     ProtocolError,
     _Frame,
 )
@@ -843,12 +844,6 @@ class ConnectionRegistry:
         else:
             future.set_exception(error)
 
-    @staticmethod
-    def requests_for_role(role: str, requests: list[str]) -> list[str]:
-        if role == "observer":
-            return sorted(OBSERVER_REQUESTS.intersection(requests))
-        return requests
-
     async def route_request(
         self,
         connection: Any,
@@ -859,9 +854,10 @@ class ConnectionRegistry:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
             return False, None
-        if method not in OBSERVER_REQUESTS or (
-            method == "list_sessions" and "project_id" in params
-        ):
+        descriptor = MethodDescriptor.for_wire(method)
+        if descriptor is None or descriptor.access.value != "read":
+            return False, None
+        if method == "list_sessions" and "project_id" in params:
             raise ProtocolError(
                 ErrorDescriptor.OBSERVER_READ_ONLY,
                 "method is unavailable to read-only observers",
