@@ -2739,7 +2739,10 @@ async def test_abort_captures_turn_before_approval_end_write(
         allow_approval_end.set()
         if abort is not None and not abort.done():
             abort.cancel()
-            await asyncio.gather(abort, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(abort, return_exceptions=True),
+                what="abort request cleanup",
+            )
         await close_serve(server, writer)
 
 
