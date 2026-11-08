@@ -13448,8 +13448,10 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     child_registry: ToolRegistry | None = None
     child_execute_entered = asyncio.Event()
     release_child_execute = asyncio.Event()
+    child_abort_signaled = asyncio.Event()
     child_abort_entered = asyncio.Event()
     original_execute = ToolRegistry.execute
+    original_abort = ToolRegistry.abort
     original_abort_approval = ToolRegistry.abort_approval
 
     async def pause_child_before_execute(
@@ -13464,6 +13466,11 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
             child_execute_entered.set()
             await release_child_execute.wait()
         return await original_execute(registry, tool_call, **kwargs)
+
+    def observe_child_abort(registry: ToolRegistry) -> None:
+        if registry is child_registry:
+            child_abort_signaled.set()
+        original_abort(registry)
 
     def record_child_abort_error(
         registry: ToolRegistry,
@@ -13482,6 +13489,8 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
             raise
 
     monkeypatch.setattr(ToolRegistry, "execute", pause_child_before_execute)
+    # test-contract: seam observe the child abort signal before releasing its tool.
+    monkeypatch.setattr(ToolRegistry, "abort", observe_child_abort)
     monkeypatch.setattr(ToolRegistry, "abort_approval", record_child_abort_error)
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -13514,23 +13523,30 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
         for message in child_store.messages()
     )
 
-    loop.abort()
-    release_child_execute.set()
-    await asyncio.wait_for(child_abort_entered.wait(), timeout=5)
-    assert child_abort_calls > 0
-    assert abort_errors == []
-    await wait_background_owner(loop)
-    notification = store.agent_notifications(pending_only=False)[-1]
-    assert notification.data["status"] == "canceled"
+    try:
+        loop.abort()
+        await asyncio.wait_for(child_abort_signaled.wait(), timeout=10)
+        release_child_execute.set()
+        await asyncio.wait_for(child_abort_entered.wait(), timeout=10)
+        assert child_abort_calls > 0
+        assert abort_errors == []
+        await wait_background_owner(loop)
+        notification = store.agent_notifications(pending_only=False)[-1]
+        assert notification.data["status"] == "canceled"
 
-    assert notification.data["killed_task_count"] == 1
-    assert "abort_or_winner" not in notification.data["text"]
-    refreshed_child = ConversationStore(
-        child_store.root_dir,
-        session_id=child_store.session_id,
-    )
-    assert refreshed_child.agent_lifecycle()["state"] == "canceled"
-    await loop.close()
+        assert notification.data["killed_task_count"] == 1
+        assert "abort_or_winner" not in notification.data["text"]
+        refreshed_child = ConversationStore(
+            child_store.root_dir,
+            session_id=child_store.session_id,
+        )
+        try:
+            assert refreshed_child.agent_lifecycle()["state"] == "canceled"
+        finally:
+            refreshed_child.close()
+    finally:
+        release_child_execute.set()
+        await loop.close()
 
 
 @pytest.mark.asyncio
