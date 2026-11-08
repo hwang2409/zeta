@@ -36,6 +36,10 @@ def __getattr__(name: str) -> object:
         from ..providers.factory import credential_store
 
         return credential_store
+    if name == "run_login":
+        from ..core.login_flow import run_login
+
+        return run_login
     if name == "OAUTH_REFRESH_TIMEOUT_SECONDS":
         from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 
@@ -441,14 +445,14 @@ def _run_login(
     provider: str, label: str = "default", replace_existing: bool = False
 ) -> str | None:
     from ..accounts.login import login_named_account
-    from ..core.login_flow import run_login
+    from ..core.login_flow import run_login as default_run_login
 
     return login_named_account(
         env_home(),
         provider,
         label,
         replace_existing=replace_existing,
-        login=run_login,
+        login=globals().get("run_login") or default_run_login,
     )
 
 
@@ -970,11 +974,16 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
 
 
 def _run_console(run: Callable[[], int]) -> int:
-    from ..accounts import AccountError
-
     try:
         return run()
-    except (AccountError, StorageFormatError) as exc:
+    except StorageFormatError as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        from ..accounts import AccountError
+
+        if not isinstance(exc, AccountError):
+            raise
         print(f"zeta: {exc}", file=sys.stderr)
         return 2
 
