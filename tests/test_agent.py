@@ -19722,8 +19722,8 @@ async def test_idle_child_wake_tool_count_is_cumulative(tmp_path: Path, monkeypa
     idle_seen = asyncio.Event()
     original_transition = run_consumer_module._transition_idle
 
-    async def observe_idle(child_store: ConversationStore) -> None:
-        await original_transition(child_store)
+    def observe_idle(child_store: ConversationStore) -> None:
+        original_transition(child_store)
         idle_seen.set()
 
     monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
