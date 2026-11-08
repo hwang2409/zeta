@@ -85,7 +85,7 @@ def _provider_message(message: Message) -> Message | None:
     if not has_tool_use and (kind in ("assistant", "range", "notification") or tokens):
         fields = metadata.get(RECEIPT_FIELDS_METADATA)
         if (isinstance(fields, Mapping) and fields.get("kind") == REASONING_KIND) or (
-            tokens and set(tokens) == {reasoning_marker(seq)}
+            tokens and all(token == reasoning_marker(seq) for token in tokens)
         ):
             return None
         return harness_notice(
