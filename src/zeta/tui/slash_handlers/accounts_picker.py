@@ -23,6 +23,7 @@ class AccountsPicker:
     details: dict[AccountId, str] | None = None
     labels: dict[AccountId, str] | None = None
     usages: dict[AccountId, UsageState] | None = None
+    unavailable: set[AccountId] | None = None
     refreshing: bool = False
     logout_confirmation: AccountId | None = None
     index: int = 0
@@ -47,6 +48,8 @@ class AccountsPicker:
         )
         if self.details and (detail := self.details.get(account)):
             line.append(f"  {detail}", style=theme.DIM)
+        if self.unavailable and account in self.unavailable:
+            line.append("  unavailable: credentials missing", style=theme.WARNING)
         markers = []
         if self.selected.get(account.provider) == account:
             markers.append("● current")
