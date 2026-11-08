@@ -27,6 +27,7 @@ from ...core.session_files import (
     session_directory,
 )
 from ...core.store import ConversationStore, TranscriptLoadError
+from ...core.transcript_recovery.runtime import repair_command_for_child_path
 from ...protocol.types import is_passive_harness_message
 from ..todo import TodoSnapshot
 from .agent_shutdown import SHUTDOWN_BUDGET_SECONDS, finish_cleanup_or_handoff
@@ -582,7 +583,12 @@ class AgentTranscriptSource:
                 pass
         self._log_refresh_error(error, traceback=True)
         reason = (
-            str(error)
+            (
+                f"{error}; run {command}"
+                if error.repair_available
+                and (command := repair_command_for_child_path(path))
+                else str(error)
+            )
             if isinstance(error, TranscriptLoadError)
             else _REFRESH_UNAVAILABLE
         )

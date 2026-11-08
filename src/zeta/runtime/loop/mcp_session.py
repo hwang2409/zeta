@@ -147,6 +147,11 @@ class MCPSession:
 
         await self._ensure_mcp_servers()
 
+    async def close_mcp_management(self) -> None:
+        """Join the management transaction owned by this MCP session."""
+
+        await self._mcp_management.aclose()
+
     def require_allowed_tools(self) -> None:
         """Raise when an exact allowlisted tool was not registered at startup."""
 
