@@ -633,9 +633,6 @@ async def _background_event_transcript_count(
     return visible.count(needle), visible
 
 
-from tests.support.owned import await_or_fail
-
-
 @pytest.mark.asyncio
 async def test_request_exit_wakes_active_full_screen_prompt(tmp_path: Path) -> None:
     app = TUIApp(
@@ -659,7 +656,7 @@ async def test_request_exit_wakes_active_full_screen_prompt(tmp_path: Path) -> N
         finally:
             if session.app.future is not None and not session.app.future.done():
                 session.app.exit(exception=EOFError())
-            await running
+            await await_or_fail(running, what="full-screen prompt exit")
 
 
 @pytest.mark.asyncio
