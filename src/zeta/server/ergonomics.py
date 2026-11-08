@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 EXTENSION_REQUESTS = [
     "rename_session",
     "delete_session",
+    "repair_transcript",
     "session_tree",
     "session_history",
     "content_read",
@@ -394,7 +395,9 @@ def history_projection(
             and not is_visible_harness_notice(entry.data["message"])
         ):
             continue
-        if entry.type in {"message", "notification"}:
+        if entry.type in {"message", "notification"} or (
+            entry.type == "warning" and entry.data.get("kind") == "transcript_recovery"
+        ):
             entries[-1].append(entry)
             entries.append([])
         elif entry.type in {
@@ -459,6 +462,27 @@ def _project_tool_call_arguments(
     return {"arguments": projected, "arguments_truncated": truncated}
 
 
+def _transcript_recovery_history_row(entry: object) -> dict[str, object]:
+    data = entry.data
+    recovery_keys = (
+        "quarantine_id",
+        "source_digest",
+        "first_bad_row",
+        "retained_last_sequence",
+        "session_id",
+        "child_run_id",
+    )
+    return {
+        "id": entry.id,
+        "role": "system",
+        "content": [{"type": "text", "text": bounded(data["message"], 8000)}],
+        "tool_result": None,
+        "transcript_recovery": {
+            key: data[key] for key in recovery_keys if key in data
+        },
+    }
+
+
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
@@ -500,6 +524,8 @@ def _history_entry_rows(
             }
         )
         return [{"id": entry.id, "role": "system", "event": "approval_end", **payload}]
+    if entry_type == "warning":
+        return [_transcript_recovery_history_row(entry)]
     if entry_type == "notification":
         data = project_notification_data(entry.data)
         kind = data.get("kind", "agent_completion")
@@ -641,7 +667,7 @@ def _history_endpoint(projection: HistoryProjection, end: int) -> str | None:
     if end == 0:
         return None
     for entry in reversed(projection.entry_groups[end - 1]):
-        if entry.type in {"message", "notification"}:
+        if entry.type in {"message", "notification", "warning"}:
             return entry.id
     return None
 
@@ -1123,8 +1149,13 @@ def history(
     )
 
 
-def settings(runtime: ServerRuntime) -> dict:
-    return {"model": runtime.model, "approval_mode": runtime.policy.default.value}
+def settings(runtime: ServerRuntime, *, include_plan_mode: bool = False) -> dict:
+    result = {"model": runtime.model, "approval_mode": runtime.policy.default.value}
+    if include_plan_mode:
+        result["plan_mode"] = (
+            runtime.loop.plan_mode if runtime.loop is not None else False
+        )
+    return result
 
 
 def catalog(runtime: ServerRuntime) -> dict:

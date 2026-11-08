@@ -3,13 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import os
+import queue
 import sqlite3
 import threading
+import time
+import traceback
 from pathlib import Path
 
 import pytest
 
 import zeta.transcript_search.index as index_module
+import zeta.transcript_search.refresh as refresh_module
+from tests.support.processes import reap_process
 from zeta.cli.main import build_parser
 from zeta.cli.project import run as run_project
 from zeta.project_registry import ProjectRegistry
@@ -18,7 +24,10 @@ from zeta.transcript_search.index import (
     TranscriptIndex,
     TranscriptIndexUnavailable,
     TranscriptSource,
+)
+from zeta.transcript_search.refresh import (
     refresh_transcript_index,
+    transcript_index_refresh_failure,
 )
 
 PROJECT_A = "p_" + "a" * 32
@@ -26,9 +35,7 @@ PROJECT_B = "p_" + "b" * 32
 
 
 def _row(seq: int, role: str, text: str, *, state: str | None = None) -> dict:
-    metadata = (
-        {"zeta.origin": "user", "origin": "human"} if role == "user" else {}
-    )
+    metadata = {"zeta.origin": "user", "origin": "human"} if role == "user" else {}
     if state is not None:
         metadata["response_state"] = state
     return {
@@ -37,7 +44,13 @@ def _row(seq: int, role: str, text: str, *, state: str | None = None) -> dict:
         "parent_id": f"r-{seq - 1}" if seq > 1 else None,
         "lane": "main",
         "type": "message",
-        "data": {"message": {"role": role, "content": [{"type": "text", "text": text}], "metadata": metadata}},
+        "data": {
+            "message": {
+                "role": role,
+                "content": [{"type": "text", "text": text}],
+                "metadata": metadata,
+            }
+        },
     }
 
 
@@ -60,19 +73,80 @@ def _write_rows(source: TranscriptSource, rows: list[dict]) -> None:
     )
 
 
-def _construct_index_process(project_dir: str, start, results) -> None:
-    start.wait()
-    TranscriptIndex(Path(project_dir), PROJECT_A)
-    results.put(None)
+def _construct_index_process(child_index: int, project_dir: str, start, results) -> None:
+    results.put((child_index, "ready", None))
+    try:
+        assert start.wait(60), "timed out waiting 60s for the parent start signal"
+        TranscriptIndex(Path(project_dir), PROJECT_A)
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put((child_index, "error", traceback.format_exc()))
+    else:
+        results.put((child_index, "ok", None))
 
 
 def _append_index_process(
-    project_dir: str, session_dir: str, session_id: str, start, results
+    child_index: int,
+    project_dir: str,
+    session_dir: str,
+    session_id: str,
+    start,
+    results,
 ) -> None:
-    start.wait()
-    index = TranscriptIndex(Path(project_dir), PROJECT_A)
-    index.append(TranscriptSource(session_id, Path(session_dir)))
-    results.put(None)
+    results.put((child_index, "ready", None))
+    try:
+        assert start.wait(60), "timed out waiting 60s for the parent start signal"
+        index = TranscriptIndex(Path(project_dir), PROJECT_A)
+        index.append(TranscriptSource(session_id, Path(session_dir)))
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put((child_index, "error", traceback.format_exc()))
+    else:
+        results.put((child_index, "ok", None))
+
+
+def _await_phase(children, results, phase: str, deadline: float) -> dict[int, tuple[str, object]]:
+    messages: dict[int, tuple[str, object]] = {}
+    while len(messages) < len(children):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return messages
+        try:
+            child_index, message_phase, payload = results.get(
+                timeout=min(0.1, remaining)
+            )
+        except queue.Empty:
+            for child_index, child in enumerate(children):
+                child.is_alive()
+                if child_index not in messages and child.exitcode not in (None, 0):
+                    raise AssertionError(
+                        f"child {child_index} exited before {phase}: "
+                        f"exitcode={child.exitcode}"
+                    )
+            continue
+        assert message_phase == phase or (
+            phase == "ok" and message_phase == "error"
+        ), f"child {child_index} reported {message_phase!r}, expected {phase!r}"
+        messages[child_index] = (message_phase, payload)
+    return messages
+
+
+def _diagnostic_process(child_index: int, start, results) -> None:
+    results.put((child_index, "ready", None))
+    start.wait(60)
+    try:
+        if child_index == 3:
+            raise RuntimeError("child 3 mutation")
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put((child_index, "error", traceback.format_exc()))
+    else:
+        results.put((child_index, "ok", None))
+
+
+def _exit_before_ready_process(child_index: int, start, results) -> None:
+    if child_index == 2:
+        os._exit(7)
+    results.put((child_index, "ready", None))
+    start.wait(60)
+    results.put((child_index, "ok", None))
 
 
 def _run_index_processes(target, arguments: list[tuple]) -> list[str | None]:
@@ -80,16 +154,67 @@ def _run_index_processes(target, arguments: list[tuple]) -> list[str | None]:
     start = context.Event()
     results = context.Queue()
     processes = [
-        context.Process(target=target, args=(*items, start, results))
-        for items in arguments
+        context.Process(target=target, args=(index, *items, start, results))
+        for index, items in enumerate(arguments)
     ]
-    for process in processes:
-        process.start()
-    start.set()
-    for process in processes:
-        process.join(10)
-    assert all(process.exitcode == 0 for process in processes)
-    return [results.get(timeout=2) for _ in processes]
+    messages: dict[int, tuple[str, object]] = {}
+
+    def diagnostics() -> str:
+        return "\n".join(
+            f"child {number}: exitcode={process.exitcode}, "
+            f"last_phase={messages.get(number, (None, None))[0]!r}, "
+            f"traceback={messages.get(number, (None, None))[1]!r}"
+            for number, process in enumerate(processes)
+        )
+
+    try:
+        for process in processes:
+            process.start()
+
+        messages.update(
+            _await_phase(
+                processes,
+                results,
+                "ready",
+                time.monotonic() + 60,
+            )
+        )
+        assert len(messages) == len(processes), (
+            "timed out waiting 60s for all children to report ready;\n"
+            + diagnostics()
+        )
+        start.set()
+
+        messages.update(
+            _await_phase(
+                processes,
+                results,
+                "ok",
+                time.monotonic() + 60,
+            )
+        )
+        assert len(messages) == len(processes), (
+            "timed out waiting 60s for all children to finish;\n" + diagnostics()
+        )
+        for process in processes:
+            process.join(60)
+        assert all(message[0] == "ok" for message in messages.values()), diagnostics()
+        assert all(process.exitcode == 0 for process in processes), diagnostics()
+        return [None] * len(processes)
+    finally:
+        start.set()
+        for process in processes:
+            reap_process(process, timeout=60)
+
+
+def test_process_diagnostics_keep_child_identity_and_traceback() -> None:
+    with pytest.raises(AssertionError, match=r"child 3:.*child 3 mutation"):
+        _run_index_processes(_diagnostic_process, [()] * 8)
+
+
+def test_process_exit_before_ready_reports_exitcode() -> None:
+    with pytest.raises(AssertionError, match=r"child 2 exited before ready: exitcode=7"):
+        _run_index_processes(_exit_before_ready_process, [()] * 8)
 
 
 def test_concurrent_processes_initialize_one_valid_database(tmp_path: Path) -> None:
@@ -135,8 +260,22 @@ def test_concurrent_processes_initialize_and_append_all_sessions(
 
 def test_rebuild_equals_incremental_append(tmp_path: Path) -> None:
     sources = [
-        _source(tmp_path / "sessions", "one", [_row(1, "user", "alpha question"), _row(2, "assistant", "beta answer", state="completed")]),
-        _source(tmp_path / "sessions", "two", [_row(1, "user", "gamma question"), _row(2, "assistant", "delta answer", state="completed")]),
+        _source(
+            tmp_path / "sessions",
+            "one",
+            [
+                _row(1, "user", "alpha question"),
+                _row(2, "assistant", "beta answer", state="completed"),
+            ],
+        ),
+        _source(
+            tmp_path / "sessions",
+            "two",
+            [
+                _row(1, "user", "gamma question"),
+                _row(2, "assistant", "delta answer", state="completed"),
+            ],
+        ),
     ]
     rebuilt = TranscriptIndex(tmp_path / "rebuilt", PROJECT_A)
     rebuilt.rebuild(sources)
@@ -172,7 +311,9 @@ def test_incremental_state_keeps_only_sanitized_search_evidence(tmp_path: Path) 
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        stored = "\n".join(row[0] for row in connection.execute("SELECT text FROM units"))
+        stored = "\n".join(
+            row[0] for row in connection.execute("SELECT text FROM units")
+        )
     indexed = "\n".join(hit.unit.text for hit in index.search("safe answer"))
     assert "source_rows" not in tables
     assert "TOP_SECRET_KEY_MATERIAL" not in stored
@@ -183,7 +324,14 @@ def test_incremental_state_keeps_only_sanitized_search_evidence(tmp_path: Path) 
 
 
 def test_project_scope_rejects_wrong_project_canary(tmp_path: Path) -> None:
-    source = _source(tmp_path / "sessions", "one", [_row(1, "user", "private canary"), _row(2, "assistant", "answer", state="completed")])
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "private canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
     index_a = TranscriptIndex(tmp_path / "a", PROJECT_A)
     index_b = TranscriptIndex(tmp_path / "b", PROJECT_B)
     index_a.append(source)
@@ -196,7 +344,14 @@ def test_project_scope_rejects_wrong_project_canary(tmp_path: Path) -> None:
 
 
 def test_deletion_and_reassignment(tmp_path: Path) -> None:
-    source = _source(tmp_path / "sessions", "one", [_row(1, "user", "moving canary"), _row(2, "assistant", "answer", state="completed")])
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "moving canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
     old = TranscriptIndex(tmp_path / "old", PROJECT_A)
     new = TranscriptIndex(tmp_path / "new", PROJECT_B)
     old.append(source)
@@ -207,11 +362,21 @@ def test_deletion_and_reassignment(tmp_path: Path) -> None:
 
 
 def test_cursor_lag_resumes_without_duplicates(tmp_path: Path) -> None:
-    source = _source(tmp_path / "sessions", "one", [_row(1, "user", "crash recovery"), _row(2, "assistant", "idempotent", state="completed")])
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "crash recovery"),
+            _row(2, "assistant", "idempotent", state="completed"),
+        ],
+    )
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
     index.append(source)
     with sqlite3.connect(index.path) as connection:
-        connection.execute("UPDATE session_cursors SET last_seq = 0 WHERE session_id = ?", (source.session_id,))
+        connection.execute(
+            "UPDATE session_cursors SET last_seq = 0 WHERE session_id = ?",
+            (source.session_id,),
+        )
         connection.commit()
     index.append(source)
     status = index.status()
@@ -220,8 +385,22 @@ def test_cursor_lag_resumes_without_duplicates(tmp_path: Path) -> None:
 
 
 def test_relaxed_search_uses_distinctive_partial_terms(tmp_path: Path) -> None:
-    source = _source(tmp_path / "sessions", "one", [_row(1, "user", "common common platypus"), _row(2, "assistant", "answer", state="completed")])
-    other = _source(tmp_path / "sessions", "two", [_row(1, "user", "common ordinary"), _row(2, "assistant", "answer", state="completed")])
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "common common platypus"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    other = _source(
+        tmp_path / "sessions",
+        "two",
+        [
+            _row(1, "user", "common ordinary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
     index.rebuild((source, other))
     hits = index.search("missing common platypus")
@@ -252,12 +431,12 @@ def test_unverified_append_rereads_and_matches_rebuild(
         reads.append(result)
         return result
 
+    # test-contract: seam count bounded transcript reads through the index
     monkeypatch.setattr(index_module, "_read_transcript", observe)
     with source.conversation_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_row(3, "user", "second question")) + "\n")
         handle.write(
-            json.dumps(_row(4, "assistant", "second answer", state="completed"))
-            + "\n"
+            json.dumps(_row(4, "assistant", "second answer", state="completed")) + "\n"
         )
     index.append(source)
 
@@ -388,9 +567,7 @@ def test_rewrite_before_cursor_with_appended_tail_forces_full_reread(
 
 def test_database_size_is_bounded_against_indexed_text(tmp_path: Path) -> None:
     rows = []
-    paragraph = " ".join(
-        f"representative-token-{index % 80}" for index in range(240)
-    )
+    paragraph = " ".join(f"representative-token-{index % 80}" for index in range(240))
     for turn in range(800):
         rows.extend(
             (
@@ -477,7 +654,9 @@ def test_rebuild_concurrent_with_append_loses_nothing(
     assert entered.wait(5)
     with source.conversation_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_row(3, "user", "new canary")) + "\n")
-        handle.write(json.dumps(_row(4, "assistant", "new answer", state="completed")) + "\n")
+        handle.write(
+            json.dumps(_row(4, "assistant", "new answer", state="completed")) + "\n"
+        )
     append = threading.Thread(target=index.append, args=(source,))
     append.start()
     release.set()
@@ -529,13 +708,14 @@ def test_inflight_refresh_cannot_repopulate_unbound_project(
     assert index.search("binding canary") == ()
 
 
-def test_version_mismatch_refuses_old_rows_and_rebuild_restores(
-    tmp_path: Path
-) -> None:
+def test_version_mismatch_refuses_old_rows_and_rebuild_restores(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
         "one",
-        [_row(1, "user", "version canary"), _row(2, "assistant", "answer", state="completed")],
+        [
+            _row(1, "user", "version canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
     )
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
     index.append(source)
@@ -558,12 +738,17 @@ def test_rebuild_recovers_schema_mismatch_and_corrupt_database(tmp_path: Path) -
     source = _source(
         tmp_path / "sessions",
         "one",
-        [_row(1, "user", "repair canary"), _row(2, "assistant", "answer", state="completed")],
+        [
+            _row(1, "user", "repair canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
     )
     project_dir = tmp_path / "project"
     index = TranscriptIndex(project_dir, PROJECT_A)
     with sqlite3.connect(index.path) as connection:
-        connection.execute("UPDATE metadata SET value = '0' WHERE key = 'schema_version'")
+        connection.execute(
+            "UPDATE metadata SET value = '0' WHERE key = 'schema_version'"
+        )
         connection.commit()
     index.rebuild((source,))
     assert index.search("repair canary")
@@ -579,7 +764,10 @@ def test_rebuild_publishes_over_existing_wal_sidecars(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
         "one",
-        [_row(1, "user", "published canary"), _row(2, "assistant", "answer", state="completed")],
+        [
+            _row(1, "user", "published canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
     )
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
     reader = sqlite3.connect(index.path)
@@ -608,7 +796,10 @@ def test_operator_cli_rebuild_status_and_search(
     source = _source(
         home / "sessions",
         "one",
-        [_row(1, "user", "operator canary"), _row(2, "assistant", "answer", state="completed")],
+        [
+            _row(1, "user", "operator canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
     )
     (source.session_dir / "meta.json").write_text(
         json.dumps({"project_id": project.project_id}), encoding="utf-8"
@@ -636,29 +827,36 @@ async def test_refreshes_coalesce_per_project(
     source = _source(
         tmp_path / "sessions",
         "one",
-        [_row(1, "user", "coalesce"), _row(2, "assistant", "answer", state="completed")],
+        [
+            _row(1, "user", "coalesce"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
     )
     (source.session_dir / "meta.json").write_text(
         json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
     )
     batches: list[tuple[str, ...]] = []
-    original = index_module._refresh_sources
+    original = refresh_module._refresh_sources
 
     def observe(root: Path, project_id: str, sources) -> None:
         batches.append(tuple(item.session_id for item in sources))
         original(root, project_id, sources)
 
-    monkeypatch.setattr(index_module, "_refresh_sources", observe)
-    await asyncio.gather(
-        *(
-            refresh_transcript_index(
-                tmp_path / "projects",
-                PROJECT_A,
-                source.session_id,
-                source.session_dir,
+    # test-contract: seam inject the refresh worker boundary
+    monkeypatch.setattr(refresh_module, "_refresh_sources", observe)
+    await asyncio.wait_for(
+        asyncio.gather(
+            *(
+                refresh_transcript_index(
+                    tmp_path / "projects",
+                    PROJECT_A,
+                    source.session_id,
+                    source.session_dir,
+                )
+                for _ in range(10)
             )
-            for _ in range(10)
-        )
+        ),
+        10,
     )
 
     assert batches == [(source.session_id,)]
@@ -671,7 +869,8 @@ async def test_refresh_sqlite_failure_is_reported(
     def fail(*args, **kwargs) -> None:
         raise sqlite3.OperationalError("disk full")
 
-    monkeypatch.setattr(index_module, "_refresh_sources", fail)
+    # test-contract: seam inject the refresh worker boundary
+    monkeypatch.setattr(refresh_module, "_refresh_sources", fail)
     with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
         await refresh_transcript_index(
             tmp_path / "projects", PROJECT_A, "one", tmp_path / "missing"
@@ -703,7 +902,7 @@ async def test_transient_refresh_failure_retries_pending_session_on_next_refresh
         (source.session_dir / "meta.json").write_text(
             json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
         )
-    original = index_module._refresh_sources
+    original = refresh_module._refresh_sources
     calls = 0
 
     def fail_once(*args) -> None:
@@ -713,7 +912,8 @@ async def test_transient_refresh_failure_retries_pending_session_on_next_refresh
             raise sqlite3.OperationalError("database is locked")
         original(*args)
 
-    monkeypatch.setattr(index_module, "_refresh_sources", fail_once)
+    # test-contract: seam inject the refresh worker boundary
+    monkeypatch.setattr(refresh_module, "_refresh_sources", fail_once)
     with pytest.raises(index_module.TranscriptIndexError, match="database is locked"):
         await refresh_transcript_index(
             tmp_path / "projects", PROJECT_A, first.session_id, first.session_dir
@@ -756,14 +956,12 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
         store.take_persisted_appends(),
     )
 
-    await store.append_message_async(
-        message(MessageRole.USER, "durableretrycanary")
-    )
+    await store.append_message_async(message(MessageRole.USER, "durableretrycanary"))
     await store.append_message_async(
         message(MessageRole.ASSISTANT, "durable retry answer")
     )
     receipts = store.take_persisted_appends()
-    original_refresh = index_module._refresh_sources
+    original_refresh = refresh_module._refresh_sources
     refresh_calls = 0
 
     def fail_once(*args) -> None:
@@ -773,7 +971,8 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
             raise sqlite3.OperationalError("disk full")
         original_refresh(*args)
 
-    monkeypatch.setattr(index_module, "_refresh_sources", fail_once)
+    # test-contract: seam inject the refresh worker boundary
+    monkeypatch.setattr(refresh_module, "_refresh_sources", fail_once)
     with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
         await refresh_transcript_index(
             projects_root,
@@ -791,11 +990,9 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     )
     assert index.search("first indexed question")
     assert index.search("durableretrycanary") == ()
-    failure = getattr(
-        index_module,
-        "transcript_index_refresh_failure",
-        lambda *_args: None,
-    )(projects_root, PROJECT_A, store.session_id)
+    failure = transcript_index_refresh_failure(
+        projects_root, PROJECT_A, store.session_id
+    )
     assert failure == (
         "disk full; pending changes will retry after the next transcript refresh"
     )
@@ -809,9 +1006,10 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
 
     assert refresh_calls == 2
     assert len(index.search("durableretrycanary")) == 1
-    assert index_module.transcript_index_refresh_failure(
-        projects_root, PROJECT_A, store.session_id
-    ) is None
+    assert (
+        transcript_index_refresh_failure(projects_root, PROJECT_A, store.session_id)
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -833,12 +1031,13 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
     (source.session_dir / "meta.json").write_text(
         json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
     )
-    original_refresh = index_module._refresh_sources
+    original_refresh = refresh_module._refresh_sources
 
     def fail(*args) -> None:
         raise sqlite3.OperationalError("disk full")
 
-    monkeypatch.setattr(index_module, "_refresh_sources", fail)
+    # test-contract: seam inject the refresh worker boundary
+    monkeypatch.setattr(refresh_module, "_refresh_sources", fail)
     for offset in range(MAX_PENDING_APPEND_RECEIPTS + 1):
         receipt = PersistedAppend(
             start_offset=offset,
@@ -860,11 +1059,12 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
                 (receipt,),
             )
 
-    states = index_module._REFRESH_STATES[asyncio.get_running_loop()]
+    states = refresh_module._REFRESH_STATES[asyncio.get_running_loop()]
     pending = states[(projects_root.resolve(), PROJECT_A)].pending[source.session_id]
     assert pending.append_receipts is None
 
-    monkeypatch.setattr(index_module, "_refresh_sources", original_refresh)
+    # test-contract: seam inject the refresh worker boundary
+    monkeypatch.setattr(refresh_module, "_refresh_sources", original_refresh)
     await refresh_transcript_index(
         projects_root,
         PROJECT_A,
@@ -881,19 +1081,24 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
 async def test_append_runs_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = _source(tmp_path / "sessions", "one", [_row(1, "user", "ticker"), _row(2, "assistant", "answer", state="completed")])
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [_row(1, "user", "ticker"), _row(2, "assistant", "answer", state="completed")],
+    )
     (source.session_dir / "meta.json").write_text(
         json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
     )
     event_loop_thread = threading.get_ident()
     refresh_threads: list[int] = []
-    original_refresh = index_module._refresh_sources
+    original_refresh = refresh_module._refresh_sources
 
     def observed_refresh(*args) -> None:
         refresh_threads.append(threading.get_ident())
         original_refresh(*args)
 
-    monkeypatch.setattr(index_module, "_refresh_sources", observed_refresh)
+    # test-contract: seam inject the refresh worker boundary
+    monkeypatch.setattr(refresh_module, "_refresh_sources", observed_refresh)
     await refresh_transcript_index(
         tmp_path / "projects", PROJECT_A, source.session_id, source.session_dir
     )
@@ -937,13 +1142,23 @@ async def test_verified_appends_stay_incremental(
     store = ConversationStore(root, session_id="one")
     store.enable_persisted_append_tracking()
     store.append_message(
-        Message(MessageRole.USER, [TextContent("first question")], metadata={"zeta.origin": "user"})
+        Message(
+            MessageRole.USER,
+            [TextContent("first question")],
+            metadata={"zeta.origin": "user"},
+        )
     )
     store.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("first answer")], metadata={"response_state": "completed"})
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("first answer")],
+            metadata={"response_state": "completed"},
+        )
     )
     initial_receipts = store.take_persisted_appends()
-    source = TranscriptSource("one", store.session_dir, append_receipts=initial_receipts)
+    source = TranscriptSource(
+        "one", store.session_dir, append_receipts=initial_receipts
+    )
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
     index.append(source)
 
@@ -962,7 +1177,9 @@ async def test_verified_appends_stay_incremental(
         )
     )
     receipts = store.take_persisted_appends()
-    appended_bytes = sum(receipt.end_offset - receipt.start_offset for receipt in receipts)
+    appended_bytes = sum(
+        receipt.end_offset - receipt.start_offset for receipt in receipts
+    )
     observed: list[object] = []
     original_read = index_module._read_transcript
 
@@ -1053,13 +1270,18 @@ def test_unexplained_mtime_change_forces_reread(
     source = _source(
         tmp_path / "sessions",
         "one",
-        [_row(1, "user", "first question"), _row(2, "assistant", "first answer", state="completed")],
+        [
+            _row(1, "user", "first question"),
+            _row(2, "assistant", "first answer", state="completed"),
+        ],
     )
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
     index.append(source)
     with source.conversation_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_row(3, "user", "later question")) + "\n")
-        handle.write(json.dumps(_row(4, "assistant", "later answer", state="completed")) + "\n")
+        handle.write(
+            json.dumps(_row(4, "assistant", "later answer", state="completed")) + "\n"
+        )
 
     observed: list[object] = []
     original_read = index_module._read_transcript
@@ -1086,10 +1308,18 @@ def test_other_process_append_without_receipt_rereads(
     root = tmp_path / "sessions"
     writer = ConversationStore(root, session_id="one")
     writer.append_message(
-        Message(MessageRole.USER, [TextContent("first question")], metadata={"zeta.origin": "user"})
+        Message(
+            MessageRole.USER,
+            [TextContent("first question")],
+            metadata={"zeta.origin": "user"},
+        )
     )
     writer.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("first answer")], metadata={"response_state": "completed"})
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("first answer")],
+            metadata={"response_state": "completed"},
+        )
     )
     source = TranscriptSource("one", writer.session_dir)
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
@@ -1097,10 +1327,18 @@ def test_other_process_append_without_receipt_rereads(
 
     other_process = ConversationStore(root, session_id="one")
     other_process.append_message(
-        Message(MessageRole.USER, [TextContent("external question")], metadata={"zeta.origin": "user"})
+        Message(
+            MessageRole.USER,
+            [TextContent("external question")],
+            metadata={"zeta.origin": "user"},
+        )
     )
     other_process.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("external answer")], metadata={"response_state": "completed"})
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("external answer")],
+            metadata={"response_state": "completed"},
+        )
     )
 
     observed: list[object] = []

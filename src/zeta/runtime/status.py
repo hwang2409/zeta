@@ -90,6 +90,11 @@ def capture_slash_status(
             transcript_index_failure=loop.transcript_index_failure(
                 transcript_session_id or session_id
             ),
+            unavailable_accounts=(
+                context.unavailable_accounts
+                if (context := getattr(loop, "account_context", None)) is not None
+                else ()
+            ),
             project_context_health=project_context_health,
         ),
         transcript_entries=loop.store.resident_entries_snapshot(),

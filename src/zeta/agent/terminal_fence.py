@@ -27,13 +27,18 @@ class TerminalTransitionFence:
         self._delivering_prompt_id = delivering_prompt_id
         self._lock = asyncio.Lock()
 
+    def owned_work_refusal(self) -> str | None:
+        if not (work := self._owned_work()):
+            return None
+        shown = ", ".join(work[:16])
+        if len(work) > 16:
+            shown += f", … (+{len(work) - 16} more)"
+        return "wait, cancel, or hand off owned work first: " + shown
+
     async def accept_finish(self, report: dict[str, object]) -> str | None:
         async with self._lock:
-            if work := self._owned_work():
-                shown = ", ".join(work[:16])
-                if len(work) > 16:
-                    shown += f", … (+{len(work) - 16} more)"
-                return "wait, cancel, or hand off owned work first: " + shown
+            if refusal := self.owned_work_refusal():
+                return refusal
             if self._notification_pending():
                 return "pending notification must be read before finish"
             reason = await self._store._to_thread_durable(

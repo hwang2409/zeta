@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import time
 import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
@@ -23,14 +25,99 @@ from .agent_progress import (
     publish_live_agent_lifecycle,
     remove_live_agent_lifecycle,
 )
-from .checkpoints import ConversationIntegrityError, _now
+from .checkpoints import ConversationIntegrityError, _now, load_session_json
 from .session_files import (
     child_directory,
+    read_session_file,
     write_session_file,
     write_session_file_if_absent,
 )
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
+_TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
+
+
+@dataclass(frozen=True, slots=True)
+class MissingAgentLifecycle:
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedAgentLifecycle:
+    value: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class BrokenAgentLifecycle:
+    path: Path
+    reason: str
+    recoverability: Literal["preserve"] = "preserve"
+    preserved: bool = True
+
+
+AgentLifecycleRead = (
+    MissingAgentLifecycle | LoadedAgentLifecycle | BrokenAgentLifecycle
+)
+
+
+def _validate_status_lifecycle(value: object) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ValueError("lifecycle data is not an object")
+    lifecycle = value
+    state = lifecycle.get("state")
+    finished_at = lifecycle.get("finished_at")
+    if state not in _AGENT_STATES:
+        raise ValueError("invalid child metadata state")
+    for field in ("started_at", "finished_at"):
+        timestamp = lifecycle.get(field)
+        if timestamp is None and field == "finished_at":
+            continue
+        if type(timestamp) is not str:
+            raise ValueError("invalid child timestamps")
+        try:
+            datetime.fromisoformat(timestamp)
+        except ValueError as exc:
+            raise ValueError("invalid child timestamps") from exc
+    if state in _TERMINAL_AGENT_STATES and finished_at is None:
+        raise ValueError("terminal state has no finished_at")
+    if state not in _TERMINAL_AGENT_STATES and finished_at is not None:
+        raise ValueError("non-terminal state has finished_at")
+    for field, minimum in (("turns_used", 0), ("tool_calls", 0), ("depth", 1)):
+        field_value = lifecycle.get(field, 0 if field != "depth" else None)
+        if type(field_value) is not int or field_value < minimum:
+            raise ValueError(f"invalid child metadata {field}")
+    for field in ("current_step", "agent_type"):
+        if type(lifecycle.get(field)) is not str:
+            raise ValueError(f"invalid child metadata {field}")
+    for field in ("handle", "description"):
+        if field in lifecycle and type(lifecycle[field]) is not str:
+            raise ValueError(f"invalid child metadata {field}")
+    elapsed = lifecycle.get("elapsed", 0.0)
+    if type(elapsed) not in {int, float} or not math.isfinite(elapsed) or elapsed < 0:
+        raise ValueError("invalid child metadata elapsed")
+    if "final_result" in lifecycle and type(lifecycle["final_result"]) is not str:
+        raise ValueError("invalid child final_result")
+    return lifecycle
+
+
+def read_agent_lifecycle_state(directory_fd: int, path: Path) -> AgentLifecycleRead:
+    """Read one lifecycle without collapsing missing or broken evidence."""
+
+    try:
+        raw = read_session_file(directory_fd, "agent_lifecycle.json")
+    except FileNotFoundError:
+        return MissingAgentLifecycle(path)
+    except OSError:
+        return BrokenAgentLifecycle(path, "could not read child state")
+    try:
+        value = load_session_json(raw)
+    except (ConversationIntegrityError, TypeError, ValueError):
+        return BrokenAgentLifecycle(path, "invalid lifecycle json")
+    try:
+        return LoadedAgentLifecycle(_validate_status_lifecycle(value))
+    except (TypeError, ValueError) as exc:
+        reason = str(exc).strip() or "invalid child lifecycle"
+        return BrokenAgentLifecycle(path, reason)
 
 
 def _session_state_mutations(
@@ -745,6 +832,13 @@ class AgentStateMixin:
     def _write_agent_lifecycle(self) -> None:
         """Atomically write lifecycle data without changing session state bytes."""
 
+        existing = read_agent_lifecycle_state(
+            self.directory_fd, self.agent_lifecycle_path
+        )
+        if isinstance(existing, BrokenAgentLifecycle):
+            raise ConversationIntegrityError(
+                "agent lifecycle is broken; refusing to overwrite preserved bytes"
+            )
         if (
             self._agent_lifecycle is not None
             and "final_result_is_receipt" in self._agent_lifecycle

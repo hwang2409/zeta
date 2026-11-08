@@ -323,7 +323,9 @@ def _agent_status_row(
     ):
         if isinstance(value, str) and value:
             fields.append(value)
-    return " · ".join(fields)
+    row = " · ".join(fields)
+    reason = child.get("reason")
+    return f"{row} — {reason}" if isinstance(reason, str) and reason else row
 
 
 def _render_agent_status(
