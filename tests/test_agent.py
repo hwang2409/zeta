@@ -19745,6 +19745,9 @@ async def test_idle_child_wake_tool_count_is_cumulative(tmp_path: Path, monkeypa
     loop.explicit_finish = True
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(
+            backend.child_started["work"].wait(), what="child start"
+        )
         await await_or_fail(idle_seen.wait(), what="first idle transition")
         handle = next(iter(parent_store.agent_children()))
         assert await send_to_run(parent_store, handle, "follow up", channel=loop._background_owner.conversation_channel) is None
