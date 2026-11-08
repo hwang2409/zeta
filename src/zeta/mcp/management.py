@@ -250,11 +250,35 @@ class MCPManagementService:
         if self._closed.is_set():
             raise MCPManagementClosedError("MCP management service is closed")
 
+    def _no_project_error(self) -> MCPManagementError:
+        if self.project_dir is None:
+            return MCPManagementError("project scope requires a repository")
+        return MCPManagementError(
+            "project directory no longer exists; cannot write MCP config"
+        )
+
+    def _project_root_for_path(self, path: Path) -> Path | None:
+        if self.project_dir is None:
+            return None
+        project_path = self._project_path or project_config_path(
+            self.project_dir
+        ).resolve()
+        return project_path.parent.parent if path == project_path else None
+
     def _atomic_json(
         self, path: Path, data: object, *, mode: int | None = None
     ) -> None:
         self._ensure_open()
-        path.parent.mkdir(parents=True, exist_ok=True)
+        project_root = self._project_root_for_path(path)
+        if project_root is not None:
+            if not project_root.is_dir():
+                raise self._no_project_error()
+            try:
+                path.parent.mkdir(parents=False, exist_ok=True)
+            except FileNotFoundError as exc:
+                raise self._no_project_error() from exc
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_open()
         fd, temporary = tempfile.mkstemp(
             prefix=".mcp-management.", dir=str(path.parent)
@@ -312,16 +336,36 @@ class MCPManagementService:
         trust_path = home_path.parent / "mcp-trust.json"
         return home_path, project_path, trust_path
 
-    def _acquire_locks(self, paths: tuple[Path, ...]) -> list[object]:
+    def _acquire_locks(
+        self, paths: tuple[Path, ...]
+    ) -> tuple[list[object], set[Path]]:
         handles: list[object] = []
+        unavailable: set[Path] = set()
         deadline = time.monotonic() + self._lock_timeout
         try:
             for path in sorted(set(paths), key=str):
                 self._ensure_open()
-                path.parent.mkdir(parents=True, exist_ok=True)
+                project_root = self._project_root_for_path(path)
+                if project_root is not None:
+                    try:
+                        if not project_root.is_dir():
+                            unavailable.add(path)
+                            continue
+                        path.parent.mkdir(parents=False, exist_ok=True)
+                    except FileNotFoundError:
+                        unavailable.add(path)
+                        continue
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
                 lock_path = path.with_name(f".{path.name}.lock")
                 self._ensure_open()
-                handle = lock_path.open("a+")
+                try:
+                    handle = lock_path.open("a+")
+                except FileNotFoundError:
+                    if project_root is None:
+                        raise
+                    unavailable.add(path)
+                    continue
                 try:
                     while True:
                         self._ensure_open()
@@ -338,7 +382,7 @@ class MCPManagementService:
                     handle.close()
                     raise
                 handles.append(handle)
-            return handles
+            return handles, unavailable
         except BaseException:
             self._release_locks(handles)
             raise
@@ -513,11 +557,15 @@ class MCPManagementService:
         paths = tuple(
             path for path in (home_path, project_path, trust_path) if path is not None
         )
-        handles = self._acquire_locks(paths)
+        handles, unavailable = self._acquire_locks(paths)
+        # A missing project root is unavailable for this transaction only; the
+        # candidate keeps the canonical path so a recreated root works again.
+        usable_project = None if project_path in unavailable else project_path
         try:
             if mutation is not None:
-                mutation(home_path, project_path, trust_path)
-            return self._candidate_locked(home_path, project_path, trust_path)
+                mutation(home_path, usable_project, trust_path)
+            candidate = self._candidate_locked(home_path, usable_project, trust_path)
+            return replace(candidate, project_path=project_path)
         finally:
             self._release_locks(handles)
 
@@ -676,7 +724,7 @@ class MCPManagementService:
         ) -> None:
             path = project_path if scope == "project" else home_path
             if path is None:
-                raise MCPManagementError("project scope requires a repository")
+                raise self._no_project_error()
             document = self._read_object(path)
             servers = copy.deepcopy(self._servers(document, path))
             change(servers)
@@ -756,7 +804,7 @@ class MCPManagementService:
     async def set_trusted(self, name: str, *, trusted: bool) -> _MCPManagerView:
         def mutate(_home: Path, project_path: Path | None, trust_path: Path) -> None:
             if project_path is None:
-                raise MCPManagementError("project scope requires a repository")
+                raise self._no_project_error()
             project = self._servers(self._read_object(project_path), project_path)
             raw = project.get(name)
             if type(raw) is not dict:
