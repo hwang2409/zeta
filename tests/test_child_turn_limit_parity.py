@@ -13,6 +13,7 @@ from rich.text import Text
 
 import zeta.agent.runner as agent_runner_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.agent.presets import AgentPreset
 from zeta.agent.runner import run_finish_gate as real_run_finish_gate
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
@@ -20,7 +21,6 @@ from zeta.runtime.loop import AgentLoop
 from zeta.server.ergonomics import _history_entry_rows
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
-from zeta.agent.presets import AgentPreset
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import _read_agent_status
 from zeta.tui.app import TUIApp
