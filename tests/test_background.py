@@ -26,7 +26,11 @@ from rich.text import Text
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.background_task_owner as owner_module
 import zeta.tools._shared.process as process_module
-from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.fake_backend import (
+    FakeBackend,
+    PerActorFakeBackend,
+    ScriptedTurn,
+)
 from tests.support.owned import await_or_fail
 from tests.support.processes import (
     kill_group_if_present,
@@ -1581,7 +1585,7 @@ def test_store_replay_accepts_task_and_unknown_notification_kinds(
 
 
 def test_child_question_notification_renders_question() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -1606,7 +1610,7 @@ def test_child_question_notification_renders_question() -> None:
 
 
 def test_child_idle_notification_renders_readable_report() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -1632,7 +1636,7 @@ def test_child_idle_notification_renders_readable_report() -> None:
 
 
 def test_child_idle_notification_without_description_shows_error_line() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui import theme
     from zeta.tui.render import render_agent_notification
 
@@ -1653,7 +1657,7 @@ def test_child_idle_notification_without_description_shows_error_line() -> None:
 
 
 def test_child_question_withdrawn_notification_renders_text() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -1677,7 +1681,7 @@ def test_child_question_withdrawn_notification_renders_text() -> None:
     assert "question withdrawn: child finished" not in plain
 
 def test_child_question_notification_strips_terminal_controls() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -1704,7 +1708,7 @@ def test_child_question_notification_strips_terminal_controls() -> None:
 
 
 def test_child_question_withdrawn_notification_ignores_legacy_text() -> None:
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -1729,7 +1733,7 @@ def test_child_question_withdrawn_notification_ignores_legacy_text() -> None:
 def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
     # S7: the TUI renders task_exited receipts and tolerates unknown kinds
     # without ever rendering them as agent completions.
-    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.protocol.types import StreamEventType
     from zeta.tui.render import render_agent_notification
 
     def render(data: dict) -> str:
@@ -1912,10 +1916,13 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         {"prompt": "child", "description": "background", "background": True},
     )
     backend = PerActorFakeBackend(
-        [ScriptedTurn(tool_calls=[call])],
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ],
         {"child": [ScriptedTurn([TextContent("done")])]},
         parent_prompt="start",
-        gated_child_call=0,
+        gated_child_prompts=set(),
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
