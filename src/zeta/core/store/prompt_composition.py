@@ -173,6 +173,12 @@ class PromptCompositionMixin:
                 current.project_memory_offset = composition.project_memory_offset
                 current.project_memory_length = composition.project_memory_length
                 current.project_memory_digest = composition.project_memory_digest
+                # Refuse a shape the reader would reject, so a failed resume never
+                # leaves an unreadable meta.json behind.
+                type(current).from_dict(
+                    current.to_storage_dict(),
+                    path=self.sessions_dir / metadata.session_id / "meta.json",
+                )
                 self._write_unlocked(current, directory_fd=directory_fd)
             self._copy_metadata(metadata, current)
             return composition
