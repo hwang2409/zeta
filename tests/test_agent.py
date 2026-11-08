@@ -2833,6 +2833,56 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_abort_during_next_request_preparation_skips_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("first-tool", "echo", {})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("must not dispatch")]),
+        ]
+    )
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path),
+        tools={"echo": lambda _: "done"},
+        max_turns=2,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    request_preparation_started = asyncio.Event()
+    allow_request_preparation = asyncio.Event()
+    assemble_calls = 0
+    original_assemble = loop.context_assembler.assemble
+
+    async def pause_second_request(*args, **kwargs):
+        nonlocal assemble_calls
+        assemble_calls += 1
+        if assemble_calls == 2:
+            request_preparation_started.set()
+            await asyncio.wait_for(allow_request_preparation.wait(), 10)
+        return await original_assemble(*args, **kwargs)
+
+    # test-contract: seam force abort after turn admission and before provider dispatch
+    loop.context_assembler.assemble = pause_second_request  # type: ignore[method-assign]
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await asyncio.wait_for(request_preparation_started.wait(), 10)
+        loop.abort()
+        allow_request_preparation.set()
+        await asyncio.wait_for(run, 10)
+        assert len(backend.calls) == 1
+    finally:
+        allow_request_preparation.set()
+        if not run.done():
+            run.cancel()
+        await asyncio.wait_for(asyncio.gather(run, return_exceptions=True), 10)
+        await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_parent_abort_cancels_background_grandchild(
     tmp_path: Path,
 ) -> None:
