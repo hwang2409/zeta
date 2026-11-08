@@ -30,34 +30,41 @@ class ExecutionOwnerStoreMixin:
         if not observer:
             self.assert_execution_owner()
         authority = nullcontext() if observer else execution_lock()
-        with authority, shape_lock(), os.fdopen(
-            open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
-        ) as handle:
-            if deadline is None:
-                try:
-                    fcntl.flock(
-                        handle.fileno(),
-                        fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB,
-                    )
-                except BlockingIOError:
-                    yield False
-                    return
-            else:
-                while True:
-                    if time.monotonic() >= deadline:
-                        raise PendingPromptCommitTimeoutError(
-                            "pending prompt commit deadline exceeded"
-                        )
+        started = False
+        try:
+            with authority, shape_lock(), os.fdopen(
+                open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT),
+                "r+",
+            ) as handle:
+                if deadline is None:
                     try:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(
+                            handle.fileno(),
+                            fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        )
                     except BlockingIOError:
-                        time.sleep(max(0, min(0.01, deadline - time.monotonic())))
-                    else:
-                        break
-            self._start_entries_installed()
-            try:
-                self._load()
-                yield True
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        yield False
+                        return
+                else:
+                    while True:
+                        if time.monotonic() >= deadline:
+                            raise PendingPromptCommitTimeoutError(
+                                "pending prompt commit deadline exceeded"
+                            )
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            time.sleep(max(0, min(0.01, deadline - time.monotonic())))
+                        else:
+                            break
+                self._start_entries_installed()
+                started = True
+                try:
+                    self._load()
+                    yield True
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            # Callbacks may append again, so they run after every ranked lock is released.
+            if started:
                 self._finish_entries_installed()
