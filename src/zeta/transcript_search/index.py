@@ -949,25 +949,24 @@ class TranscriptIndex:
     def _migrate_schema(self) -> None:
         try:
             connection = sqlite3.connect(self.path)
-            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            with closing(connection), connection:
+                metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+                if metadata.get("schema_version") != "4":
+                    return
+                columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(session_cursors)")
+                }
+                if "prefix_digest" not in columns:
+                    connection.execute(
+                        "ALTER TABLE session_cursors ADD COLUMN prefix_digest TEXT"
+                    )
+                connection.execute(
+                    "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
         except sqlite3.DatabaseError:
             return
-        with closing(connection):
-            if int(metadata.get("schema_version", -1)) != 4:
-                return
-            columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(session_cursors)")
-            }
-            if "prefix_digest" not in columns:
-                connection.execute(
-                    "ALTER TABLE session_cursors ADD COLUMN prefix_digest TEXT"
-                )
-            connection.execute(
-                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
-                (str(SCHEMA_VERSION),),
-            )
-            connection.commit()
 
     def _version_state(self) -> tuple[int, int, int, str | None]:
         try:

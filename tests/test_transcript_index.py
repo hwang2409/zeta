@@ -275,6 +275,55 @@ def test_v4_cursor_schema_migrates_and_missing_digest_rebuilds(
     assert migrated.search("after")
 
 
+def test_malformed_schema_metadata_constructs_for_rebuild(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "malformed metadata canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    with sqlite3.connect(index.path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = 'malformed' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    recovered = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    status = recovered.status()
+    assert not status.ready
+    assert status.detail is not None and "rebuild" in status.detail
+    recovered.rebuild((source,))
+    assert recovered.search("malformed metadata canary")
+
+
+def test_v4_missing_cursor_table_constructs_for_rebuild(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "missing cursor canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    with sqlite3.connect(index.path) as connection:
+        connection.execute("DROP TABLE session_cursors")
+        connection.execute(
+            "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    recovered = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    status = recovered.status()
+    assert not status.ready
+    assert status.detail is not None and "rebuild" in status.detail
+    recovered.rebuild((source,))
+    assert recovered.search("missing cursor canary")
+
+
 def test_cursor_lag_resumes_without_duplicates(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
