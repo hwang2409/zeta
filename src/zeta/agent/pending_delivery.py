@@ -779,25 +779,6 @@ class StepDeliveryFlow:
             self._wake_sink(source)
 
 
-def _answered_question_notification_id(
-    store: ConversationStore, child_instance_id: str, message: str
-) -> str | None:
-    match = QUESTION_ANSWER_PATTERN.match(message)
-    if match is None:
-        return None
-    question_id = match.group(1)
-    return next(
-        (
-            entry.id
-            for entry in store.agent_notifications()
-            if entry.data.get("kind") == "child_question"
-            and entry.data.get("child_instance_id") == child_instance_id
-            and entry.data.get("question_id") == question_id
-        ),
-        None,
-    )
-
-
 async def send_to_run(
     parent_store: ConversationStore,
     child_instance_id: object,

@@ -2060,13 +2060,13 @@ def _render_notification_transcript(
 
 def test_agent_notification_adds_one_blank_line_before_receipt() -> None:
     assert _render_notification_transcript() == (
-        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turns"
+        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turn"
     )
 
 
 def test_agent_notification_does_not_double_existing_blank_line() -> None:
     assert _render_notification_transcript(preceding_blank=True) == (
-        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turns"
+        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turn"
     )
 
 
@@ -2082,15 +2082,15 @@ def test_first_agent_notification_has_no_leading_blank_line() -> None:
     presenter.print_unit(render_event(_agent_notification_event()), blank_before=True)
 
     assert Text.from_ansi(transcript.render(120)).plain == (
-        "⏺ inspect repository · completed · 1.0s · 1 turns"
+        "⏺ inspect repository · completed · 1.0s · 1 turn"
     )
 
 
 def test_consecutive_agent_notifications_have_one_blank_line_between_receipts() -> None:
     assert _render_notification_transcript(receipts=2) == (
         "pr link\n\n"
-        "⏺ inspect repository · completed · 1.0s · 1 turns\n\n"
-        "⏺ inspect repository · completed · 1.0s · 1 turns"
+        "⏺ inspect repository · completed · 1.0s · 1 turn\n\n"
+        "⏺ inspect repository · completed · 1.0s · 1 turn"
     )
 
 
@@ -2098,7 +2098,7 @@ def test_tool_card_then_agent_notification_has_one_blank_line() -> None:
     rendered = _render_notification_transcript(tool_card=True)
 
     assert "read README.md" in rendered
-    assert "\n\n⏺ inspect repository · completed · 1.0s · 1 turns" in rendered
+    assert "\n\n⏺ inspect repository · completed · 1.0s · 1 turn" in rendered
 
 
 @pytest.mark.parametrize("status", ["error", "canceled"])
