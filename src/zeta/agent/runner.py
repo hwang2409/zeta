@@ -705,7 +705,7 @@ async def run_agent_tool(
     except BaseException:
         await child_store._to_thread_store(child_store.close)
         raise
-    loop._background_owner.store_leases.enter_context(child_store)
+    loop._background_owner.lease_store(child_store)
     loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)

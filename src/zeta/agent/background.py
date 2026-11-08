@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import weakref
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
@@ -94,6 +95,9 @@ class BackgroundAgentOwner:
         # Receipts and adopted descendants can outlive their immediate loop.
         # The tree owns child leases until root shutdown joins all watchers.
         self.store_leases = ExitStack()
+        self._store_lease_fallbacks: dict[
+            ConversationStore, weakref.ReferenceType[ConversationStore]
+        ] = {}
         self._stores: set[ConversationStore] = set()
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
@@ -255,6 +259,20 @@ class BackgroundAgentOwner:
         stores = [self.notification_store, *self._stores, *self._parent_stores.values()]
         return tuple(dict.fromkeys(stores))
 
+    def lease_store(self, store: ConversationStore) -> None:
+        """Keep a child store as a root-shutdown fallback until it closes."""
+        store_ref = weakref.ref(store)
+        self._store_lease_fallbacks[store] = store_ref
+        self.store_leases.callback(self._close_store_lease, store_ref)
+
+    @staticmethod
+    def _close_store_lease(
+        store_ref: weakref.ReferenceType[ConversationStore],
+    ) -> None:
+        store = store_ref()
+        if store is not None:
+            store.close()
+
     def track_store(self, store: ConversationStore) -> None:
         """Track a child store so completed trees can release its directory fd."""
 
@@ -287,15 +305,22 @@ class BackgroundAgentOwner:
             close_task.add_done_callback(self._finish_store_close)
 
     def _finish_store_close(self, task: asyncio.Task[Any]) -> None:
-        if task.cancelled() or task.exception() is not None:
+        # Do not call exception() here: the waiter must observe close failures.
+        if task.cancelled() or getattr(task, "_exception", None) is not None:
             return
-        store = self._store_close_stores.pop(task, None)
-        if store is None:
-            return
+        store = self._store_close_stores.get(task)
+        if store is not None:
+            self._forget_closed_store(task, store)
+
+    def _forget_closed_store(
+        self, task: asyncio.Task[Any], store: ConversationStore
+    ) -> None:
+        self._store_close_stores.pop(task, None)
         self._store_close_tasks.discard(task)
         self._store_close_tasks_by_store.pop(store, None)
         self._pending_stores.discard(store)
         self._stores.discard(store)
+        self._store_lease_fallbacks.pop(store, None)
     def register(
         self,
         instance_id: str,
@@ -401,9 +426,7 @@ class BackgroundAgentOwner:
                 store = self._store_close_stores.pop(task, None)
                 self._store_close_tasks.discard(task)
                 if store is not None:
-                    self._store_close_tasks_by_store.pop(store, None)
-                    self._pending_stores.discard(store)
-                    self._stores.discard(store)
+                    self._forget_closed_store(task, store)
 
     async def wait(self) -> None:
         current = asyncio.current_task()

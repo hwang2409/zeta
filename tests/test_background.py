@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gc
 import json
 import os
 import pty
@@ -13,6 +14,7 @@ import stat
 import subprocess
 import sys
 import threading
+import weakref
 from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
@@ -1034,6 +1036,44 @@ async def test_agent_store_closes_after_each_foreground_completion(
 
 
 @pytest.mark.asyncio
+async def test_successful_store_close_releases_root_lease_and_closes_once(
+    tmp_path: Path,
+) -> None:
+    class LeaseStore:
+        session_id = "child"
+
+        async def _to_thread_store(self, function):
+            return function()
+
+        def close(self) -> None:
+            nonlocal close_count
+            close_count += 1
+
+    close_count = 0
+    notification_store = ConversationStore(tmp_path / "notification")
+    store = LeaseStore()
+    owner = BackgroundAgentOwner(notification_store)
+    owner.lease_store(store)
+    owner.track_store(store)
+    owner.mark_store_finished(store)
+    reference = weakref.ref(store)
+
+    try:
+        owner.release_unused_stores()
+        await owner.wait_for_store_closes()
+        assert close_count == 1
+        del store
+        gc.collect()
+        assert reference() is None
+        owner.store_leases.close()
+        assert close_count == 1
+    finally:
+        await owner.wait_for_store_closes()
+        owner.store_leases.close()
+        notification_store.close()
+
+
+@pytest.mark.asyncio
 async def test_successful_store_close_is_removed_without_root_shutdown(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store)
@@ -1132,11 +1172,14 @@ async def test_unobserved_failed_store_close_is_not_retried(tmp_path: Path) -> N
         original_close()
 
     store.close = flaky_close  # type: ignore[method-assign]
+    owner.lease_store(store)
     owner.track_store(store)
     owner.mark_store_finished(store)
     owner.release_unused_stores()
     (task,) = tuple(owner._store_close_tasks)
     await asyncio.wait({task})
+    await asyncio.sleep(0)
+    assert task._log_traceback  # callback did not retrieve the failure
 
     # a later child completion releases stores before anyone observed the failure
     owner.release_unused_stores()
