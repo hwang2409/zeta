@@ -1,4 +1,5 @@
 """Small input-time slash-command dispatcher."""
+
 from __future__ import annotations
 
 import os
@@ -42,13 +43,17 @@ from .store import ConversationEntry
 
 class UsageCounterSource(Protocol):
     """Cumulative usage counters exposed by the context assembler."""
+
     uncached_input_tokens_this_session: int
     output_tokens_this_session: int
     cache_read_input_tokens_this_session: int
     cache_creation_input_tokens_this_session: int
+
+
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
     """One completed turn's token usage."""
+
     turn: int
     input_tokens: int = 0
     output_tokens: int = 0
@@ -56,6 +61,7 @@ class UsageSnapshot:
     cache_creation_input_tokens: int = 0
     model: str | None = None
     estimated_cost_usd: float | None = None
+
     @property
     def cache_total(self) -> int:
         return (
@@ -63,13 +69,17 @@ class UsageSnapshot:
             + self.cache_read_input_tokens
             + self.cache_creation_input_tokens
         )
+
     @property
     def cache_hit_rate(self) -> float | None:
         if self.cache_total == 0:
             return None
         return self.cache_read_input_tokens / self.cache_total * 100
+
+
 class UsageTracker:
     """Keep bounded usage deltas at real turn boundaries."""
+
     def __init__(self, source: UsageCounterSource, provider: str | None = None) -> None:
         self.source = source
         self.provider = provider
@@ -78,12 +88,15 @@ class UsageTracker:
         self._history: deque[UsageSnapshot] = deque(maxlen=8)
         self._cost_by_model: dict[str, UsageSnapshot] = {}
         self._completed_turns = 0
+
     @property
     def history(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._history)
+
     @property
     def cost_by_model(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._cost_by_model.values())
+
     def record(self, event_type: StreamEventType, model: str) -> None:
         current = self._counters()
         self._record_cost_delta(current, model)
@@ -91,14 +104,18 @@ class UsageTracker:
             self._baseline = current
         elif event_type is StreamEventType.TURN_END:
             self._completed_turns += 1
-            snapshot = usage_delta(current, self._baseline, self._completed_turns, model)
+            snapshot = usage_delta(
+                current, self._baseline, self._completed_turns, model
+            )
             self._history.append(snapshot)
             self._baseline = current
+
     def record_compaction(self, model: str) -> None:
         """Record direct compaction usage without adding a trend snapshot."""
         current = self._counters()
         self._record_cost_delta(current, model)
         self._baseline = current
+
     def _record_cost_delta(self, current: Mapping[str, int], model: str) -> None:
         snapshot = usage_delta(current, self._cost_baseline, 0, model)
         self._cost_baseline = dict(current)
@@ -336,9 +353,7 @@ def compaction_summary(
         entries_folded=entries_folded,
         tokens_saved=max(
             0,
-            source_tokens
-            - token_counter(marker_message)
-            - token_counter(summary),
+            source_tokens - token_counter(marker_message) - token_counter(summary),
         ),
     )
 
@@ -436,7 +451,14 @@ def usage_delta(
 
 LONG_CONTEXT_INPUT_THRESHOLD = 272_000
 LONG_CONTEXT_MODELS = frozenset(
-    {"codex-auto-review", "gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}
+    {
+        "codex-auto-review",
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+    }
 )
 
 
@@ -544,9 +566,7 @@ class SlashSession(Protocol):
 
     def slash_permissions(self, args: str) -> str: ...
 
-    async def slash_mcp_prompt(
-        self, name: str, arguments: dict[str, str]
-    ) -> str: ...
+    async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str: ...
 
     def slash_model(self, args: str) -> str: ...
 
@@ -615,9 +635,7 @@ def _format_status(status: SlashStatus) -> str:
     )
     child_tokens = child_total + status.child_output_tokens_this_session
     cache_hit_rate = (
-        "n/a"
-        if cache_total == 0
-        else f"{cache_read / cache_total * 100:.1f}%"
+        "n/a" if cache_total == 0 else f"{cache_read / cache_total * 100:.1f}%"
     )
     child_hit_rate = (
         "n/a"
@@ -626,19 +644,23 @@ def _format_status(status: SlashStatus) -> str:
     )
     cost_text = _format_estimated_cost(status)
     trend = status.usage_history[-8:]
-    trend_text = " ".join(
-        f"{snapshot.turn}:{snapshot.cache_hit_rate:.0f}%"
-        if snapshot.cache_hit_rate is not None
-        else f"{snapshot.turn}:n/a"
-        for snapshot in trend
-    ) or "none"
+    trend_text = (
+        " ".join(
+            f"{snapshot.turn}:{snapshot.cache_hit_rate:.0f}%"
+            if snapshot.cache_hit_rate is not None
+            else f"{snapshot.turn}:n/a"
+            for snapshot in trend
+        )
+        or "none"
+    )
     context_gauge = render_context_gauge(
         status.tokens_in_current_context,
         status.model_window,
     )
     window_text = (
         f"{status.tokens_in_current_context} / {status.model_window}"
-        if status.tokens_in_current_context is not None and status.model_window is not None
+        if status.tokens_in_current_context is not None
+        and status.model_window is not None
         else "unknown"
     )
     lines = [
@@ -698,10 +720,8 @@ def _format_status(status: SlashStatus) -> str:
         [
             "context_files: " + (", ".join(status.context_files) or "none"),
             "hooks: " + (", ".join(status.hooks) or "none"),
-            "automatic_memory_failure: "
-            + (status.automatic_memory_failure or "none"),
-            "transcript_index_failure: "
-            + (status.transcript_index_failure or "none"),
+            "automatic_memory_failure: " + (status.automatic_memory_failure or "none"),
+            "transcript_index_failure: " + (status.transcript_index_failure or "none"),
             f"project_context_health: {status.project_context_health or 'healthy'}",
         ]
     )
@@ -724,7 +744,8 @@ def _format_estimated_cost(status: SlashStatus) -> str:
             return f"unavailable (unknown model: {status.model})"
         return "unavailable (model attribution unavailable)"
     if status.usage_cost_by_model and all(
-        snapshot.estimated_cost_usd is not None for snapshot in status.usage_cost_by_model
+        snapshot.estimated_cost_usd is not None
+        for snapshot in status.usage_cost_by_model
     ):
         total = sum(
             snapshot.estimated_cost_usd or 0.0
@@ -775,9 +796,7 @@ def _run_init(
         return "init unchanged: /init does not accept arguments"
     if project_root is None:
         return "init error: not inside a project"
-    return ModelInputEnvelope(
-        INIT_PROMPT, "/init", MessageOrigin.SLASH_EXPANSION
-    )
+    return ModelInputEnvelope(INIT_PROMPT, "/init", MessageOrigin.SLASH_EXPANSION)
 
 
 async def _run_compact(session: SlashSession, args: str) -> str:
@@ -890,6 +909,31 @@ def _has_args(args: str) -> bool:
     return bool(args.strip())
 
 
+def _no_args(args: str) -> bool:
+    return not args.strip()
+
+
+def _never_mutates(_args: str) -> bool:
+    return False
+
+
+def _memory_mutates(args: str) -> bool:
+    action = args.strip()
+    return action == "undo" or action.startswith(
+        ("retry ", "undo ", "accept ", "resolve ")
+    )
+
+
+def _memory_read_only(args: str) -> bool:
+    action = args.strip()
+    return action in {"", "retry", "log"} or action.startswith("log ")
+
+
+def _mcp_read_only(_args: str) -> bool:
+    # MCP status can initialize and reconcile the live mount on the event loop.
+    return False
+
+
 def _vim_mutates(args: str) -> bool:
     return args.strip().lower() in {"on", "off", "toggle"}
 
@@ -906,6 +950,9 @@ def _mcp_mutates(args: str) -> bool:
         "disable",
         "trust",
         "untrust",
+        "auth",
+        "logout",
+        "reconnect",
     }
 
 
@@ -929,7 +976,12 @@ def create_slash_registry(
     )
     project_root = None if project_eligible is False else private_project_root
     registry.register(
-        SlashCommand("status", _run_status, "show session status", ServeSlash())
+        SlashCommand(
+            "status",
+            _run_status,
+            "show session status",
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+        )
     )
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
     registry.register(
@@ -937,7 +989,10 @@ def create_slash_registry(
             "mcp",
             _run_mcp,
             "show MCP server status",
-            ServeSlash(mutates=_mcp_mutates),
+            ServeSlash(
+                mutates=_mcp_mutates,
+                runs_while_busy=_mcp_read_only,
+            ),
         )
     )
     registry.register(
@@ -945,30 +1000,42 @@ def create_slash_registry(
             "model",
             _run_model,
             "pick a model or switch to one: /model [name]",
-            ServeSlash(mutates=_has_args),
+            ServeSlash(
+                mutates=_has_args,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
         SlashCommand(
-            "vim", _run_vim, "show or change vim mode", ServeSlash(mutates=_vim_mutates)
+            "vim",
+            _run_vim,
+            "show or change vim mode",
+            ServeSlash(
+                mutates=_vim_mutates,
+                runs_while_busy=_no_args,
+            ),
         )
     )
-    registry.register(
-        SlashCommand("plan", _run_plan, "show or change plan mode")
-    )
+    registry.register(SlashCommand("plan", _run_plan, "show or change plan mode"))
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
     )
     instruction_handler = lambda session, args: project_instructions_command(
-        session, args, private_project_root,
+        session,
+        args,
+        private_project_root,
         Path(effective_home).expanduser().resolve() if effective_home else None,
         project_registry_state,
     )
-    registry.register(SlashCommand(
-        "project-instructions", instruction_handler,
-        "open or create private project instructions in your editor",
-        ServeSlash(),
-    ))
+    registry.register(
+        SlashCommand(
+            "project-instructions",
+            instruction_handler,
+            "open or create private project instructions in your editor",
+            ServeSlash(),
+        )
+    )
     registry.register(
         SlashCommand(
             "init",
@@ -980,7 +1047,10 @@ def create_slash_registry(
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
     registry.register(
         SlashCommand(
-            "compact", _run_compact, "compact the context", ServeSlash(mutates=lambda _args: True)
+            "compact",
+            _run_compact,
+            "compact the context",
+            ServeSlash(mutates=lambda _args: True),
         )
     )
     registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
@@ -991,9 +1061,7 @@ def create_slash_registry(
             "fork from a prior user message or checkpoint",
         )
     )
-    registry.register(
-        SlashCommand("tree", _run_tree, "list branches or switch to one")
-    )
+    registry.register(SlashCommand("tree", _run_tree, "list branches or switch to one"))
     registry.register(
         SlashCommand("tools", _run_tools, "list tools or trust project tools")
     )
@@ -1014,39 +1082,47 @@ def create_slash_registry(
             "project",
             _run_project,
             "show or initialize the current project",
-            ServeSlash(mutates=_project_mutates),
+            ServeSlash(
+                mutates=_project_mutates,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
-        SlashCommand("inbox", _run_inbox, "list this project's inbox", ServeSlash())
+        SlashCommand(
+            "inbox",
+            _run_inbox,
+            "list this project's inbox",
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+        )
     )
     registry.register(
         SlashCommand(
             "memory",
             _run_memory,
             "show, retry, or undo automatic memory updates",
-            ServeSlash(),
+            ServeSlash(mutates=_memory_mutates, runs_while_busy=_memory_read_only),
         )
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")
     )
     registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
-    registry.register(
-        SlashCommand("tasks", _run_tasks, "inspect background processes")
-    )
+    registry.register(SlashCommand("tasks", _run_tasks, "inspect background processes"))
     registry.register(
         SlashCommand("decisions", _run_decisions, "answer or discuss open decisions")
     )
     registry.register(
-        SlashCommand("send", _run_send, "send a follow-up to a run: /send <id> <message>")
+        SlashCommand(
+            "send", _run_send, "send a follow-up to a run: /send <id> <message>"
+        )
     )
     registry.register(
         SlashCommand(
             "help",
             lambda _session, _args: registry.help_text(),
             "list commands",
-            ServeSlash(),
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
         )
     )
     registry.register(SlashCommand("approve", _run_approve, "/approve [key]"))
@@ -1063,7 +1139,10 @@ def create_slash_registry(
             "accounts",
             _run_accounts,
             "list, switch, or label accounts",
-            ServeSlash(mutates=_has_args),
+            ServeSlash(
+                mutates=_has_args,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
