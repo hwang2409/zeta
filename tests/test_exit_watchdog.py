@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -114,7 +114,13 @@ def test_teardown_watchdog_dumps_a_hung_loop_close(tmp_path: Path) -> None:
     }
     try:
         done = subprocess.run(
-            command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60
+            command,
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
         )
         output = done.stdout + done.stderr
     except subprocess.TimeoutExpired as hung:

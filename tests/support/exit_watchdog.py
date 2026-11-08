@@ -12,13 +12,13 @@ crashed worker with a stack instead of a silent hang.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Generator
 import faulthandler
 import io
 import os
 import sys
 import threading
 import time
+from collections.abc import Generator
 
 import pytest
 
