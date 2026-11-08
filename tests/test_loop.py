@@ -499,7 +499,7 @@ async def test_runtime_cancellation_after_compaction_start_discards_preparation(
     sentinel = object()
 
     async def prepare_context(**kwargs):  # type: ignore[no-untyped-def]
-        assembler._prepared_assembly = sentinel  # type: ignore[assignment]
+        assembler._preparation_owner._prepared = sentinel  # type: ignore[assignment]
         return True
 
     async def assemble(**kwargs):  # type: ignore[no-untyped-def]
@@ -513,9 +513,9 @@ async def test_runtime_cancellation_after_compaction_start_discards_preparation(
         if event.type is StreamEventType.COMPACTION_START:
             break
 
-    assert assembler._prepared_assembly is sentinel
+    assert assembler._preparation_owner._prepared is sentinel
     await asyncio.wait_for(run.aclose(), 10)
-    assert assembler._prepared_assembly is None
+    assert assembler._preparation_owner._prepared is None
 
 
 @pytest.mark.asyncio

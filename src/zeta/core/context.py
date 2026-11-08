@@ -159,16 +159,7 @@ class ContextAssembler(ContextMarkerMixin):
         self._session_usage = SessionUsage(
             sink=self.usage_sink, on_growth=self.on_token_growth
         )
-        self._prepared_assembly: tuple[tuple[Any, ...], tuple[ConversationEntry, ...], _AssemblyPreparation] | None = None
-        self._preparation_owner = ContextPreparation(
-            store=self.store,
-            prepare=lambda branch, **kwargs: self._prepare_assembly(branch, **kwargs),
-            cooperative_call=_cooperative_call,
-            token_budget=lambda: self.token_budget,
-            estimator_budget=lambda: self.estimator_token_budget,
-            retain=lambda key, branch, preparation: setattr(self, "_prepared_assembly", (key, branch, preparation)),
-            invalidate=lambda: setattr(self, "_prepared_assembly", None),
-        )
+        self._preparation_owner = ContextPreparation(self.store, lambda branch, *, force, assembly_budget, system_append: self._prepare_assembly(branch, force=force, assembly_budget=assembly_budget, system_append=system_append), self.token_budget, self.estimator_token_budget)
     def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
         if force:
@@ -203,7 +194,7 @@ class ContextAssembler(ContextMarkerMixin):
             raise ValueError("token budget must be positive")
         self.token_budget = token_budget
         self._request_budget.update_provider_limit(token_budget)
-        self._prepared_assembly = None
+        self._preparation_owner.invalidate()
 
     def update_backend(self, backend: CompletionBackend) -> None:
         """Replace the session backend without bypassing request admission."""
@@ -211,7 +202,7 @@ class ContextAssembler(ContextMarkerMixin):
         self.backend = backend
         self._request_admission.update_backend(backend)
         self.compaction_policy.backend = self._request_admission
-        self._prepared_assembly = None
+        self._preparation_owner.invalidate()
 
     def estimate_messages(self, messages: Sequence[Message]) -> int:
         """Count messages with the production context estimator."""
@@ -369,9 +360,16 @@ class ContextAssembler(ContextMarkerMixin):
 
     def discard_prepared_context(self) -> None:
         """Drop an unconsumed preparation, including its message graph."""
-        self._prepared_assembly = None
+        self._preparation_owner.discard()
 
-    async def prepare_context(self, *, backend: CompletionBackend | None = None, force: bool = False, reserved_estimator_tokens: int = 0, system_append: str = "") -> bool:
+    async def prepare_context(
+        self,
+        *,
+        backend: CompletionBackend | None = None,
+        force: bool = False,
+        reserved_estimator_tokens: int = 0,
+        system_append: str = "",
+    ) -> bool:
         if reserved_estimator_tokens < 0:
             raise ValueError("reserved estimator tokens must be non-negative")
         return await self._preparation_owner.prepare(
@@ -390,6 +388,13 @@ class ContextAssembler(ContextMarkerMixin):
         reserved_estimator_tokens: int = 0,
         system_append: str = "",
     ) -> AssembledContext:
+        """Assemble context, optionally forcing work for a retry or manual compact.
+
+        Forced retries reuse a fitting eviction view inside hysteresis. Manual
+        ``/compact`` also sets ``bypass_eviction_hysteresis`` to request a fresh
+        deterministic eviction pass without switching to model summarization.
+        """
+
         assembly_budget = self._preparation_owner.budget(reserved_estimator_tokens)
         while True:
             key = self._preparation_owner.key(
@@ -398,15 +403,10 @@ class ContextAssembler(ContextMarkerMixin):
                 assembly_budget=assembly_budget,
                 system_append=system_append,
             )
-            prepared = self._prepared_assembly
-            if prepared is not None and prepared[0] == key:
-                _, branch, preparation = prepared
-                branch_id = self._branch_id(branch)
-                self._prepared_assembly = None
-                if self.store.active_branch_head_id() == branch_id:
-                    break
-                continue
-            self._prepared_assembly = None
+            prepared = self._preparation_owner.take(key)
+            if prepared is not None:
+                branch, preparation = prepared
+                break
             branch = self.store.active_branch_snapshot()
             branch_id = self._branch_id(branch)
             preparation = await asyncio.to_thread(

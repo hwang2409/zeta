@@ -187,10 +187,10 @@ async def test_discard_prepared_context_releases_unconsumed_graph(tmp_path: Path
     assembler = ContextAssembler(store, token_budget=10_000)
 
     await assembler.prepare_context()
-    assert assembler._prepared_assembly is not None
+    assert assembler._preparation_owner._prepared is not None
     assembler.discard_prepared_context()
 
-    assert assembler._prepared_assembly is None
+    assert assembler._preparation_owner._prepared is None
 
 
 @pytest.mark.asyncio
