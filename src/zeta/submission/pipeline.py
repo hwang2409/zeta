@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from itertools import count
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from uuid import uuid4
 
 from ..core.abort import AbortSignal
@@ -30,6 +30,20 @@ from ..tools._shared.shell import (
 )
 from ..tui.composer import UndoCandidate, parse_input
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
+from .messages import (
+    _AbortAction,
+    _ApprovalAction,
+    _ApprovalLifecycle,
+    _CommandDone,
+    _DurableToolDone,
+    _Message,
+    _PreprocessingDone,
+    _ProviderDone,
+    _Retry,
+    _SlashDone,
+    _Submit,
+    _UndoAction,
+)
 from .model import (
     Submission,
     SubmissionHost,
@@ -38,80 +52,6 @@ from .model import (
     dispatch_provider,
 )
 from .notification_retry import NotificationOutcome, NotificationRetry
-
-
-class _Message(Protocol):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class _Submit:
-    submission: Submission
-    acknowledged: asyncio.Future[None] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _Retry:
-    submission: Submission
-    user_message: Message
-    acknowledged: asyncio.Future[None]
-
-
-@dataclass(frozen=True, slots=True)
-class _PreprocessingDone:
-    submission: Submission
-    model_input: ModelInputEnvelope | None = None
-    error: BaseException | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _CommandDone:
-    submission: Submission
-    receipt: str | None = None
-    error: BaseException | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _SlashDone:
-    submission: Submission
-    task: asyncio.Task[Any]
-
-
-@dataclass(frozen=True, slots=True)
-class _ProviderDone:
-    submission: Submission
-    task: asyncio.Task[NotificationOutcome]
-
-
-@dataclass(frozen=True, slots=True)
-class _DurableToolDone:
-    request_id: str
-    task: asyncio.Task[Any]
-
-
-@dataclass(frozen=True, slots=True)
-class _ApprovalLifecycle:
-    submission: Submission
-    kind: str
-    call: ToolCall
-
-
-@dataclass(frozen=True, slots=True)
-class _ApprovalAction:
-    decision: ApprovalDecision
-    requested_key: str | None
-    acknowledged: asyncio.Future[None] | None = None
-    always: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _AbortAction:
-    submission_id: int | None
-
-
-@dataclass(frozen=True, slots=True)
-class _UndoAction:
-    pass
 
 
 class SubmissionPipeline:
