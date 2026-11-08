@@ -124,9 +124,6 @@ def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> 
     )
 
 
-from tests.support.owned import await_or_fail
-
-
 @pytest.mark.asyncio
 async def test_approval_lifecycle_transition_rejects_unknown_event(
     tmp_path: Path,
@@ -403,25 +400,17 @@ async def test_cancelled_before_durable_commit_retries_abort(
     try:
         await server.control._event(_start_event(call))
         store = server.runtime.opened.store
-        entered_helper = asyncio.Event()
-        original_durable = store._to_thread_durable
+        joined_queue = asyncio.Event()
 
-        async def observe_durable(*args: object, **kwargs: object) -> object:
-            # Signal real-helper entry without blocking, so cancellation lands
-            # inside the real durable helper (parked on the held write lock).
-            entered_helper.set()
-            return await original_durable(*args, **kwargs)
-
-        # test-contract: seam observe the real durable helper without replacing it
-        monkeypatch.setattr(store, "_to_thread_durable", observe_durable)
+        # test-contract: seam observes queue admission before durable submission
+        monkeypatch.setattr(store, "_async_write_queued", joined_queue.set)
         # Hold the write lock so the settlement parks before it can commit.
         await store._async_write_lock.acquire()
         settlement = asyncio.create_task(
             server.control.resolve_approval("approve", call.id)
         )
         try:
-            async with asyncio.timeout(10):
-                await entered_helper.wait()
+            await await_or_fail(joined_queue.wait(), what="approval queue admission")
             settlement.cancel()
         finally:
             store._async_write_lock.release()
@@ -2028,7 +2017,7 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         gate.release.set()
 
         hello = json.loads(await _read_raw(replacement_reader))
-        assert hello["id"] == 10
+        assert hello.get("id") == 10, hello
     finally:
         gate.release.set()
         await close_serve(server, replacement or writer)
