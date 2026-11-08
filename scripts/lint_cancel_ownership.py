@@ -8,6 +8,7 @@ from pathlib import Path
 
 RATCHET = {
     "src/zeta/core/hooks.py:HookManager._run:creation_task",
+    "src/zeta/server/approval_settlement/approval_grants.py:finish_grant:operation",
     "src/zeta/tools/_shared/process.py:BackgroundTaskRegistry._drain_stdin:drain",
     "src/zeta/tools/_shared/tool_spawn.py:_cleanup_unwatched_transport:reap",
     "src/zeta/tools/_shared/tool_spawn.py:create_tool_subprocess_shell:cleanup",
