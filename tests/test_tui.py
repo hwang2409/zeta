@@ -14749,7 +14749,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
             refresh_rendered.set()
 
     app._repaint_accounts_picker = repaint_and_signal
-    monkeypatch.setattr("zeta.accounts.usage.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("zeta.accounts.store.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
     locked = threading.Event()
     release = threading.Event()
 

@@ -9663,7 +9663,7 @@ async def test_serve_account_refresh_reports_busy_lifecycle_lock(
         named_account_credentials(home, "codex", "work").save,
         OAuthTokens("access", "refresh", 9_999_999_999),
     )
-    monkeypatch.setattr("zeta.accounts.usage.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("zeta.accounts.store.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
     server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     locked = threading.Event()
