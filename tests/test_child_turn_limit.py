@@ -12,6 +12,7 @@ from rich.console import Console
 import zeta.agent.runner as agent_runner_module
 from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.agent import pending_delivery as pending_delivery_module
 from zeta.agent.background import (
     BackgroundAgentOwner,
@@ -819,7 +820,12 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
             finish_gate_state=SimpleNamespace(terminal_admitted=True),
         )
     )
-    grandchild_watcher = asyncio.create_task(asyncio.sleep(3600))
+    release_grandchild_watcher = asyncio.Event()
+    grandchild_watcher = asyncio.create_task(
+        await_or_fail(
+            release_grandchild_watcher.wait(), what="grandchild watcher release"
+        )
+    )
     owner.register(
         "child-1:1",
         grandchild_watcher.cancel,
@@ -855,10 +861,8 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
                 asyncio.gather(watcher, return_exceptions=True), timeout=10
             )
         owner.unregister("child-1:1")
-        grandchild_watcher.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(grandchild_watcher, return_exceptions=True), timeout=10
-        )
+        release_grandchild_watcher.set()
+        await await_or_fail(grandchild_watcher, what="grandchild watcher cleanup")
         child_store.close()
         parent_store.close()
 
