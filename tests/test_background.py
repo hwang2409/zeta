@@ -3080,7 +3080,7 @@ def test_loop_teardown_cancels_owner_before_detached_leader_exits(
     def run_loop() -> None:
         try:
             asyncio.run(leave_owner_for_loop_teardown())
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - report every thread outcome
             errors.append(exc)
         finally:
             teardown_finished.set()
