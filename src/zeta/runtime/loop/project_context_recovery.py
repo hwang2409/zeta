@@ -147,9 +147,10 @@ class ProjectContextRecoveryMixin:
                 self._read_project_context_projection()
             )
 
-    def _advance_project_context_recovery(self) -> None:
+    async def _advance_project_context_recovery(self) -> None:
         self._consume_project_context_recovery()
         self._schedule_project_context_recovery()
+        await asyncio.sleep(0)
 
     async def _close_project_context_recovery(self) -> None:
         tasks = tuple(
