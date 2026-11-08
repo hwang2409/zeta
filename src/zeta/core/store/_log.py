@@ -1009,6 +1009,8 @@ class ConversationLogMixin:
 
     def _publish_reload(self: ConversationStore, since: tuple[int, int]) -> None:
         """Publish one reload: a reset if any install in it bumped the generation."""
+        if self.on_entries_installed is None:
+            return
         generation, count = since
         self._publish_entries_installed(
             "reset"
