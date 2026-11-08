@@ -310,7 +310,7 @@ class FrameWriteOwner:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return
-            await asyncio.wait(pending, timeout=remaining)
+            await asyncio.wait(pending, timeout=min(remaining, FRAME_CANCEL_GRACE))
 
 
 async def finish_frame_write(
@@ -332,6 +332,8 @@ async def finish_frame_write(
         return await asyncio.shield(task)
     except asyncio.CancelledError:
         pass
+    if owner is not None:
+        owner.register(task)
     raise FrameWriteCancelled(await _settle_canceled_write(task, writer, owner=owner))
 
 
@@ -355,8 +357,6 @@ async def _settle_canceled_write(
                 # state or coupling it to another connection.
                 if owner is None:
                     task.add_done_callback(_observe_write)
-                else:
-                    owner.register(task)
                 return False
             aborted = True
             deadline = loop.time() + FRAME_CANCEL_GRACE
