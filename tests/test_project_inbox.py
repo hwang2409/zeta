@@ -486,6 +486,7 @@ def test_unchanged_scanner_uses_no_locks_or_json_parses(
         parses += 1
         return real_read(*args, **kwargs)
 
+    # test-contract: seam count lock entries behind the scanner interface
     monkeypatch.setattr(registry, "_project_lock", counted_locked)
     monkeypatch.setattr(scanner.inbox, "_read_record", counted_read)
     assert [scanner.scan() for _ in range(5)] == [None] * 5
@@ -941,9 +942,12 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
         assert backend.calls[0][0][-1] is notes[0]
         assert notes[0].role is MessageRole.SYSTEM
         assert notes[0].content[0].text.startswith("[zeta] inbox status:")
+        claimed = await asyncio.wait_for(
+            asyncio.to_thread(inbox.read, project_b.project_id), 10
+        )
         assert (
             'inbox: your message "Can you review this?" to beta was claimed '
-            f"by session {'b' * 32} at {(await asyncio.to_thread(inbox.read, project_b.project_id))['claimed'][0]['claimed_at']}"
+            f"by session {'b' * 32} at {claimed['claimed'][0]['claimed_at']}"
             in notes[0].content[0].text
         )
     finally:
@@ -1151,6 +1155,7 @@ async def test_claim_tracking_is_read_only_for_receiver(
         with real_lock(self, project_id, exclusive=exclusive) as project_fd:
             yield project_fd
 
+    # test-contract: seam observe domain lock modes behind sent-status scanning
     monkeypatch.setattr(ProjectInbox, "_lock", counted_lock)
     scanner = ProjectInboxScanner(
         registry,
@@ -1315,7 +1320,7 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
         first_turn.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
-            await first_turn
+            await asyncio.wait_for(first_turn, 10)
 
         monkeypatch.setattr(store, "_run_durable_write", original_durable_write)
         await _collect_turn(loop, "second")

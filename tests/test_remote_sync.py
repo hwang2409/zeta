@@ -832,6 +832,7 @@ def test_oversized_side_file_is_rejected_before_target_lock(
         raise AssertionError("target lock was acquired before size validation")
         yield
 
+    # test-contract: seam reject target locking before public validation finishes
     monkeypatch.setattr(ProjectRegistry, "_project_lock", target_lock)
 
     with pytest.raises(RemoteSyncError, match="side file is too large"):

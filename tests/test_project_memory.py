@@ -870,7 +870,10 @@ async def test_child_lineage_reconciled_after_registry_failure(
     def failing_record(*args: object, **kwargs: object) -> None:
         raise ProjectRegistryError("injected append failure")
 
-    monkeypatch.setattr(manager.project_registry, "_record_child_lineage_batch", failing_record)
+    # test-contract: seam force lineage publication failure behind a real child run
+    monkeypatch.setattr(
+        manager.project_registry, "_record_child_lineage_batch", failing_record
+    )
 
     loop = AgentLoop(
         FakeBackend(_nested_spawn_turns()),
@@ -1199,6 +1202,7 @@ def test_child_reconciliation_resumes_on_next_open_without_duplicates(
     def boom(*args: object, **kwargs: object) -> None:
         raise ProjectRegistryError("injected batch failure")
 
+    # test-contract: seam force batch failure behind reconciliation
     monkeypatch.setattr(registry, "_record_child_lineage_batch", boom, raising=False)
     reconcile_child_links(registry, manager.sessions_dir, root_id)
     # The batch publish failed, so the durable intents remain unpublished.
@@ -1295,7 +1299,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             and calls_by_thread[thread_id] == 2
         ):
             owner_before_collection.set()
-            release_owner.wait()
+            assert release_owner.wait(10), "owner release was not signalled"
         return real_session_directory(*args, **kwargs)
 
     monkeypatch.setattr(session_links, "persist_pending_child_link", observe_admission)
@@ -1408,9 +1412,10 @@ async def test_real_child_spawns_repeat_after_generation_changes(
         record_calls += 1
         if record_calls == 1:
             first_batch_ready.set()
-            release_first_batch.wait()
+            assert release_first_batch.wait(10), "first batch release was not signalled"
         real_record_sessions(*args, **kwargs)
 
+    # test-contract: seam gate one batch behind real child spawns
     monkeypatch.setattr(registry, "_record_child_lineage_batch", gate_first_batch)
     real_read = registry._read_session_records
     registry_reads = 0
@@ -1596,6 +1601,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             registry_reads += 1
             return real_read(*args, **kwargs)
 
+        # test-contract: seam gate batches behind real nested child spawns
         monkeypatch.setattr(registry, "_record_child_lineage_batch", gate_batches)
         # test-contract: seam count registry scans behind real nested spawn calls
         monkeypatch.setattr(registry, "_read_session_records", count_registry_read)
@@ -1619,7 +1625,9 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             )
         )
         grand_tasks.append(second)
-        second_owner_wait = asyncio.create_task(second_owner_entered.wait())
+        second_owner_wait = asyncio.create_task(
+            asyncio.wait_for(second_owner_entered.wait(), 10)
+        )
         done, _ = await asyncio.wait_for(
             asyncio.wait(
                 {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
@@ -1716,7 +1724,7 @@ async def test_cancelled_child_publication_joins_before_loop_close(
         if threading.get_ident() != event_loop_thread:
             worker_entered.set()
             first_phase.set()
-            release_worker.wait()
+            assert release_worker.wait(10), "worker release was not signalled"
         real_persist(*args, **kwargs)
         order.append("storage_return")
         first_phase.set()

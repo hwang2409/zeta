@@ -755,3 +755,67 @@ def test_transfer_excludes_runtime_lease_and_destination_rebuilds(
     finally:
         for store in source_stores:
             store.close()
+
+
+def test_project_refresh_does_not_hold_session_shape_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = "old memory"
+    manager, session_id = _manager_with_prompt(
+        tmp_path / "home",
+        tmp_path,
+        system_prompt=memory,
+        prompt_recipe=None,
+        project_memory_offset=0,
+        project_memory_length=len(memory),
+        project_memory_digest=hashlib.sha256(memory.encode()).hexdigest(),
+    )
+    refresh_started = threading.Event()
+    metadata_updated = threading.Event()
+    errors: list[BaseException] = []
+    calls = 0
+
+    def refresh(stored_prompt: str, **kwargs: object) -> str:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls == 1:
+            refresh_started.set()
+            assert metadata_updated.wait(10), (
+                "session metadata remained locked during project memory refresh"
+            )
+        return stored_prompt.replace("old memory", "new memory")
+
+    def update_metadata() -> None:
+        try:
+            assert refresh_started.wait(10), "project memory refresh did not start"
+            with manager._metadata_lock(session_id) as directory_fd:
+                metadata = manager._read(session_id, directory_fd=directory_fd)
+                metadata.name = "concurrent name"
+                manager._write_unlocked(metadata, directory_fd=directory_fd)
+            metadata_updated.set()
+        except BaseException as exc:  # noqa: BLE001 - joined below
+            errors.append(exc)
+            metadata_updated.set()
+
+    monkeypatch.setattr("zeta.runtime.prompt_resume.refresh_project_memory", refresh)
+    updater = threading.Thread(target=update_metadata)
+    updater.start()
+    try:
+        result = _resume(
+            manager,
+            session_id,
+            tmp_path / "home",
+            tmp_path,
+            context_loader=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"unexpected default rebuild: {kwargs}")
+            ),
+        )
+    finally:
+        metadata_updated.set()
+        updater.join(10)
+    assert not updater.is_alive(), "metadata updater did not finish"
+    assert not errors
+    assert calls == 2
+    assert result.context.system_prompt == "new memory"
+    assert manager.read_metadata(session_id).name == "concurrent name"
