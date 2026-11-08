@@ -304,6 +304,9 @@ class FrameWriteOwner:
     async def aclose(self) -> None:
         deadline = asyncio.get_running_loop().time() + 2 * FRAME_CANCEL_GRACE
         while self._active or self._orphaned:
+            for write in tuple(self._active):
+                write.cancel()
+            await asyncio.sleep(0)
             pending = set(self._active) | self._orphaned
             for write in pending:
                 write.cancel()
