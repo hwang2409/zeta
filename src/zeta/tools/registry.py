@@ -14,6 +14,7 @@ import os
 import pkgutil
 import uuid
 import weakref
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
@@ -295,6 +296,8 @@ class ToolRegistry:
         self._todo_store = session_store
         self.sent_message_tracker: Any = None
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
+        self._agent_output_cache: OrderedDict[Path, tuple[tuple[int, int, int], str]] = OrderedDict()
+        self._agent_output_cache_chars = 0
         self._execution_guard: Callable[[str], str | None] | None = None
         self.spills = SpillStore(
             session_dir=session_store.session_dir
@@ -730,6 +733,8 @@ class ToolRegistry:
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        clone._agent_output_cache = OrderedDict()
+        clone._agent_output_cache_chars = 0
         clone._mcp_excluded_names = frozenset(exclude_names)
         clone._tools = {
             name: _copy_definition(definition, clone)
