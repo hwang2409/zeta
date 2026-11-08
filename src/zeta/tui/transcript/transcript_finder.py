@@ -14,12 +14,15 @@ widget's private state through ``self`` the same way the virtual mixin does.
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from rich.padding import Padding
 from rich.text import Text
 
+from ..theme import RICH_THEME
 from .finder_overlay import FinderState
 from .fuzzy import highlight_literal
 from .message_finder import Candidate, MessageFinder, RankingResult, Role
@@ -129,6 +132,26 @@ class TranscriptFinderMixin:
 
     async def _finder_source_parts_async(self, unit: Any) -> tuple[str, ...]:
         value = unit.value
+        if isinstance(value, Padding) and isinstance(value.renderable, Text):
+            text = value.renderable
+            bounded = Padding(
+                text[:_FINDER_PREVIEW_TEXT_LIMIT],
+                (value.top, value.right, value.bottom, value.left),
+                style=value.style,
+                expand=value.expand,
+            )
+            revision = self._unit_revision(unit)
+            plain = await asyncio.to_thread(
+                self._render_search_snapshot,
+                bounded,
+                self._content_width,
+                copy.deepcopy(RICH_THEME),
+            )
+            if self._unit_revision(unit) == revision:
+                self._cache_search_text(
+                    unit.key, self._content_width, revision, plain
+                )
+            return (plain[:_FINDER_PREVIEW_TEXT_LIMIT],)
         if _is_tool_unit(value) or isinstance(getattr(value, "plain", None), str):
             return self._finder_source_parts(unit)
         width = self._content_width

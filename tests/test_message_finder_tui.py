@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.styles import Style
+from rich.padding import Padding
 from rich.text import Text
 
 from zeta.core.store import ConversationStore
@@ -184,6 +185,46 @@ async def test_newest_candidates_publish_before_older_render_finishes() -> None:
     state = transcript.finder_state()
     assert state is not None and state.complete
     assert [row.candidate.text for row in state.rows] == ["new candidate 39"]
+
+
+def test_finder_bounds_replayed_user_padding_before_rich_render(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = TranscriptWidget()
+    shapes = []
+    for index in range(20):
+        text = Text(
+            ("wide界" if index % 2 else "combining e\u0301") * 8_000,
+            style="bold red" if index % 3 else "green",
+        )
+        text.stylize("underline", 1, min(30, len(text)))
+        shapes.append(Padding(text, (index % 3, index % 4, 2, index % 5), expand=index % 2 == 0))
+
+    rendered_lengths: list[int] = []
+    render = TranscriptWidget._render_search_snapshot
+
+    def record(renderable: Any, width: int, rich_theme: Any) -> str:
+        assert isinstance(renderable, Padding)
+        assert isinstance(renderable.renderable, Text)
+        rendered_lengths.append(len(renderable.renderable))
+        return render(renderable, width, rich_theme)
+
+    monkeypatch.setattr(
+        TranscriptWidget, "_render_search_snapshot", staticmethod(record)
+    )
+
+    async def exercise() -> None:
+        for shape in shapes:
+            original = shape.renderable.copy()
+            unit = transcript.append(shape)
+            expected = Text.from_ansi(
+                transcript._search_rendered(unit, transcript._content_width)
+            ).plain[: transcript_finder._FINDER_PREVIEW_TEXT_LIMIT]
+            assert await transcript._finder_source_parts_async(unit) == (expected,)
+            assert shape.renderable == original
+
+    asyncio.run(exercise())
+    assert rendered_lengths == [transcript_finder._FINDER_PREVIEW_TEXT_LIMIT] * len(shapes)
 
 
 def test_open_finder_lists_messages_with_roles() -> None:
