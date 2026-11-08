@@ -409,9 +409,14 @@ async def list_commands(
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
-    entries = _entries_from_registry(registry, include_unavailable=include_unavailable)
-    if not transcript_repair_available(runtime.manager):
-        entries = [entry for entry in entries if entry.name != "repair-transcript"]
+    repair_available = transcript_repair_available(runtime.manager)
+    entries = [
+        entry
+        for entry in _entries_from_registry(
+            registry, include_unavailable=include_unavailable
+        )
+        if repair_available or entry.name != "repair-transcript"
+    ]
     return {
         "commands": [entry.to_dict() for entry in entries],
         "notices": list(registry.notices),

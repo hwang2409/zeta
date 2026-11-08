@@ -793,9 +793,9 @@ async def test_epoch_two_tui_repair_command_returns_upgrade_message(
     tmp_path: Path,
     bad_row: bytes,
 ) -> None:
-    from tests.support.owned import await_or_fail
+    from tests.support.owned import await_or_fail, owned_app
+    from tests.support.submissions import await_submission_pipeline
     from zeta.core.session import SessionManager
-    from zeta.tui.slash_handlers import SlashHandlerMixin
 
     (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
     manager = SessionManager(tmp_path)
@@ -811,20 +811,30 @@ async def test_epoch_two_tui_repair_command_returns_upgrade_message(
     )
     transcript = current.store.path
     transcript.write_bytes(transcript.read_bytes() + bad_row)
+    loop = AgentLoop(FakeBackend([]), current.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    rendered = StringIO()
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        zeta_home=tmp_path,
+        console=Console(file=rendered, force_terminal=False, width=200),
+    )
     unchanged = {
         str(path.relative_to(tmp_path)): path.read_bytes()
         for path in tmp_path.rglob("*")
         if path.is_file() and not path.name.startswith(".storage-format")
     }
-    tui = SimpleNamespace(
-        loop=SimpleNamespace(manager=manager, store=current.store, memory_reconciler=None)
-    )
-    try:
-        output = await SlashHandlerMixin.slash_repair_transcript(
-            tui, f"{current.metadata.session_id} confirm"
+    async with owned_app(app):
+        app._input_loop_active = True
+        await app._handle_prompt_value(
+            f"/repair-transcript {current.metadata.session_id} confirm"
         )
+        await await_submission_pipeline(app)
+        output = rendered.getvalue().strip()
         assert output == (
-            "transcript repair needs the stored-format upgrade "
+            "system · transcript repair needs the stored-format upgrade "
             "(home epoch 2, needs 4)"
         )
         assert {
@@ -832,8 +842,6 @@ async def test_epoch_two_tui_repair_command_returns_upgrade_message(
             for path in tmp_path.rglob("*")
             if path.is_file() and not path.name.startswith(".storage-format")
         } == unchanged
-    finally:
-        current.store.close()
 
 
 @pytest.mark.asyncio
