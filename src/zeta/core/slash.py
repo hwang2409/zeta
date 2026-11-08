@@ -1000,7 +1000,10 @@ def create_slash_registry(
             "mcp",
             _run_mcp,
             "show MCP server status",
-            ServeSlash(mutates=_mcp_mutates, runs_while_busy=_never_mutates),
+            ServeSlash(
+                mutates=_mcp_mutates,
+                runs_while_busy=_never_mutates,
+            ),
         )
     )
     registry.register(
@@ -1008,7 +1011,10 @@ def create_slash_registry(
             "model",
             _run_model,
             "pick a model or switch to one: /model [name]",
-            ServeSlash(mutates=_has_args, runs_while_busy=_no_args),
+            ServeSlash(
+                mutates=_has_args,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
@@ -1016,7 +1022,10 @@ def create_slash_registry(
             "vim",
             _run_vim,
             "show or change vim mode",
-            ServeSlash(mutates=_vim_mutates, runs_while_busy=_no_args),
+            ServeSlash(
+                mutates=_vim_mutates,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
@@ -1093,7 +1102,10 @@ def create_slash_registry(
             "project",
             _run_project,
             "show or initialize the current project",
-            ServeSlash(mutates=_project_mutates, runs_while_busy=_no_args),
+            ServeSlash(
+                mutates=_project_mutates,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
@@ -1155,7 +1167,10 @@ def create_slash_registry(
             "accounts",
             _run_accounts,
             "list, switch, or label accounts",
-            ServeSlash(mutates=_has_args, runs_while_busy=_no_args),
+            ServeSlash(
+                mutates=_has_args,
+                runs_while_busy=_no_args,
+            ),
         )
     )
     registry.register(
