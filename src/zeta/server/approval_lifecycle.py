@@ -15,6 +15,7 @@ from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from . import event_contract
+from .approval_grants import GrantPublication
 from .approval_settlement import persist_durably
 from .connections import Admission
 from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
@@ -48,6 +49,8 @@ class ApprovalRecord:
     disposition: str = "active"
     request: ApprovalRequest | None = None
     grant: ApprovalRequest | None = None
+    grant_committed: bool = False
+    grant_event_published: bool = False
     history_published: bool = False
     published: bool = False
     settlement: asyncio.Task[object] | None = None
@@ -100,19 +103,27 @@ class ExternalEnd:
     session_id: str | None
     data: Mapping[str, object]
     suppress_write_errors: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class Cancel:
     request_id: str
     child_instance_id: str | None = None
     reason: str = "turn_canceled"
+
+
 @dataclass(frozen=True, slots=True)
 class CleanupChild:
     child_instance_id: str
+
+
 @dataclass(frozen=True, slots=True)
 class Terminate:
     foreground_only: bool = False
     suppress_write_errors: bool = False
     reason: str = "controller_disconnected"
+
+
 @dataclass(frozen=True, slots=True)
 class BeginGrace:
     pass
@@ -708,7 +719,9 @@ class ApprovalLifecycle:
                 ErrorDescriptor.APPROVAL_UNAVAILABLE,
                 f"approval request not found or already resolved: {request_id}",
             )
-        record = self._change(record, grant=pending) if scope == "always_tool" else record
+        record = (
+            self._change(record, grant=pending) if scope == "always_tool" else record
+        )
         settlement = asyncio.create_task(self._settle_record(record, decision))
         self._change(record, settlement=settlement)
         try:
@@ -818,8 +831,12 @@ class ApprovalLifecycle:
         if not owns_record:
             self._release_gate(record, resolution=resolution)
             return resolution
+        finish = asyncio.create_task(self._finish_record(record, resolution))
         try:
-            await self._finish_record(record, resolution)
+            await asyncio.shield(finish)
+        except asyncio.CancelledError:
+            await asyncio.shield(finish)
+            raise
         except BaseException as exc:
             self._release_gate(record, error=exc)
             raise
@@ -973,6 +990,19 @@ class ApprovalLifecycle:
             self._change(record, terminal_watchdog=task)
         return True
 
+    async def _finish_grant(self, record: ApprovalRecord) -> ApprovalRecord:
+        policy = self._policy()
+        if policy is None or record.grant is None:
+            return record
+        publication = GrantPublication(policy, self._grant_published)
+        if not record.grant_committed:
+            rule, changed = publication.commit(record.grant)
+            record = self._change(record, grant_committed=True)
+            if changed and not record.grant_event_published:
+                await publication.publish(rule)
+            record = self._change(record, grant_event_published=True)
+        return record
+
     async def _finish_record(
         self, record: ApprovalRecord, resolution: dict[str, str]
     ) -> None:
@@ -992,12 +1022,8 @@ class ApprovalLifecycle:
         ):
             return
         record = self._change(current, publication_owner=owner)
-        policy = self._policy()
-        if resolution["decision"] == "allow" and record.grant is not None and policy is not None:
-            before = policy.session_allow
-            rule = policy.remember_allow(record.grant)
-            if rule not in before and self._grant_published is not None:
-                await self._grant_published(str(rule))
+        if resolution["decision"] == "allow":
+            record = await self._finish_grant(record)
         data: dict[str, object] = {
             key: value for key, value in resolution.items() if key != "request_id"
         }
@@ -1049,6 +1075,7 @@ class ApprovalLifecycle:
                     self._remove(record.target.key)
         if isinstance(history_outcome, asyncio.CancelledError):
             raise history_outcome
+
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
     ) -> None:

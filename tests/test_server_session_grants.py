@@ -1280,3 +1280,102 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
             server,
             *([replacement_writer] if replacement_writer is not None else []),
         )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["normal_owner", "duplicate", "deny", "cancel_publish"],
+)
+@pytest.mark.asyncio
+async def test_session_grant_lifecycle_table_over_unix_protocol(
+    tmp_path: Path, case: str
+) -> None:
+    """Exercise each grant outcome through the public unix serve protocol."""
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("call-1", "bash", {"command": "true"})]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _hello_and_create(reader, writer)
+        await _request(reader, writer, 3, "send", {"text": "grant"})
+        assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
+        if case == "deny":
+            response = (
+                await _request(reader, writer, 4, "deny", {"request_id": "call-1"})
+            )[-1]
+            assert response["result"]["decision"] == "deny"
+            assert not any(
+                frame.get("params", {}).get("event") == "session_grants_changed"
+                for frame in _buffer(reader)
+            )
+        else:
+            if case == "cancel_publish":
+                entered = asyncio.Event()
+                release = asyncio.Event()
+                original = server.control._publish_session_grant
+
+                async def publish(tool: str) -> None:
+                    entered.set()
+                    await release.wait()
+                    await original(tool)
+
+                server.control._approvals._grant_published = publish
+            approve = asyncio.create_task(
+                _request(
+                    reader,
+                    writer,
+                    4,
+                    "approve",
+                    {"request_id": "call-1", "scope": "always_tool"},
+                )
+            )
+            if case == "cancel_publish":
+                await await_or_fail(entered.wait(), what="grant publication")
+                record = server.control._approvals.state.records["call-1"]
+                assert record.settlement is not None
+                record.settlement.cancel()
+                release.set()
+            if case == "cancel_publish":
+                with pytest.raises(AssertionError):
+                    await await_or_fail(approve, what="canceled approve")
+                assert server.runtime.policy is not None
+                assert any(
+                    rule.tool == "bash" for rule in server.runtime.policy.session_allow
+                )
+            else:
+                frames = await await_or_fail(approve, what="approve response")
+                assert frames[-1]["result"]["decision"] == "approve"
+            grant_events = [
+                frame
+                for frame in _buffer(reader)
+                if frame.get("params", {}).get("event") == "session_grants_changed"
+            ]
+            assert len(grant_events) == 1
+            if case == "duplicate":
+                duplicate = (
+                    await _request(
+                        reader,
+                        writer,
+                        5,
+                        "approve",
+                        {"request_id": "call-1", "scope": "always_tool"},
+                    )
+                )[-1]
+                assert duplicate["error"]["code"] == -32006
+        if case != "cancel_publish":
+            snapshot = (await _request(reader, writer, 6, "session_grants"))[-1][
+                "result"
+            ]
+            assert snapshot["session_grants"] == ([] if case == "deny" else ["bash"])
+            await _frames_until_event(reader, "turn_end")
+    finally:
+        await close_serve(server, writer)
