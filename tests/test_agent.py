@@ -17914,6 +17914,7 @@ async def test_agent_cancel_retries_lifecycle_write_after_terminal_fence_wins(
         if isinstance(handle, str) and handle.count(":") == 1:
             backend.child_idle.set()
 
+    # test-contract: seam observe the target child's exact idle transition
     monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
     mark_agent_canceled = ConversationStore.mark_agent_canceled
     admit_abort = AgentLoop.admit_abort
@@ -18004,7 +18005,16 @@ async def test_agent_cancel_retries_lifecycle_write_after_terminal_fence_wins(
         assert cleanup_calls == 1
     finally:
         loop._background_owner.cancel_all()
-        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        try:
+            await asyncio.wait_for(loop._background_owner.wait(), 10)
+        except TimeoutError:
+            # test-contract: seam drain old code that cannot retry cancellation
+            watchers = tuple(loop._background_owner._watchers.values())
+            for watcher in watchers:
+                watcher.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(*watchers, return_exceptions=True), 10
+            )
         await loop.close()
         store.close()
 
