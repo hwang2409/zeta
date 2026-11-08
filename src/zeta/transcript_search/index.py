@@ -3,369 +3,46 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import threading
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Self
 
 from zeta.core.checkpoints import ConversationEntry, active_branch
 from zeta.core.store._log import PersistedAppend
-from zeta.memory.safety import redact_secrets
-from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin
 from zeta.transcript_search.source import (
-    _SAFE_ARGUMENTS,
-    MAX_DIAGNOSTIC_CHARS,
     _Cursor,
+    _prefix_digest,
     _read_transcript,
 )
 
 logger = logging.getLogger(__name__)
 
-MAX_UNIT_BYTES = 12 * 1024
-MAX_TOOL_DIGEST_BYTES = 4 * 1024
-_UNIT_SCHEMA_VERSION = 1
-
-
-@dataclass(frozen=True, slots=True)
-class TranscriptUnit:
-    """One bounded search document with a trusted source range."""
-
-    schema_version: int
-    unit_id: str
-    turn_id: str
-    project_id: str
-    session_id: str
-    seq_start: int
-    seq_end: int
-    started_at: str | None
-    ended_at: str | None
-    origin: str
-    kind: Literal["turn", "child_report"]
-    chunk_index: int
-    chunk_count: int
-    text: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> TranscriptUnit:
-        return cls(**dict(value))
-
-
-@dataclass(slots=True)
-class _Turn:
-    rows: list[Mapping[str, Any]]
-    human: list[str]
-    inputs: list[str]
-    assistant: list[str]
-    tools: list[str]
-    completed: bool = False
-
-
-def render_transcript_units(
-    project_id: str,
-    session_id: str,
-    rows: Iterable[Mapping[str, Any]],
-) -> tuple[TranscriptUnit, ...]:
-    """Render completed turns and parent-visible child reports deterministically."""
-
-    entries = sorted(
-        (
-            ConversationEntry.from_dict(row)
-            for row in rows
-            if type(row.get("seq")) is int and row.get("type") != "header"
-        ),
-        key=lambda entry: entry.seq,
-    )
-    ordered = [entry.to_dict() for entry in active_branch(entries)]
-    units: list[TranscriptUnit] = []
-    turn: _Turn | None = None
-    call_names: dict[str, str] = {}
-    for row in ordered:
-        report = _child_report(row)
-        if report is not None:
-            units.extend(_report_units(project_id, session_id, row, report))
-            continue
-        message = _message(row)
-        if message is None:
-            continue
-        role = message.get("role")
-        if role == "user":
-            if turn is not None and turn.completed:
-                units.extend(_turn_units(project_id, session_id, turn))
-                turn = None
-            if turn is None:
-                turn = _Turn([], [], [], [], [])
-            turn.rows.append(row)
-            text = _message_text(message)
-            if text:
-                if _is_human(message, row):
-                    turn.human.append(text)
-                else:
-                    turn.inputs.append(text)
-            continue
-        if turn is None:
-            continue
-        turn.rows.append(row)
-        if role == "assistant":
-            text = _message_text(message)
-            if (
-                text
-                and message.get("metadata", {}).get("response_state") != "synthetic"
-            ):
-                turn.assistant.append(text)
-            for call in _tool_calls(message):
-                call_id = call.get("id")
-                name = call.get("name")
-                if isinstance(call_id, str) and isinstance(name, str):
-                    call_names[call_id] = name
-                turn.tools.append(_tool_call_digest(call))
-            turn.completed = _completed_assistant(message)
-        elif role == "tool_result":
-            result = message.get("tool_result")
-            if isinstance(result, Mapping):
-                turn.tools.append(_tool_result_digest(result, call_names))
-    if turn is not None and turn.completed:
-        units.extend(_turn_units(project_id, session_id, turn))
-    return tuple(
-        sorted(units, key=lambda unit: (unit.seq_start, unit.kind, unit.chunk_index))
-    )
-
-
-def _message(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    if row.get("type") != "message":
-        return None
-    data = row.get("data")
-    message = data.get("message") if isinstance(data, Mapping) else None
-    return message if isinstance(message, Mapping) else None
-
-
-def _message_text(message: Mapping[str, Any]) -> str:
-    content = message.get("content")
-    if not isinstance(content, list):
-        return ""
-    values = [
-        block["text"]
-        for block in content
-        if isinstance(block, Mapping)
-        and block.get("type") == "text"
-        and isinstance(block.get("text"), str)
-    ]
-    return "\n".join(value.strip() for value in values if value.strip())
-
-
-def _is_human(message: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
-    metadata = message.get("metadata")
-    origin = (
-        metadata.get(MESSAGE_ORIGIN_METADATA) if isinstance(metadata, Mapping) else None
-    )
-    return origin == MessageOrigin.USER.value
-
-
-def _completed_assistant(message: Mapping[str, Any]) -> bool:
-    metadata = message.get("metadata")
-    metadata = metadata if isinstance(metadata, Mapping) else {}
-    state = metadata.get("response_state")
-    if state is not None:
-        return state == "completed"
-    return not metadata.get("turn_failed")
-
-
-def _tool_calls(message: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    calls: list[Mapping[str, Any]] = []
-    content = message.get("content")
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, Mapping) or block.get("type") != "tool_use":
-                continue
-            call = block.get("tool_call")
-            if isinstance(call, Mapping):
-                calls.append(call)
-    return calls
-
-
-def _tool_call_digest(call: Mapping[str, Any]) -> str:
-    name = str(call.get("name") or "unknown")
-    arguments = call.get("arguments")
-    fields: list[str] = []
-    if isinstance(arguments, Mapping):
-        keys = sorted(str(key) for key in arguments)
-        fields.append("arguments=" + ",".join(keys[:24]))
-        for key in _SAFE_ARGUMENTS:
-            value = arguments.get(key)
-            if isinstance(value, str) and value:
-                fields.append(f"{key}={_bounded_text(redact_secrets(value), 320)}")
-    return _bounded_text(f"Tool {name} call: {'; '.join(fields)}", 720)
-
-
-def _tool_result_digest(result: Mapping[str, Any], names: Mapping[str, str]) -> str:
-    call_id = result.get("tool_call_id")
-    name = names.get(call_id, "unknown") if isinstance(call_id, str) else "unknown"
-    status = "error" if result.get("is_error") else "success"
-    content = result.get("content")
-    text = content if isinstance(content, str) else ""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    diagnostic = ""
-    if lines:
-        selected = [lines[0]] if len(lines) == 1 else [lines[0], lines[-1]]
-        diagnostic = "; diagnostics=" + " | ".join(
-            _bounded_text(line, MAX_DIAGNOSTIC_CHARS) for line in selected
-        )
-    projected_size = result.get("source_bytes")
-    size = (
-        projected_size
-        if type(projected_size) is int and projected_size >= 0
-        else len(content.encode("utf-8"))
-        if isinstance(content, str)
-        else 0
-    )
-    return _bounded_text(f"Tool {name} result: {status}; bytes={size}{diagnostic}", 720)
-
-
-def _child_report(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
-    if row.get("type") != "notification":
-        return None
-    data = row.get("data")
-    if not isinstance(data, Mapping) or data.get("kind") != "agent_completion":
-        return None
-    text = data.get("text")
-    if not isinstance(text, str) or not text:
-        return None
-    return (
-        str(data.get("description") or "child agent"),
-        str(data.get("status") or "unknown"),
-        text,
-    )
-
-
-def _turn_units(project_id: str, session_id: str, turn: _Turn) -> list[TranscriptUnit]:
-    sections: list[str] = []
-    sections.extend(f"Human: {text}" for text in turn.human)
-    sections.extend(f"Input: {text}" for text in turn.inputs)
-    sections.extend(f"Agent: {text}" for text in turn.assistant)
-    if turn.tools:
-        digest = _bounded_utf8("\n".join(turn.tools), MAX_TOOL_DIGEST_BYTES)
-        sections.append("Tool activity:\n" + digest)
-    origin = "human" if turn.human else "unverified_input"
-    return _make_units(
-        project_id, session_id, turn.rows, origin, "turn", "\n\n".join(sections)
-    )
-
-
-def _report_units(
-    project_id: str,
-    session_id: str,
-    row: Mapping[str, Any],
-    report: tuple[str, str, str],
-) -> list[TranscriptUnit]:
-    description, status, text = report
-    rendered = f"Child report ({description}, {status}):\n{text}"
-    return _make_units(
-        project_id, session_id, [row], "parent_visible_child", "child_report", rendered
-    )
-
-
-def _make_units(
-    project_id: str,
-    session_id: str,
-    rows: list[Mapping[str, Any]],
-    origin: str,
-    kind: Literal["turn", "child_report"],
-    text: str,
-) -> list[TranscriptUnit]:
-    text = redact_secrets(text)
-    if not text.strip():
-        return []
-    seq_start = int(rows[0]["seq"])
-    seq_end = int(rows[-1]["seq"])
-    turn_id = _stable_id(session_id, kind, seq_start, seq_end)
-    chunks = _split_utf8(text, MAX_UNIT_BYTES)
-    timestamps = [_timestamp(row) for row in rows]
-    timestamps = [value for value in timestamps if value is not None]
-    base = TranscriptUnit(
-        schema_version=_UNIT_SCHEMA_VERSION,
-        unit_id="",
-        turn_id=turn_id,
-        project_id=project_id,
-        session_id=session_id,
-        seq_start=seq_start,
-        seq_end=seq_end,
-        started_at=timestamps[0] if timestamps else None,
-        ended_at=timestamps[-1] if timestamps else None,
-        origin=origin,
-        kind=kind,
-        chunk_index=0,
-        chunk_count=len(chunks),
-        text="",
-    )
-    return [
-        replace(
-            base,
-            unit_id=_stable_id(turn_id, str(index)),
-            chunk_index=index,
-            text=chunk,
-        )
-        for index, chunk in enumerate(chunks)
-    ]
-
-
-def _timestamp(row: Mapping[str, Any]) -> str | None:
-    data = row.get("data")
-    if not isinstance(data, Mapping):
-        return None
-    value = data.get("created_at") or data.get("timestamp")
-    return value if isinstance(value, str) else None
-
-
-def _stable_id(*parts: str | int) -> str:
-    source = "\0".join(str(part) for part in parts).encode()
-    return hashlib.sha256(source).hexdigest()[:32]
-
-
-def _bounded_text(value: str, max_chars: int) -> str:
-    clean = re.sub(r"\s+", " ", value).strip()
-    return clean if len(clean) <= max_chars else clean[: max_chars - 1] + "…"
-
-
-def _bounded_utf8(value: str, max_bytes: int) -> str:
-    encoded = value.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return value
-    return encoded[: max_bytes - 3].decode("utf-8", errors="ignore") + "…"
-
-
-def _split_utf8(value: str, max_bytes: int) -> list[str]:
-    remaining = value.strip()
-    chunks: list[str] = []
-    while len(remaining.encode("utf-8")) > max_bytes:
-        encoded = remaining.encode("utf-8")
-        prefix = encoded[:max_bytes].decode("utf-8", errors="ignore")
-        split = max(prefix.rfind("\n\n"), prefix.rfind("\n"), prefix.rfind(" "))
-        if split < max_bytes // 2:
-            split = len(prefix)
-        chunk = prefix[:split].rstrip()
-        chunks.append(chunk)
-        remaining = remaining[len(prefix[:split]) :].lstrip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks or [""]
-
+from zeta.transcript_search.render import (
+    MAX_UNIT_BYTES,  # noqa: F401 - compatibility re-export
+    TranscriptUnit,
+    _completed_assistant,
+    _message,
+    render_transcript_units,
+)
 
 SCHEMA_VERSION = 5
 SANITIZER_VERSION = 2
 INDEX_FILENAME = "transcript-index.sqlite3"
 MAX_ACTIVE_TAIL_BYTES = 1024 * 1024
+MAX_META_BYTES = 1024 * 1024
+_MAX_APPEND_PREPARE_ATTEMPTS = 3
+_REQUIRED_SAFE_OPEN_NAMES = ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC")
 _TOKEN = re.compile(r"[\w.-]+", re.UNICODE)
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 _PROJECT_LOCKS: dict[tuple[Path, str], threading.RLock] = {}
@@ -410,6 +87,51 @@ class TranscriptSource:
     @property
     def conversation_path(self) -> Path:
         return self.session_dir / "conversation.jsonl"
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredCursor:
+    byte_offset: int
+    last_seq: int
+    source_device: int
+    source_inode: int
+    source_mtime_ns: int
+    source_ctime_ns: int
+    source_size: int
+    incremental_ready: bool
+    last_entry_id: str | None
+    active_tail_json: str
+    prefix_digest: str | None
+
+    def as_cursor(self) -> _Cursor:
+        return _Cursor(
+            self.byte_offset,
+            self.last_seq,
+            self.source_device,
+            self.source_inode,
+            self.source_mtime_ns,
+            self.source_ctime_ns,
+            self.source_size,
+            self.incremental_ready,
+            self.last_entry_id,
+            tuple(json.loads(self.active_tail_json)),
+            self.prefix_digest,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CursorSnapshot:
+    expected: _StoredCursor | None
+    read_from: _Cursor | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAppend:
+    source: TranscriptSource
+    expected_cursor: _StoredCursor | None
+    full: bool
+    units: tuple[TranscriptUnit, ...]
+    next_cursor: _StoredCursor
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,11 +199,17 @@ class TranscriptIndex:
             ) from exc
 
     def append(self, source: TranscriptSource) -> IndexStatus:
-        """Incrementally ingest one source without rereading committed bytes."""
+        """Incrementally ingest one source without holding the guard while reading."""
 
-        with self._write_guard():
-            self._require_ready()
-            return self._append_locked(source)
+        for _ in range(_MAX_APPEND_PREPARE_ATTEMPTS):
+            snapshot = self._cursor_snapshot(source.session_id)
+            prepared = self._prepare_append(source, snapshot)
+            status = self._commit_prepared(prepared)
+            if status is not None:
+                return status
+        raise TranscriptIndexError(
+            "transcript changed during index refresh; retry required"
+        )
 
     def append_units(
         self,
@@ -671,51 +399,126 @@ class TranscriptIndex:
     def _append_locked(
         self, source: TranscriptSource, *, force_full: bool = False
     ) -> IndexStatus:
+        """Append while an outer exclusive guard is already held (rebuild only)."""
+
+        for _ in range(_MAX_APPEND_PREPARE_ATTEMPTS):
+            snapshot = self._cursor_snapshot_locked(source.session_id)
+            prepared = self._prepare_append(source, snapshot, force_full=force_full)
+            status = self._commit_prepared_locked(prepared)
+            if status is not None:
+                return status
+        raise TranscriptIndexError(
+            "transcript changed during index refresh; retry required"
+        )
+
+    def _cursor_snapshot(self, session_id: str) -> _CursorSnapshot:
+        with self._read_guard():
+            self._require_ready()
+            return self._cursor_snapshot_locked(session_id)
+
+    def _cursor_snapshot_locked(self, session_id: str) -> _CursorSnapshot:
         try:
             with closing(self._connect()) as connection:
-                cursor = self._cursor(connection, source.session_id)
-                indexed_seq = connection.execute(
-                    "SELECT coalesce(max(seq_end), 0) FROM units WHERE session_id = ?",
-                    (source.session_id,),
-                ).fetchone()[0]
-            if cursor is not None and int(indexed_seq) > cursor.last_seq:
-                cursor = None
-            read = _read_transcript(
-                source.conversation_path,
-                None if force_full else cursor,
-                None if force_full else source.append_receipts,
-            )
-            if (
-                not read.full
-                and read.rows
-                and read.rows[0].get("parent_id") != cursor.last_entry_id
-            ):
-                read = _read_transcript(source.conversation_path, None)
-            prior_tail = () if read.full or cursor is None else cursor.active_tail
-            render_rows = prior_tail + read.rows
-            units = render_transcript_units(
-                self.project_id, source.session_id, render_rows
-            )
-            active_tail = _active_tail(render_rows)
-            tail_json = json.dumps(active_tail, separators=(",", ":"), sort_keys=True)
-            incremental_ready = len(tail_json.encode("utf-8")) <= MAX_ACTIVE_TAIL_BYTES
-            if not incremental_ready:
-                active_tail = ()
-                tail_json = "[]"
+                expected = self._stored_cursor(connection, session_id)
+                indexed_seq = int(
+                    connection.execute(
+                        "SELECT coalesce(max(seq_end), 0) FROM units WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0]
+                )
+            read_from = expected.as_cursor() if expected is not None else None
+            if read_from is not None and indexed_seq > read_from.last_seq:
+                read_from = None
+            return _CursorSnapshot(expected=expected, read_from=read_from)
+        except sqlite3.Error as exc:
+            raise TranscriptIndexError(
+                f"could not refresh transcript index: {exc}"
+            ) from exc
+
+    def _prepare_append(
+        self,
+        source: TranscriptSource,
+        snapshot: _CursorSnapshot,
+        *,
+        force_full: bool = False,
+    ) -> _PreparedAppend:
+        cursor = None if force_full else snapshot.read_from
+        read = _read_transcript(
+            source.conversation_path,
+            cursor,
+            None if force_full else source.append_receipts,
+        )
+        if (
+            not read.full
+            and read.rows
+            and cursor is not None
+            and read.rows[0].get("parent_id") != cursor.last_entry_id
+        ):
+            read = _read_transcript(source.conversation_path, None)
+        prior_tail = () if read.full or cursor is None else cursor.active_tail
+        render_rows = prior_tail + read.rows
+        units = render_transcript_units(self.project_id, source.session_id, render_rows)
+        active_tail = _active_tail(render_rows)
+        tail_json = json.dumps(active_tail, separators=(",", ":"), sort_keys=True)
+        incremental_ready = len(tail_json.encode("utf-8")) <= MAX_ACTIVE_TAIL_BYTES
+        if not incremental_ready:
+            tail_json = "[]"
+        return _PreparedAppend(
+            source=source,
+            expected_cursor=snapshot.expected,
+            full=read.full,
+            units=units,
+            next_cursor=_StoredCursor(
+                byte_offset=read.byte_offset,
+                last_seq=read.last_seq,
+                source_device=read.source_device,
+                source_inode=read.source_inode,
+                source_mtime_ns=read.source_mtime_ns,
+                source_ctime_ns=read.source_ctime_ns,
+                source_size=read.source_size,
+                incremental_ready=incremental_ready,
+                last_entry_id=read.last_entry_id,
+                active_tail_json=tail_json,
+                prefix_digest=read.prefix_digest,
+            ),
+        )
+
+    def _commit_prepared(self, prepared: _PreparedAppend) -> IndexStatus | None:
+        with self._write_guard():
+            self._require_ready()
+            return self._commit_prepared_locked(prepared)
+
+    def _commit_prepared_locked(self, prepared: _PreparedAppend) -> IndexStatus | None:
+        try:
             with closing(self._connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                stored = self._cursor(connection, source.session_id)
-                if not read.full and stored != cursor:
+                if (
+                    self._stored_cursor(connection, prepared.source.session_id)
+                    != prepared.expected_cursor
+                ):
                     connection.rollback()
+                    return None
+                if not self._source_is_bound(prepared.source):
+                    connection.execute(
+                        "DELETE FROM units WHERE session_id = ?",
+                        (prepared.source.session_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM session_cursors WHERE session_id = ?",
+                        (prepared.source.session_id,),
+                    )
+                    connection.commit()
                     return self._status()
-                if not self._source_is_bound(source):
+                if not self._source_matches_prepared(prepared):
                     connection.rollback()
-                    self._delete_session_rows(source.session_id)
-                    return self._status()
-                if read.full:
-                    self._replace_units(connection, source.session_id, units)
+                    return None
+                if prepared.full:
+                    self._replace_units(
+                        connection, prepared.source.session_id, prepared.units
+                    )
                 else:
-                    self._upsert_units(connection, units)
+                    self._upsert_units(connection, prepared.units)
+                cursor = prepared.next_cursor
                 connection.execute(
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
@@ -736,20 +539,23 @@ class TranscriptIndex:
                         active_tail_json=excluded.active_tail_json,
                         prefix_digest=excluded.prefix_digest""",
                     (
-                        source.session_id,
-                        read.byte_offset,
-                        read.last_seq,
-                        read.source_device,
-                        read.source_inode,
-                        read.source_mtime_ns,
-                        read.source_ctime_ns,
-                        read.source_size,
-                        incremental_ready,
-                        read.last_entry_id,
-                        tail_json,
-                        read.prefix_digest,
+                        prepared.source.session_id,
+                        cursor.byte_offset,
+                        cursor.last_seq,
+                        cursor.source_device,
+                        cursor.source_inode,
+                        cursor.source_mtime_ns,
+                        cursor.source_ctime_ns,
+                        cursor.source_size,
+                        cursor.incremental_ready,
+                        cursor.last_entry_id,
+                        cursor.active_tail_json,
+                        cursor.prefix_digest,
                     ),
                 )
+                if not self._source_matches_prepared(prepared):
+                    connection.rollback()
+                    return None
                 connection.commit()
             return self._status()
         except sqlite3.Error as exc:
@@ -757,33 +563,77 @@ class TranscriptIndex:
                 f"could not refresh transcript index: {exc}"
             ) from exc
 
-    def _delete_session_rows(self, session_id: str) -> None:
-        with closing(self._connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
-            connection.execute(
-                "DELETE FROM session_cursors WHERE session_id = ?", (session_id,)
-            )
-            connection.commit()
+    @staticmethod
+    def _safe_open_flags() -> int | None:
+        values = [getattr(os, name, None) for name in _REQUIRED_SAFE_OPEN_NAMES]
+        if any(type(value) is not int for value in values):
+            return None
+        return os.O_RDONLY | values[0] | values[1] | values[2]
 
     def _source_is_bound(self, source: TranscriptSource) -> bool:
         expected = source.expected_project_id
         if expected is None:
             return True
+        flags = self._safe_open_flags()
+        if flags is None:
+            return False
         try:
-            payload = (source.session_dir / "meta.json").read_bytes()
-            if len(payload) > 1024 * 1024:
+            fd = os.open(source.session_dir / "meta.json", flags)
+        except OSError:
+            return False
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_META_BYTES:
+                return False
+            payload = bytearray()
+            while len(payload) <= MAX_META_BYTES:
+                chunk = os.read(fd, MAX_META_BYTES + 1 - len(payload))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > MAX_META_BYTES:
                 return False
             value = json.loads(payload)
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             return False
+        finally:
+            os.close(fd)
         return (
             isinstance(value, dict)
             and value.get("project_id") == expected == self.project_id
         )
 
+    def _source_matches_prepared(self, prepared: _PreparedAppend) -> bool:
+        flags = self._safe_open_flags()
+        if flags is None:
+            return False
+        try:
+            fd = os.open(prepared.source.conversation_path, flags)
+        except OSError:
+            return False
+        try:
+            info = os.fstat(fd)
+            cursor = prepared.next_cursor
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_dev != cursor.source_device
+                or info.st_ino != cursor.source_inode
+                or info.st_size != cursor.source_size
+                or info.st_mtime_ns != cursor.source_mtime_ns
+                or info.st_ctime_ns != cursor.source_ctime_ns
+                or not 0 <= cursor.byte_offset <= cursor.source_size
+            ):
+                return False
+            return _prefix_digest(fd, cursor.source_size) == cursor.prefix_digest
+        except (OSError, ValueError, TypeError):
+            return False
+        finally:
+            os.close(fd)
+
     @staticmethod
-    def _cursor(connection: sqlite3.Connection, session_id: str) -> _Cursor | None:
+    def _stored_cursor(
+        connection: sqlite3.Connection, session_id: str
+    ) -> _StoredCursor | None:
         row = connection.execute(
             """SELECT byte_offset, last_seq, source_device, source_inode,
                 source_mtime_ns, source_ctime_ns, source_size, incremental_ready,
@@ -793,13 +643,21 @@ class TranscriptIndex:
         ).fetchone()
         if row is None:
             return None
-        return _Cursor(
+        active_tail_json = json.dumps(
+            json.loads(row[9]), separators=(",", ":"), sort_keys=True
+        )
+        return _StoredCursor(
             *(int(row[index]) for index in range(7)),
             bool(row[7]),
             str(row[8]) if row[8] is not None else None,
-            tuple(json.loads(row[9])),
+            active_tail_json,
             str(row[10]) if row[10] is not None else None,
         )
+
+    @staticmethod
+    def _cursor(connection: sqlite3.Connection, session_id: str) -> _Cursor | None:
+        stored = TranscriptIndex._stored_cursor(connection, session_id)
+        return stored.as_cursor() if stored is not None else None
 
     @staticmethod
     def _replace_units(
