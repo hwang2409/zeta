@@ -13,6 +13,7 @@ session id and a published intent is removed.
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import logging
 import os
@@ -20,7 +21,8 @@ import re
 import stat
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -79,6 +81,7 @@ def valid_pending_link(value: object) -> bool:
     role = value.get("role")
     transcript_path = value.get("transcript_path")
     parent = value.get("parent_session_id")
+    previous_project_id = value.get("previous_project_id")
     return (
         isinstance(project_id, str)
         and bool(project_id)
@@ -87,6 +90,10 @@ def valid_pending_link(value: object) -> bool:
         and isinstance(transcript_path, str)
         and bool(transcript_path)
         and (parent is None or (isinstance(parent, str) and bool(parent)))
+        and (
+            previous_project_id is None
+            or (isinstance(previous_project_id, str) and bool(previous_project_id))
+        )
     )
 
 
@@ -104,6 +111,21 @@ def valid_child_pending_link(value: object) -> bool:
         and isinstance(value.get("session_id"), str)
         and bool(value["session_id"])
     )
+
+
+@contextmanager
+def project_links_lock(directory_fd: int) -> Iterator[None]:
+    """Serialize complete project-link intent mutation inside session shape."""
+
+    lock_fd = open_session_file(
+        directory_fd, ".project-links.lock", os.O_RDWR | os.O_CREAT
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def _encode_link_name(session_id: str) -> str:
@@ -124,6 +146,8 @@ def persist_pending_root_link(
     role: str,
     parent_session_id: str | None,
     lease: WriterLease,
+    *,
+    previous_project_id: str | None = None,
 ) -> None:
     """Durably publish a root-session linkage intent before registry mutation."""
 
@@ -131,9 +155,13 @@ def persist_pending_root_link(
         "project_id": project_id,
         "role": role,
         "parent_session_id": parent_session_id,
+        "previous_project_id": previous_project_id,
         "transcript_path": str(Path(sessions_dir) / session_id),
     }
-    with session_directory(sessions_dir, session_id) as (_, directory_fd):
+    with (
+        session_directory(sessions_dir, session_id) as (_, directory_fd),
+        project_links_lock(directory_fd),
+    ):
         lease.publish_json(
             directory_fd,
             "project_link_pending.json",
@@ -160,6 +188,7 @@ def persist_pending_child_link(
     name = _encode_link_name(str(link["session_id"]))
     with (
         session_directory(root.parent, root.name) as (_, root_fd),
+        project_links_lock(root_fd),
         child_directory(root_fd, PENDING_CHILD_LINKS_DIRNAME, create=True) as pending_fd,
     ):
         # Ensuring the index directory added its entry to the root session dir;
@@ -264,7 +293,10 @@ def _reconcile_child_links_pass(
     ready_collection_started: Callable[[], None] | None = None,
 ) -> _ReconcileOutcome:
     try:
-        with session_directory(sessions_dir, session_id) as (_, session_fd):
+        with (
+            session_directory(sessions_dir, session_id) as (_, session_fd),
+            project_links_lock(session_fd),
+        ):
             try:
                 pending_fd = os.open(
                     PENDING_CHILD_LINKS_DIRNAME,
@@ -283,31 +315,92 @@ def _reconcile_child_links_pass(
                     return "failed"
             finally:
                 os.close(pending_fd)
-        if intents and not _publish_pending_intents(project_registry, intents):
-            return "failed"
-        if intents:
-            with session_directory(sessions_dir, session_id) as (_, session_fd):
-                try:
-                    pending_fd = os.open(
-                        PENDING_CHILD_LINKS_DIRNAME,
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                        dir_fd=session_fd,
-                    )
-                except (FileNotFoundError, NotADirectoryError):
-                    return "drained"
-                try:
-                    for name, link in intents:
-                        status, current = _classify_pending_entry(pending_fd, name)
-                        if status != "publish" or current != link:
-                            continue
-                        if not _remove_entry(pending_fd, name):
-                            return "failed"
-                finally:
-                    os.close(pending_fd)
-        return "more" if more else "drained"
-    except (SessionError, OSError):
-        return "failed"
+        if not intents:
+            return "more" if more else "drained"
 
+        project_ids = {
+            str(project_id)
+            for _name, link in intents
+            for project_id in (link["project_id"], link.get("previous_project_id"))
+            if project_id is not None
+        }
+        domains = tuple((project_id, "sessions") for project_id in sorted(project_ids))
+        with project_registry._project_locks(
+            domains, exclusive=True
+        ) as project_fds, session_directory(
+            sessions_dir, session_id
+        ) as (_, session_fd), project_links_lock(session_fd):
+            try:
+                pending_fd = os.open(
+                    PENDING_CHILD_LINKS_DIRNAME,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=session_fd,
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                return "drained"
+            try:
+                current: list[tuple[str, dict[str, object]]] = []
+                for name, link in intents:
+                    status, value = _classify_pending_entry(pending_fd, name)
+                    if status == "publish" and value == link:
+                        current.append((name, link))
+                if not current:
+                    return "more"
+
+                by_project: dict[str, dict[str, object]] = {
+                    project_id: {"remove": set(), "records": []}
+                    for project_id in project_ids
+                }
+                for _name, link in current:
+                    project_id = str(link["project_id"])
+                    previous = link.get("previous_project_id")
+                    if previous is not None and previous != project_id:
+                        removals = by_project[str(previous)]["remove"]
+                        assert isinstance(removals, set)
+                        removals.add(str(link["session_id"]))
+                    records = by_project[project_id]["records"]
+                    assert isinstance(records, list)
+                    records.append(link)
+
+                fd_by_project = {
+                    project_id: project_fd
+                    for (project_id, _domain), project_fd in zip(
+                        domains, project_fds, strict=True
+                    )
+                }
+                ordered_projects = sorted(
+                    project_ids,
+                    key=lambda value: (
+                        bool(by_project[value]["records"]),
+                        value,
+                    ),
+                )
+                for project_id in ordered_projects:
+                    update = by_project[project_id]
+                    records = update["records"]
+                    removals = update["remove"]
+                    assert isinstance(records, list) and isinstance(removals, set)
+                    prepared = project_registry._prepare_session_records(
+                        project_id, records
+                    )
+                    project_registry._record_child_lineage_batch(
+                        fd_by_project[project_id], removals, prepared
+                    )
+                for name, _link in current:
+                    if not _remove_entry(pending_fd, name):
+                        return "failed"
+            finally:
+                os.close(pending_fd)
+        return "more" if more or len(current) != len(intents) else "drained"
+    except (
+        KeyError,
+        ProjectRegistryError,
+        SessionError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return "failed"
 
 def _collect_pending_intents(
     pending_fd: int, session_fd: int
@@ -449,43 +542,6 @@ def _classify_pending_entry(
         return "invalid", None
     return "publish", value
 
-
-def _record_child_lineage_batch(
-    project_registry: ProjectRegistry,
-    records_by_project: Mapping[str, list[Mapping[str, object]]],
-) -> None:
-    """Acquire the complete sorted sessions authority before publication."""
-    project_registry._record_child_lineage_batch(records_by_project)
-
-
-def _publish_pending_intents(
-    project_registry: ProjectRegistry,
-    intents: list[tuple[str, dict[str, object]]],
-) -> bool:
-    # Group by project so the registry's JSONL file is read exactly once per
-    # project, then published in a single deduped batch.
-    by_project: dict[str, list[tuple[str, dict[str, object]]]] = {}
-    for name, link in intents:
-        by_project.setdefault(str(link["project_id"]), []).append((name, link))
-    records_by_project = {
-        project_id: [
-            {
-                "session_id": link["session_id"],
-                "transcript_path": link["transcript_path"],
-                "role": link["role"],
-                "parent_session_id": link.get("parent_session_id"),
-            }
-            for _name, link in group
-        ]
-        for project_id, group in by_project.items()
-    }
-    try:
-        _record_child_lineage_batch(project_registry, records_by_project)
-    except (ProjectRegistryError, OSError, ValueError, KeyError, TypeError) as exc:
-        # A partial write leaves every intent in place; exact upsert repairs it.
-        logger.warning("child project linkage remains pending: %s", exc)
-        return False
-    return True
 
 
 def _open_quarantine(session_fd: int) -> int:

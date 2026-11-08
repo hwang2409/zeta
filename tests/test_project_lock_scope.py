@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import socket
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+from zeta.core.session import SessionManager
+from zeta.core.session_links import (
+    PENDING_CHILD_LINKS_DIRNAME,
+    persist_pending_child_link,
+    reconcile_child_links,
+)
 from zeta.project_registry import ProjectRegistry
 from zeta.storage_format import WRITER_EPOCH, advance
 
@@ -56,10 +65,51 @@ def _publish_other_project(home: str, project_id: str, channel: socket.socket) -
 
 
 def _record_session(home: str, project_id: str, channel: socket.socket) -> None:
-    ProjectRegistry(Path(home) / "projects").record_session(
-        project_id, session_id="session", transcript_path="session"
+    opened = SessionManager(home).create(
+        provider="codex",
+        model="test",
+        cwd=home,
+        project_id=project_id,
+        auto_project=False,
     )
-    _send(channel, "session-done")
+    opened.store.close()
+    linked = any(
+        row["session_id"] == opened.metadata.session_id
+        for row in SessionManager(home).project_registry.list_session_links(project_id)
+    )
+    _send(channel, "session-done" if linked else "session-pending")
+
+
+def _hold_sessions_publication(
+    home: str, project_id: str, channel: socket.socket
+) -> None:
+    registry = ProjectRegistry(Path(home) / "projects")
+    project_lock = getattr(registry, "_project_lock", None)
+    authority = (
+        project_lock(project_id, "sessions", exclusive=True)
+        if project_lock is not None
+        else registry._locked(write=True)
+    )
+    with authority:
+        _send(channel, "acquired")
+        if _receive(channel) != "release":
+            raise AssertionError("release signal was not sent")
+    _send(channel, "sessions-done")
+
+
+def _reconcile_child_worker(
+    home: str, value: str, channel: socket.socket
+) -> None:
+    project_id, root_id = value.split("|", 1)
+    manager = SessionManager(home)
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+    if any(
+        row["session_id"] == f"{root_id}:child"
+        for row in manager.project_registry.list_session_links(project_id)
+    ):
+        _send(channel, "child-done")
+    else:
+        _send(channel, "child-missing")
 
 
 def _hold_identity_publication(home: str, _project_id: str, channel: socket.socket) -> None:
@@ -81,8 +131,10 @@ def _hold_identity_publication(home: str, _project_id: str, channel: socket.sock
 _WORKERS = {
     "hold-memory": _hold_memory_publication,
     "hold-identity": _hold_identity_publication,
+    "hold-sessions": _hold_sessions_publication,
     "publish-memory": _publish_other_project,
     "record-session": _record_session,
+    "reconcile-child": _reconcile_child_worker,
 }
 
 
@@ -211,48 +263,330 @@ def test_p06_4_epoch_selects_legacy_then_named_authority(tmp_path: Path) -> None
     assert (home / "projects" / old_project.project_id / ".memory.lock").is_file()
 
 
-def test_p06_5_session_reference_is_reassociated_by_exact_upsert(
-    tmp_path: Path,
+def _project_session_row(
+    registry: ProjectRegistry, project_id: str, session_id: str
+) -> dict[str, object] | None:
+    return next(
+        (
+            row
+            for row in registry.list_session_links(project_id)
+            if row["session_id"] == session_id
+        ),
+        None,
+    )
+
+
+def _replace_pending(path: Path, value: dict[str, object]) -> None:
+    path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+
+
+def test_p06_5_root_reconciliation_revalidates_replaced_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / ".zeta"
     advance(home, expected_epoch=0)
-    registry = ProjectRegistry(home / "projects")
-    old_project = registry.create_project("old", "old")
-    project = registry.create_project("demo", "demo")
-    registry.record_session(
-        old_project.project_id, session_id="session", transcript_path="old"
+    manager = SessionManager(home)
+    registry = manager.project_registry
+    old = registry.create_project("old", "old")
+    stale = registry.create_project("stale", "stale")
+    latest = registry.create_project("latest", "latest")
+    opened = manager.create(
+        provider="codex",
+        model="test",
+        cwd=tmp_path,
+        project_id=old.project_id,
+        auto_project=False,
     )
-    registry.record_session(
-        project.project_id,
-        session_id="session",
-        transcript_path="new",
-        role="worker",
-        parent_session_id="parent",
+    session_id = opened.metadata.session_id
+    pending_path = manager.sessions_dir / session_id / "project_link_pending.json"
+    stale_intent = {
+        "project_id": stale.project_id,
+        "previous_project_id": old.project_id,
+        "role": "worker",
+        "parent_session_id": "stale-parent",
+        "transcript_path": str(manager.sessions_dir / session_id),
+    }
+    latest_intent = {
+        **stale_intent,
+        "project_id": latest.project_id,
+        "role": "orchestrator",
+        "parent_session_id": "latest-parent",
+    }
+    _replace_pending(pending_path, stale_intent)
+
+    reached_publication = threading.Event()
+    release_publication = threading.Event()
+    if hasattr(registry, "_project_locks"):
+        original = registry._project_locks
+        first = True
+
+        @contextmanager
+        def gated(*args: object, **kwargs: object):
+            nonlocal first
+            if first:
+                first = False
+                reached_publication.set()
+                assert release_publication.wait(10), "replacement gate was not released"
+            with original(*args, **kwargs) as value:
+                yield value
+
+        monkeypatch.setattr(registry, "_project_locks", gated)
+    else:
+        original_record = registry.record_session  # type: ignore[attr-defined]
+
+        def gated_record(*args: object, **kwargs: object) -> None:
+            reached_publication.set()
+            assert release_publication.wait(10), "replacement gate was not released"
+            original_record(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "record_session", gated_record)
+
+    failure: list[BaseException] = []
+
+    def reconcile() -> None:
+        try:
+            manager.list_sessions()
+        except BaseException as exc:  # noqa: BLE001 - thread reports every failure
+            failure.append(exc)
+
+    worker = threading.Thread(target=reconcile)
+    worker.start()
+    try:
+        assert reached_publication.wait(10), "reconciler did not reach publication"
+        _replace_pending(pending_path, latest_intent)
+        release_publication.set()
+        worker.join(10)
+        assert not worker.is_alive(), "root reconciliation did not finish"
+    finally:
+        release_publication.set()
+        worker.join(10)
+        opened.store.close()
+    assert failure == []
+    rows = {
+        project.project_id: _project_session_row(registry, project.project_id, session_id)
+        for project in (old, stale, latest)
+    }
+    assert rows[stale.project_id] is None, "replaced root intent published a stale row"
+    assert rows[old.project_id] is None
+    latest_row = rows[latest.project_id]
+    assert latest_row is not None
+    assert latest_row["role"] == "orchestrator"
+    assert latest_row["parent_session_id"] == "latest-parent"
+    assert not pending_path.exists()
+    assert sum(row is not None for row in rows.values()) == 1
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("before-old-removal", "between-removal-upsert", "after-upsert-before-cleanup"),
+)
+def test_p06_5_root_reconciliation_recovers_each_crash_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    home = tmp_path / boundary
+    advance(home, expected_epoch=0)
+    manager = SessionManager(home)
+    registry = manager.project_registry
+    old = registry.create_project("old", "old")
+    new = registry.create_project("new", "new")
+    opened = manager.create(
+        provider="codex",
+        model="test",
+        cwd=tmp_path,
+        project_id=old.project_id,
+        auto_project=False,
+    )
+    session_id = opened.metadata.session_id
+    pending_path = manager.sessions_dir / session_id / "project_link_pending.json"
+
+    calls = 0
+    original_update = getattr(registry, "_update_sessions_locked", None)
+    if original_update is not None and boundary != "after-upsert-before-cleanup":
+        def crash_update(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            if boundary == "before-old-removal" or calls == 2:
+                raise OSError(f"crash {boundary}")
+            original_update(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_update_sessions_locked", crash_update)
+    elif original_update is not None:
+        import zeta.core.session as session_module
+
+        original_unlink = session_module.os.unlink
+        crashed = False
+
+        def crash_cleanup(path: object, *args: object, **kwargs: object) -> None:
+            nonlocal crashed
+            if path == "project_link_pending.json" and not crashed:
+                crashed = True
+                raise OSError("crash after upsert")
+            original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(session_module.os, "unlink", crash_cleanup)
+
+    manager.associate_project(opened.metadata, new.project_id)
+    old_row = _project_session_row(registry, old.project_id, session_id)
+    new_row = _project_session_row(registry, new.project_id, session_id)
+    assert not (old_row is not None and new_row is not None), (
+        "a completed crash-boundary observation exposed two active project rows"
+    )
+    monkeypatch.undo()
+    retry_failures: list[BaseException] = []
+
+    def retry() -> None:
+        try:
+            manager.list_sessions()
+        except BaseException as exc:  # noqa: BLE001 - thread reports every failure
+            retry_failures.append(exc)
+
+    reconcilers = [threading.Thread(target=retry) for _ in range(2)]
+    for reconciler in reconcilers:
+        reconciler.start()
+    for reconciler in reconcilers:
+        reconciler.join(10)
+        assert not reconciler.is_alive(), "root reconciler did not make progress"
+    assert retry_failures == []
+    assert _project_session_row(registry, old.project_id, session_id) is None
+    repaired = _project_session_row(registry, new.project_id, session_id)
+    assert repaired is not None
+    assert repaired["transcript_path"] == str(manager.sessions_dir / session_id)
+    assert not pending_path.exists()
+    opened.store.close()
+
+
+def test_p06_5_child_reconciliation_revalidates_replaced_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    advance(home, expected_epoch=0)
+    manager = SessionManager(home)
+    registry = manager.project_registry
+    project = registry.create_project("demo", "demo")
+    root = manager.create(
+        provider="codex", model="test", cwd=tmp_path, auto_project=False
+    )
+    root_id = root.metadata.session_id
+    child_id = f"{root_id}:child"
+    stale = {
+        "project_id": project.project_id,
+        "session_id": child_id,
+        "role": "worker",
+        "parent_session_id": root_id,
+        "transcript_path": "/stale",
+    }
+    latest = {**stale, "role": "orchestrator", "transcript_path": "/latest"}
+    persist_pending_child_link(
+        manager.sessions_dir / root_id, stale, manager._storage_lease
+    )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    pending_path = next(pending_dir.iterdir())
+
+    reached_publication = threading.Event()
+    release_publication = threading.Event()
+    if hasattr(registry, "_project_locks"):
+        original = registry._project_locks
+
+        @contextmanager
+        def gated(*args: object, **kwargs: object):
+            reached_publication.set()
+            assert release_publication.wait(10), "replacement gate was not released"
+            with original(*args, **kwargs) as value:
+                yield value
+
+        monkeypatch.setattr(registry, "_project_locks", gated)
+    else:
+        import zeta.core.session_links as session_links_module
+
+        original_batch = session_links_module._record_child_lineage_batch
+
+        def gated_batch(*args: object, **kwargs: object) -> None:
+            reached_publication.set()
+            assert release_publication.wait(10), "replacement gate was not released"
+            original_batch(*args, **kwargs)
+
+        monkeypatch.setattr(
+            session_links_module, "_record_child_lineage_batch", gated_batch
+        )
+
+    worker = threading.Thread(
+        target=reconcile_child_links,
+        args=(registry, manager.sessions_dir, root_id),
+    )
+    worker.start()
+    try:
+        assert reached_publication.wait(10), "child reconciler did not reach publication"
+        _replace_pending(pending_path, latest)
+        release_publication.set()
+        worker.join(10)
+        assert not worker.is_alive(), "child reconciliation did not finish"
+    finally:
+        release_publication.set()
+        worker.join(10)
+    row = _project_session_row(registry, project.project_id, child_id)
+    assert row is None, "changed full-value child intent was published by stale reconciler"
+    assert pending_path.exists(), "stale reconciler cleaned the replacement child intent"
+    monkeypatch.undo()
+    reconcile_child_links(registry, manager.sessions_dir, root_id)
+    row = _project_session_row(registry, project.project_id, child_id)
+    assert row is not None
+    assert row["role"] == "orchestrator"
+    assert row["transcript_path"] == "/latest"
+    assert not pending_path.exists()
+    root.store.close()
+
+
+def test_p06_8_root_reconciliation_process_progress(tmp_path: Path) -> None:
+    home = tmp_path / ".zeta"
+    advance(home, expected_epoch=0)
+    registry = ProjectRegistry(home / "projects")
+    held = registry.create_project("held", "held")
+    target = registry.create_project("target", "target")
+
+    _run_while_lock_is_held(
+        home,
+        holder_kind="hold-sessions",
+        holder_project=held.project_id,
+        other_kind="record-session",
+        other_project=target.project_id,
+        expected="session-done",
     )
 
-    links = registry.list_session_links(project.project_id)
-    assert registry.list_session_links(old_project.project_id) == [], (
-        "reassociation left the session in its previous project"
+
+def test_p06_8_child_reconciliation_process_progress(tmp_path: Path) -> None:
+    home = tmp_path / ".zeta"
+    advance(home, expected_epoch=0)
+    registry = ProjectRegistry(home / "projects")
+    held = registry.create_project("held", "held")
+    target = registry.create_project("target", "target")
+    manager = SessionManager(home)
+    root = manager.create(
+        provider="codex", model="test", cwd=tmp_path, auto_project=False
     )
-    assert len(links) == 1
-    links_path = home / "projects" / project.project_id / "sessions.jsonl"
-    before = links_path.read_bytes(), links_path.stat().st_mtime_ns
-    registry.record_session(
-        project.project_id,
-        session_id="session",
-        transcript_path="new",
-        role="worker",
-        parent_session_id="parent",
+    root_id = root.metadata.session_id
+    persist_pending_child_link(
+        manager.sessions_dir / root_id,
+        {
+            "project_id": target.project_id,
+            "session_id": f"{root_id}:child",
+            "role": "worker",
+            "parent_session_id": root_id,
+            "transcript_path": "/child",
+        },
+        manager._storage_lease,
     )
-    assert (links_path.read_bytes(), links_path.stat().st_mtime_ns) == before
-    assert {
-        key: value for key, value in links[0].items() if key != "recorded_at"
-    } == {
-        "session_id": "session",
-        "transcript_path": "new",
-        "role": "worker",
-        "parent_session_id": "parent",
-    }
+    root.store.close()
+
+    _run_while_lock_is_held(
+        home,
+        holder_kind="hold-sessions",
+        holder_project=held.project_id,
+        other_kind="reconcile-child",
+        other_project=f"{target.project_id}|{root_id}",
+        expected="child-done",
+    )
 
 
 def test_storage_d1_project_lock_obeys_global_rank_order(tmp_path: Path) -> None:

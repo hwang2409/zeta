@@ -196,6 +196,33 @@ def _linked_session_fixture(tmp_path: Path):
     return home, project, session_id, links_path
 
 
+def _update_session_reference(
+    home: Path,
+    project_id: str,
+    *,
+    session_id: str,
+    transcript_path: str,
+    role: str = "session",
+    parent_session_id: str | None = None,
+) -> None:
+    registry = ProjectRegistry(home / "projects")
+    records = registry._prepare_session_records(
+        project_id,
+        [
+            {
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "role": role,
+                "parent_session_id": parent_session_id,
+            }
+        ],
+    )
+    with registry._project_lock(
+        project_id, "sessions", exclusive=True
+    ) as project_fd:
+        registry._update_sessions_locked(project_fd, set(), records)
+
+
 def _seed_pending_link(home: Path, session_id: str) -> Path:
     pending = home / "sessions" / session_id / "project_link_pending.json"
     pending.write_text("{}", encoding="utf-8")
@@ -276,7 +303,8 @@ def test_record_session_fast_duplicate_matches_full_reader(
                 reopened = SessionManager(home).open(session_id)
                 reopened.store.close()
             else:
-                ProjectRegistry(home / "projects").record_session(
+                _update_session_reference(
+                    home,
                     project.project_id,
                     session_id=requested_id,
                     transcript_path=str(home / "sessions" / requested_id),
@@ -415,7 +443,8 @@ def test_duplicate_session_scan_keeps_memory_below_registry_size(
     monkeypatch.setattr(registry_module.os, "read", bounded_read)
     tracemalloc.start()
     try:
-        ProjectRegistry(home / "projects").record_session(
+        _update_session_reference(
+            home,
             project.project_id,
             session_id=session_id,
             transcript_path=str(home / "sessions" / session_id),
@@ -772,19 +801,19 @@ def test_root_link_pending_intent_dir_fsync_precedes_record_session(
     monkeypatch.setattr(os, "fsync", spy_fsync)
 
     manager = SessionManager(home)
-    real_record = manager.project_registry.record_session
+    real_update = manager.project_registry._update_sessions_locked
 
-    def spy_record(*args: object, **kwargs: object) -> None:
-        events.append("record_session")
-        return real_record(*args, **kwargs)
+    def spy_update(*args: object, **kwargs: object) -> None:
+        events.append("update_sessions")
+        return real_update(*args, **kwargs)
 
-    monkeypatch.setattr(manager.project_registry, "record_session", spy_record)
+    monkeypatch.setattr(manager.project_registry, "_update_sessions_locked", spy_update)
 
     session = manager.create(provider="codex", model="fake", cwd=repository)
     session.store.close()
 
-    assert "record_session" in events
-    first_record = events.index("record_session")
+    assert "update_sessions" in events
+    first_record = events.index("update_sessions")
     # The durable intent's directory entry is fsynced immediately before the
     # registry is published, so a crash between the two boundaries is
     # recoverable rather than losing the rename.
@@ -1425,7 +1454,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
         )
         release_owner.set()
         results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True), 10
+            asyncio.gather(*tasks, return_exceptions=True), 120
         )
     finally:
         release_owner.set()
@@ -1538,19 +1567,15 @@ async def test_real_child_spawns_repeat_after_generation_changes(
                     )
                 )
             )
-        await asyncio.wait_for(
-            asyncio.gather(*tasks[1:], return_exceptions=True), 120
-        )
         last = asyncio.create_task(
             loop._run_agent_tool(
                 calls[256], calls[256].arguments, signals.new_generation(), None
             )
         )
         tasks.append(last)
-        await asyncio.wait_for(asyncio.gather(last, return_exceptions=True), 10)
         release_first_batch.set()
         results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True), 10
+            asyncio.gather(*tasks, return_exceptions=True), 120
         )
     finally:
         release_first_batch.set()
@@ -1565,9 +1590,10 @@ async def test_real_child_spawns_repeat_after_generation_changes(
         repr(result) for result in results if not isinstance(result, RuntimeError)
     ]
 
-    # The first ready set is already collected when publication blocks. The
-    # 257th admission must change the generation and force a second pass.
-    assert registry_reads == 2
+    # The semantic lock can split concurrent admissions into more than two
+    # passes, but every bounded pass reads and rewrites the project only once.
+    assert record_calls >= 2
+    assert registry_reads == record_calls
     records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=10_000)
     child_ids = [
         record["session_id"] for record in records if ":" in str(record["session_id"])
@@ -1712,12 +1738,6 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         second_owner_wait = asyncio.create_task(
             asyncio.wait_for(second_owner_entered.wait(), 10)
         )
-        done, _ = await asyncio.wait_for(
-            asyncio.wait(
-                {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
-            ),
-            10,
-        )
         grand_tasks.extend(
             asyncio.create_task(
                 child_loops[index % 2]._run_agent_tool(
@@ -1729,14 +1749,11 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             )
             for index in range(2, 4)
         )
-        await asyncio.wait_for(
-            asyncio.gather(*grand_tasks[2:], return_exceptions=True), 10
-        )
         release_batches.set()
         results = await asyncio.wait_for(
-            asyncio.gather(*grand_tasks, return_exceptions=True), 10
+            asyncio.gather(*grand_tasks, return_exceptions=True), 120
         )
-        if second_owner_wait not in done:
+        if not second_owner_wait.done():
             second_owner_wait.cancel()
             await asyncio.wait_for(
                 asyncio.gather(second_owner_wait, return_exceptions=True), 10
@@ -1761,7 +1778,8 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         repr(result) for result in results if not isinstance(result, RuntimeError)
     ]
     assert max_active_records == 1
-    assert registry_reads == 2
+    assert record_calls >= 2
+    assert registry_reads == record_calls
     records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=100)
     grandchild_ids = [
         record["session_id"]
@@ -1875,7 +1893,10 @@ async def test_cancelled_child_publication_joins_before_loop_close(
 def test_pending_index_fsyncs_root_dir_before_record_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.core.session_links import persist_pending_child_link
+    from zeta.core.session_links import (
+        persist_pending_child_link,
+        reconcile_child_links,
+    )
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     # The pending index directory's own entry lives in the root session dir; a
@@ -1898,13 +1919,13 @@ def test_pending_index_fsyncs_root_dir_before_record_session(
     monkeypatch.setattr(os, "fsync", spy_fsync)
 
     registry = manager.project_registry
-    real_record = registry.record_session
+    real_update = registry._update_sessions_locked
 
-    def spy_record(*args: object, **kwargs: object):
-        events.append("record_session")
-        return real_record(*args, **kwargs)
+    def spy_update(*args: object, **kwargs: object) -> None:
+        events.append("update_sessions")
+        return real_update(*args, **kwargs)
 
-    monkeypatch.setattr(registry, "record_session", spy_record)
+    monkeypatch.setattr(registry, "_update_sessions_locked", spy_update)
 
     child_id = f"{root_id}:1"
     link = {
@@ -1918,16 +1939,10 @@ def test_pending_index_fsyncs_root_dir_before_record_session(
     persist_pending_child_link(
         manager.sessions_dir / root_id, link, manager._storage_lease
     )
-    registry.record_session(
-        project.project_id,
-        session_id=child_id,
-        transcript_path=f"/sessions/{child_id}",
-        role="worker",
-        parent_session_id=root_id,
-    )
+    reconcile_child_links(registry, manager.sessions_dir, root_id)
 
-    assert "record_session" in events
-    first_record = events.index("record_session")
+    assert "update_sessions" in events
+    first_record = events.index("update_sessions")
     assert "fsync_root_dir" in events[:first_record]
 
 

@@ -72,6 +72,7 @@ from .session_metadata import META_VERSION, OpenedSession, SessionMetadata
 from .session_links import (
     _PROJECT_ROLES,
     persist_pending_root_link,
+    project_links_lock,
     reconcile_child_links,
     valid_pending_link,
 )
@@ -271,24 +272,16 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             try:
                 store.activate_runtime_lease()
                 if project_id is not None:
-                    link = {
-                        "project_id": project_id,
-                        "role": project_role or "session",
-                        "parent_session_id": parent_session_id,
-                        "transcript_path": str(self.sessions_dir / session_id),
-                    }
                     # The durable intent makes a crash at either boundary repairable.
                     try:
-                        with session_directory(self.sessions_dir, session_id) as (
-                            _,
-                            directory_fd,
-                        ):
-                            self._storage_lease.publish_json(
-                                directory_fd,
-                                "project_link_pending.json",
-                                mapping_mutations(link),
-                                write_session_file,
-                            )
+                        persist_pending_root_link(
+                            self.sessions_dir,
+                            session_id,
+                            project_id,
+                            project_role or "session",
+                            parent_session_id,
+                            self._storage_lease,
+                        )
                     except (SessionError, OSError) as exc:
                         logger.warning(
                             "could not persist project linkage intent: %s", exc
@@ -322,6 +315,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 current.project_role or "session",
                 current.parent_session_id,
                 self._storage_lease,
+                previous_project_id=previous_project_id,
             )
         except (SessionError, OSError) as exc:
             logger.warning("could not persist project linkage intent: %s", exc)
@@ -505,60 +499,109 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         if registry is None:
             return
         try:
-            durable_pending: dict[str, object] | None = None
-            with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
-                try:
-                    value = json.loads(
-                        read_session_file(directory_fd, "project_link_pending.json")
-                    )
+            while True:
+                with (
+                    session_directory(self.sessions_dir, session_id) as (
+                        _,
+                        directory_fd,
+                    ),
+                    project_links_lock(directory_fd),
+                ):
+                    try:
+                        value = json.loads(
+                            read_session_file(
+                                directory_fd, "project_link_pending.json"
+                            )
+                        )
+                    except (
+                        FileNotFoundError,
+                        json.JSONDecodeError,
+                        UnicodeDecodeError,
+                        OSError,
+                        SessionError,
+                    ):
+                        value = None
                     if valid_pending_link(value):
-                        durable_pending = value
-                except (
-                    FileNotFoundError,
-                    json.JSONDecodeError,
-                    UnicodeDecodeError,
-                    OSError,
-                    SessionError,
-                ):
-                    pass
-                if durable_pending is None:
-                    metadata = self._read(session_id, directory_fd=directory_fd)
-                    if metadata.project_id is None:
-                        return
-                    pending = {
-                        "project_id": metadata.project_id,
-                        "role": metadata.project_role or "session",
-                        "parent_session_id": metadata.parent_session_id,
-                        "transcript_path": str(self.sessions_dir / session_id),
+                        pending = value
+                    else:
+                        metadata = self._read(
+                            session_id, directory_fd=directory_fd
+                        )
+                        if metadata.project_id is None:
+                            return
+                        pending = {
+                            "project_id": metadata.project_id,
+                            "previous_project_id": None,
+                            "role": metadata.project_role or "session",
+                            "parent_session_id": metadata.parent_session_id,
+                            "transcript_path": str(self.sessions_dir / session_id),
+                        }
+                        write_session_file(
+                            directory_fd,
+                            "project_link_pending.json",
+                            json.dumps(pending, sort_keys=True).encode("utf-8"),
+                        )
+
+                project_id = str(pending["project_id"])
+                previous = pending.get("previous_project_id")
+                project_ids = {project_id}
+                if previous is not None and previous != project_id:
+                    project_ids.add(str(previous))
+                domains = tuple(
+                    (value, "sessions") for value in sorted(project_ids)
+                )
+                with registry._project_locks(
+                    domains, exclusive=True
+                ) as project_fds, session_directory(
+                    self.sessions_dir, session_id
+                ) as (_, directory_fd), project_links_lock(directory_fd):
+                    try:
+                        current = json.loads(
+                            read_session_file(
+                                directory_fd, "project_link_pending.json"
+                            )
+                        )
+                    except (
+                        FileNotFoundError,
+                        json.JSONDecodeError,
+                        UnicodeDecodeError,
+                        OSError,
+                        SessionError,
+                    ):
+                        continue
+                    if current != pending or not valid_pending_link(current):
+                        continue
+                    fd_by_project = {
+                        value: project_fd
+                        for (value, _domain), project_fd in zip(
+                            domains, project_fds, strict=True
+                        )
                     }
-                else:
-                    pending = durable_pending
-            registry.record_session(
-                pending["project_id"],
-                session_id=session_id,
-                transcript_path=pending["transcript_path"],
-                role=pending["role"],
-                parent_session_id=pending.get("parent_session_id"),
-            )
-            if durable_pending is None:
-                return
-            with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
-                try:
-                    current = json.loads(
-                        read_session_file(directory_fd, "project_link_pending.json")
+                    prepared = registry._prepare_session_records(
+                        project_id,
+                        [
+                            {
+                                "session_id": session_id,
+                                "transcript_path": pending["transcript_path"],
+                                "role": pending["role"],
+                                "parent_session_id": pending.get(
+                                    "parent_session_id"
+                                ),
+                            }
+                        ],
                     )
-                except (
-                    FileNotFoundError,
-                    json.JSONDecodeError,
-                    UnicodeDecodeError,
-                    OSError,
-                    SessionError,
-                ):
+                    if previous is not None and previous != project_id:
+                        registry._update_sessions_locked(
+                            fd_by_project[str(previous)], {session_id}, []
+                        )
+                    registry._update_sessions_locked(
+                        fd_by_project[project_id], set(), prepared
+                    )
+                    os.unlink(
+                        "project_link_pending.json", dir_fd=directory_fd
+                    )
+                    os.fsync(directory_fd)
                     return
-                if current != durable_pending or not valid_pending_link(current):
-                    return
-                os.unlink("project_link_pending.json", dir_fd=directory_fd)
-                os.fsync(directory_fd)
         except (
             KeyError,
             ProjectRegistryError,

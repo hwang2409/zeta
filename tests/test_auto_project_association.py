@@ -820,7 +820,7 @@ def test_project_init_uses_durable_pending_link_on_registry_failure(
     def fail(*args: object, **kwargs: object) -> None:
         raise OSError("injected registry failure")
 
-    monkeypatch.setattr(m.project_registry, "record_session", fail)
+    monkeypatch.setattr(m.project_registry, "_update_sessions_locked", fail)
     with caplog.at_level(logging.WARNING):
         current = m.associate_project(opened.metadata, project.project_id)
 
