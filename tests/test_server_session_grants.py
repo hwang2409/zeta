@@ -38,6 +38,7 @@ from tests.test_server_websocket import (
 )
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
+from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer, approval_lifecycle
 from zeta.server.approval_lifecycle import ExternalEnd
 from zeta.server.protocol import EventDescriptor
@@ -119,6 +120,7 @@ class _DelegatedBackend:
         self.child_two_ready = asyncio.Event()
         self.release_child_two = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages: Any, tool_schemas: Any):
         del tool_schemas
         last_user_index, last_user = next(
@@ -173,7 +175,8 @@ class _DelegatedBackend:
             )
         else:
             turn = ScriptedTurn([TextContent("done")])
-        async for event in FakeBackend([turn]).complete(messages, []):
+        backend = FakeBackend([turn])
+        async for event in FakeBackend.complete.__wrapped__(backend, messages, []):
             yield event
 
 
@@ -182,10 +185,13 @@ class _GatedBackend(FakeBackend):
         super().__init__(turns)
         self.release_next_call = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages: Any, tool_schemas: Any):
         if len(self.calls) == 1:
-            await self.release_next_call.wait()
-        async for event in super().complete(messages, tool_schemas):
+            await asyncio.wait_for(self.release_next_call.wait(), 10)
+        async for event in FakeBackend.complete.__wrapped__(
+            self, messages, tool_schemas
+        ):
             yield event
 
 

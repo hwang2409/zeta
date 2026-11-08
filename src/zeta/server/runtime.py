@@ -40,6 +40,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..providers.completion import owned_completion
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
@@ -64,6 +65,7 @@ class _TestScriptedBackend(CompletionBackend):
     def __init__(self, model: str) -> None:
         self.model = model
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -220,7 +222,6 @@ class ServerRuntime:
         self._background_wake_sink: SessionWakeSink | None = None
         self._approval_control_binder: ApprovalControlBinder | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
-        self._post_stream_provider_retry = False
         self._setup_reapers: set[asyncio.Task[None]] = set()
 
     def backend_for_model(
@@ -341,13 +342,6 @@ class ServerRuntime:
     def project_registry_warning(self) -> str | None:
         unavailable = self.manager.project_registry_unavailable
         return unavailable.warning if unavailable is not None else None
-
-    def set_post_stream_provider_retry(self, enabled: bool) -> None:
-        """Apply the serve client's negotiated retry display capability."""
-
-        self._post_stream_provider_retry = enabled
-        if self._state is not None:
-            self._state.loop.post_stream_provider_retry = enabled
 
     def set_approval_control_binder(self, binder: ApprovalControlBinder) -> None:
         self._approval_control_binder = binder
@@ -725,7 +719,6 @@ class ServerRuntime:
             auto_project=False,
             project_id=project_id,
             on_plan_mode_change=persist_plan_mode,
-            post_stream_provider_retry=self._post_stream_provider_retry,
             require_selected_account=(
                 self.backend_factory is None and not self._test_scripted_provider
             ),

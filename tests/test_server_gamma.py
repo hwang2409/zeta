@@ -12,6 +12,7 @@ import subprocess
 import threading
 from contextlib import suppress
 from pathlib import Path
+from types import MethodType
 
 import pytest
 from PIL import Image
@@ -33,6 +34,7 @@ from zeta.mcp.management import MCPManagementService
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
+from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer, image_delivery, slash_commands
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
@@ -1652,18 +1654,19 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
     )
     entered = [asyncio.Event(), asyncio.Event()]
     release_backend = [asyncio.Event(), asyncio.Event()]
-    original_complete = backend.complete
+    raw_complete = FakeBackend.complete.__wrapped__
 
-    async def gated_complete(messages, tool_schemas):
+    @owned_completion
+    async def gated_complete(self, messages, tool_schemas):
         turn = len(backend.calls)
         if turn in {0, 2}:
             gate = turn // 2
             entered[gate].set()
             await asyncio.wait_for(release_backend[gate].wait(), TIMEOUT)
-        async for event in original_complete(messages, tool_schemas):
+        async for event in raw_complete(backend, messages, tool_schemas):
             yield event
 
-    monkeypatch.setattr(backend, "complete", gated_complete)
+    monkeypatch.setattr(backend, "complete", MethodType(gated_complete, backend))
     server = _server(tmp_path, backend, _launch(tmp_path))
     reader, writer = await _connect(server)
     started = asyncio.Event()
