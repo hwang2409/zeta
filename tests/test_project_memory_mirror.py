@@ -119,6 +119,7 @@ def test_mirror_edits_are_ignored_and_overwritten(tmp_path: Path) -> None:
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        project_projection=registry.project_context_projection(project_id),
     )
     assert "authoritative" in context.system_prompt
     assert "local disk edit" not in context.system_prompt
