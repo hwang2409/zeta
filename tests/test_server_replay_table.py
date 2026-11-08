@@ -1292,7 +1292,9 @@ async def _stream_ended_unnegotiated(
         observer, stream_id = await _observer_with_stream(server, transport, old_session)
         await controller.request(3, "new_session", {"provider": "codex"})
         ended = await _frames_before_status(observer, 31)
-        assert _wire(ended) == [("replay_stream_ended", stream_id, "session_replaced")]
+        assert _wire(ended) == [("replay_stream_ended", stream_id, "session_replaced")], (
+            "session replacement did not end the joined observer stream with exactly one event"
+        )
         assert _ended(ended[0], old_session, stream_id, "session_replaced")
         assert all(
             frame.get("params", {}).get("event") != "replay_stream_ended"
