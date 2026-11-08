@@ -793,6 +793,7 @@ def format_status(
     plan_state: str | None = None,
     background_count: int = 0,
     decisions_count: int = 0,
+    decisions_error: str | None = None,
     main_active: bool = False,
     undo_available: bool = False,
     transcript_search: str | None = None,
@@ -873,7 +874,9 @@ def format_status(
         segments.append(state_segment)
         if background_count > 0:
             segments.append(f"bg {background_count}")
-        if decisions_count > 0:
+        if decisions_error is not None:
+            segments.append(f"decisions unavailable: {decisions_error}")
+        elif decisions_count > 0:
             noun = "decision" if decisions_count == 1 else "decisions"
             segments.append(f"● {decisions_count} {noun}")
         if main_active:
@@ -1002,7 +1005,12 @@ def format_status(
             value = fitted.plain.rstrip(" ·")
     rendered = Text(value, style=theme.CHROME)
     offset = 0
-    if decisions_count > 0:
+    if decisions_error is not None:
+        marker = f"decisions unavailable: {decisions_error}"
+        marker_start = value.find(marker)
+        if marker_start >= 0:
+            rendered.stylize(theme.ERROR, marker_start, marker_start + len(marker))
+    elif decisions_count > 0:
         noun = "decision" if decisions_count == 1 else "decisions"
         marker = f"● {decisions_count} {noun}"
         marker_start = value.find(marker)

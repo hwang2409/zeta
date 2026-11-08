@@ -15,6 +15,7 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
+from ...protocol.types import StreamEvent, StreamEventType
 from ...runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
@@ -27,6 +28,8 @@ from ..overlay import OverlayControl
 # attention records); a few-second cadence keeps the status-bar count fresh
 # without busy-polling.
 _POLL_INTERVAL = 2.0
+_POLL_RESTART_LIMIT = 3
+_POLL_RESTART_BASE = 0.5
 _PANEL_REFRESH_INTERVAL = 0.5
 
 
@@ -52,7 +55,11 @@ class DecisionsMixin:
         self._decisions_panel_control = OverlayControl()
         self._decisions_panel_open = False
         self._decisions_count = 0
+        self._decisions_error: str | None = None
         self._decisions_poll_task: asyncio.Task[None] | None = None
+        self._decisions_poll_restart: asyncio.TimerHandle | None = None
+        self._decisions_poll_failures = 0
+        self._decisions_tick_task: asyncio.Task[None] | None = None
         self._decisions_refresh_task: asyncio.Task[None] | None = None
         self._decisions_restore_text = ""
         self._decisions_restore_cursor = 0
@@ -67,6 +74,10 @@ class DecisionsMixin:
     @property
     def decisions_count(self) -> int:
         return self._decisions_count
+
+    @property
+    def decisions_error(self) -> str | None:
+        return self._decisions_error
 
     @property
     def _decisions_session_id(self) -> str:
@@ -106,35 +117,84 @@ class DecisionsMixin:
     # -- status-bar count poll ----------------------------------------------
 
     def start_decisions_poll(self) -> None:
-        if self._decisions_poll_task is not None:
+        if self._decisions_poll_task is not None and not self._decisions_poll_task.done():
             return
-        self._decisions_poll_task = asyncio.create_task(self._decisions_poll_loop())
+        self._decisions_poll_restart = None
+        task = asyncio.create_task(self._decisions_poll_loop())
+        self._decisions_poll_task = task
+        task.add_done_callback(self._decisions_poll_done)
 
     def stop_decisions_poll(self) -> None:
+        restart = self._decisions_poll_restart
+        self._decisions_poll_restart = None
+        if restart is not None:
+            restart.cancel()
         task = self._decisions_poll_task
         self._decisions_poll_task = None
         if task is not None and not task.done():
             task.cancel()
+
+    def _refresh_decisions_for_event(self, event: StreamEvent) -> None:
+        if (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "resolve_attention"
+            and event.tool_result is not None
+            and not event.tool_result.is_error
+        ):
+            self.request_decisions_refresh()
+
+    def request_decisions_refresh(self) -> None:
+        if self._decisions_tick_task is not None and not self._decisions_tick_task.done():
+            return
+        self._decisions_tick_task = asyncio.create_task(self._run_decisions_refresh())
+
+    async def _run_decisions_refresh(self) -> None:
+        try:
+            await self._decisions_tick()
+        except Exception as exc:  # noqa: BLE001 - projection failures stay visible
+            self._set_decisions_error(exc)
 
     async def _decisions_poll_loop(self) -> None:
         while True:
             await self._decisions_tick()
             await asyncio.sleep(_POLL_INTERVAL)
 
+    def _decisions_poll_done(self, task: asyncio.Task[None]) -> None:
+        if self._decisions_poll_task is not task:
+            return
+        self._decisions_poll_task = None
+        if task.cancelled():
+            error: BaseException = RuntimeError("poll stopped")
+        else:
+            error = task.exception() or RuntimeError("poll stopped")
+        self._set_decisions_error(error)
+        self._decisions_poll_failures += 1
+        if self._decisions_poll_failures > _POLL_RESTART_LIMIT:
+            return
+        delay = _POLL_RESTART_BASE * 2 ** (self._decisions_poll_failures - 1)
+        self._decisions_poll_restart = asyncio.get_running_loop().call_later(
+            delay, self.start_decisions_poll
+        )
+
+    def _set_decisions_error(self, error: BaseException) -> None:
+        reason = str(error).strip() or type(error).__name__
+        self._decisions_error = reason[:80]
+        self._invalidate_prompt()
+
     async def _decisions_tick(self) -> None:
         from ...attention_decisions import open_decisions
 
-        try:
-            items = await asyncio.to_thread(
-                open_decisions,
-                self._home,
-                self._decisions_session_id,
-                _registry_state(self),
-            )
-        except OSError:
-            return
-        changed = len(items) != self._decisions_count
+        items = await asyncio.to_thread(
+            open_decisions,
+            self._home,
+            self._decisions_session_id,
+            _registry_state(self),
+        )
+        changed = len(items) != self._decisions_count or self._decisions_error is not None
         self._decisions_count = len(items)
+        self._decisions_error = None
+        self._decisions_poll_failures = 0
         if self._decisions_panel_open:
             self._decisions_panel.set_items(items)
             self._decisions_panel_control.set_lines(
