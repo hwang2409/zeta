@@ -112,6 +112,116 @@ def _press(app: TUIApp, key: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tui_renders_broken_attention_without_request_body(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "alpha", "git"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    record = await asyncio.to_thread(
+        _request, owner, project.project_id, "secret request"
+    )
+    path = (
+        tmp_path
+        / "sessions"
+        / owner.store.session_id
+        / "attention"
+        / f"{record.id}.json"
+    )
+    path.write_bytes(b'{"why":"secret request body"')
+    app = await _make_app(tmp_path, owner, owner.store.session_id)
+    try:
+        rendered = "".join(
+            text
+            for line in app._decisions_panel.render_lines()
+            for _style, text in line
+        )
+        assert record.id in rendered
+        assert "attention/" in rendered
+        assert "invalid_json" in rendered
+        assert "secret request body" not in rendered
+    finally:
+        owner.store.close()
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_broken_row_refuses_actions(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "alpha", "git"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    broken_id = "f" * 32
+    broken_path = owner.store.session_dir / "attention" / f"{broken_id}.json"
+    broken_bytes = b'{"why":"do not expose"'
+    broken_path.parent.mkdir()
+    broken_path.write_bytes(broken_bytes)
+    app = await _make_app(tmp_path, owner, owner.store.session_id)
+    try:
+        expected = (
+            f"attention record {broken_id} is broken (invalid_json); "
+            f"repair attention/{broken_id}.json before replying"
+        )
+        results: list[object] = []
+        for command in (f"reply {broken_id} yes", f"dismiss {broken_id}"):
+            try:
+                results.append(await app.slash_decisions(command))
+            except AttributeError as exc:  # old behavior is asserted below
+                results.append(exc)
+        assert results == [expected, expected]
+
+        try:
+            _press(app, "1")
+            key_error = None
+        except AttributeError as exc:  # old behavior is asserted below
+            key_error = exc
+        assert key_error is None, f"broken-row key action raised {key_error!r}"
+        assert broken_path.read_bytes() == broken_bytes
+    finally:
+        owner.store.close()
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_broken_row_does_not_block_good_batch(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "alpha", "git"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    good = await asyncio.to_thread(_request, owner, project.project_id, "good")
+    broken_id = "f" * 32
+    broken_path = owner.store.session_dir / "attention" / f"{broken_id}.json"
+    broken_bytes = b'{"why":"do not expose"'
+    broken_path.write_bytes(broken_bytes)
+    app = await _make_app(tmp_path, owner, owner.store.session_id)
+    try:
+        _press(app, "1")
+        await asyncio.sleep(0)
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                _wait_for_records, tmp_path, owner.store.session_id, {good.id}
+            ),
+            10,
+        )
+        assert broken_path.read_bytes() == broken_bytes
+        assert (
+            len(
+                ProjectInbox(
+                    manager.project_registry, sessions_root=tmp_path / "sessions"
+                ).new_ids(project.project_id, session_id=owner.store.session_id)
+            )
+            == 1
+        )
+    finally:
+        owner.store.close()
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_popup_waits_for_recovery_before_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -472,4 +582,50 @@ async def test_tui_marks_staged_rows_and_counts_them_until_flush(
         owner.store.close()
         if restarted is not None:
             await restarted.loop.close()
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_broken_record_with_staged_reply_is_not_counted_as_staged(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "alpha", "git"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    records = await await_or_fail(
+        asyncio.to_thread(_records, owner, project.project_id),
+        what="create attention records",
+    )
+    app = await _make_app(tmp_path, owner, owner.store.session_id)
+    replies = AttentionReplies(tmp_path, owner.store.session_id)
+    try:
+        await app._decisions_tick()
+        _press(app, "1")
+        await await_or_fail(
+            asyncio.to_thread(_wait_for_staged, replies, 1), what="stage first"
+        )
+        _press(app, "j")
+        _press(app, "1")
+        await await_or_fail(
+            asyncio.to_thread(_wait_for_staged, replies, 2), what="stage second"
+        )
+        # The first record goes bad after its reply was staged.
+        broken = (
+            tmp_path
+            / "sessions"
+            / owner.store.session_id
+            / "attention"
+            / f"{records[0].id}.json"
+        )
+        broken.write_bytes(b'{"why":"cut off"')
+        await app._decisions_tick()
+        text = _rendered_text(app)
+        assert "● 2 open, 1 staged" in text, text
+        broken_rows = [line for line in text.splitlines() if records[0].id in line]
+        assert broken_rows, text
+        assert all("staged:" not in line for line in broken_rows), text
+    finally:
+        owner.store.close()
         await app.loop.close()

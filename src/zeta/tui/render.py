@@ -13,7 +13,6 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
-from ..agent.receipt import terminal_state
 from ..protocol.types import (
     ErrorInfo,
     RedactedThinkingContent,
@@ -28,10 +27,14 @@ from . import theme
 from .cards.agent import AgentCard
 from .cards.agent_message import (
     AgentIdentityIndex,
+    _notification_stats,
     answer_question_id,
     render_agent_message,
     render_agent_notification_message,
     render_agent_tool_message,
+)
+from .cards.agent_message import (
+    _completion_state as _notification_state,
 )
 from .cards.approval_card import render_approval_card as _render_approval_card
 from .cards.base import (
@@ -497,46 +500,6 @@ def _compact_notification_text(value: str, limit: int) -> str:
     return bounded.plain + "..."
 
 
-def _notification_state(data: dict[str, Any]) -> tuple[str, bool]:
-    status = data["status"]
-    state = terminal_state(status=status)
-    stats = data.get("stats")
-    if type(stats) is not dict or not ({"error", "canceled"} & stats.keys()):
-        return state, False
-
-    error = stats.get("error")
-    canceled = stats.get("canceled")
-    conflict = (
-        type(error) is not bool
-        or type(canceled) is not bool
-        or (error and canceled)
-        or error != (state == "failed")
-        or canceled != (state == "canceled")
-    )
-    return ("failed" if conflict else state), conflict
-
-
-def _notification_stats(data: dict[str, Any]) -> list[str]:
-    stats = data.get("stats")
-    if type(stats) is not dict:
-        return []
-    parts: list[str] = []
-    elapsed = stats.get("elapsed")
-    if type(elapsed) in {int, float} and elapsed >= 0:
-        seconds = round(float(elapsed), 1)
-        if seconds >= 3600:
-            parts.append(f"{int(seconds // 3600)}h{int(seconds // 60) % 60:02d}m")
-        elif seconds >= 60:
-            minutes, remainder = divmod(int(seconds), 60)
-            parts.append(f"{minutes}m{remainder:02d}s")
-        else:
-            parts.append(f"{seconds:.1f}s")
-    turns = stats.get("turns_used")
-    if type(turns) is int and turns >= 0:
-        parts.append(f"{turns} turns")
-    return parts
-
-
 # Every stream event is owned by scrollback, another TUI component, or is hidden
 # by design. Keep this exhaustive when adding a StreamEventType member.
 BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = frozenset({
@@ -622,7 +585,7 @@ def render_agent_notification(
         return Text("background agent notification unavailable", style=theme.ERROR)
     try:
         state, state_conflict = _notification_state(event.data)
-    except ValueError:
+    except (TypeError, ValueError):
         return Text("background agent notification unavailable", style=theme.ERROR)
 
     stats_parts = _notification_stats(event.data)
