@@ -58,6 +58,8 @@ async def persist_durably(
         )
     except asyncio.CancelledError:
         resolution = store.approval_resolution_data(request_id)
+        if resolution is None:
+            raise
         return SettlementResult(resolution, cancelled=True)
     except OSError:
         resolution = store.approval_resolution_data(request_id)

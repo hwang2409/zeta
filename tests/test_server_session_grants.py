@@ -1344,6 +1344,9 @@ async def test_abort_canceled_settlement_keeps_controller_connected(
         "cancel_history",
         "cancel_write",
         "cancel_owner_exit",
+        "fail_approval_end_publish",
+        "fail_grant_event_publish",
+        "fail_response_write",
         "abort",
         "replacement",
         "restart_replay",
@@ -1546,14 +1549,49 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             release = asyncio.Event()
             settlement: asyncio.Task[object] | None = None
             all_frames: list[dict[str, Any]] = []
+            failed_write = asyncio.Event()
+            failed_payloads: list[bytes] = []
+            if case.startswith("fail_"):
+                assert server.connections is not None
+                controller = server.connections._controller
+                assert controller is not None
+                original_write = controller.connection._write_physical
+
+                async def fail_named_publish(payload: bytes) -> bool:
+                    compact = payload.replace(b" ", b"")
+                    should_fail = (
+                        case == "fail_approval_end_publish"
+                        and b'"event":"approval_end"' in compact
+                        or case == "fail_grant_event_publish"
+                        and b'"event":"session_grants_changed"' in compact
+                        and b'"change":"grant"' in compact
+                        or case == "fail_response_write"
+                        and b'"id":4' in compact
+                        and b'"result"' in compact
+                    )
+                    if should_fail and not failed_write.is_set():
+                        failed_payloads.append(payload)
+                        failed_write.set()
+                        raise OSError(f"injected {case}")
+                    return await original_write(payload)
+
+                # test-contract: fail each real controller publication write once
+                monkeypatch.setattr(
+                    controller.connection, "_write_physical", fail_named_publish
+                )
             if case in {"cancel_settle", "external_end"}:
                 original_durable = ConversationStore._to_thread_durable
 
                 async def gated_durable(*args: object, **kwargs: object) -> object:
+                    if case == "cancel_settle":
+                        # test-contract: cancel before the real durable operation begins
+                        entered.set()
+                        await await_or_fail(release.wait(), what="durable settlement")
                     result = await original_durable(*args, **kwargs)
-                    # test-contract: seam gate the named production await
-                    entered.set()
-                    await await_or_fail(release.wait(), what="durable settlement")
+                    if case == "external_end":
+                        # test-contract: gate after the real durable operation commits
+                        entered.set()
+                        await await_or_fail(release.wait(), what="durable settlement")
                     return result
 
                 # test-contract: seam gate the real durable await without a production seam
@@ -1672,12 +1710,26 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     target=replace(record.target, history_store=record.target.store),
                     history_published=True,
                 )
-            approve = asyncio.create_task(
-                request(4,
-                    "approve",
-                    {"request_id": "call-1", "scope": "always_tool"},
-                )
-            )
+            approve_params = {
+                "request_id": "call-1",
+                "scope": "always_tool",
+            }
+            approve: asyncio.Task[list[dict[str, Any]]] | None = None
+            if case == "fail_response_write":
+                approve_request = {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "approve",
+                    "params": approve_params,
+                }
+                if transport == "unix":
+                    writer.write((json.dumps(approve_request) + "\n").encode())
+                    await writer.drain()
+                else:
+                    await _send_json(writer, approve_request)
+                await await_or_fail(failed_write.wait(), what="approve response failure")
+            else:
+                approve = asyncio.create_task(request(4, "approve", approve_params))
             if case == "external_end":
                 await await_or_fail(entered.wait(), what="durable settlement")
                 external_end = asyncio.create_task(
@@ -1688,6 +1740,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 release.set()
                 await await_or_fail(external_end, what="external approval end")
             if cancel:
+                assert approve is not None
                 await await_or_fail(entered.wait(), what=f"{case} gate")
                 record = server.control._approvals.state.records.get("call-1")
                 if record is not None:
@@ -1702,7 +1755,64 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 frames = await await_or_fail(approve, what=f"{case} approve response")
                 all_frames.extend(frames)
                 assert frames[-1]["result"]["decision"] == "approve"
+            elif case.startswith("fail_"):
+                if approve is not None:
+                    frames = await await_or_fail(approve, what=f"{case} response")
+                    all_frames.extend(frames)
+                await await_or_fail(failed_write.wait(), what=f"{case} write")
+                assert len(failed_payloads) == 1
+                status_frames = await await_or_fail(
+                    request(10, "status", {}), what=f"{case} live controller status"
+                )
+                all_frames.extend(status_frames)
+                assert status_frames[-1]["result"]["state"] in {
+                    "idle",
+                    "running",
+                    "tool",
+                }
+                snapshot_frames = await request(11, "session_grants", {})
+                all_frames.extend(snapshot_frames)
+                assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
+                assert server.runtime.opened is not None
+                resolution = server.runtime.opened.store.approval_resolution_data(
+                    "call-1"
+                )
+                assert resolution is not None
+                assert resolution["decision"] == "allow"
+                wire_frames = (
+                    [*all_frames, *buffered()]
+                    if transport == "unix"
+                    else all_frames
+                )
+                grant_events = [
+                    frame
+                    for frame in wire_frames
+                    if frame.get("params", {}).get("event")
+                    == "session_grants_changed"
+                    and frame.get("params", {}).get("data", {}).get("change")
+                    == "grant"
+                ]
+                approval_ends = [
+                    frame
+                    for frame in wire_frames
+                    if frame.get("params", {}).get("event") == "approval_end"
+                ]
+                responses = [frame for frame in wire_frames if frame.get("id") == 4]
+                assert len(grant_events) == (
+                    0 if case == "fail_grant_event_publish" else 1
+                )
+                assert len(approval_ends) == (1 if case == "fail_response_write" else 0)
+                assert len(responses) == (0 if case == "fail_response_write" else 1)
+                if case == "fail_grant_event_publish":
+                    assert responses[0]["error"]["message"] == (
+                        "approval persistence failed: injected fail_grant_event_publish"
+                    )
+                elif case == "fail_approval_end_publish":
+                    assert responses[0]["result"]["decision"] == "approve"
+                assert not server.control._approvals.state.records
+                return
             else:
+                assert approve is not None
                 frames = await await_or_fail(approve, what="approve response")
                 all_frames.extend(frames)
                 assert frames[-1]["result"]["decision"] == "approve"

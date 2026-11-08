@@ -812,6 +812,8 @@ class ApprovalLifecycle:
             )
         except BaseException as exc:
             self._release_gate(record, error=exc)
+            if self._owns(record):
+                self._remove(target.key)
             raise
         return resolution
 
