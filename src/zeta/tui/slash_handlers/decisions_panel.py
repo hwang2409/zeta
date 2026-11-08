@@ -83,12 +83,13 @@ class DecisionsMixin:
         full_screen_active = getattr(self, "_full_screen_active", lambda: False)
         if not args.strip() and full_screen_active():
             self._consume_overlay_submission()
-            self.open_decisions_panel()
+            await self._open_decisions_panel()
             return ""
         from ...attention_decisions import open_decisions
-        from ...attention_records import AttentionStore
 
         parts = args.split(maxsplit=2)
+        if not parts or parts[0] not in {"reply", "dismiss"}:
+            await DecisionsMixin._recover_decisions(self, self._decisions_session_id)
         items = await asyncio.to_thread(
             open_decisions,
             self._home,
@@ -104,24 +105,17 @@ class DecisionsMixin:
             )
             if record is None:
                 return "attention item not found"
+            replies = self._attention_replies(record.session_id)
             if parts[0] == "dismiss":
-                await asyncio.to_thread(
-                    AttentionStore(self._home / "sessions" / record.session_id).dismiss,
-                    attention_id,
-                    session_id=record.session_id,
-                )
+                await self._run_attention_operation(replies.dismiss, attention_id)
                 return f"dismissed {attention_id}"
             if len(parts) < 3 or not parts[2].strip():
                 return "reply text must be nonempty"
-            from ...attention_forks import deliver_attention_decision
-
-            await asyncio.to_thread(
-                deliver_attention_decision,
-                self._home,
-                record,
+            await self._run_attention_operation(
+                replies.reply,
+                record.id,
                 parts[2],
-                from_session=self.loop.store.session_id,
-                registry_state=_registry_state(self),
+                self.loop.store.session_id,
             )
             return f"replied to {attention_id}"
         if not items:
@@ -176,9 +170,39 @@ class DecisionsMixin:
 
     # -- open / close -------------------------------------------------------
 
-    def open_decisions_panel(self) -> None:
+    def _attention_replies(self, session_id: str):
+        from ...attention_replies import AttentionReplies
+
+        on_visible = (
+            self.loop.notify_project_inbox_publication
+            if session_id == self.loop.store.session_id
+            else None
+        )
+        return AttentionReplies(
+            self._home,
+            session_id,
+            registry_state=_registry_state(self),
+            on_inbox_visible=on_visible,
+        )
+
+    async def _recover_decisions(self, session_id: str):
+        return await self._run_attention_operation(
+            self._attention_replies(session_id).recover
+        )
+
+    async def _run_attention_operation(self, operation, *args, **kwargs):
+        return await asyncio.to_thread(operation, *args, **kwargs)
+
+    def open_decisions_panel(self) -> asyncio.Task[None]:
+        return asyncio.create_task(self._open_decisions_panel())
+
+    async def _open_decisions_panel(self) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
+            return
+        await self._recover_decisions(self._decisions_session_id)
+        await self._decisions_tick()
+        if self._decisions_panel_open:
             return
         buffer = session.default_buffer
         self._decisions_restore_text = buffer.text
@@ -195,6 +219,7 @@ class DecisionsMixin:
         if not self._decisions_panel_open:
             return
         self._decisions_panel_open = False
+        asyncio.create_task(self._flush_staged_decisions())
         self._decisions_panel.exit_answer()
         self._stop_decisions_refresh()
         session = self._active_session
@@ -204,6 +229,19 @@ class DecisionsMixin:
             )
             session.layout.focus(session.default_buffer)
         self._invalidate_prompt()
+
+    async def _flush_staged_decisions(self) -> None:
+        try:
+            for session_id in self._decisions_session_ids():
+                await self._run_attention_operation(
+                    self._attention_replies(session_id).flush,
+                    self.loop.store.session_id,
+                )
+        except (OSError, ValueError) as exc:
+            self._print_system(f"decisions not delivered: {exc}")
+
+    def _decisions_session_ids(self) -> tuple[str, ...]:
+        return tuple({item.session_id for item in self._decisions_panel.items})
 
     def _start_decisions_refresh(self) -> None:
         self._stop_decisions_refresh()
@@ -300,18 +338,21 @@ class DecisionsMixin:
         record = item.record
 
         async def run() -> None:
-            from ...attention_forks import deliver_attention_decision
-
+            item_ids = {
+                panel_item.record.id
+                for panel_item in self._decisions_panel.items
+                if panel_item.session_id == record.session_id
+            }
             try:
-                await asyncio.to_thread(
-                    deliver_attention_decision,
-                    self._home,
-                    record,
+                replies = self._attention_replies(record.session_id)
+                await self._run_attention_operation(
+                    replies.stage,
+                    record.id,
                     decision,
+                    flush_ids=item_ids,
                     from_session=self.loop.store.session_id,
-                    registry_state=_registry_state(self),
                 )
-            except (OSError, ValueError) as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
             await self._decisions_tick()
             self._refresh_decisions_panel()
@@ -325,15 +366,10 @@ class DecisionsMixin:
             return
 
         async def run() -> None:
-            from ...attention_records import AttentionStore
-
             try:
-                await asyncio.to_thread(
-                    AttentionStore(self._home / "sessions" / item.session_id).dismiss,
-                    item.record.id,
-                    session_id=item.session_id,
-                )
-            except (OSError, ValueError) as exc:
+                replies = self._attention_replies(item.session_id)
+                await self._run_attention_operation(replies.dismiss, item.record.id)
+            except (OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"attention not dismissed: {exc}")
             await self._decisions_tick()
 

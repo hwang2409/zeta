@@ -22,6 +22,7 @@ import pytest
 
 from tests.support.storage_homes import initialize_storage_home
 from zeta import remote_sync as remote_sync_module
+from zeta.cli.main import main as cli_main
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.memory.entry_store import _KIND_KEY
@@ -537,6 +538,49 @@ def test_pull_refuses_to_replace_an_open_session_even_with_force(
     assert "still writable after refused pull" in (
         destination / "sessions" / session_id / "conversation.jsonl"
     ).read_text(encoding="utf-8")
+
+
+def test_pull_refuses_a_snapshot_with_unreadable_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    remote = tmp_path / "remote"
+    destination = tmp_path / "destination"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    _, opened = _session(source, repo)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_session(source, transport, session_id=session_id)
+    pull_session(destination, transport, session_id=session_id)
+    local_meta = destination / "sessions" / session_id / "meta.json"
+    before = local_meta.read_bytes()
+
+    remote_meta = remote / "sessions" / session_id / "meta.json"
+    metadata = json.loads(remote_meta.read_text(encoding="utf-8"))
+    # A well-formed span, but the reader rejects components without a recipe.
+    metadata["prompt_recipe"] = None
+    metadata["prompt_components"] = {
+        "project_memory": {
+            "offset": 0,
+            "length": 0,
+            "digest": hashlib.sha256(b"").hexdigest(),
+        }
+    }
+    remote_meta.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(RemoteSyncError, match="require a recipe"):
+        pull_session(destination, transport, session_id=session_id, force=True)
+
+    assert local_meta.read_bytes() == before
+    monkeypatch.setenv("ZETA_HOME", str(destination))
+    capsys.readouterr()
+    assert cli_main(["session", "export", session_id]) == 0
+    exported = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert exported[0]["metadata"]["session_id"] == session_id
 
 
 def test_pull_maps_missing_cwd_and_records_reclone_hint(tmp_path: Path) -> None:

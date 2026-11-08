@@ -846,6 +846,7 @@ async def test_resolve_attention_does_not_open_registry(
 ) -> None:
     from types import SimpleNamespace
 
+    from zeta.attention_replies import ReplyItemOutcome, ReplyOutcome
     from zeta.runtime.project_registry_state import available_project_registry
     from zeta.tools import resolve_attention
 
@@ -861,7 +862,7 @@ async def test_resolve_attention_does_not_open_registry(
             opened.append(path)
         return original_open(path, *args, **kwargs)
 
-    record = SimpleNamespace(decision="yes")
+    record = SimpleNamespace(decision="yes", id="a" * 32, session_id=session_dir.name)
     monkeypatch.setattr(os, "open", count_open)
     monkeypatch.setattr(
         resolve_attention,
@@ -869,9 +870,15 @@ async def test_resolve_attention_does_not_open_registry(
         lambda **_kwargs: SimpleNamespace(record=record),
     )
     monkeypatch.setattr(
-        resolve_attention,
-        "deliver_attention_decision",
-        lambda *_args, **_kwargs: ("message-id", record, False),
+        resolve_attention.AttentionReplies,
+        "reply",
+        lambda *_args, **_kwargs: ReplyOutcome(
+            items=(ReplyItemOutcome(record.id, "applied"),),
+            message_id="message-id",
+        ),
+    )
+    monkeypatch.setattr(
+        resolve_attention.AttentionStore, "get", lambda *_args, **_kwargs: record
     )
     registry = SimpleNamespace(
         session_store=SimpleNamespace(

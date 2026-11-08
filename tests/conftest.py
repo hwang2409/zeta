@@ -642,7 +642,7 @@ def pytest_testnodedown(node, error) -> None:
 def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
-    from zeta.storage_format import advance, open_writer
+    from zeta.storage_format import advance, drain_releases, open_writer
     from zeta.tools import ToolRegistry
 
     stores = []
@@ -721,6 +721,7 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
             store.close()
     for manager in reversed(managers):
         manager._release_storage_lease()
+    drain_releases()  # the manager finalizer only queues its release
 
 
 @pytest.fixture
