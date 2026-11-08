@@ -326,7 +326,7 @@ class WakeScheduler:
 
         if self._closed:
             return 0
-        self._assert_owned()
+        # close must remain safe after the session execution capability is released.
         self._closed = True
         lost = len(self._records)
         self._records.clear()

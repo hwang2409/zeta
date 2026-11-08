@@ -682,5 +682,5 @@ async def test_close_discards_process_local_state_and_stops_owner_checks() -> No
     lost = await asyncio.wait_for(scheduler.close(), timeout=10)
 
     assert lost == 1
-    assert len(owner_checks) == 3
+    assert len(owner_checks) == 2
     assert scheduler.closed
