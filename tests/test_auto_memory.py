@@ -121,7 +121,6 @@ async def test_scheduled_retry_waits_for_scanner_recovery(tmp_path: Path) -> Non
         return _proposal(prompt)
 
     runner, _registry, _project_id, _notices = await asyncio.to_thread(
-
         _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0, retry_backoff_seconds=0
     )
@@ -469,7 +468,6 @@ async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_adva
         raise AssertionError("unreachable")
 
     runner, _registry, _project_id, notices = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -530,7 +528,6 @@ async def test_non_login_provider_failure_keeps_retrying(tmp_path: Path) -> None
         return _proposal(prompt)
 
     runner, _registry, _project_id, _notices = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -672,13 +669,12 @@ async def test_rejected_entry_reconciliation_advances_without_publishing_or_retr
         )
 
     runner, registry, project_id, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path, rejected_proposal, entry_format=True
     )
     pointer_path = registry.root / project_id / "memory-current.json"
     before_pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    before_mirrors = registry._entry_memory_mirrors(project_id)
+    before_mirrors = await asyncio.to_thread(registry._entry_memory_mirrors, project_id)
 
     runner.before_eviction(1, 2)
     await runner.drain()
@@ -686,7 +682,7 @@ async def test_rejected_entry_reconciliation_advances_without_publishing_or_retr
     assert runner.last_reconciled_seq == 2
     assert calls == 1
     assert json.loads(pointer_path.read_text(encoding="utf-8")) == before_pointer
-    assert registry._entry_memory_mirrors(project_id) == before_mirrors
+    assert (await asyncio.to_thread(registry._entry_memory_mirrors, project_id)) == before_mirrors
 
     runner.activity(2)
     await runner.drain()
@@ -772,7 +768,6 @@ async def test_idle_trigger(tmp_path: Path) -> None:
         return _proposal(prompt)
 
     runner, registry, project_id, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -989,7 +984,6 @@ async def test_oversized_row_is_bounded_once_and_preserves_tail_evidence(
         return _proposal(prompt)
 
     runner, registry, project_id, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
@@ -1026,7 +1020,6 @@ async def test_oversized_user_row_gets_terminal_receipt_without_publication(
         return _proposal(prompt)
 
     runner, registry, project_id, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path, invoke, transcript_count=2, minimum_interval=0
     )
@@ -1080,7 +1073,6 @@ async def test_fitting_user_row_preserves_middle_fact(tmp_path: Path) -> None:
         return '{"changes":[]}'
 
     runner, _, _, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
@@ -1124,7 +1116,6 @@ async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Pat
         return _proposal(prompt)
 
     runner, _, _, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path, invoke, transcript_count=2, token_threshold=1, minimum_interval=0
     )
@@ -1492,7 +1483,6 @@ async def test_provider_failure_records_exact_unit_and_prior_usage(tmp_path: Pat
         raise RuntimeError("provider unavailable")
 
     runner, _, _, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -1561,7 +1551,6 @@ async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
         return ReconciliationResponse("not json", {"input_tokens": 2})
 
     runner, registry, project_id, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -1575,16 +1564,16 @@ async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
     state = json.loads(runner.position_path.read_text(encoding="utf-8"))
     assert state["terminal_receipts"][0]["usage"] == {"input_tokens": 12}
 
-    listing = (await asyncio.to_thread(run_memory_command, registry, project_id, "retry", runner))
+    listing = await asyncio.to_thread(run_memory_command, registry, project_id, "retry", runner)
     assert receipt.key in listing
     valid = True
-    queued = (await asyncio.to_thread(run_memory_command,
+    queued = await asyncio.to_thread(run_memory_command,
         registry,
         project_id,
         f"retry {receipt.key[:12]}",
         runner,
         MemoryMutationAuthorization.direct_slash(),
-    ))
+    )
     assert queued == f"memory retry queued: {receipt.key}"
     await runner.drain()
 
@@ -1610,7 +1599,6 @@ async def test_repair_aggregates_usage_into_committed_provenance(tmp_path: Path)
         )
 
     runner, registry, project_id, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
@@ -1633,7 +1621,6 @@ async def test_entry_repair_login_required_pauses_without_retry(tmp_path: Path) 
         raise ProviderLoginRequiredError("login required")
 
     runner, _registry, _project_id, _notices = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -1676,7 +1663,6 @@ async def test_entry_repair_request_too_large_is_terminal(tmp_path: Path) -> Non
         raise RequestTooLargeError("request too large")
 
     runner, _registry, _project_id, _notices = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -1706,7 +1692,6 @@ async def test_first_call_request_too_large_is_terminal_not_repaired(
         raise RequestTooLargeError("request too large")
 
     runner, _registry, _project_id, _notices = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -1730,7 +1715,6 @@ async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
         )
 
     runner, _registry, project_id, _notices = await asyncio.to_thread(
-
         _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
@@ -1762,7 +1746,6 @@ async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
         )
 
     runner, _registry, _project_id, _notices = await asyncio.to_thread(
-
         _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
@@ -1826,7 +1809,6 @@ async def test_failure_writes_persistent_file_log_without_stderr(
         )
 
     runner, _, _, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -1870,7 +1852,6 @@ async def test_health_log_never_contains_transcript_or_model_text(
         return ReconciliationResponse(output, {"input_tokens": 2, "output_tokens": 1})
 
     runner, _registry, _project_id, _notices = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -1906,7 +1887,6 @@ async def test_close_with_pending_range_makes_no_backend_call(
         return '{"changes":[]}'
 
     runner, _, _, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -1938,7 +1918,6 @@ async def test_close_cancels_inflight_request_quietly(
             raise
 
     runner, _, _, notices = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -2001,7 +1980,6 @@ async def test_repartitioned_retry_replaces_original_failure(
         return _proposal(prompt)
 
     runner, registry, project_id, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
@@ -2045,7 +2023,7 @@ async def test_repartitioned_retry_replaces_original_failure(
         end_offset=0,
         end_tokens=0,
     )
-    (await asyncio.to_thread(registry.update_memory, project_id, {"brief.md": "# Brief\n\n" + "m" * 30_000}))
+    await asyncio.to_thread(registry.update_memory, project_id, {"brief.md": "# Brief\n\n" + "m" * 30_000})
 
     retry_now[0] = 1_010
     await asyncio.wait_for(runner.drain(), timeout=2)
@@ -2076,7 +2054,6 @@ async def test_drain_bounds_attempts_when_retry_key_stays_due(
         return _proposal(prompt)
 
     runner, _, _, _ = await asyncio.to_thread(
-
         _runner,
         tmp_path,
         invoke,
