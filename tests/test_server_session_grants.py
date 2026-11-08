@@ -40,6 +40,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
 from zeta.server import ZetaServer, approval_lifecycle
 from zeta.server.approval_lifecycle import ExternalEnd
+from zeta.server.protocol import EventDescriptor
 from zeta.tui.app import TUIApp
 
 FEATURES = ["session_grants"]
@@ -114,6 +115,10 @@ async def _approve_after_external_end(
 
 
 class _DelegatedBackend:
+    def __init__(self) -> None:
+        self.child_two_ready = asyncio.Event()
+        self.release_child_two = asyncio.Event()
+
     async def complete(self, messages: Any, tool_schemas: Any):
         del tool_schemas
         last_user_index, last_user = next(
@@ -153,6 +158,10 @@ class _DelegatedBackend:
             )
         elif last_user in {"child 1", "child 2"} and not has_tool_result:
             number = last_user[-1]
+            if number == "2":
+                self.child_two_ready.set()
+                # test-contract: seam the owning journey supplies the one deadline.
+                await self.release_child_two.wait()
             turn = ScriptedTurn(
                 tool_calls=[
                     ToolCall(
@@ -1246,6 +1255,70 @@ async def test_session_grant_exactness_noops_feature_gate_and_fifo_sentinels(
         await close_serve(server, writer)
 
 
+async def _collect_second_parent_terminal(
+    reader: asyncio.StreamReader,
+    release_child: asyncio.Event,
+) -> tuple[list[dict[str, Any]], str]:
+    frames: list[dict[str, Any]] = []
+    while True:
+        buffered = _buffer(reader)
+        if buffered:
+            frame = buffered.popleft()
+        else:
+            line = await reader.readline()
+            if not line:
+                return frames, "socket eof"
+            frame = json.loads(line)
+        frames.append(frame)
+        if frame.get("params", {}).get("event") == "agent_end":
+            release_child.set()
+            return frames, "parent agent end"
+
+
+async def _read_until_child_bash_two(
+    reader: asyncio.StreamReader, frames: list[dict[str, Any]]
+) -> str:
+    while True:
+        buffered = _buffer(reader)
+        if buffered:
+            frame = buffered.popleft()
+        else:
+            line = await reader.readline()
+            if not line:
+                return "socket eof"
+            frame = json.loads(line)
+        frames.append(frame)
+        params = frame.get("params", {})
+        if params.get("tool_call", {}).get("id") != "child-bash-2":
+            continue
+        event = params.get("event")
+        if event == "approval_request":
+            return "child-bash-2 approval_request"
+        if event in {"tool_start", "tool_end"}:
+            return f"child-bash-2 {event} before any approval_request"
+
+
+async def _first_child_bash_two_fact(
+    reader: asyncio.StreamReader,
+    frames: list[dict[str, Any]],
+    publication_attempted: asyncio.Event,
+) -> str:
+    wire = asyncio.create_task(_read_until_child_bash_two(reader, frames))
+    # test-contract: seam this coroutine is the await_or_fail argument.
+    hook = asyncio.create_task(publication_attempted.wait())
+    try:
+        # test-contract: seam this coroutine is the await_or_fail argument.
+        await asyncio.wait({wire, hook}, return_when=asyncio.FIRST_COMPLETED)
+        if wire.done():
+            return wire.result()
+        return "publication hook"
+    finally:
+        for task in (wire, hook):
+            task.cancel()
+        # test-contract: seam this coroutine is the await_or_fail argument.
+        await asyncio.gather(wire, hook, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
     tmp_path: Path,
@@ -1284,17 +1357,87 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
                 break
         await _wait_idle(reader, writer, 30)
 
-        await _request(reader, writer, 6, "revoke_session_grants", {"grant": "bash"})
-        await _event(reader, "session_grants_changed")
-        await _request(reader, writer, 7, "send", {"text": "second delegate"})
-        approval = await _event(reader, "approval_request")
-        assert approval["tool_call"]["id"] == "child-bash-2"
-        assert approval["delegated"] is True
-        await _request(
-            reader, writer, 8, "deny", {"request_id": approval["request_id"]}
+        publication_attempted = asyncio.Event()
+        original_admit = server.control._approvals._admit
+
+        def observe_publication(event, session_id, **fields):
+            result = original_admit(event, session_id, **fields)
+            if (
+                event is EventDescriptor.APPROVAL_REQUEST
+                and fields.get("delegated") is True
+            ):
+                publication_attempted.set()
+            return result
+
+        server.control._approvals._admit = observe_publication
+
+        async def second_delegate_journey() -> None:
+            await _request(
+                reader, writer, 6, "revoke_session_grants", {"grant": "bash"}
+            )
+            await _event(reader, "session_grants_changed")
+            second_send = await _request(
+                reader, writer, 7, "send", {"text": "second delegate"}
+            )
+            # test-contract: seam this coroutine is the await_or_fail argument.
+            await backend.child_two_ready.wait()
+            snapshot = (await _request(reader, writer, 31, "session_grants"))[-1][
+                "result"
+            ]
+            assert snapshot["session_grants"] == []
+            frames, terminal = await _collect_second_parent_terminal(
+                reader, backend.release_child_two
+            )
+            ended_on = await _first_child_bash_two_fact(
+                reader, frames, publication_attempted
+            )
+            sentinel = await _request(reader, writer, 32, "session_grants")
+            buffered = _buffer(reader)
+            frames.extend(buffered)
+            buffered.clear()
+            frames.extend(sentinel)
+            approval = next(
+                (
+                    frame["params"]
+                    for frame in frames
+                    if frame.get("params", {}).get("event") == "approval_request"
+                    and frame.get("params", {}).get("tool_call", {}).get("id")
+                    == "child-bash-2"
+                ),
+                None,
+            )
+            terminal = "delegated approval" if approval is not None else ended_on
+            assert approval is not None, (
+                "child-bash-2 did not request delegated approval; "
+                f"wait ended on: {ended_on}; second send response={second_send!r}; "
+                f"all buffered frames={frames!r}; "
+                f"live parent session_grants={snapshot!r}"
+            )
+            assert terminal == "delegated approval"
+            assert any(
+                frame.get("params", {}).get("event") == "tool_end"
+                and frame.get("params", {}).get("tool_call", {}).get("id")
+                == "agent-2"
+                for frame in frames
+            )
+            assert any(
+                frame.get("params", {}).get("event") == "agent_end"
+                for frame in frames
+            )
+            assert approval["tool_call"]["id"] == "child-bash-2"
+            assert approval["delegated"] is True
+            await _request(
+                reader, writer, 8, "deny", {"request_id": approval["request_id"]}
+            )
+            await _frames_until_event(reader, "turn_end")
+
+        await await_or_fail(
+            second_delegate_journey(),
+            timeout=300,
+            what="second delegated approval journey",
         )
-        await _frames_until_event(reader, "turn_end")
     finally:
+        backend.release_child_two.set()
         await close_serve(server, writer)
 
 
