@@ -7,10 +7,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ..core.approval import ApprovalPolicy, ApprovalRequest
-from ..core.store import ConversationStore
-from .connections import Admission
-from .protocol import EventDescriptor
+from ...core.approval import ApprovalPolicy, ApprovalRequest
+from ...core.store import ConversationStore
+from ..connections import Admission
+from ..protocol import EventDescriptor
 
 ApprovalKey = str | tuple[str, str]
 
@@ -66,3 +66,33 @@ class GrantPublication:
     async def publish(self, rule: str) -> None:
         if self._publish is not None:
             await self._publish(rule)
+
+    async def finish(
+        self, request: ApprovalRequest, committed: bool, event_published: bool
+    ) -> tuple[bool, bool]:
+        """Commit a grant and publish its first event, exactly once."""
+        if committed:
+            return committed, event_published
+        rule, changed = self.commit(request)
+        if changed and not event_published:
+            await self.publish(rule)
+        return True, True
+
+
+async def finish_grant(
+    publication: GrantPublication,
+    request: ApprovalRequest,
+    committed: bool,
+    event_published: bool,
+) -> tuple[bool, bool, bool]:
+    """Finish grant publication while deferring cancellation of the owner."""
+    operation = asyncio.create_task(
+        publication.finish(request, committed, event_published)
+    )
+    cancelled = False
+    try:
+        committed, event_published = await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        cancelled = True
+        committed, event_published = await asyncio.shield(operation)
+    return committed, event_published, cancelled

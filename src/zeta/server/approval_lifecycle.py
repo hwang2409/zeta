@@ -14,8 +14,13 @@ from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from . import event_contract
-from .approval_grants import ApprovalRecord, GrantPublication, _ApprovalTarget
 from .approval_settlement import persist_durably
+from .approval_settlement.approval_grants import (
+    ApprovalRecord,
+    GrantPublication,
+    _ApprovalTarget,
+    finish_grant,
+)
 from .connections import Admission
 from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 
@@ -798,12 +803,8 @@ class ApprovalLifecycle:
         if not owns_record:
             self._release_gate(record, resolution=resolution)
             return resolution
-        finish = asyncio.create_task(self._finish_record(record, resolution))
         try:
-            await asyncio.shield(finish)
-        except asyncio.CancelledError:
-            await asyncio.shield(finish)
-            raise
+            await self._finish_record(record, resolution)
         except BaseException as exc:
             self._release_gate(record, error=exc)
             raise
@@ -957,19 +958,6 @@ class ApprovalLifecycle:
             self._change(record, terminal_watchdog=task)
         return True
 
-    async def _finish_grant(self, record: ApprovalRecord) -> ApprovalRecord:
-        policy = self._policy()
-        if policy is None or record.grant is None:
-            return record
-        publication = GrantPublication(policy, self._grant_published)
-        if not record.grant_committed:
-            rule, changed = publication.commit(record.grant)
-            record = self._change(record, grant_committed=True)
-            if changed and not record.grant_event_published:
-                await publication.publish(rule)
-            record = self._change(record, grant_event_published=True)
-        return record
-
     async def _finish_record(
         self, record: ApprovalRecord, resolution: dict[str, str]
     ) -> None:
@@ -989,8 +977,22 @@ class ApprovalLifecycle:
         ):
             return
         record = self._change(current, publication_owner=owner)
-        if resolution["decision"] == "allow":
-            record = await self._finish_grant(record)
+        grant_cancelled = False
+        if resolution["decision"] == "allow" and record.grant is not None:
+            policy = self._policy()
+            if policy is not None:
+                publication = GrantPublication(policy, self._grant_published)
+                committed, published, grant_cancelled = await finish_grant(
+                    publication,
+                    record.grant,
+                    record.grant_committed,
+                    record.grant_event_published,
+                )
+                record = self._change(
+                    record,
+                    grant_committed=committed,
+                    grant_event_published=published,
+                )
         data: dict[str, object] = {
             key: value for key, value in resolution.items() if key != "request_id"
         }
@@ -1040,8 +1042,8 @@ class ApprovalLifecycle:
                     if current.terminal_watchdog is not None:
                         current.terminal_watchdog.cancel()
                     self._remove(record.target.key)
-        if isinstance(history_outcome, asyncio.CancelledError):
-            raise history_outcome
+        if isinstance(history_outcome, asyncio.CancelledError) or grant_cancelled:
+            raise history_outcome or asyncio.CancelledError
 
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
