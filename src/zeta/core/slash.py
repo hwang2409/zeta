@@ -966,6 +966,10 @@ def _mcp_mutates(args: str) -> bool:
     }
 
 
+def _decisions_mutates(args: str) -> bool:
+    return args.strip().partition(" ")[0] in {"dismiss", "reply"}
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -1137,7 +1141,12 @@ def create_slash_registry(
     registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
     registry.register(SlashCommand("tasks", _run_tasks, "inspect background processes"))
     registry.register(
-        SlashCommand("decisions", _run_decisions, "answer or discuss open decisions")
+        SlashCommand(
+            "decisions",
+            _run_decisions,
+            "read, reply to, or dismiss attention items",
+            ServeSlash(mutates=_decisions_mutates),
+        )
     )
     registry.register(
         SlashCommand(
