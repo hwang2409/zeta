@@ -25,6 +25,7 @@ from ..protocol.types import (
 )
 from . import event_contract
 from .protocol import ErrorDescriptor, ProtocolError
+from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
     from .control import ServeControl
@@ -320,6 +321,7 @@ class DeliveryRequests:
                         ],
                         session_id,
                         required_feature="session_history_fidelity",
+                        replay_row=RowFacts(seq=entry.seq),
                         **{key: value for key, value in row.items() if key != "event"},
                     )
         turn_reason = {

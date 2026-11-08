@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..protocol import ErrorDescriptor, ProtocolError
+from .rows import Covers, OldRow
 
 REPLAY_MAX_RECORDS = 256
 REPLAY_MAX_BYTES = 4 * 1024 * 1024
@@ -38,9 +39,29 @@ class ReplayScopeId:
 @dataclass(frozen=True, slots=True)
 class PublishedSessionEvent:
     stream_id: str
-    seq: int
+    seq: int | None
     scope: ReplayScopeId
     size: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Frontier:
+    """The newest row seq the join's history read included, and the store's
+    reset generation when the join began (a reset renumbers rows)."""
+
+    seq: int
+    reset_generation: int
+
+
+@dataclass(slots=True)
+class HeldFrame:
+    """A frame buffered for a pending join; seq is assigned at the join's end."""
+
+    event: Any
+    fields: dict[str, object]
+    covers: Covers
+    size: int
+    seq: int | None = None
 
 
 @dataclass(slots=True)
@@ -48,7 +69,9 @@ class PendingReplayJoin:
     connection: Any
     scope: ReplayScopeId
     stream_id: str
-    frames: list[tuple[Any, dict[str, object]]] = field(default_factory=list)
+    reset_generation: int
+    frames: list[HeldFrame] = field(default_factory=list)
+    frontier: Frontier | None = None
     stale: bool = False
 
 
@@ -56,6 +79,29 @@ class PendingReplayJoin:
 class _Subscription:
     scope: ReplayScopeId
     stream_id: str
+    frontier: Frontier
+
+
+class _Decision:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+# a replay frame whose row is in the stream's history, or that cannot be placed
+DROP = _Decision("DROP")
+EVICT = _Decision("EVICT")
+
+
+def decide(covers: Covers, frontier: Frontier) -> _Decision | None:
+    """Return DROP, EVICT, or None (send) for one frame on one stream."""
+    if covers is None:
+        return None
+    if isinstance(covers, OldRow):
+        return DROP if frontier.seq >= covers.bound else EVICT
+    return DROP if covers <= frontier.seq else None
 
 
 @dataclass(slots=True)
@@ -163,48 +209,91 @@ class SessionReplay:
         self._bytes += size
         return None
 
-    def begin_join(self, connection: Any, scope: ReplayScopeId) -> PendingReplayJoin:
+    def begin_join(
+        self, connection: Any, scope: ReplayScopeId, reset_generation: int
+    ) -> PendingReplayJoin:
         self.connection_closed(connection)
-        pending = PendingReplayJoin(connection, scope, secrets.token_urlsafe(9))
+        pending = PendingReplayJoin(
+            connection, scope, secrets.token_urlsafe(9), reset_generation
+        )
         self._next_sequences[connection] = 1
         self._pending[connection] = pending
         return pending
 
     def finish_join(
-        self, connection: Any, history_snapshot: dict[str, object]
+        self, connection: Any, history_snapshot: dict[str, object], frontier_seq: int
     ) -> dict[str, object]:
+        """Fix the join's frontier; drop held frames its history already shows."""
         pending = self._pending.get(connection)
         if pending is None or pending.stale:
             raise ProtocolError(
                 ErrorDescriptor.STALE_EVENT_SEQUENCE,
                 "replay continuity was invalidated",
             )
+        frontier = Frontier(frontier_seq, pending.reset_generation)
+        kept: list[HeldFrame] = []
+        for held in pending.frames:
+            decision = decide(held.covers, frontier)
+            if decision is EVICT:
+                raise ProtocolError(
+                    ErrorDescriptor.STALE_EVENT_SEQUENCE,
+                    "replay continuity was invalidated",
+                )
+            if decision is DROP:
+                self.release(pending.scope, held.size)
+                continue
+            held.seq = self._next_sequences[connection]
+            self._next_sequences[connection] = held.seq + 1
+            kept.append(held)
+        pending.frames = kept
+        pending.frontier = frontier
         return {
             **history_snapshot,
             "replay": {"stream_id": pending.stream_id, "history_seq": 0},
         }
 
-    def pending_tail(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
+    def pending_tail(self, connection: Any) -> list[HeldFrame]:
         pending = self._pending.get(connection)
         return [] if pending is None else list(pending.frames)
 
     def activate_join(self, connection: Any) -> None:
         pending = self._pending.pop(connection, None)
-        if pending is None or pending.stale:
+        if pending is None or pending.stale or pending.frontier is None:
             raise ProtocolError(
                 ErrorDescriptor.STALE_EVENT_SEQUENCE,
                 "replay continuity was invalidated",
             )
         self._subscriptions[connection] = _Subscription(
-            pending.scope, pending.stream_id
+            pending.scope, pending.stream_id, pending.frontier
         )
 
+    def reset_generation(self, connection: Any) -> int | None:
+        """The store reset generation a connection's stream or join began at."""
+        subscription = self._subscriptions.get(connection)
+        if subscription is not None:
+            return subscription.frontier.reset_generation
+        pending = self._pending.get(connection)
+        return None if pending is None else pending.reset_generation
+
+    def pending_stream_id(self, connection: Any) -> str | None:
+        pending = self._pending.get(connection)
+        return None if pending is None else pending.stream_id
+
     def prepare(
-        self, connection: Any, scope: ReplayScopeId
-    ) -> PublishedSessionEvent | None:
+        self, connection: Any, scope: ReplayScopeId, covers: Covers = None
+    ) -> PublishedSessionEvent | _Decision | None:
+        """Return the frame's stream position, DROP, EVICT, or None (no stream).
+
+        A frame for a join still reading its history gets no seq yet.
+        """
         target = self._subscriptions.get(connection) or self._pending.get(connection)
         if target is None or target.scope != scope:
             return None
+        if target.frontier is None:
+            return PublishedSessionEvent(target.stream_id, None, scope)
+        decision = decide(covers, target.frontier)
+        if decision is not None:
+            return decision
         return PublishedSessionEvent(
             target.stream_id, self._next_sequences.get(connection, 1), scope
         )
@@ -216,21 +305,18 @@ class SessionReplay:
         fields: dict[str, object],
         published: PublishedSessionEvent,
         frame_size: int,
+        covers: Covers = None,
     ) -> PublishedSessionEvent | None:
-        current = self.prepare(connection, published.scope)
+        current = self.prepare(connection, published.scope, covers)
         if current != published:
             return None
-        self._next_sequences[connection] = published.seq + 1
+        if published.seq is not None:
+            self._next_sequences[connection] = published.seq + 1
         pending = self._pending.get(connection)
-        payload = {
-            "stream_id": published.stream_id,
-            "seq": published.seq,
-            "_replay_scope": published.scope,
-            "_replay_size": frame_size,
-            **fields,
-        }
         if pending is not None:
-            pending.frames.append((event, payload))
+            pending.frames.append(
+                HeldFrame(event, fields, covers, frame_size, published.seq)
+            )
         return PublishedSessionEvent(
             published.stream_id, published.seq, published.scope, frame_size
         )
@@ -256,6 +342,6 @@ class SessionReplay:
         ended = self._subscriptions.pop(connection, None)
         self._next_sequences.pop(connection, None)
         if pending is not None:
-            for _, fields in pending.frames:
-                self.release(fields["_replay_scope"], fields["_replay_size"])
+            for held in pending.frames:
+                self.release(pending.scope, held.size)
         return ended

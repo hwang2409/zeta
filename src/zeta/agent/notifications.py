@@ -88,6 +88,7 @@ class AgentNotificationMixin:
                         notification.id
                     ),
                 },
+                row_seq=notification.seq,
             )
             for notification in publications.notifications
         ]

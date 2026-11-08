@@ -52,6 +52,7 @@ from .protocol import (
     ProtocolError,
     bounded,
 )
+from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
     from .server import ZetaServer
@@ -74,6 +75,8 @@ class NotificationPresentation:
         notification: Mapping[str, object],
         protocol_version: str,
         send: NotificationSender,
+        *,
+        row_seq: int | None = None,
     ) -> None:
         notification_id = notification.get("notification_id")
         key = (
@@ -93,6 +96,7 @@ class NotificationPresentation:
                 event_name,
                 session_id,
                 data=event_contract.notification_payload(notification),
+                replay_row=RowFacts(seq=row_seq),
             )
         except FrameWriteCancelled as cancelled:
             if not cancelled.written and key is not None:
@@ -410,6 +414,7 @@ class ServeControl:
                     event_contract.AuxiliaryEvent.USER_MESSAGE
                 ],
                 self.server.runtime.session_id,
+                replay_row=RowFacts(delivery_id=delivery_id),
                 **fields,
             )
 
@@ -889,7 +894,9 @@ class ServeControl:
             ):
                 await self._notify(wire_event, session_id, _admitted=True, **fields)
                 return
-            await self._notify(wire_event, session_id, **fields)
+            await self._notify(
+                wire_event, session_id, replay_row=RowFacts(seq=event.row_seq), **fields
+            )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
             await self._end_approval(
@@ -903,7 +910,11 @@ class ServeControl:
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(
-                session_id, event.data, self._protocol_version(), self._notify
+                session_id,
+                event.data,
+                self._protocol_version(),
+                self._notify,
+                row_seq=event.row_seq,
             )
             return
         if kind is StreamEventType.ERROR:

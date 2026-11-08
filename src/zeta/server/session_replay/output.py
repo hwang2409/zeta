@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -9,7 +10,9 @@ from typing import Any
 
 from .. import ergonomics
 from ..protocol import EventDescriptor, _Frame
-from . import ReplayScopeId, _Subscription, history_features
+from . import DROP, EVICT, ReplayScopeId, _Subscription, history_features, rows
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,15 +33,65 @@ class ReplayOutput:
         session_id: str | None,
         required_feature: str | None,
         fields: dict[str, object],
+        covers: rows.Covers,
     ) -> None:
         """Send a controller event to observers that joined its replay scope."""
         for observer in tuple(self._observers):
             if not self._feature_rejected(observer, event, required_feature, fields):
-                self._publish_replay(observer, event, session_id, fields)
+                self._publish_replay(observer, event, session_id, fields, covers)
+
+    def _replay_covers(
+        self,
+        event: EventDescriptor,
+        session_id: str | None,
+        fields: dict[str, object],
+        replay_row: rows.RowFacts | None,
+    ) -> rows.Covers:
+        """Find the history row one publication presents, once for every stream."""
+        if session_id is None:
+            return None
+        scope = ReplayScopeId.top(session_id)
+        facts = replay_row or rows.RowFacts()
+        try:
+            source = rows.route(event, fields, facts)
+        except rows.UnroutedEvent as exc:
+            logger.error("replay event has no route table entry: %s", exc)
+            self.invalidate_replay_scope(scope, "evicted")
+            return None
+        store = self._replay_store(scope)
+        if store is None:
+            return None
+        return rows.covers(event, source, store, fields, facts)
+
+    def _replay_store(self, scope: ReplayScopeId) -> Any:
+        """The scope's store while a replay stream or join needs it, else None."""
+        for connection in self._connections:
+            if self.replay.scope_for(connection) == scope:
+                runtime = connection.server.runtime
+                if runtime.opened is not None and runtime.session_id == scope.value:
+                    return runtime.opened.store
+        return None
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         self.invalidate_replay_connection(connection, reason="rejoined")
-        self.replay.begin_join(connection, scope)
+        store = ergonomics.active(connection.server.runtime, {"session_id": scope.value})
+        self.replay.begin_join(connection, scope, store.reset_generation())
+
+    def finish_replay_join(
+        self, connection: Any, history: dict[str, object], frontier_seq: int
+    ) -> dict[str, object]:
+        scope = self.replay.scope_for(connection)
+        if scope is not None and not self._frontier_holds(connection, scope):
+            self.invalidate_replay_scope(scope, "session_replaced")
+        return self.replay.finish_join(connection, history, frontier_seq)
+
+    def _frontier_holds(self, connection: Any, scope: ReplayScopeId) -> bool:
+        """False after a store reset that can renumber rows since the join began."""
+        generation = self.replay.reset_generation(connection)
+        store = self._replay_store(scope)
+        return generation is None or (
+            store is not None and store.reset_generation() == generation
+        )
 
     def invalidate_replay_connection(
         self,
@@ -124,37 +177,52 @@ class ReplayOutput:
         event: EventDescriptor,
         session_id: str | None,
         fields: dict[str, object],
+        covers: rows.Covers,
     ) -> bool:
+        """Admit one frame to a replay stream; False when the caller sends it plainly."""
         if "session_replay_seq" not in state.features or session_id is None:
             return False
         scope = ReplayScopeId.top(session_id)
-        prepared = self.replay.prepare(state.connection, scope)
+        connection = state.connection
+        if covers is not None and not self._frontier_holds(connection, scope):
+            self.invalidate_replay_scope(scope, "session_replaced")
+            return False
+        prepared = self.replay.prepare(connection, scope, covers)
+        if prepared is DROP:
+            return True
+        if prepared is EVICT:
+            self.invalidate_replay_connection(connection, reason="evicted")
+            return False
         if prepared is None or state.output is None:
             return False
-        payload = {"stream_id": prepared.stream_id, "seq": prepared.seq, **fields}
-        frame = state.connection.codec.notification(event, session_id, **payload)
+        # a pending join's frames get their seq when the join ends
+        position = {"stream_id": prepared.stream_id}
+        if prepared.seq is not None:
+            position["seq"] = prepared.seq
+        frame = connection.codec.notification(event, session_id, **position, **fields)
         if frame is None:
             return False
         while (victim := self.replay.reserve(scope, len(frame))) is not None:
             self.invalidate_replay_scope(victim, "evicted")
-            prepared = self.replay.prepare(state.connection, scope)
+            prepared = self.replay.prepare(connection, scope, covers)
             if prepared is None:
                 return True
         published = self.replay.commit(
-            state.connection,
+            connection,
             event,
             {**fields, "_session_id": session_id},
             prepared,
             len(frame),
+            covers,
         )
         if published is None:
             self.replay.release(scope, len(frame))
             return True
-        if self.replay.is_pending(state.connection):
+        if self.replay.is_pending(connection):
             return True
         if not self._admit(state, frame):
             self.replay.release(scope, published.size)
-            self.invalidate_replay_connection(state.connection)
+            self.invalidate_replay_connection(connection)
             return True
         self._enqueue(
             state.output,
@@ -177,15 +245,20 @@ class ReplayOutput:
             self.invalidate_replay_connection(connection)
             return False
         held = self.replay.pending_tail(connection)
+        stream_id = self.replay.pending_stream_id(connection)
         items: list[_OutputFrame] = [_OutputFrame(frame)]
-        for event, fields in held:
+        for frame_state in held:
             public = {
                 key: value
-                for key, value in fields.items()
-                if key not in {"_session_id", "_replay_scope", "_replay_size"}
+                for key, value in frame_state.fields.items()
+                if key != "_session_id"
             }
             payload = connection.codec.notification(
-                event, fields["_session_id"], **public
+                frame_state.event,
+                frame_state.fields["_session_id"],
+                stream_id=stream_id,
+                seq=frame_state.seq,
+                **public,
             )
             if payload is None:
                 self.invalidate_replay_connection(connection)
@@ -193,9 +266,9 @@ class ReplayOutput:
             items.append(
                 _OutputFrame(
                     payload,
-                    replay_stream_id=public["stream_id"],
-                    replay_scope=fields["_replay_scope"],
-                    replay_size=fields["_replay_size"],
+                    replay_stream_id=stream_id,
+                    replay_scope=self.replay.scope_for(connection),
+                    replay_size=frame_state.size,
                 )
             )
         if not self._fits(
@@ -228,24 +301,25 @@ class ReplayOutput:
 
     async def read_replay_history(
         self, connection: Any, session_id: str
-    ) -> dict[str, object]:
-        """Read the newest history page of the pinned active store off-loop."""
+    ) -> tuple[dict[str, object], int]:
+        """Read the newest history page of the pinned active store off-loop.
+
+        Also return the seq of the newest row that page's history includes.
+        """
         store = ergonomics.active(connection.server.runtime, {"session_id": session_id})
         pinned = SimpleNamespace(opened=SimpleNamespace(store=store))
         features = history_features(self._connections[connection].features)
         result = await self.run_read(
             connection,
-            lambda: ergonomics.history(
+            lambda: ergonomics.replay_history(
                 pinned,
-                {"session_id": session_id, "before": None},
                 include_delivery_id={
                     "delivery_id", "user_message_event", "user_message_delivery_id"
                 } <= features,
-                backward_enabled="session_history_backward" in features,
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
             ),
         )
-        assert isinstance(result, dict)
+        assert isinstance(result, tuple)
         return result

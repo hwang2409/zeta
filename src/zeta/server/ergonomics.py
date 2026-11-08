@@ -170,6 +170,8 @@ class HistoryProjection:
     entry_index: Mapping[str, Any] = MappingProxyType({})
     groups: tuple[tuple[dict[str, object], ...], ...] = ()
     body_sizes: tuple[int, ...] = ()
+    # seq of the newest active-branch row this projection includes
+    frontier: int = 0
 
 
 @dataclass
@@ -413,6 +415,7 @@ def history_projection(
         tuple(tuple(group) for group in entries),
         MappingProxyType(approval_calls),
         MappingProxyType(entry_index),
+        frontier=branch[-1].seq if branch else 0,
     )
     with _cache_creation_lock:
         cached = _cache(
@@ -836,6 +839,7 @@ def _fit_history_groups(
             projection.entry_index,
             tuple(cache_groups),
             tuple(cache_sizes),
+            projection.frontier,
         ),
     )
 
@@ -991,6 +995,44 @@ def _backward_history_request(
     content_read: bool,
     served_turn_end: bool,
 ) -> dict:
+    return _backward_history_page(
+        runtime,
+        params,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
+    )[0]
+
+
+def replay_history(
+    runtime: ServerRuntime,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
+    served_turn_end: bool,
+) -> tuple[dict, int]:
+    """Return the newest backward page and the seq of the newest row it covers."""
+    return _backward_history_page(
+        runtime,
+        {"before": None},
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
+    )
+
+
+def _backward_history_page(
+    runtime: ServerRuntime,
+    params: dict,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
+    served_turn_end: bool,
+) -> tuple[dict, int]:
     before = params["before"]
     validator = params.get("history_validator")
     if before is None:
@@ -1029,7 +1071,7 @@ def _backward_history_request(
         fidelity,
         content_read,
         served_turn_end,
-    )
+    ), projection.frontier
 
 
 def _forward_history_request(

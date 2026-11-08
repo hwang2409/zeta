@@ -637,10 +637,12 @@ class _Client:
                 self.server.connections.begin_replay_join(
                     self, ReplayScopeId.top(session_id)
                 )
-                history = await self.server.connections.read_replay_history(
+                history, frontier = await self.server.connections.read_replay_history(
                     self, session_id
                 )
-                return self.server.connections.replay.finish_join(self, history)
+                return self.server.connections.finish_replay_join(
+                    self, history, frontier
+                )
             except BaseException:
                 self.server.connections.invalidate_replay_connection(self, reason="rejoined")
                 raise

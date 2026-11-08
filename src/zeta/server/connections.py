@@ -20,6 +20,7 @@ from .protocol import (
 )
 from .session_replay import SessionReplay, history_features
 from .session_replay.output import ReplayOutput, _OutputFrame
+from .session_replay.rows import RowFacts
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
@@ -267,10 +268,12 @@ class ConnectionRegistry(ReplayOutput):
         session_id: str | None,
         *,
         required_feature: str | None = None,
+        replay_row: RowFacts | None = None,
         **fields: object,
     ) -> Admission:
         """Admit one controller event without waiting for physical output."""
-        self._publish_observer_replay(event, session_id, required_feature, fields)
+        covers = self._replay_covers(event, session_id, fields, replay_row)
+        self._publish_observer_replay(event, session_id, required_feature, fields, covers)
         outcome, frame, output = self._controller_preflight(
             self._controller,
             event,
@@ -281,7 +284,7 @@ class ConnectionRegistry(ReplayOutput):
         if outcome.kind != "admitted" or frame is None or output is None:
             return outcome
         if self._publish_replay(
-            self._controller, event, session_id, dict(fields)
+            self._controller, event, session_id, dict(fields), covers
         ):
             return outcome
         if not self._admit(self._controller, frame):
@@ -299,9 +302,11 @@ class ConnectionRegistry(ReplayOutput):
         session_id: str | None,
         *,
         required_feature: str | None = None,
+        replay_row: RowFacts | None = None,
         **fields: object,
     ) -> bool:
-        self._publish_observer_replay(event, session_id, required_feature, fields)
+        covers = self._replay_covers(event, session_id, fields, replay_row)
+        self._publish_observer_replay(event, session_id, required_feature, fields, covers)
         outcome, frame, output = self._controller_preflight(
             self._controller,
             event,
@@ -313,7 +318,7 @@ class ConnectionRegistry(ReplayOutput):
             return False
         state = self._controller
         assert state is not None
-        if self._publish_replay(state, event, session_id, fields):
+        if self._publish_replay(state, event, session_id, fields, covers):
             return True
         if not self._admit(state, frame):
             return False
@@ -342,11 +347,12 @@ class ConnectionRegistry(ReplayOutput):
             and feature in state.features
             and (state is not self._controller or not self._controller_output_paused)
         )
+        covers = self._replay_covers(event, session_id, {"data": data}, None)
         for state in states:
             frame = state.connection.codec.notification(event, session_id, data=data)
             if frame is None:
                 continue
-            if self._publish_replay(state, event, session_id, {"data": data}):
+            if self._publish_replay(state, event, session_id, {"data": data}, covers):
                 continue
             if state is self._controller:
                 await self.send(state.connection, frame)
