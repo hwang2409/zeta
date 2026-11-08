@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import random
+import select
 import subprocess
 import sys
 import threading
@@ -372,9 +373,30 @@ store.close()
         stdout=subprocess.PIPE,
         text=True,
     )
-    assert process.stdout is not None
-    assert process.stdout.readline() == "ready\n"
-    return process
+    try:
+        assert process.stdout is not None
+        readable, _, _ = select.select([process.stdout], [], [], 10)
+        state = (
+            "running" if process.poll() is None else f"exit code {process.returncode}"
+        )
+        assert readable, f"timed out waiting for child owner readiness; process {state}"
+        assert process.stdout.readline() == "ready\n"
+        return process
+    except BaseException:
+        _kill_and_drain_child_owner(process)
+        raise
+
+
+def _kill_and_drain_child_owner(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.communicate(timeout=10)
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 def _persist_finished_receipt(
@@ -522,9 +544,7 @@ async def test_agent_status_projects_running_lifecycle_after_owner_is_killed(
         assert preserved["monotonic_pid"] == os.getpid()
         assert "final_result" not in preserved
     finally:
-        if owner.poll() is None:
-            owner.kill()
-            owner.wait(timeout=10)
+        _kill_and_drain_child_owner(owner)
         await loop.close()
         store.close()
 
