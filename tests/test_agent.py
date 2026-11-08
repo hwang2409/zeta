@@ -57,6 +57,7 @@ from zeta.agent.presets import (
 from zeta.agent.runner import _child_base_system_prompt
 from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.config.settings import SettingsError, load_settings
+from zeta.context_eviction import EVICTION_KIND, evict_messages, eviction_view
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.checkpoints import ConversationEntry
@@ -14880,30 +14881,126 @@ async def test_empty_idle_notifies_parent_once_with_last_message(
 
 @pytest.mark.asyncio
 async def test_idle_notice_uses_retained_last_message_after_eviction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
+    report = "real retained child report " + "detail " * 100
     parent, child, registry, loop, _parent_flow, _wakes = await _idle_notice_fixture(
         tmp_path
     )
-    run, _idle_waiting, prompts = await _run_until_idle_wait(
-        loop,
-        child,
-        monkeypatch,
-        replies=["real retained child report", "reminder did no work"],
-        result_texts=["[assistant text evicted · seq 851]", "[assistant text evicted · seq 857]"],
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent(report)]),
+            ScriptedTurn([TextContent("reminder did no work")]),
+        ]
     )
+    evicted = False
+    rendered_report = ""
+
+    def evict_report(_turns: int) -> None:
+        nonlocal evicted, rendered_report
+        if evicted:
+            return
+        entry = child.active_branch_snapshot()[-1]
+        persisted = Message.from_dict(entry.data["message"])
+        records = [(entry.seq, persisted)]
+        result = evict_messages(records, fixed_tokens=0, target_tokens=0)
+        assert result.items_evicted
+        rendered_report = result.messages[0].content[0].text
+        child.commit_compaction_marker(
+            "[deterministic semantic eviction view]",
+            entry.seq,
+            entry.seq,
+            expected_parent_id=child.active_branch_head_id(),
+            kind=EVICTION_KIND,
+            view=eviction_view(records, result),
+        )
+        evicted = True
+
+    channel = loop._background_owner.conversation_channel
+    channel.unregister_loop("root:1")
+    await channel.unregister_delivery_flow("root:1")
+    child_loop = AgentLoop(
+        backend,
+        child,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+        max_turns=None,
+        agent_depth=1,
+        agent_instance_id="root:1",
+        background_owner=loop._background_owner,
+    )
+    child_loop.explicit_finish = True
+    child_loop._terminal_transition_fence = TerminalTransitionFence(
+        child,
+        owned_work=lambda: child_loop.background_work_descriptions,
+        delivering_prompt_id=lambda: getattr(child_loop, "_delivering_prompt_id", None),
+    )
+    idle_waiting = asyncio.Event()
+
+    async def wait_idle(_wake: object, _timeout: float | None) -> bool:
+        idle_waiting.set()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
+        return True
+
+    def child_result(text: str, **kwargs: object) -> dict[str, object]:
+        state = kwargs.get("state")
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": rendered_report if state == "idle" else text,
+                }
+            ],
+            "isError": state == "failed",
+            "structuredContent": {
+                "status": "running" if state == "idle" else "completed"
+            },
+        }
+
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            child_loop,
+            "work",
+            child_store=child,
+            child_turns=lambda: len(backend.calls),
+            child_path=str(child.session_dir),
+            explicit_finish_metadata={
+                "child_instance_id": "root:1",
+                "description": "work",
+            },
+            publish=lambda _text: None,
+            update_turns=evict_report,
+            update_step=lambda _step: None,
+            update_tool_calls=lambda _calls: None,
+            finish_lifecycle=lambda _state, _text: {},
+            publish_lifecycle=lambda *_args, **_kwargs: None,
+            child_result=child_result,
+            error_message=str,
+            idle_wait=wait_idle,
+        )
+    )
+    run.add_done_callback(lambda _task: idle_waiting.set())
     try:
+        await asyncio.wait_for(idle_waiting.wait(), 10)
+        assert not run.done(), run.result()
         notices = [
             entry
             for entry in parent.agent_notifications(pending_only=False)
             if entry.data.get("kind") == "child_idle"
         ]
-        assert prompts == ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
+        assert len(backend.calls) == 2
         assert len(notices) == 1
-        assert notices[0].data["text"] == "real retained child report"
-        assert "assistant text evicted" not in notices[0].data["text"]
+        assert notices[0].data["text"] == report
+        assert "assistant text evicted" in rendered_report
     finally:
-        await _cancel_idle_fixture(run, registry, parent, child)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, 10)
+        await child_loop.close()
+        await asyncio.wait_for(registry.close(), 10)
+        parent.close()
+        child.close()
 
 
 @pytest.mark.asyncio
