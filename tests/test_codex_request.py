@@ -71,6 +71,6 @@ async def test_cancellation_does_not_corrupt_replay() -> None:
     await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
     replay = b"".join([part async for part in prepared.content])
     assert len(replay) == int(prepared.headers["Content-Length"])
