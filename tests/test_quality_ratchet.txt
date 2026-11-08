@@ -1,4 +1,5 @@
 tests/support/processes.py::_finish_child_process_cleanup
+tests/support/processes.py::read_pid_file
 tests/support/processes.py::reap_process
 tests/support/serve_contract.py::_run_cleanup
 tests/support/server_backend.py::complete
@@ -15,6 +16,7 @@ tests/test_accounts.py::ticker
 tests/test_accounts_exhaustion.py::recover
 tests/test_accounts_exhaustion.py::run
 tests/test_accounts_exhaustion.py::test_account_switch_never_replays_transcript
+tests/test_accounts_status.py::read_then_lock
 tests/test_accounts_usage.py::__aiter__
 tests/test_accounts_usage.py::block_request
 tests/test_accounts_usage.py::cancel_refresh
@@ -582,6 +584,7 @@ tests/test_transport.py::__aiter__
 tests/test_transport.py::blocking_sleep
 tests/test_transport.py::test_retry_sleep_is_injectable_and_cancellation_interrupts_it
 tests/test_tui.py::block
+tests/test_tui.py::block_todo_cleanup
 tests/test_tui.py::blocked_activation
 tests/test_tui.py::complete
 tests/test_tui.py::delayed_mcp
@@ -661,6 +664,7 @@ tests/test_tui.py::test_undo_restores_double_slash_source_text
 tests/test_tui.py::test_undo_restores_next_image_token_after_deleted_token
 tests/test_tui.py::test_undo_restores_staged_image_for_resubmission
 tests/test_tui.py::test_undo_restores_text_and_aborts_streaming_turn
+tests/test_tui.py::test_unhandled_loop_exception_shows_ui_error_without_leaving_tui
 tests/test_tui.py::test_vi_composer_can_show_approval_prompt_while_in_normal_mode
 tests/test_tui.py::test_vi_composer_ctrl_c_interrupts_in_insert_and_normal_modes
 tests/test_tui.py::test_vi_composer_escape_and_insert_update_native_state

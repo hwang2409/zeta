@@ -398,12 +398,25 @@ def _enclosing_nodes(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> list[ast
     return ancestors
 
 
+def _finite_timeout_call(call: ast.Call) -> bool:
+    return (
+        _name(call.func) in {
+            "asyncio.timeout",
+            "asyncio.timeout_at",
+            "timeout",
+            "timeout_at",
+        }
+        and bool(call.args)
+        and not (isinstance(call.args[0], ast.Constant) and call.args[0].value is None)
+    )
+
+
 def _inside_timeout_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     return any(
         isinstance(ancestor, ast.AsyncWith)
         and any(
             isinstance(item.context_expr, ast.Call)
-            and _name(item.context_expr.func) in {"asyncio.timeout", "timeout"}
+            and _finite_timeout_call(item.context_expr)
             for item in ancestor.items
         )
         for ancestor in _enclosing_nodes(node, parents)
@@ -413,22 +426,26 @@ def _inside_timeout_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> b
 def _inside_deadline_argument(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     child = node
     for ancestor in _enclosing_nodes(node, parents):
-        if (
-            isinstance(ancestor, ast.Call)
-            and _name(ancestor.func)
-            in {
-                "asyncio.wait_for",
-                "wait_for",
-                "asyncio.timeout",
-                "timeout",
-                "await_or_fail",
-            }
-            and any(child is argument for argument in ancestor.args)
+        if not isinstance(ancestor, ast.Call) or not any(
+            child is argument for argument in ancestor.args
         ):
+            if isinstance(ancestor, (ast.stmt, ast.comprehension)):
+                return False
+            child = ancestor
+            continue
+        function = _name(ancestor.func)
+        if function == "await_or_fail":
             return True
-        if isinstance(ancestor, (ast.stmt, ast.comprehension)):
-            return False
-        child = ancestor
+        if function in {"asyncio.wait_for", "wait_for"}:
+            return (
+                len(ancestor.args) > 1
+                and not (
+                    isinstance(ancestor.args[1], ast.Constant)
+                    and ancestor.args[1].value is None
+                )
+                and child is ancestor.args[0]
+            )
+        return False
     return False
 
 
@@ -442,67 +459,77 @@ def _enclosing_function_touches_added_line(
     )
 
 
-def _contains_async_sleep(node: ast.AST) -> bool:
+def _imported_loop_names(tree: ast.AST) -> tuple[set[str], set[str]]:
+    sleep_names = {"asyncio.sleep", "anyio.sleep"}
+    iterator_names = {"itertools.count", "itertools.cycle", "iter"}
+    modules = {"asyncio", "anyio", "itertools"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in modules:
+                    modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module in {
+            "asyncio",
+            "anyio",
+            "itertools",
+        }:
+            module = node.module
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if alias.name == "sleep" and module in {"asyncio", "anyio"}:
+                    sleep_names.add(name)
+                elif alias.name in {"count", "cycle"} and module == "itertools":
+                    iterator_names.add(name)
+    for module in modules:
+        if module in {"asyncio", "anyio"}:
+            sleep_names.add(f"{module}.sleep")
+        elif module == "itertools":
+            iterator_names.update({f"{module}.count", f"{module}.cycle"})
+    return sleep_names, iterator_names
+
+
+def _contains_async_sleep(node: ast.AST, sleep_names: set[str]) -> bool:
     return any(
         isinstance(child, ast.Await)
         and isinstance(child.value, ast.Call)
-        and _name(child.value.func) == "asyncio.sleep"
+        and _name(child.value.func) in sleep_names
         for child in ast.walk(node)
     )
 
 
-def _contains_failure(node: ast.AST) -> bool:
-    return any(
-        isinstance(child, (ast.Assert, ast.Raise))
-        or (
-            isinstance(child, ast.Call)
-            and _name(child.func) in {"pytest.fail", "fail"}
-        )
-        for child in ast.walk(node)
-    )
-
-
-def _counter_bound_fails(node: ast.While, parents: dict[ast.AST, ast.AST]) -> bool:
-    counter_names = {
-        compare.left.id
-        for compare in ast.walk(node.test)
-        if isinstance(compare, ast.Compare)
-        and isinstance(compare.left, ast.Name)
-        and any(isinstance(op, (ast.Lt, ast.LtE)) for op in compare.ops)
-        and any(
-            isinstance(value, ast.Constant) and isinstance(value.value, int)
-            for value in compare.comparators
-        )
-    }
-    if not counter_names or not any(
-        isinstance(child, ast.AugAssign)
-        and isinstance(child.target, ast.Name)
-        and child.target.id in counter_names
-        for child in ast.walk(node)
-    ):
+def _is_unbounded_iterator(node: ast.For, iterator_names: set[str]) -> bool:
+    if not isinstance(node.iter, ast.Call):
         return False
-    if _contains_failure(node):
-        return True
-    child = node
-    while child in parents:
-        parent = parents[child]
-        body = getattr(parent, "body", None)
-        if isinstance(body, list) and node in body:
-            return any(_contains_failure(sibling) for sibling in body[body.index(node) + 1 :])
-        child = parent
-    return False
+    name = _name(node.iter.func)
+    return name in iterator_names or (name == "iter" and len(node.iter.args) == 2)
 
 
 def _is_unbounded_polling_loop(
-    node: ast.While, parents: dict[ast.AST, ast.AST]
+    node: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+    sleep_names: set[str],
+    iterator_names: set[str],
+    lines: list[str],
 ) -> bool:
-    if not _contains_async_sleep(node):
+    if not (
+        isinstance(node, ast.While)
+        or isinstance(node, ast.For)
+        and _is_unbounded_iterator(node, iterator_names)
+    ):
         return False
-    if _inside_timeout_context(node, parents) or _inside_deadline_argument(node, parents):
+    if not _contains_async_sleep(node, sleep_names):
         return False
-    if _contains_timing_reference(node.test) or _contains_timing_reference(node):
+    if _has_marker(lines, node.lineno, set(CONTRACT_KINDS)):
         return False
-    return not _counter_bound_fails(node, parents)
+    if _inside_timeout_context(node, parents) or _inside_deadline_argument(
+        node, parents
+    ):
+        return False
+    return not any(
+        isinstance(child, ast.Await)
+        and _inside_deadline_argument(child, parents)
+        for child in ast.walk(node)
+    )
 
 
 def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
@@ -589,8 +616,12 @@ def _deadline_findings(
     node: ast.AST,
     lines: list[str],
     parents: dict[ast.AST, ast.AST],
+    sleep_names: set[str],
+    iterator_names: set[str],
 ) -> list[Finding]:
-    if isinstance(node, ast.While) and _is_unbounded_polling_loop(node, parents):
+    if _is_unbounded_polling_loop(
+        node, parents, sleep_names, iterator_names, lines
+    ):
         return [
             Finding(
                 path,
@@ -668,11 +699,15 @@ def _scan_deadline_nodes(
     nodes: list[ast.AST],
     lines: list[str],
     parents: dict[ast.AST, ast.AST],
+    tree: ast.AST,
 ) -> list[Finding]:
+    sleep_names, iterator_names = _imported_loop_names(tree)
     return [
         finding
         for node in nodes
-        for finding in _deadline_findings(path, node, lines, parents)
+        for finding in _deadline_findings(
+            path, node, lines, parents, sleep_names, iterator_names
+        )
     ]
 
 
@@ -883,7 +918,7 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     findings = _scan_added_nodes(
         path, added_nodes, lines, literal_names, serialized_names
     )
-    findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents))
+    findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents, tree))
     findings.extend(_global_bootstrap_findings(path, tree, source, added))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
@@ -941,8 +976,13 @@ def _scan_deadline_findings(
             for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
         }
+        sleep_names, iterator_names = _imported_loop_names(tree)
         for node in ast.walk(tree):
-            findings.extend(_deadline_findings(path, node, lines, parents))
+            findings.extend(
+                _deadline_findings(
+                    path, node, lines, parents, sleep_names, iterator_names
+                )
+            )
     return findings, trees
 
 

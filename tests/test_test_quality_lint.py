@@ -148,6 +148,60 @@ def test_await_deadline_rule_rejects_unbounded_waits(
         ),
         (
             """async def test_spin():
+    deadline = time.monotonic() + 10
+    while not ready:
+        now = time.monotonic()
+        await asyncio.sleep(0)
+""",
+            [("TQ004", 3)],
+        ),
+        (
+            """async def test_spin():
+    deadline = time.monotonic() + 10
+    while not ready:
+        if time.monotonic() > deadline:
+            ignored = True
+        await asyncio.sleep(0)
+""",
+            [("TQ004", 3)],
+        ),
+        (
+            """async def test_spin():
+    async with asyncio.timeout(None):
+        while not ready:
+            await asyncio.sleep(0)
+""",
+            [("TQ004", 3)],
+        ),
+        (
+            """from asyncio import sleep
+
+async def test_spin():
+    while not ready:
+        await sleep(0)
+""",
+            [("TQ004", 4)],
+        ),
+        (
+            """import anyio
+
+async def test_spin():
+    while not ready:
+        await anyio.sleep(0)
+""",
+            [("TQ004", 4)],
+        ),
+        (
+            """import itertools
+
+async def test_spin():
+    for _ in itertools.count():
+        await asyncio.sleep(0)
+""",
+            [("TQ004", 4)],
+        ),
+        (
+            """async def test_spin():
     async with asyncio.timeout(10):
         while not ready:
             await asyncio.sleep(0)
@@ -156,30 +210,18 @@ def test_await_deadline_rule_rejects_unbounded_waits(
         ),
         (
             """async def test_spin():
-    deadline = time.monotonic() + 10
-    while not ready and time.monotonic() < deadline:
-        await asyncio.sleep(0)
-    assert ready
-""",
-            [],
-        ),
-        (
-            """async def test_spin():
-    attempts = 0
-    while not ready and attempts < 3:
-        attempts += 1
-        await asyncio.sleep(0)
-    pytest.fail("ready did not arrive")
-""",
-            [],
-        ),
-        (
-            """async def test_spin():
     while not ready:
-        # test-contract: latency exercise a short polling interval
-        await asyncio.sleep(0.01)
+        await await_or_fail(asyncio.sleep(0), what="tick")
 """,
-            [("TQ004", 2)],
+            [],
+        ),
+        (
+            """async def test_spin():
+    # test-contract: complexity heartbeat task is cancelled by fixture teardown
+    while not ready:
+        await asyncio.sleep(0)
+""",
+            [],
         ),
     ],
 )
