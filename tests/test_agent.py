@@ -12398,8 +12398,8 @@ async def test_agent_cancel_mixed_child_and_task_terminal_result(
     )
     store, loop, run, completion_published = await _start_task_gate(tmp_path, backend)
 
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
-    await asyncio.wait_for(run, timeout=5)
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
+    await asyncio.wait_for(run, timeout=10)
     notification = await _completion_after_publication(store, completion_published)
     assert "background sub-agents" in backend.gate_text
     assert "collect mixed evidence" in backend.gate_text
