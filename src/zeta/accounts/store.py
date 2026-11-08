@@ -710,6 +710,7 @@ class AccountStore:
     def _stage_account_tokens(
         self, account_fd: int, account: AccountId, tokens: OAuthTokens
     ) -> None:
+        tokens = _effective_tokens(account_fd, tokens)
         publish_mapping(
             self.home, account_fd, "oauth.json", tokens.to_dict(), atomic_publish
         )
@@ -898,14 +899,6 @@ class AccountCredentials:
                 f"{self.provider_label} OAuth token refresh stalled",
                 retryable=outcome is OAuthRefreshFailure.TRANSIENT,
             ) from exc
-        if not refreshed.email or not refreshed.workspace:
-            refreshed = OAuthTokens(
-                refreshed.access_token,
-                refreshed.refresh_token,
-                refreshed.expires_at,
-                refreshed.email or tokens.email,
-                refreshed.workspace or tokens.workspace,
-            )
         self._write(home_fd, refreshed)
         return refreshed.access_token
 
@@ -929,6 +922,7 @@ class AccountCredentials:
 
     def _write(self, home_fd: int, tokens: OAuthTokens) -> None:
         with _account_directory(home_fd, self.account) as account_fd:
+            tokens = _effective_tokens(account_fd, tokens)
             publish_mapping(
                 self.store.home,
                 account_fd,
@@ -1146,6 +1140,20 @@ def _delete_publication_pending(directory_fd: int) -> None:
     except FileNotFoundError:
         return
     _fsync_directory(directory_fd)
+
+
+def _effective_tokens(directory_fd: int, tokens: OAuthTokens) -> OAuthTokens:
+    current = _read_optional_bytes(directory_fd, "oauth.json")
+    if current is None or (tokens.email is not None and tokens.workspace is not None):
+        return tokens
+    previous = _tokens_from_bytes(current)
+    return OAuthTokens(
+        tokens.access_token,
+        tokens.refresh_token,
+        tokens.expires_at,
+        tokens.email or previous.email,
+        tokens.workspace or previous.workspace,
+    )
 
 
 def _verify_tokens(directory_fd: int, expected: OAuthTokens) -> None:
