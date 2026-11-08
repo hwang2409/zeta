@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from ..context_eviction.receipt_constructors import (
+    REASONING_KIND,
     RECEIPT_FIELDS_METADATA,
     RECEIPT_KIND_METADATA,
-    REASONING_KIND,
     is_receipt_echo,
     reasoning_marker,
 )

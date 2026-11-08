@@ -22,9 +22,6 @@ from ..protocol.types import (
 )
 from ._fact_floor import validate_fact_floor
 from .receipt_constructors import (
-    RECEIPT_KIND_METADATA as RECEIPT_KIND_METADATA,
-)
-from .receipt_constructors import (
     REASONING_KIND,
     _assistant_receipt,
     _collapsed_assistant_receipt,
@@ -35,6 +32,9 @@ from .receipt_constructors import (
     _structured_result_receipt,
     _tool_call_receipt,
     reasoning_marker,
+)
+from .receipt_constructors import (
+    RECEIPT_KIND_METADATA as RECEIPT_KIND_METADATA,
 )
 from .token_estimates import estimated_text_tokens, estimated_tokens  # noqa: F401
 from .tool_exchange_fold import fold_consumed_tool_exchanges

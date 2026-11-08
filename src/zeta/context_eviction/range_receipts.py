@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from ..protocol.types import Message, MessageRole, TextContent, ToolUseContent
+from .receipt_constructors import RANGE_RECEIPT_LIMIT as _RANGE_LIMIT
 from .receipt_constructors import (
     RANGE_RECEIPT_PREFIX,
     RANGE_RECEIPT_SUFFIX,
@@ -14,7 +15,7 @@ from .receipt_constructors import (
     RECEIPT_KIND_METADATA,
     reasoning_marker,
 )
-from .receipt_constructors import RANGE_RECEIPT_LIMIT as _RANGE_LIMIT
+
 _MAX_TOOL_KINDS = 12
 
 

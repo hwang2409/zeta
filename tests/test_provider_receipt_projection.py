@@ -428,8 +428,10 @@ async def test_building_payloads_changes_no_stored_row_or_message(tmp_path: Path
         ("  [assistant text evicted · seq 1474][assistant reasoning evicted · seq 1516]\n", 2),
         ("[duplicate result collapsed into seq 9]", 1),
         (
-            "[evicted range] seq 3-8: 2 assistant notes, 1 user request: fix it]; "
-            "recall_history seq_start=3, seq_end=8 for exact content",
+            (
+                "[evicted range] seq 3-8: 2 assistant notes, 1 user request: fix it]; "
+                "recall_history seq_start=3, seq_end=8 for exact content"
+            ),
             1,
         ),
         ("done. [assistant text evicted · seq 5]", None),
@@ -449,7 +451,10 @@ async def test_building_payloads_changes_no_stored_row_or_message(tmp_path: Path
     ],
 )
 def test_receipt_grammar_accepts_only_whole_receipt_text(text: str, tokens: int | None) -> None:
-    from zeta.context_eviction.receipt_constructors import is_receipt_echo, receipt_tokens
+    from zeta.context_eviction.receipt_constructors import (
+        is_receipt_echo,
+        receipt_tokens,
+    )
 
     parsed = receipt_tokens(text)
     assert (None if parsed is None else len(parsed)) == tokens
