@@ -24,7 +24,10 @@ class StoreLifecycleMixin:
         if self._closed:
             raise ConversationIntegrityError("conversation store is closed")
         if self._read_only:
-            self._load()
+            if self._observer_snapshot:
+                self._sync_observer_snapshot()
+            else:
+                self._load()
             self._load_session_state()
         else:
             with self._append_lock():

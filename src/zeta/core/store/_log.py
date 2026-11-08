@@ -10,6 +10,7 @@ store. Reopen the session to force a full load after unsupported external edits.
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
 import logging
@@ -422,7 +423,7 @@ class _FullLoadValidator:
             "invalid_active_branch_links",
         )
 
-    def finish(self) -> None:
+    def finish(self, *, install: bool = True) -> None:
         if not self.header_seen:
             raise self.store._transcript_error(
                 kind="unrecoverable_header",
@@ -437,8 +438,9 @@ class _FullLoadValidator:
         if self.state._entries:
             self._select_branch(self.state._entries[-1])
         self.state._rebuild_client_deliveries(self.state._entries)
-        for attribute in self._STATE_ATTRIBUTES:
-            setattr(self.store, attribute, getattr(self.state, attribute))
+        if install:
+            for attribute in self._STATE_ATTRIBUTES:
+                setattr(self.store, attribute, getattr(self.state, attribute))
 
 
 class ConversationLogMixin:
@@ -725,6 +727,9 @@ class ConversationLogMixin:
 
     def _sync_log_without_waiting(self: ConversationStore) -> None:
         """Synchronize changed log metadata unless another writer owns it."""
+        if self._observer_snapshot:
+            self._sync_observer_snapshot()
+            return
         if self._log_metadata_matches():
             return
         with self._append_lock(wait=False, observer=self._read_only) as acquired:
@@ -732,6 +737,81 @@ class ConversationLogMixin:
                 # A writer can expose a new size before releasing the lock. A
                 # later query synchronizes the append after the writer exits.
                 return
+
+    def _sync_observer_snapshot(self: ConversationStore) -> None:
+        """Install only a validated prefix from one authoritative source view."""
+        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+        try:
+            g0 = os.fstat(fd)
+            raw = self._read_fd(fd, g0.st_size)
+        finally:
+            os.close(fd)
+        complete_end = raw.rfind(b"\\n") + 1
+        if complete_end == getattr(self, "_log_offset", 0) and complete_end and self._known_prefix_matches_bytes(raw, complete_end):
+            return
+        candidate = raw[:complete_end]
+        baseline = (len(self._entries), self._entry_prefix_digest)
+        validator = _FullLoadValidator(self, candidate, g0)
+        for physical_row in self._iter_physical_rows(candidate, g0, validator.validated_prefix):
+            validator.accept(physical_row)
+        validator.finish(install=False)
+        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+        try:
+            g1 = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if (g0.st_dev, g0.st_ino, g0.st_ctime_ns, g0.st_size, g0.st_mtime_ns) != (
+            g1.st_dev,
+            g1.st_ino,
+            g1.st_ctime_ns,
+            g1.st_size,
+            g1.st_mtime_ns,
+        ):
+            return self._sync_observer_snapshot() if not self._entries else None
+        if complete_end < g0.st_size and not self._observer_append_active():
+            self._load()
+            return
+        for attribute in _FullLoadValidator._STATE_ATTRIBUTES:
+            setattr(self, attribute, getattr(validator.state, attribute))
+        delta = (
+            self._installed_delta_from_baseline(self._entries, baseline)
+            if self.on_entries_installed is not None
+            else ()
+        )
+        self._set_observer_log_stat(g0, complete_end, raw)
+        self._publish_entries_installed(delta)
+
+    def _observer_append_active(self: ConversationStore) -> bool:
+        fd = open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return False
+        finally:
+            os.close(fd)
+
+    def _known_prefix_matches_bytes(self: ConversationStore, raw: bytes, offset: int) -> bool:
+        known = getattr(self, "_log_prefix_fingerprint", None)
+        if known is None:
+            return False
+        length = min(offset, PREFIX_FINGERPRINT_BYTES)
+        return hashlib.blake2b(raw[offset - length : offset], digest_size=16).digest() == known
+
+    def _set_observer_log_stat(
+        self: ConversationStore, stat: os.stat_result, offset: int, raw: bytes
+    ) -> None:
+        length = min(offset, PREFIX_FINGERPRINT_BYTES)
+        self._log_identity = (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
+        self._log_offset = offset
+        self._log_mtime_ns = stat.st_mtime_ns
+        self._log_prefix_fingerprint = hashlib.blake2b(
+            raw[offset - length : offset], digest_size=16
+        ).digest()
+        self._transcript_generation += 1
 
     def _load(self: ConversationStore) -> None:
         """Synchronize in-memory state with the durable log.
