@@ -83,7 +83,6 @@ def test_app_owner_closes_after_body_failure(pytester: pytest.Pytester) -> None:
         pytester,
         """
 import asyncio
-import json
 from pathlib import Path
 import pytest
 from tests.support.fake_backend import FakeBackend
@@ -125,7 +124,6 @@ def test_app_owner_reports_pending_task_on_closed_loop(pytester: pytest.Pytester
         pytester,
         """
 import asyncio
-import json
 from pathlib import Path
 import pytest
 from tests.support.fake_backend import FakeBackend
@@ -164,7 +162,6 @@ def test_app_owner_accepts_done_task_on_closed_loop(pytester: pytest.Pytester) -
         pytester,
         """
 import asyncio
-import json
 import threading
 import pytest
 from tests.support.fake_backend import FakeBackend
@@ -221,7 +218,6 @@ def test_app_owner_reports_bounded_close_failure(pytester: pytest.Pytester) -> N
         pytester,
         """
 import asyncio
-import json
 import pytest
 from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
@@ -310,7 +306,6 @@ def test_server_owner_reports_bounded_close_failure(pytester: pytest.Pytester) -
         pytester,
         """
 import asyncio
-import json
 import pytest
 from zeta.server import ZetaServer
 
