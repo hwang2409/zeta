@@ -68,6 +68,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
+from tests.support.owned import await_or_fail
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import (
@@ -157,6 +158,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    harness_notice,
     with_message_origin,
 )
 from zeta.tui import theme
@@ -393,6 +395,30 @@ async def _background_event_transcript_count(
     )
     if app_sink is not None:
         app_sink(app)
+    macro_cancellations: list[asyncio.Task[object]] = []
+    macro_cancellation_reached = asyncio.Event()
+    release_macro_cancellation = asyncio.Event()
+    if owner == "background_macro":
+        kill_background_task = app.loop.tool_registry.background_tasks.kill
+
+        async def track_macro_cancellation(
+            task_id: str, *, cause: str, tui_presented: bool = False
+        ) -> dict[str, object]:
+            task = asyncio.current_task()
+            assert task is not None
+            macro_cancellations.append(task)
+            result = await kill_background_task(
+                task_id, cause=cause, tui_presented=tui_presented
+            )
+            if event == "session_shutdown":
+                macro_cancellation_reached.set()
+                await await_or_fail(
+                    release_macro_cancellation.wait(),
+                    what="release background macro cancellation",
+                )
+            return result
+
+        app.loop.tool_registry.background_tasks.kill = track_macro_cancellation  # type: ignore[method-assign]
     blocked_command = (
         f"{shlex.quote(sys.executable)} -c 'import threading; threading.Event().wait()'"
     )
@@ -510,7 +536,35 @@ async def _background_event_transcript_count(
             app._print = fail_output
             app._print_unit = fail_output
         app.request_exit()
-        await asyncio.wait_for(running, 10)
+        cancellation_owned_at_shutdown = True
+        if owner == "background_macro" and event == "session_shutdown":
+            assert task_id is not None
+            await await_or_fail(
+                macro_cancellation_reached.wait(),
+                what="background macro cancellation cleanup",
+            )
+            await await_or_fail(
+                app.loop.tool_registry.background_tasks.wait(task_id),
+                what="background macro process exit",
+            )
+            checkpoint = asyncio.Event()
+            asyncio.get_running_loop().call_soon(checkpoint.set)
+            await await_or_fail(
+                checkpoint.wait(), what="background macro watcher checkpoint"
+            )
+            cancellation_owned_at_shutdown = (
+                app.loop._background_owner.owns_running(f"macro:{launch.id}")
+            )
+            release_macro_cancellation.set()
+        await await_or_fail(running, what="TUI shutdown")
+        if owner == "background_macro" and event == "session_shutdown":
+            assert cancellation_owned_at_shutdown, (
+                "background macro cancellation was unowned during session shutdown"
+            )
+            assert len(macro_cancellations) == 1
+            assert macro_cancellations[0].done(), (
+                "background macro cancellation survived session shutdown"
+            )
 
     resumed = ""
     if event == "session_shutdown":
@@ -8649,9 +8703,8 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
                     time.sleep(0.01)
             return bool(should_stop and should_stop())
 
-        deliveries = recover_agent_children(loop, should_stop=observed_stop)
+        recover_agent_children(loop, should_stop=observed_stop)
         recovery_steps += children_before - len(loop.store.agent_children())
-        return deliveries
 
     monkeypatch.setattr(background, "_recover_agent_children", gated_recovery)
     app = TUIApp(
@@ -8671,10 +8724,19 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         assert app._input_loop_active, (
             "TUI input did not start during activation recovery"
         )
-        app.request_exit()
-        await activation_cancelled.wait()
-        recovery_release.set()
-        await run_task
+        try:
+            app.request_exit()
+            await asyncio.wait_for(activation_cancelled.wait(), 10)
+            recovery_release.set()
+            await asyncio.wait_for(run_task, 10)
+        finally:
+            recovery_release.set()
+            if not run_task.done():
+                run_task.cancel()
+            try:
+                await asyncio.wait_for(run_task, 10)
+            except asyncio.CancelledError:
+                pass
 
     interrupted_store = ConversationStore(
         tmp_path / "sessions", session_id=root.session_id
@@ -13837,6 +13899,14 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     assert nudge.role is MessageRole.SYSTEM
     assert nudge.content[0].text.startswith("[zeta] empty-turn recovery:")
     store.append_message(nudge)
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("continuing")]))
+    store.append_message(
+        harness_notice(
+            "shell cwd",
+            "/removed/worktree was removed; continuing in /survivor",
+            event="shell_cwd_recovered",
+        )
+    )
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("here is the answer")])
     )
@@ -13854,6 +13924,11 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
         rendered = Text.from_ansi(output.getvalue()).plain
         assert "here is the answer" in rendered
         assert "[zeta] empty-turn recovery:" in rendered
+        assert (
+            "[zeta] shell cwd: /removed/worktree was removed; continuing in"
+            in rendered
+        )
+        assert "/survivor" in rendered
         assert rendered.count("do the thing") == 1
     finally:
         await app.loop.close()
