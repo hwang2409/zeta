@@ -87,6 +87,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    harness_notice,
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
@@ -5024,14 +5025,22 @@ async def test_session_history_shows_zeta_notice_as_system_message(
     try:
         store = server.runtime.opened.store
         expected = []
-        notice_id = ""
+        notice_ids: dict[str, str] = {}
+        notices = {
+            3: build_nudge_message(),
+            4: harness_notice(
+                "shell cwd",
+                "/removed/worktree was removed; continuing in /survivor",
+                event="shell_cwd_recovered",
+            ),
+        }
         for index in range(9):
-            if index == 4:
-                notice = build_nudge_message()
+            if index in notices:
+                notice = notices[index]
                 assert notice.role is MessageRole.SYSTEM
-                assert notice.content[0].text.startswith("[zeta] empty-turn recovery:")
-                notice_id = store.append_message(notice).id
-                expected.append(notice_id)
+                event = notice.metadata["zeta_event"]
+                notice_ids[event] = store.append_message(notice).id
+                expected.append(notice_ids[event])
             expected.append(
                 store.append_message(
                     Message(MessageRole.ASSISTANT, [TextContent(f"visible-{index}")])
@@ -5061,10 +5070,18 @@ async def test_session_history_shows_zeta_notice_as_system_message(
         assert [row["id"] for row in rows] == expected
         assert first["next_offset"] == 8
         assert second["next_offset"] is None
-        notice_row = next(row for row in rows if row["id"] == notice_id)
-        assert notice_row["role"] == "system"
-        assert notice_row["content"][0]["text"].startswith(
+        notice_rows = {
+            event: next(row for row in rows if row["id"] == notice_id)
+            for event, notice_id in notice_ids.items()
+        }
+        assert notice_rows["empty_turn_nudge"]["role"] == "system"
+        assert notice_rows["empty_turn_nudge"]["content"][0]["text"].startswith(
             "[zeta] empty-turn recovery:"
+        )
+        assert notice_rows["shell_cwd_recovered"]["role"] == "system"
+        assert notice_rows["shell_cwd_recovered"]["content"][0]["text"] == (
+            "[zeta] shell cwd: /removed/worktree was removed; "
+            "continuing in /survivor"
         )
     finally:
         await close_serve(server, writer)
