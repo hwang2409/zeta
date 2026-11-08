@@ -960,6 +960,8 @@ def _stalling_backend(provider: str, client: httpx.AsyncClient, tmp_path: Path, 
     [
         pytest.param({}, 90.0, 3, id="production-defaults"),
         pytest.param({"stall_seconds": 30}, 30.0, 3, id="stall_seconds=30"),
+        # above the 15-minute model-progress limit, the transport limit still wins
+        pytest.param({"stall_seconds": 1200}, 1200.0, 3, id="stall_seconds=1200"),
         pytest.param({"stall_retries": 0}, 90.0, 1, id="stall_retries=0"),
         pytest.param({"stall_retries": 1}, 90.0, 2, id="stall_retries=1"),
     ],
@@ -986,7 +988,7 @@ async def test_stream_stall_settings_set_owner_deadline_and_retry_count(
     stalls: list[float] = []
     try:
         for stream in streams:
-            entered = asyncio.ensure_future(stream.entered.wait())
+            entered = asyncio.ensure_future(asyncio.wait_for(stream.entered.wait(), 10))
             try:
                 done, _ = await await_or_fail(
                     asyncio.wait({task, entered}, return_when=asyncio.FIRST_COMPLETED),

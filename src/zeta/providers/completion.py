@@ -1048,6 +1048,8 @@ def complete(
         clock=clock or getattr(adapter, "_completion_clock", None),
         wait=wait or getattr(adapter, "_completion_wait", None),
         transport_idle=transport_idle,
+        # a silent stream must reach the user's transport limit, not stall earlier as "model progress"
+        model_idle=max(MODEL_PROGRESS_IDLE_SECONDS, transport_idle),
     )
 
 
