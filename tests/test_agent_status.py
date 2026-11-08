@@ -591,6 +591,7 @@ async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
         read_threads.append(threading.get_ident())
         return original(*args, **kwargs)
 
+    # test-contract: seam tracks the off-loop lifecycle read
     monkeypatch.setattr(agent_tools, "_read_child_lifecycle", tracked_read)
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
