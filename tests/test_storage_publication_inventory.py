@@ -8,7 +8,7 @@ from pathlib import Path
 _DURABILITY_CALLBACKS = {
     ("session_retention.py", "write_retention_pin", "atomic_publish_file"),
     ("project_registry.py", "_publish", "atomic_publish_file"),
-    ("project_inbox.py", "_persist", "atomic_publish_file"),
+    ("project_inbox_sent/__init__.py", "_persist", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
     (
         "memory/entry_history.py",
