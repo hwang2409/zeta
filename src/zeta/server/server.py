@@ -52,20 +52,166 @@ from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
 
-def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
-    async def handle(
-        client: object, request_id: str | int, params: dict[str, Any]
-    ) -> object:
-        return await client._dispatch_descriptor(request_id, descriptor, params)  # type: ignore[attr-defined]
-
-    return handle
+async def _handle_login_start(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client.logins.request("login_start", params)  # type: ignore[attr-defined]
 
 
-HANDLERS: dict[MethodDescriptor, Handler] = {
-    descriptor: _descriptor_handler(descriptor) for descriptor in MethodDescriptor
-}
-if HANDLERS.keys() != set(MethodDescriptor):
-    raise RuntimeError("serve method handlers are not exhaustive")
+async def _handle_login_status(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client.logins.request("login_status", params)  # type: ignore[attr-defined]
+
+
+async def _handle_login_cancel(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client.logins.request("login_cancel", params)  # type: ignore[attr-defined]
+
+
+async def _handle_login_providers(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client.logins.request("login_providers", params)  # type: ignore[attr-defined]
+
+
+async def _handle_new_session_request(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._handle_new_session(request_id, params)  # type: ignore[attr-defined]
+
+
+async def _handle_resume_request(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._handle_resume(request_id, params)  # type: ignore[attr-defined]
+
+
+async def _handle_ping(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return {"pong": True}
+
+
+async def _handle_turn_context(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return client.server.turn_contexts.set_request(  # type: ignore[attr-defined]
+        client.features, client.server.runtime, params
+    )
+
+
+async def _handle_list_sessions(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    result, _page_ids = await client.connections.run_read(  # type: ignore[attr-defined]
+        client,
+        lambda: client._list_sessions(request_id, params),  # type: ignore[attr-defined]
+    )
+    return result
+
+
+async def _handle_send(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client.server.control.deliveries.send(params, client.features)  # type: ignore[attr-defined]
+
+
+async def _handle_steer(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client.server.control.deliveries.steer(params, client.features)  # type: ignore[attr-defined]
+
+
+async def _handle_delivery_status(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return client.server.control.deliveries.status(params, client.features)  # type: ignore[attr-defined]
+
+
+async def _handle_clear_steering(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return abort_scope.clear_pending_steering(
+        client.features, client.server.runtime.loop
+    )  # type: ignore[attr-defined]
+
+
+async def _handle_session_grants(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._dispatch_session_grants(
+        MethodDescriptor.SESSION_GRANTS, params
+    )  # type: ignore[attr-defined]
+
+
+async def _handle_revoke_session_grants(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._dispatch_session_grants(
+        MethodDescriptor.REVOKE_SESSION_GRANTS, params
+    )  # type: ignore[attr-defined]
+
+
+async def _handle_approve(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    scope = params.get("scope", "once")
+    if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "scope must be 'once' or 'always_tool'"
+        )
+    return await client.server.control.resolve_approval(
+        ApprovalDecision.APPROVE, _required_string(params, "request_id"), scope
+    )  # type: ignore[attr-defined]
+
+
+async def _handle_deny(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    scope = params.get("scope", "once")
+    if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "scope must be 'once' or 'always_tool'"
+        )
+    if scope == "always_tool":
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "scope 'always_tool' requires approve"
+        )
+    return await client.server.control.resolve_approval(
+        ApprovalDecision.DENY, _required_string(params, "request_id"), scope
+    )  # type: ignore[attr-defined]
+
+
+async def _handle_abort(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client.server.control.abort(
+        abort_scope.parse_abort_scope(params, client.features)
+    )  # type: ignore[attr-defined]
+
+
+async def _handle_status(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    assert client.server.connections is not None  # type: ignore[attr-defined]
+    session_id = (
+        client.server.runtime.session_id
+        if client.server.runtime.opened is not None
+        else None
+    )  # type: ignore[attr-defined]
+    return await client.server.connections.read_status(
+        client,
+        await client._status(
+            include_connection_setup_counts=params.get(
+                "include_connection_setup_counts"
+            )
+            is True
+        ),
+        session_id,
+    )  # type: ignore[attr-defined]
+
 
 _LOGIN_METHODS = frozenset(
     MethodDescriptor[name]
@@ -98,6 +244,225 @@ _PROJECT_METHODS = frozenset(
     MethodDescriptor[name]
     for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
 )
+
+
+async def _handle_rename_session(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.RENAME_SESSION, params)  # type: ignore[attr-defined]
+
+
+async def _handle_delete_session(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.DELETE_SESSION, params)  # type: ignore[attr-defined]
+
+
+async def _handle_session_tree(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SESSION_TREE, params)  # type: ignore[attr-defined]
+
+
+async def _handle_session_history(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SESSION_HISTORY, params)  # type: ignore[attr-defined]
+
+
+async def _handle_content_read(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.CONTENT_READ, params)  # type: ignore[attr-defined]
+
+
+async def _handle_switch_branch(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SWITCH_BRANCH, params)  # type: ignore[attr-defined]
+
+
+async def _handle_fork_message(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.FORK_MESSAGE, params)  # type: ignore[attr-defined]
+
+
+async def _handle_model_catalog(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.MODEL_CATALOG, params)  # type: ignore[attr-defined]
+
+
+async def _handle_session_settings(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SESSION_SETTINGS, params)  # type: ignore[attr-defined]
+
+
+async def _handle_set_settings(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SET_SETTINGS, params)  # type: ignore[attr-defined]
+
+
+async def _handle_set_compaction(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SET_COMPACTION, params)  # type: ignore[attr-defined]
+
+
+async def _handle_send_images(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SEND_IMAGES, params)  # type: ignore[attr-defined]
+
+
+async def _handle_slash_list(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SLASH_LIST, params)  # type: ignore[attr-defined]
+
+
+async def _handle_slash_run(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.SLASH_RUN, params)  # type: ignore[attr-defined]
+
+
+async def _handle_account_list(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.ACCOUNT_LIST, params)  # type: ignore[attr-defined]
+
+
+async def _handle_account_logout(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.ACCOUNT_LOGOUT, params)  # type: ignore[attr-defined]
+
+
+async def _handle_account_refresh(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.ACCOUNT_REFRESH, params)  # type: ignore[attr-defined]
+
+
+async def _handle_account_switch(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._ergonomics(MethodDescriptor.ACCOUNT_SWITCH, params)  # type: ignore[attr-defined]
+
+
+async def _handle_list_projects(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await _handle_project(
+        client, request_id, params, MethodDescriptor.LIST_PROJECTS
+    )
+
+
+async def _handle_project(
+    client: object,
+    request_id: str | int,
+    params: dict[str, Any],
+    descriptor: MethodDescriptor,
+) -> object:
+    assert client.projects is not None  # type: ignore[attr-defined]
+    return await asyncio.to_thread(
+        client.projects.dispatch,
+        request_id,
+        descriptor.wire,
+        params,
+        features=client.features,
+    )  # type: ignore[attr-defined]
+
+
+async def _handle_list_projects(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await _handle_project(
+        client, request_id, params, MethodDescriptor.LIST_PROJECTS
+    )
+
+
+async def _handle_project_show(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await _handle_project(
+        client, request_id, params, MethodDescriptor.PROJECT_SHOW
+    )
+
+
+async def _handle_project_memory_log(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await _handle_project(
+        client, request_id, params, MethodDescriptor.PROJECT_MEMORY_LOG
+    )
+
+
+async def _handle_project_inbox(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await _handle_project(
+        client, request_id, params, MethodDescriptor.PROJECT_INBOX
+    )
+
+
+HANDLERS: dict[MethodDescriptor, Handler] = {
+    MethodDescriptor.LIST_SESSIONS: _handle_list_sessions,
+    MethodDescriptor.NEW_SESSION: _handle_new_session_request,
+    MethodDescriptor.RESUME: _handle_resume_request,
+    MethodDescriptor.SEND: _handle_send,
+    MethodDescriptor.STEER: _handle_steer,
+    MethodDescriptor.APPROVE: _handle_approve,
+    MethodDescriptor.DENY: _handle_deny,
+    MethodDescriptor.ABORT: _handle_abort,
+    MethodDescriptor.STATUS: _handle_status,
+    MethodDescriptor.RENAME_SESSION: _handle_rename_session,
+    MethodDescriptor.DELETE_SESSION: _handle_delete_session,
+    MethodDescriptor.SESSION_TREE: _handle_session_tree,
+    MethodDescriptor.SESSION_HISTORY: _handle_session_history,
+    MethodDescriptor.CONTENT_READ: _handle_content_read,
+    MethodDescriptor.SWITCH_BRANCH: _handle_switch_branch,
+    MethodDescriptor.FORK_MESSAGE: _handle_fork_message,
+    MethodDescriptor.MODEL_CATALOG: _handle_model_catalog,
+    MethodDescriptor.SESSION_SETTINGS: _handle_session_settings,
+    MethodDescriptor.SET_SETTINGS: _handle_set_settings,
+    MethodDescriptor.SET_COMPACTION: _handle_set_compaction,
+    MethodDescriptor.SEND_IMAGES: _handle_send_images,
+    MethodDescriptor.SLASH_LIST: _handle_slash_list,
+    MethodDescriptor.SLASH_RUN: _handle_slash_run,
+    MethodDescriptor.ACCOUNT_LIST: _handle_account_list,
+    MethodDescriptor.ACCOUNT_LOGOUT: _handle_account_logout,
+    MethodDescriptor.ACCOUNT_REFRESH: _handle_account_refresh,
+    MethodDescriptor.ACCOUNT_SWITCH: _handle_account_switch,
+    MethodDescriptor.LOGIN_START: _handle_login_start,
+    MethodDescriptor.LOGIN_STATUS: _handle_login_status,
+    MethodDescriptor.LOGIN_CANCEL: _handle_login_cancel,
+    MethodDescriptor.LOGIN_PROVIDERS: _handle_login_providers,
+    MethodDescriptor.PING: _handle_ping,
+    MethodDescriptor.SET_TURN_CONTEXT: _handle_turn_context,
+    MethodDescriptor.LIST_PROJECTS: lambda c, i, p: _handle_project(
+        c, i, p, MethodDescriptor.LIST_PROJECTS
+    ),
+    MethodDescriptor.PROJECT_SHOW: lambda c, i, p: _handle_project(
+        c, i, p, MethodDescriptor.PROJECT_SHOW
+    ),
+    MethodDescriptor.PROJECT_MEMORY_LOG: lambda c, i, p: _handle_project(
+        c, i, p, MethodDescriptor.PROJECT_MEMORY_LOG
+    ),
+    MethodDescriptor.PROJECT_INBOX: lambda c, i, p: _handle_project(
+        c, i, p, MethodDescriptor.PROJECT_INBOX
+    ),
+    MethodDescriptor.CLEAR_STEERING: _handle_clear_steering,
+    MethodDescriptor.DELIVERY_STATUS: _handle_delivery_status,
+    MethodDescriptor.SESSION_GRANTS: _handle_session_grants,
+    MethodDescriptor.REVOKE_SESSION_GRANTS: _handle_revoke_session_grants,
+}
+if HANDLERS.keys() != set(MethodDescriptor):
+    raise RuntimeError("serve method handlers are not exhaustive")
 
 
 class _UnixSocketListener:
@@ -601,6 +966,7 @@ class _Client:
             raise self._descriptor_protocol_error(descriptor)
         if descriptor.feature is not None and descriptor.feature not in self.features:
             raise self._descriptor_feature_error(descriptor)
+        self._method = descriptor
         return await HANDLERS[descriptor](self, request_id, params)
 
     def _descriptor_protocol_error(self, descriptor: MethodDescriptor) -> ProtocolError:
@@ -638,191 +1004,101 @@ class _Client:
         )
         return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
 
-    async def _dispatch_descriptor(
-        self,
-        request_id: str | int,
-        descriptor: MethodDescriptor,
-        params: dict[str, Any],
+    async def _handle_new_session(
+        self, request_id: str | int, params: dict[str, Any]
     ) -> object:
-        method = descriptor.wire
-        if descriptor in _LOGIN_METHODS:
-            return await self.logins.request(method, params)
-        if descriptor in _ERGONOMICS_METHODS:
-            return await self._ergonomics(descriptor, params)
-        if descriptor is MethodDescriptor.PING:
-            if "ping" not in self.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "ping requires the negotiated ping feature",
+        try:
+            initial_model = _optional_string(params, "model")
+            initial_mode = _optional_string(params, "approval_mode")
+            if initial_mode is not None:
+                self._require_feature("new_session_settings", "approval_mode")
+                if initial_model is None:
+                    initial_model = _required_string(params, "model")
+                model_selection.validate(initial_model, initial_mode)
+            candidate = self._host_commands(params)
+            with self.server.control.reserve_session_swap():
+                cwd = None
+                if "cwd" in params:
+                    self._require_feature("session_cwd", "cwd")
+                    cwd = _directory(params, "cwd")
+                await self.server.control._terminate_pending_approvals()
+                await self.server.runtime.create_session(
+                    provider=_optional_string(params, "provider"),
+                    model=initial_model,
+                    cwd=cwd,
                 )
-            return {"pong": True}
-        if descriptor is MethodDescriptor.SET_TURN_CONTEXT:
-            contexts = self.server.turn_contexts
-            return contexts.set_request(self.features, self.server.runtime, params)
-        if descriptor in _PROJECT_METHODS:
-            assert self.projects is not None
-            return await asyncio.to_thread(
-                self.projects.dispatch,
-                request_id,
-                method,
-                params,
-                features=self.features,
-            )
-        if descriptor is MethodDescriptor.LIST_SESSIONS:
-            result, _page_ids = await self.connections.run_read(
-                self, lambda: self._list_sessions(request_id, params)
-            )
-            return result
-        if descriptor is MethodDescriptor.NEW_SESSION:
-            try:
-                initial_model = _optional_string(params, "model")
-                initial_mode = _optional_string(params, "approval_mode")
-                if initial_mode is not None:
-                    self._require_feature("new_session_settings", "approval_mode")
-                    if initial_model is None:
-                        initial_model = _required_string(params, "model")
-                    model_selection.validate(initial_model, initial_mode)
-                candidate = self._host_commands(params)
-                with self.server.control.reserve_session_swap():
-                    cwd = None
-                    if "cwd" in params:
-                        self._require_feature("session_cwd", "cwd")
-                        cwd = _directory(params, "cwd")
-                    await self.server.control._terminate_pending_approvals()
-                    await self.server.runtime.create_session(
-                        provider=_optional_string(params, "provider"),
-                        model=initial_model,
-                        cwd=cwd,
+                if initial_model is not None and initial_mode is not None:
+                    await model_selection.apply_rpc(
+                        self.server.runtime, initial_model, initial_mode
                     )
-                    if initial_model is not None and initial_mode is not None:
-                        await model_selection.apply_rpc(
-                            self.server.runtime, initial_model, initial_mode
-                        )
-                    self.server.control._active_host_commands = candidate
-                    self.server.control._host_binding_required = (
-                        "session_host_commands" in self.features
-                    )
-                    self.server.control.session_replaced()
-                    self.server.control.clear_approvals()
-                    await self.server.control.controller_ready()
-                    await self.server.control.publish_session_grant_reset()
-                    return {"session": self._session_snapshot()}
-            except BaseException:
-                if self.server.runtime.state is None:
-                    self.server.control._active_host_commands = None
-                    self.server.control._host_binding_required = False
-                raise
-        if descriptor is MethodDescriptor.RESUME:
-            try:
-                candidate = self._host_commands(params)
-                with self.server.control.reserve_session_swap():
-                    session_id = _required_string(params, "session_id")
-                    unhealthy_same_session = (
-                        self.server.control.unhealthy()
-                        and self.server.runtime.session_id == session_id
-                    )
-                    await self.server.control._terminate_pending_approvals()
-                    if unhealthy_same_session:
-                        try:
-                            await self.server.runtime.resume_session(
-                                session_id, force=True
-                            )
-                        except SessionNotFoundError as exc:
-                            raise ProtocolError(
-                                ErrorDescriptor.SESSION_NOT_FOUND,
-                                str(exc),
-                                {"session_id": session_id},
-                            ) from exc
-                        except SessionOwnedError as exc:
-                            raise _session_owned_protocol_error(exc) from exc
-                        except Exception as exc:
-                            raise ProtocolError(
-                                ErrorDescriptor.INTERNAL_ERROR,
-                                "approval persistence failed",
-                            ) from exc
-                    else:
-                        try:
-                            await self.server.runtime.resume_session(session_id)
-                        except SessionNotFoundError as exc:
-                            raise ProtocolError(
-                                ErrorDescriptor.SESSION_NOT_FOUND,
-                                str(exc),
-                                {"session_id": session_id},
-                            ) from exc
-                        except SessionOwnedError as exc:
-                            raise _session_owned_protocol_error(exc) from exc
-                    self.server.control._active_host_commands = candidate
-                    self.server.control._host_binding_required = (
-                        "session_host_commands" in self.features
-                    )
-                    self.server.control.session_replaced()
-                    self.server.control.clear_approvals()
-                    await self.server.control.controller_ready()
-                    await self.server.control.publish_session_grant_reset()
-                    return {"session": self._session_snapshot()}
-            except BaseException:
-                if self.server.runtime.state is None:
-                    self.server.control._active_host_commands = None
-                    self.server.control._host_binding_required = False
-                raise
-        if descriptor in {
-            MethodDescriptor.SESSION_GRANTS,
-            MethodDescriptor.REVOKE_SESSION_GRANTS,
-        }:
-            return await self._dispatch_session_grants(descriptor, params)
-        if descriptor is MethodDescriptor.SEND:
-            return await self.server.control.deliveries.send(params, self.features)
-        if descriptor is MethodDescriptor.STEER:
-            return await self.server.control.deliveries.steer(params, self.features)
-        if descriptor is MethodDescriptor.DELIVERY_STATUS:
-            return self.server.control.deliveries.status(params, self.features)
-        if descriptor is MethodDescriptor.CLEAR_STEERING:
-            return abort_scope.clear_pending_steering(
-                self.features, self.server.runtime.loop
-            )
-        if descriptor in {MethodDescriptor.APPROVE, MethodDescriptor.DENY}:
-            scope = params.get("scope", "once")
-            if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
-                raise ProtocolError(
-                    ErrorDescriptor.INVALID_PARAMS,
-                    "scope must be 'once' or 'always_tool'",
+                self.server.control._active_host_commands = candidate
+                self.server.control._host_binding_required = (
+                    "session_host_commands" in self.features
                 )
-            if scope == "always_tool" and descriptor is not MethodDescriptor.APPROVE:
-                raise ProtocolError(
-                    ErrorDescriptor.INVALID_PARAMS,
-                    "scope 'always_tool' requires approve",
+                self.server.control.session_replaced()
+                self.server.control.clear_approvals()
+                await self.server.control.controller_ready()
+                await self.server.control.publish_session_grant_reset()
+                return {"session": self._session_snapshot()}
+        except BaseException:
+            if self.server.runtime.state is None:
+                self.server.control._active_host_commands = None
+                self.server.control._host_binding_required = False
+            raise
+
+    async def _handle_resume(
+        self, request_id: str | int, params: dict[str, Any]
+    ) -> object:
+        try:
+            candidate = self._host_commands(params)
+            with self.server.control.reserve_session_swap():
+                session_id = _required_string(params, "session_id")
+                unhealthy_same_session = (
+                    self.server.control.unhealthy()
+                    and self.server.runtime.session_id == session_id
                 )
-            decision = (
-                ApprovalDecision.APPROVE
-                if descriptor is MethodDescriptor.APPROVE
-                else ApprovalDecision.DENY
-            )
-            return await self.server.control.resolve_approval(
-                decision, _required_string(params, "request_id"), scope
-            )
-        if descriptor is MethodDescriptor.ABORT:
-            return await self.server.control.abort(
-                abort_scope.parse_abort_scope(params, self.features)
-            )
-        if descriptor is MethodDescriptor.STATUS:
-            assert self.server.connections is not None
-            session_id = (
-                self.server.runtime.session_id
-                if self.server.runtime.opened is not None
-                else None
-            )
-            return await self.server.connections.read_status(
-                self,
-                await self._status(
-                    include_connection_setup_counts=(
-                        params.get("include_connection_setup_counts") is True
-                    )
-                ),
-                session_id,
-            )
-        raise ProtocolError(
-            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
-        )
+                await self.server.control._terminate_pending_approvals()
+                if unhealthy_same_session:
+                    try:
+                        await self.server.runtime.resume_session(session_id, force=True)
+                    except SessionNotFoundError as exc:
+                        raise ProtocolError(
+                            ErrorDescriptor.SESSION_NOT_FOUND,
+                            str(exc),
+                            {"session_id": session_id},
+                        ) from exc
+                    except SessionOwnedError as exc:
+                        raise _session_owned_protocol_error(exc) from exc
+                    except Exception as exc:
+                        raise ProtocolError(
+                            ErrorDescriptor.INTERNAL_ERROR,
+                            "approval persistence failed",
+                        ) from exc
+                else:
+                    try:
+                        await self.server.runtime.resume_session(session_id)
+                    except SessionNotFoundError as exc:
+                        raise ProtocolError(
+                            ErrorDescriptor.SESSION_NOT_FOUND,
+                            str(exc),
+                            {"session_id": session_id},
+                        ) from exc
+                    except SessionOwnedError as exc:
+                        raise _session_owned_protocol_error(exc) from exc
+                self.server.control._active_host_commands = candidate
+                self.server.control._host_binding_required = (
+                    "session_host_commands" in self.features
+                )
+                self.server.control.session_replaced()
+                self.server.control.clear_approvals()
+                await self.server.control.controller_ready()
+                await self.server.control.publish_session_grant_reset()
+                return {"session": self._session_snapshot()}
+        except BaseException:
+            if self.server.runtime.state is None:
+                self.server.control._active_host_commands = None
+                self.server.control._host_binding_required = False
+            raise
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
