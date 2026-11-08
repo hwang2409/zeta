@@ -63,7 +63,7 @@ async def abort_active_turn(
         loop.abort(foreground_only=foreground_only, steering_drop_reason=None)
     await terminate_approvals(foreground_only=foreground_only)
     before_cancel()
-    if cancel_task and not task.cancelling():
+    if cancel_task:
         task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     return True
