@@ -1416,31 +1416,36 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="publish-generation")
-    snapshot_ready = threading.Event()
-    release_snapshot = threading.Event()
+    delta_ready = threading.Event()
+    release_delta = threading.Event()
     owner_thread = threading.get_ident()
-    original_detach = ConversationStore._detach_log_state
+    original_copy = ConversationStore._owned_installed_delta
     blocked = False
 
-    def block_first_worker_snapshot(candidate: ConversationStore):
+    def block_first_worker_delta(delta: object):
         nonlocal blocked
-        state = original_detach(candidate)
+        copied = original_copy(delta)
         if not blocked and threading.get_ident() != owner_thread:
             blocked = True
-            snapshot_ready.set()
-            assert release_snapshot.wait(timeout=5)
-        return state
+            delta_ready.set()
+            assert release_delta.wait(timeout=10)
+        return copied
 
     monkeypatch.setattr(
-        ConversationStore, "_detach_log_state", block_first_worker_snapshot
+        ConversationStore, "_owned_installed_delta", staticmethod(block_first_worker_delta)
     )
     write = asyncio.create_task(
         store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
     )
-    assert await asyncio.to_thread(snapshot_ready.wait, 2)
-    store.append_message(message(MessageRole.ASSISTANT, "owner"))
-    release_snapshot.set()
-    await write
+    try:
+        assert await asyncio.to_thread(delta_ready.wait, 10)
+        store.append_message(message(MessageRole.ASSISTANT, "owner"))
+        release_delta.set()
+        await asyncio.wait_for(write, 10)
+    finally:
+        release_delta.set()
+        if not write.done():
+            await asyncio.wait_for(asyncio.shield(write), 10)
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
