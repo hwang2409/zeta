@@ -175,7 +175,7 @@ class AsyncDurableWritesMixin:
             writer._log_offset = delta.log_offset
             writer._log_mtime_ns = delta.log_mtime_ns
             writer._log_prefix_fingerprint = delta.log_prefix_fingerprint
-        if aligned and writer._log_metadata_matches():
+        if aligned:
             return writer
         writer.close()
         replacement = self._new_persistent_durable_writer()
