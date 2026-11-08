@@ -141,17 +141,27 @@ async def _handle_clear_steering(
 async def _handle_session_grants(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._dispatch_session_grants(
-        MethodDescriptor.SESSION_GRANTS, params
-    )  # type: ignore[attr-defined]
+    session_grants.require_feature(client.features)  # type: ignore[attr-defined]
+    return session_grants.read(
+        client.server.runtime.policy,
+        client.server.runtime.session_id,
+        params,  # type: ignore[attr-defined]
+    )
 
 
 async def _handle_revoke_session_grants(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._dispatch_session_grants(
-        MethodDescriptor.REVOKE_SESSION_GRANTS, params
-    )  # type: ignore[attr-defined]
+    session_grants.require_feature(client.features)  # type: ignore[attr-defined]
+    change_result = session_grants.revoke(
+        client.server.runtime.policy,
+        client.server.runtime.session_id,
+        params,  # type: ignore[attr-defined]
+    )
+    result, change = change_result
+    if change.changed:
+        await client.server.control.publish_session_grant_change(change)  # type: ignore[attr-defined]
+    return result
 
 
 async def _handle_approve(
@@ -326,7 +336,9 @@ async def _handle_model_catalog(
 async def _handle_session_settings(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return ergonomics.settings(client.server.runtime)  # type: ignore[attr-defined]
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    ergonomics.active(runtime, params)
+    return ergonomics.settings(runtime)
 
 
 async def _handle_set_settings(
@@ -396,15 +408,19 @@ async def _handle_slash_run(
 async def _handle_account_list(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await accounts.list_accounts(client.server.runtime)  # type: ignore[attr-defined]
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    ergonomics.active(runtime, params)
+    return await accounts.list_accounts(runtime)
 
 
 async def _handle_account_logout(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    ergonomics.active(runtime, params)
     return await accounts.request(
         "account_logout",
-        client.server.runtime,
+        runtime,
         client.server.control.require_idle,
         params,
     )  # type: ignore[attr-defined]
@@ -413,9 +429,11 @@ async def _handle_account_logout(
 async def _handle_account_refresh(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    ergonomics.active(runtime, params)
     return await accounts.request(
         "account_refresh",
-        client.server.runtime,
+        runtime,
         client.server.control.require_idle,
         params,
     )  # type: ignore[attr-defined]
@@ -424,11 +442,13 @@ async def _handle_account_refresh(
 async def _handle_account_switch(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    ergonomics.active(runtime, params)
     return await accounts.run_owned_switch(
         client,
         accounts.request(
             "account_switch",
-            client.server.runtime,
+            runtime,
             client.server.control.require_idle,
             params,
         ),
@@ -989,20 +1009,6 @@ class _Client:
         return await self.server.connections.route_request(
             self, request_id, method, params
         )
-
-    async def _dispatch_session_grants(
-        self, descriptor: MethodDescriptor, params: dict[str, Any]
-    ) -> object:
-        session_grants.require_feature(self.features)
-        runtime = self.server.runtime
-        if descriptor is MethodDescriptor.SESSION_GRANTS:
-            return session_grants.read(runtime.policy, runtime.session_id, params)
-        result, change = session_grants.revoke(
-            runtime.policy, runtime.session_id, params
-        )
-        if change.changed:
-            await self.server.control.publish_session_grant_change(change)
-        return result
 
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]

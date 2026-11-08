@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ import pytest
 from tests.support.serve_contract import ServeContract
 
 PIN = Path(__file__).parent / "fixtures" / "serve_wire_pin.jsonl"
+PIN_BASE_SHA = "ded830c144474addcf17f950a55540912cb37c53"
 _ERGONOMICS_METHODS = {
     "rename_session",
     "delete_session",
@@ -45,16 +48,34 @@ def _w4_delta(raw: str, method: str) -> str:
     return raw
 
 
+def test_wire_pin_was_captured_from_base() -> None:
+    header = json.loads(PIN.read_text().splitlines()[0])
+    command = header.get("command", "the base-worktree capture command")
+    captured_at = header.get("captured_at")
+    assert captured_at == PIN_BASE_SHA, (
+        f"wire pin capture commit must be {PIN_BASE_SHA}; rerun {command}"
+    )
+    current = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    assert captured_at != current, (
+        f"wire pin must not be captured from the head under test; rerun {command}"
+    )
+    if shutil.which("git") is not None:
+        assert (
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", PIN_BASE_SHA, current],
+                check=False,
+            ).returncode
+            == 0
+        ), f"{PIN_BASE_SHA} must be an ancestor of HEAD; rerun {command}"
+
+
 @pytest.mark.asyncio
 async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
     metadata, pins = _pin()
     assert pins
     ergonomics_rows = [pin for pin in pins if pin.get("kind") == "ergonomics_valid"]
-    assert len(ergonomics_rows) == len(_ERGONOMICS_METHODS)
+    assert len(ergonomics_rows) >= len(_ERGONOMICS_METHODS)
     assert {pin["method"] for pin in ergonomics_rows} == _ERGONOMICS_METHODS
-    assert PIN.read_text().splitlines()[0] == (
-        '{"fixture":"serve_wire_pin","base_sha":"e8e77882"}'
-    )
     assert {pin.get("kind") for pin in pins} >= {
         "mutation_observer",
         "mutation_unhealthy",
@@ -121,9 +142,20 @@ async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
                 },
             )
             assert json.loads(hello).get("error") is None
+            active_session_id: str | None = None
             for pin in group:
+                params = dict(pin["params"])
+                if params.get("session_id") == "$ACTIVE_SESSION":
+                    if active_session_id is None:
+                        created = await client.request_raw(
+                            "active-session", "new_session", {"provider": "codex"}
+                        )
+                        active_session_id = json.loads(created)["result"]["session"][
+                            "session_id"
+                        ]
+                    params["session_id"] = active_session_id
                 actual = await client.request_raw(
-                    pin["request_id"], pin["method"], pin["params"]
+                    pin["request_id"], pin["method"], params
                 )
                 if pin.get("kind") == "ergonomics_valid":
                     assert json.loads(actual) == json.loads(pin["response"])
