@@ -324,8 +324,11 @@ class MCPManagementService:
         trust_path = home_path.parent / "mcp-trust.json"
         return home_path, project_path, trust_path
 
-    def _acquire_locks(self, paths: tuple[Path, ...]) -> list[object]:
+    def _acquire_locks(
+        self, paths: tuple[Path, ...]
+    ) -> tuple[list[object], set[Path]]:
         handles: list[object] = []
+        unavailable: set[Path] = set()
         deadline = time.monotonic() + self._lock_timeout
         try:
             for path in sorted(set(paths), key=str):
@@ -334,9 +337,11 @@ class MCPManagementService:
                 if project_root is not None:
                     try:
                         if not project_root.is_dir():
+                            unavailable.add(path)
                             continue
                         path.parent.mkdir(parents=False, exist_ok=True)
                     except FileNotFoundError:
+                        unavailable.add(path)
                         continue
                 else:
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +352,7 @@ class MCPManagementService:
                 except FileNotFoundError:
                     if project_root is None:
                         raise
+                    unavailable.add(path)
                     continue
                 try:
                     while True:
@@ -364,7 +370,7 @@ class MCPManagementService:
                     handle.close()
                     raise
                 handles.append(handle)
-            return handles
+            return handles, unavailable
         except BaseException:
             self._release_locks(handles)
             raise
@@ -539,7 +545,9 @@ class MCPManagementService:
         paths = tuple(
             path for path in (home_path, project_path, trust_path) if path is not None
         )
-        handles = self._acquire_locks(paths)
+        handles, unavailable = self._acquire_locks(paths)
+        if project_path in unavailable:
+            project_path = None
         try:
             if mutation is not None:
                 mutation(home_path, project_path, trust_path)

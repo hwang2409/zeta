@@ -1324,16 +1324,59 @@ async def test_missing_project_root_is_not_recreated_during_transaction(
             project.rmdir()
         return original_acquire(paths)
 
-    # test-contract: remove the project after path calculation and before lock creation
+    # test-contract: seam remove the project after paths resolve but before locking
     monkeypatch.setattr(manager, "_acquire_locks", remove_project_before_lock)
     try:
         snapshot = await manager.refresh()
+        # test-contract: durability the project root must stay absent
         assert not project.exists()
         assert snapshot.entries == ()
-        with pytest.raises(MCPManagementError, match="project directory"):
+        with pytest.raises(MCPManagementError, match="project scope"):
             await manager.add("missing", scope="project", command=sys.executable)
     finally:
         await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transaction_refuses_project_recreated_after_lock_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "repo"
+    manager = MCPManagementService(home=tmp_path / "first-home", project_dir=project)
+    writer = MCPManagementService(home=tmp_path / "second-home", project_dir=project)
+    original_acquire = manager._acquire_locks
+    lock_decided = threading.Event()
+    release = threading.Event()
+
+    def pause_after_lock_decision(paths):
+        result = original_acquire(paths)
+        lock_decided.set()
+        if not release.wait(10):
+            raise AssertionError("transaction was not released")
+        return result
+
+    # test-contract: recreate the root only after the first transaction skips its lock
+    monkeypatch.setattr(manager, "_acquire_locks", pause_after_lock_decision)
+    transaction = asyncio.create_task(
+        manager.add("unlocked", scope="project", command=sys.executable)
+    )
+    try:
+        assert await asyncio.to_thread(lock_decided.wait, 10)
+        project.mkdir()
+        await writer.add("concurrent", scope="project", command=sys.executable)
+        release.set()
+        with pytest.raises(MCPManagementError, match="project scope"):
+            await asyncio.wait_for(transaction, 10)
+        assert (await writer.resolve("concurrent", scope="project")).name == "concurrent"
+        with pytest.raises(MCPManagementError, match="unknown MCP server"):
+            await writer.resolve("unlocked", scope="project")
+    finally:
+        release.set()
+        if not transaction.done():
+            transaction.cancel()
+        await asyncio.wait_for(asyncio.gather(transaction, return_exceptions=True), 10)
+        await manager.aclose()
+        await writer.aclose()
 
 
 @pytest.mark.asyncio
