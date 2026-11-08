@@ -7,7 +7,7 @@ synchronous owner-loop calls, so they may not query SQLite.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -21,7 +21,6 @@ from ...protocol.types import (
 from ._client_delivery import CLIENT_DELIVERY_METADATA
 
 if TYPE_CHECKING:
-    from ..checkpoints import ConversationEntry
     from ._store import ConversationStore
 
 # The newest rows a lookup can see; older rows are unknown, not absent.
@@ -97,63 +96,55 @@ type RecentRowKey = (
 )
 
 
-def _message(entry: ConversationEntry) -> Mapping[str, Any] | None:
-    return entry.data["message"] if entry.type == "message" else None
-
-
 def _metadata(message: Mapping[str, Any]) -> Mapping[str, Any]:
     return message.get("metadata") or {}
 
 
-def _matches(key: RecentRowKey, entry: ConversationEntry) -> bool:
-    """Match one raw row; never decodes a Message."""
-    data = entry.data
+def _predicate(key: RecentRowKey) -> tuple[str, Callable[[dict[str, Any]], bool]]:
+    """Return the row type and a raw ``entry.data`` test; never decodes a Message."""
     match key:
         case ToolResult(tool_call_id):
-            message = _message(entry)
-            result = message.get("tool_result") if message is not None else None
-            return result is not None and result.get("tool_call_id") == tool_call_id
+            return "message", lambda data: (
+                (data["message"].get("tool_result") or {}).get("tool_call_id")
+                == tool_call_id
+            )
         case ApprovalResolution(request_id):
-            return (
-                entry.type == "approval_resolution"
-                and data.get("request_id") == request_id
+            return "approval_resolution", lambda data: (
+                data.get("request_id") == request_id
             )
         case ApprovalHistory(event, wire_request_id):
-            return (
-                entry.type == "approval_history"
-                and data.get("event") == event
-                and data.get("request_id") == wire_request_id
+            return "approval_history", lambda data: (
+                data.get("request_id") == wire_request_id and data.get("event") == event
             )
         case DeliveredMessage(delivery_id):
-            message = _message(entry)
-            return (
-                message is not None
-                and _metadata(message).get(CLIENT_DELIVERY_METADATA) == delivery_id
+            return "message", lambda data: (
+                _metadata(data["message"]).get(CLIENT_DELIVERY_METADATA) == delivery_id
             )
         case DroppedSteer(delivery_id):
-            return (
-                entry.type == "client_delivery"
+            return "client_delivery", lambda data: (
+                data.get("delivery_id") == delivery_id
                 and data.get("status") == "dropped"
-                and data.get("delivery_id") == delivery_id
             )
         case AssistantResponseAfter():
-            message = _message(entry)
-            if message is None or message.get("role") != "assistant":
-                return False
-            metadata = _metadata(message)
-            return metadata.get(ASSISTANT_RESPONSE_STATE) in {
-                ASSISTANT_RESPONSE_COMPLETED,
-                ASSISTANT_RESPONSE_ABORTED,
-            } and not metadata.get("compaction_summary")
+            return "message", _is_assistant_response
         case UserTurnMessageAfter():
-            message = _message(entry)
-            return (
-                message is not None
-                and message.get("role") == "user"
-                and _metadata(message).get(MESSAGE_ORIGIN_METADATA)
+            return "message", lambda data: (
+                data["message"].get("role") == "user"
+                and _metadata(data["message"]).get(MESSAGE_ORIGIN_METADATA)
                 == MessageOrigin.USER.value
             )
     raise TypeError(f"unknown recent row key: {key!r}")
+
+
+def _is_assistant_response(data: dict[str, Any]) -> bool:
+    message = data["message"]
+    if message.get("role") != "assistant":
+        return False
+    metadata = _metadata(message)
+    return metadata.get(ASSISTANT_RESPONSE_STATE) in {
+        ASSISTANT_RESPONSE_COMPLETED,
+        ASSISTANT_RESPONSE_ABORTED,
+    } and not metadata.get("compaction_summary")
 
 
 class RecentRowsMixin:
@@ -177,17 +168,20 @@ class RecentRowsMixin:
             entry = self._active_approval_requests.get(key.request_id)
             return None if entry is None else entry.seq
         entries = self._entries
+        row_type, test = _predicate(key)
         if type(key) in (AssistantResponseAfter, UserTurnMessageAfter):
             if key.seq + 1 < floor:
                 return None
             # seq == index + 1, so index key.seq is the first row after key.seq.
             for index in range(max(key.seq, 0), len(entries)):
-                if _matches(key, entries[index]):
-                    return entries[index].seq
+                entry = entries[index]
+                if entry.type == row_type and test(entry.data):
+                    return entry.seq
             return None
         for index in range(len(entries) - 1, floor - 2, -1):
-            if _matches(key, entries[index]):
-                return entries[index].seq
+            entry = entries[index]
+            if entry.type == row_type and test(entry.data):
+                return entry.seq
         return None
 
     def row_id_at(self: ConversationStore, seq: int) -> str | None:
