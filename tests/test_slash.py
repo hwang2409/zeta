@@ -1396,14 +1396,25 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
     assert app.slash_status().compaction_history == ()
 
 
-def test_unknown_command_passes_through_unchanged() -> None:
+def test_unknown_slash_command_returns_error_with_close_match() -> None:
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
-    assert registry.dispatch(session(), "/unknown arg") is None
-    envelope = registry.input_for_model("/unknown arg")
-    assert envelope.text == "/unknown arg"
-    assert envelope.display_text == "/unknown arg"
-    assert envelope.origin is MessageOrigin.USER
+    result = registry.dispatch(session(), "/statu")
+
+    assert result == (
+        "unknown command /statu. type // to send it as text. did you mean /status?"
+    )
+
+
+def test_non_slash_safe_and_escaped_slash_input_still_reaches_model() -> None:
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
+
+    for value, expected in (("/Users/henry/x", "/Users/henry/x"), ("//quit", "/quit")):
+        assert registry.dispatch(session(), value) is None
+        envelope = registry.input_for_model(value)
+        assert envelope.text == expected
+        assert envelope.display_text == value
+        assert envelope.origin is MessageOrigin.USER
 
 
 def test_double_slash_escapes_registered_command() -> None:
