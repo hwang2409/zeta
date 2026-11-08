@@ -1,5 +1,6 @@
 """Named subscription accounts and crash-safe legacy migration."""
 
+from .registry import AccountRegistryMissingError
 from .session import (
     AccountListSnapshot,
     SessionAccountContext,
@@ -12,7 +13,6 @@ from .store import (
     AccountError,
     AccountId,
     AccountLoopThreadLockError,
-    AccountRegistryMissingError,
     AccountStore,
 )
 from .usage import AccountUsage
