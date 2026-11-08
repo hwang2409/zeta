@@ -381,10 +381,12 @@ class _NotificationBackend(CompletionBackend):
         if error := self.exceptions.get(index):
             raise error
         if index in self.failures or index in self.errors:
+            # an unclassified stream_error escapes the completion owner (it is
+            # not provider-retryable), so the notification retry seam sees it.
             yield StreamEvent(
                 StreamEventType.ERROR,
                 error=self.errors.get(
-                    index, ErrorInfo("transport_error", "provider stopped")
+                    index, ErrorInfo("stream_error", "provider stopped")
                 ),
             )
             return
@@ -427,7 +429,7 @@ class _BlockingNotificationBackend(CompletionBackend):
         if index == 0:
             yield StreamEvent(
                 StreamEventType.ERROR,
-                error=ErrorInfo("transport_error", "provider stopped"),
+                error=ErrorInfo("stream_error", "provider stopped"),
             )
             return
         self.started.set()

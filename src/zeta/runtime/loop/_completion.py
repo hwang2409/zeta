@@ -35,47 +35,16 @@ MAX_ERROR_MESSAGE = 400
 
 async def provider_events(
     completion: AsyncIterator[StreamEvent],
-    on_started: Callable[[], Awaitable[None]] | None = None,
+    on_started: Callable[[], Awaitable[None]],
 ) -> AsyncIterator[StreamEvent]:
-    """Preserve stream ordering while exposing the provider-start seam."""
+    """Run ``on_started`` once the provider's first event arrives."""
 
-    finished = object()
-    events: asyncio.Queue[StreamEvent | object] = asyncio.Queue(maxsize=1)
-    consumed = asyncio.Event()
-    started = asyncio.Event()
-
-    async def produce() -> None:
-        started.set()
-        try:
-            async for event in completion:
-                await events.put(event)
-                await consumed.wait()
-                consumed.clear()
-        finally:
-            task = asyncio.current_task()
-            if task is None or not task.cancelling():
-                await events.put(finished)
-
-    producer = asyncio.create_task(produce())
-    try:
-        await started.wait()
-        if producer.done() and not producer.cancelled():
-            error = producer.exception()
-            if error is not None:
-                raise error
-        if on_started is not None:
+    started = False
+    async for event in completion:
+        if not started:
+            started = True
             await on_started()
-        while (event := await events.get()) is not finished:
-            assert isinstance(event, StreamEvent)
-            try:
-                yield event
-            finally:
-                consumed.set()
-        await producer
-    finally:
-        if not producer.done():
-            producer.cancel()
-            await asyncio.gather(producer, return_exceptions=True)
+        yield event
 
 
 def observed_completion(
@@ -83,14 +52,17 @@ def observed_completion(
     store: ConversationStore,
     steering: ClientSteeringBatch | None,
 ) -> AsyncIterator[StreamEvent]:
-    """Publish steering when the provider starts without changing event order."""
+    """Publish steering once the provider answers, without changing event order.
+
+    a request that fails or is aborted before any provider event leaves the
+    steering queued, so the turn outcome decides its terminal status.
+    """
 
     if steering is None:
         return completion
-    on_started = (
-        partial(store.deliver_client_steering, steering) if steering is not None else None
+    return provider_events(
+        completion, partial(store.deliver_client_steering, steering)
     )
-    return provider_events(completion, on_started)
 
 
 def _is_permission_error(error: BaseException) -> bool:

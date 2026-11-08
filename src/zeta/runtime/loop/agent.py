@@ -877,7 +877,7 @@ class AgentLoop(
                 steering = self.store.pending_client_steering()
                 notification_context = system_message if notification_turn else None
                 prepared_delivery = await step_delivery.prepare_request(
-                    "retry" if step_delivery.has_pending_edge else "after_tools",
+                    "after_tools",
                     context_messages,
                     steering,
                     active_tools,
