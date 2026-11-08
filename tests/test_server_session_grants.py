@@ -44,6 +44,10 @@ PRECEDENCE = ["deny", "ask", "allow", "default"]
 
 
 class _DelegatedBackend:
+    def __init__(self) -> None:
+        self.child_two_ready = asyncio.Event()
+        self.release_child_two = asyncio.Event()
+
     async def complete(self, messages: Any, tool_schemas: Any):
         del tool_schemas
         last_user_index, last_user = next(
@@ -83,6 +87,13 @@ class _DelegatedBackend:
             )
         elif last_user in {"child 1", "child 2"} and not has_tool_result:
             number = last_user[-1]
+            if number == "2":
+                self.child_two_ready.set()
+                await await_or_fail(
+                    self.release_child_two.wait(),
+                    timeout=120,
+                    what="release child-bash-2 after parent terminal",
+                )
             turn = ScriptedTurn(
                 tool_calls=[
                     ToolCall(
@@ -1084,6 +1095,39 @@ async def test_session_grant_exactness_noops_feature_gate_and_fifo_sentinels(
         await close_serve(server, writer)
 
 
+async def _collect_second_delegated_approval(
+    reader: asyncio.StreamReader,
+    release_child: asyncio.Event,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str]:
+    frames: list[dict[str, Any]] = []
+
+    async def collect() -> tuple[dict[str, Any] | None, str]:
+        while True:
+            buffered = _buffer(reader)
+            if buffered:
+                frame = buffered.popleft()
+            else:
+                line = await reader.readline()
+                if not line:
+                    return None, "socket eof"
+                frame = json.loads(line)
+            frames.append(frame)
+            params = frame.get("params", {})
+            event = params.get("event")
+            if event == "agent_end" and not release_child.is_set():
+                release_child.set()
+            if (
+                event == "approval_request"
+                and params.get("tool_call", {}).get("id") == "child-bash-2"
+            ):
+                return params, "delegated approval"
+
+    approval, terminal = await await_or_fail(
+        collect(), timeout=60, what="second delegated approval collection"
+    )
+    return approval, frames, terminal
+
+
 @pytest.mark.asyncio
 async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
     tmp_path: Path,
@@ -1124,8 +1168,35 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
 
         await _request(reader, writer, 6, "revoke_session_grants", {"grant": "bash"})
         await _event(reader, "session_grants_changed")
-        await _request(reader, writer, 7, "send", {"text": "second delegate"})
-        approval = await _event(reader, "approval_request")
+        second_send = await _request(
+            reader, writer, 7, "send", {"text": "second delegate"}
+        )
+        await await_or_fail(
+            backend.child_two_ready.wait(),
+            timeout=60,
+            what="child-bash-2 provider gate",
+        )
+        snapshot = (await _request(reader, writer, 31, "session_grants"))[-1]["result"]
+        assert snapshot["session_grants"] == []
+        approval, frames, terminal = await _collect_second_delegated_approval(
+            reader, backend.release_child_two
+        )
+        assert approval is not None, (
+            "child-bash-2 did not request delegated approval; "
+            f"terminal={terminal}; second send response={second_send!r}; "
+            f"all buffered frames={frames!r}; "
+            f"live parent session_grants={snapshot!r}"
+        )
+        assert terminal == "delegated approval"
+        assert any(
+            frame.get("params", {}).get("event") == "tool_end"
+            and frame.get("params", {}).get("tool_call", {}).get("id") == "agent-2"
+            for frame in frames
+        )
+        assert any(
+            frame.get("params", {}).get("event") == "agent_end"
+            for frame in frames
+        )
         assert approval["tool_call"]["id"] == "child-bash-2"
         assert approval["delegated"] is True
         await _request(
@@ -1133,6 +1204,7 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
         )
         await _frames_until_event(reader, "turn_end")
     finally:
+        backend.release_child_two.set()
         await close_serve(server, writer)
 
 
