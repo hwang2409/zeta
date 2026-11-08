@@ -2299,7 +2299,11 @@ async def test_stall_after_two_partial_parallel_calls_is_retried(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_stall_after_dispatched_tool_call_is_not_retried(tmp_path: Path) -> None:
+async def test_failure_after_dispatched_tool_call_retries_without_reexecuting(
+    tmp_path: Path,
+) -> None:
+    # the completion after a committed tool call is a new logical completion
+    # with a fresh retry budget; retrying it never repeats the committed tool.
     call = ToolCall("echo-1", "echo", {"value": "once"})
     backend = AttemptBackend(
         [
@@ -2313,24 +2317,30 @@ async def test_stall_after_dispatched_tool_call_is_not_retried(tmp_path: Path) -
                 )
             ],
             RetryableProviderFailure(),
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+                )
+            ],
         ]
     )
     executions: list[str] = []
+    store = ConversationStore(tmp_path)
 
     events = await collect(
         AgentLoop(
             backend,
-            ConversationStore(tmp_path),
+            store,
             tools={"echo": lambda arguments: executions.append(arguments["value"]) or "ok"},
             skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert executions == ["once"]
-    assert backend.calls == 2
-    assert not any(event.type is StreamEventType.RETRY for event in events)
-    assert events[-2].error is not None
-    assert events[-2].error.message == "request failed"
+    assert backend.calls == 3
+    assert [event.type for event in events].count(StreamEventType.RETRY) == 1
+    assert store.messages()[-1].content == [TextContent("done")]
 
 
 @pytest.mark.asyncio

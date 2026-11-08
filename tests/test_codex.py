@@ -3734,17 +3734,15 @@ async def test_content_event_before_response_created_is_still_rejected(
 
 
 @pytest.mark.asyncio
-async def test_events_after_response_completion_are_rejected(tmp_path: Path) -> None:
-    events = message_stream() + [event("keepalive")]
-    client = client_for(sse(events))
-    with pytest.raises(CodexStreamError, match="follows response completion"):
-        [
-            item
-            async for item in CodexBackend(
-                client=client, token_store=store_for(tmp_path / "codex.json")
-            ).complete([], [], control=completion_control())
-        ]
-    await client.aclose()
+async def test_events_after_response_completion_are_rejected() -> None:
+    # the completion owner never reads past response completion; the decoder
+    # still rejects a record that follows it when read explicitly.
+    response = httpx.Response(200, text=sse(message_stream() + [event("keepalive")]))
+    try:
+        with pytest.raises(CodexStreamError, match="follows response completion"):
+            [item async for item in codex_module._decode_response(response)]
+    finally:
+        await response.aclose()
 
 
 @pytest.mark.asyncio
@@ -4139,6 +4137,13 @@ async def test_cleanup_control_exception_matrix(
             close_outcome = await backend.aclose()
             assert len(close_outcome.failures) == 1
             assert isinstance(close_outcome.failures[0].error, GeneratorExit)
+    elif not primary and cleanup_error is GeneratorExit:
+        # the owner closes a completed response at its sentinel; a GeneratorExit
+        # from that close is the close itself, so the response stands.
+        streamed = [
+            item async for item in backend.complete([], [], control=completion_control())
+        ]
+        assert streamed[-1].type is StreamEventType.MESSAGE_END
     else:
         with pytest.raises(cleanup_error) as raised:
             [item async for item in backend.complete([], [], control=completion_control())]
