@@ -307,6 +307,7 @@ def compose_runtime(
             max_agent_depth=config.agents_max_depth,
             **loop_kwargs,
         )
+        loop.project_discovery = project_discovery
         loop.explicit_finish = config.agents_explicit_finish
         loop.post_stream_provider_retry = post_stream_provider_retry
 

@@ -124,6 +124,7 @@ async def test_new_session_settings_apply_before_first_turn(tmp_path: Path) -> N
             "new_session",
             {"model": "gpt-5.4-mini", "approval_mode": "allow"},
         )
+        assert "error" not in created[-1], created[-1]
         assert created[-1]["result"]["session"]["model"] == "gpt-5.4-mini"
         await _request(reader, writer, 3, "send", {"text": "hello"})
         await _event(reader, "agent_end")
