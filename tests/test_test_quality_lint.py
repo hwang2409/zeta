@@ -1295,16 +1295,20 @@ def test_non_test_python_files_are_ignored(tmp_path: Path) -> None:
         ),
         (
             "src/zeta/x.py",
-            'from pathlib import Path\nimport asyncio\n'
-            'async def x():\n    await x\n'
-            '    await asyncio.to_thread(Path("x").exists())\n',
+            (
+                'from pathlib import Path\nimport asyncio\n'
+                'async def x():\n    await x\n'
+                '    await asyncio.to_thread(Path("x").exists())\n'
+            ),
             {"TQ007"},
         ),
         (
             "src/zeta/tests/test_y.py",
-            'from pathlib import Path\nimport asyncio\n'
-            'async def test_y():\n    await x\n'
-            '    await asyncio.to_thread(Path("x").exists())\n',
+            (
+                'from pathlib import Path\nimport asyncio\n'
+                'async def test_y():\n    await x\n'
+                '    await asyncio.to_thread(Path("x").exists())\n'
+            ),
             {"TQ004", "TQ007"},
         ),
         ("scripts/x.py", "async def x():\n    await x\n", set()),
