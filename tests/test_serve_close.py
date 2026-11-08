@@ -138,6 +138,75 @@ async def test_explicit_close(tmp_path):
     result.assert_outcomes(passed=1)
 
 
+def test_app_owner_reports_bounded_close_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_hanging_app_close(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    async def hang():
+        await asyncio.Event().wait()
+    app.close = hang
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*hang: TUIApp.close did not finish within 10 s*"])
+
+
+def test_two_apps_and_server_close_in_dependency_order(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.server import ZetaServer
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+def app(tmp_path):
+    return TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+
+@pytest.mark.asyncio
+async def test_owners(tmp_path):
+    first = app(tmp_path / "first")
+    second = app(tmp_path / "second")
+    for value in (first, second):
+        original = value.close
+        async def close(original=original):
+            await original()
+            with Path("order").open("a") as marker:
+                marker.write("a")
+        value.close = close
+    server = ZetaServer(home=tmp_path / "server", port=0, provider="codex")
+    await server.start()
+    original = server.close
+    async def close_server():
+        with Path("order").open("a") as marker:
+            marker.write("s")
+        await original()
+    server.close = close_server
+""",
+    )
+    result.assert_outcomes(passed=1)
+    assert (pytester.path / "order").read_text() == "aas"
+
+
 def test_server_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
     result = _run_owner_test(
         pytester,
