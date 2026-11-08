@@ -1282,6 +1282,7 @@ def test_newest_record_with_lowest_id_survives_pruning(
     )
     tracker_module = sys.modules[SentMessageTracker.__module__]
     monkeypatch.setattr(tracker_module, "SENT_HISTORY_LIMIT", 2)
+    # test-contract: seam make pruning order deterministic
     monkeypatch.setattr(tracker_module, "_now", lambda: next(timestamps))
     tracker = SentMessageTracker(home / "sessions", "a" * 32)
 

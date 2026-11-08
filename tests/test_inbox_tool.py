@@ -697,6 +697,7 @@ async def _exercise_cancelled_send(
     monkeypatch.setattr(
         project_inbox_sent_module, "read_session_file", observed_read
     )
+    # test-contract: seam hold the real message publication boundary
     monkeypatch.setattr(ProjectInbox, "_publish_record", gated_publish)
     message_id = "e" * 32
     operation = asyncio.create_task(
