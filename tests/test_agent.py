@@ -7283,33 +7283,46 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     root_woke = asyncio.Event()
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop.set_background_wake_callback(root_woke.set)
+    child_store: ConversationStore | None = None
+    grandchild_store: ConversationStore | None = None
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
-    backend.release_grandchild.set()
-    await asyncio.wait_for(backend.child_notification_started.wait(), timeout=2)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
+        backend.release_grandchild.set()
+        await asyncio.wait_for(backend.child_notification_started.wait(), timeout=2)
 
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    root_notifications = store.agent_notifications(pending_only=False)
-    assert len(root_notifications) == 1
-    assert root_notifications[0].data["display_only"] is True
-    assert store.agent_notifications() == []
-    assert not root_woke.is_set()
-    nested_result = next(
-        message.tool_result for message in child_store.messages() if message.tool_result
-    )
-    assert nested_result.structured_content is not None
-    assert nested_result.structured_content["status"] == "running"
-    assert [
-        entry.data["status"]
-        for entry in child_store.agent_notifications(pending_only=False)
-    ] == ["completed"]
-    grandchild_store = ConversationStore(
-        child_store.session_dir / "agents", session_id="1"
-    )
-    assert grandchild_store.agent_canceled() is None
-    backend.release_child_notification.set()
-    await loop.close()
+        child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+        root_notifications = store.agent_notifications(pending_only=False)
+        assert len(root_notifications) == 1
+        assert root_notifications[0].data["display_only"] is True
+        assert store.agent_notifications() == []
+        assert not root_woke.is_set()
+        nested_result = next(
+            message.tool_result
+            for message in child_store.messages()
+            if message.tool_result
+        )
+        assert nested_result.structured_content is not None
+        assert nested_result.structured_content["status"] == "running"
+        assert [
+            entry.data["status"]
+            for entry in child_store.agent_notifications(pending_only=False)
+        ] == ["completed"]
+        grandchild_store = ConversationStore(
+            child_store.session_dir / "agents", session_id="1"
+        )
+        assert grandchild_store.agent_canceled() is None
+        backend.release_child_notification.set()
+    finally:
+        backend.release_grandchild.set()
+        backend.release_child_notification.set()
+        await loop.close()
+        if grandchild_store is not None:
+            grandchild_store.close()
+        if child_store is not None:
+            child_store.close()
+        store.close()
 
 
 @pytest.mark.asyncio
