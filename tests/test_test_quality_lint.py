@@ -277,6 +277,31 @@ def test_await_deadline_rule_rejects_unbounded_waits(
             [],
         ),
         (
+            "delete rebound",
+            "import asyncio\nasync def test_spin():\n    del asyncio\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "global declaration rebound",
+            "import asyncio\nasync def test_spin():\n    global asyncio\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "match capture rebound",
+            "import asyncio\nasync def test_spin(value):\n    match value:\n        case asyncio:\n            pass\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "walrus rebound",
+            "import asyncio\nasync def test_spin():\n    if (asyncio := fake):\n        pass\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "for target rebound",
+            "import asyncio\nasync def test_spin():\n    for asyncio in modules:\n        pass\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
             "another import rebound",
             "import asyncio\nimport json as asyncio\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
             [],
@@ -1244,62 +1269,97 @@ async def test_new_wait():
     assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 5)]
 
 
-def test_polling_spin_allowlist_rejects_a_new_site_in_an_allowlisted_function(
-    tmp_path: Path,
-) -> None:
-    source = """import asyncio
-async def test_existing_wait():
-    while first:
-        await asyncio.sleep(0)
-    while second:
-        await asyncio.sleep(0)
-"""
-    target = tmp_path / "tests/test_example.py"
-    target.parent.mkdir()
-    target.write_text(source)
-    (tmp_path / quality.RATCHET_PATH).write_text(
-        "tests/test_example.py::test_existing_wait\n"
-    )
-    (tmp_path / quality.POLLING_SPIN_RATCHET_PATH).write_text(
-        "tests/test_example.py::test_existing_wait::1\n"
-    )
-
-    findings = quality.lint_polling_spins(tmp_path)
-
-    assert [(finding.code, finding.line, finding.message) for finding in findings] == [
-        ("TQ004", 5, quality.POLLING_SPIN_ERROR)
-    ]
-
-
-def test_polling_spin_allowlist_rejects_a_stale_site(tmp_path: Path) -> None:
-    source = """import asyncio
-async def test_existing_wait():
-    while first:
-        await asyncio.sleep(0)
-"""
-    target = tmp_path / "tests/test_example.py"
-    target.parent.mkdir()
-    target.write_text(source)
-    (tmp_path / quality.RATCHET_PATH).write_text(
-        "tests/test_example.py::test_existing_wait\n"
-    )
-    (tmp_path / quality.POLLING_SPIN_RATCHET_PATH).write_text(
-        "tests/test_example.py::test_existing_wait::1\n"
-        "tests/test_example.py::test_existing_wait::2\n"
-    )
-
-    findings = quality.lint_polling_spins(tmp_path)
-
-    assert [(finding.code, finding.line, finding.message) for finding in findings] == [
+@pytest.mark.parametrize(
+    ("case", "current_source", "expected_exit", "new_lines", "stale_count"),
+    [
         (
-            "TQ004",
+            "replaced loop gets a new slot and leaves the old slot stale",
+            """import asyncio
+async def test_existing_wait():
+    while entirely_new_condition:
+        await asyncio.sleep(0)
+""",
             1,
-            (
-                "stale polling-spin allowlist entry "
-                "tests/test_example.py::test_existing_wait::2; delete it"
-            ),
-        )
-    ]
+            [3],
+            1,
+        ),
+        (
+            "unrelated line shift keeps the slot",
+            """
+import asyncio
+async def test_existing_wait():
+    while first:
+        await asyncio.sleep(0)
+""",
+            0,
+            [],
+            0,
+        ),
+        (
+            "fixed loop leaves its slot stale",
+            """import asyncio
+async def test_existing_wait():
+    assert ready
+""",
+            1,
+            [],
+            1,
+        ),
+        (
+            "second identical loop gets a distinct ordinal",
+            """import asyncio
+async def test_existing_wait():
+    while first:
+        await asyncio.sleep(0)
+    while first:
+        await asyncio.sleep(0)
+""",
+            1,
+            [5],
+            0,
+        ),
+    ],
+)
+def test_polling_spin_allowlist_uses_content_identity_through_cli(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    case: str,
+    current_source: str,
+    expected_exit: int,
+    new_lines: list[int],
+    stale_count: int,
+) -> None:
+    del case
+    target = tmp_path / "tests/test_example.py"
+    target.parent.mkdir()
+    target.write_text(
+        """import asyncio
+async def test_existing_wait():
+    while first:
+        await asyncio.sleep(0)
+"""
+    )
+    _, polling_spins, trees = quality._scan_deadline_findings(tmp_path)
+    slots = quality._polling_spin_slots(polling_spins, trees)
+    (tmp_path / quality.POLLING_SPIN_RATCHET_PATH).write_text(
+        "".join(f"{slot}\n" for slot in slots)
+    )
+    target.write_text(current_source)
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = quality.main(["--polling-spins"])
+    output = capsys.readouterr().out.splitlines()
+
+    assert exit_code == expected_exit
+    assert [
+        int(line.split(":", 2)[1])
+        for line in output
+        if line.endswith(quality.POLLING_SPIN_ERROR)
+    ] == new_lines
+    assert sum("stale polling-spin allowlist entry" in line for line in output) == (
+        stale_count
+    )
 
 
 def test_write_ratchet_command_records_each_function_once(

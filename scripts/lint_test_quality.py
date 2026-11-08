@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import subprocess
 import sys
@@ -584,45 +585,44 @@ def _scoped_walk(node: ast.AST) -> list[ast.AST]:
     return result
 
 
+def _binds_name(node: ast.AST, name: str, direct_imports: set[int]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == name and not isinstance(node.ctx, ast.Load)
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, ast.alias):
+        bound = node.asname or node.name.split(".")[0]
+        return bound == name and id(node) not in direct_imports
+    return any(
+        value == name or isinstance(value, list) and name in value
+        for field in ("name", "names", "rest")
+        if (value := getattr(node, field, None)) is not None
+    )
+
+
 def _direct_sleep_modules(tree: ast.Module) -> set[str]:
+    direct_aliases = {
+        id(imported)
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for imported in statement.names
+        if imported.name in {"asyncio", "anyio"} and imported.asname is None
+    }
     direct_imports = Counter(
         imported.name
         for statement in tree.body
         if isinstance(statement, ast.Import)
         for imported in statement.names
-        if imported.name in {"asyncio", "anyio"} and imported.asname is None
+        if id(imported) in direct_aliases
     )
-    modules = set(direct_imports)
-    rebound = {module for module, count in direct_imports.items() if count > 1}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.arg) and node.arg in modules:
-            rebound.add(node.arg)
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            rebound.add(node.id)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name in modules:
-                rebound.add(node.name)
-        elif isinstance(
-            node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)
-        ) and node.name in modules:
-            rebound.add(node.name)
-        elif isinstance(node, ast.MatchMapping) and node.rest in modules:
-            rebound.add(node.rest)
-        elif isinstance(node, ast.Import):
-            for imported in node.names:
-                bound = imported.asname or imported.name.split(".")[0]
-                if bound in modules and not (
-                    node in tree.body
-                    and imported.name == bound
-                    and imported.asname is None
-                ):
-                    rebound.add(bound)
-        elif isinstance(node, ast.ImportFrom):
-            for imported in node.names:
-                bound = imported.asname or imported.name
-                if bound in modules:
-                    rebound.add(bound)
-    return modules - rebound
+    return {
+        module
+        for module, count in direct_imports.items()
+        if count == 1
+        and not any(
+            _binds_name(node, module, direct_aliases) for node in ast.walk(tree)
+        )
+    }
 
 
 def _literal_zero_sleep(node: ast.AST, modules: set[str]) -> bool:
@@ -1394,11 +1394,19 @@ def _polling_spin_slots(
     slots: dict[str, Finding] = {}
     counts: Counter[str] = Counter()
     for finding in sorted(findings, key=lambda item: (str(item.path), item.line)):
-        function_key = (
-            f"{finding.path}::{_function_at_line(trees[finding.path], finding.line)}"
+        tree = trees[finding.path]
+        function_key = f"{finding.path}::{_function_at_line(tree, finding.line)}"
+        loop = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.While) and node.lineno == finding.line
         )
-        counts[function_key] += 1
-        slots[f"{function_key}::{counts[function_key]}"] = finding
+        fingerprint = hashlib.sha256(
+            ast.dump(loop, include_attributes=False).encode()
+        ).hexdigest()[:16]
+        identity = f"{function_key}::{fingerprint}"
+        counts[identity] += 1
+        slots[f"{identity}::{counts[identity]}"] = finding
     return slots
 
 
