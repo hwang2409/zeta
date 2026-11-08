@@ -390,6 +390,7 @@ async def test_server_close_owns_cancellation_resistant_write(
 ) -> None:
     monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
     started = asyncio.Event()
+    release = asyncio.Event()
 
     class Writer:
         class Transport:
@@ -403,9 +404,9 @@ async def test_server_close_owns_cancellation_resistant_write(
 
         async def drain(self) -> None:
             started.set()
-            while True:
+            while not release.is_set():
                 try:
-                    await asyncio.Event().wait()
+                    await asyncio.wait_for(release.wait(), 10)
                 except asyncio.CancelledError:
                     if getattr(self, "cancels", 0) < 2:
                         self.cancels = getattr(self, "cancels", 0) + 1
@@ -414,25 +415,35 @@ async def test_server_close_owns_cancellation_resistant_write(
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     client = _Client(server, asyncio.StreamReader(), Writer())
+    before = set(asyncio.all_tasks())
     write = asyncio.create_task(client._write_physical(client.codec.response(None, {})))
     try:
         await await_or_fail(started.wait(), what="write start")
         write.cancel()
         with pytest.raises(protocol_module.FrameWriteCancelled):
             await await_or_fail(write, what="canceled write")
-        orphaned_writes = getattr(server, "_orphaned_writes", None)
-        assert orphaned_writes is not None
-        assert len(orphaned_writes) == 1
-
-        orphaned = tuple(orphaned_writes)
+        orphaned = tuple(
+            task
+            for task in asyncio.all_tasks()
+            if task not in before
+            and not task.done()
+            and task.get_coro().__qualname__ == "FrameCodec.write"
+        )
+        assert len(orphaned) == 1
         await await_or_fail(server.close(), what="server close")
-        assert not orphaned_writes
         assert all(task.done() or task.cancelled() for task in orphaned)
     finally:
-        if not write.done():
-            write.cancel()
+        release.set()
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task not in before and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
         await await_or_fail(
-            asyncio.gather(write, return_exceptions=True), what="write cleanup"
+            asyncio.gather(write, *pending, return_exceptions=True),
+            what="write cleanup",
         )
         if server.connections is not None:
             await await_or_fail(server.close(), what="server cleanup")
