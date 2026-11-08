@@ -17,7 +17,6 @@ from .context_parts.tool_results import truncate_tool_results
 from .context_usage import SessionUsage
 from ..context_accounting import (
     MessageTokenCounts,
-    context_digest as _digest,
     cooperative_call as _cooperative_call,
     message_token_count as _message_token_count,
 )
@@ -159,10 +158,6 @@ class ContextAssembler(ContextMarkerMixin):
         self._session_usage = SessionUsage(
             sink=self.usage_sink, on_growth=self.on_token_growth
         )
-
-    @property
-    def digest(self) -> str | None:
-        return self.last_context.digest if self.last_context is not None else None
 
     def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
@@ -1077,7 +1072,6 @@ class ContextAssembler(ContextMarkerMixin):
         return AssembledContext(
             messages=messages,
             token_count=self._count(messages),
-            digest=_digest(messages),
             compacted=compacted,
         )
 
