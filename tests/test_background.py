@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio.runners
 import concurrent.futures
 import contextlib
 import json
@@ -24,6 +25,7 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.tools._shared.background_task_owner as owner_module
 import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
@@ -3028,6 +3030,57 @@ async def test_background_task_stays_running_for_detached_group_member(
             what="detached group cleanup",
         )
         await tasks.close()
+
+
+def test_loop_teardown_cancels_owner_waiting_for_detached_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_polling = threading.Event()
+    cancellation_started = threading.Event()
+    group_exited = threading.Event()
+    teardown_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def group_exists(_pid: int) -> bool:
+        owner_polling.set()
+        return not group_exited.is_set()
+
+    original_cancel_all = asyncio.runners._cancel_all_tasks
+
+    def track_cancel_all(loop: asyncio.AbstractEventLoop) -> None:
+        cancellation_started.set()
+        original_cancel_all(loop)
+
+    monkeypatch.setattr(owner_module, "_group_exists", group_exists)
+    monkeypatch.setattr(asyncio.runners, "_cancel_all_tasks", track_cancel_all)
+
+    async def leave_owner_for_loop_teardown() -> None:
+        tasks = BackgroundTaskRegistry()
+        await tasks.start(_python("pass"), tmp_path)
+        assert await asyncio.to_thread(owner_polling.wait, 10), (
+            "owner did not reach the detached group probe"
+        )
+
+    def run_loop() -> None:
+        try:
+            asyncio.run(leave_owner_for_loop_teardown())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            teardown_finished.set()
+
+    thread = threading.Thread(target=run_loop)
+    thread.start()
+    try:
+        assert cancellation_started.wait(10), "loop teardown did not cancel its tasks"
+        assert teardown_finished.wait(10), (
+            "loop teardown did not finish after cancelling the background owner"
+        )
+        assert not errors
+    finally:
+        group_exited.set()
+        thread.join(10)
+        assert not thread.is_alive(), "background owner survived test cleanup"
 
 
 @pytest.mark.asyncio
