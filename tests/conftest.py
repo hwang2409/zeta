@@ -777,6 +777,7 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
     from tests.support.owned import await_or_fail, close_owned_app
+    from tests.support.owner_counts import SAFETY_NET_CLOSING
     from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
@@ -980,62 +981,66 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     # test-contract: seam records successful app closes for idempotent teardown
     monkeypatch.setattr(TUIApp, "close", tracked_app_close)
     yield
-    first_error: BaseException | None = None
+    closing = SAFETY_NET_CLOSING.set(True)
+    try:
+        first_error: BaseException | None = None
 
-    # Apps own loops and stores, so close them before those lower-level owners.
-    for app in reversed(apps.copy()):
-        if app not in closed_apps:
+        # Apps own loops and stores, so close them before those lower-level owners.
+        for app in reversed(apps.copy()):
+            if app not in closed_apps:
+                try:
+                    await await_or_fail(close_owned_app(app), what="TUIApp.close")
+                except BaseException as exc:  # noqa: BLE001 - close every owner
+                    if first_error is None:
+                        first_error = exc
+
+        async def close_server(server: ZetaServer) -> None:
+            nonlocal first_error
             try:
-                await await_or_fail(close_owned_app(app), what="TUIApp.close")
+                await await_or_fail(server.close(), what="ZetaServer.close")
             except BaseException as exc:  # noqa: BLE001 - close every owner
                 if first_error is None:
                     first_error = exc
 
-    async def close_server(server: ZetaServer) -> None:
-        nonlocal first_error
-        try:
-            await await_or_fail(server.close(), what="ZetaServer.close")
-        except BaseException as exc:  # noqa: BLE001 - close every owner
-            if first_error is None:
-                first_error = exc
-
-    for server in reversed(servers):
-        if server not in closed_servers:
-            await close_server(server)
-    for reconciler in reversed(memory_reconcilers):
-        try:
-            await reconciler.close()
-        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-            pass
-    for loop in reversed(loops):
-        if not loop._closed:
+        for server in reversed(servers):
+            if server not in closed_servers:
+                await close_server(server)
+        for reconciler in reversed(memory_reconcilers):
             try:
-                await loop_close(loop)
+                await reconciler.close()
             except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
                 pass
-    for registry in reversed(registries):
-        if not registry._closed:
+        for loop in reversed(loops):
+            if not loop._closed:
+                try:
+                    await loop_close(loop)
+                except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                    pass
+        for registry in reversed(registries):
+            if not registry._closed:
+                try:
+                    await registry_close(registry)
+                except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                    pass
+        for store in reversed((*stores, *composed_stores)):
+            if not store._closed:
+                try:
+                    store_close(store)
+                except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                    pass
+        for workspace in reversed(workspaces):
             try:
-                await registry_close(registry)
+                workspace.close()
             except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
                 pass
-    for store in reversed((*stores, *composed_stores)):
-        if not store._closed:
-            try:
-                store_close(store)
-            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-                pass
-    for workspace in reversed(workspaces):
-        try:
-            workspace.close()
-        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-            pass
-    for manager in reversed(managers):
-        manager._release_storage_lease()
-    for lease in test_home_leases.values():
-        lease.close()
-    if first_error is not None:
-        raise first_error
+        for manager in reversed(managers):
+            manager._release_storage_lease()
+        for lease in test_home_leases.values():
+            lease.close()
+        if first_error is not None:
+            raise first_error
+    finally:
+        SAFETY_NET_CLOSING.reset(closing)
 
 
 @pytest.fixture

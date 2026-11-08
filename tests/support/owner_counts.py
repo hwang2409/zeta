@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import inspect
-import sys
 import threading
 import weakref
 from collections import defaultdict
+from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
 from typing import Any
+
+# conftest's safety net sets this for its cleanup phase. Tasks and asyncio.to_thread
+# copy it, so closes it starts there are not test closes. shortcut: a close the
+# safety net reaches through a plain thread or run_in_executor would count as a
+# test close; no gated close runs that way today.
+SAFETY_NET_CLOSING: ContextVar[bool] = ContextVar("safety_net_closing", default=False)
 
 CLOSE_GUIDANCE = {
     "AgentLoop": "await loop.close()",
@@ -17,7 +23,7 @@ CLOSE_GUIDANCE = {
     "ToolRegistry": "await registry.close()",
     "BackgroundTaskRegistry": "await registry.close()",
     "ZetaServer": "await server.close()",
-    "TUIApp": "async with owned_app(app)",
+    "TUIApp": "async with owned_app(app) (tests/support/owned.py)",
 }
 
 OwnerRow = tuple[str, str, int]
@@ -63,7 +69,7 @@ class OwnerCounts:
             record = self._records.get(id(obj))
             if record is None or record[0]() is not obj or record[1] != self.active_node:
                 return
-            if not _closed_by_cleanup_fixture():
+            if not SAFETY_NET_CLOSING.get():
                 self._counts[record[1:]][1] += 1
             self._records.pop(id(obj), None)
 
@@ -142,16 +148,6 @@ class OwnerCounts:
             setattr(cls, name, original)
 
 
-def _closed_by_cleanup_fixture() -> bool:
-    """Closes done by conftest's safety-net fixture do not count as test closes."""
-    frame = sys._getframe(2)
-    while frame is not None:
-        if frame.f_code.co_name == "close_direct_test_runtime_owners":
-            return True
-        frame = frame.f_back
-    return False
-
-
 def merge_rows(groups: list[list[OwnerRow]]) -> list[OwnerRow]:
     merged: dict[tuple[str, str], int] = {}
     for rows in groups:
@@ -163,15 +159,31 @@ def merge_rows(groups: list[list[OwnerRow]]) -> list[OwnerRow]:
     return [(nodeid, kind, count) for (nodeid, kind), count in sorted(merged.items())]
 
 
-def read_baseline(path: Path) -> dict[tuple[str, str], int]:
-    if not path.exists():
-        return {}
+def parse_baseline(text: str) -> dict[tuple[str, str], int]:
     baseline = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in text.splitlines():
         label, raw_count = raw_line.rsplit("=", 1)
         nodeid, kind = label.rsplit("::", 1)
         baseline[(nodeid, kind)] = int(raw_count)
     return baseline
+
+
+def read_baseline(path: Path) -> dict[tuple[str, str], int]:
+    if not path.exists():
+        return {}
+    return parse_baseline(path.read_text(encoding="utf-8"))
+
+
+def baseline_growth(base_text: str, head_text: str) -> list[str]:
+    """Rows the head baseline adds or raises over the base; only lowering is allowed."""
+    base = parse_baseline(base_text)
+    return [
+        f"owner leak baseline: {nodeid}::{kind}={count} (base "
+        f"{base.get((nodeid, kind), 'has no row')}); do not add or raise baseline "
+        f"rows: close the owner in the test ({CLOSE_GUIDANCE[kind]})"
+        for (nodeid, kind), count in sorted(parse_baseline(head_text).items())
+        if count > base.get((nodeid, kind), 0)
+    ]
 
 
 def gate_failures(rows: list[OwnerRow], baseline_path: Path) -> list[str]:
@@ -184,7 +196,8 @@ def gate_failures(rows: list[OwnerRow], baseline_path: Path) -> list[str]:
         guidance = CLOSE_GUIDANCE[kind]
         failures.append(
             f"owner leak ratchet: {nodeid} left {unclosed} {kind} owner(s) unclosed "
-            f"(baseline {allowed}); close the owner with {guidance}"
+            f"(baseline {allowed}); close the owner with {guidance}; "
+            "do not add rows to tests/owner_leak_ratchet.txt"
         )
     return failures
 

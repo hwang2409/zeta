@@ -47,3 +47,4 @@ runs:
         name: owner-counts-${{ runner.os }}-py${{ inputs.python-version || 'default' }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/owner-counts.txt
         if-no-files-found: ignore
+        retention-days: 7
