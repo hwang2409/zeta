@@ -696,8 +696,12 @@ class ApprovalLifecycle:
         )
         settlement = asyncio.create_task(self._settle_record(record, decision))
         self._change(record, settlement=settlement)
+        done, _ = await asyncio.wait(
+            (record.admitted, settlement), return_when=asyncio.FIRST_COMPLETED
+        )
+        outcome = record.admitted if record.admitted in done else settlement
         try:
-            resolution = await asyncio.shield(record.admitted)
+            resolution = outcome.result()
         except OSError as exc:
             raise ProtocolError(
                 ErrorDescriptor.INTERNAL_ERROR, f"approval persistence failed: {exc}"

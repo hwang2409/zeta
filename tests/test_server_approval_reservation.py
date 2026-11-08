@@ -391,10 +391,10 @@ async def test_same_tick_approval_reservation_winner(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_before_durable_commit_retries_abort(
+async def test_cancelled_handler_before_durable_commit_does_not_cancel_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cancellation with no committed decision resets to pending; abort retries."""
+    """Handler cancellation does not transfer into the settlement owner."""
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
         await server.control._event(_start_event(call))
@@ -423,12 +423,8 @@ async def test_cancelled_before_durable_commit_retries_abort(
             store._async_write_lock.release()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(settlement, what="cancelled settlement before commit")
-        assert store.approval_resolution_data(call.id) is None
-        retry = server.control._terminate_pending_approvals()
-        assert retry is not None
-        async with asyncio.timeout(10):
-            await retry
-        assert store.approval_resolution_data(call.id)["decision"] == "abort"
+        await server.control.wait_for_approval_settlement()
+        assert store.approval_resolution_data(call.id)["decision"] == "allow"
         assert call.id not in server.control._approvals.state.records
     finally:
         await close_serve(server, writer)
@@ -464,6 +460,7 @@ async def test_cancelled_after_durable_commit_keeps_decision(
         gate.release.set()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(settlement, what="cancelled settlement after commit")
+        await server.control.wait_for_approval_settlement()
         resolution = store.approval_resolution_data(call.id)
         assert resolution is not None and resolution["decision"] == "allow"
         assert call.id not in server.control._approvals.state.records
