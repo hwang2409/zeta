@@ -112,6 +112,7 @@ def test_covered_rows_skip_message_decoding() -> None:
     with patch.object(Message, "from_dict", wraps=Message.from_dict) as from_dict:
         projected = assembler._visible_items([*entries, marker])
 
+    # test-contract: seam _visible_items is the narrow projection seam under test
     assert [item.message.content[0].text for item in projected] == ["1"]
     assert from_dict.call_count == 1
 
