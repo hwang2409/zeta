@@ -667,14 +667,14 @@ async def test_background_task_owner_state_table(
 
         if row == "cancel-live-group-probe":
             child_ready = tmp_path / "detached-probe-child"
-            leader_ready = tmp_path / "detached-probe-leader"
             probe_entered = asyncio.Event()
-            leader_pids: list[int] = []
+            probed_pids: list[int] = []
             original_group_exists = owner_module._group_exists
 
             def group_exists(pid: int) -> bool:
                 exists = original_group_exists(pid)
-                if exists and leader_pids == [pid] and child_ready.exists():
+                if exists and child_ready.exists():
+                    probed_pids.append(pid)
                     probe_entered.set()
                 return exists
 
@@ -682,28 +682,18 @@ async def test_background_task_owner_state_table(
             monkeypatch.setattr(owner_module, "_group_exists", group_exists)
             child = "import os,signal; print(os.getpid(), flush=True); signal.pause()"
             leader = (
-                "import pathlib,signal,subprocess,sys\n"
-                "released = False\n"
-                "def release(*_):\n"
-                "    global released\n"
-                "    released = True\n"
-                "signal.signal(signal.SIGUSR1, release)\n"
+                "import pathlib,subprocess,sys\n"
                 f"child = subprocess.Popen([sys.executable, '-c', {child!r}], "
                 "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
                 f"pathlib.Path({str(child_ready)!r}).write_text(child.stdout.readline())\n"
-                f"pathlib.Path({str(leader_ready)!r}).write_text(str(__import__('os').getpid()))\n"
-                "while not released:\n"
-                "    signal.pause()\n"
             )
             task_id = await start_registered(_python(leader))
             owner = registry.background_tasks._owners[task_id]
             leader_pid = owner.record.pid
-            leader_pids.append(leader_pid)
             child_pid = await read_pid_file(child_ready)
-            await read_pid_file(leader_ready)
-            os.kill(leader_pid, signal.SIGUSR1)
             try:
                 await await_or_fail(probe_entered.wait(), what="live group probe")
+                assert probed_pids == [leader_pid]
                 lifecycle = owner.lifecycle
                 assert lifecycle is not None
                 lifecycle.cancel()
