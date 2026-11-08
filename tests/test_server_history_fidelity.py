@@ -14,7 +14,7 @@ from tests.support.serve_close import close_serve
 from tests.support.server_client import event, request
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.agent.receipt import build_agent_receipt
-from zeta.agent.turn_limit import build_turn_limit_result
+from zeta.agent.turn_limit import ChildTurnControl, build_turn_limit_result
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -231,6 +231,31 @@ async def test_serve_replay_maps_turn_limit_receipt(tmp_path: Path) -> None:
         projected = rows[0]["tool_result"]["structured_content"]
         assert projected["status"] == "turn_limit"
         assert projected["handoff_path"] == str(child_path / "turn-limit-handoff.md")
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_history_maps_child_turn_limit_notice_once(tmp_path: Path) -> None:
+    server, reader, writer, session_id = await _open(tmp_path)
+    try:
+        control = ChildTurnControl(10, str(server.runtime.opened.store.session_dir))
+        warning = None
+        for _ in range(9):
+            warning = control.begin_completion() or warning
+            control.finish_completion()
+        assert warning is not None
+        server.runtime.opened.store.append_message(warning)
+
+        rows = await _history(reader, writer, session_id)
+        text = "\n".join(
+            block["text"]
+            for row in rows
+            for block in row["content"]
+            if block["type"] == "text"
+        )
+        assert text.count("child turn limit") == 1
+        assert text.count("2 model completion(s) remain, including this one") == 1
     finally:
         await close_serve(server, writer)
 

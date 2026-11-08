@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
 import zeta.agent.runner as agent_runner_module
 from tests.support.agent_lifecycle import wait_background_owner
@@ -43,6 +44,7 @@ from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import _read_agent_status
+from zeta.tui.app import TUIApp
 from zeta.tui.render import render_event
 
 
@@ -642,6 +644,33 @@ async def test_agent_status_reloads_turn_limit_projection(
         assert "[zeta:turn-limit" not in str(status["final_result"])
     finally:
         await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_replay_renders_child_turn_limit_notice_once(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "session")
+    control = ChildTurnControl(10, str(store.session_dir))
+    warning = None
+    for _ in range(9):
+        warning = control.begin_completion() or warning
+        control.finish_completion()
+    assert warning is not None
+    store.append_message(warning)
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        app._rebuild_transcript()
+        rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
+        assert rendered.count("child turn limit") == 1
+        assert rendered.count("2 model completion(s) remain, including this one") == 1
+    finally:
+        await app.loop.close()
         store.close()
 
 
