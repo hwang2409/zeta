@@ -24,6 +24,7 @@ from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
+import zeta.tools._shared.process_output as process_output_module
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.processes import (
     kill_group_if_present,
@@ -172,6 +173,20 @@ def test_cancel_all_invokes_each_canceller_once_without_subtree_scans() -> None:
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
     await asyncio.wait_for(registry.wait(task_id), timeout=30)
+
+
+def test_utf8_char_chunk_ascii_bypasses_incremental_decoder(monkeypatch) -> None:
+    def fail_decoder(*args, **kwargs):
+        raise AssertionError("ASCII input should not create an incremental decoder")
+
+    monkeypatch.setattr(process_output_module.codecs, "getincrementaldecoder", fail_decoder)
+    assert process_output_module.utf8_char_chunk(b"hello", 3) == b"hel"
+
+
+@pytest.mark.parametrize("limit", [0, 2, 5, 99])
+def test_utf8_char_chunk_ascii_limits_match_bytes(limit: int) -> None:
+    data = b"hello"
+    assert process_output_module.utf8_char_chunk(data, limit) == data[:limit]
 
 
 @pytest.mark.asyncio
