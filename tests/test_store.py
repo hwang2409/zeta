@@ -2233,7 +2233,7 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     assert reopened_again.path.read_bytes() == reopened.path.read_bytes()
 
 
-@pytest.mark.parametrize("epoch", [2, 3])
+@pytest.mark.parametrize("epoch", range(2, storage_format.WRITER_EPOCH))
 def test_lower_epoch_torn_tail_keeps_legacy_repair_without_recovery_files(
     tmp_path: Path, epoch: int
 ) -> None:
@@ -2273,7 +2273,7 @@ print(json.dumps({
     assert result["data"] == {"message": "dropped torn final conversation line"}
     assert result["recovery"] == []
     assert result["quarantine"] == []
-    assert storage_format.WRITER_EPOCH == 4
+    assert epoch < storage_format.WRITER_EPOCH
 
 
 def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:

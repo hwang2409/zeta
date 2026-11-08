@@ -62,6 +62,7 @@ class PromptInput:
     text: str
     origin: MessageOrigin
     deadline: float | None
+    starts_new_episode: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +116,10 @@ def _commit_delivery_input(
 ) -> ProducerResult:
     if isinstance(item, PromptInput):
         entry = store.pending_prompt_queue.append(
-            item.text, origin=item.origin, deadline=item.deadline
+            item.text,
+            origin=item.origin,
+            deadline=item.deadline,
+            starts_new_episode=item.starts_new_episode,
         )
         return ProducerResult((entry,), True, 1)
 
@@ -471,6 +475,8 @@ def validate_delivery_input(item: DeliveryInput) -> DeliverySource:
             raise ValueError("prompt text must be a nonempty string")
         if not isinstance(item.origin, MessageOrigin):
             raise TypeError("prompt origin must be a MessageOrigin")
+        if type(item.starts_new_episode) is not bool:
+            raise TypeError("prompt starts_new_episode must be a bool")
         return "prompt"
     if not isinstance(item, NotificationInput):
         raise TypeError("delivery input must be PromptInput or NotificationInput")

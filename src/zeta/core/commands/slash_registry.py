@@ -22,6 +22,7 @@ from .custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
+from .slash_errors import unknown_slash_command
 
 if TYPE_CHECKING:
     from ..slash import SlashSession
@@ -251,9 +252,14 @@ class SlashCommandRegistry:
                 parts[1] if len(parts) == 2 else "",
                 display_text=value,
             )
-        if custom is None or custom.kind != "exec":
-            return None
-        return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
+        if custom is not None:
+            if custom.kind != "exec":
+                return None
+            return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
+        return unknown_slash_command(
+            value, name, parts[1] if len(parts) == 2 else "",
+            (entry[0] for entry in self.completion_entries),
+        )
 
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""
