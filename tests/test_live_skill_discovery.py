@@ -468,7 +468,7 @@ async def test_serve_run_discovers_new_skill_without_list_refresh(
         assert "live body" in result["text"]
         assert "request" in result["text"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
