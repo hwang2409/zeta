@@ -896,7 +896,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     async def tracked_app_close(app, *args, **kwargs):
         await app_close(app, *args, **kwargs)
         closed_apps.add(app)
-        apps.remove(app)
+        if app in apps:
+            apps.remove(app)
 
     @wraps(server_close)
     async def tracked_server_close(server, *args, **kwargs):
