@@ -108,6 +108,7 @@ class ConnectionRegistry:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
         self._controller: _Connection | None = None
+        self._controller_output_paused = False
         self._observers: list[_Connection] = []
         self._closed = False
         self._read_condition = threading.Condition()
@@ -208,6 +209,10 @@ class ConnectionRegistry:
         state = self._connections.get(connection)
         return state is not None and state is self._controller
 
+    def activate_controller(self, connection: Any) -> None:
+        if self.is_controller(connection):
+            self._controller_output_paused = False
+
     def controller_metadata(self) -> ControllerMetadata | None:
         state = self._controller
         if state is None:
@@ -227,6 +232,8 @@ class ConnectionRegistry:
     ) -> tuple[Admission, _Frame | None, _OutputState | None]:
         if state is None:
             return Admission("no_controller"), None, None
+        if state is self._controller and self._controller_output_paused:
+            return Admission("not_writable"), None, None
         if required_feature is not None and required_feature not in state.features:
             return Admission("feature_rejected"), None, None
         if (
@@ -317,7 +324,9 @@ class ConnectionRegistry:
         states = tuple(
             state
             for state in (self._controller, *self._observers)
-            if state is not None and feature in state.features
+            if state is not None
+            and feature in state.features
+            and (state is not self._controller or not self._controller_output_paused)
         )
         for state in states:
             frame = state.connection.codec.notification(event, session_id, data=data)
@@ -334,6 +343,7 @@ class ConnectionRegistry:
             return
         if state is self._controller:
             self._controller = None
+            self._controller_output_paused = True
         if state in self._observers:
             self._observers.remove(state)
         output = state.output
@@ -674,15 +684,24 @@ class ConnectionRegistry:
         self._cancel_overflow_deadline(output)
         if role == "observer":
             self._clear_output(output)
-            if output.writer_task is not None:
+            if (
+                output.writer_task is not None
+                and output.writer_task is not asyncio.current_task()
+            ):
                 output.writer_task.cancel()
             return
+        self._clear_output(output, result=False)
+        writer_task = output.writer_task
+        current_task = asyncio.current_task()
         if (
-            output.current_frame is None
-            and not output.queue
-            and output.writer_task is not None
+            writer_task is None
+            or writer_task is current_task
+            or output.current_write is current_task
         ):
-            output.writer_task.cancel()
+            return
+        if output.current_frame is not None:
+            self._finish_future(output.current_frame.future, False)
+        writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
         while output.queue:
