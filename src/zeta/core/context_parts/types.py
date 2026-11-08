@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from ...context_accounting import context_digest
 from ...protocol.types import Message
 from ..store import ConversationEntry
 
@@ -16,16 +15,6 @@ class AssembledContext:
     messages: list[Message]
     token_count: int
     compacted: bool = False
-    _cached_digest: str | None = field(default=None, init=False, repr=False, compare=False)
-
-    @property
-    def digest(self) -> str:
-        """Return the canonical digest, computing it only when requested."""
-        digest = self._cached_digest
-        if digest is None:
-            digest = context_digest(self.messages)
-            object.__setattr__(self, "_cached_digest", digest)
-        return digest
 
 
 @dataclass(frozen=True, slots=True)

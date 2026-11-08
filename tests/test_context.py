@@ -2,13 +2,13 @@ from pathlib import Path
 import asyncio
 import base64
 import json
+import hashlib
 import threading
 from tempfile import TemporaryDirectory
 
 import pytest
 
 import zeta.core.context as context_module
-import zeta.core.context_parts.types as context_types
 from zeta.core.context import (
     AssembledContext,
     BudgetExceeded,
@@ -18,10 +18,7 @@ from zeta.core.context import (
     SummaryCompletionError,
 )
 from zeta.context_eviction import EVICTION_KIND
-from zeta.context_accounting import (
-    compact_json_chunks,
-    compact_json_length,
-)
+from zeta.context_accounting import compact_json_length
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.providers.anthropic import build_messages_payload
@@ -70,7 +67,6 @@ def context_root() -> Path:
 def test_compact_json_length_matches_canonical_encoding(value: object) -> None:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
     assert compact_json_length(value) == len(encoded)
-    assert "".join(compact_json_chunks(value)) == encoded
 
 
 async def _append_during_preparation(
@@ -139,40 +135,27 @@ def test_needs_compaction_uses_resident_branch_without_replay(
 
 
 @pytest.mark.asyncio
-async def test_context_digest_is_lazy_and_cached(
+async def test_context_assembly_does_not_hash_messages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    count_threads: set[int] = set()
-    digest_calls = 0
-    real_digest = context_types.context_digest
+    hash_calls = 0
+    real_sha256 = hashlib.sha256
 
-    def token_count(_message: Message) -> int:
-        count_threads.add(threading.get_ident())
-        return 1
-
-    def observed_digest(messages: list[Message]) -> str:
-        nonlocal digest_calls
-        digest_calls += 1
-        return real_digest(messages)
+    def observed_sha256(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal hash_calls
+        hash_calls += 1
+        return real_sha256(*args, **kwargs)
 
     store = ConversationStore(tmp_path)
     for index in range(100):
         store.append_message(text(MessageRole.USER, f"message {index} " * 1_000))
-    assembler = ContextAssembler(store, token_budget=10_000, token_counter=token_count)
-    monkeypatch.setattr(context_types, "context_digest", observed_digest)
+    assembler = ContextAssembler(store, token_budget=10_000, token_counter=lambda _: 1)
+    monkeypatch.setattr(hashlib, "sha256", observed_sha256)
 
     assembled = await assembler.assemble_context()
 
-    assert digest_calls == 0
     assert assembled.token_count == 100
-    provider_messages = [message.to_dict() for message in assembled.messages]
-
-    expected_digest = real_digest(assembled.messages)
-    assert assembled.digest == expected_digest
-    assert digest_calls == 1
-    assert assembler.digest == expected_digest
-    assert digest_calls == 1
-    assert [message.to_dict() for message in assembled.messages] == provider_messages
+    assert hash_calls == 0
 
 
 @pytest.mark.asyncio
@@ -455,7 +438,6 @@ async def test_minimal_tool_tail_is_truncated_without_mutating_store(
     second = await assembler.assemble_context()
 
     assert first.messages == second.messages
-    assert first.digest == second.digest
     assembled_result = first.messages[-1].tool_result
     assert assembled_result is not None
     assert assembled_result.tool_call_id == call.id
@@ -846,7 +828,6 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
     )
     assert replayed[2] == text(MessageRole.USER, "current request")
     assert messages[-1] == replayed[-1]
-    assert assembler.digest is not None
 
 
 @pytest.mark.asyncio
@@ -2231,7 +2212,6 @@ async def test_token_cache_on_and_off_give_identical_turns_across_eviction(
         assert [m.to_dict() for m in cached_context.messages] == [
             m.to_dict() for m in uncached_context.messages
         ]
-        assert cached_context.digest == uncached_context.digest
         assert (
             cached_context.token_count
             == uncached_context.token_count

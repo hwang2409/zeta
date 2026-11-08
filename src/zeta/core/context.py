@@ -159,10 +159,6 @@ class ContextAssembler(ContextMarkerMixin):
             sink=self.usage_sink, on_growth=self.on_token_growth
         )
 
-    @property
-    def digest(self) -> str | None:
-        return self.last_context.digest if self.last_context is not None else None
-
     def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
         if force:
