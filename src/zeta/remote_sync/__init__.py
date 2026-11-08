@@ -25,6 +25,7 @@ from typing import Protocol
 from ..core.session import SessionManager
 from ..core.session_execution import RUNTIME_LEASE_NAME
 from ..core.session_files import SessionError, SessionInUseError, session_directory
+from ..core.session_metadata import SessionMetadata
 from ..core.store import ConversationStore
 from ..core.transcript_recovery import RepairTarget, validate_recovery_records
 from ..storage_format import WriterLease, open_writer
@@ -509,7 +510,7 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
     meta_path = snapshot / "meta.json"
     meta = _read_json(meta_path)
     meta["cwd"] = cwd_text
-    _write_json(meta_path, meta)
+    _write_metadata(meta_path, meta)
     for log in snapshot.rglob("conversation.jsonl"):
         temporary = log.with_name(f".{log.name}.{os.getpid()}.tmp")
         try:
@@ -555,7 +556,7 @@ def _append_resume_hint(snapshot: Path) -> None:
         "</zeta-remote-resume>"
     )
     metadata["system_prompt"] = f"{prompt}\n\n{hint}" if prompt else hint
-    _write_json(meta_path, metadata)
+    _write_metadata(meta_path, metadata)
 
 
 def _map_missing_cwd(snapshot: Path, placeholder: Path) -> None:
@@ -702,6 +703,16 @@ def _read_json(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise RemoteSyncError(f"transfer data is not an object: {path}")
     return value
+
+
+def _write_metadata(path: Path, value: dict[str, object]) -> None:
+    # The same reader validation SessionManager._publish_metadata applies, so a
+    # transferred session never lands with a meta.json the reader rejects.
+    try:
+        SessionMetadata.from_dict(value, path=path)
+    except SessionError as exc:
+        raise RemoteSyncError(f"session metadata is unreadable: {exc}") from exc
+    _write_json(path, value)
 
 
 def _write_json(path: Path, value: object) -> None:
