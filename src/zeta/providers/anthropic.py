@@ -528,7 +528,7 @@ class AnthropicBackend(CompletionBackend):
         *,
         token: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        async with self._lease.borrow() as client:
+        async with self._lease.borrow("anthropic completion") as client:
             events = self._complete_once_with_client(
                 client, messages, tool_schemas, token=token
             )

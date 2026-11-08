@@ -344,12 +344,23 @@ def is_completion_sentinel(event: StreamEvent) -> bool:
 _ATTEMPT_END = object()
 
 
+# attempt closes still running after their caller was cancelled
+_CLOSING_ATTEMPTS: set[asyncio.Task[None]] = set()
+
+
+def _release_close(task: asyncio.Task[None]) -> None:
+    _CLOSING_ATTEMPTS.discard(task)
+    # the first caller reads the outcome; a cancelled caller abandons it
+    if not task.cancelled():
+        task.exception()
+
+
 class IteratorProviderAttempt:
     """Expose decoder activity and output through one owned attempt handle."""
 
     def __init__(self, source: AsyncIterator[StreamEvent]) -> None:
         self._source = source
-        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._producer: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[AttemptSignal | BaseException | object] = (
             asyncio.Queue()
@@ -402,9 +413,20 @@ class IteratorProviderAttempt:
         return item
 
     async def aclose(self) -> None:
-        if self._closed:
+        # the close runs as one task, so cancelling a caller (twice in serve:
+        # client disconnect, then server close) cannot stop it before the
+        # source closes and releases what it holds (an HTTP lease borrow).
+        if self._close_task is not None:
+            # test-contract: seam a later close waits for the first close
+            await asyncio.wait((self._close_task,))
             return
-        self._closed = True
+        self._close_task = asyncio.create_task(self._close())
+        _CLOSING_ATTEMPTS.add(self._close_task)
+        self._close_task.add_done_callback(_release_close)
+        # test-contract: seam cancellation cannot interrupt the source close
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         if self._producer is not None and not self._producer.done():
             self._producer.cancel()
             # test-contract: seam producer cancellation must drain fully

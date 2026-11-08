@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import time
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -26,6 +27,8 @@ _BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
 _BACKGROUND_CLEANUP_REPORT_TASKS: set[asyncio.Task[object]] = set()
 _MAX_BACKGROUND_CLEANUP_REPORTS = 16
 _dropped_cleanup_reports = 0
+# how long a lease close waits for open borrows before it closes the client anyway
+LEASE_DRAIN_BOUND = 30.0
 CloseFailureReporter = Callable[[int, BaseException], None]
 
 
@@ -264,8 +267,8 @@ class HTTPClientLease:
     """Own one completion client and drain active borrows before closing it."""
 
     __slots__ = (
-        "_active_borrows",
         "_background_reporter_registered",
+        "_borrowers",
         "_close_task",
         "_drained",
         "_retired",
@@ -280,33 +283,49 @@ class HTTPClientLease:
         self.owned = configured is None
         self.client = configured or httpx.AsyncClient(timeout=timeout)
         self.connection_setup_count = int(self.owned)
-        self._active_borrows = 0
+        self._borrowers: Counter[str] = Counter()
         self._background_reporter_registered = False
         self._close_task: asyncio.Task[None] | None = None
         self._drained = asyncio.Event()
         self._drained.set()
         self._retired = False
 
+    @property
+    def _active_borrows(self) -> int:
+        return self._borrowers.total()
+
     @contextlib.asynccontextmanager
-    async def borrow(self) -> AsyncIterator[httpx.AsyncClient]:
+    async def borrow(self, borrower: str) -> AsyncIterator[httpx.AsyncClient]:
         if self._retired:
             raise RuntimeError("completion backend is retired")
-        self._active_borrows += 1
+        self._borrowers[borrower] += 1
         self._drained.clear()
         try:
             yield self.client
         finally:
-            self._active_borrows -= 1
-            if self._active_borrows == 0:
+            self._borrowers[borrower] -= 1
+            if not +self._borrowers:
+                self._borrowers.clear()
                 self._drained.set()
 
     def retire(self) -> None:
         self._retired = True
 
     async def _close_owned(self) -> None:
-        await self._drained.wait()
+        leaked: RuntimeError | None = None
+        try:
+            async with asyncio.timeout(LEASE_DRAIN_BOUND):
+                await self._drained.wait()
+        except TimeoutError:
+            # a borrow that never ends must not hang close forever: name it
+            leaked = RuntimeError(
+                "http client closed with borrows still open: "
+                + ", ".join(sorted(+self._borrowers))
+            )
         if self.owned:
             await self.client.aclose()
+        if leaked is not None:
+            raise leaked
 
     def start_close(self) -> None:
         self.retire()
@@ -330,7 +349,7 @@ class HTTPClientLease:
     async def refresh(
         self, refresh_token: Callable[[httpx.AsyncClient], Awaitable[str]]
     ) -> str:
-        async with self.borrow() as client:
+        async with self.borrow("token refresh") as client:
             return await refresh_token(client)
 
 
