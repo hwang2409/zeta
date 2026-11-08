@@ -60,6 +60,7 @@ import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.account_processes import hold_provider_login_lock
+from tests.support.completion import completion_control
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
@@ -97,6 +98,7 @@ from zeta.providers.anthropic import (
     OAuthTokens,
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
+from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop import persistence as persistence_module
@@ -1252,6 +1254,7 @@ class GateBackend(CompletionBackend):
         self.release = asyncio.Event()
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1276,6 +1279,7 @@ class QueueOrderBackend(CompletionBackend):
         self.release = asyncio.Event()
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1289,7 +1293,7 @@ class QueueOrderBackend(CompletionBackend):
                 content=TextContent("| name | value |\n| --- | --- |"),
             )
             self.started.set()
-            await self.release.wait()
+            await await_or_fail(self.release.wait(), what="table response release")
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(
@@ -1306,6 +1310,7 @@ class QueueOrderBackend(CompletionBackend):
 
 
 class ErrorBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1323,6 +1328,7 @@ class AbortThenSuccessBackend(CompletionBackend):
         self.started = asyncio.Event()
         self.calls = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1337,7 +1343,9 @@ class AbortThenSuccessBackend(CompletionBackend):
                 content=TextContent("partial response"),
             )
             self.started.set()
-            await asyncio.Event().wait()
+            await await_or_fail(
+                asyncio.Event().wait(), what="interrupted response cancellation"
+            )
         response = "second response"
         yield StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
@@ -1354,6 +1362,7 @@ class ErrorThenSuccessBackend(CompletionBackend):
         self.calls = 0
         self.request_messages: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1381,6 +1390,7 @@ class ErrorThenSuccessBackend(CompletionBackend):
 
 
 class AlwaysErrorBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1400,6 +1410,7 @@ class WaitingFailureBackend(CompletionBackend):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1412,7 +1423,7 @@ class WaitingFailureBackend(CompletionBackend):
             content=TextContent("partial response"),
         )
         self.started.set()
-        await self.release.wait()
+        await await_or_fail(self.release.wait(), what="failed response release")
         yield StreamEvent(
             StreamEventType.ERROR,
             error=ErrorInfo("transport_error", "network disconnected"),
@@ -1424,6 +1435,7 @@ class RaisedErrorBackend(CompletionBackend):
     def __init__(self, error: Exception) -> None:
         self.error = error
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1435,6 +1447,7 @@ class RaisedErrorBackend(CompletionBackend):
 
 
 class GhostPreviewBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1455,6 +1468,7 @@ class EventBackend(CompletionBackend):
     def __init__(self, event: StreamEvent) -> None:
         self.event = event
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1471,6 +1485,7 @@ class BlockingToolBackend(CompletionBackend):
     def __init__(self, call: ToolCall) -> None:
         self.call = call
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1490,6 +1505,7 @@ class StreamingToolBackend(CompletionBackend):
         self.tool_update = asyncio.Event()
         self.allow_message_end = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1515,6 +1531,7 @@ class OrderedToolBackend(CompletionBackend):
         self.calls = calls
         self.index = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1544,6 +1561,7 @@ class SlowSecondCompletionBackend(CompletionBackend):
         self.release_second = asyncio.Event()
         self.index = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -4376,6 +4394,7 @@ async def test_oauth_refresh_rejection_renders_as_login_problem(tmp_path: Path) 
     driver = AnthropicCredentialDriver(token_url="https://refresh.test/token")
 
     class RefreshFailureBackend:
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             async with httpx.AsyncClient(
@@ -4512,7 +4531,7 @@ async def test_retry_reuses_user_message_and_keeps_partial_output(
     assert app.retry_available()
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     messages = store.messages()
     assert [message.role for message in messages] == [
@@ -4548,7 +4567,7 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
     await app._consume_turn("prompt")
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     rendered = Text.from_ansi(app.console.file.getvalue()).plain
     assert rendered.count("provider failure · timeout") == 2
@@ -4562,6 +4581,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -4613,7 +4633,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
 
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert backend.calls == 3
     assert store.messages()[-1].content[0].text == "done"
@@ -4627,6 +4647,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -4689,7 +4710,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
 
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert backend.calls == 3
     assert store.messages()[-1].content[0].text == "done"
@@ -4748,7 +4769,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
 
     app.retry_failed_turn()
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     users = [
         message for message in store.messages() if message.role is MessageRole.USER
@@ -4846,10 +4867,10 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     app._active_session = session
     task = asyncio.create_task(app._consume_turn("prompt"))
     app._active_task = task
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="draft response start")
     session.app.current_buffer.insert_text("draft while streaming")
     backend.release.set()
-    await task
+    await await_or_fail(task, what="draft response completion")
 
     assert session.app.current_buffer.text == "draft while streaming"
     failed_message = app.loop.store.messages()[-1]
@@ -4879,7 +4900,7 @@ async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
 
     assert app._draft.load() == "new rapid draft"
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
     await app.loop.close()
 
 
@@ -4906,11 +4927,11 @@ async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
     session.default_buffer.insert_text("third draft")
     await asyncio.sleep(0.25)
 
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
     backend.release.set()
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     await wait_until(lambda: len(backend.calls) == 2)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert session.default_buffer.text == "third draft"
     assert app._draft.load() == "third draft"
@@ -4945,11 +4966,11 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
     app._submit_input(session.default_buffer.text)
     session.default_buffer.reset()
 
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
     backend.release.set()
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     await wait_until(lambda: len(backend.calls) == 2)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert first_image.exists()
     assert second_image.exists()
@@ -6955,6 +6976,7 @@ async def test_early_close_retry_drops_inline_partial_from_scrollback(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -7012,13 +7034,14 @@ async def test_truncated_response_notice_is_printed_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
 
     class TruncatedBackend(CompletionBackend):
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -11122,12 +11145,12 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("first\r")
-        await backend.started.wait()
+        await await_or_fail(backend.started.wait(), what="queued response start")
         pipe.send_text("second\r")
         backend.release.set()
         await wait_until(lambda: len(store.messages()) == 4)
         pipe.send_text("\x04")
-        await run_task
+        await await_or_fail(run_task, what="queued TUI run")
 
     user_texts = [
         block.text
@@ -11172,7 +11195,7 @@ async def test_control_command_does_not_reject_rapid_follow_up(
     app._submit_input(command)
     app._submit_input("probe")
     await wait_until(lambda: len(backend.calls) == 1)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     if expected == "checkpoint_count":
         assert store.checkpoint_count() == 1
@@ -11197,9 +11220,10 @@ async def test_plain_approve_word_is_sent_to_model_from_composer(
     )
 
     app._submit_input(text)
+    # test-contract: latency ui task startup is the product readiness contract
     await asyncio.sleep(0.05)
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
 
     assert [
         block.text
@@ -11232,7 +11256,7 @@ async def test_plain_approve_word_is_sent_to_model_from_prompt_session(
         pipe.send_text(f"{text}\r")
         await asyncio.sleep(0.05)
         pipe.send_text("\x04")
-        await run_task
+        await await_or_fail(run_task, what="submitted TUI run")
 
     assert [
         block.text
@@ -11270,9 +11294,10 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
     )
 
     app._submit_input("approve the plan")
+    # test-contract: latency ui task startup is the product readiness contract
     await asyncio.sleep(0.05)
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
 
     assert [request.key for request in app.pending_approvals] == [call.id]
     assert [
@@ -11298,12 +11323,12 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
 
     app._submit_input("first")
     app._submit_input("second")
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
 
     backend.release.set()
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     await wait_until(lambda: len(backend.calls) == 2)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     user_texts = [
         block.text
@@ -11332,10 +11357,10 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(
     app.undo_sent_turn()
     app._submit_input("same")
     await asyncio.sleep(0)
-    await asyncio.gather(app._active_task, return_exceptions=True)
+    await await_or_fail(asyncio.gather(app._active_task, return_exceptions=True), what="asyncio.gather(app._active_task, return_exceptions=True)")
     await asyncio.sleep(0)
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
 
     user_texts = [
         block.text
@@ -11363,13 +11388,13 @@ async def test_undo_restores_double_slash_source_text(tmp_path: Path) -> None:
 
     raw = "  //status  \n"
     await app._handle_prompt_value(raw)
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
     app.undo_sent_turn()
-    await asyncio.gather(app._active_task, return_exceptions=True)
+    await await_or_fail(asyncio.gather(app._active_task, return_exceptions=True), what="asyncio.gather(app._active_task, return_exceptions=True)")
 
     assert session.app.current_buffer.text == raw
     await app._handle_prompt_value(raw)
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert len(backend.calls) == 2
     resent = [
@@ -13496,7 +13521,7 @@ async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
     monkeypatch.setattr(app.loop, "slash_mcp_prompt", resolve)
     await app._handle_prompt_value("/fake:review")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     message = store.messages()[0]
     assert message.content == [
@@ -13627,11 +13652,13 @@ async def test_undo_restores_text_and_aborts_streaming_turn(tmp_path: Path) -> N
     app._active_session = session
     task = asyncio.create_task(app._consume_turn("sent message"))
     app._active_task = task
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="undo response start")
 
     app._undo_candidate = UndoCandidate("sent message")
     app.undo_sent_turn()
-    await asyncio.gather(task, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(task, return_exceptions=True), what="undo response cleanup"
+    )
 
     assert session.app.current_buffer.text == "sent message"
     assert app._loop_state == "interrupted"
@@ -13654,12 +13681,14 @@ async def test_undo_keeps_a_draft_typed_during_streaming(tmp_path: Path) -> None
     app._active_session = session
     task = asyncio.create_task(app._consume_turn("sent message"))
     app._active_task = task
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="undo backend start")
     session.default_buffer.insert_text("new draft")
     app._undo_candidate = UndoCandidate("sent message")
 
     app.undo_sent_turn()
-    await asyncio.gather(task, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(task, return_exceptions=True), what="undo turn cancellation"
+    )
     await app._draft.flush_pending()
 
     assert session.app.current_buffer.text == "new draft"
@@ -13684,16 +13713,16 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
     app._pending_attachment_tokens["[Image #1]"] = staged
     await app._handle_prompt_value("inspect [Image #1]")
     assert app._active_task is not None
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
 
     app.undo_sent_turn()
-    await asyncio.gather(app._active_task, return_exceptions=True)
+    await await_or_fail(asyncio.gather(app._active_task, return_exceptions=True), what="asyncio.gather(app._active_task, return_exceptions=True)")
 
     assert app._pending_attachment_tokens == {"[Image #1]": staged}
     assert app._pending_attachments == [staged]
     await app._handle_prompt_value("inspect [Image #1]")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     user_messages = [
         message for message in store.messages() if message.role is MessageRole.USER
@@ -13726,9 +13755,12 @@ async def test_undo_restores_next_image_token_after_deleted_token(
     app._next_image_token = 3
 
     await app._handle_prompt_value("inspect [Image #2]")
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="image undo backend start")
     app.undo_sent_turn()
-    await asyncio.gather(app._active_task, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(app._active_task, return_exceptions=True),
+        what="image undo turn cancellation",
+    )
 
     monkeypatch.setattr(
         "zeta.tui.paste_runtime.paste_image", lambda _, **kwargs: pasted
@@ -13832,6 +13864,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
             self.calls = 0
             self.release_first = asyncio.Event()
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -13843,7 +13876,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
             self.max_active = max(self.max_active, self.active)
             try:
                 if self.calls == 1:
-                    await self.release_first.wait()
+                    await asyncio.wait_for(self.release_first.wait(), 10)
                 yield StreamEvent(StreamEventType.MESSAGE_START)
                 yield StreamEvent(
                     StreamEventType.MESSAGE_END,
@@ -14091,7 +14124,7 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
                 client=client,
                 token_budget=expected_budget,
             )
-            [event async for event in probe.complete([], [])]
+            [event async for event in probe.complete([], [], control=completion_control())]
         persisted = manager.read_metadata(opened.metadata.session_id)
         assert persisted.compaction_budget == expected_budget
         assert loop.context_assembler.token_budget == expected_budget

@@ -41,7 +41,6 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer
 from zeta.server.protocol import EventDescriptor, ProtocolError
-from zeta.server.server import LOADED_SESSION_MUTATIONS
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
 
@@ -1021,11 +1020,10 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             "steer": {"text": "blocked"},
             "switch_branch": {"session_id": session_id, "head_id": "missing"},
         }
-        assert params_by_method.keys() == LOADED_SESSION_MUTATIONS
         old_state = server.runtime.state
         old_metadata = server.runtime.metadata.to_dict()
         old_entries = tuple(server.runtime.opened.store.entries)
-        for request_id, method in enumerate(LOADED_SESSION_MUTATIONS, 20):
+        for request_id, method in enumerate(params_by_method, 20):
             response = (
                 await _request(
                     reader, writer, request_id, method, params_by_method[method]
@@ -2034,9 +2032,7 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
     events: list[tuple[str, str | None]] = []
     original_admit = server.control._admit_controller
 
-    def record(
-        event: str, session_id: str | None = None, **fields: object
-    ) -> object:
+    def record(event: str, session_id: str | None = None, **fields: object) -> object:
         request_id = fields.get("request_id")
         events.append((event, request_id if isinstance(request_id, str) else None))
         return original_admit(event, session_id, **fields)

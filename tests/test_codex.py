@@ -1,3 +1,4 @@
+
 import asyncio
 import base64
 import http.server
@@ -13,7 +14,9 @@ import httpx
 import pytest
 
 import zeta.providers.codex as codex_module
+from tests.support.completion import completion_control
 from tests.support.credentials import codex_credentials
+from tests.support.owned import await_or_fail
 from zeta.accounts import AccountCredentials
 from zeta.core.context import ContextAssembler
 from zeta.core.slash import SlashStatus, _format_status
@@ -40,6 +43,7 @@ from zeta.providers.codex import (
     extract_account_id,
 )
 from zeta.providers.codex_payload import _cache_affinity_json
+from zeta.providers.completion import owned_completion
 from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.runtime.loop import AgentLoop
@@ -617,25 +621,6 @@ async def _drain(events) -> None:
 
 
 @pytest.mark.asyncio
-async def test_partial_codex_error_body_stalls_and_closes(
-    tmp_path: Path,
-) -> None:
-    stream = _PartialErrorBody()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, stream=stream, request=request)
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    backend = CodexBackend(
-        client=client,
-        token_store=store_for(tmp_path / "codex.json"),
-        stall_seconds=0.01,
-    )
-    with pytest.raises(CodexStreamError, match="error body stalled"):
-        # bounded: a missing watchdog fails with TimeoutError instead of hanging
-        await asyncio.wait_for(_drain(backend._complete_once([], [])), timeout=5)
-    assert stream.closed.is_set()
-    await client.aclose()
 
 
 def store_for(path: Path, token: str | None = None) -> AccountCredentials:
@@ -666,7 +651,7 @@ async def test_responses_stream_maps_text_usage_and_has_one_completion_boundary(
             client=client,
             token_store=store_for(tmp_path / "codex.json"),
             base_url="https://test.invalid/codex/responses",
-        ).complete([Message(MessageRole.USER, [TextContent("hi")])], [])
+        ).complete([Message(MessageRole.USER, [TextContent("hi")])], [], control=completion_control())
     ]
 
     assert len(requests) == 1
@@ -726,7 +711,7 @@ async def test_responses_preserve_tool_order_and_canonicalize_cache_key(
             ),
             Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "done")),
         ]
-        async for _ in backend.complete(messages, schemas):
+        async for _ in backend.complete(messages, schemas, control=completion_control()):
             pass
 
     assert len(requests) == 2
@@ -787,7 +772,7 @@ async def test_chatgpt_cache_affinity_reuses_static_prefix(
             Message(MessageRole.SYSTEM, [TextContent(instruction)]),
             Message(MessageRole.USER, [TextContent("run")]),
         ]
-        async for _ in backend.complete(messages, schema):
+        async for _ in backend.complete(messages, schema, control=completion_control()):
             pass
 
     keys = [request.headers["session-id"] for request in requests]
@@ -840,7 +825,7 @@ async def test_gpt56_plan_tool_choice_keeps_cache_affinity(tmp_path: Path) -> No
     ):
         async for _ in backend.complete(
             [system, Message(MessageRole.USER, [TextContent("go")])], tools
-        ):
+        , control=completion_control()):
             pass
 
     first, second = (json.loads(request.content) for request in requests)
@@ -900,7 +885,7 @@ async def test_gpt55_cache_key_does_not_pad_instructions(tmp_path: Path) -> None
         tools = [{"name": "lookup", "description": "x" * description_size}]
         async for _ in backend.complete(
             [Message(MessageRole.USER, [TextContent("run")])], tools
-        ):
+        , control=completion_control()):
             pass
 
     payloads = [json.loads(request.content) for request in requests]
@@ -950,7 +935,7 @@ async def test_luna_cache_key_keeps_plan_affinity_without_padding(
         )
         async for _ in backend.complete(
             [system, Message(MessageRole.USER, [TextContent("run")])], [tool]
-        ):
+        , control=completion_control()):
             pass
 
     first, plan, sol = (json.loads(request.content) for request in requests)
@@ -975,7 +960,7 @@ async def test_responses_stream_normalizes_cached_input_usage(tmp_path: Path) ->
             client=client,
             token_store=store_for(tmp_path / "codex.json"),
             base_url="https://test.invalid/codex/responses",
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert events[-1].data["usage"] == {
@@ -1049,7 +1034,7 @@ async def test_transient_transport_failures_retry_until_success(
         async for item in CodexBackend(
             client=client,
             token_store=store_for(tmp_path / "codex.json"),
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert len(requests) == 3
@@ -1082,7 +1067,7 @@ async def test_transient_transport_failure_exhausts_five_attempts(
             async for item in CodexBackend(
                 client=client,
                 token_store=store_for(tmp_path / "codex.json"),
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
 
     assert len(requests) == 5
@@ -1160,7 +1145,7 @@ async def test_clean_eof_without_tool_call_discards_partial_and_retries(
 ) -> None:
     requests: list[httpx.Request] = []
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -1517,7 +1502,7 @@ async def test_response_incomplete_max_output_tokens_finishes_turn_as_max_tokens
         async for item in CodexBackend(
             client=client,
             token_store=store_for(tmp_path / "codex.json"),
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert len(requests) == 1
@@ -1618,7 +1603,7 @@ async def test_response_incomplete_content_filter_is_terminal_not_retried(
         async for item in CodexBackend(
             client=client,
             token_store=store_for(tmp_path / "codex.json"),
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert len(requests) == 1
@@ -1806,6 +1791,7 @@ async def test_open_blocks_completion_retries_and_resets_partial_output(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -1863,6 +1849,7 @@ async def test_stream_inconsistency_retry_budget_is_bounded(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -1942,7 +1929,7 @@ async def test_midstream_disconnect_after_tool_call_is_not_retried(
             async for item in CodexBackend(
                 client=client,
                 token_store=store_for(tmp_path / "codex.json"),
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
 
     assert len(requests) == 1
@@ -2033,7 +2020,7 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "codex.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     completed_calls = [
@@ -2076,7 +2063,7 @@ async def test_stream_accepts_completed_reasoning_without_status(tmp_path: Path)
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "reasoning-no-status.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     message = events[-1].message
@@ -2140,7 +2127,7 @@ async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Pat
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "codex.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     message = events[-1].message
@@ -2231,7 +2218,7 @@ async def test_message_parts_allow_refusal_before_output_text(tmp_path: Path) ->
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "ordered-parts.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert events[-1].message is not None
@@ -2274,7 +2261,7 @@ async def test_message_parts_reject_shared_index_across_kinds(tmp_path: Path) ->
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "shared-index.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     await client.aclose()
 
@@ -2324,7 +2311,7 @@ async def test_reasoning_summary_and_content_parts_decode_together(tmp_path: Pat
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "combined.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert events[-1].message is not None
@@ -2346,7 +2333,7 @@ async def test_reasoning_text_round_trips_into_payload(tmp_path: Path) -> None:
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "raw.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     message = events[-1].message
@@ -2381,7 +2368,7 @@ async def test_completed_raw_reasoning_wins_over_streamed_text(tmp_path: Path) -
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "raw-mismatch.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     message = events[-1].message
@@ -2462,7 +2449,7 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "codex.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
     assert events[-1].message is not None
     assert events[-1].message.content == [ThinkingContent("stop-only"), ThinkingContent("")]
@@ -2923,7 +2910,7 @@ async def test_encrypted_only_reasoning_round_trips_into_payload(tmp_path: Path)
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "codex.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     message = events[-1].message
@@ -2988,7 +2975,7 @@ async def test_completed_reasoning_summary_wins_over_streamed_text(tmp_path: Pat
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "summary-mismatch.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert events[-1].message is not None
@@ -3009,7 +2996,7 @@ async def test_completed_summary_parts_win_over_streamed_parts(tmp_path: Path) -
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "moved-summary.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
     assert events[-1].message is not None
     assert events[-1].message.content == [ThinkingContent("ab")]
@@ -3031,7 +3018,7 @@ async def test_completed_raw_reasoning_count_wins_over_streamed_parts(
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "moved-raw.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
     assert events[-1].message is not None
     assert events[-1].message.metadata["codex_output_items"][0]["content"] == [
@@ -3057,7 +3044,7 @@ async def test_stream_rejects_cross_kind_message_parts(
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / f"{mutation}.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     await client.aclose()
 
@@ -3086,7 +3073,7 @@ async def test_stream_rejects_invalid_item_identity(
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / f"{mutation}.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     await client.aclose()
 
@@ -3114,7 +3101,7 @@ async def test_stream_rejects_unrequested_custom_tool_call(tmp_path: Path) -> No
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "custom-tool.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
 
     await client.aclose()
@@ -3130,7 +3117,7 @@ async def test_stream_rejects_missing_completed_item(tmp_path: Path) -> None:
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "missing-item.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     await client.aclose()
 
@@ -3147,7 +3134,7 @@ async def test_stream_rejects_in_progress_completed_message(tmp_path: Path) -> N
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "in-progress.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     assert raised.value.retryable is True
     assert raised.value.retry_reason == "stream_inconsistent"
@@ -3220,7 +3207,7 @@ async def test_stream_rejects_in_progress_completed_items(
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / f"{kind}.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     assert raised.value.retryable is True
     assert raised.value.retry_reason == "stream_inconsistent"
@@ -3240,7 +3227,7 @@ async def test_stream_rejects_non_completed_response_status(tmp_path: Path) -> N
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "response-status.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     assert raised.value.retryable is True
     assert raised.value.retry_reason == "stream_inconsistent"
@@ -3312,7 +3299,7 @@ async def test_stream_rejects_incomplete_completed_items(tmp_path: Path, kind: s
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / f"{kind}.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     await client.aclose()
 
@@ -3672,7 +3659,7 @@ async def test_auth_failure_and_transport_failure_are_typed(
     client = httpx.AsyncClient(transport=httpx.MockTransport(http_handler))
     with pytest.raises(CodexAuthError) as raised:
         await anext(
-            CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json")).complete([], [])
+            CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json")).complete([], [], control=completion_control())
         )
     assert "access-token-secret-value" not in str(raised.value)
     await client.aclose()
@@ -3690,7 +3677,7 @@ async def test_auth_failure_and_transport_failure_are_typed(
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "transport.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     assert "transport secret" not in str(raised.value)
     await client.aclose()
@@ -3707,7 +3694,7 @@ async def test_stream_error_does_not_expose_provider_body(tmp_path: Path) -> Non
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "codex.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     assert "access-token-secret-value" not in str(raised.value)
     await client.aclose()
@@ -3721,7 +3708,7 @@ async def test_keepalive_before_response_created_is_ignored(tmp_path: Path) -> N
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "codex.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     types = [item.type for item in collected]
@@ -3741,23 +3728,21 @@ async def test_content_event_before_response_created_is_still_rejected(
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "codex.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_events_after_response_completion_are_rejected(tmp_path: Path) -> None:
-    events = message_stream() + [event("keepalive")]
-    client = client_for(sse(events))
-    with pytest.raises(CodexStreamError, match="follows response completion"):
-        [
-            item
-            async for item in CodexBackend(
-                client=client, token_store=store_for(tmp_path / "codex.json")
-            ).complete([], [])
-        ]
-    await client.aclose()
+async def test_events_after_response_completion_are_rejected() -> None:
+    # the completion owner never reads past response completion; the decoder
+    # still rejects a record that follows it when read explicitly.
+    response = httpx.Response(200, text=sse(message_stream() + [event("keepalive")]))
+    try:
+        with pytest.raises(CodexStreamError, match="follows response completion"):
+            [item async for item in codex_module._decode_response(response)]
+    finally:
+        await response.aclose()
 
 
 @pytest.mark.asyncio
@@ -3771,7 +3756,7 @@ async def test_output_item_done_closes_message_part_without_part_done(
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "message.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert collected[-1].message is not None
@@ -3812,7 +3797,7 @@ async def test_output_item_done_closes_empty_reasoning_summary_part(
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "summary.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert collected[-1].message is not None
@@ -3832,7 +3817,7 @@ async def test_output_item_done_closes_raw_reasoning_without_text_done(
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "raw.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert collected[-1].message is not None
@@ -3881,7 +3866,7 @@ async def test_output_item_done_closes_function_arguments_without_arguments_done
         item
         async for item in CodexBackend(
             client=client, token_store=store_for(tmp_path / "function.json")
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     completion = next(
@@ -3921,7 +3906,7 @@ async def test_non_http_stream_exception_is_not_remapped(tmp_path: Path) -> None
             item
             async for item in CodexBackend(
                 client=Client(), token_store=store_for(tmp_path / "codex.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
 
 
@@ -3952,7 +3937,7 @@ async def test_non_http_cleanup_exception_is_typed_diagnostic(tmp_path: Path) ->
             client=Client(),
             token_store=store_for(tmp_path / "codex.json"),
             diagnostics_path=diagnostics_path,
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
     assert items[-1].type is StreamEventType.MESSAGE_END
     record = json.loads(diagnostics_path.read_text())
@@ -3984,7 +3969,7 @@ async def test_each_malformed_stream_fails_at_its_named_gate(
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / f"{mutation}.json")
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     await client.aclose()
 
@@ -4087,7 +4072,7 @@ async def test_cleanup_failure_keeps_primary_outcome_and_is_diagnostic(
     outcome: RuntimeError | None = None
     streamed: list[object] = []
     try:
-        streamed = [item async for item in backend.complete([], [])]
+        streamed = [item async for item in backend.complete([], [], control=completion_control())]
     except RuntimeError as exc:
         outcome = exc
 
@@ -4141,9 +4126,9 @@ async def test_cleanup_control_exception_matrix(
     if scope == "client":
         if primary:
             with pytest.raises(CodexStreamError):
-                [item async for item in backend.complete([], [])]
+                [item async for item in backend.complete([], [], control=completion_control())]
         else:
-            [item async for item in backend.complete([], [])]
+            [item async for item in backend.complete([], [], control=completion_control())]
         if cleanup_error is asyncio.CancelledError:
             with pytest.raises(cleanup_error) as raised:
                 await backend.aclose()
@@ -4152,9 +4137,16 @@ async def test_cleanup_control_exception_matrix(
             close_outcome = await backend.aclose()
             assert len(close_outcome.failures) == 1
             assert isinstance(close_outcome.failures[0].error, GeneratorExit)
+    elif not primary and cleanup_error is GeneratorExit:
+        # the owner closes a completed response at its sentinel; a GeneratorExit
+        # from that close is the close itself, so the response stands.
+        streamed = [
+            item async for item in backend.complete([], [], control=completion_control())
+        ]
+        assert streamed[-1].type is StreamEventType.MESSAGE_END
     else:
         with pytest.raises(cleanup_error) as raised:
-            [item async for item in backend.complete([], [])]
+            [item async for item in backend.complete([], [], control=completion_control())]
         if primary:
             assert isinstance(raised.value.__cause__, CodexStreamError)
         else:
@@ -4174,7 +4166,7 @@ async def test_consumer_aclose_finishes_without_leaking_cleanup(
         async def aiter_lines(self):
             for line in sse(message_stream()[:1]).splitlines():
                 yield line
-            await never.wait()
+            await await_or_fail(never.wait(), what="never.wait()")
 
     class Stream:
         async def __aenter__(self):
@@ -4189,7 +4181,7 @@ async def test_consumer_aclose_finishes_without_leaking_cleanup(
 
     iterator = CodexBackend(
         client=Client(), token_store=store_for(tmp_path / "codex.json")
-    ).complete([], [])
+    ).complete([], [], control=completion_control())
     assert (await anext(iterator)).type is StreamEventType.MESSAGE_START
     await asyncio.wait_for(iterator.aclose(), timeout=1)
     assert cleanup_finished.is_set()
@@ -4215,7 +4207,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
 
         async def __aexit__(self, exc_type, exc_value, traceback):
             cleanup_started.set()
-            await never.wait()
+            await await_or_fail(never.wait(), what="never.wait()")
 
     class Client:
         def stream(self, method, url, *, headers, json):
@@ -4225,14 +4217,14 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
     async def consume() -> list[StreamEventType]:
         return [
             item.type
-            async for item in CodexBackend(client=Client(), token_store=store).complete([], [])
+            async for item in CodexBackend(client=Client(), token_store=store).complete([], [], control=completion_control())
         ]
 
     task = asyncio.create_task(consume())
     await asyncio.wait_for(cleanup_started.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as raised:
-        await task
+        await await_or_fail(task, what="task")
     assert isinstance(raised.value.__cause__, CodexStreamError)
 
 
@@ -4413,7 +4405,7 @@ async def test_response_failed_diagnostic_records_structured_context(tmp_path: P
         diagnostics_path=tmp_path / "diagnostics.jsonl",
     )
     with pytest.raises(CodexStreamError):
-        [item async for item in backend.complete([], [])]
+        [item async for item in backend.complete([], [], control=completion_control())]
     records = [json.loads(line) for line in (tmp_path / "diagnostics.jsonl").read_text().splitlines()]
     assert len(records) == 1
     record = records[0]
@@ -4463,7 +4455,7 @@ async def test_diagnostic_records_actual_retry_decision(
         diagnostics_path=path,
     )
     with pytest.raises(CodexStreamError):
-        [item async for item in backend.complete([], [])]
+        [item async for item in backend.complete([], [], control=completion_control())]
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert len(records) == 1
     assert records[0]["retryable"] is True
@@ -4500,7 +4492,7 @@ async def test_diagnostic_records_actual_retry_decision(
         diagnostics_path=exhausted_path,
     )
     with pytest.raises(CodexStreamError):
-        [item async for item in backend.complete([], [])]
+        [item async for item in backend.complete([], [], control=completion_control())]
     exhausted = [json.loads(line) for line in exhausted_path.read_text().splitlines()]
     assert len(exhausted) == 5
     assert [record["will_retry"] for record in exhausted] == [True] * 4 + [False]

@@ -14,6 +14,7 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
 )
+from zeta.providers.completion import owned_completion
 
 
 class StopThenFailBackend(CompletionBackend):
@@ -21,6 +22,7 @@ class StopThenFailBackend(CompletionBackend):
         self.calls = 0
         self.started = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tool_schemas: Sequence[dict[str, Any]]
     ) -> AsyncIterator[StreamEvent]:
@@ -38,6 +40,7 @@ class ServerFakeBackend(CompletionBackend):
         self.delay = delay
         self.model = model
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tool_schemas: Sequence[dict[str, Any]]
     ) -> AsyncIterator[StreamEvent]:
