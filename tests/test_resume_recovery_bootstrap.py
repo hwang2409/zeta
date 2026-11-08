@@ -105,9 +105,11 @@ async def test_resume_activation_and_stage_reads_do_not_encode_history(
         return b"request"
 
     count_stage.__name__ = "_stage_delivery_request"
+    # test-contract: complexity counts historical row encodes on the real turn path
     monkeypatch.setattr(
         ConversationStore, "_encoded_entry_line", staticmethod(count_historical)
     )
+    # test-contract: seam counts both production stage calls per provider attempt
     monkeypatch.setattr(ConversationStore, "_stage_delivery_request", count_stage)
     backend = FakeBackend(
         [
@@ -179,6 +181,7 @@ async def test_real_tool_turn_keeps_retained_writer_aligned(
 
     sync_append.__name__ = "append_message"
     async_append.__name__ = "append_message_async"
+    # test-contract: complexity counts historical row encodes on the real tool path
     monkeypatch.setattr(
         ConversationStore, "_encoded_entry_line", staticmethod(count_historical)
     )
@@ -343,6 +346,7 @@ async def test_owner_sync_delta_falls_back_if_external_writer_follows(
         reloads += 1
         original_load(store)
 
+    # test-contract: durability proves an external append forces a clean full reload
     monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
     try:
         await flow.prepare_request("idle_start", [], None)
@@ -386,6 +390,7 @@ async def test_warm_writer_sees_external_append_between_open_and_start(
         return original_snapshot(store)
 
     monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
+    # test-contract: complexity distinguishes one bounded snapshot from repeated copies
     monkeypatch.setattr(ConversationStore, "_snapshot_log_state", count_snapshots)
     flow = StepDeliveryFlow(resident)
     await flow.initialize()

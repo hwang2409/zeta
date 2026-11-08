@@ -945,6 +945,7 @@ async def test_async_linear_append_does_not_snapshot_complete_history(
     def reject_snapshot(_store: ConversationStore) -> None:
         raise AssertionError("ordinary async append copied complete store state")
 
+    # test-contract: complexity rejects a full-state copy on ordinary async append
     monkeypatch.setattr(ConversationStore, "_snapshot_log_state", reject_snapshot)
 
     entry = await store.append_message_async(
