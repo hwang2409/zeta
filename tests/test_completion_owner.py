@@ -421,11 +421,11 @@ class _BlockingCloseAttempt(_SequenceAttempt):
     async def aclose(self) -> None:
         self.close_started.set()
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="blocking response close")
         except asyncio.CancelledError:
             self.close_cancelled.set()
             if self.slow_cancel is not None:
-                await self.slow_cancel.wait()
+                await await_or_fail(self.slow_cancel.wait(), what="slow close cancellation")
             raise
         finally:
             self.close_finished.set()
@@ -461,7 +461,7 @@ async def test_task_deadline_bounds_the_stream_close() -> None:
     finally:
         if not closing.done():
             closing.cancel()
-        await asyncio.gather(closing, return_exceptions=True)
+        await _within(asyncio.gather(closing, return_exceptions=True))
 
 
 @pytest.mark.asyncio
@@ -490,4 +490,4 @@ async def test_outer_cancel_during_task_deadline_drain_waits_for_close() -> None
         slow_cancel.set()
         if not closing.done():
             closing.cancel()
-        await asyncio.gather(closing, return_exceptions=True)
+        await _within(asyncio.gather(closing, return_exceptions=True))
