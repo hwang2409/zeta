@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import ast
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,55 +9,25 @@ import pytest
 
 from tests.support.serve_close import close_serve
 
-_TESTS_ROOT = Path(__file__).resolve().parent
-_CLOSE_SERVE_CONDITION_FIX = (
-    "call close_serve unconditionally; pass optional writers as "
-    "*[w for w in (...) if w is not None]"
-)
 
-
-def _is_close_serve_call(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    return (isinstance(func, ast.Name) and func.id == "close_serve") or (
-        isinstance(func, ast.Attribute) and func.attr == "close_serve"
+def _run_owner_test(pytester: pytest.Pytester, source: str):
+    pytester.makeconftest('pytest_plugins = ("tests.conftest", "pytest_asyncio")')
+    pytester.makeini("[pytest]\nasyncio_mode = auto\n")
+    pytester.makepyfile(test_owner=source)
+    root = str(Path(__file__).resolve().parents[1])
+    old_pythonpath = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = (
+        root
+        if not old_pythonpath
+        else os.pathsep.join((root, old_pythonpath))
     )
-
-
-def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
-    """Line numbers of close_serve calls nested in an if/elif/else body.
-
-    close_serve owns serve-test cleanup; gating it behind a condition is the
-    recurring bug where an early failure skips the server/writer close and
-    leaks descriptors into the next test (PR #881 rounds 1-2). The guard has no
-    exemptions: a call that needs a condition is rewritten to the unconditional
-    form instead.
-    """
-    lines: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.If):
-            for branch in (node.body, node.orelse):
-                for statement in branch:
-                    for inner in ast.walk(statement):
-                        if _is_close_serve_call(inner):
-                            lines.add(inner.lineno)
-    return lines
-
-
-def test_close_serve_is_never_called_under_a_condition() -> None:
-    offenders: list[str] = []
-    for path in sorted(_TESTS_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        root = _TESTS_ROOT.parent
-        offenders.extend(
-            f"{path.relative_to(root)}:{line}"
-            for line in sorted(_conditional_close_serve_lines(tree))
-        )
-    assert not offenders, (
-        "close_serve must not be nested inside an if/elif/else body "
-        f"({', '.join(offenders)}): {_CLOSE_SERVE_CONDITION_FIX}"
-    )
+    try:
+        return pytester.runpytest_subprocess("-q")
+    finally:
+        if old_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = old_pythonpath
 
 
 @dataclass
@@ -74,6 +44,107 @@ class _Server:
         self.closed = True
         if self.fail:
             raise RuntimeError("server close failed")
+
+
+def test_server_owner_closes_after_body_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from pathlib import Path
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_leaked_server(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    await server.start()
+    original_close = server.close
+    async def close_and_prove():
+        await original_close()
+        assert not server.socket_path.exists()
+        assert server._server is None
+        Path("closed").write_text("closed")
+    server.close = close_and_prove
+    assert False, "original body failure"
+""",
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*AssertionError: original body failure*"])
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_server_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_explicit_close(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    await server.start()
+    await server.close()
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
+def test_server_owner_reports_bounded_close_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import pytest
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_hanging_close(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    async def hang():
+        await asyncio.Event().wait()
+    server.close = hang
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*ZetaServer.close did not finish within 10 s*"])
+
+
+def test_server_owner_closes_all_servers(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from pathlib import Path
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_two_servers(tmp_path):
+    servers = [
+        ZetaServer(home=tmp_path / str(index), port=0, provider="codex")
+        for index in range(2)
+    ]
+    for server in servers:
+        await server.start()
+        original_close = server.close
+        async def close_and_prove(server=server, original_close=original_close):
+            await original_close()
+            assert server._server is None
+            with Path("closed").open("a") as marker:
+                marker.write("x")
+        server.close = close_and_prove
+""",
+    )
+    result.assert_outcomes(passed=1)
+    assert (pytester.path / "closed").read_text() == "xx"
 
 
 class _Writer:

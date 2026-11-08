@@ -39,11 +39,19 @@ def _never(_args: str) -> bool:
     return False
 
 
+def _always(_args: str) -> bool:
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class ServeSlash:
     """Serve-specific policy for one shared slash command."""
 
-    mutates: Callable[[str], bool] = _never
+    mutates: Callable[[str], bool] = _always
+    runs_while_busy: Callable[[str], bool] = _never
+
+    def can_run_while_busy(self, args: str) -> bool:
+        return self.runs_while_busy(args) and not self.mutates(args)
 
 
 class SlashSurface(StrEnum):
@@ -74,9 +82,7 @@ class SlashCommandRegistry:
         self._skills: dict[str, SkillMeta] = {}
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
-        self._mcp_prompts = MCPPromptCommands(
-            self._notices, self._warning_notices
-        )
+        self._mcp_prompts = MCPPromptCommands(self._notices, self._warning_notices)
 
     def register(self, command: SlashCommand) -> None:
         if not is_slash_safe_name(command.name):
@@ -89,7 +95,9 @@ class SlashCommandRegistry:
     def custom_commands(self) -> tuple[CustomCommand, ...]:
         """Return loaded custom commands in stable name order."""
 
-        return tuple(self._custom_commands[name] for name in sorted(self._custom_commands))
+        return tuple(
+            self._custom_commands[name] for name in sorted(self._custom_commands)
+        )
 
     @property
     def builtin_commands(self) -> tuple[SlashCommand, ...]:
@@ -151,9 +159,7 @@ class SlashCommandRegistry:
         prompts = self._mcp_prompts.completion_entries()
         return builtins + custom + skills + prompts
 
-    def set_mcp_prompts(
-        self, entries: Sequence[tuple[str, str, MCPPrompt]]
-    ) -> None:
+    def set_mcp_prompts(self, entries: Sequence[tuple[str, str, MCPPrompt]]) -> None:
         """Replace live MCP prompt commands from one mount snapshot."""
         self._mcp_prompts.replace(tuple(entries))
 
