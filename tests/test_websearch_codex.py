@@ -101,7 +101,7 @@ def install_codex_transport(
     status: int = 200,
     stream: httpx.AsyncByteStream | None = None,
 ) -> None:
-    async def access_token(_store, _client):
+    async def access_token(_store, _client, **_kwargs):
         return "test-token"
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -608,7 +608,7 @@ async def test_inflight_acquisition_cleared_after_completion(monkeypatch, regist
     release_first = asyncio.Event()
     first_finished = asyncio.Event()
 
-    async def access_token(_store, _client):
+    async def access_token(_store, _client, **_kwargs):
         nonlocal acquisition_calls
         acquisition_calls += 1
         if acquisition_calls == 1:

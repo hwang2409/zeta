@@ -314,7 +314,7 @@ class AccountUsage:
     ) -> httpx.Response:
         from ..codex import CodexCredentialDriver
         from ..providers.anthropic import AnthropicCredentialDriver
-        from .store import AccountCredentials
+        from .store import AccountCredentials, credential_wait_timeout_seconds
 
         driver = (
             AnthropicCredentialDriver()
@@ -322,7 +322,9 @@ class AccountUsage:
             else CodexCredentialDriver()
         )
         credentials = AccountCredentials(self.store, account, driver)
-        token = await credentials.access_token(client)
+        token = await credentials.access_token(
+            client, lock_timeout=credential_wait_timeout_seconds()
+        )
         headers = credentials.auth_headers(token)
         headers["accept"] = "application/json"
         if account.provider == "anthropic":
