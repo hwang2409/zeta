@@ -19,6 +19,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
+    ImageContent,
     Message,
     MessageOrigin,
     MessageRole,
@@ -29,6 +30,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.providers import codex_payload
 from zeta.providers.anthropic import OAuthTokens
 from zeta.providers.codex import (
     DEFAULT_CODEX_MODEL,
@@ -44,6 +46,58 @@ from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+
+
+def test_codex_reuses_strict_image_validation_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+    message = Message.from_dict(
+        {
+            "role": "user",
+            "content": [{"type": "image", "data": data, "mimeType": "image/png"}],
+        }
+    )
+    assert isinstance(message.content[0], ImageContent)
+    monkeypatch.setattr(
+        codex_payload,
+        "decoded_image_bytes",
+        lambda image: pytest.fail("strictly reconstructed image was decoded twice"),
+    )
+    payload = build_responses_payload([message], [], model="gpt-5")
+    assert payload["input"][0]["content"][0]["image_url"] == f"data:image/png;base64,{data}"
+
+
+def test_codex_keeps_direct_image_validation_and_tool_result_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+    calls = 0
+    original = codex_payload.decoded_image_bytes
+
+    def count_decode(image):
+        nonlocal calls
+        calls += 1
+        return original(image)
+
+    monkeypatch.setattr(codex_payload, "decoded_image_bytes", count_decode)
+    direct = Message(MessageRole.USER, [ImageContent(data, "image/png")])
+    build_responses_payload([direct], [], model="gpt-5")
+    tool = ToolResult.from_dict(
+        {
+            "tool_call_id": "call",
+            "content": "image",
+            "is_error": False,
+            "content_blocks": [{"type": "image", "data": data, "mimeType": "image/png"}],
+        }
+    )
+    tool_message = Message(MessageRole.TOOL_RESULT, [], tool_result=tool)
+    build_responses_payload([tool_message], [], model="gpt-5")
+    assert calls == 1
+    assert tool.content_blocks is not None
+    tool.content_blocks[0]["data"] = "invalid"
+    build_responses_payload([tool_message], [], model="gpt-5")
+    assert calls == 2
 
 
 def test_tool_argument_deltas_do_not_parse_until_item_completion(

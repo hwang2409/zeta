@@ -44,6 +44,8 @@ class MessageRole(StrEnum):
 
 MESSAGE_ORIGIN_METADATA = "zeta.origin"
 
+_VALIDATED_IMAGE = object()
+
 
 class MessageOrigin(StrEnum):
     """Durable authorship source, independent of provider-facing message role."""
@@ -105,6 +107,9 @@ class ImageContent:
     mime_type: str
     path: str | None = None
     size: int | None = None
+    _validation_marker: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @property
     def type(self) -> ContentType:
@@ -559,7 +564,9 @@ def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
             raise ValueError("image content path must be a nonempty string")
         if size is not None and (type(size) is not int or size < 0):
             raise ValueError("image content size must be a nonnegative integer")
-        return ImageContent(data, mime_type, path, size)
+        image = ImageContent(data, mime_type, path, size)
+        object.__setattr__(image, "_validation_marker", _VALIDATED_IMAGE)
+        return image
     if content_type is ContentType.THINKING:
         text = value.get("text")
         if type(text) is not str:
@@ -590,6 +597,9 @@ class ToolResult:
     )
     is_canceled: bool = field(default=False, compare=False)
     lifecycle_projection: dict[str, Any] | None = field(default=None, compare=False)
+    _validation_marker: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -656,7 +666,7 @@ class ToolResult:
                 )
         if structured_content is not None and type(structured_content) is not dict:
             raise ValueError("tool result structured_content must be an object")
-        return cls(
+        result = cls(
             tool_call_id=tool_call_id,
             content=content,
             is_error=is_error,
@@ -666,6 +676,17 @@ class ToolResult:
             ),
             is_canceled=is_canceled,
         )
+        if content_blocks is not None:
+            object.__setattr__(
+                result,
+                "_validation_marker",
+                tuple(
+                    (id(block), block["data"], block["mimeType"])
+                    for block in content_blocks
+                    if block["type"] == "image"
+                ),
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
