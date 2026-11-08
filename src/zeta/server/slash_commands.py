@@ -9,6 +9,7 @@ themselves as such rather than half-executing.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
@@ -25,6 +27,10 @@ from ..core.slash import (
     SlashStatus,
     _format_status,
     create_slash_registry,
+)
+from ..core.transcript_recovery.runtime import (
+    repair_transcript_for_runtime,
+    transcript_repair_available,
 )
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
@@ -109,6 +115,90 @@ class ServerSlashSession:
 
     # --- runnable server-side ---
 
+    async def slash_decisions(self, args: str) -> str:
+        from ..attention_decisions import open_decisions
+        from ..attention_forks import deliver_attention_decision
+        from ..attention_records import AttentionStore
+
+        loop = self._runtime.loop
+        opened = self._runtime.opened
+        if loop is None or opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        parts = args.split(maxsplit=2)
+        registry_state = self._runtime.manager.project_registry_state
+        items = await asyncio.to_thread(
+            open_decisions,
+            self._runtime.home,
+            opened.metadata.session_id,
+            registry_state,
+        )
+        if parts and parts[0] in {"dismiss", "reply"}:
+            if len(parts) < 2:
+                return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
+            item = next((item for item in items if item.record.id == parts[1]), None)
+            if item is None:
+                return "attention item not found"
+            store = AttentionStore(self._runtime.home / "sessions" / item.session_id)
+            if parts[0] == "dismiss":
+                await asyncio.to_thread(
+                    store.dismiss, item.record.id, session_id=item.session_id
+                )
+                return f"dismissed {item.record.id}"
+            if len(parts) < 3 or not parts[2].strip():
+                return "reply text must be nonempty"
+            await asyncio.to_thread(
+                deliver_attention_decision,
+                self._runtime.home,
+                item.record,
+                parts[2],
+                from_session=opened.metadata.session_id,
+                registry_state=registry_state,
+            )
+            return f"replied to {item.record.id}"
+        if not items:
+            return "no open attention items"
+        return "open attention items:\n" + "\n".join(
+            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            for item in items
+        )
+
+    @property
+    def plan_mode(self) -> bool:
+        return self._runtime.loop.plan_mode if self._runtime.loop is not None else False
+
+    @property
+    def active(self) -> bool:
+        return False
+
+    @property
+    def pending_approvals(self) -> tuple[str, ...]:
+        if self._approval_control is None:
+            return ()
+        return self._approval_control.pending_approval_labels()
+
+    def set_plan_mode(self, enabled: bool):
+        if self._runtime.loop is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        return self._runtime.loop.set_plan_mode(enabled)
+
+    def invalidate_prompt(self) -> None:
+        return None
+
+    def plan_mode_background_blocker(self) -> str | None:
+        work = tuple(getattr(self._runtime.loop, "background_work_descriptions", ()))
+        if not work:
+            return None
+        return (
+            "plan mode unchanged: background work is active: "
+            f"{', '.join(work)}; stop it or wait"
+        )
+
+    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
+        return await run_plan_command(self, args)
+
+    async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
+        return await run_implement_command(self, args)
+
     def slash_status_command(self, args: str) -> str | Awaitable[str]:
         del args
         if self._run_blocking is None:
@@ -167,7 +257,12 @@ class ServerSlashSession:
         displays = await asyncio.to_thread(context.store.list_display)
         lines: list[str] = []
         for item in displays:
-            lines.append(str(item) + (f"  {item.detail}" if item.detail else ""))
+            availability = (
+                "  unavailable: credentials missing" if not item.available else ""
+            )
+            lines.append(
+                str(item) + (f"  {item.detail}" if item.detail else "") + availability
+            )
             lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
         return "\n".join(lines) or "no accounts"
 
@@ -272,6 +367,34 @@ class ServerSlashSession:
                 runtime.loop._set_runtime_project(runtime.metadata)
         return view.text
 
+    async def slash_repair_transcript(self, args: str) -> str:
+        parts = args.split()
+        if len(parts) not in {2, 3} or parts[-1] != "confirm":
+            return "usage: /repair-transcript <session-id> [<child-run-id>] confirm"
+        child_run_id = parts[1] if len(parts) == 3 else None
+        result = await repair_transcript_for_runtime(
+            self._runtime.manager,
+            parts[0],
+            child_run_id,
+            parent_store=(
+                self._runtime.opened.store
+                if self._runtime.opened is not None
+                else None
+            ),
+            memory_reconciler=(
+                self._runtime.loop.memory_reconciler
+                if self._runtime.loop is not None
+                else None
+            ),
+        )
+        return (
+            f"repaired transcript {parts[0]}"
+            + (f" child {child_run_id}" if child_run_id is not None else "")
+            + "; quarantine "
+            f"{result.quarantine_id}; retained through sequence "
+            f"{result.retained_last_sequence}"
+        )
+
     async def slash_memory(self, args: str) -> str:
         runtime = self._runtime
         project_id = runtime.metadata.project_id
@@ -282,7 +405,7 @@ class ServerSlashSession:
             return "memory: project registry unavailable"
         loop = getattr(runtime, "loop", None)
         reconciler = loop.memory_reconciler if loop is not None else None
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             run_memory_command,
             registry,
             project_id,
@@ -290,6 +413,7 @@ class ServerSlashSession:
             reconciler,
             MemoryMutationAuthorization.direct_slash(),
         )
+        return await result if inspect.isawaitable(result) else result
 
     async def slash_mcp(
         self, args: str
@@ -375,11 +499,46 @@ async def list_commands(
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
-    entries = _entries_from_registry(registry, include_unavailable=include_unavailable)
+    repair_available = transcript_repair_available(runtime.manager)
+    entries = [
+        entry
+        for entry in _entries_from_registry(
+            registry, include_unavailable=include_unavailable
+        )
+        if repair_available or entry.name != "repair-transcript"
+    ]
     return {
         "commands": [entry.to_dict() for entry in entries],
         "notices": list(registry.notices),
     }
+
+
+async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
+    """Return whether slash_run can resolve without starting model work."""
+
+    first_line = text.split("\n", 1)[0]
+    parts = first_line[1:].split(maxsplit=1)
+    if not parts:
+        return False
+    name = parts[0]
+    tail = parts[1] if len(parts) == 2 else ""
+    if runtime.loop is not None:
+        await runtime.loop.refresh_skills()
+    registry = await asyncio.to_thread(build_registry, runtime)
+    command = registry.command_for(name)
+    if command is not None:
+        if not registry.available(command):
+            return True
+        return command.serve is not None and command.serve.can_run_while_busy(tail)
+    custom = registry.custom_command_for(name)
+    if custom is not None:
+        return custom.kind == "exec" or registry.needs_inline_shell_resolution(text)
+    if any(skill.name == name for skill in registry.skill_entries):
+        return False
+    return any(
+        prompt_name == name
+        for prompt_name, _description, _source in registry.mcp_prompt_entries
+    )
 
 
 async def run_command(
@@ -389,10 +548,11 @@ async def run_command(
     register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
     approval_control: _ApprovalProjection | None = None,
     run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
+    busy: bool = False,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
-    if not text.startswith("/") or text.startswith("//"):
+    if not text.startswith("/"):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must start with '/'")
     first_line = text.split("\n", 1)[0]
     parts = first_line[1:].split(maxsplit=1)
@@ -406,7 +566,11 @@ async def run_command(
     command = registry.command_for(name)
     if command is not None and not registry.available(command):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    if command is not None and command.serve is not None and command.serve.mutates(tail):
+    if (
+        command is not None
+        and command.serve is not None
+        and command.serve.mutates(tail)
+    ):
         ergonomics.require_mutable(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
@@ -419,18 +583,24 @@ async def run_command(
         if custom.kind != "prompt" or registry.needs_inline_shell_resolution(text):
             return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
         envelope = registry.input_for_model(text)
+        if busy:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(
-        runtime, approval_control, run_blocking=run_blocking
-    )
+    session = ServerSlashSession(runtime, approval_control, run_blocking=run_blocking)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}
     if isinstance(result, SlashPromptError):
         return {"kind": SlashResultKindDescriptor.ERROR, "text": result.message}
     if isinstance(result, ModelInputEnvelope):
+        if busy:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         return _model_input_result(result, register_model_input)
     if isinstance(result, _ClientOnlySlashResult):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": result.name}
@@ -533,6 +703,7 @@ __all__ = [
     "ServerSlashSession",
     "SlashCommandInfo",
     "build_registry",
+    "can_run_while_busy",
     "list_commands",
     "run_command",
 ]
