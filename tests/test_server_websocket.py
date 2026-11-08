@@ -692,3 +692,31 @@ def test_serve_websocket_cli_flags() -> None:
     )
     assert args.ws_port == 8765
     assert args.ws_origins == ["http://127.0.0.1:5173", "https://app.example:443"]
+
+
+@pytest.mark.asyncio
+async def test_websocket_child_history_requires_negotiation(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await server.start()
+    reader, writer, status, _ = await _connect(
+        server, token=server._websocket.token, protocol_fields=["zeta.v1"]
+    )
+    assert status == 101
+    try:
+        await _send_json(
+            writer,
+            {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2"}},
+        )
+        assert (await _read_json(reader))["id"] == 1
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "child_run_history",
+                "params": {"session_id": "missing", "run_id": "bad"},
+            },
+        )
+        assert (await _read_json(reader))["error"]["code"] == -32601
+    finally:
+        await close_serve(server, writer)
