@@ -23,7 +23,7 @@ _ALLOWED_REASONS = {
 
 # Each row is (module, function, reason). Persisted payloads must not be allowlisted.
 _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
-    ("zeta.accounts.store", "_registry_reference_index", "in-memory value"),
+    ("zeta.accounts.registry", "_registry_reference_index", "in-memory value"),
     ("zeta.config.settings", "_strip_unsafe_project_keys", "settings"),
     ("zeta.config.settings", "_merge_tool_policy", "settings"),
     ("zeta.config.settings", "_validate", "settings"),
