@@ -165,6 +165,7 @@ class ContextAssembler(ContextMarkerMixin):
             self.token_budget,
             self.estimator_token_budget,
         )
+
     def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
         if force:
@@ -366,19 +367,19 @@ class ContextAssembler(ContextMarkerMixin):
         return list(context.messages)
 
     def discard_prepared_context(self) -> None:
+        """Drop an unconsumed preparation, including its message graph."""
         self._preparation_owner.discard()
+
 
     async def prepare_context(
         self,
         *,
-        backend: CompletionBackend | None = None,
         force: bool = False,
         reserved_estimator_tokens: int = 0,
         system_append: str = "",
     ) -> bool:
         if reserved_estimator_tokens < 0:
             raise ValueError("reserved estimator tokens must be non-negative")
-        self._preparation_owner._prepare = self._prepare_assembly
         return await self._preparation_owner.prepare(
             force=force,
             reserved_estimator_tokens=reserved_estimator_tokens,
@@ -403,25 +404,12 @@ class ContextAssembler(ContextMarkerMixin):
         """
 
         assembly_budget = self._preparation_owner.budget(reserved_estimator_tokens)
-        while True:
-            key = self._preparation_owner.key(
-                self.store.active_branch_head_id(),
-                force=force,
-                assembly_budget=assembly_budget,
-                system_append=system_append,
-            )
-            prepared = self._preparation_owner.take(key)
-            if prepared is not None:
-                branch, preparation = prepared
-                branch_id = self._branch_id(branch)
-                break
-            self._preparation_owner._prepare = self._prepare_assembly
-            await self._preparation_owner.prepare(
-                force=force,
-                reserved_estimator_tokens=reserved_estimator_tokens,
-                system_append=system_append,
-            )
-            continue
+        branch, preparation = await self._preparation_owner.prepare_and_take(
+            force=force,
+            reserved_estimator_tokens=reserved_estimator_tokens,
+            system_append=system_append,
+        )
+        branch_id = self._branch_id(branch)
         items = preparation.items
         result_seqs = preparation.result_seqs
         boundary = preparation.boundary
@@ -1219,7 +1207,9 @@ class ContextAssembler(ContextMarkerMixin):
                 items.extend(self._marker_items(marker, active_source_seqs, entries))
         return items
 
-    def _branch_id(self, entries: Sequence[ConversationEntry]) -> str | None: return entries[-1].id if entries else None
+    @staticmethod
+    def _branch_id(entries: Sequence[ConversationEntry]) -> str | None:
+        return entries[-1].id if entries else None
 
     def _tail_boundary(self, items: Sequence[_ContextItem]) -> int:
         tail_start = max(0, len(items) - self.retained_tail)

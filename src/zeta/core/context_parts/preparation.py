@@ -36,7 +36,13 @@ class ContextPreparation:
         self._prepared: tuple[PreparationKey, Prepared] | None = None
 
     @staticmethod
-    def key(branch_id: str | None, *, force: bool, assembly_budget: int, system_append: str) -> PreparationKey:
+    def key(
+        branch_id: str | None,
+        *,
+        force: bool,
+        assembly_budget: int,
+        system_append: str,
+    ) -> PreparationKey:
         return branch_id, force, assembly_budget, system_append
 
     def update_budgets(self, token_budget: int, estimator_budget: int) -> None:
@@ -48,6 +54,30 @@ class ContextPreparation:
         if reserved_estimator_tokens < 0:
             raise ValueError("reserved estimator tokens must be non-negative")
         return self._token_budget if reserved_estimator_tokens == 0 else max(1, self._estimator_budget - reserved_estimator_tokens)
+
+    async def prepare_and_take(
+        self,
+        *,
+        force: bool,
+        reserved_estimator_tokens: int,
+        system_append: str,
+    ) -> tuple[tuple[ConversationEntry, ...], _AssemblyPreparation]:
+        assembly_budget = self.budget(reserved_estimator_tokens)
+        while True:
+            key = self.key(
+                self._store.active_branch_head_id(),
+                force=force,
+                assembly_budget=assembly_budget,
+                system_append=system_append,
+            )
+            prepared = self.take(key)
+            if prepared is not None:
+                return prepared
+            await self.prepare(
+                force=force,
+                reserved_estimator_tokens=reserved_estimator_tokens,
+                system_append=system_append,
+            )
 
     async def prepare(self, *, force: bool, reserved_estimator_tokens: int, system_append: str) -> bool:
         assembly_budget = self.budget(reserved_estimator_tokens)

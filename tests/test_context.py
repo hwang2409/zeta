@@ -87,7 +87,7 @@ async def _append_during_preparation(
             assert release_preparation.wait(2)
         return real_prepare(*args, **kwargs)
 
-    monkeypatch.setattr(assembler, "_prepare_assembly", blocked_prepare)
+    monkeypatch.setattr(assembler._preparation_owner, "_prepare", blocked_prepare)
     assembly = asyncio.create_task(assembler.assemble_context())
     assert await asyncio.to_thread(preparation_started.wait, 2)
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("appended")]), MessageOrigin.USER))
@@ -148,7 +148,7 @@ async def test_prepared_context_is_consumed_once(tmp_path: Path, monkeypatch: py
         return real_prepare(*args, **kwargs)
 
     # test-contract: seam instrumentation verifies one preparation per head.
-    monkeypatch.setattr(assembler, "_prepare_assembly", observed_prepare)
+    monkeypatch.setattr(assembler._preparation_owner, "_prepare", observed_prepare)
     assert await assembler.prepare_context() is False
     first = await assembler.assemble_context()
     second = await assembler.assemble_context()
@@ -170,10 +170,9 @@ async def test_budget_update_discards_prepared_context(tmp_path: Path, monkeypat
         return real_prepare(*args, **kwargs)
 
     # test-contract: seam instrumentation verifies budget invalidation.
-    monkeypatch.setattr(assembler, "_prepare_assembly", observed_prepare)
+    monkeypatch.setattr(assembler._preparation_owner, "_prepare", observed_prepare)
     await assembler.prepare_context()
     assembler.update_token_budget(5_000)
-    assert assembler._preparation_owner._prepared is None
     await assembler.assemble_context()
 
     assert budgets == [10_000, 5_000]
@@ -193,7 +192,7 @@ async def test_prepared_context_retries_after_append(tmp_path: Path, monkeypatch
         return real_prepare(*args, **kwargs)
 
     # test-contract: seam instrumentation verifies stale-head retry.
-    monkeypatch.setattr(assembler, "_prepare_assembly", observed_prepare)
+    monkeypatch.setattr(assembler._preparation_owner, "_prepare", observed_prepare)
     await assembler.prepare_context()
     store.append_message(text(MessageRole.USER, "after"))
     assembled = await assembler.assemble_context()

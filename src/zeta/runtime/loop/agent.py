@@ -842,7 +842,6 @@ class AgentLoop(
                     await account_context.ensure_account_state(self)
                 try:
                     should_compact = await self.context_assembler.prepare_context(
-                        backend=self.backend,
                         force=retrying_context,
                         system_append=host_instruction,
                     )

@@ -449,7 +449,7 @@ async def test_runtime_prepares_context_once_without_sync_preflight(
         return False
 
     # test-contract: seam instrumentation verifies one runtime preparation.
-    monkeypatch.setattr(loop.context_assembler, "_prepare_assembly", observed_prepare)
+    monkeypatch.setattr(loop.context_assembler._preparation_owner, "_prepare", observed_prepare)
     monkeypatch.setattr(loop.context_assembler, "needs_compaction", unexpected_preflight)
 
     await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
