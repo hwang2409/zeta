@@ -46,13 +46,10 @@ run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 def pytest_sessionstart(session: pytest.Session) -> None:
     if not _IS_REPOSITORY_TESTS:
         return
-    root = Path(str(session.config.rootpath)).resolve()
-    if root != _REPOSITORY_ROOT:
-        return
     import zeta
 
     imported = Path(zeta.__file__).resolve()
-    source = (root / "src").resolve()
+    source = (_REPOSITORY_ROOT / "src").resolve()
     if not imported.is_relative_to(source):
         pytest.exit(
             f"wrong zeta import: {imported}; expected source under {source}. "
