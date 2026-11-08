@@ -14712,14 +14712,12 @@ async def _run_until_idle_wait(
     monkeypatch: pytest.MonkeyPatch,
     *,
     replies: list[str] | None = None,
-    result_texts: list[str] | None = None,
     wait_for_idle: bool = True,
     child_instance_id: str = "root:1",
 ) -> tuple[asyncio.Task[dict[str, object]], asyncio.Event, list[str]]:
     idle_waiting = asyncio.Event()
     prompts: list[str] = []
     reply_texts = iter(replies or ["last child message"])
-    rendered_texts = iter(result_texts) if result_texts is not None else None
 
     async def consume(_loop, prompt, **kwargs):
         await _ack_fake_delivery(child, kwargs)
@@ -14732,9 +14730,7 @@ async def _run_until_idle_wait(
             "content": [
                 {
                     "type": "text",
-                    "text": next(rendered_texts, reply)
-                    if rendered_texts is not None
-                    else reply,
+                    "text": reply,
                 }
             ],
             "isError": False,
