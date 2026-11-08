@@ -210,14 +210,6 @@ class _PresentNotificationsCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class _AcknowledgeNotificationsCommand(_StoreMutationCommand):
-    notification_ids: list[str]
-
-    def apply(self, store: Any) -> None:
-        store.acknowledge_agent_notifications(self.notification_ids)
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class _WarmStepDeliveryCommand(_StoreMutationCommand):
     def apply(self, store: Any) -> None:
         store._warm_step_delivery_writer()

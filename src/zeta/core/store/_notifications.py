@@ -10,7 +10,6 @@ from ...agent.receipt import valid_killed_task_fields
 from ...protocol.types import Message, MessageOrigin, ToolUseContent
 from ..checkpoints import ConversationEntry
 from ._async_writes import (
-    _AcknowledgeNotificationsCommand,
     _PresentNotificationsCommand,
     _RecordNotificationDeliveryCommand,
 )
@@ -634,15 +633,6 @@ class NotificationStateMixin:
                 if writer is not None and writer is not self:
                     writer.close()
                     self._durable_writer = None
-
-    async def acknowledge_agent_notifications_async(
-        self: ConversationStore, notification_ids: list[str]
-    ) -> None:
-        """Consume one claimed notification batch off the event loop."""
-
-        await self._commit_storage_command(
-            _AcknowledgeNotificationsCommand(notification_ids=notification_ids)
-        )
 
     def acknowledge_agent_notification(
         self: ConversationStore, notification_id: str
