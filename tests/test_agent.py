@@ -2966,10 +2966,11 @@ async def test_abort_during_next_request_preparation_skips_provider_dispatch(
     tmp_path: Path,
 ) -> None:
     call = ToolCall("first-tool", "echo", {})
+    next_reply = "the next run completed"
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[call]),
-            ScriptedTurn([TextContent("must not dispatch")]),
+            ScriptedTurn([TextContent(next_reply)]),
         ]
     )
     loop = AgentLoop(
@@ -3003,6 +3004,20 @@ async def test_abort_during_next_request_preparation_skips_provider_dispatch(
         allow_request_preparation.set()
         await asyncio.wait_for(run, 10)
         assert len(backend.calls) == 1
+
+        next_events = await _collect(
+            loop.run_turn("after abort", origin=MessageOrigin.USER)
+        )
+        assert [
+            event.type
+            for event in next_events
+            if event.type
+            in {StreamEventType.TURN_START, StreamEventType.TURN_END}
+        ] == [StreamEventType.TURN_START, StreamEventType.TURN_END]
+        assert len(backend.calls) == 2
+        assert next_reply in json.dumps(
+            [message.to_dict() for message in loop.store.messages()]
+        )
     finally:
         allow_request_preparation.set()
         if not run.done():
@@ -12927,6 +12942,63 @@ def _first_tool_result(store: ConversationStore) -> ToolResult:
     return next(
         message.tool_result for message in store.messages() if message.tool_result
     )
+
+
+@pytest.mark.asyncio
+async def test_first_turn_mcp_setup_does_not_recreate_removed_shell_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_cwd = tmp_path / "removed-cwd"
+    session_cwd.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=session_cwd)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("removed-cwd", "bash", {"command": "pwd"})]
+            ),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    probe_entered = threading.Event()
+    loop_ready = threading.Event()
+    release_probe = threading.Event()
+    ready_before_release = False
+    original_is_dir = Path.is_dir
+
+    def held_is_dir(path: Path) -> bool:
+        if path == session_cwd:
+            probe_entered.set()
+            assert release_probe.wait(10)
+        return original_is_dir(path)
+
+    event_loop = asyncio.get_running_loop()
+
+    def check_loop_readiness() -> None:
+        nonlocal ready_before_release
+        assert probe_entered.wait(10)
+        event_loop.call_soon_threadsafe(loop_ready.set)
+        ready_before_release = loop_ready.wait(1)
+        release_probe.set()
+
+    monkeypatch.setattr(Path, "is_dir", held_is_dir)
+    readiness_thread = threading.Thread(target=check_loop_readiness)
+    readiness_thread.start()
+    try:
+        session_cwd.rmdir()
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.to_thread(readiness_thread.join, 10)
+
+        assert ready_before_release
+        result = _first_tool_result(store)
+        assert result.is_error is False
+        assert result.structured_content["stdout"].strip() == str(tmp_path)
+        assert not session_cwd.exists()
+    finally:
+        release_probe.set()
+        await asyncio.to_thread(readiness_thread.join, 10)
+        await loop.close()
 
 
 @pytest.mark.asyncio
