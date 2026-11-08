@@ -55,15 +55,17 @@ async def request(
     await asyncio.wait_for(writer.drain(), TIMEOUT)
     buffered = _buffer(reader)
     deferred: list[dict[str, Any]] = []
-    while True:
-        if buffered:
-            frame = buffered.popleft()
-        else:
-            frame = await read(reader)
-        if frame.get("id") == request_id:
-            buffered.extend(deferred)
-            return [frame]
-        deferred.append(frame)
+    try:
+        while True:
+            if buffered:
+                frame = buffered.popleft()
+            else:
+                frame = await read(reader)
+            if frame.get("id") == request_id:
+                return [frame]
+            deferred.append(frame)
+    finally:
+        buffered.extendleft(reversed(deferred))
 
 
 async def approve_and_collect_grant(

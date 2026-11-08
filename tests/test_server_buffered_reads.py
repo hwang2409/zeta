@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.server_client import (
     _buffer,
     assert_event_order,
@@ -177,6 +178,39 @@ async def test_request_consumes_buffered_frames_before_socket_reads() -> None:
     _buffer(reader).append({"id": 1, "result": {}})
 
     assert await request(reader, _Writer(), 1, "deny") == [{"id": 1, "result": {}}]
+
+
+@pytest.mark.asyncio
+async def test_canceled_request_restores_deferred_frames() -> None:
+    read_started = asyncio.Event()
+    read_release = asyncio.Event()
+
+    class BlockingReader(_Reader):
+        async def readline(self) -> bytes:
+            read_started.set()
+            await await_or_fail(read_release.wait(), what="socket read release")
+            return b""
+
+    skipped = _event_frame("session_grants_changed", "grant")
+    reader = BlockingReader()
+    _buffer(reader).append(skipped)
+    pending = asyncio.create_task(request(reader, _Writer(), 1, "approve"))
+    try:
+        await await_or_fail(read_started.wait(), what="socket read start")
+        pending.cancel()
+        await await_or_fail(
+            asyncio.gather(pending, return_exceptions=True),
+            what="request cancellation",
+        )
+        assert list(_buffer(reader)) == [skipped]
+    finally:
+        read_release.set()
+        if not pending.done():
+            pending.cancel()
+            await await_or_fail(
+                asyncio.gather(pending, return_exceptions=True),
+                what="request cleanup",
+            )
 
 
 # The shape of the pre-#647 mistake in test_server.py: a raw readline on the
