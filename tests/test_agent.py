@@ -19738,7 +19738,7 @@ async def test_idle_child_wake_tool_count_is_cumulative(tmp_path: Path, monkeypa
             ScriptedTurn(tool_calls=[ToolCall("three", "todo", {"items": []}), ToolCall("four", "todo", {"items": []})]),
             ScriptedTurn(tool_calls=[finish_two]),
         ]},
-        parent_prompt="start", gated_child_prompts=set(), parent_waits_for_children=False,
+        parent_prompt="start", gated_child_prompts={"work"}, parent_waits_for_children=False,
     )
     parent_store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, parent_store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -19747,6 +19747,7 @@ async def test_idle_child_wake_tool_count_is_cumulative(tmp_path: Path, monkeypa
         await await_or_fail(
             backend.child_started["work"].wait(), what="child start"
         )
+        backend.release_children.set()
         await await_or_fail(idle_seen.wait(), what="first idle transition")
         handle = next(iter(parent_store.agent_children()))
         assert await send_to_run(parent_store, handle, "follow up", channel=loop._background_owner.conversation_channel) is None
