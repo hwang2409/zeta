@@ -20,7 +20,6 @@ from tests.test_server import (
     TIMEOUT,
     _connect,
     _event,
-    _frames_until_eof,
     _frames_until_event,
     _read,
     _request,
@@ -1453,13 +1452,15 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                         ExternalEnd("call-1", session_id, {})
                     )
                 )
-                await await_or_fail(external_end, what="external approval end")
                 release.set()
+                await await_or_fail(external_end, what="external approval end")
             if cancel:
                 await await_or_fail(entered.wait(), what=f"{case} gate")
                 record = server.control._approvals.state.records.get("call-1")
                 if record is not None:
                     settlement = record.settlement
+                original_turn = server.control._turn_task
+                assert original_turn is not None
                 cancel_target = settlement or approve
                 if settlement is not None:
                     assert not settlement.done()
@@ -1472,9 +1473,24 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 assert frames[-1]["result"]["decision"] == "approve"
 
             if cancel:
+                published = [
+                    frame
+                    for frame in _buffer(reader)
+                    if frame.get("params", {}).get("event") == "session_grants_changed"
+                ]
+                assert len(published) == 1, (
+                    f"{case} must publish one grant-change event before replacement; "
+                    f"observed {published!r}"
+                )
+                assert not server.control._approvals.state.records, (
+                    f"{case} left an approval record after grant settlement"
+                )
                 original_frames = list(_buffer(reader))
                 _buffer(reader).clear()
-                original_frames.extend(await _frames_until_eof(reader))
+                await await_or_fail(
+                    asyncio.gather(original_turn, return_exceptions=True),
+                    what=f"{case} original turn end",
+                )
                 (
                     replacement_reader,
                     replacement_writer,
@@ -1491,18 +1507,38 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 )
                 snapshot = snapshot_frames[-1]["result"]
                 assert snapshot["session_grants"] == ["bash"]
-                await _request(
-                    replacement_reader,
-                    replacement_writer,
-                    12,
-                    "send",
-                    {"text": "ask again"},
+                original_status = (
+                    await await_or_fail(
+                        _request(replacement_reader, replacement_writer, 12, "status"),
+                        what=f"{case} original turn terminal status",
+                    )
+                )[-1]
+                assert original_status["result"]["state"] == "idle", (
+                    f"{case} replacement controller did not observe the original "
+                    "turn reaching idle"
                 )
-                next_turn = await _frames_until_event(replacement_reader, "turn_end")
+                send_frames = await await_or_fail(
+                    _request(
+                        replacement_reader,
+                        replacement_writer,
+                        13,
+                        "send",
+                        {"text": "ask again"},
+                    ),
+                    what=f"{case} replacement send response",
+                )
+                send_response = send_frames[-1]
+                assert send_response.get("result", {}).get("accepted") is True, (
+                    f"{case} replacement send was not accepted: {send_response!r}"
+                )
+                next_turn = await await_or_fail(
+                    _frames_until_event(replacement_reader, "turn_end"),
+                    what=f"{case} replacement turn end",
+                )
                 assert not any(
                     frame.get("params", {}).get("event") == "approval_request"
                     for frame in next_turn
-                )
+                ), f"{case} replacement unexpectedly asked for approval"
                 replacement_frames.extend(snapshot_frames)
                 replacement_frames.extend(_buffer(replacement_reader))
                 changed = [
@@ -1510,8 +1546,13 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     for frame in [*original_frames, *replacement_frames]
                     if frame.get("params", {}).get("event") == "session_grants_changed"
                 ]
-                assert len(changed) == 1
-                assert not server.control._approvals.state.records
+                assert len(changed) == 1, (
+                    f"{case} must publish exactly one grant-change event; "
+                    f"observed {changed!r}"
+                )
+                assert not server.control._approvals.state.records, (
+                    f"{case} left an approval record after replacement turn"
+                )
             else:
                 grant_events = [
                     frame
@@ -1520,16 +1561,40 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 ]
                 assert len(grant_events) == (0 if case == "deny" else 1)
                 if case == "duplicate":
-                    duplicate = (
+                    _buffer(reader).clear()
+                    assert server.runtime.opened is not None
+                    duplicate_call = ToolCall(
+                        "call-2", "bash", {"command": "true"}
+                    )
+                    server.runtime.opened.store.append_approval_request(
+                        "call-2", duplicate_call
+                    )
+                    before = (await _request(reader, writer, 5, "session_grants"))[-1]
+                    assert before["result"]["session_grants"] == ["bash"]
+                    duplicate_response = (
                         await _request(
                             reader,
                             writer,
-                            5,
+                            6,
                             "approve",
-                            {"request_id": "call-1", "scope": "always_tool"},
+                            {"request_id": "call-2", "scope": "always_tool"},
                         )
                     )[-1]
-                    assert duplicate["error"]["code"] == -32006
+                    assert duplicate_response.get("result", {}).get("accepted") is True, (
+                        f"duplicate approval was not accepted: {duplicate_response!r}"
+                    )
+                    sentinel = (await _request(reader, writer, 7, "session_grants"))[-1]
+                    assert sentinel["result"]["session_grants"] == ["bash"]
+                    duplicate_events = [
+                        frame
+                        for frame in _buffer(reader)
+                        if frame.get("params", {}).get("event")
+                        == "session_grants_changed"
+                    ]
+                    assert not duplicate_events, (
+                        "duplicate grant changed the event stream: "
+                        f"{duplicate_events!r}"
+                    )
         if not cancel:
             restarted = case == "restart_replay"
             if restarted:
