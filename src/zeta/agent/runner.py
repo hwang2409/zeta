@@ -359,7 +359,7 @@ async def _build_child_loop(
     follow_up_loop: bool,
     description: str,
     child_account_context: Any,
-    child_turn_control: ChildTurnControl | None,
+    child_turn_control: ChildTurnControl | None = None,
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None

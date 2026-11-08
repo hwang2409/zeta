@@ -74,6 +74,7 @@ _RAW_DELETION = {
     ("core/session_files.py", "copy_session_tree", "unlink"),
     ("core/session_files.py", "unlink_session_file", "unlink"),
     ("core/session_files.py", "write_session_file", "unlink"),
+    ("core/session_files.py", "write_session_file_if_absent", "unlink"),
     ("core/session_links.py", "_remove_entry", "unlink"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "unlink"),
     ("mcp/management.py", "_atomic_json", "unlink"),
