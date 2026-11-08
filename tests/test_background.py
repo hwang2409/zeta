@@ -1034,6 +1034,59 @@ async def test_agent_store_closes_after_each_foreground_completion(
 
 
 @pytest.mark.asyncio
+async def test_successful_store_close_is_removed_without_root_shutdown(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    owner.track_store(store)
+    owner.mark_store_finished(store)
+
+    try:
+        owner.release_unused_stores()
+        (task,) = tuple(owner._store_close_tasks)
+        await asyncio.wait_for(asyncio.shield(task), 10)
+        await asyncio.sleep(0)
+
+        assert store not in owner._stores
+        assert store not in owner._pending_stores
+        assert not owner._store_close_tasks
+        assert not owner._store_close_stores
+        assert not owner._store_close_tasks_by_store
+        with pytest.raises(OSError):
+            os.fstat(store.directory_fd)
+    finally:
+        await owner.wait_for_store_closes()
+        owner.store_leases.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_store_close_is_retained_for_root_wait(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    owner.track_store(store)
+    owner.mark_store_finished(store)
+
+    try:
+        owner.release_unused_stores()
+        (task,) = tuple(owner._store_close_tasks)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+
+        assert store in owner._stores
+        assert task in owner._store_close_tasks
+        assert owner._store_close_stores[task] is store
+        assert owner._store_close_tasks_by_store[store] is task
+    finally:
+        owner._store_close_tasks.clear()
+        owner._store_close_stores.clear()
+        owner._store_close_tasks_by_store.clear()
+        owner._pending_stores.clear()
+        owner._stores.clear()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_store_close_is_retained_for_retry(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store)
