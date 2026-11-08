@@ -47,7 +47,7 @@ class BlockingBackend:
     async def complete(self, messages, tool_schemas):
         del messages, tool_schemas
         self.started.set()
-        await self.release.wait()
+        await asyncio.wait_for(self.release.wait(), 10)
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
