@@ -776,6 +776,7 @@ def _train_case(
     depth: int = 1,
     plain: bool = False,
     synced_pr: bool = False,
+    stacked_pr: bool = False,
 ) -> tuple[str, str, str, str]:
     _api_repo(r)
     initial = subprocess.check_output(
@@ -825,6 +826,15 @@ def _train_case(
             )
             (r / "src/pr_fix.py").write_text("def pr_fix(): pass\n")
             commit(r, "pr fix after main merge")
+        if stacked_pr:
+            # the PR stacks on a PR the train already merged (#1085's shape).
+            subprocess.run(
+                ["git", "merge", "--no-ff", "--no-edit", train_change],
+                cwd=r,
+                check=True,
+            )
+            (r / "src/pr_fix.py").write_text("def pr_fix(): pass\n")
+            commit(r, "pr fix after stacking")
         pr_base = "pr-side"
     subprocess.run(
         ["git", "update-ref", "refs/remotes/origin/main", origin_main],
@@ -867,12 +877,14 @@ def _train_case(
     subprocess.run(
         ["git", "merge", "--no-ff", "--no-commit", pr_head], cwd=r, check=True
     )
-    subprocess.run(["git", "rm", "-qf", "src/main_only.py"], cwd=r, check=True)
+    # the stacked PR also carries main_only, so plain shapes lose the fix commit.
+    loss = "train_fix" if plain else "main_only"
+    subprocess.run(["git", "rm", "-qf", f"src/{loss}.py"], cwd=r, check=True)
     commit(r, "train result")
     merge = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
-    return merge, train_merge, pr_head, "main_only"
+    return merge, train_merge, pr_head, loss
 
 
 @pytest.mark.parametrize("case", ["lost line", "renamed owner"])
@@ -1290,6 +1302,7 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
         ("train-plain", 0, False),
         ("train-plain-newer", 0, False),
         ("train-plain-synced-pr", 0, False),
+        ("train-plain-stacked-pr", 0, False),
         ("train-plain-wrong", None, True),
         ("both", None, True),
         ("neither", None, True),
@@ -1309,6 +1322,7 @@ def test_parent_selection_table(
             depth=1 if shape == "train-1" else 2,
             plain=shape.startswith("train-plain"),
             synced_pr=shape == "train-plain-synced-pr",
+            stacked_pr=shape == "train-plain-stacked-pr",
         )
     else:
         r = repo(tmp_path)

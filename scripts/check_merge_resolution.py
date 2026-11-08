@@ -441,27 +441,31 @@ def _is_ancestor(ancestor: str, descendant: str) -> bool:
     return result.returncode == 0
 
 
-def _train_parent_qualifies(
-    parent: str, first_parent_chain: set[str], origin_main: str
-) -> bool:
-    """Return whether a parent is the head of a no-ff train chain.
+def _train_path(
+    parent: str, first_parent_chain: set[str], origin_main: str, other: str
+) -> tuple[bool, bool]:
+    """Walk first parents to origin/main's first-parent chain.
 
-    Plain fix commits and merges of main may sit on the train's first-parent
-    path, but at least one merge on it must bring in a side origin/main lacks
-    (a PR head). A PR branch only merges main, so it never qualifies.
+    Return whether the path holds only merges (a plain no-ff train chain), and
+    whether some merge on it brings in a side that neither origin/main nor the
+    other parent has (a train carrying plain fix commits between its merges).
     """
-    current, brings_side = parent, False
+    current, only_merges, brings_side = parent, True, False
     while current not in first_parent_chain:
         try:
             parents = git("rev-list", "--parents", "-n", "1", current).split()[1:]
         except subprocess.CalledProcessError:
-            return False
+            return False, False
         if not parents:
-            return False
-        if len(parents) == 2 and not _is_ancestor(parents[1], origin_main):
+            return False, False
+        if len(parents) != 2:
+            only_merges = False
+        elif not brings_side and not (
+            _is_ancestor(parents[1], origin_main) or _is_ancestor(parents[1], other)
+        ):
             brings_side = True
         current = parents[0]
-    return brings_side
+    return only_merges, brings_side
 
 
 def _direct_main_parent(
@@ -486,17 +490,23 @@ def _direct_main_parent(
 
 def _train_chain_parent(
     parents: list[str], first_parent_chain: set[str], origin_main: str
-) -> tuple[int | None, str]:
+) -> tuple[int | None, str, str]:
+    """Pick the train side: an all-merge chain first, then a chain with plain commits."""
     if not origin_main:
-        return None, ""
-    matches = [
-        index
+        return None, "", "neither parent qualifies"
+    paths = [
+        _train_path(parent, first_parent_chain, origin_main, parents[1 - index])
         for index, parent in enumerate(parents)
-        if _train_parent_qualifies(parent, first_parent_chain, origin_main)
     ]
-    if len(matches) == 1:
-        return matches[0], "the selected parent is the train merge chain"
-    return None, ""
+    for rule, picks in (
+        ("the train merge chain", [path[0] for path in paths]),
+        ("the train chain with plain commits", [path[1] for path in paths]),
+    ):
+        if picks.count(True) == 1:
+            return picks.index(True), f"the selected parent is {rule}", ""
+        if picks.count(True) == 2:
+            return None, "", "both parents qualify"
+    return None, "", "neither parent qualifies"
 
 
 def _identify_main_parent(
@@ -518,18 +528,11 @@ def _identify_main_parent(
             origin_main,
             "exactly one parent is on origin/main ancestry",
         )
-    index, reason = _train_chain_parent(parents, first_parent_chain, origin_main)
+    index, reason, details = _train_chain_parent(
+        parents, first_parent_chain, origin_main
+    )
     if index is not None:
         return index, reason, origin_main, "exactly one parent is the train merge chain"
-    train_matches = [
-        parent
-        for parent in parents
-        if origin_main
-        and _train_parent_qualifies(parent, first_parent_chain, origin_main)
-    ]
-    details = (
-        "both parents qualify" if len(train_matches) > 1 else "neither parent qualifies"
-    )
     return None, "", origin_main, details
 
 
