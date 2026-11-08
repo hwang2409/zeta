@@ -3067,10 +3067,12 @@ async def test_foreground_abort_does_not_interrupt_tool_cleanup(
         del arguments
         handler_started.set()
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(
+                asyncio.Event().wait(), what="controlled tool wait"
+            )
         except asyncio.CancelledError:
             cleanup_started.set()
-            await cleanup_release.wait()
+            await await_or_fail(cleanup_release.wait(), what="cleanup release")
             cleanup_finished.set()
             return ToolResult("controlled", "cleaned up")
 
