@@ -828,6 +828,7 @@ async def test_websocket_child_history_ignores_production_partial_append(
         await _read_json(reader)
         first = await child_history(2)
         assert first["result"]["messages"][-1]["content"][0]["text"] == "complete"
+        # test-contract: seam pauses one production append after its strict row prefix
         monkeypatch.setattr(ConversationStore, "_write_bytes", split_write)
         append_thread = threading.Thread(target=append_message)
         append_thread.start()

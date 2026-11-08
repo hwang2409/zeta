@@ -264,7 +264,7 @@ async def test_child_history_reports_cached_stable_torn_tail_with_repair_offer(
         with transcript.open("ab") as stream:
             stream.write(b'{"type":"message"')
         damaged = (await request(reader, writer, 4, "child_run_history", params))[-1]
-        assert damaged["error"]["data"] == {
+        assert damaged.get("error", {}).get("data") == {
             "code": "corrupt_transcript",
             "kind": "torn_tail",
             "row": 3,
@@ -353,6 +353,7 @@ async def test_child_history_bounds_persistent_source_change(
             os.replace(replacement, transcript)
         return raw
 
+    # test-contract: seam forces every authoritative observer read to be replaced
     monkeypatch.setattr(ConversationStore, "_read_fd", staticmethod(replace_after_every_read))
     try:
         replies = await await_or_fail(
@@ -407,6 +408,7 @@ async def test_child_history_rejects_replacement_during_continuation(
                 replaced = True
             return raw
 
+        # test-contract: seam replaces the source between observer g0 and g1
         monkeypatch.setattr(ConversationStore, "_read_fd", staticmethod(replace_after_read))
         continuation = (
             await request(
@@ -421,7 +423,7 @@ async def test_child_history_rejects_replacement_during_continuation(
                 },
             )
         )[-1]
-        assert continuation["error"]["code"] == -32009, continuation
+        assert continuation.get("error", {}).get("code") == -32009, continuation
     finally:
         await close_serve(server, writer)
 
@@ -468,6 +470,7 @@ async def test_child_history_unix_ignores_production_partial_append(
     try:
         first = (await request(reader, writer, 3, "child_run_history", params))[-1]
         assert first["result"]["messages"][-1]["content"][0]["text"] == "complete"
+        # test-contract: seam pauses one production append after its strict row prefix
         monkeypatch.setattr(ConversationStore, "_write_bytes", split_write)
         append_thread = threading.Thread(target=append_message)
         append_thread.start()

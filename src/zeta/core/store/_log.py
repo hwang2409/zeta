@@ -766,6 +766,7 @@ class ConversationLogMixin:
             and complete_end
             and self._known_prefix_matches_bytes(raw, complete_end)
         ):
+            self._check_observer_source(g0, retry_source_change)
             return
         candidate = raw[:complete_end]
         baseline = (len(self._entries), self._entry_prefix_digest)
@@ -773,24 +774,10 @@ class ConversationLogMixin:
         for physical_row in self._iter_physical_rows(candidate, g0, validator.validated_prefix):
             validator.accept(physical_row)
         validator.finish(install=False)
-        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
-        try:
-            g1 = os.fstat(fd)
-        finally:
-            os.close(fd)
-        if (g0.st_dev, g0.st_ino, g0.st_ctime_ns, g0.st_size, g0.st_mtime_ns) != (
-            g1.st_dev,
-            g1.st_ino,
-            g1.st_ctime_ns,
-            g1.st_size,
-            g1.st_mtime_ns,
-        ):
-            replaced = (g0.st_dev, g0.st_ino) != (g1.st_dev, g1.st_ino)
-            if retry_source_change and (not self._entries or not replaced):
-                return self._sync_observer_snapshot(retry_source_change=False)
-            raise ObserverSnapshotChanged("observer transcript changed during read")
+        if self._check_observer_source(g0, retry_source_change):
+            return
         if complete_end < g0.st_size and not self._observer_append_active():
-            self._load()
+            self._load_full()
             return
         for attribute in _FullLoadValidator._STATE_ATTRIBUTES:
             setattr(self, attribute, getattr(validator.state, attribute))
@@ -801,6 +788,30 @@ class ConversationLogMixin:
         )
         self._set_observer_log_stat(g0, complete_end, raw)
         self._publish_entries_installed(delta)
+
+    def _check_observer_source(
+        self: ConversationStore,
+        g0: os.stat_result,
+        retry_source_change: bool,
+    ) -> bool:
+        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+        try:
+            g1 = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if (g0.st_dev, g0.st_ino, g0.st_ctime_ns, g0.st_size, g0.st_mtime_ns) == (
+            g1.st_dev,
+            g1.st_ino,
+            g1.st_ctime_ns,
+            g1.st_size,
+            g1.st_mtime_ns,
+        ):
+            return False
+        replaced = (g0.st_dev, g0.st_ino) != (g1.st_dev, g1.st_ino)
+        if retry_source_change and (not self._entries or not replaced):
+            self._sync_observer_snapshot(retry_source_change=False)
+            return True
+        raise ObserverSnapshotChanged("observer transcript changed during read")
 
     def _observer_append_active(self: ConversationStore) -> bool:
         fd = open_session_file(self.directory_fd, ".lock", os.O_RDWR)
