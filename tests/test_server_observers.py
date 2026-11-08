@@ -722,11 +722,16 @@ async def _controller_event_stream(
             lambda frame: frame.get("params", {}).get("event") == "sub_agent_receipt",
         )
         await send(4, "deny", {"request_id": "call-1"})
-        await _read_raw_until(
-            reader,
-            frames,
-            lambda frame: frame.get("params", {}).get("event") == "turn_end",
-        )
+        completed_frames: set[str] = set()
+
+        def is_turn_complete(frame: dict[str, Any]) -> bool:
+            if frame.get("id") == 4:
+                completed_frames.add("deny")
+            if frame.get("params", {}).get("event") == "turn_end":
+                completed_frames.add("turn_end")
+            return completed_frames == {"deny", "turn_end"}
+
+        await _read_raw_until(reader, frames, is_turn_complete)
         assert session_id.encode() in b"".join(frames)
         return b"".join(frames)
     finally:
