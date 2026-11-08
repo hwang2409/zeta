@@ -14620,11 +14620,11 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait(1)
+            release.wait(10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
-    assert locked.wait(1)
+    assert locked.wait(10)
     publisher_waiting = threading.Event()
     original_lifecycle_guard = AccountStore._lifecycle_guard
 
@@ -14635,22 +14635,43 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
             yield
 
     monkeypatch.setattr(AccountStore, "_lifecycle_guard", waiting_lifecycle_guard)
-    publisher = threading.Thread(
-        target=lambda: named_account_credentials(home, "codex", "work").save(
-            OAuthTokens("new-access", "new-refresh", 9_999_999_999)
-        )
+    publisher_errors: list[BaseException] = []
+    published_tokens = OAuthTokens(
+        "new-access", "new-refresh", 9_999_999_999, email="henry@example.com"
     )
+
+    def publish_credentials() -> None:
+        try:
+            # separate product bug: save merges email before verifying tokens.
+            named_account_credentials(home, "codex", "work").save(
+                published_tokens
+            )
+        except BaseException as exc:  # noqa: BLE001 - assert the thread outcome below
+            publisher_errors.append(exc)
+
+    publisher = threading.Thread(target=publish_credentials)
     publisher.start()
-    assert publisher_waiting.wait(1)
+    assert publisher_waiting.wait(10)
     try:
         assert await app.slash_accounts("") == ""
         assert app._accounts_picker is not None
         assert publisher.is_alive()
     finally:
         release.set()
-        holder.join()
-        publisher.join()
+        await asyncio.to_thread(holder.join, 10)
+        await asyncio.to_thread(publisher.join, 10)
         opened.store.close()
+
+    assert not holder.is_alive()
+    assert not publisher.is_alive()
+    assert publisher_errors == []
+    assert (
+        await asyncio.wait_for(
+            asyncio.to_thread(named_account_credentials(home, "codex", "work").read),
+            10,
+        )
+        == published_tokens
+    )
 
 
 def test_accounts_panel_labels_codex_primary_as_seven_day() -> None:
