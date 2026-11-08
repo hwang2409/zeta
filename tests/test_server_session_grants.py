@@ -1325,8 +1325,10 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
 
                 async def publish(tool: str) -> None:
                     entered.set()
-                    await release.wait()
-                    await original(tool)
+                    await await_or_fail(
+                        release.wait(), what="grant publication release"
+                    )
+                    await await_or_fail(original(tool), what="grant event publication")
 
                 server.control._approvals._grant_published = publish
             approve = asyncio.create_task(
