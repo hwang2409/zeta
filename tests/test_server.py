@@ -1327,6 +1327,36 @@ async def test_session_history_and_subscribe_joins_live_sequence_on_unix_socket(
 
 
 @pytest.mark.asyncio
+async def test_session_replay_releases_completed_frames_for_long_stream(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1", "features": ["session_replay_seq"]})
+        session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
+        result = (await _request(reader, writer, 3, "session_history_and_subscribe", {"session_id": session["session_id"]}))[-1]["result"]
+        assert result["replay"]["history_seq"] == 0
+        for sequence in range(1, 301):
+            await server.control._notify(EventDescriptor.TURN_START, session["session_id"], data={})
+            while True:
+                frame = await _read(reader)
+                if frame.get("method") != "event":
+                    continue
+                event = frame["params"]
+                if event.get("event") == "turn_start" and "stream_id" in event:
+                    break
+            assert event["stream_id"] == result["replay"]["stream_id"]
+            assert event["seq"] == sequence
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_session_replay_join_admits_response_before_held_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -318,6 +318,8 @@ class ConnectionRegistry:
 
     def replay_session_replaced(self) -> None:
         self.replay.session_replaced()
+        for scope in self.replay.take_invalidated():
+            self._discard_replay_scope(scope)
 
     def _discard_replay_scope(self, scope: ReplayScopeId) -> None:
         for state in tuple(self._connections.values()):
@@ -352,20 +354,19 @@ class ConnectionRegistry:
             {**fields, "_session_id": session_id},
             frame_size,
         )
+        for invalidated in self.replay.take_invalidated():
+            self._discard_replay_scope(invalidated)
         if published is None:
-            for invalidated in self.replay.take_invalidated():
-                self._discard_replay_scope(invalidated)
             return False
         payload = {"stream_id": published.stream_id, "seq": published.seq, **fields}
-        replay_scope = payload.pop("_replay_scope", None)
-        replay_size = payload.pop("_replay_size", 0)
+        replay_scope = published.scope
+        replay_size = published.size
         payload.pop("_session_id", None)
         frame = state.connection.codec.notification(event, session_id, **payload)
         if frame is None or state.output is None:
             return False
-        subscription = self.replay._subscriptions.get(state.connection)
         pending = self.replay._pending.get(state.connection)
-        if pending is not None and subscription is None:
+        if pending is not None:
             return True
         if not self._admit(state, frame):
             self.replay.connection_closed(state.connection)
@@ -386,7 +387,7 @@ class ConnectionRegistry:
         if state is None or state.output is None or not self._admit(state, frame):
             return False
         output = state.output
-        held = self.replay.activate_join(connection)
+        held = self.replay.pending_tail(connection)
         items: list[_OutputFrame] = [_OutputFrame(frame)]
         for event, fields in held:
             session_id = fields.pop("_session_id", None)
@@ -406,6 +407,7 @@ class ConnectionRegistry:
             )
         for item in items:
             self._enqueue(output, item, wake=False)
+        self.replay.activate_join(connection)
         output.wake.set()
         future = self.loop.create_future()
         items[0].future = future

@@ -31,6 +31,8 @@ class ReplayScopeId:
 class PublishedSessionEvent:
     stream_id: str
     seq: int
+    scope: ReplayScopeId
+    size: int
 
 
 @dataclass(slots=True)
@@ -46,9 +48,6 @@ class PendingReplayJoin:
 class _Subscription:
     scope: ReplayScopeId
     stream_id: str
-    next_seq: int = 1
-    pending: bool = True
-    held: list[tuple[Any, dict[str, object]]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -151,21 +150,21 @@ class SessionReplay:
         return pending
 
     def finish_join(self, connection: Any, history_snapshot: dict[str, object]) -> dict[str, object]:
+        pending = self._pending.get(connection)
+        if pending is None or pending.stale:
+            raise ProtocolError(ErrorDescriptor.STALE_EVENT_SEQUENCE, "replay continuity was invalidated")
+        return {**history_snapshot, "replay": {"stream_id": pending.stream_id, "history_seq": 0}}
+
+    def pending_tail(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
+        pending = self._pending.get(connection)
+        return [] if pending is None else list(pending.frames)
+
+    def activate_join(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
         pending = self._pending.pop(connection, None)
         if pending is None or pending.stale:
             raise ProtocolError(ErrorDescriptor.STALE_EVENT_SEQUENCE, "replay continuity was invalidated")
-        subscription = _Subscription(pending.scope, pending.stream_id)
-        self._subscriptions[connection] = subscription
-        subscription.held.extend(pending.frames)
-        return {**history_snapshot, "replay": {"stream_id": pending.stream_id, "history_seq": 0}}
-
-    def activate_join(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
-        subscription = self._subscriptions.get(connection)
-        if subscription is None:
-            return []
-        subscription.pending = False
-        held, subscription.held = subscription.held, []
-        return held
+        self._subscriptions[connection] = _Subscription(pending.scope, pending.stream_id)
+        return pending.frames
 
     def publish(self, connection: Any, scope: ReplayScopeId, event: Any, fields: dict[str, object], frame_size: int) -> PublishedSessionEvent | None:
         subscription = self._subscriptions.get(connection)
@@ -182,9 +181,9 @@ class SessionReplay:
             "_replay_size": frame_size,
             **fields,
         }
-        if pending is not None or subscription is not None and subscription.pending:
-            target.held.append((event, payload))
-        return PublishedSessionEvent(target.stream_id, seq)
+        if pending is not None:
+            pending.frames.append((event, payload))
+        return PublishedSessionEvent(target.stream_id, seq, scope, frame_size)
 
     def release(self, scope: ReplayScopeId, size: int) -> None:
         owner = self._scopes.get(scope)

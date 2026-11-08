@@ -25,7 +25,7 @@ from zeta.server.transport import _parse_subprotocol_auth
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
-TIMEOUT = 30
+TIMEOUT = 10
 
 
 async def _read_http_headers(
