@@ -87,6 +87,9 @@ class SessionReplay:
         invalidated, self._invalidated = self._invalidated, set()
         return invalidated
 
+    def invalidate_scope(self, scope: ReplayScopeId) -> None:
+        self._invalidate_scope(scope)
+
     def _drop_scope(self, scope: ReplayScopeId) -> None:
         current = self._scopes.pop(scope, None)
         if current is not None:

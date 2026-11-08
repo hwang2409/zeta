@@ -317,10 +317,15 @@ class ConnectionRegistry:
     ) -> dict[str, object]:
         return self.replay.finish_join(connection, history_snapshot)
 
+    def invalidate_replay_scope(self, scope: ReplayScopeId, reason: str) -> None:
+        del reason
+        self.replay.invalidate_scope(scope)
+        self._discard_replay_scope(scope)
+
     def replay_session_replaced(self) -> None:
         self.replay.session_replaced()
         for scope in self.replay.take_invalidated():
-            self._discard_replay_scope(scope)
+            self.invalidate_replay_scope(scope, "session_replaced")
 
     def _discard_connection_replay(self, connection: Any) -> None:
         state = self._connections.get(connection)
@@ -378,7 +383,7 @@ class ConnectionRegistry:
             len(frame),
         )
         for invalidated in self.replay.take_invalidated():
-            self._discard_replay_scope(invalidated)
+            self.invalidate_replay_scope(invalidated, "publication")
         if published is None:
             return False
         pending = self.replay._pending.get(state.connection)
@@ -667,6 +672,9 @@ class ConnectionRegistry:
             result, _ = await output.current_write
         except asyncio.CancelledError:
             self._finish_frame_accounting(output, item)
+            if item.join_response:
+                self.replay.connection_closed(state.connection)
+                self._discard_connection_replay(state.connection)
             if not output.released:
                 self._finish_future(item.future, False)
             if asyncio.current_task().cancelling():
@@ -679,6 +687,9 @@ class ConnectionRegistry:
             return
         except Exception as exc:  # noqa: BLE001 - preserve write failure for its caller
             self._finish_frame_accounting(output, item)
+            if item.join_response:
+                self.replay.connection_closed(state.connection)
+                self._discard_connection_replay(state.connection)
             self._finish_future(item.future, error=exc)
             if output.phase == "flushing":
                 self._reset_flush(output, error=exc)
