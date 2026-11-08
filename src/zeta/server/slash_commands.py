@@ -28,7 +28,10 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
-from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
+from ..core.transcript_recovery.runtime import (
+    repair_transcript_for_runtime,
+    transcript_repair_available,
+)
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
@@ -111,6 +114,53 @@ class ServerSlashSession:
         self._run_blocking = run_blocking
 
     # --- runnable server-side ---
+
+    async def slash_decisions(self, args: str) -> str:
+        from ..attention_decisions import open_decisions
+        from ..attention_forks import deliver_attention_decision
+        from ..attention_records import AttentionStore
+
+        loop = self._runtime.loop
+        opened = self._runtime.opened
+        if loop is None or opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        parts = args.split(maxsplit=2)
+        registry_state = self._runtime.manager.project_registry_state
+        items = await asyncio.to_thread(
+            open_decisions,
+            self._runtime.home,
+            opened.metadata.session_id,
+            registry_state,
+        )
+        if parts and parts[0] in {"dismiss", "reply"}:
+            if len(parts) < 2:
+                return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
+            item = next((item for item in items if item.record.id == parts[1]), None)
+            if item is None:
+                return "attention item not found"
+            store = AttentionStore(self._runtime.home / "sessions" / item.session_id)
+            if parts[0] == "dismiss":
+                await asyncio.to_thread(
+                    store.dismiss, item.record.id, session_id=item.session_id
+                )
+                return f"dismissed {item.record.id}"
+            if len(parts) < 3 or not parts[2].strip():
+                return "reply text must be nonempty"
+            await asyncio.to_thread(
+                deliver_attention_decision,
+                self._runtime.home,
+                item.record,
+                parts[2],
+                from_session=opened.metadata.session_id,
+                registry_state=registry_state,
+            )
+            return f"replied to {item.record.id}"
+        if not items:
+            return "no open attention items"
+        return "open attention items:\n" + "\n".join(
+            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            for item in items
+        )
 
     @property
     def plan_mode(self) -> bool:
@@ -449,7 +499,14 @@ async def list_commands(
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
-    entries = _entries_from_registry(registry, include_unavailable=include_unavailable)
+    repair_available = transcript_repair_available(runtime.manager)
+    entries = [
+        entry
+        for entry in _entries_from_registry(
+            registry, include_unavailable=include_unavailable
+        )
+        if repair_available or entry.name != "repair-transcript"
+    ]
     return {
         "commands": [entry.to_dict() for entry in entries],
         "notices": list(registry.notices),
@@ -495,7 +552,7 @@ async def run_command(
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
-    if not text.startswith("/") or text.startswith("//"):
+    if not text.startswith("/"):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must start with '/'")
     first_line = text.split("\n", 1)[0]
     parts = first_line[1:].split(maxsplit=1)
