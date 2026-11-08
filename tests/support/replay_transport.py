@@ -1,0 +1,162 @@
+"""Real serve transports for replay protocol tests."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import secrets
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlencode
+
+from tests.support.owned import await_or_fail
+from tests.support.sockets import short_socket_path
+from zeta.server import ZetaServer
+
+Transport = Literal["unix", "websocket"]
+
+
+def classify(frame: dict[str, Any]) -> tuple[str, object]:
+    """Classify a wire frame by response id or replay stream."""
+    if "id" in frame:
+        return "response", frame["id"]
+    params = frame.get("params", {})
+    return "event", params.get("stream_id")
+
+
+@dataclass
+class ReplayClient:
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    websocket: bool
+    buffered: deque[dict[str, Any]] = field(default_factory=deque)
+
+    async def send(self, request_id: int, method: str, params: dict[str, object]) -> None:
+        value = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        payload = json.dumps(value, separators=(",", ":")).encode()
+        self.writer.write(_masked_frame(payload) if self.websocket else payload + b"\n")
+        await await_or_fail(self.writer.drain(), what=f"send {method}")
+
+    async def read(self) -> dict[str, Any]:
+        if self.buffered:
+            return self.buffered.popleft()
+        return await self._read_wire()
+
+    async def _read_wire(self) -> dict[str, Any]:
+        if not self.websocket:
+            line = await await_or_fail(self.reader.readline(), what="unix replay frame")
+            assert line, "server closed unix replay connection"
+            return json.loads(line)
+        first, second = await await_or_fail(self.reader.readexactly(2), what="websocket replay header")
+        assert first & 0x0F == 1 and second & 0x80 == 0
+        size = second & 0x7F
+        if size == 126:
+            size = int.from_bytes(await self.reader.readexactly(2), "big")
+        elif size == 127:
+            size = int.from_bytes(await self.reader.readexactly(8), "big")
+        return json.loads(await self.reader.readexactly(size))
+
+    async def response(self, request_id: int) -> dict[str, Any]:
+        skipped: list[dict[str, Any]] = []
+        try:
+            while True:
+                frame = await self._read_wire()
+                if frame.get("id") == request_id:
+                    return frame
+                skipped.append(frame)
+        finally:
+            self.buffered.extend(skipped)
+
+    async def request(self, request_id: int, method: str, params: dict[str, object]) -> dict[str, Any]:
+        await self.send(request_id, method, params)
+        return await self.response(request_id)
+
+    async def event(self, name: str | None = None) -> dict[str, Any]:
+        skipped: list[dict[str, Any]] = []
+        try:
+            while True:
+                frame = await self.read() if not skipped else await self._read_wire()
+                params = frame.get("params")
+                if isinstance(params, dict) and (name is None or params.get("event") == name):
+                    return params
+                skipped.append(frame)
+        finally:
+            self.buffered.extendleft(reversed(skipped))
+
+    async def close(self) -> None:
+        self.writer.close()
+        await self.writer.wait_closed()
+
+
+async def connect_replay(server: ZetaServer, transport: Transport) -> ReplayClient:
+    if transport == "unix":
+        if server.connections is None:
+            await server.start()
+        reader, writer = await asyncio.open_unix_connection(server.socket_path)
+        return ReplayClient(reader, writer, False)
+    if server.connections is None:
+        await server.start()
+    assert server._websocket is not None
+    reader, writer = await asyncio.open_connection("127.0.0.1", server._websocket.port)
+    query = urlencode({"token": server._websocket.token})
+    key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    writer.write(
+        (
+            f"GET /?{query} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{server._websocket.port}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+    )
+    await await_or_fail(writer.drain(), what="websocket replay handshake")
+    raw = await await_or_fail(reader.readuntil(b"\r\n\r\n"), what="websocket replay handshake response")
+    lines = raw.decode("ascii").split("\r\n")
+    assert lines[0].split()[1] == "101"
+    headers = {
+        name.lower(): value.strip()
+        for line in lines[1:]
+        if line
+        for name, value in [line.split(":", 1)]
+    }
+    expected = base64.b64encode(
+        hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+    ).decode("ascii")
+    assert headers["sec-websocket-accept"] == expected
+    return ReplayClient(reader, writer, True)
+
+
+def replay_server(home: Path, transport: Transport, backend_factory: Any) -> ZetaServer:
+    options: dict[str, object] = {
+        "home": home,
+        "provider": "codex",
+        "backend_factory": backend_factory,
+    }
+    if transport == "unix":
+        options["socket_path"] = short_socket_path(home)
+    else:
+        options.update(port=0, ws_port=0)
+    return ZetaServer(**options)
+
+
+async def negotiate(client: ReplayClient, *, replay: bool = True, observer: bool = False) -> dict[str, Any]:
+    features = (["serve_observers"] if observer else []) + (["session_replay_seq"] if replay else [])
+    params: dict[str, object] = {"protocol_version": "1.1", "features": features}
+    if observer:
+        params["role"] = "observer"
+    return await client.request(1, "hello", params)
+
+
+def _masked_frame(payload: bytes) -> bytes:
+    size = len(payload)
+    if size < 126:
+        header = bytes((0x81, 0x80 | size))
+    elif size <= 0xFFFF:
+        header = bytes((0x81, 0x80 | 126)) + size.to_bytes(2, "big")
+    else:
+        header = bytes((0x81, 0x80 | 127)) + size.to_bytes(8, "big")
+    mask = b"test"
+    return header + mask + bytes(value ^ mask[index % 4] for index, value in enumerate(payload))

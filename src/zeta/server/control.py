@@ -255,8 +255,6 @@ class ServeControl:
         self._approvals.clear_approvals()
 
     def session_replaced(self) -> None:
-        if self.server.connections is not None:
-            self.server.connections.replay_session_replaced()
         self._approvals.session_replaced()
 
     async def wait_for_approval_settlement(self) -> None:

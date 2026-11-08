@@ -32,7 +32,7 @@ class PublishedSessionEvent:
     stream_id: str
     seq: int
     scope: ReplayScopeId
-    size: int
+    size: int = 0
 
 
 @dataclass(slots=True)
@@ -59,7 +59,7 @@ class _Scope:
 
 
 class SessionReplay:
-    """Owns frontier, sequence, join, and bounded replay accounting."""
+    """Own replay stream state and its bounded charge ledger."""
 
     def __init__(self) -> None:
         self._subscriptions: dict[Any, _Subscription] = {}
@@ -69,8 +69,6 @@ class SessionReplay:
         self._next_ordinal = 0
         self._records = 0
         self._bytes = 0
-        self._invalidated: set[ReplayScopeId] = set()
-        self._pressure: set[ReplayScopeId] = set()
 
     def _scope(self, scope: ReplayScopeId) -> _Scope:
         current = self._scopes.get(scope)
@@ -80,20 +78,24 @@ class SessionReplay:
             self._scopes[scope] = current
         return current
 
-    def _invalidate_scope(self, scope: ReplayScopeId) -> None:
-        self._invalidated.add(scope)
-        self._drop_scope(scope)
+    def scopes(self) -> tuple[ReplayScopeId, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    *self._scopes,
+                    *(pending.scope for pending in self._pending.values()),
+                    *(subscription.scope for subscription in self._subscriptions.values()),
+                )
+            )
+        )
 
-    def take_pressure(self) -> set[ReplayScopeId]:
-        pressure, self._pressure = self._pressure, set()
-        return pressure
+    def scope_for(self, connection: Any) -> ReplayScopeId | None:
+        state = self._subscriptions.get(connection) or self._pending.get(connection)
+        return None if state is None else state.scope
 
-    def take_invalidated(self) -> set[ReplayScopeId]:
-        invalidated, self._invalidated = self._invalidated, set()
-        return invalidated
-
-    def invalidate_scope(self, scope: ReplayScopeId) -> None:
-        self._invalidate_scope(scope)
+    def stream_id(self, connection: Any) -> str | None:
+        subscription = self._subscriptions.get(connection)
+        return None if subscription is None else subscription.stream_id
 
     def _drop_scope(self, scope: ReplayScopeId) -> None:
         current = self._scopes.pop(scope, None)
@@ -104,9 +106,14 @@ class SessionReplay:
             if pending.scope == scope:
                 pending.stale = True
                 self._pending.pop(connection, None)
+                self._next_sequences.pop(connection, None)
         for connection, subscription in tuple(self._subscriptions.items()):
             if subscription.scope == scope:
                 self._subscriptions.pop(connection, None)
+                self._next_sequences.pop(connection, None)
+
+    def invalidate_scope(self, scope: ReplayScopeId) -> None:
+        self._drop_scope(scope)
 
     def _largest_scope(self) -> ReplayScopeId | None:
         if not self._scopes:
@@ -120,7 +127,7 @@ class SessionReplay:
             ),
         )
 
-    def _reserve(self, scope: ReplayScopeId, size: int) -> ReplayScopeId | None:
+    def reserve(self, scope: ReplayScopeId, size: int) -> ReplayScopeId | None:
         owner = self._scope(scope)
         if (
             owner.records + 1 > REPLAY_SCOPE_MAX_RECORDS
@@ -132,17 +139,12 @@ class SessionReplay:
             or self._bytes + size > REPLAY_MAX_BYTES
         ):
             return self._largest_scope() or scope
-        owner = self._scope(scope)
         owner.records += 1
         owner.bytes += size
         owner.charges.append(size)
         self._records += 1
         self._bytes += size
         return None
-
-    def stream_id(self, connection: Any) -> str | None:
-        subscription = self._subscriptions.get(connection)
-        return None if subscription is None else subscription.stream_id
 
     def begin_join(self, connection: Any, scope: ReplayScopeId) -> PendingReplayJoin:
         self.connection_closed(connection)
@@ -151,31 +153,43 @@ class SessionReplay:
         self._pending[connection] = pending
         return pending
 
-    def finish_join(self, connection: Any, history_snapshot: dict[str, object]) -> dict[str, object]:
+    def finish_join(
+        self, connection: Any, history_snapshot: dict[str, object]
+    ) -> dict[str, object]:
         pending = self._pending.get(connection)
         if pending is None or pending.stale:
-            raise ProtocolError(ErrorDescriptor.STALE_EVENT_SEQUENCE, "replay continuity was invalidated")
-        return {**history_snapshot, "replay": {"stream_id": pending.stream_id, "history_seq": 0}}
+            raise ProtocolError(
+                ErrorDescriptor.STALE_EVENT_SEQUENCE,
+                "replay continuity was invalidated",
+            )
+        return {
+            **history_snapshot,
+            "replay": {"stream_id": pending.stream_id, "history_seq": 0},
+        }
 
     def pending_tail(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
         pending = self._pending.get(connection)
         return [] if pending is None else list(pending.frames)
 
-    def activate_join(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
+    def activate_join(self, connection: Any) -> None:
         pending = self._pending.pop(connection, None)
         if pending is None or pending.stale:
-            raise ProtocolError(ErrorDescriptor.STALE_EVENT_SEQUENCE, "replay continuity was invalidated")
-        self._subscriptions[connection] = _Subscription(pending.scope, pending.stream_id)
-        return pending.frames
+            raise ProtocolError(
+                ErrorDescriptor.STALE_EVENT_SEQUENCE,
+                "replay continuity was invalidated",
+            )
+        self._subscriptions[connection] = _Subscription(
+            pending.scope, pending.stream_id
+        )
 
-    def prepare(self, connection: Any, scope: ReplayScopeId) -> PublishedSessionEvent | None:
-        subscription = self._subscriptions.get(connection)
-        pending = self._pending.get(connection)
-        target = subscription if subscription is not None else pending
+    def prepare(
+        self, connection: Any, scope: ReplayScopeId
+    ) -> PublishedSessionEvent | None:
+        target = self._subscriptions.get(connection) or self._pending.get(connection)
         if target is None or target.scope != scope:
             return None
         return PublishedSessionEvent(
-            target.stream_id, self._next_sequences.get(connection, 1), scope, 0
+            target.stream_id, self._next_sequences.get(connection, 1), scope
         )
 
     def commit(
@@ -186,13 +200,11 @@ class SessionReplay:
         published: PublishedSessionEvent,
         frame_size: int,
     ) -> PublishedSessionEvent | None:
-        if self._next_sequences.get(connection, 1) != published.seq:
-            return None
-        victim = self._reserve(published.scope, frame_size)
-        if victim is not None:
-            self._pressure.add(victim)
+        current = self.prepare(connection, published.scope)
+        if current != published:
             return None
         self._next_sequences[connection] = published.seq + 1
+        pending = self._pending.get(connection)
         payload = {
             "stream_id": published.stream_id,
             "seq": published.seq,
@@ -200,7 +212,6 @@ class SessionReplay:
             "_replay_size": frame_size,
             **fields,
         }
-        pending = self._pending.get(connection)
         if pending is not None:
             pending.frames.append((event, payload))
         return PublishedSessionEvent(
@@ -224,22 +235,9 @@ class SessionReplay:
 
     def connection_closed(self, connection: Any) -> None:
         pending = self._pending.pop(connection, None)
-        subscription = self._subscriptions.pop(connection, None)
+        self._subscriptions.pop(connection, None)
         self._next_sequences.pop(connection, None)
-        for item in (pending, subscription):
-            if item is None:
-                continue
-            for _, fields in item.frames if pending is item else item.held:
-                self.release(
-                    fields["_replay_scope"], fields["_replay_size"]
-                )
-
-    def session_replaced(self) -> None:
-        for pending in self._pending.values():
-            pending.stale = True
-        self._pending.clear()
-        self._subscriptions.clear()
-        for scope in tuple(self._scopes):
-            self._invalidate_scope(scope)
-        self._scopes.clear()
-        self._records = self._bytes = 0
+        if pending is None:
+            return
+        for _, fields in pending.frames:
+            self.release(fields["_replay_scope"], fields["_replay_size"])

@@ -282,7 +282,7 @@ class ConnectionRegistry:
         if outcome.kind != "admitted" or frame is None or output is None:
             return outcome
         if self._publish_replay(
-            self._controller, event, session_id, dict(fields), len(frame) + 64
+            self._controller, event, session_id, dict(fields)
         ):
             return outcome
         if not self._admit(self._controller, frame):
@@ -295,20 +295,8 @@ class ConnectionRegistry:
         return outcome
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        old_stream = self.replay.stream_id(connection)
+        self.invalidate_replay_connection(connection, "rejoin")
         self.replay.begin_join(connection, scope)
-        if old_stream is not None:
-            state = self._connections.get(connection)
-            if state is not None and state.output is not None:
-                kept: deque[_OutputFrame] = deque()
-                while state.output.queue:
-                    item = state.output.queue.popleft()
-                    if item.replay_stream_id == old_stream:
-                        self._finish_frame_accounting(state.output, item)
-                    else:
-                        kept.append(item)
-                state.output.queue = kept
-                self._assert_retained_accounting(state.output)
 
     async def finish_replay_join(
         self,
@@ -317,14 +305,18 @@ class ConnectionRegistry:
     ) -> dict[str, object]:
         return self.replay.finish_join(connection, history_snapshot)
 
+    def invalidate_replay_connection(self, connection: Any, reason: str) -> None:
+        del reason
+        self.replay.connection_closed(connection)
+        self._discard_connection_replay(connection)
+
     def invalidate_replay_scope(self, scope: ReplayScopeId, reason: str) -> None:
         del reason
         self.replay.invalidate_scope(scope)
         self._discard_replay_scope(scope)
 
     def replay_session_replaced(self) -> None:
-        self.replay.session_replaced()
-        for scope in self.replay.take_invalidated():
+        for scope in self.replay.scopes():
             self.invalidate_replay_scope(scope, "session_replaced")
 
     def _discard_connection_replay(self, connection: Any) -> None:
@@ -363,7 +355,6 @@ class ConnectionRegistry:
         event: EventDescriptor,
         session_id: str | None,
         fields: dict[str, object],
-        frame_size: int,
     ) -> bool:
         if "session_replay_seq" not in state.features or session_id is None:
             return False
@@ -375,6 +366,11 @@ class ConnectionRegistry:
         frame = state.connection.codec.notification(event, session_id, **payload)
         if frame is None:
             return False
+        while (victim := self.replay.reserve(scope, len(frame))) is not None:
+            self.invalidate_replay_scope(victim, "capacity")
+            prepared = self.replay.prepare(state.connection, scope)
+            if prepared is None:
+                return True
         published = self.replay.commit(
             state.connection,
             event,
@@ -382,27 +378,17 @@ class ConnectionRegistry:
             prepared,
             len(frame),
         )
-        pressure = self.replay.take_pressure()
-        for victim in pressure:
-            self.invalidate_replay_scope(victim, "capacity")
-        if published is None and scope not in pressure:
-            published = self.replay.commit(
-                state.connection,
-                event,
-                {**fields, "_session_id": session_id},
-                prepared,
-                len(frame),
-            )
         if published is None:
-            return False
+            self.replay.release(scope, len(frame))
+            return True
         pending = self.replay._pending.get(state.connection)
         if pending is not None:
             return True
         replay_scope = published.scope
         replay_size = published.size
         if not self._admit(state, frame):
-            self.replay.connection_closed(state.connection)
-            return False
+            self.invalidate_replay_scope(scope, "admission_failed")
+            return True
         self._enqueue(
             state.output,
             _OutputFrame(
@@ -417,11 +403,11 @@ class ConnectionRegistry:
     async def admit_join_response(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
         if state is None or state.output is None:
-            self.replay.connection_closed(connection)
+            self.invalidate_replay_connection(connection, "join_admission_failed")
             return False
         output = state.output
         if output.phase not in {"claimed_buffering", "flushing", "ready"}:
-            self.replay.connection_closed(connection)
+            self.invalidate_replay_connection(connection, "join_admission_failed")
             return False
         held = self.replay.pending_tail(connection)
         items: list[_OutputFrame] = [_OutputFrame(frame)]
@@ -431,7 +417,7 @@ class ConnectionRegistry:
             replay_size = fields.pop("_replay_size", 0)
             payload = connection.codec.notification(event, session_id, **fields)
             if payload is None:
-                self.replay.connection_closed(connection)
+                self.invalidate_replay_connection(connection, "join_encoding_failed")
                 return False
             items.append(
                 _OutputFrame(
@@ -448,9 +434,13 @@ class ConnectionRegistry:
             > OUTPUT_MAX_BYTES
             or output.retained_frames + len(items) + 1 > OUTPUT_MAX_FRAMES
         ):
-            self.replay.connection_closed(connection)
+            scope = self.replay.scope_for(connection)
+            if scope is not None:
+                self.invalidate_replay_scope(scope, "join_admission_failed")
+            self._begin_overflow(state, enqueue_control=True)
             return False
         items[0].join_response = True
+        items[0].replay_scope = self.replay.scope_for(connection)
         for item in items:
             self._enqueue(output, item, wake=False)
         self.replay.activate_join(connection)
@@ -489,15 +479,14 @@ class ConnectionRegistry:
             observer_frame = observer.connection.codec.notification(
                 event, session_id, **replay_fields
             )
-            if observer_frame is not None:
-                self._publish_replay(
-                    observer,
-                    event,
-                    session_id,
-                    replay_fields,
-                    len(observer_frame) + 64,
-                )
-        replayed = self._publish_replay(state, event, session_id, replay_fields, len(frame) + 64)
+            if observer_frame is not None and not self._publish_replay(
+                observer,
+                event,
+                session_id,
+                replay_fields,
+            ):
+                self._publish_observer(observer, observer_frame)
+        replayed = self._publish_replay(state, event, session_id, replay_fields)
         if replayed:
             return True
         if not self._admit(state, frame):
@@ -531,7 +520,7 @@ class ConnectionRegistry:
             frame = state.connection.codec.notification(event, session_id, data=data)
             if frame is None:
                 continue
-            if self._publish_replay(state, event, session_id, {"data": data}, len(frame) + 64):
+            if self._publish_replay(state, event, session_id, {"data": data}):
                 continue
             if state is self._controller:
                 await self.send(state.connection, frame)
@@ -539,7 +528,7 @@ class ConnectionRegistry:
                 self._publish_observer(state, frame)
 
     def release(self, connection: Any) -> None:
-        self.replay.connection_closed(connection)
+        self.invalidate_replay_connection(connection, "connection_closed")
         state = self._connections.pop(connection, None)
         if state is None:
             return
@@ -681,9 +670,7 @@ class ConnectionRegistry:
             result, _ = await output.current_write
         except asyncio.CancelledError:
             self._finish_frame_accounting(output, item)
-            if item.join_response:
-                self.replay.connection_closed(state.connection)
-                self._discard_connection_replay(state.connection)
+            self._fail_replay_frame(item, "write_cancelled")
             if not output.released:
                 self._finish_future(item.future, False)
             if asyncio.current_task().cancelling():
@@ -696,9 +683,7 @@ class ConnectionRegistry:
             return
         except Exception as exc:  # noqa: BLE001 - preserve write failure for its caller
             self._finish_frame_accounting(output, item)
-            if item.join_response:
-                self.replay.connection_closed(state.connection)
-                self._discard_connection_replay(state.connection)
+            self._fail_replay_frame(item, "write_failed")
             self._finish_future(item.future, error=exc)
             if output.phase == "flushing":
                 self._reset_flush(output, error=exc)
@@ -708,11 +693,14 @@ class ConnectionRegistry:
             output.current_write = None
         self._finish_frame_accounting(output, item)
         self._finish_future(item.future, result)
-        if not result and item.join_response:
-            self.replay.connection_closed(state.connection)
-            self._discard_connection_replay(state.connection)
+        if not result:
+            self._fail_replay_frame(item, "write_failed")
         if not result and output.phase == "flushing":
             self._reset_flush(output, False)
+
+    def _fail_replay_frame(self, item: _OutputFrame, reason: str) -> None:
+        if item.replay_scope is not None:
+            self.invalidate_replay_scope(item.replay_scope, reason)
 
     async def _complete_output_phase(
         self, state: _Connection, output: _OutputState
@@ -992,7 +980,6 @@ class ConnectionRegistry:
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
             ),
-            session_id=target[0],
         )
         assert isinstance(result, dict)
         return result
