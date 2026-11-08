@@ -43,9 +43,19 @@ def _is_repository_test_path(path: Path) -> bool:
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 
+_OWNER_COUNTS = None
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
+    global _OWNER_COUNTS
     if not _IS_REPOSITORY_TESTS:
         return
+    capture_path = os.environ.get("ZETA_CAPTURE_OWNER_COUNTS")
+    if capture_path:
+        from tests.support.owner_counts import start
+
+        worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+        _OWNER_COUNTS = start(f"{capture_path}.{worker}.jsonl")
     import zeta
 
     imported = Path(zeta.__file__).resolve()
@@ -525,6 +535,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     """Report retained fds and stop workers before they approach FD_SETSIZE."""
     del nextitem
     global _FD_RETAINED_MAX, _FD_START_COUNT
+    if _OWNER_COUNTS is not None:
+        _OWNER_COUNTS.node_start(item.nodeid)
     before = _open_file_descriptors()
     if _FD_START_COUNT is None:
         _FD_START_COUNT = len(before)
@@ -533,6 +545,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
             for descriptor, description in before.items()
         )
     yield
+    if _OWNER_COUNTS is not None:
+        _OWNER_COUNTS.node_finish(item.nodeid)
     after = _open_file_descriptors()
     previous_count = _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
     if previous_count is not None and len(after) > previous_count:
