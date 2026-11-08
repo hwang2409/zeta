@@ -10,6 +10,7 @@ import pytest
 
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
     build_agent_receipt,
@@ -951,7 +952,9 @@ async def test_concurrent_status_calls_cannot_regress_projection(
     first = asyncio.create_task(asyncio.to_thread(read_status))
     assert await asyncio.to_thread(older_started.wait, 1)
     second = asyncio.create_task(asyncio.to_thread(read_status))
-    newer_result, older_result = await asyncio.gather(second, first)
+    newer_result, older_result = await await_or_fail(
+        asyncio.gather(second, first), what="overlapping lifecycle reads"
+    )
     assert newer_result["tool_calls"] == 2
     assert older_result["tool_calls"] == 1
     rendered = AgentCard.render_receipt(event)
