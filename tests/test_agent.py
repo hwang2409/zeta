@@ -15329,6 +15329,7 @@ async def test_idle_child_is_running_during_wake_turn(
     loop.agent_instance_id = "parent:1"
     loop._terminal_transition_fence = TerminalTransitionFence(child_store)
     first_idle = asyncio.Event()
+    post_reminder_idle = asyncio.Event()
     wake_started = asyncio.Event()
     release_wake = asyncio.Event()
     calls = 0
@@ -15346,6 +15347,8 @@ async def test_idle_child_is_running_during_wake_turn(
         kwargs["finish_lifecycle"]("idle", "WAIT")
         if calls == 1:
             first_idle.set()
+        elif calls == 3:
+            post_reminder_idle.set()
         return {
             "content": [{"type": "text", "text": "WAIT"}],
             "isError": False,
@@ -15378,14 +15381,9 @@ async def test_idle_child_is_running_during_wake_turn(
 
     release_wake.set()
 
-    async def wait_for_new_idle() -> None:
-        while (
-            child_store.agent_lifecycle().get("state") != "idle"
-            or child_store.agent_lifecycle().get("idle_since") == first_idle_since
-        ):
-            await asyncio.sleep(0)
-
-    await asyncio.wait_for(wait_for_new_idle(), timeout=2)
+    await await_or_fail(
+        post_reminder_idle.wait(), what="post-reminder idle lifecycle update"
+    )
     assert child_store.agent_lifecycle()["state"] == "idle"
     assert child_store.agent_lifecycle()["idle_since"] > first_idle_since
 
