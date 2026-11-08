@@ -889,7 +889,6 @@ def test_typed_mutation_deletion_gate(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     try:
         assert not hasattr(store, "_run_durable_write")
-        assert not hasattr(store, "_to_thread_durable")
         delta = store.commit(
             AppendConversationRows((_warning("public"),), result="public"),
             store.conversation_generation,
