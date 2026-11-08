@@ -306,8 +306,12 @@ class FrameWriteOwner:
         while self._active or self._orphaned:
             for write in tuple(self._active):
                 write.cancel()
+            # Let canceled writers reach their handler and register the inner
+            # write here, so this pass cancels it instead of the next one.
             await asyncio.sleep(0)
             pending = set(self._active) | self._orphaned
+            if not pending:
+                return
             for write in pending:
                 write.cancel()
             remaining = deadline - asyncio.get_running_loop().time()

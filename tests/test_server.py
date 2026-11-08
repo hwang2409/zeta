@@ -520,6 +520,67 @@ async def test_server_close_drains_write_registered_during_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_server_close_survives_orphaned_write_settling_during_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
+    started = asyncio.Event()
+    stall = asyncio.get_running_loop().create_future()
+    gate = asyncio.get_running_loop().create_future()
+
+    class Writer:
+        class Transport:
+            def abort(self) -> None:
+                pass
+
+        transport = Transport()
+
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            started.set()
+            try:
+                await asyncio.wait_for(stall, 10)
+            except asyncio.CancelledError:
+                pass  # resist the abort-time cancel so the write stays orphaned
+            await asyncio.wait_for(gate, 10)
+
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    await await_or_fail(server.start(), what="server start")
+    listener = server._server
+    assert listener is not None and listener.is_serving()
+    client = _Client(server, asyncio.StreamReader(), Writer())
+    write = asyncio.create_task(client._write_physical(client.codec.response(None, {})))
+    assert server.connections is not None
+    real_aclose = server.connections.aclose
+
+    async def settle_orphan_then_aclose() -> None:
+        await real_aclose()
+        # The orphaned write finishes in the step right before the frame
+        # owner closes, so its done callback runs inside the owner's close.
+        gate.set_result(None)
+        await asyncio.sleep(0)
+
+    server.connections.aclose = settle_orphan_then_aclose  # type: ignore[method-assign]
+    try:
+        await await_or_fail(started.wait(), what="write start")
+        write.cancel()
+        with pytest.raises(protocol_module.FrameWriteCancelled):
+            await await_or_fail(write, what="canceled write")
+        await await_or_fail(server.close(), what="server close")
+        assert not listener.is_serving()
+    finally:
+        if not gate.done():
+            gate.set_result(None)
+        if listener.is_serving():
+            listener.close()
+            await await_or_fail(listener.wait_closed(), what="listener cleanup")
+
+
+@pytest.mark.asyncio
 async def test_repeated_stalled_unix_writes_close_each_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
