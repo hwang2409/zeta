@@ -1694,7 +1694,7 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
         if watchdog_reads == 2:
             enter.close()
             raise TimeoutError
-        return await enter
+        return await asyncio.wait_for(enter, timeout=10)
 
     monkeypatch.setattr(
         "zeta.providers.ollama.wait_for_response_headers",
