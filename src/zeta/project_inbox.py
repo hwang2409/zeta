@@ -12,7 +12,7 @@ import stat
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
@@ -231,6 +231,7 @@ class ProjectInbox:
         in_reply_to: str | None = None,
         message_id: str | None = None,
         to_session: str | None = None,
+        on_visible: Callable[[], None] | None = None,
     ) -> str:
         session, target, message_id = self._deliver(
             from_project=from_project,
@@ -243,7 +244,13 @@ class ProjectInbox:
             message_id=message_id,
             to_session=to_session,
         )
-        self._record_sent(session, message_id, target)
+        if on_visible is not None:
+            try:
+                on_visible()
+            except Exception:  # noqa: BLE001,S110
+                # The durable record remains authoritative if its wake cannot run.
+                pass
+        self._sent_tracker(session).record(message_id, target)
         return message_id
 
     def send_with_outcome(
@@ -272,29 +279,11 @@ class ProjectInbox:
         )
         return message_id, self._sent_tracker(session).record(message_id, target)
 
-    @contextmanager
-    def holding(self, project: str) -> Iterator[ProjectInbox]:
-        """Hold one project's exclusive inbox authority.
-
-        The yielded inbox sends to that project under the hold, so a caller can
-        take later-ranked locks (session shape) and commit its own record before
-        release. Sent-ledger rows are recorded after release.
-        """
-        target = self._resolve_project(project)
-        with self._held_directories(target.project_id) as dirs:
-            held = _HeldInbox(self, target, dirs)
-            yield held
-        for session, message_id in held.sent:
-            self._record_sent(session, message_id, target.project_id)
-
     def _deliver(self, **kwargs: Any) -> tuple[str, str, str]:
         session, target, message_id, body, record = self._outgoing(**kwargs)
         with self._directories(target, create=True) as dirs:
             self._publish_outgoing(dirs, message_id, body, record)
         return session, target, message_id
-
-    def _record_sent(self, session: str, message_id: str, target: str) -> None:
-        self._sent_tracker(session).record(message_id, target)
 
     def _sent_tracker(self, session: str) -> SentMessageTracker:
         if self.sent_tracker is not None and self.sent_tracker.session_id == session:
@@ -1204,41 +1193,3 @@ class ProjectInbox:
                 raise InboxError("unsafe done history body")
             os.unlink(body_name, dir_fd=bodies_fd)
 
-
-class _HeldInbox(ProjectInbox):
-    """An inbox bound to one already-held project inbox authority."""
-
-    def __init__(
-        self,
-        owner: ProjectInbox,
-        project: Project,
-        dirs: tuple[int, int, int, int, int],
-    ) -> None:
-        super().__init__(
-            owner.registry,
-            sessions_root=owner.sessions_root,
-            sent_tracker=owner.sent_tracker,
-            receipts=owner.receipts,
-        )
-        self._held_project = project
-        self._held_dirs = dirs
-        self.sent: list[tuple[str, str]] = []
-
-    def _resolve_project(self, value: str) -> Project:
-        # Identity ranks before the held inbox lock, so only the held project resolves.
-        if value != self._held_project.project_id:
-            raise InboxError("the held inbox authority covers another project")
-        return self._held_project
-
-    @contextmanager
-    def _directories(
-        self, project_id: str, *, create: bool
-    ) -> Iterator[tuple[int, int, int, int, int]]:
-        if project_id != self._held_project.project_id:
-            raise InboxError("the held inbox authority covers another project")
-        with _storage_errors():
-            yield self._held_dirs
-
-    def _record_sent(self, session: str, message_id: str, target: str) -> None:
-        # The sent ledger takes the stored-format lease, which ranks first.
-        self.sent.append((session, message_id))

@@ -7,7 +7,7 @@ import json
 import os
 import stat
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -27,6 +27,7 @@ from .core.session_files import (
 from .storage_format import reject_unknown_keys
 
 _MAX_RECORD_BYTES = 256 * 1024
+ATTENTION_KIND_EPOCH = 5
 
 
 def _now() -> str:
@@ -125,11 +126,11 @@ class AttentionStore:
         kind: AttentionKind = "decision",
     ) -> AttentionRecord:
         require_closed_variant("attention.kind", kind)
-        if kind != "decision" and self.writer_epoch < WRITER_EPOCH:
+        if kind != "decision" and self.writer_epoch < ATTENTION_KIND_EPOCH:
             raise ValueError(
                 "non-decision attention kinds require the one-way shared cutover: "
                 f"zeta storage-format advance --expected-epoch {self.writer_epoch} "
-                f"--target-epoch {WRITER_EPOCH}"
+                f"--target-epoch {ATTENTION_KIND_EPOCH}"
             )
         if kind != "decision" and (options or recommendation is not None):
             raise ValueError(
@@ -175,59 +176,12 @@ class AttentionStore:
         self.replace(record, create_directory=True)
         return record
 
-    def dismiss(
-        self, attention_id: str, *, session_id: str
-    ) -> tuple[AttentionRecord, bool]:
-        with self.holding(attention_id, session_id=session_id) as (current, write):
-            if current.status == "resolved":
-                return current, True
-            if current.kind == "decision":
-                raise ValueError("decision attention items require a reply")
-            dismissed = replace(
-                current, status="resolved", resolved_at=_now(), decision=None
-            )
-            write(dismissed)
-            return dismissed, False
-
     def get(self, attention_id: str) -> AttentionRecord:
         _check_id(attention_id)
         value = _bounded_json(self.directory / f"{attention_id}.json")
         if not isinstance(value, dict):
             raise TypeError("attention record must be a JSON object")
         return AttentionRecord.from_dict(value)
-
-    def resolve(
-        self,
-        attention_id: str,
-        *,
-        session_id: str,
-        decision: str,
-    ) -> tuple[AttentionRecord, bool]:
-        """Resolve one owned record without delivering anything."""
-        decision = decision.strip()
-        if not decision:
-            raise ValueError("decision must be nonempty")
-        with self.holding(attention_id, session_id=session_id) as (current, write):
-            if current.status == "resolved":
-                return current, True
-            resolved = resolved_record(current, decision)
-            write(resolved)
-            return resolved, False
-
-    @contextmanager
-    def holding(
-        self, attention_id: str, *, session_id: str
-    ) -> Iterator[tuple[AttentionRecord, Callable[[AttentionRecord], None]]]:
-        """Hold session shape plus `.resolution.lock` over one owned record.
-
-        Yields the record and a writer that uses the already-held lock. Every
-        mutation of an existing record goes through this lock.
-        """
-        with self._resolution_lock() as attention_fd:
-            current = self._read_at(attention_fd, attention_id)
-            if current.session_id != session_id:
-                raise ValueError("attention record does not belong to this session")
-            yield current, lambda record: self._write_at(attention_fd, record)
 
     def release_fork(self, attention_id: str, fork_session_id: str) -> None:
         """Clear an open record's binding to `fork_session_id`, if it still has it."""
@@ -309,11 +263,6 @@ class AttentionStore:
                 + "\n"
             ).encode(),
         )
-
-
-def resolved_record(record: AttentionRecord, decision: str) -> AttentionRecord:
-    """Return `record` resolved with an already-validated `decision`."""
-    return replace(record, status="resolved", resolved_at=_now(), decision=decision)
 
 
 def _check_id(attention_id: str) -> None:

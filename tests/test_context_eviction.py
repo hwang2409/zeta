@@ -44,6 +44,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
+from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import _messages as build_ollama_messages
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -2499,6 +2500,7 @@ class _CancelablePartialBackend(CompletionBackend):
         self.reset = reset
         self.partial_seen = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],

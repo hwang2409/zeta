@@ -13,6 +13,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
 from ..locking import shape_lock
+from ..storage_format import drain_releases
 
 
 class SessionError(ValueError):
@@ -66,6 +67,8 @@ def session_directory(
             _component(session_id)
             root_fd = cleanup.enter_context(session_root(root))
             session_fd = cleanup.enter_context(child_directory(root_fd, session_id))
+            if exclusive:
+                drain_releases()  # a store this process dropped must not refuse deletion
             try:
                 fcntl.flock(
                     session_fd,

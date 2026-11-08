@@ -15,13 +15,14 @@ from zeta.protocol.types import (
     TextContent,
     ToolSchema,
 )
-from zeta.providers.retry_policy import ProviderRetryBudget, use_retry_budget
+from zeta.providers.completion import CompletionRetryBudget, owned_completion
 
 
 class _BudgetExhaustingBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls = 0
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
@@ -45,6 +46,7 @@ class _PostStreamRetryBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls = 0
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
@@ -52,12 +54,14 @@ class _PostStreamRetryBackend(CompletionBackend):
         self.calls += 1
         if self.calls == 1:
             yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="stale")
             yield StreamEvent(
                 StreamEventType.ERROR,
                 error=ErrorInfo("timeout", "unsafe provider detail"),
                 data={"retry_after": 0},
             )
             return
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta='{"changes":[]}')
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent('{"changes":[]}')]),
@@ -69,6 +73,7 @@ class _OversizedStreamingBackend(CompletionBackend):
     def __init__(self) -> None:
         self.requested_third = False
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
@@ -84,7 +89,9 @@ async def test_bounded_reconciliation_stops_reading_oversized_stream() -> None:
     backend = _OversizedStreamingBackend()
 
     with use_response_byte_limit(8):
-        response = await complete_reconciliation(backend, "safe prompt")
+        response = await complete_reconciliation(
+            backend, "safe prompt", CompletionRetryBudget()
+        )
 
     assert response.text == "12345678"
     assert response.truncated is True
@@ -94,13 +101,12 @@ async def test_bounded_reconciliation_stops_reading_oversized_stream() -> None:
 @pytest.mark.asyncio
 async def test_original_and_repair_share_one_provider_attempt_budget() -> None:
     backend = _BudgetExhaustingBackend()
-    budget = ProviderRetryBudget()
+    budget = CompletionRetryBudget()
 
-    with use_retry_budget(budget):
-        response = await complete_reconciliation(backend, "original")
-        assert response.text == "not json"
-        with pytest.raises(RuntimeError, match="budget exhausted"):
-            await complete_reconciliation(backend, "repair")
+    response = await complete_reconciliation(backend, "original", budget)
+    assert response.text == "not json"
+    with pytest.raises(RuntimeError, match="budget exhausted"):
+        await complete_reconciliation(backend, "repair", budget)
 
     assert backend.calls == 5
     assert budget.attempts == 5
@@ -110,7 +116,10 @@ async def test_original_and_repair_share_one_provider_attempt_budget() -> None:
 async def test_reconciliation_retries_after_partial_stream_before_commit() -> None:
     backend = _PostStreamRetryBackend()
 
-    response = await complete_reconciliation(backend, "safe prompt")
+    with use_response_byte_limit(len(b'{"changes":[]}')):
+        response = await complete_reconciliation(
+            backend, "safe prompt", CompletionRetryBudget()
+        )
 
     assert backend.calls == 2
     assert response.text == '{"changes":[]}'

@@ -133,6 +133,57 @@ Example response:
 {"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.0","server":"zeta","capabilities":{"requests":["list_sessions","new_session","resume","send","steer","approve","deny","abort","status"],"notifications":["event"]}}}
 ```
 
+## method table
+
+The server declares each request method once. `since` is the first protocol version
+that advertises the method. A feature value means the client must negotiate that
+feature. Observer connections receive only methods with `read` access.
+
+| method | since | feature | access |
+| --- | --- | --- | --- |
+| `list_sessions` | `1.0` | `none` | `read` |
+| `new_session` | `1.0` | `none` | `controller_write` |
+| `resume` | `1.0` | `none` | `controller_write` |
+| `send` | `1.0` | `none` | `delivery` |
+| `steer` | `1.0` | `none` | `delivery` |
+| `approve` | `1.0` | `none` | `session_mutation` |
+| `deny` | `1.0` | `none` | `session_mutation` |
+| `abort` | `1.0` | `none` | `session_mutation` |
+| `status` | `1.0` | `none` | `read` |
+| `rename_session` | `1.1` | `none` | `session_mutation` |
+| `delete_session` | `1.1` | `none` | `controller_write` |
+| `repair_transcript` | `1.1` | `none` | `session_mutation` |
+| `session_tree` | `1.1` | `none` | `read` |
+| `session_history` | `1.1` | `none` | `read` |
+| `content_read` | `1.1` | `content_read` | `read` |
+| `switch_branch` | `1.1` | `none` | `session_mutation` |
+| `fork_message` | `1.1` | `none` | `session_mutation` |
+| `model_catalog` | `1.1` | `none` | `read` |
+| `session_settings` | `1.1` | `none` | `read` |
+| `set_settings` | `1.1` | `none` | `session_mutation` |
+| `set_compaction` | `1.1` | `none` | `session_mutation` |
+| `send_images` | `1.1` | `none` | `delivery` |
+| `slash_list` | `1.1` | `none` | `controller_read` |
+| `slash_run` | `1.1` | `none` | `session_mutation` |
+| `account_list` | `1.1` | `none` | `controller_read` |
+| `account_logout` | `1.1` | `none` | `controller_write` |
+| `account_refresh` | `1.1` | `none` | `controller_write` |
+| `account_switch` | `1.1` | `none` | `controller_write` |
+| `login_start` | `1.1` | `none` | `controller_write` |
+| `login_status` | `1.1` | `none` | `controller_read` |
+| `login_cancel` | `1.1` | `none` | `controller_write` |
+| `login_providers` | `1.1` | `none` | `controller_read` |
+| `ping` | `1.1` | `ping` | `read` |
+| `set_turn_context` | `1.1` | `turn_context` | `session_mutation` |
+| `list_projects` | `1.1` | `projects` | `controller_read` |
+| `project_show` | `1.1` | `projects` | `controller_read` |
+| `project_memory_log` | `1.1` | `projects` | `controller_read` |
+| `project_inbox` | `1.1` | `projects` | `controller_write` |
+| `clear_steering` | `1.0` | `abort_scope` | `session_mutation` |
+| `delivery_status` | `1.0` | `delivery_id` | `read` |
+| `session_grants` | `1.1` | `session_grants` | `read` |
+| `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
+
 ## common JSON-RPC shapes
 
 Every request has `jsonrpc` (`"2.0"`), `id` (a string or integer), `method`
@@ -1464,7 +1515,7 @@ The shared slash registry has this order and surface availability:
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
 | `tasks` | no | inspect background processes |
-| `decisions` | yes | read, reply to, or dismiss attention items |
+| `decisions` | yes | read, reply, dismiss, or batch-reply to attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |
 | `approve` | no | `/approve [key]` |

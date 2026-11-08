@@ -131,11 +131,13 @@ def _conservative_context(
     ):
         prompt = prompt[:offset] + prompt[offset + length :]
         empty_digest = hashlib.sha256(b"").hexdigest()
-        components["project_memory"] = {
-            "offset": offset,
-            "length": 0,
-            "digest": empty_digest,
-        }
+        if metadata.prompt_recipe is not None:
+            # A pre-recipe session keeps its span only in the legacy fields.
+            components["project_memory"] = {
+                "offset": offset,
+                "length": 0,
+                "digest": empty_digest,
+            }
         return ProjectContext(
             prompt,
             tuple(Path(path) for path in metadata.context_files),

@@ -33,7 +33,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ...locking import shape_lock
-from ...storage_format import WriterLease, mapping_mutations, open_writer
+from ...storage_format import (
+    WriterLease,
+    mapping_mutations,
+    open_writer,
+    release_later,
+    release_now,
+)
 from ..process_env import subprocess_env
 from ..session_files import (
     child_directory,
@@ -491,7 +497,7 @@ class WorkspaceSnapshotStore:
                 )
                 self._load()
                 self._release_lease = weakref.finalize(
-                    self, self._close_leases, lease.pop_all(), self._storage_lease
+                    self, release_later, self._close_leases, lease.pop_all(), self._storage_lease
                 )
             storage_ownership.pop_all()
 
@@ -550,7 +556,7 @@ class WorkspaceSnapshotStore:
         storage_lease.close()
 
     def close(self) -> None:
-        self._release_lease()
+        release_now(self._release_lease)
 
     @contextmanager
     def _shadow_workspace(self, *, write: bool = False):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 from collections.abc import Iterator
@@ -16,7 +15,6 @@ from .attention_records import (
     AttentionRecord,
     AttentionStore,
     read_bounded_session_json,
-    resolved_record,
 )
 from .config.tool_policy import ToolPolicy
 from .core.checkpoints import ConversationEntry
@@ -29,7 +27,6 @@ from .core.session_files import (
     write_session_file,
 )
 from .core.store.prompt_composition import clone_prompt_composition
-from .project_inbox import ProjectInbox
 from .protocol.types import Message, MessageRole, TextContent, ToolUseContent
 from .runtime.project_registry_state import (
     ProjectRegistryState,
@@ -119,75 +116,6 @@ def validate_attention_fork(
     ):
         raise ValueError("attention fork is not bound to this source record")
     return ValidatedAttentionFork(fork, record)
-
-
-_RESOLUTION_ATTEMPTS = 5
-
-
-def attention_decision_message_id(attention_id: str) -> str:
-    """Return the stable inbox identity for one attention reply."""
-    return hashlib.sha256(f"attention-decision:{attention_id}".encode()).hexdigest()[
-        :32
-    ]
-
-
-def deliver_attention_decision(
-    home: Path,
-    record: AttentionRecord,
-    decision: str,
-    *,
-    from_session: str,
-    registry_state: ProjectRegistryState | None = None,
-) -> tuple[str, AttentionRecord, bool]:
-    """Deliver and resolve one attention reply through the shared resolution seam."""
-    decision = decision.strip()
-    if not decision:
-        raise ValueError("decision must be nonempty")
-    message_id = attention_decision_message_id(record.id)
-    store = AttentionStore(Path(home) / "sessions" / record.session_id)
-    state = registry_state or available_project_registry(Path(home) / "projects")
-    registry = state.registry
-    if registry is None:
-        raise ValueError("project registry is unavailable")
-    inbox = ProjectInbox(registry, sessions_root=Path(home) / "sessions")
-    for _attempt in range(_RESOLUTION_ATTEMPTS):
-        # Lock order: project identity/inbox first, then source shape plus
-        # `.resolution.lock`, so read a tentative record without the inbox.
-        with store.holding(record.id, session_id=record.session_id) as (tentative, _):
-            pass
-        if tentative.status == "resolved":
-            return message_id, tentative, True
-        if tentative.project_id is None:
-            raise ValueError("attention record has no project")
-        label = "Decision" if tentative.kind == "decision" else "Reply"
-        with (
-            inbox.holding(tentative.project_id) as held,
-            store.holding(record.id, session_id=record.session_id) as (
-                current,
-                write,
-            ),
-        ):
-            if current != tentative:
-                continue
-            held.send(
-                from_project=current.project_id,
-                from_session=from_session,
-                to_project=current.project_id,
-                to_session=current.session_id,
-                kind="reply",
-                title=f"{label}: {current.title}",
-                body=(
-                    f"User {label.lower()} relayed from session {from_session}. "
-                    f"The question was asked at {current.created_at}; check "
-                    "whether the situation has changed before acting.\n\n"
-                    f"{label}: {decision}"
-                ),
-                message_id=message_id,
-            )
-            resolved = resolved_record(current, decision)
-            write(resolved)
-        return message_id, resolved, False
-    raise ValueError("attention record kept changing during resolution; try again")
 
 
 def release_discussion_fork(
