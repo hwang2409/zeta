@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ...core.store.recent_rows import (
+from ...core.store import (
     ApprovalHistory,
     ApprovalRequest,
     ApprovalResolution,

@@ -24,7 +24,7 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
-from zeta.core.store import recent_rows
+from zeta.core.store import _row_history
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -574,7 +574,7 @@ async def test_row_older_than_lookup_window_ends_older_streams_only(
     serve = await _serve(tmp_path, transport, FakeBackend([]))
     try:
         old_stream = (await serve.join(serve.observer))["replay"]["stream_id"]
-        monkeypatch.setattr(recent_rows, "RECENT_ROW_WINDOW", 4)
+        monkeypatch.setattr(_row_history, "RECENT_ROW_WINDOW", 4)
         _tool_rows(serve.store, "late-call")
         for index in range(5):
             serve.store.append_task_notification(task_id=f"filler-{index}", command="true", exit_code=0)
