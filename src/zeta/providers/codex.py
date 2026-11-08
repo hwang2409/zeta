@@ -257,7 +257,7 @@ class CodexBackend(CompletionBackend):
             headers = self.token_store.auth_headers(access_token)
             headers["session-id"] = cache_key
             body = await encode_json_payload(
-                payload, ensure_ascii=False, separators=(",", ":")
+                payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
             )
             headers.setdefault("content-type", "application/json")
             stream_context = client.stream(

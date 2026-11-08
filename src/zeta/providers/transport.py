@@ -43,20 +43,25 @@ async def encode_json_payload(
     ensure_ascii: bool = True,
     sort_keys: bool = False,
     separators: tuple[str, str] | None = None,
+    allow_nan: bool = True,
 ) -> bytes:
     """Encode JSON while yielding between bounded pieces of the payload."""
     encoder = json.JSONEncoder(
-        ensure_ascii=ensure_ascii, sort_keys=sort_keys, separators=separators
+        ensure_ascii=ensure_ascii,
+        sort_keys=sort_keys,
+        separators=separators,
+        allow_nan=allow_nan,
     )
     body = bytearray()
     pending = 0
     for fragment in encoder.iterencode(payload):
-        encoded = fragment.encode()
-        body.extend(encoded)
-        pending += len(encoded)
-        if pending >= _JSON_YIELD_BYTES:
-            await asyncio.sleep(0)
-            pending = 0
+        for character in fragment:
+            encoded = character.encode()
+            body.extend(encoded)
+            pending += len(encoded)
+            if pending >= _JSON_YIELD_BYTES:
+                await asyncio.sleep(0)
+                pending = 0
     return bytes(body)
 
 

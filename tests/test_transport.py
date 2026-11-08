@@ -75,22 +75,43 @@ async def test_encoded_payload_uses_known_length_without_chunked_framing() -> No
 
 
 @pytest.mark.asyncio
-async def test_encode_json_payload_yields_during_large_encoding() -> None:
-    progressed = asyncio.Event()
+async def test_encode_json_payload_yields_repeatedly_during_one_large_scalar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.providers import transport
 
-    async def observer() -> None:
-        await asyncio.sleep(0)
-        progressed.set()
+    original_sleep = asyncio.sleep
+    progress = 0
 
-    observer_task = asyncio.create_task(observer())
-    try:
-        await encode_json_payload({"text": "x" * (512 * 1024)})
-        await asyncio.wait_for(observer_task, 10)
-        assert progressed.is_set()
-    finally:
-        if not observer_task.done():
-            observer_task.cancel()
-            await asyncio.wait_for(observer_task, 10)
+    async def observe_sleep(delay: float) -> None:
+        nonlocal progress
+        progress += 1
+        await original_sleep(delay)
+
+    monkeypatch.setattr(transport.asyncio, "sleep", observe_sleep)
+    await encode_json_payload({"text": "x" * (10 * 1024 * 1024)})
+    assert progress >= 2
+
+
+@pytest.mark.asyncio
+async def test_encode_json_payload_preserves_non_ascii_at_chunk_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.providers import transport
+
+    monkeypatch.setattr(transport, "_JSON_YIELD_BYTES", 5)
+    payload = {"text": "é界🙂" * 20}
+    encoded = await encode_json_payload(payload, ensure_ascii=False)
+    assert encoded == json.dumps(payload, ensure_ascii=False).encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+async def test_encode_json_payload_rejects_non_finite_numbers_when_requested(
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="Out of range float values are not JSON compliant"):
+        await encode_json_payload({"value": value}, allow_nan=False)
 
 
 class _PartialErrorBody(httpx.AsyncByteStream):
