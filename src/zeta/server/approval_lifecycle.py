@@ -218,28 +218,6 @@ class ApprovalLifecycle:
     def _next_token(self) -> int:
         return max((item.token for item in self._state.records.values()), default=0) + 1
 
-    def _reset_for_retry(self, key: ApprovalKey, token: int, generation: int) -> None:
-        """Return an owned record whose durable write never committed to pending."""
-        current = self._state.records.get(key)
-        if (
-            current is None
-            or current.token != token
-            or generation != self._state.generation
-        ):
-            return
-        self._release_gate(current, error=asyncio.CancelledError())
-        self._put(
-            replace(
-                current,
-                admitted=asyncio.get_running_loop().create_future(),
-                token=self._next_token(),
-                phase="pending",
-                disposition="active",
-                settlement=None,
-                publication_owner=None,
-            )
-        )
-
     def _remove(self, key: ApprovalKey) -> None:
         records = dict(self._state.records)
         records.pop(key, None)
@@ -767,9 +745,6 @@ class ApprovalLifecycle:
                 target.store, target.store_request_id, decision, reason
             )
         )
-        if result.should_retry:
-            self._reset_for_retry(target.key, token, generation)
-            raise asyncio.CancelledError
         resolution = result.resolution
         current = self._state.records.get(target.key)
         owns_record = (

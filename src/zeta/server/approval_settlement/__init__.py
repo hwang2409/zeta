@@ -13,12 +13,6 @@ from ...core.store import ConversationStore
 @dataclass(frozen=True, slots=True)
 class SettlementResult:
     resolution: dict[str, str] | None
-    cancelled: bool = False
-
-    @property
-    def should_retry(self) -> bool:
-        """True when a cancelled settlement never committed a durable decision."""
-        return self.cancelled and self.resolution is None
 
 
 async def finish_despite_cancellation[T](
@@ -60,7 +54,7 @@ async def persist_durably(
         resolution = store.approval_resolution_data(request_id)
         if resolution is None:
             raise
-        return SettlementResult(resolution, cancelled=True)
+        return SettlementResult(resolution)
     except OSError:
         resolution = store.approval_resolution_data(request_id)
         if resolution is not None:

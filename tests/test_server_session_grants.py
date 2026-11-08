@@ -1575,7 +1575,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         raise OSError(f"injected {case}")
                     return await original_write(payload)
 
-                # test-contract: fail each real controller publication write once
+                # test-contract: seam fail each controller publication write once
                 monkeypatch.setattr(
                     controller.connection, "_write_physical", fail_named_publish
                 )
