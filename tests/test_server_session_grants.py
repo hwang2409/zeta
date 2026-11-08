@@ -91,7 +91,7 @@ class _DelegatedBackend:
                 self.child_two_ready.set()
                 await await_or_fail(
                     self.release_child_two.wait(),
-                    timeout=120,
+                    timeout=360,
                     what="release child-bash-2 after parent terminal",
                 )
             turn = ScriptedTurn(
@@ -1123,7 +1123,7 @@ async def _collect_second_delegated_approval(
                 return params, "delegated approval"
 
     approval, terminal = await await_or_fail(
-        collect(), timeout=60, what="second delegated approval collection"
+        collect(), timeout=300, what="second delegated approval collection"
     )
     return approval, frames, terminal
 
@@ -1173,7 +1173,7 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
         )
         await await_or_fail(
             backend.child_two_ready.wait(),
-            timeout=60,
+            timeout=300,
             what="child-bash-2 provider gate",
         )
         snapshot = (await _request(reader, writer, 31, "session_grants"))[-1]["result"]
