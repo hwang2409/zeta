@@ -240,12 +240,18 @@ class DecisionsMixin:
     async def _flush_staged_decisions(self) -> None:
         try:
             for session_id in self._decisions_session_ids():
-                await self._run_attention_operation(
+                outcome = await self._run_attention_operation(
                     self._attention_replies(session_id).flush,
                     self.loop.store.session_id,
                 )
+                self._print_broken_outcomes(outcome)
         except (OSError, ValueError) as exc:
             self._print_system(f"decisions not delivered: {exc}")
+
+    def _print_broken_outcomes(self, outcome) -> None:
+        for item in outcome.items:
+            if item.status == "broken":
+                self._print_system(f"decision not delivered: {item.detail}")
 
     def _decisions_session_ids(self) -> tuple[str, ...]:
         return tuple({item.session_id for item in self._decisions_panel.items})
@@ -357,13 +363,14 @@ class DecisionsMixin:
             }
             try:
                 replies = self._attention_replies(record.session_id)
-                await self._run_attention_operation(
+                outcome = await self._run_attention_operation(
                     replies.stage,
                     record.id,
                     decision,
                     flush_ids=item_ids,
                     from_session=self.loop.store.session_id,
                 )
+                self._print_broken_outcomes(outcome)
             except (OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
             await self._decisions_tick()

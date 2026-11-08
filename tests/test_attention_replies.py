@@ -1052,3 +1052,128 @@ def test_single_reply_message_names_its_question(tmp_path: Path) -> None:
         + _section(record, "Use SQLite.")
     )
     assert message["title"] == f"Decision: {record.title}"
+
+
+def _attention_files(fixture: ReplyFixture) -> dict[str, bytes]:
+    return {
+        path.relative_to(fixture.attention_dir).as_posix(): path.read_bytes()
+        for path in fixture.attention_dir.rglob("*")
+        if path.is_file() and path.name != ".resolution.lock"
+    }
+
+
+def test_flush_sends_good_staged_reply_and_keeps_broken_one(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, count=2)
+    good, bad = fixture.records
+    fixture.replies.stage(good.id, "good answer")
+    fixture.replies.stage(bad.id, "bad answer")
+    bad_path = fixture.attention_dir / f"{bad.id}.json"
+    bad_path.write_bytes(b"{")
+
+    try:
+        outcome = fixture.replies.flush(fixture.answerer_session_id)
+    # Capture the old failure so fail-first reaches the behavior assertion.
+    except attention_replies.ReplyConflict as exc:
+        outcome = ReplyOutcome(items=(), message_id=repr(exc))
+
+    messages = fixture.inbox_messages()
+    assert len(messages) == 1, f"broken staged record blocked the batch: {outcome}"
+    assert messages[0]["body"] == (
+        _RELAY_PREAMBLE.format(sender=fixture.answerer_session_id)
+        + "\n\n"
+        + _section(good, "good answer")
+    )
+    store = AttentionStore(fixture.home / "sessions" / fixture.session_id)
+    assert store.get(good.id).status == "resolved"
+    assert bad_path.read_bytes() == b"{"
+    assert (fixture.attention_dir / "staged" / bad.id).read_text() == "bad answer"
+    assert not (fixture.attention_dir / "staged" / good.id).exists()
+    statuses = {item.attention_id: item.status for item in outcome.items}
+    assert statuses == {good.id: "applied", bad.id: "broken"}
+    assert outcome.staged == ((bad.id, "bad answer"),)
+    _assert_no_live_journal(fixture)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "stage",
+        "stage-flush",
+        "flush",
+        "reply",
+        "dismiss",
+        "resolve_local",
+        "stage_and_flush",
+        "recover",
+    ],
+)
+def test_record_broken_at_call_time_never_blocks_good_items(
+    operation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path, count=2)
+    good, bad = fixture.records
+    replies = fixture.replies
+    sender = fixture.answerer_session_id
+    if operation in {"stage-flush", "flush"}:
+        replies.stage(bad.id, "bad answer")
+    if operation == "flush":
+        replies.stage(good.id, "good answer")
+    if operation == "recover":
+        _leave_sealed_journals(
+            fixture, replies, monkeypatch, [(good, "good answer"), (bad, "bad answer")]
+        )
+    bad_path = fixture.attention_dir / f"{bad.id}.json"
+    bad_path.write_bytes(b"{")
+    before = _attention_files(fixture)
+    calls = {
+        "stage": lambda: replies.stage(bad.id, "bad answer"),
+        "stage-flush": lambda: replies.stage(
+            good.id, "good answer", flush_ids={good.id}, from_session=sender
+        ),
+        "flush": lambda: replies.flush(sender),
+        "reply": lambda: replies.reply(bad.id, "bad answer", sender),
+        "dismiss": lambda: replies.dismiss(bad.id),
+        "resolve_local": lambda: replies.resolve_local(bad.id, "bad answer"),
+        "stage_and_flush": lambda: replies.stage_and_flush(
+            [(good.id, "good answer"), (bad.id, "bad answer")], sender
+        ),
+        "recover": replies.recover,
+    }
+    refusal: attention_replies.ReplyConflict | None = None
+    outcome = ReplyOutcome()
+    try:
+        outcome = calls[operation]()
+    except attention_replies.ReplyConflict as exc:
+        refusal = exc
+
+    assert bad_path.read_bytes() == b"{"
+    store = AttentionStore(fixture.home / "sessions" / fixture.session_id)
+    if operation in {"stage", "reply", "dismiss", "resolve_local"}:
+        assert refusal is not None and "invalid_json" in str(refusal)
+        assert _attention_files(fixture) == before, "refusal left a partial write"
+        assert fixture.inbox_messages() == []
+        return
+    assert refusal is None, f"{operation} let a broken record block good items"
+    [message] = fixture.inbox_messages()
+    assert message["body"] == (
+        _RELAY_PREAMBLE.format(sender=sender) + "\n\n" + _section(good, "good answer")
+    )
+    assert store.get(good.id).status == "resolved"
+    if operation == "recover":
+        # The broken record's journal is kept until the record is repaired.
+        [journal] = fixture.attention_dir.glob("sending-*-*")
+        assert (journal / bad.id).read_text() == "bad answer"
+        return
+    broken = [item for item in outcome.items if item.attention_id == bad.id]
+    assert [(item.status, item.detail) for item in broken] == [
+        (
+            "broken",
+            (
+                f"attention record {bad.id} is broken (invalid_json); "
+                f"repair attention/{bad.id}.json before replying"
+            ),
+        )
+    ]
+    staged = fixture.attention_dir / "staged" / bad.id
+    assert staged.exists() == (operation != "stage_and_flush")
+    _assert_no_live_journal(fixture)
