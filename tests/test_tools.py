@@ -49,15 +49,29 @@ def _niceness_command() -> str:
     return _python_command("import os; print(os.getpriority(os.PRIO_PROCESS, 0))")
 
 
-def _descendant_command(child_pid: Path | None = None) -> str:
-    child = "import os,signal,pathlib\n"
+def _descendant_command(
+    child_pid: Path | None = None, release_path: Path | None = None
+) -> str:
+    child = "import os,signal,pathlib,time\n"
     if child_pid:
         child += f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
-    child += "signal.pause()"
+    if release_path:
+        child += "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        child += (
+            "while not pathlib.Path("
+            f"{str(release_path)!r}"
+            ").exists(): time.sleep(0.01)\n"
+        )
+    else:
+        child += "signal.pause()"
     parent = (
-        "import subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
-        + "time.sleep(5)"
+        "import pathlib,subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        + (
+            f"while not pathlib.Path({str(release_path)!r}).exists(): time.sleep(0.01)"
+            if release_path
+            else "time.sleep(5)"
+        )
     )
     return _python_command(parent)
 
@@ -1608,12 +1622,15 @@ async def test_bash_timeout_kills_and_reaps_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     child_pid = tmp_path / "timeout-child.pid"
+    release_path = tmp_path / "timeout-release"
     timeout_ready = asyncio.Event()
+    timeout_fired = asyncio.Event()
     real_sleep = asyncio.sleep
 
     async def wait_for_readiness(delay: float) -> None:
         if delay == 0.5:
             await asyncio.wait_for(timeout_ready.wait(), 10)
+            timeout_fired.set()
             return
         await real_sleep(delay)
 
@@ -1627,7 +1644,9 @@ async def test_bash_timeout_kills_and_reaps_descendants(
                     "bash-timeout",
                     "bash",
                     {
-                        "command": _descendant_command(child_pid=child_pid),
+                        "command": _descendant_command(
+                            child_pid=child_pid, release_path=release_path
+                        ),
                         "timeout": 0.5,
                     },
                 )
@@ -1635,10 +1654,26 @@ async def test_bash_timeout_kills_and_reaps_descendants(
         )
         child_pid_value = await read_pid_file(child_pid)
         timeout_ready.set()
-        result = await asyncio.wait_for(execution, 10)
-        await wait_pid_exited(child_pid_value)
+        await await_or_fail(timeout_fired.wait(), what="bash timeout awaitable")
+        done, _ = await asyncio.wait({execution}, timeout=10)
+        if not done:
+            release_path.touch()
+            result = await await_or_fail(
+                execution, what="bash execution after timeout fallback release"
+            )
+        else:
+            result = execution.result()
 
-        assert result["isError"] is True
+        assert result["isError"] is True, (
+            "bash did not return a timeout result after its timeout fired"
+        )
+        try:
+            await wait_pid_exited(child_pid_value)
+        except AssertionError as error:
+            raise AssertionError(
+                "bash timeout did not terminate the descendant process"
+            ) from error
+
         assert "timed out after" in result["content"][0]["text"]
         assert result["structuredContent"]["timed_out"] is True
         assert result["structuredContent"]["error"]["tool"] == "bash"
