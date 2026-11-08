@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import os
 import threading
@@ -76,12 +75,7 @@ def _loop(
         agent_catalog=catalog,
     )
     schemas = tuple(registry.schemas) if explicit_schemas else None
-    parameters = inspect.signature(AgentLoop).parameters
-    live_scope = (
-        {"live_config_home": home, "live_config_project_dir": project}
-        if "live_config_home" in parameters
-        else {"skill_home": home, "skill_project_dir": project}
-    )
+    live_scope = {"live_config_home": home, "live_config_project_dir": project}
     loop = AgentLoop(
         backend or FakeBackend([]),
         store,
@@ -96,10 +90,7 @@ def _loop(
 
 
 async def _refresh(loop: AgentLoop) -> None:
-    refresher = getattr(loop, "refresh_live_config", None)
-    if refresher is None:
-        refresher = loop.refresh_skills
-    await refresher()
+    await loop.refresh_live_config()
 
 
 @pytest.mark.asyncio
@@ -259,10 +250,7 @@ async def test_running_child_refreshes_delegation_catalog_without_changing_selec
 
     _write_agent(profile, "specialist", "focused specialist", "second body")
     _write_agent(home / "agents" / "delegate.md", "delegate", "delegated specialist")
-    _ = [
-        event
-        async for event in child.run_turn("next", origin=MessageOrigin.USER)
-    ]
+    _ = [event async for event in child.run_turn("next", origin=MessageOrigin.USER)]
 
     assert selected.prompt_suffix == "first body"
     child_prompt = child._runtime_prompt.system_prompt
@@ -395,29 +383,17 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
     _write_agent(profile, "specialist", "focused specialist")
     entered = threading.Event()
     release = threading.Event()
-    watcher = getattr(loop, "_live_config_watcher", None)
-    if watcher is not None:
-        original = watcher.prepare
+    watcher = loop._live_config_watcher
+    assert watcher is not None
+    original = watcher.prepare
 
-        def paused(base, *, force: bool = False):
-            candidate = original(base, force=force)
-            entered.set()
-            assert release.wait(timeout=10)
-            return candidate
+    def paused(base, *, force: bool = False):
+        candidate = original(base, force=force)
+        entered.set()
+        assert release.wait(timeout=10)
+        return candidate
 
-        watcher.prepare = paused
-    else:
-        watcher = loop._skill_watcher
-        assert watcher is not None
-        original = watcher.scan
-
-        def paused(*, force: bool = False):
-            candidate = original(force=force)
-            entered.set()
-            assert release.wait(timeout=10)
-            return candidate
-
-        watcher.scan = paused
+    watcher.prepare = paused
     task = asyncio.create_task(_refresh(loop))
     try:
         assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
@@ -448,9 +424,7 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
         if not task.done():
             task.cancel()
         try:
-            await asyncio.wait_for(
-                asyncio.gather(task, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         finally:
             await asyncio.wait_for(loop.close(), 10)
 
@@ -493,9 +467,7 @@ async def test_equal_mcp_schema_refresh_keeps_prepared_live_candidate(
         if not task.done():
             task.cancel()
         try:
-            await asyncio.wait_for(
-                asyncio.gather(task, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         finally:
             await asyncio.wait_for(loop.close(), 10)
 
@@ -566,40 +538,24 @@ async def test_live_config_prepares_schema_and_prompt_off_loop(
 ) -> None:
     loop, home, _project = _loop(tmp_path)
     _write_agent(home / "agents" / "specialist.md", "specialist", "focused")
-    watcher = getattr(loop, "_live_config_watcher", None)
+    watcher = loop._live_config_watcher
+    assert watcher is not None
     event_thread = threading.get_ident()
     prepare_threads: list[int] = []
     commit_threads: list[int] = []
-    if watcher is not None:
-        original_prepare = watcher.prepare
-        original_commit = watcher.commit
+    original_prepare = watcher.prepare
+    original_commit = watcher.commit
 
-        def prepare(base, *, force: bool = False):
-            prepare_threads.append(threading.get_ident())
-            return original_prepare(base, force=force)
+    def prepare(base, *, force: bool = False):
+        prepare_threads.append(threading.get_ident())
+        return original_prepare(base, force=force)
 
-        def commit(candidate):
-            commit_threads.append(threading.get_ident())
-            return original_commit(candidate)
+    def commit(candidate):
+        commit_threads.append(threading.get_ident())
+        return original_commit(candidate)
 
-        watcher.prepare = prepare
-        watcher.commit = commit
-    else:
-        watcher = loop._skill_watcher
-        assert watcher is not None
-        original_scan = watcher.scan
-        original_commit = watcher.commit
-
-        def scan(*, force: bool = False):
-            prepare_threads.append(threading.get_ident())
-            return original_scan(force=force)
-
-        def commit(candidate):
-            commit_threads.append(threading.get_ident())
-            return original_commit(candidate)
-
-        watcher.scan = scan
-        watcher.commit = commit
+    watcher.prepare = prepare
+    watcher.commit = commit
     await _refresh(loop)
 
     assert prepare_threads == [prepare_threads[0]]
@@ -641,9 +597,7 @@ async def test_config_changed_background_event_renders_immediately(
     async with stack:
         store = ConversationStore(tmp_path / "session")
         stack.callback(store.close)
-        loop = AgentLoop(
-            FakeBackend([]), store, skill_catalog=SkillCatalog.empty()
-        )
+        loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
         stack.push_async_callback(loop.close)
         output = StringIO()
         app = TUIApp(
@@ -661,9 +615,7 @@ async def test_config_changed_background_event_renders_immediately(
             )
         )
 
-        assert output.getvalue().strip() == (
-            "agent profiles changed: added specialist"
-        )
+        assert output.getvalue().strip() == ("agent profiles changed: added specialist")
 
 
 @pytest.mark.asyncio

@@ -785,8 +785,6 @@ async def _frames_until_eof(reader: asyncio.StreamReader) -> list[dict[str, Any]
     return frames
 
 
-
-
 class OAuthRefreshFailureBackend:
     def __init__(self, driver: Any, status_code: int) -> None:
         self.driver = driver
@@ -2757,7 +2755,9 @@ async def test_abort_captures_turn_before_approval_end_write(
         writer.write(b'{"jsonrpc":"2.0","id":5,"method":"status","params":{}}\n')
         await await_or_fail(writer.drain(), what="status request write")
         frames += await await_or_fail(
-            read_until(reader, lambda frame: frame.get("id") == 5, what="status response"),
+            read_until(
+                reader, lambda frame: frame.get("id") == 5, what="status response"
+            ),
             what="status response frames",
         )
         names = [frame.get("params", {}).get("event") for frame in frames]
@@ -3516,9 +3516,7 @@ async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> Non
         await asyncio.sleep(0)
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         writers.append(writer)
-        hello = await _request(
-            reader, writer, 1, "hello", {"protocol_version": "1.0"}
-        )
+        hello = await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         assert hello[-1]["result"]["notices"] == [
             "could not clean up account directory /secret"
         ]
@@ -3856,7 +3854,10 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
         ),
         (
             "error",
-            {"error": {"code": "empty_turn", "message": bounded_error.message}, "data": {}},
+            {
+                "error": {"code": "empty_turn", "message": bounded_error.message},
+                "data": {},
+            },
         ),
     ]
 
@@ -10987,10 +10988,7 @@ async def test_config_changed_requires_live_config_changed_feature(
 
         prepared_events: list[StreamEvent] = []
         server.runtime.loop.set_background_event_sink(prepared_events.append)
-        refresher = getattr(server.runtime.loop, "refresh_live_config", None)
-        if refresher is None:
-            refresher = server.runtime.loop.refresh_skills
-        await refresher()
+        await server.runtime.loop.refresh_live_config()
         assert len(prepared_events) == 1
         notifications: list[str] = []
         original_notify = server.control._notify
@@ -11029,14 +11027,17 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
     async def raw_request_frames(
         request_id: int, method: str, params: dict[str, object]
     ) -> bytes:
-        request = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-        ).encode() + b"\n"
+        request = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+            ).encode()
+            + b"\n"
+        )
         writer.write(request)
         await asyncio.wait_for(writer.drain(), 10)
         frames: list[bytes] = []
@@ -11049,9 +11050,7 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
 
     try:
         await asyncio.wait_for(
-            raw_request_frames(
-                1, "hello", {"protocol_version": "1.1", "features": []}
-            ),
+            raw_request_frames(1, "hello", {"protocol_version": "1.1", "features": []}),
             30,
         )
         await asyncio.wait_for(
@@ -11070,15 +11069,11 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
         await asyncio.wait_for(server.runtime.loop.refresh_live_config(), 10)
         assert len(prepared_events) == 1
 
-        base_frames = await asyncio.wait_for(
-            raw_request_frames(3, "status", {}), 30
-        )
+        base_frames = await asyncio.wait_for(raw_request_frames(3, "status", {}), 30)
         await asyncio.wait_for(
             server.control._event(prepared_events[0], background=True), 10
         )
-        actual_frames = await asyncio.wait_for(
-            raw_request_frames(3, "status", {}), 30
-        )
+        actual_frames = await asyncio.wait_for(raw_request_frames(3, "status", {}), 30)
 
         assert actual_frames == base_frames
     finally:
@@ -11172,10 +11167,7 @@ async def test_active_status_overlays_live_config_without_persisting_metadata(
             "---\nprofile body\n",
             encoding="utf-8",
         )
-        refresher = getattr(server.runtime.loop, "refresh_live_config", None)
-        if refresher is None:
-            refresher = server.runtime.loop.refresh_skills
-        await refresher()
+        await server.runtime.loop.refresh_live_config()
         from zeta.skills.agent_catalog import AgentCatalog
         from zeta.skills.catalog import SkillCatalog
 
@@ -11699,7 +11691,9 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     # test-contract: seam the bounded queue has no public admission hook
     monkeypatch.setattr(server.connections, "_enqueue", record_enqueue)
     # test-contract: seam approval settlement has no public pre-publication hook
-    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish_record)
+    monkeypatch.setattr(
+        server.control._approvals, "_finish_record", gated_finish_record
+    )
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})

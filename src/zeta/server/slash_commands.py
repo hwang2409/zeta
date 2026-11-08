@@ -284,9 +284,7 @@ class ServerSlashSession:
             parts[0],
             child_run_id,
             parent_store=(
-                self._runtime.opened.store
-                if self._runtime.opened is not None
-                else None
+                self._runtime.opened.store if self._runtime.opened is not None else None
             ),
             memory_reconciler=(
                 self._runtime.loop.memory_reconciler
@@ -423,7 +421,7 @@ async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
     if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
+        await runtime.loop.refresh_live_config()
     registry = await asyncio.to_thread(build_registry, runtime)
     command = registry.command_for(name)
     if command is not None:

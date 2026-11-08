@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import hashlib
-import inspect
 import os
 import threading
 from io import StringIO
@@ -60,10 +59,6 @@ def _runtime_text(loop: AgentLoop) -> str:
 
 
 def _live_skill_kwargs(home: Path, project: Path) -> dict[str, Path]:
-    """Let this behavioral test run against main before the interface existed."""
-
-    if "live_config_home" not in inspect.signature(AgentLoop).parameters:
-        return {}
     return {"live_config_home": home, "live_config_project_dir": project}
 
 
@@ -237,9 +232,7 @@ async def test_live_live_config_discards_stale_plan_prompt(
         if not refresh.done():
             refresh.cancel()
         try:
-            await asyncio.wait_for(
-                asyncio.gather(refresh, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(refresh, return_exceptions=True), 10)
         finally:
             try:
                 await asyncio.wait_for(loop.close(), 10)
@@ -325,9 +318,7 @@ async def test_live_live_config_discards_stale_memory_prompt(
         if not refresh.done():
             refresh.cancel()
         try:
-            await asyncio.wait_for(
-                asyncio.gather(refresh, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(refresh, return_exceptions=True), 10)
         finally:
             try:
                 await asyncio.wait_for(loop.close(), 10)
@@ -485,10 +476,7 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
 
     async def refresh_and_run_turn() -> None:
         await loop.refresh_live_config()
-        _ = [
-            event
-            async for event in loop.run_turn("next", origin=MessageOrigin.USER)
-        ]
+        _ = [event async for event in loop.run_turn("next", origin=MessageOrigin.USER)]
 
     try:
         await asyncio.wait_for(refresh_and_run_turn(), timeout=10)
