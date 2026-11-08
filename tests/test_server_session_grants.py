@@ -1113,6 +1113,50 @@ async def _collect_second_parent_terminal(
             return frames, "parent agent end"
 
 
+async def _read_until_child_bash_two(
+    reader: asyncio.StreamReader, frames: list[dict[str, Any]]
+) -> str:
+    while True:
+        buffered = _buffer(reader)
+        if buffered:
+            frame = buffered.popleft()
+        else:
+            line = await reader.readline()
+            if not line:
+                return "socket eof"
+            frame = json.loads(line)
+        frames.append(frame)
+        params = frame.get("params", {})
+        if params.get("tool_call", {}).get("id") != "child-bash-2":
+            continue
+        event = params.get("event")
+        if event == "approval_request":
+            return "child-bash-2 approval_request"
+        if event in {"tool_start", "tool_end"}:
+            return f"child-bash-2 {event} before any approval_request"
+
+
+async def _first_child_bash_two_fact(
+    reader: asyncio.StreamReader,
+    frames: list[dict[str, Any]],
+    publication_attempted: asyncio.Event,
+) -> str:
+    wire = asyncio.create_task(_read_until_child_bash_two(reader, frames))
+    # test-contract: seam this coroutine is the await_or_fail argument.
+    hook = asyncio.create_task(publication_attempted.wait())
+    try:
+        # test-contract: seam this coroutine is the await_or_fail argument.
+        await asyncio.wait({wire, hook}, return_when=asyncio.FIRST_COMPLETED)
+        if wire.done():
+            return wire.result()
+        return "publication hook"
+    finally:
+        for task in (wire, hook):
+            task.cancel()
+        # test-contract: seam this coroutine is the await_or_fail argument.
+        await asyncio.gather(wire, hook, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
     tmp_path: Path,
@@ -1182,8 +1226,9 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
             frames, terminal = await _collect_second_parent_terminal(
                 reader, backend.release_child_two
             )
-            # test-contract: seam this coroutine is the await_or_fail argument.
-            await publication_attempted.wait()
+            ended_on = await _first_child_bash_two_fact(
+                reader, frames, publication_attempted
+            )
             sentinel = await _request(reader, writer, 32, "session_grants")
             buffered = _buffer(reader)
             frames.extend(buffered)
@@ -1199,14 +1244,10 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
                 ),
                 None,
             )
-            terminal = (
-                "delegated approval"
-                if approval is not None
-                else "publication sentinel"
-            )
+            terminal = "delegated approval" if approval is not None else ended_on
             assert approval is not None, (
                 "child-bash-2 did not request delegated approval; "
-                f"terminal={terminal}; second send response={second_send!r}; "
+                f"wait ended on: {ended_on}; second send response={second_send!r}; "
                 f"all buffered frames={frames!r}; "
                 f"live parent session_grants={snapshot!r}"
             )
