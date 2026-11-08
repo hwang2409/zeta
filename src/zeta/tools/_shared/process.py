@@ -26,7 +26,6 @@ from ...core.session_files import (
     session_root,
     write_session_file,
 )
-from ...core.thread_call import run_owned_thread_call
 from ...storage_format import WriterLease
 from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
@@ -954,12 +953,19 @@ class BackgroundTaskRegistry:
         publish: Callable[[], None],
         notice: BackgroundTaskNoticeSinkValue | None,
     ) -> None:
-        await run_owned_thread_call(
-            lambda: self._persist(rows),
-            lambda _result: publish(),
-        )
+        worker = asyncio.create_task(asyncio.to_thread(self._persist, rows))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        worker.result()
+        publish()
         if notice is not None:
             self._notice(notice)
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _persistence_rows(
         self,
