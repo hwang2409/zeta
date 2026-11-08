@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import pytest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.styles import Style
+from rich.console import Group
 from rich.padding import Padding
 from rich.text import Text
 
@@ -187,55 +189,137 @@ async def test_newest_candidates_publish_before_older_render_finishes() -> None:
     assert [row.candidate.text for row in state.rows] == ["new candidate 39"]
 
 
-def test_finder_bounds_replayed_user_padding_before_rich_render(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transcript = TranscriptWidget()
-    shapes = [
-        Padding(Text((" " * 100 + "\n") * 200 + "needle"), (0, 0, 0, 0))
-    ]
-    for index in range(20):
-        text = Text(
-            ("wide界" if index % 2 else "combining e\u0301") * 8_000,
-            style="bold red" if index % 3 else "green",
+def _finder_differential_shapes() -> list[Padding]:
+    """Retain the real fixture's long replayed-user shape at compact scale."""
+
+    generator = random.Random(1)
+    mismatch_parts = []
+    for _ in range(generator.randint(20, 200)):
+        mismatch_parts.append(
+            generator.choice(
+                (
+                    " " * generator.randint(1, 200),
+                    "x" * generator.randint(1, 300),
+                    " needle ",
+                    "\n",
+                    "界" * generator.randint(1, 50),
+                    "e\u0301" * generator.randint(1, 50),
+                )
+            )
         )
-        text.stylize("underline", 1, min(30, len(text)))
-        shapes.append(Padding(text, (index % 3, index % 4, 2, index % 5), expand=index % 2 == 0))
+    mismatch_source = "".join(mismatch_parts)
+    mismatch_source += "x" * max(0, 12_001 - len(mismatch_source))
 
-    rendered_lengths: list[int] = []
-    render = TranscriptWidget._render_search_snapshot
+    shapes: list[Padding] = []
+    sources = (
+        mismatch_source,
+        "",
+        " " * 12_040,
+        (" " * 97 + "\n") * 130,
+        "line\n" * 2_500,
+        "wide界" * 2_500,
+        "combining e\u0301" * 1_300,
+        "prefix needle " + "x" * 12_100,
+        "x" * 12_050 + " farneedle",
+    )
+    for index in range(24):
+        text = Text(
+            sources[index % len(sources)],
+            style=("bold red", "green", "on black")[index % 3],
+        )
+        if text:
+            start = min(len(text) - 1, 11_995)
+            text.stylize("underline", start, min(len(text), start + 20))
+        shapes.append(
+            Padding(
+                text,
+                (index % 3, index % 4, (index + 1) % 3, (index + 2) % 5),
+                style=("", "blue", "on black")[index % 3],
+                expand=index % 2 == 0,
+            )
+        )
+    return shapes
 
-    def record(renderable: Any, width: int, rich_theme: Any) -> str:
-        assert isinstance(renderable, Padding)
-        assert isinstance(renderable.renderable, Text)
-        rendered_lengths.append(len(renderable.renderable))
-        return render(renderable, width, rich_theme)
 
-    monkeypatch.setattr(
-        TranscriptWidget, "_render_search_snapshot", staticmethod(record)
+async def _public_finder_result(
+    transcript: TranscriptWidget, query: str
+) -> tuple[Any, ...]:
+    request = transcript.open_finder()
+    assert request is not None
+    transcript.finder_set_query(query)
+    async for candidates, complete in transcript.build_finder_candidate_batches(request):
+        assert transcript.finder_publish_candidate_batch(
+            request, candidates, complete=complete
+        )
+        while transcript.finder_needs_ranking():
+            result = transcript.finder_rank()
+            assert result is not None
+            assert transcript.finder_publish(result)
+    state = transcript.finder_state()
+    assert state is not None and state.complete
+    return (
+        tuple(
+            (
+                row.candidate.index,
+                row.candidate.role,
+                row.candidate.marker,
+                row.candidate.text,
+                row.candidate.preview,
+                row.score,
+                row.excerpt,
+                row.highlights,
+            )
+            for row in state.rows
+        ),
+        state.selected,
+        state.preview,
+        state.total,
     )
 
-    async def exercise() -> None:
-        for width in (20, 40, 80, 120):
-            transcript._content_width = width
-            for shape in shapes:
-                original = shape.renderable.copy()
-                unit = transcript.append(shape)
-                expected = Text.from_ansi(
-                    transcript._search_rendered(unit, width)
-                ).plain[: transcript_finder._FINDER_PREVIEW_TEXT_LIMIT]
-                actual = (await transcript._finder_source_parts_async(unit))[0]
-                assert actual == expected
-                assert transcript_finder.find_matches("needle", actual) == transcript_finder.find_matches(
-                    "needle", expected
-                )
-                assert shape.renderable == original
-                if "needle" in expected:
-                    assert "needle" in transcript._searchable_text(unit, width)
 
-    asyncio.run(exercise())
-    assert rendered_lengths
-    assert max(rendered_lengths) <= max(len(shape.renderable) for shape in shapes)
+@pytest.mark.asyncio
+async def test_public_finder_preserves_exact_full_search_projection() -> None:
+    for width in (20, 40, 80, 120):
+        candidate = TranscriptWidget()
+        oracle = TranscriptWidget()
+        candidate._content_width = width
+        oracle._content_width = width
+        candidate_units = []
+        originals = []
+        for shape in _finder_differential_shapes():
+            originals.append(shape.renderable.copy())
+            candidate_unit = candidate.append(shape)
+            oracle_unit = oracle.append(Group(shape))
+            candidate.mark_user(candidate_unit)
+            oracle.mark_user(oracle_unit)
+            candidate_units.append(candidate_unit)
+
+        for query in ("needle", "farneedle", "wide界", "e\u0301", "no-output"):
+            assert await _public_finder_result(
+                candidate, query
+            ) == await _public_finder_result(oracle, query)
+            candidate.finder_cancel()
+            oracle.finder_cancel()
+
+        for unit, original in zip(candidate_units, originals):
+            assert unit.value.renderable == original
+            cached = candidate._unit_search_cache[unit.key][width]
+            assert cached == (
+                candidate._unit_revision(unit),
+                Text.from_ansi(candidate._search_rendered(unit, width)).plain,
+            )
+
+        candidate.begin_search()
+        oracle.begin_search()
+        candidate.update_search("farneedle")
+        oracle.update_search("farneedle")
+        assert candidate.next_search_match() == oracle.next_search_match()
+        assert candidate.previous_search_match() == oracle.previous_search_match()
+        candidate_content = candidate.create_content(width, 20)
+        oracle_content = oracle.create_content(width, 20)
+        assert [candidate_content.get_line(index) for index in range(20)] == [
+            oracle_content.get_line(index) for index in range(20)
+        ]
 
 
 def test_open_finder_lists_messages_with_roles() -> None:
