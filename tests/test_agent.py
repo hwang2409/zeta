@@ -17703,6 +17703,21 @@ async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
     wake_before_cancel: bool,
 ) -> None:
     backend = CancelIdleTreeBackend(with_grandchild=with_grandchild)
+    loop_thread = threading.get_ident()
+    cancellation_write_threads: list[int] = []
+    mark_agent_canceled = ConversationStore.mark_agent_canceled
+
+    @wraps(mark_agent_canceled)
+    def observe_cancellation_write(
+        child_store: ConversationStore, parent_tool_call_id: str
+    ) -> None:
+        if parent_tool_call_id == "start-child":
+            cancellation_write_threads.append(threading.get_ident())
+        mark_agent_canceled(child_store, parent_tool_call_id)
+
+    monkeypatch.setattr(
+        ConversationStore, "mark_agent_canceled", observe_cancellation_write
+    )
     monkeypatch.setitem(
         AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
     )
@@ -17777,6 +17792,8 @@ async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
         child_status = status["structuredContent"]["children"][0]
         assert child_status["state"] == "canceled"
         assert child_status["finished_at"] is not None
+        assert cancellation_write_threads
+        assert all(thread != loop_thread for thread in cancellation_write_threads)
 
         await asyncio.wait_for(loop._background_owner.wait(), 10)
         if grandchild_path is not None:

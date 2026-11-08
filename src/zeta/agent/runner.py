@@ -1034,7 +1034,9 @@ async def run_agent_tool(
             return False
         if terminal_fence is not None and not await terminal_fence.cancel():
             return False
-        child_store.mark_agent_canceled(tool_call.id)
+        await child_store._to_thread_agent_state(
+            child_store.mark_agent_canceled, tool_call.id
+        )
         child_canceled = True
         return True
 
