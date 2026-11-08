@@ -642,6 +642,43 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
         await server.close()
 
 
+def _controller_fixture_frames() -> bytes:
+    expected = (
+        Path(__file__).parent / "fixtures" / "serve_control_detach_origin_main.jsonl"
+    ).read_bytes()
+    frames = expected.splitlines(keepends=True)
+    split = next(index for index, frame in enumerate(frames) if b'"id":1' in frame)
+    return b"".join(frames[:split])
+
+
+@pytest.mark.asyncio
+async def test_controller_stream_reads_deny_response_written_after_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CI run 42502453427: the id-4 deny response reached the socket after turn_end.
+    turn_end_written = asyncio.Event()
+    write = _Client._write
+    write_physical = _Client._write_physical
+
+    async def response_after_turn_end(self: _Client, payload: bytes) -> bool:
+        if json.loads(payload).get("id") == 4:
+            await asyncio.wait_for(turn_end_written.wait(), 10)
+        return await write(self, payload)
+
+    async def mark_turn_end(self: _Client, payload: bytes) -> bool:
+        written = await write_physical(self, payload)
+        if b'"event":"turn_end"' in payload:
+            turn_end_written.set()
+        return written
+
+    # test-contract: seam no public hook orders one response after a later event
+    monkeypatch.setattr(_Client, "_write", response_after_turn_end)
+    # test-contract: seam no public event says a frame reached the socket
+    monkeypatch.setattr(_Client, "_write_physical", mark_turn_end)
+    actual = await _controller_event_stream(tmp_path, monkeypatch, observer=False)
+    assert_raw_frames_preserved(actual, _controller_fixture_frames())
+
+
 @pytest.mark.parametrize("child_instance_id", ["root:1", "root:1:1"])
 @pytest.mark.asyncio
 async def test_display_only_idle_reaches_serve_without_parent_turn(
