@@ -455,6 +455,9 @@ Params: exactly one of `text` or `input_id`. `text` is a non-empty direct user
 message. `input_id` is available only with `model_input_ids` and refers to a
 server-owned `model_input` returned by `slash_run`. With the negotiated
 `delivery_id` feature, params can also contain `delivery_id` as described below.
+An optional `session_id` names the session the client means; a different
+session returns `-32003` `session_mismatch` and delivers nothing (see
+"delivery session guard").
 The result acknowledges scheduling with `accepted` (`true`) and `session_id`.
 Streaming starts as notifications. Only one turn can run at a time. With the
 `user_message_event` feature, a `user_message` event with `mode: "send"`
@@ -471,7 +474,8 @@ precedes the acknowledgement.
 ### `steer`
 
 Params: required `text`, a non-empty string. With the negotiated `delivery_id`
-feature, params can also contain `delivery_id` as described below. The server
+feature, params can also contain `delivery_id` as described below. An optional
+`session_id` is checked as for `send` (see "delivery session guard"). The server
 queues this user message at the next safe provider boundary. A turn must be
 running. With the `user_message_event` feature, a `user_message` event with
 `mode: "steer"` precedes the acknowledgement.
