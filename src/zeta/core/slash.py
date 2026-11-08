@@ -1143,7 +1143,7 @@ def create_slash_registry(
         SlashCommand(
             "decisions",
             _run_decisions,
-            "read, reply to, or dismiss attention items",
+            "read, reply, dismiss, or batch-reply to attention items",
             ServeSlash(mutates=_decisions_mutates),
         )
     )
