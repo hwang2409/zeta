@@ -404,94 +404,106 @@ async def test_slash_requests_reuse_session_repo_root_and_build_once(
             check=True,
             capture_output=True,
         )
-        repos.append((repo, nested))
+        repos.append(nested)
+    plain = tmp_path / "plain"
+    plain.mkdir()
 
+    registry_builds = 0
+    discovery_commands = 0
+    original_build_registry = slash_commands.build_registry
+    original_subprocess_run = subprocess.run
+
+    def tracked_build_registry(runtime):
+        nonlocal registry_builds
+        registry_builds += 1
+        return original_build_registry(runtime)
+
+    def tracked_subprocess_run(*args, **kwargs):
+        nonlocal discovery_commands
+        command = list(args[0])
+        if command[:3] == ["git", "-c", "core.fsmonitor=false"]:
+            discovery_commands += 1
+        return original_subprocess_run(*args, **kwargs)
+
+    monkeypatch.setattr(slash_commands, "build_registry", tracked_build_registry)
+    monkeypatch.setattr(subprocess, "run", tracked_subprocess_run)
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, ["session_cwd"])
-        first = (
-            await _request(
-                reader,
-                writer,
-                "first-session",
-                "new_session",
-                {"cwd": str(repos[0][1])},
-            )
-        )[-1]["result"]["session"]["session_id"]
-
-        registry_builds = 0
-        repo_root_commands = 0
-        original_build_registry = slash_commands.build_registry
-        original_subprocess_run = subprocess.run
-
-        def tracked_build_registry(runtime):
-            nonlocal registry_builds
-            registry_builds += 1
-            return original_build_registry(runtime)
-
-        def tracked_subprocess_run(*args, **kwargs):
-            nonlocal repo_root_commands
-            command = list(args[0])
-            if command[-2:] == ["rev-parse", "--show-toplevel"]:
-                repo_root_commands += 1
-            return original_subprocess_run(*args, **kwargs)
-
-        monkeypatch.setattr(slash_commands, "build_registry", tracked_build_registry)
-        monkeypatch.setattr(subprocess, "run", tracked_subprocess_run)
-        original_turn_busy = server.control.turn_busy
-        monkeypatch.setattr(server.control, "turn_busy", lambda: True)
-        for request_id in range(3):
+        observed = []
+        for index, (cwd, expected) in enumerate(
+            [(repos[0], "repository first"), (repos[1], "repository second")]
+        ):
+            session_id = (
+                await _request(
+                    reader,
+                    writer,
+                    f"session-{index}",
+                    "new_session",
+                    {"cwd": str(cwd)},
+                )
+            )[-1]["result"]["session"]["session_id"]
+            if index == 0:
+                original_turn_busy = server.control.turn_busy
+                monkeypatch.setattr(server.control, "turn_busy", lambda: True)
+                for request_id in range(3):
+                    result = (
+                        await _request(
+                            reader,
+                            writer,
+                            f"busy-{request_id}",
+                            "slash_run",
+                            {"session_id": session_id, "text": "/status"},
+                        )
+                    )[-1]["result"]
+                    assert result["kind"] == "output"
+                busy_registry_builds = registry_builds
+                monkeypatch.setattr(server.control, "turn_busy", original_turn_busy)
             result = (
                 await _request(
                     reader,
                     writer,
-                    f"busy-{request_id}",
+                    f"location-{index}",
                     "slash_run",
-                    {"session_id": first, "text": "/status"},
+                    {"session_id": session_id, "text": "/location"},
                 )
             )[-1]["result"]
-            assert result["kind"] == "output"
-        busy_registry_builds = registry_builds
-        busy_repo_root_commands = repo_root_commands
-        monkeypatch.setattr(server.control, "turn_busy", original_turn_busy)
+            observed.append((result["kind"], expected in result["text"]))
 
-        second = (
+        plain_session = (
             await _request(
                 reader,
                 writer,
-                "second-session",
+                "plain-session",
                 "new_session",
-                {"cwd": str(repos[1][1])},
+                {"cwd": str(plain)},
             )
         )[-1]["result"]["session"]["session_id"]
-        repo_root_commands = 0
-        result = (
-            await _request(
-                reader,
-                writer,
-                "second-location",
-                "slash_run",
-                {"session_id": second, "text": "/location"},
-            )
-        )[-1]["result"]
-        assert result["kind"] == "model_input"
-        assert "repository second" in result["text"]
         listed = (
             await _request(
                 reader,
                 writer,
-                "second-list",
+                "plain-list",
                 "slash_list",
-                {"session_id": second},
+                {"session_id": plain_session},
             )
         )[-1]["result"]
-        assert any(command["name"] == "location" for command in listed["commands"])
+        observed.append(
+            (
+                "non-repository",
+                all(command["name"] != "location" for command in listed["commands"]),
+            )
+        )
+
+        assert observed == [
+            ("model_input", True),
+            ("model_input", True),
+            ("non-repository", True),
+        ]
         assert busy_registry_builds == 3, "busy slash_run rebuilt its registry"
-        assert registry_builds == 5, "slash requests did not build exactly once"
-        assert (
-            busy_repo_root_commands == repo_root_commands == 0
-        ), "slash_run repeated Git repo-root discovery"
+        assert discovery_commands == 3, "session setup repeated Git discovery"
+        assert registry_builds == 6, "slash requests did not build exactly once"
     finally:
         await close_serve(server, writer)
 

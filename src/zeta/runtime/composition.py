@@ -70,6 +70,7 @@ class RuntimeComposition:
     policy: ApprovalPolicy
     model: str
     project_dir: Path
+    repo_root: Path
     external_tools: ExternalToolDiscovery
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
@@ -450,6 +451,11 @@ def compose_runtime(
             policy=policy,
             model=selected_model,
             project_dir=repo_root,
+            repo_root=(
+                project_discovery.repo_root
+                if project_discovery is not None
+                else Path(metadata.cwd).resolve()
+            ),
             external_tools=external_tools,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,

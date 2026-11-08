@@ -131,6 +131,7 @@ class SessionState:
     loop: AgentLoop
     policy: ApprovalPolicy
     project_dir: Path
+    repo_root: Path
     usage: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker = field(init=False)
     status: str = "idle"
@@ -147,6 +148,7 @@ class SessionState:
             loop=composition.loop,
             policy=composition.policy,
             project_dir=composition.project_dir,
+            repo_root=composition.repo_root,
         )
 
     @property
@@ -306,6 +308,12 @@ class ServerRuntime:
         if self._state is None:
             raise RuntimeError("server has no active session")
         return self._state.project_dir
+
+    @property
+    def repo_root(self) -> Path:
+        if self._state is None:
+            raise RuntimeError("server has no active session")
+        return self._state.repo_root
 
     async def initialize_project_registry(self) -> None:
         """Probe registry availability once outside the event loop."""

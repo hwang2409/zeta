@@ -458,7 +458,7 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
     catalog = loop.tool_registry.skill_catalog
     return create_slash_registry(
         zeta_home=runtime.home,
-        project_dir=runtime.project_dir,
+        project_dir=runtime.repo_root,
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
         surface=SlashSurface.SERVE,
