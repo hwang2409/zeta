@@ -32,6 +32,7 @@ from ..checkpoints import (
     _now,
     load_session_json,
 )
+from ..checkpoints.entry_types import sent_message_receipts
 from ..session_files import open_session_file
 from ..transcript_recovery import (
     TRANSCRIPT_REPAIR_EPOCH,
@@ -40,7 +41,6 @@ from ..transcript_recovery import (
     reconcile_pending,
     repair_transcript,
 )
-from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:

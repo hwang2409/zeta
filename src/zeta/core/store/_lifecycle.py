@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Self
 
 from ..checkpoints import ConversationIntegrityError
+from ..checkpoints.mutation import unregister_conversation_target
 
 
 class StoreLifecycleMixin:
@@ -14,6 +15,7 @@ class StoreLifecycleMixin:
         """Drain durable writers, then release this store's activity leases."""
         self.on_entries_installed = None
         if self._drain_durable_writes_for_close():
+            unregister_conversation_target(self)
             if self._runtime_lease is not None:
                 self._runtime_lease.close()
             self.directory_fd = -1
