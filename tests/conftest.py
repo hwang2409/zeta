@@ -726,7 +726,7 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
-    from tests.support.owned import await_or_fail
+    from tests.support.owned import await_or_fail, close_owned_app
     from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
@@ -738,6 +738,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     from zeta.storage_format import open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
+    from zeta.tui.app import TUIApp
 
     loops: list[AgentLoop] = []
     stores: list[ConversationStore] = []
@@ -748,6 +749,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     registries: list[ToolRegistry] = []
     servers: list[ZetaServer] = []
     closed_servers: set[ZetaServer] = set()
+    apps: list[TUIApp] = []
+    closed_apps: weakref.WeakSet[TUIApp] = weakref.WeakSet()
     test_home_leases = {}
     loop_init = AgentLoop.__init__
     loop_close = AgentLoop.close
@@ -767,6 +770,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     background_init = BackgroundTaskRegistry.__init__
     server_init = ZetaServer.__init__
     server_close = ZetaServer.close
+    app_init = TUIApp.__init__
+    app_close = TUIApp.close
     store_close = ConversationStore.close
     registry_close = ToolRegistry.close
 
@@ -879,6 +884,18 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         server_init(server, *args, **kwargs)
         servers.append(server)
 
+    @wraps(app_init)
+    def tracked_app_init(app, *args, **kwargs):
+        app_init(app, *args, **kwargs)
+        apps.append(app)
+
+    @wraps(app_close)
+    async def tracked_app_close(app, *args, **kwargs):
+        await app_close(app, *args, **kwargs)
+        closed_apps.add(app)
+        if app in apps:
+            apps.remove(app)
+
     @wraps(server_close)
     async def tracked_server_close(server, *args, **kwargs):
         await server_close(server, *args, **kwargs)
@@ -908,8 +925,21 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(ZetaServer, "__init__", tracked_server_init)
     # test-contract: seam records successful server closes for idempotent teardown
     monkeypatch.setattr(ZetaServer, "close", tracked_server_close)
+    # test-contract: seam tracks and closes apps created by tests
+    monkeypatch.setattr(TUIApp, "__init__", tracked_app_init)
+    # test-contract: seam records successful app closes for idempotent teardown
+    monkeypatch.setattr(TUIApp, "close", tracked_app_close)
     yield
     first_error: BaseException | None = None
+
+    # Apps own loops and stores, so close them before those lower-level owners.
+    for app in reversed(apps.copy()):
+        if app not in closed_apps:
+            try:
+                await await_or_fail(close_owned_app(app), what="TUIApp.close")
+            except BaseException as exc:  # noqa: BLE001 - close every owner
+                if first_error is None:
+                    first_error = exc
 
     async def close_server(server: ZetaServer) -> None:
         nonlocal first_error
