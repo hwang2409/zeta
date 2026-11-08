@@ -21,6 +21,7 @@ import zeta.providers.completion as completion_module
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
+from zeta.accounts import AccountCredentialLockTimeoutError
 from zeta.agent.finish_gate import finish_gate_message
 from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
@@ -2526,6 +2527,46 @@ async def test_retry_budget_exhausted_fails_with_original_error(tmp_path: Path) 
     assert events[-2].error is not None
     assert events[-2].error.message == "first failure"
     assert store.messages()[-1].metadata["turn_error"]["message"] == "first failure"
+
+
+@pytest.mark.asyncio
+async def test_account_lock_exhaustion_is_recoverable_on_next_turn(
+    tmp_path: Path,
+) -> None:
+    backend = AttemptBackend(
+        [
+            *[AccountCredentialLockTimeoutError() for _ in range(5)],
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("still alive")],
+                    ),
+                )
+            ],
+        ]
+    )
+
+    async def no_wait(_delay: float) -> None:
+        return None
+
+    backend._completion_wait = no_wait
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    failed = await collect(loop.run_turn("first", origin=MessageOrigin.USER))
+    recovered = await collect(loop.run_turn("second", origin=MessageOrigin.USER))
+
+    assert backend.calls == 6
+    assert sum(event.type is StreamEventType.RETRY for event in failed) == 4
+    assert failed[-2].error is not None
+    assert failed[-2].error.code == "account_lock_timeout"
+    assert not any(event.type is StreamEventType.ERROR for event in recovered)
+    assert recovered[-2].message is not None
+    assert recovered[-2].message.content == [TextContent("still alive")]
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,8 @@ from ..protocol.types import (
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
+MAX_ACCOUNT_LOCK_ATTEMPTS = 5
+MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
 MODEL_PROGRESS_IDLE_SECONDS = 15 * 60.0
 
@@ -35,7 +37,6 @@ _RETRYABLE_STATUS_CODES = {
     408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529
 }
 _TERMINAL_ERROR_CODES = {
-    "account_lock_timeout",
     "auth_error",
     "authentication_error",
     "context_length_exceeded",
@@ -147,6 +148,7 @@ class RetryPlan:
     reason: str
     delay: float
     is_stall: bool = False
+    is_account_lock: bool = False
 
 
 @dataclass(slots=True)
@@ -164,23 +166,21 @@ class CompletionRetryBudget:
     records: list[dict[str, object]] = field(default_factory=list)
     attempt_records: list[dict[str, object]] = field(default_factory=list)
     started_at: float | None = None
+    account_lock_attempts: int = 0
+    account_lock_started_at: float | None = None
+    account_lock_exclusion_started_at: float | None = None
+    excluded_account_lock_seconds: float = 0.0
+    attempt_started_at: float | None = None
     committed: bool = False
 
     def start_attempt(self, owner: str, now: float, *, is_stall: bool = False) -> bool:
-        if self.attempts >= self.max_attempts:
-            self.exhausted = True
-            self.records.append({"decision": "budget-exhausted"})
-            return False
-        if (
-            not is_stall
-            and self.started_at is not None
-            and now - self.started_at - self.excluded_stall_seconds
-            >= MAX_PROVIDER_RETRY_SECONDS
-        ):
+        del is_stall
+        if self.attempts >= self.max_attempts + MAX_ACCOUNT_LOCK_ATTEMPTS - 1:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return False
         self.attempts += 1
+        self.attempt_started_at = now
         self.attempt_records.append({"attempt": self.attempts, "owner": owner})
         return True
 
@@ -194,16 +194,26 @@ class CompletionRetryBudget:
         first_failure = self.original_error is None
         if first_failure:
             self.original_error = source
-            self.started_at = now
-            self.excluded_stall_seconds = 0.0
         if self.exhausted or not retryable_provider_error(source, event_data):
             return None
-        if self.attempts >= self.max_attempts:
+        is_account_lock = getattr(source, "code", None) == "account_lock_timeout"
+        if is_account_lock:
+            return self._plan_account_lock(source, now, event_data)
+        if self.account_lock_exclusion_started_at is not None:
+            self.excluded_account_lock_seconds += (
+                now - self.account_lock_exclusion_started_at
+            )
+            self.account_lock_exclusion_started_at = None
+        if self.started_at is None:
+            self.started_at = now
+            self.excluded_stall_seconds = 0.0
+        generic_attempts = self.attempts - self.account_lock_attempts
+        if generic_attempts >= self.max_attempts:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return None
         explicit_retry_after = retry_after_seconds(source, event_data)
-        delay = retry_wait_seconds(source, self.attempts, event_data)
+        delay = retry_wait_seconds(source, generic_attempts, event_data)
         is_stall = bool(getattr(source, "is_stall", False))
         stall_seconds = getattr(source, "stall_seconds", 0.0)
         has_stall_duration = isinstance(stall_seconds, (int, float)) and stall_seconds > 0
@@ -216,7 +226,12 @@ class CompletionRetryBudget:
                 return None
             self.stall_retries += 1
         assert self.started_at is not None
-        elapsed = now - self.started_at - self.excluded_stall_seconds
+        elapsed = (
+            now
+            - self.started_at
+            - self.excluded_stall_seconds
+            - self.excluded_account_lock_seconds
+        )
         if (not is_stall or has_stall_duration) and elapsed + delay > MAX_PROVIDER_RETRY_SECONDS:
             self.exhausted = True
             record: dict[str, object] = {"decision": "budget-exhausted"}
@@ -230,6 +245,33 @@ class CompletionRetryBudget:
             reason=retry_reason(source),
             delay=delay,
             is_stall=is_stall,
+        )
+
+    def _plan_account_lock(
+        self,
+        source: BaseException | object,
+        now: float,
+        event_data: Mapping[str, Any] | None,
+    ) -> RetryPlan | None:
+        if self.account_lock_exclusion_started_at is None:
+            self.account_lock_exclusion_started_at = self.attempt_started_at or now
+        if self.account_lock_started_at is None:
+            self.account_lock_started_at = self.account_lock_exclusion_started_at
+        self.account_lock_attempts += 1
+        delay = retry_wait_seconds(source, self.account_lock_attempts, event_data)
+        elapsed = now - self.account_lock_started_at
+        if (
+            self.account_lock_attempts >= MAX_ACCOUNT_LOCK_ATTEMPTS
+            or elapsed + delay > MAX_ACCOUNT_LOCK_RETRY_SECONDS
+        ):
+            self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
+            return None
+        return RetryPlan(
+            attempt=self.attempts + 1,
+            reason=retry_reason(source),
+            delay=delay,
+            is_account_lock=True,
         )
 
     def record_retry(self, plan: RetryPlan) -> None:
@@ -836,6 +878,21 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         )
 
     def _retry_notice(self, plan: RetryPlan, error: object) -> StreamEvent:
+        if plan.is_account_lock:
+            return StreamEvent(
+                StreamEventType.RETRY,
+                data={
+                    "text": (
+                        "waiting for account lock; retrying in "
+                        f"{format_retry_delay(plan.delay)}s"
+                    ),
+                    "kind": "account_lock_wait",
+                    "attempt": plan.attempt,
+                    "retry": self._control.budget.account_lock_attempts,
+                    "delay": plan.delay,
+                    "reason": plan.reason,
+                },
+            )
         if plan.is_stall:
             stall_attempt = self._control.budget.stall_retries
             return StreamEvent(

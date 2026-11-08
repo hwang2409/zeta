@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from tests.support.owned import await_or_fail
+from zeta.accounts import AccountCredentialLockTimeoutError
 from zeta.protocol.types import (
     ErrorInfo,
     Message,
@@ -302,6 +303,85 @@ async def test_retry_after_and_shared_attempt_budget_are_owner_policy() -> None:
     assert backend.created == 5
     assert len(delays) == 4
     assert all(attempt.closed == 1 for attempt in errors)
+
+
+@pytest.mark.asyncio
+async def test_account_lock_timeout_waits_then_retries_same_completion() -> None:
+    clock = _ManualClock()
+    delays: list[float] = []
+
+    async def wait(delay: float) -> None:
+        delays.append(delay)
+        clock.current += delay
+
+    first = _SequenceAttempt(AccountCredentialLockTimeoutError())
+    second = _SequenceAttempt(
+        AttemptSignal(
+            TransportActivity.MODEL_PROGRESS,
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="done"),
+        ),
+        AttemptSignal(
+            TransportActivity.MODEL_PROGRESS,
+            StreamEvent(StreamEventType.MESSAGE_END),
+        ),
+    )
+    backend = _AttemptBackend([first, second], clock, wait=wait)
+    completion = backend.complete([], [], control=_control())
+    try:
+        events = await _collect(completion)
+    finally:
+        await _within(completion.aclose())
+
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert retry.data["kind"] == "account_lock_wait"
+    assert retry.data["text"].startswith("waiting for account lock; retrying in ")
+    assert not any(event.type is StreamEventType.ERROR for event in events)
+    assert events[-2].delta == "done"
+    assert backend.created == 2
+    assert len(delays) == 1
+
+
+@pytest.mark.asyncio
+async def test_account_lock_retry_does_not_consume_transient_attempt_budget() -> None:
+    clock = _ManualClock()
+
+    async def wait(delay: float) -> None:
+        clock.current += delay
+
+    attempts = [
+        _SequenceAttempt(AccountCredentialLockTimeoutError()),
+        *[_SequenceAttempt(_RetryableError("busy")) for _ in range(5)],
+    ]
+    backend = _AttemptBackend(attempts, clock, wait=wait)
+    completion = backend.complete([], [], control=_control())
+    try:
+        with pytest.raises(_RetryableError, match="busy"):
+            await _collect(completion)
+    finally:
+        await _within(completion.aclose())
+
+    assert backend.created == 6
+
+
+@pytest.mark.asyncio
+async def test_account_lock_exhaustion_stops_after_five_attempts() -> None:
+    clock = _ManualClock()
+
+    async def wait(delay: float) -> None:
+        clock.current += delay
+
+    attempts = [
+        _SequenceAttempt(AccountCredentialLockTimeoutError()) for _ in range(5)
+    ]
+    backend = _AttemptBackend(attempts, clock, wait=wait)
+    completion = backend.complete([], [], control=_control())
+    try:
+        with pytest.raises(AccountCredentialLockTimeoutError):
+            await _collect(completion)
+    finally:
+        await _within(completion.aclose())
+
+    assert backend.created == 5
 
 
 @pytest.mark.asyncio

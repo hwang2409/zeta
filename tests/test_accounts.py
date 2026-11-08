@@ -57,9 +57,12 @@ from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
     RedactedThinkingContent,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ThinkingContent,
 )
+from zeta.providers.codex import CodexBackend
 from zeta.providers.completion import owned_completion, retryable_provider_error
 from zeta.providers.factory import build_backend, credential_store
 from zeta.runtime.loop import AgentLoop
@@ -70,6 +73,7 @@ from zeta.tools.websearch import codex as websearch_codex
 from zeta.tui import bootstrap as tui_bootstrap
 from zeta.tui import models as tui_models
 from zeta.tui.app import TUIApp
+from zeta.tui.render import render_event
 
 _SENTINEL = "token-text-must-not-escape"
 
@@ -113,6 +117,114 @@ def _access_turn_credentials(
         result.put(None)
 
 
+def _run_contended_codex_turn(
+    home: str,
+    release: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 0.05
+    conversation = ConversationStore(Path(home) / "contended-session")
+
+    async def run() -> None:
+        account = AccountId("codex", "work")
+        credential = credential_store("codex", home=home, account=account)
+        assert credential is not None
+        response_events = [
+            {"type": "response.created", "response": {"id": "response-test"}},
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "message-test", "role": "assistant"},
+            },
+            {
+                "type": "response.content_part.added",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text"},
+            },
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "hello",
+            },
+            {
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "hello",
+            },
+            {"type": "response.content_part.done", "output_index": 0, "content_index": 0},
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "message-test",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "response-test",
+                    "status": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+            },
+        ]
+        body = "".join(
+            f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+            for event in response_events
+        )
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=body,
+                request=request,
+            )
+
+        async def wait_for_release(_delay: float) -> None:
+            assert await asyncio.to_thread(release.wait, 5)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = CodexBackend(client=client, token_store=credential)
+        backend._completion_wait = wait_for_release
+        events: list[StreamEvent] = []
+        try:
+            async for stream_event in AgentLoop(
+                backend,
+                conversation,
+                skill_catalog=SkillCatalog.empty(),
+            ).run_turn("hello", origin=MessageOrigin.USER):
+                events.append(stream_event)
+                if stream_event.type is StreamEventType.RETRY:
+                    result.put(("retry", stream_event.data))
+        finally:
+            await backend.aclose()
+        result.put(
+            (
+                "result",
+                [event.type.value for event in events],
+                [
+                    block.text
+                    for event in events
+                    if event.type is StreamEventType.MESSAGE_END
+                    and event.message is not None
+                    for block in event.message.content
+                    if isinstance(block, TextContent)
+                ],
+                [event.error.message for event in events if event.error is not None],
+            )
+        )
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("method", ["read", "bootstrap"])
 def test_turn_credential_access_times_out_when_another_process_holds_lock(
     tmp_path: Path, method: str
@@ -153,6 +265,79 @@ def test_turn_credential_access_times_out_when_another_process_holds_lock(
             holder.kill()
             holder.join(timeout=5)
         reader.close()
+        holder.close()
+        result.close()
+        result.join_thread()
+
+
+def test_codex_turn_retries_real_account_lock_contention(tmp_path: Path) -> None:
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, account.provider, account.name).save(
+        OAuthTokens(
+            _jwt_token(
+                {
+                    "exp": 4_000_000_000,
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "account-test"
+                    },
+                }
+            ),
+            "refresh-secret",
+            4_000_000_000,
+        )
+    )
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    result = context.Queue()
+    holder = context.Process(
+        target=_hold_lifecycle_lock,
+        args=(str(tmp_path), account, ready, release),
+    )
+    turn = context.Process(
+        target=_run_contended_codex_turn,
+        args=(str(tmp_path), release, result),
+    )
+    holder.start()
+    try:
+        assert ready.wait(timeout=20)
+        turn.start()
+        first = result.get(timeout=20)
+        assert first[0] == "retry", "the contended turn ended instead of waiting"
+        assert first[1]["kind"] == "account_lock_wait"
+        rendered = render_event(StreamEvent(StreamEventType.RETRY, data=first[1]))
+        assert rendered is not None
+        assert "waiting for account lock" in rendered.plain
+        release.set()
+        outcome = result.get(timeout=20)
+        assert outcome == (
+            "result",
+            [
+                "agent_start",
+                "turn_start",
+                "retry",
+                "message_start",
+                "message_update",
+                "message_end",
+                "turn_end",
+                "agent_end",
+            ],
+            ["hello"],
+            [],
+        )
+        turn.join(timeout=5)
+        assert turn.exitcode == 0
+    finally:
+        release.set()
+        if turn.pid is not None:
+            if turn.is_alive():
+                turn.kill()
+            turn.join(timeout=5)
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5)
+        turn.close()
         holder.close()
         result.close()
         result.join_thread()

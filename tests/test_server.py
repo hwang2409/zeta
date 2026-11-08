@@ -60,7 +60,12 @@ from tests.support.server_client import (
 )
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.support.storage_homes import initialize_storage_home
-from zeta.accounts import AccountId, AccountStore, AccountUsage
+from zeta.accounts import (
+    AccountCredentialLockTimeoutError,
+    AccountId,
+    AccountStore,
+    AccountUsage,
+)
 from zeta.attention_records import AttentionStore
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -1065,6 +1070,28 @@ class EarlyCloseRetryBackend:
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("keep me")]),
         )
+
+
+class AccountLockRetryBackend:
+    def __init__(self) -> None:
+        self.calls = 0
+        self._completion_wait = _no_wait
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        del messages, tool_schemas
+        self.calls += 1
+        if self.calls == 1:
+            raise AccountCredentialLockTimeoutError(AccountId("codex", "work"))
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="done")
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+
+async def _no_wait(_delay: float) -> None:
+    return None
 
 
 async def _provider_retry_frames(
@@ -3828,6 +3855,37 @@ async def test_reused_core_key_gets_fresh_wire_id_after_end(tmp_path: Path) -> N
     await approvals.transition(Cancel(tool_call.id, "child", "turn_canceled"))
     approvals.register_delegated(request, store, "child")
     assert approvals.wire_id(request.key) != first
+
+
+@pytest.mark.asyncio
+async def test_account_lock_wait_precedes_successful_assistant_frame(
+    tmp_path: Path,
+) -> None:
+    backend = AccountLockRetryBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        while not any(
+            frame.get("params", {}).get("event") == "agent_end" for frame in frames
+        ):
+            frames.append(await _read(reader))
+    finally:
+        await close_serve(server, writer)
+
+    events = [frame["params"] for frame in frames if frame.get("method") == "event"]
+    names = [event["event"] for event in events]
+    retry = next(event for event in events if event["event"] == "retry")
+    assert "waiting for account lock" in retry["data"]["text"]
+    assert names.index("retry") < names.index("assistant_message")
+    assert backend.calls == 2
 
 
 @pytest.mark.asyncio
