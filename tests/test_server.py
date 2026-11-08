@@ -3081,6 +3081,83 @@ async def test_clear_steering_requires_abort_scope_feature(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_foreground_abort_does_not_interrupt_tool_cleanup(
+    tmp_path: Path,
+) -> None:
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    handler_started = asyncio.Event()
+
+    async def controlled_tool(arguments: dict[str, Any]) -> ToolResult:
+        del arguments
+        handler_started.set()
+        try:
+            await await_or_fail(
+                asyncio.Event().wait(), what="controlled tool wait"
+            )
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await await_or_fail(cleanup_release.wait(), what="cleanup release")
+            cleanup_finished.set()
+            return ToolResult("controlled", "cleaned up")
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("controlled", "controlled", {})],
+            )
+        ]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        cli_yolo=True,
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    abort: asyncio.Task[list[dict[str, Any]]] | None = None
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        server.runtime.loop.tool_registry.register(
+            "controlled",
+            controlled_tool,
+            parameters={"type": "object", "properties": {}},
+            requires_approval=False,
+        )
+        await _request(reader, writer, 3, "send", {"text": "run controlled"})
+        await _event(reader, "tool_start")
+        await await_or_fail(handler_started.wait(), what="controlled tool start")
+
+        abort = asyncio.create_task(
+            _request(reader, writer, 4, "abort", {"scope": "foreground"})
+        )
+        await await_or_fail(cleanup_started.wait(), what="tool cleanup start")
+        cleanup_release.set()
+        frames = await await_or_fail(abort, what="foreground abort response")
+        assert frames[-1]["result"] == {"aborted": True}
+        await await_or_fail(cleanup_finished.wait(), what="tool cleanup finish")
+    finally:
+        cleanup_release.set()
+        if abort is not None and not abort.done():
+            abort.cancel()
+            await await_or_fail(
+                asyncio.gather(abort, return_exceptions=True),
+                what="foreground abort cleanup",
+            )
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_foreground_abort_cancels_tool_but_keeps_background_child(
     tmp_path: Path,
 ) -> None:
