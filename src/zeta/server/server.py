@@ -25,6 +25,7 @@ from . import (
     ergonomics,
     login,
     model_selection,
+    run_work,
     slash_commands,
 )
 from . import control as session_grants
@@ -45,6 +46,7 @@ from .protocol import (
     Access,
     ApprovalDecision,
     ErrorDescriptor,
+    EventDescriptor,
     FrameCodec,
     Handler,
     MethodDescriptor,
@@ -483,6 +485,20 @@ async def _handle_project_inbox(
     )
 
 
+async def _handle_run_work_list(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await run_work.list_run_work(
+        client.server.runtime, params, client.server.control._run_blocking  # type: ignore[attr-defined]
+    )
+
+
+async def _handle_background_task_cancel(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await run_work.cancel_background_task(client.server.runtime, params)  # type: ignore[attr-defined]
+
+
 HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.LIST_SESSIONS: _handle_list_sessions,
     MethodDescriptor.NEW_SESSION: _handle_new_session_request,
@@ -526,6 +542,8 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.DELIVERY_STATUS: _handle_delivery_status,
     MethodDescriptor.SESSION_GRANTS: _handle_session_grants,
     MethodDescriptor.REVOKE_SESSION_GRANTS: _handle_revoke_session_grants,
+    MethodDescriptor.RUN_WORK_LIST: _handle_run_work_list,
+    MethodDescriptor.BACKGROUND_TASK_CANCEL: _handle_background_task_cancel,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
@@ -707,7 +725,33 @@ class ZetaServer:
         self.runtime.set_approval_control_binder(self.control.bind_policy)
         self.runtime.set_background_event_sink(self.control._publish_background_event)
         self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
+        self.runtime.set_run_work_event_sink(self._publish_run_work_event)
         self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
+
+    def _publish_run_work_event(
+        self, session_id: str, event: EventDescriptor, fields: dict[str, object]
+    ) -> None:
+        connections = self.connections
+        if connections is None:
+            return
+
+        def publish() -> None:
+            controller = connections.controller_metadata()
+            if controller is None or "run_work" not in controller.features:
+                return
+            if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
+                awaitable = self.control._notify(
+                    EventDescriptor.BACKGROUND_TASK_UPDATED, session_id, **fields
+                )
+            elif event is EventDescriptor.TODO_UPDATED:
+                awaitable = self.control._notify(
+                    EventDescriptor.TODO_UPDATED, session_id, **fields
+                )
+            else:
+                raise ValueError(f"unsupported run-work event: {event.value}")
+            asyncio.create_task(awaitable)
+
+        connections.loop.call_soon_threadsafe(publish)
 
     @property
     def address(self) -> str:

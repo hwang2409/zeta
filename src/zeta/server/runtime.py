@@ -47,11 +47,15 @@ from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
+from ..tools._shared.background_task_types import BackgroundTaskNotice
+from ..tools._shared.run_work import background_task_row
+from .protocol import EventDescriptor
 
 BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]
 SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
+RunWorkEventSink = Callable[[str, EventDescriptor, dict[str, object]], None]
 ApprovalControlBinder = Callable[[ApprovalPolicy], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
 _SETUP_SHUTDOWN_WAIT_SECONDS = 1.0
@@ -216,6 +220,7 @@ class ServerRuntime:
         self._background_wake_sink: SessionWakeSink | None = None
         self._approval_control_binder: ApprovalControlBinder | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
+        self._run_work_event_sink: RunWorkEventSink | None = None
         self._post_stream_provider_retry = False
         self._setup_reapers: set[asyncio.Task[None]] = set()
 
@@ -346,6 +351,12 @@ class ServerRuntime:
     def set_memory_notice_sink(self, sink: MemoryNoticeSink | None) -> None:
         """Attach the frontend callback for automatic memory updates."""
         self._memory_notice_sink = sink
+        if self._state is not None:
+            self._bind_background_event_sink(self._state)
+
+    def set_run_work_event_sink(self, sink: RunWorkEventSink | None) -> None:
+        """Attach the frontend callback for committed task and todo updates."""
+        self._run_work_event_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
 
@@ -629,6 +640,37 @@ class ServerRuntime:
             raise
 
     def _bind_background_event_sink(self, state: SessionState) -> None:
+        run_work_sink = self._run_work_event_sink
+        if run_work_sink is None:
+            state.loop.tool_registry.background_tasks.set_notice_sink(None)
+            state.opened.store.set_todo_change_sink(None)
+        else:
+            session_id = state.session_id
+            registry = state.loop.tool_registry.background_tasks
+
+            def task_changed(notice: object) -> None:
+                if not isinstance(notice, BackgroundTaskNotice):
+                    return
+                task = next(
+                    (item for item in registry.snapshot() if item.task_id == notice.task_id),
+                    None,
+                )
+                if task is not None:
+                    run_work_sink(
+                        session_id,
+                        EventDescriptor.BACKGROUND_TASK_UPDATED,
+                        {"task": background_task_row(task)},
+                    )
+
+            registry.set_notice_sink(task_changed)
+            state.opened.store.set_todo_change_sink(
+                lambda todo: run_work_sink(
+                    session_id,
+                    EventDescriptor.TODO_UPDATED,
+                    {"todo": [dict(item) for item in todo]},
+                )
+            )
+
         sink = self._background_event_sink
         wake_sink = self._background_wake_sink
         if sink is None:
