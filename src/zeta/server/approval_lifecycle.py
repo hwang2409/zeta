@@ -764,9 +764,15 @@ class ApprovalLifecycle:
         generation = record.generation
         target = record.target
 
-        result = await persist_durably(
-            target.store, target.store_request_id, decision, reason
-        )
+        while True:
+            try:
+                result = await persist_durably(
+                    target.store, target.store_request_id, decision, reason
+                )
+                break
+            except asyncio.CancelledError:
+                # The settlement owner owns recovery from cancellation.
+                continue
         if result.should_retry:
             self._reset_for_retry(target.key, token, generation)
             raise asyncio.CancelledError
@@ -806,11 +812,15 @@ class ApprovalLifecycle:
         if not owns_record:
             self._release_gate(record, resolution=resolution)
             return resolution
-        try:
-            await self._finish_record(record, resolution)
-        except BaseException as exc:
-            self._release_gate(record, error=exc)
-            raise
+        while True:
+            try:
+                await self._finish_record(record, resolution)
+                break
+            except asyncio.CancelledError:
+                continue
+            except BaseException as exc:
+                self._release_gate(record, error=exc)
+                raise
         return resolution
 
     def request_approval_abort(

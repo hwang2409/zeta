@@ -1280,6 +1280,56 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         )
 
 
+@pytest.mark.asyncio
+async def test_abort_canceled_settlement_keeps_controller_connected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = ToolCall("abort-call", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    gate_enabled = False
+    original_durable = ConversationStore._to_thread_durable
+
+    async def gated_durable(*args: object, **kwargs: object) -> object:
+        nonlocal gate_enabled
+        result = await original_durable(*args, **kwargs)
+        if gate_enabled:
+            entered.set()
+            await await_or_fail(release.wait(), what="abort settlement")
+        return result
+
+    # test-contract: seam gate the settlement's real durable await
+    monkeypatch.setattr(ConversationStore, "_to_thread_durable", gated_durable)
+    reader, writer = await _connect(server)
+    try:
+        await _hello_and_create(reader, writer)
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        gate_enabled = True
+        abort = asyncio.create_task(_request(reader, writer, 4, "abort"))
+        await await_or_fail(entered.wait(), what="abort settlement gate")
+        record = server.control._approvals.state.records[approval["request_id"]]
+        assert record.settlement is not None
+        record.settlement.cancel()
+        release.set()
+        frames = await await_or_fail(abort, what="abort response")
+        assert frames[-1]["result"] == {"aborted": True}
+        approval_end = await _event(reader, "approval_end")
+        assert approval_end["reason"] == "turn_canceled"
+        status = (await _request(reader, writer, 5, "status"))[-1]
+        assert status["result"]["state"] in {"idle", "running"}
+    finally:
+        release.set()
+        await close_serve(server, writer)
+
+
 @pytest.mark.parametrize(
     "case",
     [
