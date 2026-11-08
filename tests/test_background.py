@@ -29,6 +29,7 @@ import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import (
+    _wait_pid_exited_sync,
     kill_group_if_present,
     read_pid_file,
     wait_for_path_command,
@@ -3038,6 +3039,7 @@ def test_loop_teardown_cancels_owner_before_detached_leader_exits(
     teardown_finished = threading.Event()
     errors: list[BaseException] = []
     leader_pids: list[int] = []
+    child_pids: list[int] = []
     registries: list[BackgroundTaskRegistry] = []
     child_ready = tmp_path / "detached-loop-child"
     original_cancel_all = asyncio.runners._cancel_all_tasks
@@ -3077,7 +3079,7 @@ def test_loop_teardown_cancels_owner_before_detached_leader_exits(
         registries.append(tasks)
         _task_id, leader_pid = await tasks.start(_python(leader), tmp_path)
         leader_pids.append(leader_pid)
-        await read_pid_file(child_ready)
+        child_pids.append(await read_pid_file(child_ready))
 
     def run_loop() -> None:
         try:
@@ -3095,6 +3097,7 @@ def test_loop_teardown_cancels_owner_before_detached_leader_exits(
             "loop teardown did not finish after cancelling the background owner"
         )
         assert not errors
+        _wait_pid_exited_sync(child_pids[0], timeout=1)
     finally:
         for leader_pid in leader_pids:
             kill_group_if_present(leader_pid)

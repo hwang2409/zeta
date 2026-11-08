@@ -13,7 +13,7 @@ from typing import IO, TYPE_CHECKING, Any, Literal
 from ...core.thread_call import run_owned_thread_call
 from . import process_output
 from .background_log_writer import _OrderedLogWriter
-from .background_spawn import _group_exists
+from .background_spawn import _group_exists, _signal_group
 from .background_task_types import (
     BackgroundTaskKillOutcome,
     BackgroundTaskNotice,
@@ -107,6 +107,8 @@ class _BackgroundTaskOwner:
                     await asyncio.shield(task)
                 except asyncio.CancelledError:
                     cancelled = True
+                    # test-contract: latency teardown kills the owned process group
+                    _signal_group(process, signal.SIGKILL)
             if task.cancelled():
                 cancelled = True
                 return None
