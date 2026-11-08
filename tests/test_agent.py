@@ -16723,6 +16723,7 @@ def _seed_recoverable_child(
         "agent",
         {"prompt": "work", "description": "worker", "background": True},
     )
+    parent.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     child.mark_agent_parent(call.id, agent_type="worker")
     child.start_agent_lifecycle(
         handle=f"{parent_handle}:{number}",
