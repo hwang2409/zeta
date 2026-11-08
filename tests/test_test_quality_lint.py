@@ -272,6 +272,11 @@ def test_await_deadline_rule_rejects_unbounded_waits(
             [],
         ),
         (
+            "exception target rebound",
+            "import asyncio\nasync def test_spin():\n    try:\n        work()\n    except Error as asyncio:\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
             "another import rebound",
             "import asyncio\nimport json as asyncio\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
             [],

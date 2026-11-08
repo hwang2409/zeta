@@ -602,6 +602,12 @@ def _direct_sleep_modules(tree: ast.Module) -> set[str]:
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name in modules:
                 rebound.add(node.name)
+        elif isinstance(
+            node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)
+        ) and node.name in modules:
+            rebound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest in modules:
+            rebound.add(node.rest)
         elif isinstance(node, ast.Import):
             for imported in node.names:
                 bound = imported.asname or imported.name.split(".")[0]
