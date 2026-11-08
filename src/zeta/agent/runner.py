@@ -60,9 +60,14 @@ from .presets import (
     AgentPreset,
     resolve_child_profile_tools,
 )
-from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
+from .receipt import (
+    MAX_AGENT_RESULT_BYTES,
+    TerminalState,
+    child_cleanup_details,
+    recoverable_error_result,
+)
 from .run_consumer import consume_run as consume_follow_up_run
-from .terminal_fence import TerminalTransitionFence
+from .terminal_fence import TerminalTransitionFence, persist_confirmed_cancel
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
@@ -283,19 +288,7 @@ async def consume_child(
         failure_message = error_message(exc)
     if failure_message is not None:
         if failure_error is not None and failure_error[0] == "account_lock_timeout":
-            result = terminal_result(
-                state="idle",
-                text=f"agent error: {failure_message}",
-                error=False,
-                status="running",
-            )
-            structured = result.get("structuredContent")
-            if isinstance(structured, dict):
-                structured["recoverable_error"] = {
-                    "code": failure_error[0],
-                    "message": failure_error[1],
-                }
-            return result
+            return recoverable_error_result(terminal_result, failure_message, *failure_error)
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
@@ -1048,15 +1041,25 @@ async def run_agent_tool(
         nonlocal child_canceled
         if child_canceled:
             return False
-        if terminal_fence is not None and not await terminal_fence.cancel():
-            return False
+        # Claim before any await: concurrent requests (owner cleanup and the
+        # child's own abort path) must not both write; a failed write releases it.
         child_canceled = True
-        return True
+        try:
+            return await persist_confirmed_cancel(
+                terminal_fence, child_store, tool_call.id
+            )
+        except BaseException:
+            child_canceled = False
+            raise
 
     async def cleanup_canceled_child(
         confirmation: asyncio.Task[bool],
     ) -> None:
-        if not await confirmation:
+        try:
+            confirmed = await confirmation
+        except Exception:  # noqa: BLE001 - the caller reports confirmation failures
+            return
+        if not confirmed:
             return
         child_loop.admit_abort()
         child_loop.tool_registry.abort()
@@ -1066,7 +1069,6 @@ async def run_agent_tool(
             child_task.cancel()
         await loop._background_owner.wait_for_descendant_watchers(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
-        child_store.mark_agent_canceled(tool_call.id)
 
     def request_child_cancel() -> CancellationRequest:
         """Start durable cancellation and tree-owned cleanup."""

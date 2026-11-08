@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
+from threading import Event as ThreadEvent
+from threading import Lock as ThreadLock
+from threading import Thread
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +23,7 @@ from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.attention_decisions import DecisionItem, open_decisions
 from zeta.attention_forks import create_discussion_fork, release_discussion_fork
 from zeta.attention_records import AttentionStore
@@ -26,7 +31,15 @@ from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolResult,
+)
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
@@ -34,6 +47,7 @@ from zeta.tools.resolve_attention import register_fork
 from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
 from zeta.tui.cards.decisions import DecisionsPanel
+from zeta.tui.layout import status_toolbar
 from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import format_status
 from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin
@@ -94,6 +108,26 @@ def _decisions_app(home: Path, opened) -> TUIApp:
         model="fake",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
+    )
+
+
+def _rendered_decisions_status(app: TUIApp) -> str:
+    return "".join(text for _style, text in status_toolbar(app, 160))
+
+
+async def _stop_decisions(app: TUIApp) -> None:
+    stopped = app.stop_decisions_poll()
+    if inspect.isawaitable(stopped):
+        await asyncio.wait_for(stopped, 10)
+
+
+def _resolved_event(*, child: bool = False) -> StreamEvent:
+    call = ToolCall("resolve-1", "resolve_attention", {})
+    return StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "resolved"),
+        data={"agent_instance_id": "child-1"} if child else {},
     )
 
 
@@ -167,6 +201,384 @@ async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> 
     await app.loop.tool_registry.close()
     current.store.close()
     other.store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_attention_event_refreshes_rendered_count_immediately(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    record = await asyncio.to_thread(
+        _request, current, project.project_id, "Current", "This one."
+    )
+    app = _decisions_app(tmp_path, current)
+    refreshed = asyncio.Event()
+    try:
+        await app._decisions_tick()
+        assert "1 attention item" in _rendered_decisions_status(app)
+        app._invalidate_prompt = lambda: (
+            refreshed.set() if "● " not in _rendered_decisions_status(app) else None
+        )
+        result = await app.loop.tool_registry.definitions_by_name[
+            "resolve_attention"
+        ].handler({"attention_id": record.id, "decision": "done"})
+        assert result["isError"] is False
+
+        app._handle_tool_event(_resolved_event())
+        try:
+            await asyncio.wait_for(refreshed.wait(), 10)
+        except TimeoutError:
+            pass
+
+        assert "● " not in _rendered_decisions_status(app)
+    finally:
+        await _stop_decisions(app)
+        await app.loop.tool_registry.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.attention_decisions as decisions_module
+    import zeta.tui.slash_handlers.decisions_panel as panel_module
+
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    record = await asyncio.to_thread(
+        _request, current, project.project_id, "Current", "This one."
+    )
+    app = _decisions_app(tmp_path, current)
+    real_open = decisions_module.open_decisions
+    failed = asyncio.Event()
+    recovered = asyncio.Event()
+    release_failure = ThreadEvent()
+    calls = 0
+    loop = asyncio.get_running_loop()
+
+    def flaky_open(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            loop.call_soon_threadsafe(failed.set)
+            release_failure.wait(timeout=10)
+            raise ValueError("bad projection")
+        return real_open(*args, **kwargs)
+
+    try:
+        await app._decisions_tick()
+        assert "1 attention item" in _rendered_decisions_status(app)
+        app._invalidate_prompt = lambda: (
+            recovered.set() if "● " not in _rendered_decisions_status(app) else None
+        )
+        monkeypatch.setattr(decisions_module, "open_decisions", flaky_open)
+        # test-contract: seam backoff is shortened; the toolbar render is unchanged
+        monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
+        app.start_decisions_poll()
+        await await_or_fail(failed.wait(), what="failing decision poll")
+        await asyncio.to_thread(
+            AttentionReplies(tmp_path, current.store.session_id).resolve_local,
+            record.id,
+            "done",
+        )
+        release_failure.set()
+        try:
+            await asyncio.wait_for(recovered.wait(), 10)
+        except TimeoutError:
+            pass
+
+        assert "● " not in _rendered_decisions_status(app)
+    finally:
+        release_failure.set()
+        await _stop_decisions(app)
+        await app.loop.tool_registry.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_decisions_failure_renders_unavailable_then_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.attention_decisions as decisions_module
+    import zeta.tui.slash_handlers.decisions_panel as panel_module
+
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    record = await asyncio.to_thread(
+        _request, current, project.project_id, "Current", "This one."
+    )
+    app = _decisions_app(tmp_path, current)
+    real_open = decisions_module.open_decisions
+    unavailable = asyncio.Event()
+    recovered = asyncio.Event()
+    app._invalidate_prompt = lambda: (
+        unavailable.set() if app.decisions_error is not None else recovered.set()
+    )
+
+    def broken_open(*_args, **_kwargs):
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(decisions_module, "open_decisions", broken_open)
+    # test-contract: seam backoff is shortened; the toolbar render is unchanged
+    monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
+    try:
+        app.start_decisions_poll()
+        try:
+            await asyncio.wait_for(unavailable.wait(), 10)
+        except TimeoutError:
+            pass
+        assert "decisions unavailable: projection failed" in _rendered_decisions_status(app)
+
+        monkeypatch.setattr(decisions_module, "open_decisions", real_open)
+        await asyncio.to_thread(
+            AttentionReplies(tmp_path, current.store.session_id).resolve_local,
+            record.id,
+            "done",
+        )
+        app.request_decisions_refresh()
+        try:
+            await asyncio.wait_for(recovered.wait(), 10)
+        except TimeoutError:
+            pass
+
+        assert "decisions unavailable" not in _rendered_decisions_status(app)
+    finally:
+        await _stop_decisions(app)
+        await app.loop.tool_registry.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
+async def test_child_resolution_event_refreshes_rendered_count(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    anchor = current.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
+    )
+    record = await asyncio.to_thread(
+        _request,
+        current,
+        project.project_id,
+        "Current",
+        "This one.",
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+    )
+    app = _decisions_app(tmp_path, current)
+    fork = None
+    registry = None
+    refreshed = asyncio.Event()
+    try:
+        await app._decisions_tick()
+        assert "1 attention item" in _rendered_decisions_status(app)
+        app._invalidate_prompt = lambda: (
+            refreshed.set() if "● " not in _rendered_decisions_status(app) else None
+        )
+        fork_id = await asyncio.to_thread(
+            create_discussion_fork, tmp_path, current.store.session_id, record.id
+        )
+        fork = manager.open(fork_id)
+        registry = ToolRegistry(
+            tmp_path,
+            session_store=fork.store,
+            skill_catalog=SkillCatalog.empty(),
+            project_id=project.project_id,
+            project_registry=manager.project_registry,
+            tool_allow=fork.metadata.tool_allow,
+        )
+        register_fork(registry)
+        result = await registry.definitions_by_name["resolve_attention"].handler(
+            {"decision": "done"}
+        )
+        assert result["isError"] is False
+
+        app._handle_background_event_now(_resolved_event(child=True))
+        try:
+            await asyncio.wait_for(refreshed.wait(), 10)
+        except TimeoutError:
+            pass
+
+        assert "● " not in _rendered_decisions_status(app)
+    finally:
+        await _stop_decisions(app)
+        if registry is not None:
+            await registry.close()
+        if fork is not None:
+            fork.store.close()
+        await app.loop.tool_registry.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
+async def test_hung_decisions_scan_stays_single_flight_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.attention_decisions as decisions_module
+    import zeta.tui.slash_handlers.decisions_panel as panel_module
+
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    await asyncio.to_thread(_request, current, project.project_id, "Current", "This one.")
+    app = _decisions_app(tmp_path, current)
+    real_open = decisions_module.open_decisions
+    entered = asyncio.Event()
+    release = ThreadEvent()
+    unavailable = asyncio.Event()
+    recovered = asyncio.Event()
+    calls = 0
+    active = 0
+    max_active = 0
+    counter_lock = ThreadLock()
+    loop = asyncio.get_running_loop()
+
+    def hung_open(*args, **kwargs):
+        nonlocal calls, active, max_active
+        with counter_lock:
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=10)
+            return real_open(*args, **kwargs)
+        finally:
+            with counter_lock:
+                active -= 1
+
+    try:
+        await app._decisions_tick()
+        assert "1 attention item" in _rendered_decisions_status(app)
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        app._invalidate_prompt = lambda: (
+            unavailable.set() if app.decisions_error is not None else recovered.set()
+        )
+        monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
+        # test-contract: seam timeout is shortened; the toolbar render is unchanged
+        monkeypatch.setattr(panel_module, "_SCAN_TIMEOUT", 0.01, raising=False)
+        app.start_decisions_poll()
+        await await_or_fail(entered.wait(), what="started decision scan")
+        for _ in range(50):
+            app._handle_tool_event(_resolved_event())
+            app.close_decisions_panel()
+            app.open_decisions_panel()
+        await await_or_fail(unavailable.wait(), what="timed-out decision scan")
+
+        rendered = _rendered_decisions_status(app)
+        assert calls == 1
+        assert "decisions unavailable: TimeoutError" in rendered and "1 attention item" not in rendered
+
+        recovered.clear()
+        release.set()
+        await await_or_fail(recovered.wait(), what="late decision scan recovery")
+        # a panel open that arrives after the shared scan ends may start a new scan;
+        # the invariant is that scans never overlap.
+        assert max_active == 1
+        assert "1 attention item" in _rendered_decisions_status(app)
+    finally:
+        release.set()
+        await _stop_decisions(app)
+        await app.loop.tool_registry.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
+async def test_stopping_decisions_scan_drains_owner_without_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.attention_decisions as decisions_module
+
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    app = _decisions_app(tmp_path, current)
+    entered = asyncio.Event()
+    release = ThreadEvent()
+    loop = asyncio.get_running_loop()
+
+    def hung_open(*_args, **_kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(timeout=10)
+        return ()
+
+    monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
+    try:
+        app.start_decisions_poll()
+        await await_or_fail(entered.wait(), what="started decision scan")
+        await _stop_decisions(app)
+        live = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and "decisions" in repr(task.get_coro())
+        ]
+        rendered = _rendered_decisions_status(app)
+        assert not live and "decisions unavailable" not in rendered
+    finally:
+        release.set()
+        await _stop_decisions(app)
+        await app.loop.tool_registry.close()
+        current.store.close()
+
+
+def test_stuck_decisions_scan_does_not_block_asyncio_run_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.attention_decisions as decisions_module
+
+    entered = ThreadEvent()
+    release = ThreadEvent()
+    finished = ThreadEvent()
+    errors: list[Exception] = []
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = _session(tmp_path, project.project_id)
+    app = _decisions_app(tmp_path, current)
+
+    def hung_open(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(timeout=10), "test did not release held decision scan"
+        return ()
+
+    async def run_tui_lifecycle() -> None:
+        try:
+            app.start_decisions_poll()
+            while not entered.is_set():
+                await asyncio.sleep(0)
+            await app.stop_decisions_poll()
+        finally:
+            await app.loop.tool_registry.close()
+            current.store.close()
+
+    def run() -> None:
+        try:
+            asyncio.run(run_tui_lifecycle())
+        except Exception as exc:  # noqa: BLE001 - surfaced in the parent assertion
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
+    thread = Thread(target=run, name="test-tui-lifecycle")
+    thread.start()
+    try:
+        assert entered.wait(timeout=5), f"decision scan did not start: {errors!r}"
+        assert finished.wait(timeout=5), "asyncio.run() waited for the held decision scan"
+        assert not release.is_set() and not errors
+    finally:
+        release.set()
+        thread.join(timeout=5)
 
 
 def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) -> None:
