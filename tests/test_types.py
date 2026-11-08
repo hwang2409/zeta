@@ -1,5 +1,6 @@
 from zeta.protocol.types import (
     ErrorInfo,
+    ImageContent,
     Message,
     MessageRole,
     RedactedThinkingContent,
@@ -49,6 +50,27 @@ def test_thinking_wire_body_marks_display_safe_text() -> None:
         "text": "",
         "signature": "opaque",
     }
+
+
+def test_image_validation_provenance_is_not_public_state() -> None:
+    data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+    reconstructed = Message.from_dict(
+        {
+            "role": "user",
+            "content": [{"type": "image", "data": data, "mimeType": "image/png"}],
+        }
+    ).content[0]
+    direct = ImageContent(data, "image/png")
+    assert reconstructed == direct
+    assert hash(reconstructed) == hash(direct)
+    assert "validation" not in repr(reconstructed)
+    assert reconstructed.to_dict() == direct.to_dict()
+    assert (
+        Message.from_dict(
+            {"role": "user", "content": [reconstructed.to_dict()]}
+        ).content[0]
+        == reconstructed
+    )
 
 
 def test_tool_result_round_trip_preserves_mixed_content_blocks() -> None:

@@ -6,7 +6,7 @@ import base64
 import binascii
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
@@ -43,6 +43,29 @@ class MessageRole(StrEnum):
 
 
 MESSAGE_ORIGIN_METADATA = "zeta.origin"
+
+_VALIDATED_IMAGE = object()
+
+
+class _ValidationState:
+    __slots__ = ("_validation_marker",)
+
+    def __getstate__(self) -> list[Any]:
+        return [getattr(self, item.name) for item in fields(type(self))]
+
+    def __setstate__(self, state: list[Any]) -> None:
+        for item, value in zip(fields(type(self)), state, strict=True):
+            object.__setattr__(self, item.name, value)
+
+
+def _image_validation_snapshot(
+    content_blocks: list[dict[str, Any]],
+) -> tuple[tuple[int, str, str], ...]:
+    return tuple(
+        (id(block), block["data"], block["mimeType"])
+        for block in content_blocks
+        if block["type"] == "image"
+    )
 
 
 class MessageOrigin(StrEnum):
@@ -100,7 +123,7 @@ class TextContent:
 
 
 @dataclass(frozen=True, slots=True)
-class ImageContent:
+class ImageContent(_ValidationState):
     data: str
     mime_type: str
     path: str | None = None
@@ -559,7 +582,9 @@ def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
             raise ValueError("image content path must be a nonempty string")
         if size is not None and (type(size) is not int or size < 0):
             raise ValueError("image content size must be a nonnegative integer")
-        return ImageContent(data, mime_type, path, size)
+        image = ImageContent(data, mime_type, path, size)
+        object.__setattr__(image, "_validation_marker", _VALIDATED_IMAGE)
+        return image
     if content_type is ContentType.THINKING:
         text = value.get("text")
         if type(text) is not str:
@@ -580,7 +605,7 @@ def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolResult:
+class ToolResult(_ValidationState):
     tool_call_id: str
     content: str
     is_error: bool = False
@@ -656,7 +681,7 @@ class ToolResult:
                 )
         if structured_content is not None and type(structured_content) is not dict:
             raise ValueError("tool result structured_content must be an object")
-        return cls(
+        result = cls(
             tool_call_id=tool_call_id,
             content=content,
             is_error=is_error,
@@ -666,6 +691,11 @@ class ToolResult:
             ),
             is_canceled=is_canceled,
         )
+        if content_blocks is not None:
+            object.__setattr__(
+                result, "_validation_marker", _image_validation_snapshot(content_blocks)
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True)

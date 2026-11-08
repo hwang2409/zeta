@@ -1,8 +1,11 @@
 import asyncio
 import base64
+import copy
+import dataclasses
 import http.server
 import json
 import multiprocessing
+import pickle
 import threading
 import time
 import uuid
@@ -19,6 +22,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
+    ImageContent,
     Message,
     MessageOrigin,
     MessageRole,
@@ -29,6 +33,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.providers import codex_payload
 from zeta.providers.anthropic import OAuthTokens
 from zeta.providers.codex import (
     DEFAULT_CODEX_MODEL,
@@ -40,10 +45,110 @@ from zeta.providers.codex import (
     extract_account_id,
 )
 from zeta.providers.codex_payload import _cache_affinity_json
+
+
+def test_validation_provenance_is_private_and_legacy_pickle_safe() -> None:
+    data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+    image = Message.from_dict(
+        {"role": "user", "content": [{"type": "image", "data": data, "mimeType": "image/png"}]}
+    ).content[0]
+    result = ToolResult.from_dict(
+        {
+            "tool_call_id": "call",
+            "content": "image",
+            "is_error": False,
+            "content_blocks": [{"type": "image", "data": data, "mimeType": "image/png"}],
+        }
+    )
+    old_image = pickle.loads(bytes.fromhex("80049542000000000000008c137a6574612e70726f746f636f6c2e7479706573948c0c496d616765436f6e74656e749493942981945d94288c0178948c09696d6167652f706e67944e4e65622e"))
+    old_result = pickle.loads(
+        bytes.fromhex(
+            "800495d2000000000000008c137a6574612e70726f746f636f6c2e7479706573948c0a546f6f6c526573756c749493942981945d94288c0463616c6c948c05696d61676594895d947d94288c04747970659468068c0464617461948c606956424f5277304b47676f414141414e5355684555674141414145414141414243415941414141664663534a4141414144556c45515652346e474e672b4d384141414145414145426f754445734141414141424a52553545726b4a6767673d3d948c086d696d6554797065948c09696d6167652f706e679475614e894e65622e"
+        )
+    )
+    assert build_responses_payload(
+        [Message(MessageRole.TOOL_RESULT, tool_result=old_result)], [], model="gpt-5"
+    )["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call",
+            "output": "[image block] media_type=image/png dimensions=1x1 bytes=70",
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{data}",
+                }
+            ],
+        },
+    ]
+    assert json.dumps(dataclasses.asdict(image)) == json.dumps(
+        {"data": data, "mime_type": "image/png", "path": None, "size": None}
+    )
+    assert "_validation_marker" not in dataclasses.asdict(result)
+    assert copy.deepcopy(image) == image
+    assert dataclasses.replace(image, path="x") == ImageContent(data, "image/png", "x")
+    assert build_responses_payload([Message(MessageRole.USER, [old_image])], [], model="gpt-5")["input"]
+
+
 from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+
+
+def test_codex_reuses_strict_image_validation_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+    message = Message.from_dict(
+        {
+            "role": "user",
+            "content": [{"type": "image", "data": data, "mimeType": "image/png"}],
+        }
+    )
+    assert isinstance(message.content[0], ImageContent)
+    monkeypatch.setattr(
+        codex_payload,
+        "decoded_image_bytes",
+        lambda image: pytest.fail("strictly reconstructed image was decoded twice"),
+    )
+    payload = build_responses_payload([message], [], model="gpt-5")
+    assert payload["input"][0]["content"][0]["image_url"] == f"data:image/png;base64,{data}"
+
+
+def test_codex_keeps_direct_image_validation_and_tool_result_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+    calls = 0
+    original = codex_payload.decoded_image_bytes
+
+    def count_decode(image):
+        nonlocal calls
+        calls += 1
+        return original(image)
+
+    monkeypatch.setattr(codex_payload, "decoded_image_bytes", count_decode)
+    direct = Message(MessageRole.USER, [ImageContent(data, "image/png")])
+    build_responses_payload([direct], [], model="gpt-5")
+    tool = ToolResult.from_dict(
+        {
+            "tool_call_id": "call",
+            "content": "image",
+            "is_error": False,
+            "content_blocks": [{"type": "image", "data": data, "mimeType": "image/png"}],
+        }
+    )
+    tool_message = Message(MessageRole.TOOL_RESULT, [], tool_result=tool)
+    build_responses_payload([tool_message], [], model="gpt-5")
+    assert calls == 1
+    assert tool.content_blocks is not None
+    tool.content_blocks[0]["data"] = "invalid"
+    build_responses_payload([tool_message], [], model="gpt-5")
+    assert calls == 2
 
 
 def test_tool_argument_deltas_do_not_parse_until_item_completion(
