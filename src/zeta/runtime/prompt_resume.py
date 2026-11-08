@@ -402,7 +402,7 @@ def resume_prompt(
     explicit_custom = system_override is not None or system_append is not None
     skills, agents = _catalogs(home=home, repo_root=repo_root)
 
-    compose = partial(
+    compose_with = partial(
         _resume_composition,
         home=home,
         repo_root=repo_root,
@@ -417,13 +417,28 @@ def resume_prompt(
         explicit_custom=explicit_custom,
         project_features_enabled=project_features_enabled,
         registry=registry,
-        projection=project_projection,
     )
+    projection = project_projection
+    capture = manager.project_registry if projection is not None else None
+
+    def compose(current: SessionMetadata) -> PromptComposition:
+        # Re-read project memory with no session shape lock held; a change since
+        # the last capture is a changed composition input, so compose again.
+        nonlocal projection
+        while True:
+            composition = compose_with(current, projection=projection)
+            if capture is None:
+                return composition
+            fresh = capture.project_context_projection(current.project_id)
+            if fresh == projection:
+                return composition
+            projection = fresh
+
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
     context = replace(
         _adopted_context(metadata, composition.notices),
-        health=(project_projection.health if project_projection is not None else None),
+        health=(projection.health if projection is not None else None),
     )
     if owns_skill_index:
         context = _replace_context_skill_index(context, skills)

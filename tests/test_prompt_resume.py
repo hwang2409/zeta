@@ -19,6 +19,7 @@ from zeta.core.session import SessionManager
 from zeta.core.session_execution import SessionOwnedError
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
+from zeta.project_registry import Project, ProjectRegistry
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.project_registry_state import ProjectRegistryState
@@ -733,10 +734,11 @@ def test_transfer_excludes_runtime_lease_and_destination_rebuilds(
             store.close()
 
 
-@pytest.mark.parametrize("recipe", ["custom", "default"])
-def test_resume_uses_project_snapshot_captured_before_execution(
-    tmp_path: Path, recipe: str
-) -> None:
+def _project_session(
+    tmp_path: Path, recipe: str, memory: str
+) -> tuple[Path, Path, SessionManager, ProjectRegistry, Project, str]:
+    """Create a project-bound session whose prompt owns a ``memory`` span."""
+
     home = tmp_path / "home"
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -750,7 +752,7 @@ def test_resume_uses_project_snapshot_captured_before_execution(
     registry.compare_and_swap_memory(
         project.project_id,
         expected_digest=initial.digest,
-        updates={"brief.md": "old memory"},
+        updates={"brief.md": memory},
     )
     old_projection = registry.project_context_projection(project.project_id)
     old_context = load_project_context(
@@ -797,6 +799,16 @@ def test_resume_uses_project_snapshot_captured_before_execution(
     )
     session_id = opened.metadata.session_id
     opened.store.close()
+    return home, repository, manager, registry, project, session_id
+
+
+@pytest.mark.parametrize("recipe", ["custom", "default"])
+def test_resume_uses_project_snapshot_captured_before_execution(
+    tmp_path: Path, recipe: str
+) -> None:
+    home, repository, manager, registry, project, session_id = _project_session(
+        tmp_path, recipe, "old memory"
+    )
     before_update = registry.memory_snapshot(project.project_id)
     registry.compare_and_swap_memory(
         project.project_id,
@@ -846,3 +858,183 @@ def test_resume_uses_project_snapshot_captured_before_execution(
         assert result.context.system_prompt.endswith("\nunknown-suffix")
     else:
         assert result.context.system_prompt == expected.system_prompt
+
+
+def _set_memory(registry: ProjectRegistry, project_id: str, text: str) -> None:
+    snapshot = registry.memory_snapshot(project_id)
+    registry.compare_and_swap_memory(
+        project_id, expected_digest=snapshot.digest, updates={"brief.md": text}
+    )
+
+
+def _hold_memory(registry: ProjectRegistry, project_id: str):
+    """Hold the real project memory authority (the root lock before p06)."""
+
+    if not hasattr(registry, "_project_lock"):
+        return registry._locked(write=True)
+    return registry._project_lock(project_id, "memory", exclusive=True)
+
+
+def _start_public_resume(
+    manager: SessionManager,
+    registry: ProjectRegistry,
+    project: Project,
+    session_id: str,
+    *,
+    home: Path,
+    repo_root: Path,
+) -> tuple[threading.Event, threading.Event, list[object], threading.Thread]:
+    """Run the serve/TUI writable resume sequence: open, capture, then resume."""
+
+    captured = threading.Event()
+    go = threading.Event()
+    outcome: list[object] = []
+
+    def public_resume() -> None:
+        try:
+            opened = manager.open(session_id)
+            try:
+                projection = registry.project_context_projection(project.project_id)
+                captured.set()
+                assert go.wait(10), "test did not release the resume"
+                outcome.append(
+                    resume_prompt(
+                        opened.metadata,
+                        manager=manager,
+                        store=opened.store,
+                        home=home,
+                        repo_root=repo_root,
+                        inbox_enabled=True,
+                        session_project=projection.session_project,
+                        cwd_project=projection.session_project,
+                        registry=registry,
+                        project_projection=projection,
+                    ).context.system_prompt
+                )
+            finally:
+                opened.store.close()
+        except BaseException as exc:  # noqa: BLE001 - asserted by the test
+            outcome.append(exc)
+
+    resume = threading.Thread(target=public_resume)
+    resume.start()
+    return captured, go, outcome, resume
+
+
+def _assert_resumed_with(
+    manager: SessionManager, session_id: str, outcome: list[object]
+) -> None:
+    assert len(outcome) == 1 and isinstance(outcome[0], str), outcome
+    persisted = manager.read_metadata(session_id).system_prompt
+    for prompt in (outcome[0], persisted):
+        assert "current memory" in prompt and "old memory" not in prompt, (
+            "resume adopted a stale composition after its memory input changed"
+        )
+
+
+def test_p06_7_writable_resume_reads_memory_before_shape_commit(
+    tmp_path: Path,
+) -> None:
+    home, repository, manager, registry, project, session_id = _project_session(
+        tmp_path, "default", "original memory"
+    )
+    _set_memory(registry, project.project_id, "old memory")
+    captured, go, outcome, resume = _start_public_resume(
+        manager, registry, project, session_id, home=home, repo_root=repository
+    )
+    try:
+        assert captured.wait(10), "resume did not capture project context"
+        _set_memory(registry, project.project_id, "current memory")
+        with _hold_memory(registry, project.project_id):
+            go.set()
+            persisted = manager.read_metadata(session_id, lock_timeout=10)
+            assert not outcome and "old memory" not in persisted.system_prompt, (
+                "resume persisted a stale composition before re-reading memory"
+            )
+    finally:
+        go.set()
+        resume.join(10)
+    assert not resume.is_alive()
+    _assert_resumed_with(manager, session_id, outcome)
+
+
+_MEMORY_HOLDER = """
+import sys
+import time
+from pathlib import Path
+from zeta.core.session import SessionManager
+from zeta.project_registry import ProjectRegistry
+
+home, project_id, session_id, signals = sys.argv[1:5]
+signals = Path(signals)
+manager = SessionManager(Path(home))
+registry = ProjectRegistry(Path(home) / "projects")
+held = (
+    registry._project_lock(project_id, "memory", exclusive=True)
+    if hasattr(registry, "_project_lock")
+    else registry._locked(write=True)
+)
+
+
+def wait(name):
+    deadline = time.monotonic() + 30
+    while not (signals / name).exists():
+        assert time.monotonic() < deadline, name
+        time.sleep(0.01)
+
+
+with held:
+    (signals / "held").write_text("held")
+    wait("metadata")
+    try:
+        manager.read_metadata(session_id, lock_timeout=10)
+    except Exception as exc:
+        (signals / "metadata-done").write_text(f"refused: {exc}")
+    else:
+        (signals / "metadata-done").write_text("read")
+    wait("release")
+"""
+
+
+def test_p06_8_prompt_resume_process_progress(tmp_path: Path) -> None:
+    home, repository, manager, registry, project, session_id = _project_session(
+        tmp_path, "default", "original memory"
+    )
+    _set_memory(registry, project.project_id, "old memory")
+    signals = tmp_path / "signals"
+    signals.mkdir()
+    captured, go, outcome, resume = _start_public_resume(
+        manager, registry, project, session_id, home=home, repo_root=repository
+    )
+    holder: subprocess.Popen[bytes] | None = None
+    try:
+        assert captured.wait(10), "resume did not capture project context"
+        _set_memory(registry, project.project_id, "current memory")
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _MEMORY_HOLDER,
+                str(home),
+                project.project_id,
+                session_id,
+                str(signals),
+            ]
+        )
+        _wait_for(signals / "held")
+        go.set()
+        (signals / "metadata").write_text("go")
+        _wait_for(signals / "metadata-done")
+        assert (signals / "metadata-done").read_text() == "read", (
+            "public metadata operation did not finish while memory was held"
+        )
+        assert not outcome, "resume adopted a composition without the memory authority"
+    finally:
+        go.set()
+        (signals / "release").write_text("release")
+        resume.join(10)
+        if holder is not None:
+            holder.wait(10)
+    assert not resume.is_alive()
+    assert holder.returncode == 0
+    _assert_resumed_with(manager, session_id, outcome)
