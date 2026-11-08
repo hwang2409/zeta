@@ -249,117 +249,190 @@ _PROJECT_METHODS = frozenset(
 async def _handle_rename_session(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.RENAME_SESSION, params)  # type: ignore[attr-defined]
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    return await ergonomics.mutate_session(
+        runtime,
+        "rename_session",
+        _required_string(params, "session_id"),
+        params.get("name"),
+        client.server.control.require_idle,  # type: ignore[attr-defined]
+    )
 
 
 async def _handle_delete_session(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.DELETE_SESSION, params)  # type: ignore[attr-defined]
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    return await ergonomics.mutate_session(
+        runtime,
+        "delete_session",
+        _required_string(params, "session_id"),
+        params.get("name"),
+        client.server.control.require_idle,  # type: ignore[attr-defined]
+    )
 
 
 async def _handle_session_tree(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SESSION_TREE, params)  # type: ignore[attr-defined]
+    return await client.server.connections.read_session(client, "session_tree", params)  # type: ignore[attr-defined]
 
 
 async def _handle_session_history(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SESSION_HISTORY, params)  # type: ignore[attr-defined]
+    return await client.server.connections.read_session(
+        client, "session_history", params
+    )  # type: ignore[attr-defined]
 
 
 async def _handle_content_read(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.CONTENT_READ, params)  # type: ignore[attr-defined]
+    return await client.server.connections.read_session(client, "content_read", params)  # type: ignore[attr-defined]
 
 
 async def _handle_switch_branch(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SWITCH_BRANCH, params)  # type: ignore[attr-defined]
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    store = ergonomics.active(runtime, params)
+    await client.server.control.require_idle()  # type: ignore[attr-defined]
+    ergonomics.require_mutable(runtime, client.server.control.has_pending_approvals())  # type: ignore[attr-defined]
+    head = _required_string(params, "head_id")
+    current = store.replay()
+    if not current or current[-1].id != head:
+        store.switch_to_branch(head)
+    return ergonomics.tree(runtime)
 
 
 async def _handle_fork_message(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.FORK_MESSAGE, params)  # type: ignore[attr-defined]
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    store = ergonomics.active(runtime, params)
+    await client.server.control.require_idle()  # type: ignore[attr-defined]
+    ergonomics.require_mutable(runtime, client.server.control.has_pending_approvals())  # type: ignore[attr-defined]
+    store.append_message_fork(_required_string(params, "message_id"))
+    return ergonomics.tree(runtime)
 
 
 async def _handle_model_catalog(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.MODEL_CATALOG, params)  # type: ignore[attr-defined]
+    return ergonomics.catalog(client.server.runtime)  # type: ignore[attr-defined]
 
 
 async def _handle_session_settings(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SESSION_SETTINGS, params)  # type: ignore[attr-defined]
+    return ergonomics.settings(client.server.runtime)  # type: ignore[attr-defined]
 
 
 async def _handle_set_settings(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SET_SETTINGS, params)  # type: ignore[attr-defined]
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    ergonomics.active(runtime, params)
+    await client.server.control.require_idle()  # type: ignore[attr-defined]
+    ergonomics.require_mutable(runtime, client.server.control.has_pending_approvals())  # type: ignore[attr-defined]
+    model = _required_string(params, "model")
+    mode = _required_string(params, "approval_mode")
+    model_selection.validate(model, mode)
+    await model_selection.apply_rpc(runtime, model, mode)
+    return ergonomics.settings(runtime)
 
 
 async def _handle_set_compaction(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SET_COMPACTION, params)  # type: ignore[attr-defined]
+    ergonomics.active(client.server.runtime, params)  # type: ignore[attr-defined]
+    _required_string(params, "mode")
+    raise ProtocolError(
+        ErrorDescriptor.INVALID_PARAMS,
+        "compaction mode selection was removed; eviction is always used",
+    )
 
 
 async def _handle_send_images(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SEND_IMAGES, params)  # type: ignore[attr-defined]
+    ergonomics.active(client.server.runtime, params)  # type: ignore[attr-defined]
+    return await client.server.control.deliveries.send_images(params, client.features)  # type: ignore[attr-defined]
 
 
 async def _handle_slash_list(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SLASH_LIST, params)  # type: ignore[attr-defined]
+    ergonomics.active(client.server.runtime, params)  # type: ignore[attr-defined]
+    include_unavailable = params.get("include_unavailable", False)
+    if not isinstance(include_unavailable, bool):
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            "include_unavailable must be a boolean",
+        )
+    return await slash_commands.list_commands(
+        client.server.runtime,
+        include_unavailable=include_unavailable,
+    )  # type: ignore[attr-defined]
 
 
 async def _handle_slash_run(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.SLASH_RUN, params)  # type: ignore[attr-defined]
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    ergonomics.active(runtime, params)
+    await client.server.control.require_idle()  # type: ignore[attr-defined]
+    register = client.server.control.model_input_registrar(client.features)  # type: ignore[attr-defined]
+    return await slash_commands.run_command(
+        runtime,
+        _required_string(params, "text"),
+        register_model_input=register,
+        approval_control=client.server.control,
+        run_blocking=client.server.control._run_blocking,
+    )  # type: ignore[attr-defined]
 
 
 async def _handle_account_list(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.ACCOUNT_LIST, params)  # type: ignore[attr-defined]
+    return await accounts.list_accounts(client.server.runtime)  # type: ignore[attr-defined]
 
 
 async def _handle_account_logout(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.ACCOUNT_LOGOUT, params)  # type: ignore[attr-defined]
+    return await accounts.request(
+        "account_logout",
+        client.server.runtime,
+        client.server.control.require_idle,
+        params,
+    )  # type: ignore[attr-defined]
 
 
 async def _handle_account_refresh(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.ACCOUNT_REFRESH, params)  # type: ignore[attr-defined]
+    return await accounts.request(
+        "account_refresh",
+        client.server.runtime,
+        client.server.control.require_idle,
+        params,
+    )  # type: ignore[attr-defined]
 
 
 async def _handle_account_switch(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
-    return await client._ergonomics(MethodDescriptor.ACCOUNT_SWITCH, params)  # type: ignore[attr-defined]
-
-
-async def _handle_list_projects(
-    client: object, request_id: str | int, params: dict[str, Any]
-) -> object:
-    return await _handle_project(
-        client, request_id, params, MethodDescriptor.LIST_PROJECTS
-    )
+    return await accounts.run_owned_switch(
+        client,
+        accounts.request(
+            "account_switch",
+            client.server.runtime,
+            client.server.control.require_idle,
+            params,
+        ),
+    )  # type: ignore[attr-defined]
 
 
 async def _handle_project(
@@ -444,18 +517,10 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.LOGIN_PROVIDERS: _handle_login_providers,
     MethodDescriptor.PING: _handle_ping,
     MethodDescriptor.SET_TURN_CONTEXT: _handle_turn_context,
-    MethodDescriptor.LIST_PROJECTS: lambda c, i, p: _handle_project(
-        c, i, p, MethodDescriptor.LIST_PROJECTS
-    ),
-    MethodDescriptor.PROJECT_SHOW: lambda c, i, p: _handle_project(
-        c, i, p, MethodDescriptor.PROJECT_SHOW
-    ),
-    MethodDescriptor.PROJECT_MEMORY_LOG: lambda c, i, p: _handle_project(
-        c, i, p, MethodDescriptor.PROJECT_MEMORY_LOG
-    ),
-    MethodDescriptor.PROJECT_INBOX: lambda c, i, p: _handle_project(
-        c, i, p, MethodDescriptor.PROJECT_INBOX
-    ),
+    MethodDescriptor.LIST_PROJECTS: _handle_list_projects,
+    MethodDescriptor.PROJECT_SHOW: _handle_project_show,
+    MethodDescriptor.PROJECT_MEMORY_LOG: _handle_project_memory_log,
+    MethodDescriptor.PROJECT_INBOX: _handle_project_inbox,
     MethodDescriptor.CLEAR_STEERING: _handle_clear_steering,
     MethodDescriptor.DELIVERY_STATUS: _handle_delivery_status,
     MethodDescriptor.SESSION_GRANTS: _handle_session_grants,
@@ -966,7 +1031,6 @@ class _Client:
             raise self._descriptor_protocol_error(descriptor)
         if descriptor.feature is not None and descriptor.feature not in self.features:
             raise self._descriptor_feature_error(descriptor)
-        self._method = descriptor
         return await HANDLERS[descriptor](self, request_id, params)
 
     def _descriptor_protocol_error(self, descriptor: MethodDescriptor) -> ProtocolError:
@@ -1167,93 +1231,6 @@ class _Client:
                 ErrorDescriptor.INVALID_PARAMS,
                 f"{param} requires the negotiated {feature} feature",
             )
-
-    async def _ergonomics(
-        self, descriptor: MethodDescriptor, params: dict[str, Any]
-    ) -> object:
-        if isinstance(descriptor, str):
-            descriptor = MethodDescriptor.for_wire(descriptor)
-            if descriptor is None:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND, "method not found"
-                )
-        runtime = self.server.runtime
-        method = descriptor.wire
-        if descriptor in {
-            MethodDescriptor.RENAME_SESSION,
-            MethodDescriptor.DELETE_SESSION,
-        }:
-            return await ergonomics.mutate_session(
-                runtime,
-                method,
-                _required_string(params, "session_id"),
-                params.get("name"),
-                self.server.control.require_idle,
-            )
-        if descriptor in {
-            MethodDescriptor.SESSION_TREE,
-            MethodDescriptor.SESSION_HISTORY,
-        }:
-            assert self.server.connections is not None
-            return await self.server.connections.read_session(self, method, params)
-        if descriptor is MethodDescriptor.CONTENT_READ:
-            if "content_read" not in self.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "content_read requires the negotiated content_read feature",
-                )
-            assert self.server.connections is not None
-            return await self.server.connections.read_session(self, method, params)
-        if descriptor is MethodDescriptor.MODEL_CATALOG:
-            return ergonomics.catalog(runtime)
-        store = ergonomics.active(runtime, params)
-        if descriptor is MethodDescriptor.SEND_IMAGES:
-            return await self.server.control.deliveries.send_images(
-                params, self.features
-            )
-        if descriptor is MethodDescriptor.SESSION_SETTINGS:
-            return ergonomics.settings(runtime)
-        if descriptor in {
-            MethodDescriptor.ACCOUNT_LIST,
-            MethodDescriptor.ACCOUNT_LOGOUT,
-            MethodDescriptor.ACCOUNT_REFRESH,
-            MethodDescriptor.ACCOUNT_SWITCH,
-            MethodDescriptor.SLASH_LIST,
-        }:
-            return await slash_commands.read_request(
-                method, runtime, self.server.control.require_idle, params, self
-            )
-        await self.server.control.require_idle()
-        if descriptor is MethodDescriptor.SLASH_RUN:
-            register = self.server.control.model_input_registrar(self.features)
-            return await slash_commands.run_command(
-                runtime,
-                _required_string(params, "text"),
-                register_model_input=register,
-                approval_control=self.server.control,
-                run_blocking=self.server.control._run_blocking,
-            )
-        ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
-        if descriptor is MethodDescriptor.SET_SETTINGS:
-            model = _required_string(params, "model")
-            mode = _required_string(params, "approval_mode")
-            model_selection.validate(model, mode)
-            await model_selection.apply_rpc(runtime, model, mode)
-            return ergonomics.settings(runtime)
-        if descriptor is MethodDescriptor.SET_COMPACTION:
-            _required_string(params, "mode")
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS,
-                "compaction mode selection was removed; eviction is always used",
-            )
-        if descriptor is MethodDescriptor.FORK_MESSAGE:
-            store.append_message_fork(_required_string(params, "message_id"))
-        elif descriptor is MethodDescriptor.SWITCH_BRANCH:
-            head = _required_string(params, "head_id")
-            current = store.replay()
-            if not current or current[-1].id != head:
-                store.switch_to_branch(head)
-        return ergonomics.tree(runtime)
 
     def _session_snapshot(self) -> dict[str, object] | None:
         runtime = self.server.runtime

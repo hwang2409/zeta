@@ -1412,10 +1412,12 @@ async def test_slash_and_ergonomics_read_serve_control_not_store(
         )
         session = ServerSlashSession(server.runtime)
         session._approval_control = server.control
+        server._client.protocol_version = "1.1"
         status = session.slash_status()
         assert status.pending_approvals == ("call-1 (read)",)
         with pytest.raises(ProtocolError) as error:
-            await server._client._ergonomics(
+            await server._client._dispatch(
+                "set-settings",
                 "set_settings",
                 {
                     "session_id": server.runtime.session_id,
