@@ -17,7 +17,6 @@ from .context_parts.tool_results import truncate_tool_results
 from .context_usage import SessionUsage
 from ..context_accounting import (
     MessageTokenCounts,
-    context_digest as _digest,
     cooperative_call as _cooperative_call,
     message_token_count as _message_token_count,
 )
@@ -1077,7 +1076,6 @@ class ContextAssembler(ContextMarkerMixin):
         return AssembledContext(
             messages=messages,
             token_count=self._count(messages),
-            digest=_digest(messages),
             compacted=compacted,
         )
 

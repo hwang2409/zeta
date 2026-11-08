@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 import pytest
 
 import zeta.core.context as context_module
+import zeta.core.context_parts.types as context_types
 from zeta.core.context import (
     AssembledContext,
     BudgetExceeded,
@@ -138,34 +139,40 @@ def test_needs_compaction_uses_resident_branch_without_replay(
 
 
 @pytest.mark.asyncio
-async def test_context_count_and_digest_run_off_event_loop(
+async def test_context_digest_is_lazy_and_cached(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    loop_thread = threading.get_ident()
     count_threads: set[int] = set()
-    digest_threads: set[int] = set()
-    real_digest = context_module._digest
+    digest_calls = 0
+    real_digest = context_types.context_digest
 
     def token_count(_message: Message) -> int:
         count_threads.add(threading.get_ident())
         return 1
 
     def observed_digest(messages: list[Message]) -> str:
-        digest_threads.add(threading.get_ident())
+        nonlocal digest_calls
+        digest_calls += 1
         return real_digest(messages)
 
     store = ConversationStore(tmp_path)
     for index in range(100):
         store.append_message(text(MessageRole.USER, f"message {index} " * 1_000))
     assembler = ContextAssembler(store, token_budget=10_000, token_counter=token_count)
-    monkeypatch.setattr(context_module, "_digest", observed_digest)
+    monkeypatch.setattr(context_types, "context_digest", observed_digest)
 
-    await assembler.assemble_context()
+    assembled = await assembler.assemble_context()
 
-    assert count_threads
-    assert digest_threads
-    assert loop_thread not in count_threads
-    assert loop_thread not in digest_threads
+    assert digest_calls == 0
+    assert assembled.token_count == 100
+    provider_messages = [message.to_dict() for message in assembled.messages]
+
+    expected_digest = real_digest(assembled.messages)
+    assert assembled.digest == expected_digest
+    assert digest_calls == 1
+    assert assembler.digest == expected_digest
+    assert digest_calls == 1
+    assert [message.to_dict() for message in assembled.messages] == provider_messages
 
 
 @pytest.mark.asyncio
