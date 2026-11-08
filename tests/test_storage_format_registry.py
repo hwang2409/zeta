@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -33,9 +35,11 @@ from zeta.core.store._validation import (
 )
 from zeta.core.store.prompt_composition import parse_prompt_recipe
 from zeta.core.todo import parse_todo_items
+from zeta.memory import entry_store
 from zeta.memory.entry_history import EntryMemoryHistoryMixin
 from zeta.memory.entry_store import _exact_dict
 from zeta.memory.entry_sync import parse_resolution_candidates
+from zeta.project_errors import ProjectRegistryError
 from zeta.project_memory_history import ProjectMemoryHistoryMixin
 from zeta.project_registry import ProjectRegistry
 from zeta.project_schema import validate_project_record
@@ -162,6 +166,81 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
 
     def exact(label: str, fields: set[str]) -> Validator:
         return lambda payload: _exact_dict(payload, fields, label)
+
+    legacy_entry_fields = frozenset(
+        {
+            "status",
+            "supersedes",
+            "accepted_by",
+            "project_id",
+            "valid_from",
+            "created_at",
+            "superseded_by",
+            "representation",
+            "id",
+            "kind",
+            "text",
+            "section",
+            "sources",
+            "migration_order",
+            "accepted_at",
+            "seen_at",
+            "valid_until",
+            "last_operation_id",
+            "expires_at",
+            "migration_source",
+            "automatic",
+            "updated_at",
+        }
+    )
+
+    def persisted_legacy_entry(payload: dict[str, object]) -> object:
+        callers: list[str] = []
+        reject_unknown_keys = entry_store.reject_unknown_keys
+
+        def track_reject_unknown_keys(value: object, name: str) -> None:
+            if name == "memory_entry":
+                callers.append(inspect.currentframe().f_back.f_code.co_name)
+            reject_unknown_keys(value, name)
+
+        state = {
+            "format": 2,
+            "project_id": "p_" + "a" * 32,
+            "generation": 0,
+            "schema": {
+                "version": 1,
+                "profile": "zeta",
+                "kinds": [
+                    {
+                        "key": "state",
+                        "name": "State",
+                        "description": "State",
+                        "prompt_mode": "always",
+                        "prompt_priority": 1,
+                        "prompt_max_entries": 1,
+                        "default_expiry_days": None,
+                    }
+                ],
+            },
+            "entries": {"m_" + "a" * 32: payload},
+            "compacted_through_version": None,
+        }
+        try:
+            with mock.patch.object(
+                entry_store, "reject_unknown_keys", track_reject_unknown_keys
+            ):
+                return entry_store.state_from_bytes(json.dumps(state).encode())
+        except Exception as exc:
+            if "_registry_probe_extra" in payload:
+                assert callers == ["state_from_bytes"], (
+                    "legacy memory entry extra key bypassed the direct registry check"
+                )
+            missing_fields = legacy_entry_fields - payload.keys()
+            if missing_fields:
+                assert isinstance(exc, ProjectRegistryError) and str(exc) == (
+                    "invalid memory entry"
+                ), f"legacy memory entry missing {sorted(missing_fields)} bypassed the shape check"
+            raise
 
     def fact_root(payload: dict[str, object]) -> object:
         return validate_fact_floor(payload)
@@ -831,6 +910,35 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
                     "updated_at",
                 }
             ),
+        ),
+        ShapeCase(
+            "memory_entry",
+            persisted_legacy_entry,
+            {
+                "id": "m_" + "a" * 32,
+                "project_id": "p_" + "a" * 32,
+                "kind": "state",
+                "text": "State",
+                "representation": "entry",
+                "status": "active",
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "seen_at": timestamp,
+                "expires_at": None,
+                "valid_from": timestamp,
+                "valid_until": None,
+                "supersedes": [],
+                "superseded_by": [],
+                "sources": [],
+                "automatic": False,
+                "accepted_at": None,
+                "accepted_by": None,
+                "last_operation_id": "op_" + "b" * 32,
+                "section": None,
+                "migration_order": None,
+                "migration_source": None,
+            },
+            legacy_entry_fields,
         ),
         ShapeCase(
             "memory_missing_entry",
