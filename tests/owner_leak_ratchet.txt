@@ -76,6 +76,7 @@ tests/test_agent.py::test_abort_during_next_request_preparation_skips_provider_d
 tests/test_agent.py::test_abort_propagates_through_two_nested_levels::ConversationStore=4
 tests/test_agent.py::test_aborted_notification_wake_commits_durable_notifications::ConversationStore=2
 tests/test_agent.py::test_accepted_delivery_publishes_exact_staged_ids_before_acknowledgement::ConversationStore=2
+tests/test_agent.py::test_account_lock_exhaustion_keeps_child_alive_for_follow_up::ConversationStore=2
 tests/test_agent.py::test_agent_cancel_mixed_child_and_task_terminal_result::ConversationStore=2
 tests/test_agent.py::test_agent_cancel_reports_failed_confirmation_and_allows_retry::ConversationStore=1
 tests/test_agent.py::test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_success::ConversationStore=1
@@ -345,6 +346,7 @@ tests/test_agent.py::test_nested_child_usage_propagates_to_root_once::Conversati
 tests/test_agent.py::test_nested_child_usage_propagates_to_root_once::ToolRegistry=3
 tests/test_agent.py::test_nested_explicit_finisher_does_not_see_lead_sibling_as_owned_work::ConversationStore=2
 tests/test_agent.py::test_nested_profile_resolves_tools_hidden_by_parent_profile::ConversationStore=2
+tests/test_agent.py::test_non_account_error_still_terminates_child::ConversationStore=2
 tests/test_agent.py::test_nonexistent_target_under_symlinked_ancestor_canonicalized::ConversationStore=2
 tests/test_agent.py::test_notification_batch_reaches_provider_context::ConversationStore=2
 tests/test_agent.py::test_notification_batch_uses_whole_request_budget[1000000]::ConversationStore=2
@@ -1784,6 +1786,10 @@ tests/test_loop.py::test_abort_during_backoff_keeps_ui_and_store_consistent::Age
 tests/test_loop.py::test_abort_during_backoff_keeps_ui_and_store_consistent::BackgroundTaskRegistry=1
 tests/test_loop.py::test_abort_during_backoff_keeps_ui_and_store_consistent::ConversationStore=2
 tests/test_loop.py::test_abort_during_backoff_keeps_ui_and_store_consistent::ToolRegistry=1
+tests/test_loop.py::test_account_lock_exhaustion_is_recoverable_on_next_turn::AgentLoop=1
+tests/test_loop.py::test_account_lock_exhaustion_is_recoverable_on_next_turn::BackgroundTaskRegistry=1
+tests/test_loop.py::test_account_lock_exhaustion_is_recoverable_on_next_turn::ConversationStore=2
+tests/test_loop.py::test_account_lock_exhaustion_is_recoverable_on_next_turn::ToolRegistry=1
 tests/test_loop.py::test_aclose_after_message_end_persists_complete_state::AgentLoop=1
 tests/test_loop.py::test_aclose_after_message_end_persists_complete_state::BackgroundTaskRegistry=1
 tests/test_loop.py::test_aclose_after_message_end_persists_complete_state::ConversationStore=2
@@ -1882,6 +1888,10 @@ tests/test_loop.py::test_failed_child_returns_error_and_sibling_survives::AgentL
 tests/test_loop.py::test_failed_child_returns_error_and_sibling_survives::BackgroundTaskRegistry=1
 tests/test_loop.py::test_failed_child_returns_error_and_sibling_survives::ConversationStore=3
 tests/test_loop.py::test_failed_child_returns_error_and_sibling_survives::ToolRegistry=1
+tests/test_loop.py::test_failure_after_dispatched_tool_call_retries_without_reexecuting::AgentLoop=1
+tests/test_loop.py::test_failure_after_dispatched_tool_call_retries_without_reexecuting::BackgroundTaskRegistry=1
+tests/test_loop.py::test_failure_after_dispatched_tool_call_retries_without_reexecuting::ConversationStore=2
+tests/test_loop.py::test_failure_after_dispatched_tool_call_retries_without_reexecuting::ToolRegistry=1
 tests/test_loop.py::test_fake_usage_reports_cache_reads_on_consecutive_turns::AgentLoop=1
 tests/test_loop.py::test_fake_usage_reports_cache_reads_on_consecutive_turns::BackgroundTaskRegistry=1
 tests/test_loop.py::test_fake_usage_reports_cache_reads_on_consecutive_turns::ConversationStore=2

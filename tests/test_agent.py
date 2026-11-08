@@ -8071,10 +8071,13 @@ async def test_typed_child_type_survives_cancellation_and_reopen(
     child_started = asyncio.Event()
 
     class StartedBackend(FakeBackend):
+        @owned_completion
         async def complete(
             self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
         ) -> AsyncIterator[StreamEvent]:
-            async for event in super().complete(messages, tool_schemas):
+            async for event in FakeBackend.complete.__wrapped__(
+                self, messages, tool_schemas
+            ):
                 if (
                     len(self.calls) == 2
                     and event.type is StreamEventType.MESSAGE_UPDATE
