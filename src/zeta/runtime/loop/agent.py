@@ -120,8 +120,6 @@ from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
 TaskResult = TypeVar("TaskResult")
-
-
 @dataclass(frozen=True, slots=True)
 class _ToollessTransition:
     continue_turn: bool
@@ -129,8 +127,6 @@ class _ToollessTransition:
     nudge_turn_pending: bool
     recovery_state: EmptyTurnRecoveryState
     error: ErrorInfo | None = None
-
-
 class AgentLoop(
     BackendOwnerMixin,
     TurnPersistenceMixin,
@@ -372,10 +368,8 @@ class AgentLoop(
             self.step_delivery.capacity_changed()
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
-
     def admit_abort(self) -> None:
         self._abort_admitted = True
-
     def abort(
         self,
         *,
@@ -388,7 +382,6 @@ class AgentLoop(
             self._background_owner.cancel_all()
             if steering_drop_reason is not None:
                 self.store.drop_client_steering(steering_drop_reason)
-
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
         The running ``_run_turn`` drains this queue before the next provider
@@ -396,17 +389,14 @@ class AgentLoop(
         tool_result. Callers must pass a durable USER-role message.
         """
         self.store.queue_client_steering(message)
-
     @property
     def has_pending_steering(self) -> bool:
         return self.store.has_pending_client_steering
-
     def clear_pending_steering(
         self,
         reason: Literal["clear", "turn_end"] = "clear",
     ) -> int:
         return self.store.drop_client_steering(reason)
-
     def drop_pending_steering(
         self,
         reason: Literal["abort", "disconnect", "turn_end", "failed"],
@@ -1253,10 +1243,7 @@ class AgentLoop(
             )
         yield StreamEvent(
             StreamEventType.ERROR,
-            error=ErrorInfo(
-                "max_turns",
-                f"maximum turns reached: {max_completions if max_completions is not None else self.max_turns}",
-            ),
+            error=ErrorInfo("max_turns", f"maximum turns reached: {max_completions or self.max_turns}"),
         )
         if self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")

@@ -488,7 +488,7 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
-            parent_owned_wake_eligible=explicit_finish,
+            parent_owned_wake_eligible=True,
         )
 
         def prepare_child_project_context(
