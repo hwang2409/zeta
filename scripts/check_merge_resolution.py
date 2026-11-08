@@ -403,7 +403,7 @@ def _pr_line_items(
         if _main_overlaps(start, end, main_blocks):
             continue
         key = item_key(item)
-        required = max(0, max(counts[1][key], counts[2][key]) - counts[0][key])
+        required = max(0, counts[1][key] + counts[2][key] - counts[0][key])
         lost = min(additions[key], max(0, required - counts[3][key]))
         if lost and sum(item_key(candidate) == key for candidate in result) < lost:
             result.append(item)
@@ -1083,6 +1083,34 @@ def _render_finding(
     )
 
 
+def _base_view(main: str, branch: str) -> str:
+    bases = git("merge-base", "--all", main, branch).splitlines()
+    base = bases[0]
+    for index, other in enumerate(bases[1:], 1):
+        result = subprocess.run(
+            ["git", "merge-tree", "--write-tree", base, other],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode not in {0, 1}:
+            raise subprocess.CalledProcessError(
+                result.returncode, result.args, result.stdout, result.stderr
+            )
+        tree = result.stdout.splitlines()[0]
+        base = (
+            git(
+                "-c", "user.name=zeta merge checker",
+                "-c", "user.email=zeta@example.invalid",
+                "commit-tree", tree, "-p", base, "-p", other,
+                input="virtual merge base\n",
+            ).strip()
+            if index < len(bases) - 1
+            else tree
+        )
+    return base
+
+
 def _merge_paths(base: str, main: str, branch: str, commit: str) -> tuple[set[str], set[str]]:
     changed = set(git("diff", "--name-only", base, main).splitlines())
     all_paths = {
@@ -1111,7 +1139,7 @@ def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: 
 
 
 def _parse_merge_data(commit: str, main: str, branch: str, args):
-    base = git("merge-base", main, branch).strip()
+    base = _base_view(main, branch)
     text = "\n".join(
         [git("log", "-1", "--format=%B", commit)]
         + ([args.allow.read()] if args.allow else [])

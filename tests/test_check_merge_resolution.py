@@ -1015,14 +1015,14 @@ def test_pr_line_final_multiset_and_insertion_table(tmp_path: Path) -> None:
             "clean merge",
         ),
         (
-            "pr already on main through train",
+            "independent identical lines lose branch copy",
             "def check():\n    anchor()\n    tail()\n",
-            "def check():\n    anchor()\n    emit()\n    tail()\n",
-            "def check():\n    anchor()\n    tail()\n    emit()\n",
-            "def check():\n    anchor()\n    tail()\n    emit()\n",
-            "def check():\n    anchor()\n    tail()\n    emit()\n",
-            0,
-            "clean merge",
+            "def check():\n    anchor()\n    return None\n    tail()\n",
+            "def check():\n    anchor()\n    tail()\n    return None\n",
+            "def check():\n    anchor()\n    tail()\n    return None\n",
+            "def check():\n    anchor()\n    tail()\n    return None\n",
+            1,
+            "return None",
         ),
         (
             "restored by final with marker",
@@ -1041,7 +1041,7 @@ def test_pr_line_final_multiset_and_insertion_table(tmp_path: Path) -> None:
         merge, final_revision = _public_line_case(r, base, branch, main, merge_text, final)
         checker_args = (
             (r, merge)
-            if name == "pr already on main through train"
+            if name == "independent identical lines lose branch copy"
             else (r, merge, "--final", final_revision)
         )
         result = run(*checker_args)
@@ -1095,22 +1095,69 @@ def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> N
 
 
 
-def test_train_merge_does_not_duplicate_pr_lines_already_on_main(tmp_path: Path) -> None:
-    r = repo(tmp_path)
+def _criss_cross_line_case(r: Path, *, lose_branch_line: bool) -> tuple[str, list[str]]:
+    repo(r)
     (r / "src").mkdir()
-    (r / "src/a.py").write_text("def check():\n    anchor()\n")
+    base_text = "def check():\n    anchor()\n"
+    (r / "src/a.py").write_text(base_text)
     commit(r, "base")
-    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
-    (r / "src/a.py").write_text("def check():\n    anchor()\n    emit()\n")
-    commit(r, "pr")
-    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
-    (r / "src/a.py").write_text("def check():\n    main_change()\n    anchor()\n    emit()\n")
-    commit(r, "main includes pr")
-    _set_origin_main(r)
-    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
-    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "main"], cwd=r, check=True)
-    commit(r, "train merges main")
-    assert run(r).returncode == 0
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    subprocess.run(["git", "checkout", "-qb", "left"], cwd=r, check=True)
+    (r / "src/a.py").write_text(base_text + "    shared_pr_line()\n")
+    commit(r, "shared pr")
+    left_tip = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    subprocess.run(["git", "checkout", "-qb", "right", base], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    main_line()\n    anchor()\n")
+    commit(r, "main change")
+    right_tip = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    subprocess.run(["git", "checkout", "-q", "left"], cwd=r, check=True)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", right_tip], cwd=r, check=True)
+    commit(r, "train includes main")
+    if lose_branch_line:
+        with (r / "src/a.py").open("a") as handle:
+            handle.write("    branch_only()\n")
+        commit(r, "branch line after shared bases")
+    left_parent = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    subprocess.run(["git", "checkout", "-q", "right"], cwd=r, check=True)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", left_tip], cwd=r, check=True)
+    commit(r, "main includes shared pr")
+    right_parent = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", right_parent], cwd=r, check=True)
+    subprocess.run(["git", "checkout", "-q", "right"], cwd=r, check=True)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", left_parent], cwd=r, check=True)
+    if lose_branch_line:
+        (r / "src/a.py").write_text(
+            "def check():\n    main_line()\n    anchor()\n    shared_pr_line()\n"
+        )
+    commit(r, "train result")
+    merge = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    bases = subprocess.check_output(
+        ["git", "merge-base", "--all", left_parent, right_parent], cwd=r, text=True
+    ).splitlines()
+    return merge, bases
+
+
+@pytest.mark.parametrize(
+    ("lose_branch_line", "expected", "needle"),
+    [(False, 0, "clean merge"), (True, 1, "branch_only()")],
+)
+def test_criss_cross_base_view_is_used_by_public_cli(
+    tmp_path: Path, lose_branch_line: bool, expected: int, needle: str
+) -> None:
+    r = tmp_path / str(lose_branch_line)
+    r.mkdir()
+    merge, bases = _criss_cross_line_case(r, lose_branch_line=lose_branch_line)
+    assert len(bases) == 2
+    base_sources = [
+        subprocess.check_output(
+            ["git", "show", f"{base}:src/a.py"], cwd=r, text=True
+        )
+        for base in bases
+    ]
+    assert sum("shared_pr_line" in text for text in base_sources) == 1
+    result = run(r, merge)
+    assert result.returncode == expected
+    assert needle in result.stdout
 
 
 def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
