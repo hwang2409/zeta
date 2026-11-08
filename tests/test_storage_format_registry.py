@@ -35,6 +35,10 @@ from zeta.core.store._validation import (
 )
 from zeta.core.store.prompt_composition import parse_prompt_recipe
 from zeta.core.todo import parse_todo_items
+from zeta.core.transcript_recovery import (
+    parse_evidence_manifest,
+    parse_recovery_record,
+)
 from zeta.memory import entry_store
 from zeta.memory.entry_history import EntryMemoryHistoryMixin
 from zeta.memory.entry_store import _exact_dict
@@ -393,6 +397,37 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
         "repo_agents": "include",
         "lanes": [],
     }
+    recovery_target = {"root_session_id": "session", "child_run_id": None}
+    recovery_evidence = {
+        "schema": "zeta.transcript-quarantine.v1",
+        "quarantine_id": "a" * 32,
+        "target": recovery_target,
+        "source_digest": digest,
+        "source_size": 1,
+        "first_bad_row": 2,
+        "first_bad_offset": 1,
+        "valid_prefix_end": 1,
+        "retained_last_sequence": 1,
+        "repaired_digest": digest,
+        "diagnosed_at": timestamp,
+        "payload_digest": digest,
+        "payload_size": 1,
+    }
+    recovery_state = {
+        "schema": "zeta.transcript-recovery.v1",
+        "quarantine_id": "a" * 32,
+        "target": recovery_target,
+        "state": "committed",
+        "expected_source_digest": digest,
+        "repaired_digest": digest,
+        "cutoff_sequence": 1,
+        "diagnosis_timestamp": timestamp,
+        "memory_step": "not_required",
+    }
+
+    def recovery_target_parser(payload: dict[str, object]) -> object:
+        return parse_evidence_manifest({**recovery_evidence, "target": payload})
+
     attention = {
         "id": "a" * 32,
         "created_at": timestamp,
@@ -1136,6 +1171,24 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
             attention_fork,
             {"forked_from_session": "s", "forked_at_entry": "e", "attention_id": "a"},
             frozenset({"forked_from_session", "forked_at_entry", "attention_id"}),
+        ),
+        ShapeCase(
+            "transcript_recovery.evidence",
+            parse_evidence_manifest,
+            recovery_evidence,
+            frozenset(recovery_evidence),
+        ),
+        ShapeCase(
+            "transcript_recovery.state",
+            parse_recovery_record,
+            recovery_state,
+            frozenset(recovery_state),
+        ),
+        ShapeCase(
+            "transcript_recovery.target",
+            recovery_target_parser,
+            recovery_target,
+            frozenset(recovery_target),
         ),
     ]
 
