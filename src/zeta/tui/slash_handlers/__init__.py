@@ -23,6 +23,7 @@ from ...accounts import (
 from ...accounts.login import login_failure_message, login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
+from ...core.commands.plan_commands import run_implement_command, run_plan_command
 from ...core.project_context import project_command_view
 from ...core.session import (
     SessionError,
@@ -37,7 +38,7 @@ from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
-from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType
+from ...protocol.types import StreamEvent, StreamEventType
 from ...providers.factory import build_backend
 from ...runtime.status import build_slash_status, capture_slash_status
 from ...tools._shared.user_discovery import trust_project_tools
@@ -182,6 +183,7 @@ class SlashHandlerMixin:
             {item.account: item.detail for item in displays if item.detail},
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
+            {item.account for item in displays if not item.available},
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
@@ -555,74 +557,33 @@ class SlashHandlerMixin:
             return f"model: {self.model} ({'; '.join(notes)})"
         return f"model: {self.model}"
 
-    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
-        """Toggle plan mode or submit a prompt while entering it."""
+    @property
+    def plan_mode(self) -> bool:
+        override = getattr(self, "_slash_plan_mode", None)
+        if override is not None:
+            return override
+        return self.loop.plan_mode
 
-        requested = args.strip()
-        normalized = requested.lower()
-        if not requested:
-            return await self._set_plan_mode_from_command(not self.loop.plan_mode)
-        if normalized == "off":
-            return await self._set_plan_mode_from_command(False)
-        if normalized == "on":
-            return await self._set_plan_mode_from_command(True)
-        if normalized == "toggle":
-            return await self._set_plan_mode_from_command(not self.loop.plan_mode)
-        if self.active or self.pending_approvals:
-            return (
-                "plan mode unchanged: cannot change plan mode while a turn or "
-                "approval is active"
-            )
-        if not self.loop.plan_mode:
-            blocked = self._plan_mode_background_blocker()
-            if blocked is not None:
-                return blocked
-        if not self.loop.plan_mode:
-            await self._change_plan_mode(True)
-            self._invalidate_prompt()
-        return ModelInputEnvelope(
-            requested,
-            f"/plan {requested}",
-            MessageOrigin.SLASH_EXPANSION,
-        )
+    @plan_mode.setter
+    def plan_mode(self, enabled: bool) -> None:
+        self._slash_plan_mode = enabled
+
+    def set_plan_mode(self, enabled: bool):
+        if self.loop is self:
+            return super().set_plan_mode(enabled)
+        return self.loop.set_plan_mode(enabled)
+
+    def invalidate_prompt(self) -> None:
+        self._invalidate_prompt()
+
+    def plan_mode_background_blocker(self) -> str | None:
+        return self._plan_mode_background_blocker()
+
+    async def slash_plan(self, args: str) -> str | ModelInputEnvelope:
+        return await run_plan_command(self, args)
 
     async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
-        """Exit plan mode and submit the explicit implementation request."""
-
-        if args:
-            return "implement unchanged: /implement does not accept arguments"
-        if not self.loop.plan_mode:
-            return "implement unavailable: plan mode is off"
-        if self.active or self.pending_approvals:
-            return (
-                "implement unavailable: cannot leave plan mode while a turn or "
-                "approval is active"
-            )
-        await self._change_plan_mode(False)
-        self._invalidate_prompt()
-        return ModelInputEnvelope(
-            "implement the plan you proposed above",
-            "/implement",
-            MessageOrigin.SLASH_EXPANSION,
-        )
-
-    async def _set_plan_mode_from_command(self, enabled: bool) -> str:
-        if enabled == self.loop.plan_mode:
-            return f"plan mode: {'on' if enabled else 'off'}"
-        if self.active or self.pending_approvals:
-            return (
-                "plan mode unchanged: cannot change plan mode while a turn or "
-                "approval is active"
-            )
-        if enabled:
-            blocked = self._plan_mode_background_blocker()
-            if blocked is not None:
-                return blocked
-        await self._change_plan_mode(enabled)
-        self._invalidate_prompt()
-        if enabled:
-            return "plan mode: on (read-only tools; deliver the plan as your answer)"
-        return "plan mode: off"
+        return await run_implement_command(self, args)
 
     def _plan_mode_background_blocker(self) -> str | None:
         work = tuple(getattr(self.loop, "background_work_descriptions", ()))
@@ -632,11 +593,6 @@ class SlashHandlerMixin:
             "plan mode unchanged: background work is active: "
             f"{', '.join(work)}; stop it or wait"
         )
-
-    async def _change_plan_mode(self, enabled: bool) -> None:
-        persisted = self.loop.set_plan_mode(enabled)
-        if persisted is not None:
-            await persisted
 
     def toggle_plan_mode(self) -> None:
         """Toggle plan mode from the keyboard, reporting the same notice."""
