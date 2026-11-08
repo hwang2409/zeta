@@ -64,13 +64,6 @@ class DeliveredMessage:
 
 
 @dataclass(frozen=True, slots=True)
-class DroppedSteer:
-    """The ``client_delivery`` row that dropped a queued steer."""
-
-    delivery_id: str
-
-
-@dataclass(frozen=True, slots=True)
 class AssistantResponseAfter:
     """The first completed or aborted assistant reply after ``seq``."""
 
@@ -90,7 +83,6 @@ type RecentRowKey = (
     | ApprovalResolution
     | ApprovalHistory
     | DeliveredMessage
-    | DroppedSteer
     | AssistantResponseAfter
     | UserTurnMessageAfter
 )
@@ -119,11 +111,6 @@ def _predicate(key: RecentRowKey) -> tuple[str, Callable[[dict[str, Any]], bool]
         case DeliveredMessage(delivery_id):
             return "message", lambda data: (
                 _metadata(data["message"]).get(CLIENT_DELIVERY_METADATA) == delivery_id
-            )
-        case DroppedSteer(delivery_id):
-            return "client_delivery", lambda data: (
-                data.get("delivery_id") == delivery_id
-                and data.get("status") == "dropped"
             )
         case AssistantResponseAfter():
             return "message", _is_assistant_response
@@ -173,12 +160,10 @@ class RecentRowsMixin:
             if key.seq + 1 < floor:
                 return None
             # seq == index + 1, so index key.seq is the first row after key.seq.
-            for index in range(max(key.seq, 0), len(entries)):
-                entry = entries[index]
-                if entry.type == row_type and test(entry.data):
-                    return entry.seq
-            return None
-        for index in range(len(entries) - 1, floor - 2, -1):
+            indexes = range(max(key.seq, 0), len(entries))
+        else:
+            indexes = range(len(entries) - 1, floor - 2, -1)
+        for index in indexes:
             entry = entries[index]
             if entry.type == row_type and test(entry.data):
                 return entry.seq
@@ -192,6 +177,11 @@ class RecentRowsMixin:
         return self._entries[seq - 1].id
 
     def reset_generation(self: ConversationStore) -> int:
-        """Count installs that replaced resident rows instead of extending them."""
+        """Count installs that replaced resident rows instead of extending them.
+
+        The count can over-count: an async commit that installs after a pure
+        external append also counts. Treat a change as "rows may be renumbered,
+        rebuild", never as proof; use ``row_id_at`` for an exact check.
+        """
         self._assert_owner_thread()
         return self._reset_generation
