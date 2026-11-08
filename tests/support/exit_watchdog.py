@@ -19,18 +19,14 @@ def pytest_sessionfinish() -> None:
         os.environ.get("ZETA_TEST_EXIT_WATCHDOG_SECONDS", EXIT_WATCHDOG_SECONDS)
     )
     faulthandler.dump_traceback_later(seconds, exit=True, file=sys.__stderr__)
-
-
-@pytest.hookimpl(trylast=True)
-def pytest_sessionfinish() -> None:  # noqa: F811 - DIAG ONLY
-    import threading
+    import threading  # DIAG ONLY
 
     worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
     for thread in threading.enumerate():
-        target = getattr(thread, "_target", None)
         print(
             f"DIAG live-thread worker={worker} name={thread.name} "
-            f"daemon={thread.daemon} target={target!r}",
+            f"daemon={thread.daemon} target={getattr(thread, '_target', None)!r}",
             file=sys.__stderr__,
             flush=True,
         )
+
