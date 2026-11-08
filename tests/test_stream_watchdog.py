@@ -40,7 +40,11 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex import CodexBackend
-from zeta.providers.completion import ProviderStallError, owned_completion
+from zeta.providers.completion import (
+    TRANSPORT_IDLE_SECONDS,
+    ProviderStallError,
+    owned_completion,
+)
 from zeta.runtime.headless import drive_turn
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -326,15 +330,17 @@ async def test_anthropic_backend_stall_budget_exhausts(
     clock = ManualDeadlineClock()
     backend._completion_clock = clock
     backend._completion_wait = _no_op_sleep
+    control = completion_control()
     with pytest.raises(ProviderStallError) as excinfo:
         await _collect_after_expirations(
-            backend.complete([], [], control=completion_control()),
+            backend.complete([], [], control=control),
             clock,
             [stream.entered for stream in streams],
         )
 
     assert excinfo.value.is_stall is True
     assert len(requests) == 3
+    assert control.budget.records[-1] == {"decision": "budget-exhausted"}
     await client.aclose()
 
 
@@ -458,6 +464,60 @@ async def test_provider_stalls_waiting_for_response_headers(
             )
         assert caught.value.is_stall is True
         assert len(requests) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+async def test_owner_stall_while_reading_error_body_retries_and_closes_it(
+    tmp_path: Path, provider: str
+) -> None:
+    """An HTTP 503 whose body stops mid-read is a stall the owner retries.
+
+    Production idle constants run on a manual clock; nothing sleeps.
+    """
+    requests: list[httpx.Request] = []
+    hanging = _HangingByteStream(b'{"error":{"message":"partial')
+    success = ANTHROPIC_SSE if provider == "anthropic" else CODEX_COMPLETE_SSE
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(503, stream=hanging, request=request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=success,
+            request=request,
+        )
+
+    client = _mock_client(handler)
+    if provider == "anthropic":
+        backend = AnthropicBackend(
+            client=client, token_store=_anthropic_store(tmp_path / "claude.json")
+        )
+    else:
+        backend = CodexBackend(
+            client=client,
+            token_store=_codex_store(tmp_path / "codex.json"),
+            base_url="https://test.invalid/codex/responses",
+        )
+    try:
+        clock = ManualDeadlineClock()
+        backend._completion_clock = clock
+        backend._completion_wait = _no_op_sleep
+        events = await _collect_after_expirations(
+            backend.complete([], [], control=completion_control()),
+            clock,
+            [hanging.entered],
+        )
+        retries = [event for event in events if event.type is StreamEventType.RETRY]
+        assert [event.data.get("is_stall") for event in retries] == [True]
+        assert events[-1].type is StreamEventType.MESSAGE_END
+        assert len(requests) == 2
+        # the stall fired at the production transport idle bound (90 s)
+        assert clock.current == TRANSPORT_IDLE_SECONDS
+        assert hanging._closed.is_set()
     finally:
         await client.aclose()
 
