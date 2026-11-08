@@ -54,7 +54,9 @@ class Probe:
     delivered: int = 0
     requests: int | None = None
 
-    async def __call__(self, arguments: dict[str, Any]) -> str:
+    async def __call__(
+        self, arguments: dict[str, Any], abort_signal: AbortSignal
+    ) -> str:
         del arguments
         task = asyncio.current_task()
         assert task is not None
@@ -66,6 +68,11 @@ class Probe:
                 raise ValueError("boom")
             if self.mode == "tool_canceled":
                 raise execution._ToolCanceled()
+            if self.mode == "cooperative":
+                # Start waiting after the owner's signal watcher, as bash does.
+                await asyncio.sleep(0)
+                await asyncio.wait_for(abort_signal.wait(), 30)
+                return "stopped on signal"
             # wait_for, not await_or_fail: a cancel here must not leave an inner
             # task pending. 30 s, so the row-level 10 s guards fire first.
             await asyncio.wait_for(self.forever.wait(), 30)
@@ -248,6 +255,21 @@ async def outer_cancel_at_each_loop_turn(h: Harness) -> Outcome:
     assert len(seen) == 1, f"(requests, delivered, result) differ by turn: {sorted(seen, key=str)}"
     requests, delivered, result = seen.pop()
     return Outcome((requests,), (delivered,), (result,))
+
+
+async def cooperative_handler_sees_signal_first(h: Harness) -> Outcome:
+    """A handler that stops on the signal itself (bash, agent) gets no cancel."""
+    signal = AbortSignal()
+    task = asyncio.create_task(
+        execution.run_handler_with_abort(h.probes[0], {}, signal, None, "call-0")
+    )
+    h.tasks.append(task)
+    await h.all_started()
+    signal.abort()
+    return h.outcome((summarize(await await_or_fail(task, what="owner result")),))
+
+
+cooperative_handler_sees_signal_first.mode = "cooperative"  # type: ignore[attr-defined]
 
 
 async def signal_only(h: Harness) -> Outcome:
@@ -446,6 +468,11 @@ ROWS: list[Any] = [
         direct("wait", cancel_first=True, signal_first=True), 1, False,
         Outcome((1,), (1,), ("canceled",)),
         id="outer-cancel-before-owner-first-await-with-signal",
+    ),
+    pytest.param(
+        cooperative_handler_sees_signal_first, 1, False,
+        Outcome((0,), (0,), ("stopped on signal",)),
+        id="cooperative-handler-sees-signal-first",
     ),
     pytest.param(outer_cancel_at_each_loop_turn, 1, False, Outcome((1,), (1,), ("canceled",)), id="outer-cancel-at-each-owner-await"),
     # Every route that reaches a running handler, through the real loop.

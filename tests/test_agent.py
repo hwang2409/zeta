@@ -17548,7 +17548,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         register_builtin=True,
     )
     owner = BackgroundAgentOwner(parent_store)
-    watcher = asyncio.create_task(asyncio.Event().wait())
+    watcher = asyncio.create_task(asyncio.wait_for(asyncio.Event().wait(), 60))
     release = asyncio.Event()
     wait_started = asyncio.Event()
     wait_gate = asyncio.Event()
@@ -17556,7 +17556,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     attempts = 0
 
     async def confirm() -> bool:
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return await fence.cancel()
 
     def cancel() -> CancellationRequest:
@@ -17581,7 +17581,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
             first_wait = False
             confirm_timeouts.append(timeout)
             wait_started.set()
-            await wait_gate.wait()
+            await asyncio.wait_for(wait_gate.wait(), 10)
             return set(), set(awaitables)
         return await original_wait(awaitables, timeout=timeout)
 
@@ -17593,10 +17593,10 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     try:
         call = ToolCall("cancel-1", "agent_cancel", {"handle": "root:1"})
         pending = asyncio.create_task(registry.execute(call))
-        await wait_started.wait()
+        await await_or_fail(wait_started.wait(), what="confirmation wait start")
         assert confirm_timeouts == [1.0]
         wait_gate.set()
-        unconfirmed = await pending
+        unconfirmed = await await_or_fail(pending, what="first agent_cancel")
         assert unconfirmed["isError"] is True
         assert unconfirmed["structuredContent"]["status"] == "cancellation_unconfirmed"
         assert "not confirmed" in unconfirmed["content"][0]["text"]
@@ -17638,7 +17638,9 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         wait_gate.set()
         owner.unregister("root:1")
         watcher.cancel()
-        await asyncio.gather(watcher, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(watcher, return_exceptions=True), what="watcher cleanup"
+        )
         await registry.close()
         child_store.close()
 
