@@ -1079,6 +1079,9 @@ async def run_agent_tool(
             return request_child_cancel()
 
         async def cleanup_background_child() -> None:
+            await loop._background_owner.wait_for_descendant_watchers(
+                child_instance_id
+            )
             await loop._background_owner.conversation_channel.unregister_delivery_flow(
                 child_instance_id
             )
