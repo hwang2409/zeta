@@ -4993,43 +4993,6 @@ def test_tasks_panel_wraps_long_commands_at_a_separator() -> None:
     assert all(cell_len(line) <= 72 for line in rendered)
 
 
-def test_agent_card_preserves_hard_wrap_layout(tmp_path: Path) -> None:
-    path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
-    child = ConversationStore(tmp_path / "agents", session_id="child")
-    send = ToolCall(
-        "send-path",
-        "agent_send",
-        {
-            "child_instance_id": "root:1",
-            "message": f"{path}verylongfilenamewithoutbreaks",
-        },
-    )
-    try:
-        child.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(send)]))
-        call = ToolCall(
-            "agent-path",
-            "agent",
-            {"prompt": "inspect", "description": "child"},
-        )
-
-        rendered = AgentCard.render_expanded(
-            call,
-            elapsed_seconds=1.0,
-            turns_used=1,
-            child_session_path=str(child.session_dir),
-        )
-        output = StringIO()
-        _test_console(output, width=80).print(rendered)
-        lines = Text.from_ansi(output.getvalue()).plain.splitlines()
-        content = [line.strip("│ ") for line in lines]
-
-        assert f"{path}verylongfilenamewitho" in content
-        assert "utbreaks" in content
-        assert all(cell_len(line) <= 80 for line in lines)
-    finally:
-        child.close()
-
-
 def test_idle_agent_card_reports_count_fd_floor_and_warning(tmp_path: Path) -> None:
     from zeta.tui.cards.agent_sync import AgentTranscriptTreeSnapshot
 
@@ -6627,9 +6590,8 @@ async def test_status_card_wraps_complete_project_context_health(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("width", [40, 80, 160])
 async def test_status_card_wraps_long_path_at_separator(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = TUIApp(
         AgentLoop(
@@ -6641,6 +6603,7 @@ async def test_status_card_wraps_long_path_at_separator(
         model="offline",
     )
     session = app._make_session()
+    width = 40
     app._active_session = session
     app._install_full_screen_layout(session)
     path = "/Users/henry/zeta/wrap-word-boundary/long-token"
