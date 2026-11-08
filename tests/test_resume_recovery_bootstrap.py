@@ -485,6 +485,7 @@ async def test_close_waits_for_durable_delta_proof(
         assert release_proof.wait(10)
         return original_proof(store, *args, **kwargs)
 
+    # test-contract: seam pauses the worker at the close-sensitive proof boundary
     monkeypatch.setattr(
         ConversationStore, "_proven_bounded_durable_delta", gated_proof
     )
@@ -525,7 +526,8 @@ async def test_close_waits_for_durable_delta_proof(
         release_proof.set()
         await asyncio.wait_for(operation, 10)
         assert await asyncio.to_thread(close_done.wait, 10)
-        close.join()
+        close.join(timeout=10)
+        assert not close.is_alive()
         assert close_errors == []
         reopened = ConversationStore(tmp_path, session_id=resident.session_id)
         try:
@@ -540,7 +542,8 @@ async def test_close_waits_for_durable_delta_proof(
             await asyncio.to_thread(resident.close)
         elif close.is_alive():
             assert await asyncio.to_thread(close_done.wait, 10)
-            close.join()
+            close.join(timeout=10)
+            assert not close.is_alive()
 
 
 def test_writer_snapshot_uses_structural_copy(tmp_path: Path) -> None:
