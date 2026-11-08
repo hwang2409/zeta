@@ -6,8 +6,10 @@ import argparse
 import ast
 import difflib
 import hashlib
+import os
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 
@@ -792,15 +794,19 @@ def _parse_error_status(
     final_revision: str | None,
     final_sources: dict[tuple[str, str], str | None],
     final_error_path: str | None,
+    base: str,
 ) -> int:
     revision, path, syntax = error
+    # The merge base view is not the merge: a later fix of the merge cannot excuse it.
+    label = "merge base" if revision == base else "merge"
     lines = text.splitlines()
     if any(line.startswith(f"merge-resolution: {path} parse ->") for line in lines):
-        print(f"allowed merge parse diagnostic: {revision}:{path}")
+        print(f"allowed {label} parse diagnostic: {revision}:{path}")
         return 0
     final_text = final_sources.get((final_revision, path)) if final_revision else None
     fixed_later = (
-        final_revision
+        revision != base
+        and final_revision
         and commit != final_revision
         and final_error_path is None
         and final_text is not None
@@ -816,7 +822,7 @@ def _parse_error_status(
         )
         return 0
     print(
-        f"merge does not parse: {revision}:{path}:{syntax.lineno} (conflict marker?)",
+        f"{label} does not parse: {revision}:{path}:{syntax.lineno} (conflict marker?)",
         file=sys.stderr,
     )
     return 2
@@ -1087,17 +1093,7 @@ def _base_view(main: str, branch: str) -> str:
     bases = git("merge-base", "--all", main, branch).splitlines()
     base = bases[0]
     for index, other in enumerate(bases[1:], 1):
-        result = subprocess.run(
-            ["git", "merge-tree", "--write-tree", base, other],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode not in {0, 1}:
-            raise subprocess.CalledProcessError(
-                result.returncode, result.args, result.stdout, result.stderr
-            )
-        tree = result.stdout.splitlines()[0]
+        tree = _merge_bases(base, other, bases[0])
         base = (
             git(
                 "-c", "user.name=zeta merge checker",
@@ -1109,6 +1105,39 @@ def _base_view(main: str, branch: str) -> str:
             else tree
         )
     return base
+
+
+def _merge_bases(left: str, right: str, real_base: str) -> str:
+    result = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", left, right],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, result.stdout, result.stderr
+        )
+    tree, *conflicted = [field for field in result.stdout.split("\0") if field]
+    if not conflicted:
+        return tree
+    # A real common ancestor can only over-report a loss; Git's conflicted tree has markers.
+    paths = sorted(set(conflicted))
+    print(f"merge bases conflict on {', '.join(paths)}; using base {real_base} for them")
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+
+        def index_git(*args: str, input: str = "") -> str:
+            return subprocess.check_output(
+                ["git", "--literal-pathspecs", *args], text=True, input=input, env=env
+            )
+
+        index_git("read-tree", tree)
+        listed = "".join(f"{path}\0" for path in paths)
+        index_git("update-index", "--force-remove", "-z", "--stdin", input=listed)
+        entries = index_git("ls-tree", "-r", "-z", real_base, "--", *paths)
+        index_git("update-index", "-z", "--index-info", input=entries)
+        return index_git("write-tree").strip()
 
 
 def _merge_paths(base: str, main: str, branch: str, commit: str) -> tuple[set[str], set[str]]:
@@ -1225,6 +1254,7 @@ def main() -> int:
             final_revision,
             final_sources,
             final_error_path,
+            revisions[0],
         )
     old_items, main_items, branch_items, merge_items = (
         parsed[revision] for revision in revisions

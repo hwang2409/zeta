@@ -1135,21 +1135,73 @@ def _criss_cross_line_case(r: Path) -> tuple[str, list[str]]:
     return merge, bases
 
 
-def test_criss_cross_base_view_keeps_real_loss_red(tmp_path: Path) -> None:
-    r = tmp_path / "loss"
-    r.mkdir()
+def _shared_line_bases_case(r: Path) -> tuple[str, tuple[str, ...]]:
     merge, bases = _criss_cross_line_case(r)
     assert len(bases) == 2
     base_sources = [
-        subprocess.check_output(
-            ["git", "show", f"{base}:src/a.py"], cwd=r, text=True
-        )
+        subprocess.check_output(["git", "show", f"{base}:src/a.py"], cwd=r, text=True)
         for base in bases
     ]
     assert sum("shared_pr_line" in text for text in base_sources) == 1
-    result = run(r, merge)
-    assert result.returncode == 1
+    return merge, ()
+
+
+def _conflicting_bases_case(r: Path) -> tuple[str, tuple[str, ...]]:
+    def head() -> str:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+
+    def write(value: int, extra: str = "") -> None:
+        (r / "src/a.py").write_text(
+            f"def f():\n    return {value}\n\n\ndef g():\n    anchor()\n{extra}"
+        )
+
+    def merge_in(other: str, value: int, extra: str = "") -> str:
+        subprocess.run(
+            ["git", "merge", "--no-ff", "--no-commit", other], cwd=r, capture_output=True, check=False
+        )
+        write(value, extra)
+        commit(r, f"merge {other}")
+        return head()
+
+    repo(r)
+    (r / "src").mkdir()
+    write(0)
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "left"], cwd=r, check=True)
+    write(1)
+    commit(r, "left base")
+    left_base = head()
+    subprocess.run(["git", "checkout", "-qb", "right", "main"], cwd=r, check=True)
+    write(2)
+    commit(r, "right base")
+    right_base = head()
+    subprocess.run(["git", "checkout", "-q", "left"], cwd=r, check=True)
+    branch = merge_in(right_base, 1, "    branch_only()\n")
+    subprocess.run(["git", "checkout", "-q", "right"], cwd=r, check=True)
+    main = merge_in(left_base, 2)
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", main], cwd=r, check=True)
+    bases = subprocess.check_output(["git", "merge-base", "--all", branch, main], cwd=r, text=True)
+    assert set(bases.split()) == {left_base, right_base}
+    merge = merge_in(branch, 2)
+    (r / "src/b.py").write_text("later = 1\n")
+    commit(r, "later commit")
+    return merge, ("--main-sha", main, "--final", head())
+
+
+@pytest.mark.parametrize(
+    ("case", "diagnostic"),
+    [
+        (_shared_line_bases_case, "src/a.py"),
+        (_conflicting_bases_case, "merge bases conflict on src/a.py; using base "),
+    ],
+    ids=["shared line in one base", "bases conflict, final given"],
+)
+def test_criss_cross_base_view_keeps_real_loss_red(tmp_path: Path, case, diagnostic: str) -> None:
+    merge, args = case(tmp_path)
+    result = run(tmp_path, merge, *args)
+    assert result.returncode == 1, result.stdout + result.stderr
     assert "branch_only()" in result.stdout
+    assert diagnostic in result.stdout
 
 
 def test_train_with_shared_pr_uses_all_merge_bases() -> None:
