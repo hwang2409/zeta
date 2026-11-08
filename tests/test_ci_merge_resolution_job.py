@@ -99,8 +99,9 @@ def test_pull_request_checks_only_first_parent_merges(tmp_path: Path) -> None:
     git(repo, "config", "user.email", "test@example.com")
     git(repo, "config", "user.name", "test")
     git(repo, "remote", "add", "origin", str(repo))
+    git(repo, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
     (repo / "src").mkdir()
-    (repo / "src/a.py").write_text("def lost(): pass\n")
+    (repo / "src/a.py").write_text("def base(): pass\n")
     (repo / "scripts").mkdir()
     (repo / "scripts/check_merge_resolution.py").write_text(
         "import sys\n"
@@ -111,22 +112,47 @@ def test_pull_request_checks_only_first_parent_merges(tmp_path: Path) -> None:
     (repo / "src/a.py").write_text("def feature(): pass\n")
     commit(repo, "feature")
     git(repo, "checkout", "-q", "main")
-    (repo / "src/a.py").write_text("def lost(): pass\ndef added(): pass\n")
+    (repo / "src/a.py").write_text("def main(): pass\n")
     commit(repo, "main")
-    main_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10).strip()
-    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "feature"], cwd=repo, check=False, timeout=10)
+    main_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10
+    ).strip()
+
+    # this historical merge is on perf/integration, not on main.
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "feature"],
+        cwd=repo,
+        check=False,
+        timeout=10,
+    )
     git(repo, "checkout", "feature", "--", "src/a.py")
-    commit(repo, "inner merge")
-    inner_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10).strip()
-    git(repo, "checkout", "-qb", "train", main_sha)
+    commit(repo, "integration merge")
+    inner_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10
+    ).strip()
+    git(repo, "update-ref", "refs/heads/main", main_sha)
+
+    git(repo, "checkout", "-qb", "train", inner_sha)
     (repo / "train").write_text("train\n")
     commit(repo, "train change")
-    train_parent_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10).strip()
-    subprocess.run(["git", "merge", "--no-ff", "--no-commit", inner_sha], cwd=repo, check=False, timeout=10)
-    git(repo, "checkout", inner_sha, "--", "src/a.py")
+    git(repo, "checkout", "-qb", "target-feature", inner_sha)
+    (repo / "target").write_text("target\n")
+    commit(repo, "target feature")
+    git(repo, "checkout", "train")
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "target-feature"],
+        cwd=repo,
+        check=True,
+        timeout=10,
+    )
     commit(repo, "train merge")
-    train_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10).strip()
-    git(repo, "update-ref", "refs/remotes/origin/main", train_parent_sha)
+    train_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10
+    ).strip()
+
+    git(repo, "update-ref", "refs/heads/perf/integration", inner_sha)
+    git(repo, "update-ref", "refs/remotes/origin/main", main_sha)
+    git(repo, "update-ref", "refs/remotes/origin/perf/integration", inner_sha)
     (repo / "expected").write_text(train_sha)
 
     fake_bin = tmp_path / "bin"
@@ -134,20 +160,22 @@ def test_pull_request_checks_only_first_parent_merges(tmp_path: Path) -> None:
     fake_gh = fake_bin / "gh"
     fake_gh.write_text("#!/bin/sh\nexit 0\n")
     fake_gh.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "EVENT_NAME": "pull_request",
+        "BASE_REF": "perf/integration",
+        "HEAD_SHA": train_sha,
+        "PR_NUMBER": "917",
+        "FINAL_SHA": train_sha,
+        "PR_BODY": "",
+        "CHECK_MERGE_RESOLUTION_SCRIPT": str(repo / "scripts/check_merge_resolution.py"),
+    }
+
     result = subprocess.run(
         _merge_resolution_command(tmp_path),
         cwd=repo,
-        env={
-            **os.environ,
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "EVENT_NAME": "pull_request",
-            "HEAD_SHA": train_sha,
-            "BASE_SHA": train_parent_sha,
-            "PR_NUMBER": "917",
-            "FINAL_SHA": train_sha,
-            "PR_BODY": "",
-            "CHECK_MERGE_RESOLUTION_SCRIPT": str(repo / "scripts/check_merge_resolution.py"),
-        },
+        env=env,
         text=True,
         capture_output=True,
         timeout=20,
