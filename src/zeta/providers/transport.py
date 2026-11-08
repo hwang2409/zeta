@@ -18,10 +18,6 @@ from .completion import is_control_exception, merge_exception, report_transport_
 from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
-DEFAULT_STREAM_STALL_SECONDS = 90.0  # Transport idle, including missing keepalives.
-# Long hidden reasoning is normal; diagnostics will let us safely tighten this later.
-MODEL_PROGRESS_STALL_SECONDS = 15 * 60.0
-DEFAULT_STREAM_STALL_RETRIES = 2
 _BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
 _BACKGROUND_CLEANUP_REPORT_TASKS: set[asyncio.Task[object]] = set()
 _MAX_BACKGROUND_CLEANUP_REPORTS = 16
@@ -338,14 +334,10 @@ async def build_response_error[ErrorT: RuntimeError](
     response: httpx.Response,
     build: Callable[[int, bytes, Mapping[str, str]], ErrorT],
     limit: int = 8192,
-    *,
-    stall_seconds: float,
-    on_stall: Callable[[float], BaseException],
 ) -> ErrorT:
     """Build a provider error from a bounded streaming response body."""
 
     body = bytearray()
-    del stall_seconds, on_stall
     async for chunk in response.aiter_bytes():
         report_transport_activity()
         body.extend(chunk[: limit - len(body)])
@@ -378,32 +370,8 @@ class StreamProgressDiagnostics:
         return max(self.max_gap_s, time.monotonic() - self.last_at)
 
 
-class StreamFinished:
-    """Mutable flag the provider decoder sets when the completion sentinel
-    arrives, so ``sse_lines``' stall watchdog treats any post-completion
-    silence as a clean EOF instead of a spurious stall retry."""
-
-    __slots__ = ("value",)
-
-    def __init__(self) -> None:
-        self.value = False
-
-
-
-
-
-
-
-
-async def sse_lines[E: RuntimeError](
-    response: httpx.Response,
-    seconds: float,
-    provider: str,
-    error_class: type[E],
-    finished: StreamFinished | None = None,
-) -> AsyncIterator[str]:
+async def sse_lines(response: httpx.Response) -> AsyncIterator[str]:
     """Yield low-level SSE lines while the completion owner tracks activity."""
-    del seconds, provider, error_class, finished
     async for line in response.aiter_lines():
         report_transport_activity()
         yield line

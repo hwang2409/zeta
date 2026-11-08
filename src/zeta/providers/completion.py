@@ -31,6 +31,7 @@ MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
 MAX_ACCOUNT_LOCK_ATTEMPTS = 5
 MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
+MAX_STALL_RETRIES = 2
 MODEL_PROGRESS_IDLE_SECONDS = 15 * 60.0
 
 _RETRYABLE_STATUS_CODES = {
@@ -160,7 +161,7 @@ class CompletionRetryBudget:
     retry_wait_seconds: float = 0.0
     original_error: Any | None = None
     exhausted: bool = False
-    max_stall_retries: int = 2
+    max_stall_retries: int = MAX_STALL_RETRIES
     stall_retries: int = 0
     excluded_stall_seconds: float = 0.0
     records: list[dict[str, object]] = field(default_factory=list)
@@ -1034,7 +1035,11 @@ def complete(
     control: CompletionControl,
     clock: DeadlineClock | None = None,
     wait: Callable[[float], Awaitable[None]] | None = None,
+    transport_idle: float = TRANSPORT_IDLE_SECONDS,
+    max_stall_retries: int = MAX_STALL_RETRIES,
 ) -> CompletionRun:
+    """Run one owned completion with the backend's configured stall limits."""
+    control.budget.max_stall_retries = max_stall_retries
     return CompletionRun(
         adapter,
         messages,
@@ -1042,6 +1047,7 @@ def complete(
         control,
         clock=clock or getattr(adapter, "_completion_clock", None),
         wait=wait or getattr(adapter, "_completion_wait", None),
+        transport_idle=transport_idle,
     )
 
 

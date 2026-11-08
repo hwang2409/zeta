@@ -1270,22 +1270,6 @@ def test_ollama_rejects_orphan_tool_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ollama_nonpositive_stall_seconds_disables_watchdog() -> None:
-    client = _ScriptedClient(
-        [
-            (0, [(0.02, '{"message":{"content":"ok"},"done":true}')]),
-        ]
-    )
-    events = [
-        event
-        async for event in OllamaBackend(client=client, stall_seconds=0).complete(
-            [], []
-        , control=completion_control())
-    ]
-    assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
-
-
-@pytest.mark.asyncio
 async def test_ollama_does_not_transport_retry_after_meaningful_output() -> None:
     class Client(_ScriptedClient):
         def stream(self, *args, **kwargs):
@@ -1305,7 +1289,7 @@ async def test_ollama_does_not_transport_retry_after_meaningful_output() -> None
         [
             event
             async for event in OllamaBackend(
-                client=client, stall_seconds=0.01, stall_retries=1
+                client=client, stall_retries=1
             ).complete([], [], control=completion_control())
         ]
     assert client.calls == 1
@@ -1382,7 +1366,7 @@ async def test_ollama_closes_stream_and_owned_client_on_early_close(close_mode) 
     original = ollama.httpx.AsyncClient
     ollama.httpx.AsyncClient = OwnedClient
     try:
-        backend = OllamaBackend(stall_seconds=0)
+        backend = OllamaBackend()
         completion = backend.complete([], [], control=completion_control())
         await completion.__anext__()
         if close_mode == "aclose":
@@ -1495,7 +1479,7 @@ async def test_ollama_cancelled_real_transport_does_not_leak_fds(
         for _ in range(100):
             first_event = asyncio.Event()
             backend = OllamaBackend(
-                base_url=f"http://127.0.0.1:{port}", stall_seconds=0
+                base_url=f"http://127.0.0.1:{port}"
             )
 
             async def consume(
@@ -1541,7 +1525,7 @@ async def test_ollama_stall_zero_allows_progressing_real_transport(
             return [
                 event
                 async for event in OllamaBackend(
-                    client=client, base_url=tcp_http_server.url, stall_seconds=0
+                    client=client, base_url=tcp_http_server.url
                 ).complete([], [], control=completion_control())
             ]
 
