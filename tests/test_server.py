@@ -11982,3 +11982,76 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         release_settlement_finish.set()
         release_write.set()
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_returns_broken_sent_ledger_activation_notice(
+    tmp_path: Path,
+) -> None:
+    from zeta.project_registry import ProjectRegistry
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    ProjectRegistry(tmp_path / "projects").create_project(
+        "project", "test", workspace
+    )
+    manager = SessionManager(tmp_path)
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="offline", cwd=workspace)
+    )
+    session_id = opened.metadata.session_id
+    ledger = opened.store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    opened.store.close()
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=workspace,
+        port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    writer = None
+    try:
+        activation_error = None
+        try:
+            await server.runtime.resume_session(session_id)
+        except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
+            activation_error = exc
+        assert activation_error is None
+        reader, writer = await _connect(server)
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        history = (
+            await _request(
+                reader,
+                writer,
+                2,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        notices = [
+            row
+            for row in history
+            if any(
+                block.get("type") == "text"
+                and "sent history is incomplete (invalid_json)" in block.get("text", "")
+                for block in row["content"]
+            )
+        ]
+        assert len(notices) == 1
+        notice = "\n".join(
+            block["text"]
+            for block in notices[0]["content"]
+            if block.get("type") == "text"
+        )
+        assert notices[0]["role"] == "system"
+        assert "file was not changed" in notice
+        assert "unless the repaired ledger includes their IDs" in notice
+    finally:
+        if writer is None:
+            await close_serve(server)
+        else:
+            await close_serve(server, writer)

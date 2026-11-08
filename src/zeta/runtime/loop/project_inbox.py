@@ -10,8 +10,8 @@ from ...project_inbox import (
     SENT_STATUS_EVENT,
     InboxError,
     ProjectInboxScanner,
-    SentMessageTracker,
 )
+from ...project_inbox_sent import SentMessageTracker
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import Message, harness_notice
 
@@ -31,8 +31,22 @@ class ProjectInboxNotificationMixin:
     async def _activate_project_inbox(self) -> None:
         if "inbox" not in self.tool_registry.registered_names or self.agent_depth > 0:
             return
-        self._inbox_scanner = self._new_project_inbox_scanner()
+        self._inbox_scanner = await asyncio.to_thread(
+            self._new_project_inbox_scanner
+        )
+        sent_outcome = self._inbox_scanner._activation_sent_outcome
         await self._check_project_inbox()
+        if sent_outcome is not None and sent_outcome.health.state == "broken":
+            await self._append_turn_message(
+                harness_notice(
+                    "inbox sent history",
+                    sent_outcome.warning,
+                    event=SENT_STATUS_EVENT,
+                    metadata={
+                        "sent_ledger_health": sent_outcome.health.as_dict()
+                    },
+                )
+            )
         watcher = asyncio.create_task(self._watch_project_inbox())
         self._tracked_tasks.add(watcher)
         watcher.add_done_callback(self._tracked_tasks.discard)
@@ -50,14 +64,16 @@ class ProjectInboxNotificationMixin:
                 projects.root.parent / "sessions", self.store.session_id
             )
             self.tool_registry.sent_message_tracker = tracker
-        tracker.reconcile(self.store.sent_message_receipts())
-        return ProjectInboxScanner(
+        sent_outcome = tracker.reconcile(self.store.sent_message_receipts())
+        scanner = ProjectInboxScanner(
             projects,
             project_id,
             sessions_root=projects.root.parent / "sessions",
             session_id=self.store.session_id,
             tracker=tracker,
         )
+        scanner._activation_sent_outcome = sent_outcome
+        return scanner
 
     async def _watch_project_inbox(self) -> None:
         while True:
