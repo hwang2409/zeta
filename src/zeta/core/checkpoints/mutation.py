@@ -525,8 +525,11 @@ async def commit_conversation_async[ResultT](
     token = target
     try:
 
-        def commit_transient(cancellation: object) -> CommittedDelta[ResultT]:
-            from ..store._async_writes import _MutationCancellation
+        def commit_transient(cancellation: object) -> object:
+            from ..store._async_writes import (
+                _MutationCancellation,
+                _SubmittedMutationOutcome,
+            )
             from ..store._store import ConversationStore
 
             assert isinstance(cancellation, _MutationCancellation)
@@ -548,25 +551,37 @@ async def commit_conversation_async[ResultT](
                 ) from exc
             try:
                 last_conflict: ConversationGenerationConflict | None = None
-                for _attempt in range(4):
-                    expected = target.conversation_generation
-                    try:
-                        return target.commit(
-                            command, expected, _cancellation=cancellation
-                        )
-                    except ConversationGenerationConflict as exc:
-                        last_conflict = exc
-                assert last_conflict is not None
-                raise last_conflict
+                try:
+                    for _attempt in range(4):
+                        expected = target.conversation_generation
+                        try:
+                            delta = target.commit(command, expected)
+                            return _SubmittedMutationOutcome(
+                                None, delta, None, target.take_persisted_appends()
+                            )
+                        except ConversationGenerationConflict as exc:
+                            last_conflict = exc
+                    assert last_conflict is not None
+                    raise last_conflict
+                except BaseException as error:  # noqa: BLE001 - finish owned recovery
+                    return _SubmittedMutationOutcome(
+                        None, None, error, target.take_persisted_appends()
+                    )
             finally:
                 target.close()
 
-        from ..store._async_writes import _submit_durable_mutation
+        from ..store._async_writes import (
+            _submit_durable_mutation,
+            _SubmittedMutationOutcome,
+        )
 
         async def finish_transient(
-            result: CommittedDelta[ResultT],
+            outcome: _SubmittedMutationOutcome,
         ) -> CommittedDelta[ResultT]:
-            return result
+            if outcome.error is not None:
+                raise outcome.error
+            assert outcome.delta is not None
+            return outcome.delta
 
         return await _submit_durable_mutation(
             command, commit_transient, finish_transient

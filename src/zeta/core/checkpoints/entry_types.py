@@ -71,14 +71,15 @@ def _message(_context: EntryValidationContext, entry: Any) -> None:
     _message_approval_requests(parsed_message, entry.data.get("approval_requests", []))
 
 
-def _message_approval_requests(
-    parsed_message: Message, approval_requests: object
-) -> None:
+def _validated_approval_requests(
+    approval_requests: object,
+) -> list[ToolCall]:
     from ..store._approval_display import validated_approval_display
 
     if type(approval_requests) is not list:
         raise ValueError("message approval_requests must be an array")
     request_ids: set[str] = set()
+    tool_calls: list[ToolCall] = []
     for request in approval_requests:
         if type(request) is not dict:
             raise ValueError("message approval request must be an object")
@@ -91,19 +92,22 @@ def _message_approval_requests(
         request_ids.add(request_id)
         if type(tool_call) is not dict:
             raise ValueError("approval request tool_call must be an object")
-        parsed_tool_call = ToolCall.from_dict(tool_call)
+        tool_calls.append(ToolCall.from_dict(tool_call))
         if "approval_display" in request:
             validated_approval_display(request["approval_display"])
-        anchored_call = next(
-            (
-                block.tool_call
-                for block in parsed_message.content
-                if isinstance(block, ToolUseContent)
-                and block.tool_call.id == parsed_tool_call.id
-            ),
-            None,
-        )
-        if anchored_call != parsed_tool_call:
+    return tool_calls
+
+
+def _message_approval_requests(
+    parsed_message: Message, approval_requests: object
+) -> None:
+    anchored = {
+        block.tool_call.id: block.tool_call
+        for block in parsed_message.content
+        if isinstance(block, ToolUseContent)
+    }
+    for tool_call in _validated_approval_requests(approval_requests):
+        if anchored.get(tool_call.id) != tool_call:
             raise ValueError("approval request must match an anchored tool call")
 
 

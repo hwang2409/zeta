@@ -15,6 +15,8 @@ from ..checkpoints.mutation import (
     ConversationGenerationConflict,
     ConversationMutation,
     MutationCancellationPolicy,
+    _cursor,
+    _ResidentPatch,
     execute_mutation,
 )
 from ._pending_prompts import PendingPromptWriterReloadedError
@@ -369,7 +371,8 @@ class _AppendPendingPromptCommand(_StoreMutationCommand):
 
 
 class _MutationCancellation:
-    def __init__(self) -> None:
+    def __init__(self, context: object | None = None) -> None:
+        self.context = context
         self.cancelled = threading.Event()
         self.write_started = threading.Event()
         self._lock = threading.Lock()
@@ -400,22 +403,71 @@ def _mutation_cancellation_observed(
     """Test seam after caller cancellation reaches the shared policy boundary."""
 
 
+def _before_mutation_write_gate() -> None:
+    """Test seam on the executor before the one mutation write gate."""
+
+
+def _run_gated_mutation[DurableT](
+    cancellation: _MutationCancellation,
+    worker: Callable[[_MutationCancellation], DurableT],
+    before_write: Callable[[], None] | None,
+    submission_failed: Callable[[], None] | None,
+) -> DurableT:
+    try:
+        _before_mutation_write_gate()
+        if before_write is not None:
+            before_write()
+        cancellation.begin_write()
+    except BaseException:
+        if submission_failed is not None:
+            submission_failed()
+        raise
+    return worker(cancellation)
+
+
+async def _adopt_cancelled_mutation[ResultT](
+    command: ConversationMutation[Any],
+    cancellation: _MutationCancellation,
+    operation: asyncio.Task[ResultT],
+    cancelled: Callable[[MutationCancellationPolicy], None] | None,
+) -> tuple[bool, ResultT | None]:
+    policy = command.cancellation_policy
+    _mutation_cancellation_observed(policy)
+    if cancelled is not None:
+        cancelled(policy)
+    if (
+        policy is MutationCancellationPolicy.ABORT_BEFORE_WRITE
+        and cancellation.abort_before_write()
+    ):
+        return True, await asyncio.shield(operation)
+    if operation.done():
+        return True, operation.result()
+    return False, None
+
+
 async def _submit_durable_mutation[DurableT, ResultT](
     command: ConversationMutation[Any],
     worker: Callable[[_MutationCancellation], DurableT],
     finish: Callable[[DurableT], Awaitable[ResultT]],
     *,
     before_submit: Callable[[], None] | None = None,
+    before_write: Callable[[], None] | None = None,
+    worker_context: object | None = None,
     submission_failed: Callable[[], None] | None = None,
     cancelled: Callable[[MutationCancellationPolicy], None] | None = None,
 ) -> ResultT:
     """Submit one durable mutation and enforce its cancellation policy."""
-    cancellation = _MutationCancellation()
+    cancellation = _MutationCancellation(worker_context)
     if before_submit is not None:
         before_submit()
     try:
         worker_future = asyncio.get_running_loop().run_in_executor(
-            None, worker, cancellation
+            None,
+            _run_gated_mutation,
+            cancellation,
+            worker,
+            before_write,
+            submission_failed,
         )
     except BaseException:
         if submission_failed is not None:
@@ -433,23 +485,31 @@ async def _submit_durable_mutation[DurableT, ResultT](
             break
         except asyncio.CancelledError:
             was_cancelled = True
-            _mutation_cancellation_observed(command.cancellation_policy)
-            if cancelled is not None:
-                cancelled(command.cancellation_policy)
-            if (
-                command.cancellation_policy
-                is MutationCancellationPolicy.ABORT_BEFORE_WRITE
-                and cancellation.abort_before_write()
-            ):
-                result = await asyncio.shield(operation)
-                break
-            if operation.done():
-                result = operation.result()
+            finished, adopted = await _adopt_cancelled_mutation(
+                command, cancellation, operation, cancelled
+            )
+            if finished:
+                result = adopted
                 break
     task = asyncio.current_task()
     if was_cancelled or (task is not None and task.cancelling() > 0):
         raise asyncio.CancelledError
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class _ResidentMutationBaseline:
+    generation: int
+    cursor: tuple[tuple[int, int, int] | None, int, int | None, bytes | None, bytes]
+    patch: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _SubmittedMutationOutcome:
+    prelude: CommittedDelta[Any] | None
+    delta: CommittedDelta[Any] | None
+    error: BaseException | None
+    receipts: Any
 
 
 class _AsyncWriteLock(asyncio.Lock):
@@ -560,14 +620,9 @@ class AsyncDurableWritesMixin:
         self: ConversationStore,
         command: ConversationMutation[Any],
         expected_generation: int,
-        *,
-        _cancellation: _MutationCancellation | None = None,
     ) -> CommittedDelta[Any]:
         self._assert_owner_thread()
         with self._mutation_lock:
-            if _cancellation is not None:
-                self._before_committed_mutation()
-                _cancellation.begin_write()
             delta = execute_mutation(self, command, expected_generation)
         if delta._resident_patch.replace_entries:
             self._publish_entries_installed("reset")
@@ -580,23 +635,72 @@ class AsyncDurableWritesMixin:
     def _before_committed_mutation(self: ConversationStore) -> None:
         """Test seam immediately before a dispatched mutation can write."""
 
+    def _materialization_prelude(
+        self: ConversationStore,
+        writer: ConversationStore,
+        baseline: _ResidentMutationBaseline,
+    ) -> CommittedDelta[Any] | None:
+        cursor = _cursor(writer)
+        current = (
+            cursor.identity,
+            cursor.offset,
+            cursor.mtime_ns,
+            cursor.prefix_fingerprint,
+            cursor.entry_prefix_digest,
+        )
+        if current == baseline.cursor:
+            return None
+        return CommittedDelta(
+            generation_before=baseline.generation,
+            generation_after=writer.conversation_generation,
+            committed_entries=(),
+            entries_to_install=writer._owned_installed_delta(tuple(writer._entries)),
+            _resident_patch=_ResidentPatch(
+                {field: copy.deepcopy(getattr(writer, field)) for field in _PATCH_FIELDS},
+                baseline.patch,
+                replace_entries=True,
+            ),
+            result=None,
+            log_cursor=cursor,
+            dedupe_key=None,
+            duplicate=False,
+        )
+
     def _run_committed_mutation(
         self: ConversationStore,
         command: ConversationMutation[Any],
         expected_generation: int,
-        cancelled_before_write: _MutationCancellation,
-    ) -> tuple[CommittedDelta[Any], Any]:
+        cancellation: _MutationCancellation,
+    ) -> _SubmittedMutationOutcome:
+        baseline = cancellation.context
+        assert isinstance(baseline, _ResidentMutationBaseline)
         writer: ConversationStore | None = None
+        prelude: CommittedDelta[Any] | None = None
         try:
             writer = self._durable_writer
             if writer is None:
                 writer = self._new_persistent_durable_writer()
                 self._durable_writer = writer
-            self._before_committed_mutation()
-            cancelled_before_write.begin_write()
+            with writer._append_lock():
+                pass
+            prelude = self._materialization_prelude(writer, baseline)
             self._after_committed_mutation_started()
-            delta = execute_mutation(writer, command, expected_generation)
-            return delta, writer.take_persisted_appends()
+            generation = (
+                writer.conversation_generation
+                if prelude is not None
+                else expected_generation
+            )
+            try:
+                delta = execute_mutation(writer, command, generation)
+            except BaseException as error:
+                if prelude is None:
+                    raise
+                return _SubmittedMutationOutcome(
+                    prelude, None, error, writer.take_persisted_appends()
+                )
+            return _SubmittedMutationOutcome(
+                prelude, delta, None, writer.take_persisted_appends()
+            )
         except (ConversationGenerationConflict, PendingPromptWriterReloadedError):
             raise
         except BaseException:
@@ -650,36 +754,61 @@ class AsyncDurableWritesMixin:
     async def _finish_submitted_mutation(
         self: ConversationStore,
         command: ConversationMutation[Any],
-        committed: tuple[CommittedDelta[Any], Any],
+        outcome: _SubmittedMutationOutcome,
     ) -> CommittedDelta[Any]:
-        delta, receipts = committed
         await self._before_committed_install()
-        installed: tuple[ConversationEntry, ...] | str = ()
+        installed: list[tuple[ConversationEntry, ...] | str] = []
         with self._durable_write_condition:
             if not self._closing and not self._closed:
-                installed = self._install_committed_delta(delta)
-            self._accept_persisted_appends(receipts)
+                if outcome.prelude is not None:
+                    installed.append(self._install_committed_delta(outcome.prelude))
+                if outcome.delta is not None:
+                    installed.append(self._install_committed_delta(outcome.delta))
+            self._accept_persisted_appends(outcome.receipts)
         await self._before_committed_publish()
-        if installed == "reset":
+        if "reset" in installed:
             self._publish_entries_installed("reset")
-        elif installed:
-            self._publish_prepared_entries_installed(installed)
+        else:
+            appended = tuple(
+                entry
+                for delta in installed
+                if delta
+                for entry in delta
+            )
+            if appended:
+                self._publish_prepared_entries_installed(appended)
+        if outcome.error is not None:
+            raise outcome.error
+        assert outcome.delta is not None
         if isinstance(command, _StoreMutationCommand):
             command.after_persisted()
-        return delta
+        return outcome.delta
 
     async def _commit_async_unlocked(
         self: ConversationStore,
         command: ConversationMutation[Any],
         expected_generation: int,
     ) -> CommittedDelta[Any]:
+        baseline = _ResidentMutationBaseline(
+            expected_generation,
+            (
+                self._log_identity,
+                self._log_offset,
+                self._log_mtime_ns,
+                self._log_prefix_fingerprint,
+                self._entry_prefix_digest,
+            ),
+            {field: copy.deepcopy(getattr(self, field)) for field in _PATCH_FIELDS},
+        )
         return await _submit_durable_mutation(
             command,
             lambda cancellation: self._run_committed_mutation(
                 command, expected_generation, cancellation
             ),
-            lambda committed: self._finish_submitted_mutation(command, committed),
+            lambda outcome: self._finish_submitted_mutation(command, outcome),
             before_submit=self._before_mutation_submit,
+            before_write=self._before_committed_mutation,
+            worker_context=baseline,
             submission_failed=self._mutation_submission_failed,
             cancelled=self._submitted_mutation_cancelled,
         )
