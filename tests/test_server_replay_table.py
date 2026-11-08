@@ -353,13 +353,13 @@ async def _connection_close(
     assert server.connections is not None and server._client is not None
     closed_connection = server._client
     released = asyncio.Event()
-    release_errors: list[BaseException] = []
+    release_errors: list[AttributeError] = []
     original_release = server.connections.release
 
     def release(connection: Any) -> None:
         try:
             original_release(connection)
-        except BaseException as exc:
+        except AttributeError as exc:
             release_errors.append(exc)
         finally:
             released.set()
