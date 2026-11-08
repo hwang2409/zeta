@@ -593,7 +593,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                         )
                     await self._finish_attempt(error)
                     self._closed = True
-                    raise error
+                    raise
                 context = getattr(error, "diagnostic_context", None)
                 if isinstance(context, dict):
                     context["max_progress_gap_s"] = self._maximum_progress_gap
