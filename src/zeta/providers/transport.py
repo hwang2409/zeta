@@ -55,13 +55,24 @@ async def encode_json_payload(
     body = bytearray()
     pending = 0
     for fragment in encoder.iterencode(payload):
-        for character in fragment:
-            encoded = character.encode()
-            body.extend(encoded)
-            pending += len(encoded)
-            if pending >= _JSON_YIELD_BYTES:
-                await asyncio.sleep(0)
-                pending = 0
+        # Encode moderate text slices, then split bytes only at UTF-8 boundaries.
+        for offset in range(0, len(fragment), 64 * 1024):
+            encoded = fragment[offset : offset + 64 * 1024].encode()
+            while encoded:
+                limit = min(_JSON_YIELD_BYTES - pending, len(encoded))
+                end = limit
+                while end < len(encoded) and end > 0 and encoded[end] & 0xC0 == 0x80:
+                    end -= 1
+                if end == 0:
+                    end = limit
+                    while end < len(encoded) and encoded[end] & 0xC0 == 0x80:
+                        end += 1
+                body.extend(encoded[:end])
+                encoded = encoded[end:]
+                pending += end
+                if pending >= _JSON_YIELD_BYTES:
+                    await asyncio.sleep(0)
+                    pending = 0
     return bytes(body)
 
 
