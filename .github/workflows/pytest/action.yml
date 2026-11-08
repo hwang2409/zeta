@@ -35,4 +35,15 @@ runs:
     # Report slow tests so future bottlenecks are visible in the CI logs.
     - name: Run the suite
       shell: bash
+      env:
+        ZETA_CAPTURE_OWNER_COUNTS: ${{ runner.temp }}/owner-counts.jsonl
       run: uv run ${{ inputs.python-version != '' && format('--python "{0}" ', inputs.python-version) || '' }}--frozen pytest -q -n 4 --dist worksteal --durations=25
+    - name: Print owner count capture
+      if: always()
+      shell: bash
+      run: |
+        echo 'OWNER_COUNTS_CAPTURE_BEGIN'
+        for artifact in "$RUNNER_TEMP"/owner-counts.jsonl.*.jsonl; do
+          test -f "$artifact" && cat "$artifact"
+        done
+        echo 'OWNER_COUNTS_CAPTURE_END'
