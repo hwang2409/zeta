@@ -751,7 +751,11 @@ class ZetaServer:
                 raise ValueError(f"unsupported run-work event: {event.value}")
             asyncio.create_task(awaitable)
 
-        connections.loop.call_soon_threadsafe(publish)
+        try:
+            connections.loop.call_soon_threadsafe(publish)
+        except RuntimeError:
+            if not connections.loop.is_closed():
+                raise
 
     @property
     def address(self) -> str:

@@ -4,6 +4,7 @@ import asyncio
 import shlex
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +97,47 @@ async def test_run_work_lists_and_cancels_real_task_and_publishes_todo(
         assert terminal["task"] == canceled
     finally:
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_todo_write_after_closed_server_loop_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    await request(
+        reader,
+        writer,
+        "hello",
+        "hello",
+        {"protocol_version": "1.2", "features": ["run_work"]},
+    )
+    await request(reader, writer, "new", "new_session", {"provider": "codex"})
+    store = server.runtime.opened.store
+    # test-contract: seam this is the post-commit edge that can race server teardown
+    todo_committed = store._todo_change_sink
+    assert todo_committed is not None
+    await close_serve(server, writer)
+
+    notifications: list[object] = []
+
+    async def record_notification(*args: object, **kwargs: object) -> None:
+        notifications.append((args, kwargs))
+
+    # test-contract: seam the test runner loop stays open, so inject the closed serve loop
+    monkeypatch.setattr(server.control, "_notify", record_notification)
+    closed_loop = asyncio.new_event_loop()
+    exception_contexts: list[dict[str, object]] = []
+    closed_loop.set_exception_handler(
+        lambda _loop, context: exception_contexts.append(context)
+    )
+    closed_loop.close()
+    server.connections = SimpleNamespace(loop=closed_loop)  # type: ignore[assignment]
+
+    todo_committed([{"content": "late write", "status": "pending"}])
+
+    assert notifications == []
+    assert exception_contexts == []
 
 
 @pytest.mark.asyncio
