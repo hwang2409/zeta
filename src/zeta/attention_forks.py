@@ -419,12 +419,19 @@ def create_discussion_fork(
             {**record.to_dict(), "fork_session_id": fork_id}
         )
         try:
-            current = attention_store.get(attention_id)
-            if current != record or current.status == "resolved":
-                if current.fork_session_id:
-                    return current.fork_session_id
-                raise ValueError("attention record changed during fork allocation")
-            attention_store.replace(bound_record)
+            reopened_source = manager.open(source_session_id, _read_only=True)
+            try:
+                current = attention_store.get(attention_id)
+                if (
+                    reopened_source.metadata != source_metadata
+                    or reopened_source.store.replay() != branch
+                    or current != record
+                    or current.status == "resolved"
+                ):
+                    raise ValueError("source changed during fork allocation")
+                attention_store.replace(bound_record)
+            finally:
+                reopened_source.store.close()
         except BaseException:
             try:
                 publication_succeeded = (

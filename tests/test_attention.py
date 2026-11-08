@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import threading
+import multiprocessing
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -579,57 +579,111 @@ def test_failed_fork_binding_removes_created_session(
     opened.store.close()
 
 
-def test_discussion_fork_releases_source_before_project_publication(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _create_gated_discussion_fork(
+    home: str,
+    source_session_id: str,
+    attention_id: str,
+    publication_started: object,
+    publication_release: object,
+    result: object,
 ) -> None:
-    opened = _session(tmp_path)
+    original = SessionManager._reconcile_project_link
+
+    def gated_publication(manager: SessionManager, session_id: str) -> None:
+        publication_started.set()  # type: ignore[attr-defined]
+        if not publication_release.wait(10):  # type: ignore[attr-defined]
+            raise AssertionError("fork project publication was not released")
+        original(manager, session_id)
+
+    SessionManager._reconcile_project_link = gated_publication
+    try:
+        fork_id = create_discussion_fork(
+            Path(home), source_session_id, attention_id
+        )
+    except BaseException as exc:  # noqa: BLE001 - reported to parent process
+        result.put(("rejected", type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
+    else:
+        result.put(("created", fork_id))  # type: ignore[attr-defined]
+
+
+def _delete_fork_source(home: str, source_session_id: str, result: object) -> None:
+    try:
+        SessionManager(Path(home)).delete(source_session_id)
+    except BaseException as exc:  # noqa: BLE001 - reported to parent process
+        result.put(("failed", type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
+    else:
+        result.put(("deleted",))  # type: ignore[attr-defined]
+
+
+def test_p06_8_discussion_fork_allocation_process_progress(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    opened = _session(tmp_path, project_id=project.project_id)
     anchor = opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
     attention = AttentionStore(opened.store.session_dir).request(
         session_id=opened.store.session_id,
-        project_id=None,
+        project_id=project.project_id,
         entry_id=anchor.id,
         entry_seq=anchor.seq,
         title="Question",
         why="Need a choice.",
     )
-    session_id = opened.store.session_id
+    source_session_id = opened.store.session_id
     opened.store.close()
 
-    publication_started = threading.Event()
-    metadata_updated = threading.Event()
-    real_create = SessionManager.create
-    errors: list[BaseException] = []
-    fork_ids: list[str] = []
-
-    def gated_create(self, *args, **kwargs):
-        publication_started.set()
-        assert metadata_updated.wait(10), (
-            "source session remained owned during fork project publication"
-        )
-        return real_create(self, *args, **kwargs)
-
-    def create_fork() -> None:
-        try:
-            fork_ids.append(create_discussion_fork(tmp_path, session_id, attention.id))
-        except BaseException as exc:  # noqa: BLE001 - joined below
-            errors.append(exc)
-            metadata_updated.set()
-
-    monkeypatch.setattr(SessionManager, "create", gated_create)
-    worker = threading.Thread(target=create_fork)
-    worker.start()
-    try:
-        assert publication_started.wait(10), "fork publication did not start"
-        SessionManager(tmp_path).rename(session_id, "updated during fork")
-        metadata_updated.set()
-    finally:
-        metadata_updated.set()
-        worker.join(10)
-    assert not worker.is_alive(), "fork creator did not finish"
-    assert not errors
-    assert len(fork_ids) == 1
-    assert SessionManager(tmp_path).read_metadata(session_id).name == (
-        "updated during fork"
+    context = multiprocessing.get_context("spawn")
+    publication_started = context.Event()
+    publication_release = context.Event()
+    fork_result = context.Queue()
+    deletion_result = context.Queue()
+    creator = context.Process(
+        target=_create_gated_discussion_fork,
+        args=(
+            str(tmp_path),
+            source_session_id,
+            attention.id,
+            publication_started,
+            publication_release,
+            fork_result,
+        ),
     )
+    deleter = context.Process(
+        target=_delete_fork_source,
+        args=(str(tmp_path), source_session_id, deletion_result),
+    )
+    creator.start()
+    try:
+        assert publication_started.wait(10), "fork project publication did not start"
+        deleter.start()
+        assert deletion_result.get(timeout=10) == ("deleted",), (
+            "public opposing mutation did not complete before fork project publication"
+        )
+        publication_release.set()
+        creator.join(10)
+        deleter.join(10)
+        assert not creator.is_alive(), "fork creator did not finish"
+        assert not deleter.is_alive(), "source deleter did not finish"
+        assert creator.exitcode == 0
+        assert deleter.exitcode == 0
+
+        outcome = fork_result.get(timeout=10)
+        assert outcome[0] == "rejected", "stale discussion fork was bound"
+        assert "not found" in outcome[2]
+        assert list(manager.sessions_dir.iterdir()) == [], (
+            "created fork was not cleaned"
+        )
+    finally:
+        publication_release.set()
+        for process in (creator, deleter):
+            if process.pid is not None and process.is_alive():
+                process.kill()
+            if process.pid is not None:
+                process.join(10)
+                process.close()
+        for result in (fork_result, deletion_result):
+            result.close()
+            result.join_thread()
