@@ -119,6 +119,62 @@ class ReconciliationState:
         return int(self._value["seq"])
 
     @property
+    def generation(self) -> int:
+        return int(self._value.get("generation", 0))
+
+    @property
+    def recovery_quarantine_id(self) -> str | None:
+        value = self._value.get("recovery_quarantine_id")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def recovery_cutoff(self) -> int | None:
+        value = self._value.get("recovery_cutoff")
+        return value if type(value) is int and value >= 0 else None
+
+    @property
+    def paused_for_recovery(self) -> bool:
+        return self._value.get("recovery_paused") is True
+
+    def reset_for_recovery(
+        self,
+        *,
+        generation: int,
+        retained_last_sequence: int = 0,
+        quarantine_id: str,
+        paused: bool,
+    ) -> None:
+        """Forget byte evidence and rescan the repaired transcript from byte zero."""
+        if type(generation) is not int or generation < 1:
+            raise ValueError("invalid recovery generation")
+        if type(retained_last_sequence) is not int or retained_last_sequence < 0:
+            raise ValueError("invalid recovery cutoff")
+        if not quarantine_id:
+            raise ValueError("invalid recovery quarantine id")
+        self._value["generation"] = generation
+        self._value["recovery_quarantine_id"] = quarantine_id
+        self._value["recovery_cutoff"] = retained_last_sequence
+        self._value["recovery_paused"] = paused
+        self._value["seq"] = retained_last_sequence
+        self._value["transcript_bytes"] = 0
+        self._value["transcript_tokens"] = 0
+        self._value["early_trigger_seq"] = min(
+            self.early_trigger_seq, retained_last_sequence
+        )
+        self._value["pending_failures"] = []
+        self._value["completed_ranges"] = []
+        self._value["terminal_receipts"] = []
+        self._value["last_failure"] = None
+        self._value["scanner_failure"] = None
+        self._publish("transcript-recovery")
+
+    def resume_recovery(self, quarantine_id: str) -> None:
+        if self.recovery_quarantine_id != quarantine_id:
+            raise ValueError("memory recovery quarantine does not match")
+        self._value["recovery_paused"] = False
+        self._publish("transcript-recovery-resumed")
+
+    @property
     def transcript_bytes(self) -> int:
         return int(self._value["transcript_bytes"])
 
@@ -742,9 +798,28 @@ class ReconciliationState:
             except FileNotFoundError:
                 pass
 
+    @staticmethod
+    def _recovery_fields(value: Mapping[str, Any]) -> dict[str, object]:
+        fields: dict[str, object] = {
+            "recovery_quarantine_id": None,
+            "recovery_cutoff": None,
+            "recovery_paused": False,
+        }
+        quarantine_id = value.get("recovery_quarantine_id")
+        if quarantine_id is None or isinstance(quarantine_id, str) and quarantine_id:
+            fields["recovery_quarantine_id"] = quarantine_id
+        cutoff = value.get("recovery_cutoff")
+        if cutoff is None or type(cutoff) is int and cutoff >= 0:
+            fields["recovery_cutoff"] = cutoff
+        paused = value.get("recovery_paused")
+        if type(paused) is bool:
+            fields["recovery_paused"] = paused
+        return fields
+
     def _read(self) -> dict[str, Any]:
         empty: dict[str, Any] = {
             "seq": 0,
+            "generation": 0,
             "transcript_bytes": 0,
             "transcript_tokens": 0,
             "early_trigger_seq": 0,
@@ -753,6 +828,9 @@ class ReconciliationState:
             "terminal_receipts": [],
             "last_failure": None,
             "scanner_failure": None,
+            "recovery_quarantine_id": None,
+            "recovery_cutoff": None,
+            "recovery_paused": False,
         }
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
@@ -762,6 +840,7 @@ class ReconciliationState:
             return empty
         for name in (
             "seq",
+            "generation",
             "transcript_bytes",
             "transcript_tokens",
             "early_trigger_seq",
@@ -781,6 +860,10 @@ class ReconciliationState:
             ):
                 empty[name] = candidate
         empty["last_failure"] = value.get("last_failure")
+        empty.update(self._recovery_fields(value))
+        for key, item in value.items():
+            if key not in empty:
+                empty[key] = item
         scanner_failure = value.get("scanner_failure")
         if isinstance(scanner_failure, dict):
             seq = scanner_failure.get("seq")
