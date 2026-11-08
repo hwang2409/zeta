@@ -2731,6 +2731,34 @@ def test_transcript_search_stays_anchored_at_the_tail_until_closed() -> None:
     assert not transcript.follow_tail
 
 
+def test_transcript_membership_indexes_track_mark_remove_and_clear() -> None:
+    class MembershipProbe(list[object]):
+        contains_calls = 0
+
+        def __contains__(self, value: object) -> bool:
+            self.contains_calls += 1
+            return super().__contains__(value)
+
+    transcript = TranscriptWidget()
+    user = transcript.append(Text("user"))
+    other = transcript.append(Text("other"))
+    transcript._units = MembershipProbe(transcript._units)
+
+    transcript.mark_user(user)
+
+    assert transcript._units.contains_calls == 0
+    assert transcript._user_units == [user]
+    transcript.remove(user)
+    assert user not in transcript.units
+    assert user not in transcript._unit_set
+    assert user not in transcript._user_unit_set
+    transcript.clear()
+    assert not transcript._unit_set
+    assert not transcript._user_unit_set
+    assert transcript.units == ()
+    assert other not in transcript._user_unit_set
+
+
 def test_transcript_user_jumps_skip_non_user_units() -> None:
     transcript = TranscriptWidget()
     first_user = transcript.append(Text("first user"))
