@@ -790,9 +790,12 @@ class AgentLoop(
         recovering_tool_limit = False
         consuming_notifications = False
         iteration_consuming_notifications = False
+        completion_limit = (
+            max_completions if max_completions is not None else self.max_turns
+        )
         while (
-            (max_completions if max_completions is not None else self.max_turns) is None
-            or turn_number < (max_completions if max_completions is not None else self.max_turns)
+            completion_limit is None
+            or turn_number < completion_limit
             or step_delivery.has_pending_edge
             or retrying_context
             or retrying_provider
@@ -1242,7 +1245,7 @@ class AgentLoop(
             )
         yield StreamEvent(
             StreamEventType.ERROR,
-            error=ErrorInfo("max_turns", f"maximum turns reached: {max_completions or self.max_turns}"),
+            error=ErrorInfo("max_turns", f"maximum turns reached: {completion_limit}"),
         )
         if self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")

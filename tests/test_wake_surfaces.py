@@ -118,7 +118,7 @@ async def test_serve_real_event_path_maps_wake_tool_with_negotiated_fidelity() -
         published.append((event, session_id, fields))
         return True
 
-    async def no_stale_approvals(_session_id: str | None) -> None:
+    def no_stale_approvals(_session_id: str | None) -> None:
         return None
 
     control._notify = publish  # type: ignore[method-assign]
