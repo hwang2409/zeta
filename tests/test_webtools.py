@@ -357,6 +357,32 @@ async def test_registry_reuses_fetch_connection(
 
 
 @pytest.mark.asyncio
+async def test_registry_never_replays_fetch_response_cookies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _KeepAliveServer(response_headers=b"Set-Cookie: session=secret\r\n")
+    await server.start()
+    _route_test_hosts(monkeypatch)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        for index, host in enumerate(("cookie-a.test", "cookie-b.test", "cookie-a.test")):
+            result = await registry.execute(
+                ToolCall(
+                    f"fetch-cookie-{index}",
+                    "fetch",
+                    {"url": f"http://{host}:{server.port}/"},
+                )
+            )
+            assert result["isError"] is False, result
+
+        assert "cookie" not in server.request_headers[1]
+        assert "cookie" not in server.request_headers[2]
+    finally:
+        await registry.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_registry_reuses_each_duckduckgo_origin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -482,13 +508,13 @@ async def test_registry_close_drains_in_flight_web_request(
         client = next(iter(registry.web_clients._anonymous.values())).client
 
         close_task.cancel()
+        response_gate.set()
+        await await_or_fail(request, what="in-flight fetch to release its web client")
         cancelled = await await_or_fail(
             asyncio.gather(close_task, return_exceptions=True),
             what="cancelled registry close caller to finish",
         )
         assert isinstance(cancelled[0], asyncio.CancelledError)
-        response_gate.set()
-        await await_or_fail(request, what="in-flight fetch to release its web client")
         async with registry.web_clients._condition:
             pass
         assert client.is_closed, "cancelled registry close left its web client open"
