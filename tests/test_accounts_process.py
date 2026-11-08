@@ -231,3 +231,74 @@ async def test_console_serve_starts_when_only_non_active_accounts_are_missing(
     finally:
         await _stop_process(process, output, "serve shutdown")
         Path(f"{socket_path}.lock").unlink(missing_ok=True)
+
+
+def _account_files(home: Path) -> dict[str, bytes]:
+    root = home / "accounts"
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _headless_start(home: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        (_entrypoint(), "--provider", "codex", "-p", "/status"),
+        cwd=Path.cwd(),
+        env=_environment(home),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_PROCESS_TIMEOUT,
+    )
+
+
+@pytest.mark.parametrize(
+    ("registry", "warning"),
+    [
+        (None, "accounts.json is missing; kept every account directory"),
+        (b"{not json\n", "accounts.json is invalid; kept it and every account"),
+    ],
+    ids=("missing", "broken"),
+)
+def test_start_without_a_loaded_registry_keeps_every_account_file(
+    tmp_path: Path, registry: bytes | None, warning: str
+) -> None:
+    accounts = (AccountId("codex", "work"), AccountId("anthropic", "personal"))
+    build_account_home(tmp_path, accounts, available=accounts, defaults=accounts)
+    for account in accounts:
+        usage = tmp_path / "accounts" / account.provider / account.name / "usage.json"
+        usage.write_text('{"version": 1}\n')
+    if registry is None:
+        (tmp_path / "accounts.json").unlink()
+    else:
+        (tmp_path / "accounts.json").write_bytes(registry)
+    before = _account_files(tmp_path)
+
+    result = _headless_start(tmp_path)
+
+    assert _account_files(tmp_path) == before, result.stderr
+    assert warning in result.stderr
+    if registry is None:
+        assert not (tmp_path / "accounts.json").exists()
+    else:
+        assert (tmp_path / "accounts.json").read_bytes() == registry
+
+
+def test_start_with_a_loaded_registry_still_sweeps_an_orphan_directory(
+    tmp_path: Path,
+) -> None:
+    account = AccountId("codex", "work")
+    build_account_home(tmp_path, (account,), available=(account,), defaults=(account,))
+    orphan = tmp_path / "accounts" / "codex" / "deleted"
+    orphan.mkdir(mode=0o700)
+    (orphan / "oauth.json").write_text("secret")
+    kept = _account_files(tmp_path)
+    del kept["codex/deleted/oauth.json"]
+
+    result = _headless_start(tmp_path)
+
+    assert not orphan.exists(), result.stderr
+    assert _account_files(tmp_path) == kept

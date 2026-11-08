@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import hashlib
 import json
+import logging
 import os
-import re
 import stat
 import threading
 import time
@@ -18,14 +17,12 @@ from contextlib import (
     asynccontextmanager,
     contextmanager,
 )
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 import httpx
 
 from ..core.session_files import (
-    SessionFileReplaced,
     child_directory,
     open_session_file,
     read_session_file,
@@ -39,12 +36,9 @@ from ..oauth import (
     credential_file_lock,
 )
 from ..storage_format import (
-    CLOSED_VARIANTS,
     DeleteValue,
     SetValue,
     open_writer,
-    reject_unknown_keys,
-    require_closed_variant,
 )
 from . import availability
 from .files import (
@@ -63,57 +57,20 @@ from .files import (
     read_optional_bytes as _read_optional_bytes,
 )
 from .publication import atomic_publish, publish_mapping
+from .registry import (
+    _PROVIDERS,
+    _UNSAFE_REGISTRY_WARNINGS,
+    AccountError,
+    AccountId,
+    _account_label,
+    _AccountRegistry,
+    _publication_record,
+    _read_publication_pending,
+    _Registry,
+    _registry_reference_index,
+)
 
-_PROVIDERS = cast(frozenset[str], CLOSED_VARIANTS["account.provider"])
-_MAX_SWEEP_WARNING_PATHS = 5
-_SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
-
-
-def _account_label(value: str) -> str:
-    if type(value) is not str:
-        raise ValueError("invalid account label")
-    label = value.lower()
-    if not _SLUG.fullmatch(label):
-        raise ValueError("invalid account label")
-    return label
-
-
-def _registry_reference_index(
-    value: Mapping[str, Any],
-) -> dict[tuple[str, str], AccountId]:
-    accounts = value["accounts"]
-    labels = value["labels"]
-    references: dict[tuple[str, str], AccountId] = {}
-    for key, metadata in accounts.items():
-        if not isinstance(key, str) or not isinstance(metadata, Mapping):
-            raise TypeError
-        provider, name = key.split(":", 1)
-        require_closed_variant("account.provider", provider)
-        account = AccountId(provider, name)
-        if key != str(account) or any(
-            metadata.get(field) != expected
-            for field, expected in {
-                "provider": account.provider,
-                "name": account.name,
-            }.items()
-        ):
-            raise ValueError
-        label = labels.get(key, account.name)
-        if _account_label(label) != label:
-            raise ValueError
-        for reference in {account.name, label}:
-            previous = references.setdefault((account.provider, reference), account)
-            if previous != account:
-                raise ValueError
-    if set(labels) - set(accounts):
-        raise ValueError
-    return references
-
-
-class AccountError(RuntimeError):
-    """A credential-safe account-store error."""
-
-
+logger = logging.getLogger(__name__)
 class AccountCredentialLockTimeoutError(AccountError):
     """An account operation could not acquire its lifecycle lock in time."""
 
@@ -132,22 +89,7 @@ class AccountLoopThreadLockError(AccountError):
     """A blocking account lock was requested on an asyncio loop thread."""
 
 
-@dataclass(frozen=True, slots=True)
-class AccountId:
-    provider: str
-    name: str
-
-    def __post_init__(self) -> None:
-        name = self.name.lower()
-        if self.provider not in _PROVIDERS or not _SLUG.fullmatch(name):
-            raise ValueError("invalid account id")
-        object.__setattr__(self, "name", name)
-
-    def __str__(self) -> str:
-        return f"{self.provider}:{self.name}"
-
-
-class AccountStore:
+class AccountStore(_AccountRegistry):
     """Own the durable account catalog, credentials, and process locks."""
 
     def __init__(self, home: str | Path) -> None:
@@ -505,6 +447,7 @@ class AccountStore:
         value = value or self._read_registry(home_fd)
         self._check_reference_available(value, account, account.name)
         key = str(account)
+        self._refuse_orphaning_registration(home_fd, account)
         value["accounts"][key] = {
             "provider": account.provider,
             "name": account.name,
@@ -528,102 +471,28 @@ class AccountStore:
                 return ()
             with self._lock_at(home_fd, ".accounts-migration.lock"):
                 with self._registry_guard(home_fd):
-                    self._sweep_orphan_directories(home_fd, warnings)
+                    state, value = self._load_registry(home_fd)
+                    if state is _Registry.LOADED:
+                        self._sweep_orphan_directories(
+                            home_fd, set(value["accounts"]), warnings
+                        )
+                    elif (
+                        state is _Registry.BROKEN
+                        or self._has_unregistered_account_directories(home_fd, set())
+                    ):
+                        warnings.append(_UNSAFE_REGISTRY_WARNINGS[state])
+                        logger.warning("%s", warnings[-1])
+                    if state is _Registry.BROKEN:
+                        return tuple(warnings)
                 for provider in ("anthropic", "codex"):
                     self._migrate_provider(home_fd, provider)
         return tuple(warnings)
 
-    def _list_orphan_directories(
-        self, home_fd: int, registered: set[str]
-    ) -> list[tuple[str, str, str, set[str]]]:
-        orphans: list[tuple[str, str, str, set[str]]] = []
-        for root, allowed in (
-            ("accounts", {"oauth.json", "usage.json", "publish-pending.json"}),
-            ("account-locks", {"lifecycle.lock", "usage.lock"}),
-        ):
-            try:
-                with child_directory(home_fd, root) as root_fd:
-                    for provider in _PROVIDERS:
-                        try:
-                            with child_directory(root_fd, provider) as provider_fd:
-                                names = [
-                                    (
-                                        name,
-                                        stat.S_ISDIR(
-                                            os.stat(
-                                                name,
-                                                dir_fd=provider_fd,
-                                                follow_symlinks=False,
-                                            ).st_mode
-                                        ),
-                                    )
-                                    for name in sorted(os.listdir(provider_fd))
-                                ]
-                        except FileNotFoundError:
-                            continue
-                        orphans.extend(
-                            (root, provider, name, allowed)
-                            for name, is_directory in names
-                            if is_directory and f"{provider}:{name}" not in registered
-                        )
-            except FileNotFoundError:
-                continue
-        return orphans
+    def refuse_orphaning_registration(self, account: AccountId) -> None:
+        """Fail before a login starts if its registration would be refused."""
 
-    def _orphan_is_pending_publication(
-        self, home_fd: int, root: str, provider: str, name: str
-    ) -> bool:
-        if root != "accounts":
-            return False
-        account = AccountId(provider, name)
-        try:
-            with (
-                child_directory(home_fd, root) as root_fd,
-                child_directory(root_fd, provider) as provider_fd,
-                child_directory(provider_fd, name) as account_fd,
-            ):
-                pending = _read_publication_pending(account_fd)
-                credential = _read_optional_bytes(account_fd, "oauth.json")
-        except FileNotFoundError:
-            return True
-        return (
-            pending is not None
-            and credential is not None
-            and pending == _publication_record(account, credential)
-        )
-
-    def _remove_orphan_directory(
-        self, home_fd: int, root: str, provider: str, name: str, allowed: set[str]
-    ) -> str | None:
-        from .logout import remove_account_directory, sweep_warning_path
-
-        try:
-            remove_account_directory(home_fd, root, (provider, name), allowed=allowed)
-        except (AccountError, OSError, ValueError):
-            return sweep_warning_path(self.home / root / provider / name)
-        return None
-
-    def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
-        registered, refused = set(self._read_registry(home_fd)["accounts"]), []
-        for root, provider, name, allowed in self._list_orphan_directories(
-            home_fd, registered
-        ):
-            try:
-                if self._orphan_is_pending_publication(home_fd, root, provider, name):
-                    continue
-            except ValueError:
-                pass
-            path = self._remove_orphan_directory(home_fd, root, provider, name, allowed)
-            if path is not None:
-                refused.append(path)
-        warnings.extend(
-            f"could not clean up account directory {path}; check its mode or ownership, then delete it or fix it"
-            for path in refused[:_MAX_SWEEP_WARNING_PATHS]
-        )
-        if len(refused) > _MAX_SWEEP_WARNING_PATHS:
-            warnings.append(
-                f"and {len(refused) - _MAX_SWEEP_WARNING_PATHS} more account directories could not be cleaned up"
-            )
+        with self._home() as home_fd:
+            self._refuse_orphaning_registration(home_fd, account)
 
     def _migrate_provider(self, home_fd: int, provider: str) -> None:
         account = AccountId(provider, "default")
@@ -634,6 +503,8 @@ class AccountStore:
             self._lifecycle_guard(home_fd, account),
             credential_file_lock(legacy_path),
         ):
+            if self._registering_would_orphan(home_fd, account):
+                return
             value = self._read_registry(home_fd)
             registered = str(account) in value["accounts"]
             legacy_exists = _exists_regular(home_fd, legacy_name)
@@ -658,49 +529,6 @@ class AccountStore:
             with _open_account_directory(home_fd, account) as account_fd:
                 _delete_publication_pending(account_fd)
             _unlink_legacy(home_fd, legacy_name)
-
-    def _read_registry(self, home_fd: int) -> dict[str, Any]:
-        try:
-            for attempt in range(5):
-                try:
-                    raw = _read_optional(home_fd, "accounts.json")
-                    break
-                except SessionFileReplaced:
-                    if attempt == 4:
-                        raise
-            if raw is None:
-                return {"version": 1, "accounts": {}, "defaults": {}, "labels": {}}
-            value = json.loads(raw)
-            if (
-                not isinstance(value, Mapping)
-                or require_closed_variant(
-                    "account_registry.version", value.get("version")
-                )
-                != 1
-                or not isinstance(value.get("accounts"), Mapping)
-                or not isinstance(value.get("defaults"), Mapping)
-                or not isinstance(value.get("labels", {}), Mapping)
-            ):
-                raise ValueError
-            accounts = dict(value["accounts"])
-            defaults = dict(value["defaults"])
-            labels = dict(value.get("labels", {}))
-            normalized = {
-                "version": 1,
-                "accounts": accounts,
-                "defaults": defaults,
-                "labels": labels,
-            }
-            _registry_reference_index(normalized)
-            for provider, key in defaults.items():
-                if not isinstance(provider, str) or not isinstance(key, str):
-                    raise TypeError
-                require_closed_variant("account.provider", provider)
-                if key not in accounts or not key.startswith(f"{provider}:"):
-                    raise ValueError
-            return normalized
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise AccountError("accounts.json is invalid; use /accounts") from exc
 
     def _stage_account_tokens(
         self, account_fd: int, account: AccountId, tokens: OAuthTokens
@@ -945,6 +773,7 @@ class AccountCredentials:
         if registered:
             self._write(home_fd, tokens)
             return
+        self.store._refuse_orphaning_registration(home_fd, self.account)
         with _account_directory(home_fd, self.account) as account_fd:
             self.store._stage_account_tokens(account_fd, self.account, tokens)
         self.store._register_account(home_fd, self.account, value)
@@ -1106,37 +935,6 @@ def _open_account_directory(home_fd: int, account: AccountId) -> Iterator[int]:
 
 def _token_bytes(tokens: OAuthTokens) -> bytes:
     return (json.dumps(tokens.to_dict(), separators=(",", ":")) + "\n").encode()
-
-
-def _publication_record(account: AccountId, credential: bytes) -> dict[str, str]:
-    return {
-        "provider": account.provider,
-        "name": account.name,
-        "sha256": hashlib.sha256(credential).hexdigest(),
-    }
-
-
-def _read_publication_pending(directory_fd: int) -> dict[str, str] | None:
-    raw = _read_optional(directory_fd, "publish-pending.json")
-    if raw is None:
-        return None
-    try:
-        value = json.loads(raw)
-        if isinstance(value, Mapping):
-            reject_unknown_keys(value, "account_publication_marker")
-        if (
-            not isinstance(value, Mapping)
-            or require_closed_variant("account.provider", value["provider"])
-            != value["provider"]
-            or not isinstance(value["name"], str)
-            or not _SLUG.fullmatch(value["name"])
-            or not isinstance(value["sha256"], str)
-            or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
-        ):
-            raise ValueError
-        return dict(value)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
 
 
 def _delete_publication_pending(directory_fd: int) -> None:
