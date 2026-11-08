@@ -22,7 +22,7 @@ from zeta.agent.finish_gate import finish_gate_message
 from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
-from zeta.core.context import ContextAssembler
+from zeta.core.context import AssembledContext, ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
 from zeta.protocol.types import (
@@ -448,6 +448,7 @@ async def test_runtime_prepares_context_once_without_sync_preflight(
         preflight_calls += 1
         return False
 
+    # test-contract: seam instrumentation verifies one runtime preparation.
     monkeypatch.setattr(loop.context_assembler, "_prepare_assembly", observed_prepare)
     monkeypatch.setattr(loop.context_assembler, "needs_compaction", unexpected_preflight)
 
@@ -455,6 +456,66 @@ async def test_runtime_prepares_context_once_without_sync_preflight(
 
     assert calls == 1
     assert preflight_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_compaction_start_precedes_durable_assembly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    order: list[str] = []
+    starts = 0
+    assembler = loop.context_assembler
+    message = Message(MessageRole.USER, [TextContent("prepared")])
+
+    async def prepare_context(**kwargs):  # type: ignore[no-untyped-def]
+        order.append("prepare")
+        return True
+
+    async def assemble(**kwargs):  # type: ignore[no-untyped-def]
+        order.append("durable-compaction")
+        assembler.last_context = AssembledContext([message], 1, compacted=True)
+        return [message]
+
+    monkeypatch.setattr(assembler, "prepare_context", prepare_context)
+    monkeypatch.setattr(assembler, "assemble", assemble)
+    events = await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
+    starts = sum(event.type is StreamEventType.COMPACTION_START for event in events)
+
+    assert starts == 1
+    assert order == ["prepare", "durable-compaction"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancellation_after_compaction_start_discards_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    assembler = loop.context_assembler
+    sentinel = object()
+
+    async def prepare_context(**kwargs):  # type: ignore[no-untyped-def]
+        assembler._prepared_assembly = sentinel  # type: ignore[assignment]
+        return True
+
+    async def assemble(**kwargs):  # type: ignore[no-untyped-def]
+        pytest.fail("durable assembly must not run after cancellation")
+
+    monkeypatch.setattr(assembler, "prepare_context", prepare_context)
+    monkeypatch.setattr(assembler, "assemble", assemble)
+    run = loop.run_turn("hi", origin=MessageOrigin.USER)
+    while True:
+        event = await asyncio.wait_for(anext(run), 10)
+        if event.type is StreamEventType.COMPACTION_START:
+            break
+
+    assert assembler._prepared_assembly is sentinel
+    await asyncio.wait_for(run.aclose(), 10)
+    assert assembler._prepared_assembly is None
 
 
 @pytest.mark.asyncio
