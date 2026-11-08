@@ -700,7 +700,13 @@ class AccountStore:
                     raise ValueError
             return normalized
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise AccountError("accounts.json is invalid; use /accounts") from exc
+            raise self._invalid_registry_error() from exc
+
+    def _invalid_registry_error(self) -> AccountError:
+        return AccountError(
+            f"accounts.json is not valid: {self.registry}; move it aside to a backup, "
+            "then run login again or restore it from a backup"
+        )
 
     def _stage_account_tokens(
         self, account_fd: int, account: AccountId, tokens: OAuthTokens
@@ -726,7 +732,7 @@ class AccountStore:
         try:
             _registry_reference_index(value)
         except (KeyError, TypeError, ValueError) as exc:
-            raise AccountError("accounts.json is invalid; use /accounts") from exc
+            raise self._invalid_registry_error() from exc
         raw = _read_optional(home_fd, "accounts.json")
         current = json.loads(raw) if raw is not None else {}
         mutations = [
