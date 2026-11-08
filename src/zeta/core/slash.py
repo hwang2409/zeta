@@ -547,9 +547,20 @@ class SlashStatus:
     explicit_finish: bool = False
     connection_setup_counts: tuple[dict[str, object], ...] = ()
     max_agent_depth: int = 3
+    unavailable_accounts: tuple[str, ...] = ()
 
 
 class SlashSession(Protocol):
+    plan_mode: bool
+    active: bool
+    pending_approvals: object
+
+    def set_plan_mode(self, enabled: bool) -> Awaitable[None] | None: ...
+
+    def invalidate_prompt(self) -> None: ...
+
+    def plan_mode_background_blocker(self) -> str | None: ...
+
     def slash_status_command(self, args: str) -> str: ...
 
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope: ...
@@ -686,6 +697,7 @@ def _format_status(status: SlashStatus) -> str:
         f"tokens_in_current_context: {context_tokens}",
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
+        "unavailable_accounts: " + (", ".join(status.unavailable_accounts) or "none"),
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
         status.mcp_summary,
         "usage:",
@@ -935,11 +947,6 @@ def _memory_read_only(args: str) -> bool:
     return action in {"", "retry", "log"} or action.startswith("log ")
 
 
-def _mcp_read_only(_args: str) -> bool:
-    # MCP status can initialize and reconcile the live mount on the event loop.
-    return False
-
-
 def _vim_mutates(args: str) -> bool:
     return args.strip().lower() in {"on", "off", "toggle"}
 
@@ -997,7 +1004,7 @@ def create_slash_registry(
             "show MCP server status",
             ServeSlash(
                 mutates=_mcp_mutates,
-                runs_while_busy=_mcp_read_only,
+                runs_while_busy=_never_mutates,
             ),
         )
     )
@@ -1023,9 +1030,18 @@ def create_slash_registry(
             ),
         )
     )
-    registry.register(SlashCommand("plan", _run_plan, "show or change plan mode"))
     registry.register(
-        SlashCommand("implement", _run_implement, "implement the proposed plan")
+        SlashCommand(
+            "plan",
+            _run_plan,
+            "show or change plan mode",
+            ServeSlash(),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "implement", _run_implement, "implement the proposed plan", ServeSlash()
+        )
     )
     instruction_handler = lambda session, args: project_instructions_command(
         session,
