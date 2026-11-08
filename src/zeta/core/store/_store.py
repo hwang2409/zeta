@@ -101,9 +101,11 @@ from ._validation import (
     NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
 )
+from .recent_rows import RecentRowsMixin
 
 
 class ConversationStore(
+    RecentRowsMixin,
     ApprovalHistoryStoreMixin,
     AsyncDurableWritesMixin,
     PendingPromptStoreMixin,
