@@ -3623,8 +3623,12 @@ async def _run_post_cap_tool_cycle(
         what="root turn",
     )
 
-    exhausted_wait = asyncio.create_task(backend.post_cap_exhausted.wait())
-    terminal_wait = asyncio.create_task(terminal_published.wait())
+    exhausted_wait = asyncio.create_task(
+        asyncio.wait_for(backend.post_cap_exhausted.wait(), 10)
+    )
+    terminal_wait = asyncio.create_task(
+        asyncio.wait_for(terminal_published.wait(), 10)
+    )
     done, pending = await await_or_fail(
         asyncio.wait(
             {exhausted_wait, terminal_wait}, return_when=asyncio.FIRST_COMPLETED
@@ -3635,7 +3639,10 @@ async def _run_post_cap_tool_cycle(
     assert terminal_wait not in done
     for task in pending:
         task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(*pending, return_exceptions=True),
+        what="post-cap wait cleanup",
+    )
 
     child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
     if send_fresh_prompt:
@@ -9495,6 +9502,7 @@ async def test_root_delivery_committed_after_terminal_check_rearms_idle_wake(
                 flow.produce(_task_exit_input("terminal-race"))
             )
 
+    # test-contract: seam force the terminal-check/notification-commit ordering
     monkeypatch.setattr(loop, "_schedule_transcript_index", schedule_and_produce)
     loop.set_background_wake_callback(woke.set)
     events: list[StreamEvent] = []
