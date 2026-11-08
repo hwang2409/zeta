@@ -207,7 +207,12 @@ class ServerSlashSession:
         displays = await asyncio.to_thread(context.store.list_display)
         lines: list[str] = []
         for item in displays:
-            lines.append(str(item) + (f"  {item.detail}" if item.detail else ""))
+            availability = (
+                "  unavailable: credentials missing" if not item.available else ""
+            )
+            lines.append(
+                str(item) + (f"  {item.detail}" if item.detail else "") + availability
+            )
             lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
         return "\n".join(lines) or "no accounts"
 

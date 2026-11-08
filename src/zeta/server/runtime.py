@@ -691,6 +691,9 @@ class ServerRuntime:
             project_id=project_id,
             on_plan_mode_change=persist_plan_mode,
             post_stream_provider_retry=self._post_stream_provider_retry,
+            require_selected_account=(
+                self.backend_factory is None and not self._test_scripted_provider
+            ),
             **kwargs,
         )
         metadata = composition.opened.metadata
