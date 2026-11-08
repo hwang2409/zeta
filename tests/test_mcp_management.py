@@ -1380,6 +1380,28 @@ async def test_transaction_refuses_project_recreated_after_lock_decision(
 
 
 @pytest.mark.asyncio
+async def test_project_scope_returns_after_missing_root_is_recreated(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    manager = MCPManagementService(home=tmp_path / "home", project_dir=project)
+    try:
+        assert (await manager.refresh()).entries == ()
+        assert not project.exists()
+        project.mkdir()
+        # test-contract: durability a missing root must not stay unavailable
+        await manager.add("back", scope="project", command=sys.executable)
+        config = json.loads((project / ".zeta" / "mcp.json").read_text())
+        assert "back" in config["servers"]
+        snapshot = await manager.refresh()
+        assert [(item.name, item.scope) for item in snapshot.entries] == [
+            ("back", "project")
+        ]
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
 async def test_failed_transaction_does_not_poison_next_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

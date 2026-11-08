@@ -549,12 +549,14 @@ class MCPManagementService:
             path for path in (home_path, project_path, trust_path) if path is not None
         )
         handles, unavailable = self._acquire_locks(paths)
-        if project_path in unavailable:
-            project_path = None
+        # A missing project root is unavailable for this transaction only; the
+        # candidate keeps the canonical path so a recreated root works again.
+        usable_project = None if project_path in unavailable else project_path
         try:
             if mutation is not None:
-                mutation(home_path, project_path, trust_path)
-            return self._candidate_locked(home_path, project_path, trust_path)
+                mutation(home_path, usable_project, trust_path)
+            candidate = self._candidate_locked(home_path, usable_project, trust_path)
+            return replace(candidate, project_path=project_path)
         finally:
             self._release_locks(handles)
 
