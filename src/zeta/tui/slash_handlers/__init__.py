@@ -32,7 +32,10 @@ from ...core.session import (
     persist_metadata_change,
 )
 from ...core.slash import SlashStatus, _format_status
-from ...core.transcript_recovery.runtime import repair_transcript_for_runtime
+from ...core.transcript_recovery.runtime import (
+    TranscriptRepairRequiresUpgrade,
+    repair_transcript_for_runtime,
+)
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
@@ -752,13 +755,16 @@ class SlashHandlerMixin:
         if len(parts) not in {2, 3} or parts[-1] != "confirm":
             return "usage: /repair-transcript <session-id> [<child-run-id>] confirm"
         child_run_id = parts[1] if len(parts) == 3 else None
-        result = await repair_transcript_for_runtime(
-            self.loop.manager,
-            parts[0],
-            child_run_id,
-            parent_store=self.loop.store,
-            memory_reconciler=getattr(self.loop, "memory_reconciler", None),
-        )
+        try:
+            result = await repair_transcript_for_runtime(
+                self.loop.manager,
+                parts[0],
+                child_run_id,
+                parent_store=self.loop.store,
+                memory_reconciler=getattr(self.loop, "memory_reconciler", None),
+            )
+        except TranscriptRepairRequiresUpgrade as exc:
+            return str(exc)
         return (
             f"repaired transcript {parts[0]}"
             + (f" child {child_run_id}" if child_run_id is not None else "")

@@ -789,6 +789,63 @@ async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_pat
     )
 
 
+@pytest.mark.parametrize("bad_row", [b'{"broken":\n', b'{"broken":'])
+@pytest.mark.asyncio
+async def test_epoch_two_tui_repair_command_returns_upgrade_message(
+    tmp_path: Path,
+    bad_row: bytes,
+) -> None:
+    from tests.support.owned import await_or_fail, owned_app
+    from tests.support.submissions import await_submission_pipeline
+    from zeta.core.session import SessionManager
+
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
+    manager = SessionManager(tmp_path)
+    current = await await_or_fail(
+        asyncio.to_thread(
+            manager.create,
+            provider="codex",
+            model="offline",
+            cwd=tmp_path,
+            auto_project=False,
+        ),
+        what="create current session",
+    )
+    transcript = current.store.path
+    transcript.write_bytes(transcript.read_bytes() + bad_row)
+    loop = AgentLoop(FakeBackend([]), current.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    rendered = StringIO()
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        zeta_home=tmp_path,
+        console=Console(file=rendered, force_terminal=False, width=200),
+    )
+    unchanged = {
+        str(path.relative_to(tmp_path)): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and not path.name.startswith(".storage-format")
+    }
+    async with owned_app(app):
+        app._input_loop_active = True
+        await app._handle_prompt_value(
+            f"/repair-transcript {current.metadata.session_id} confirm"
+        )
+        await await_submission_pipeline(app)
+        output = rendered.getvalue().strip()
+        assert output == (
+            "system · transcript repair needs the stored-format upgrade "
+            "(home epoch 2, needs 4)"
+        )
+        assert {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file() and not path.name.startswith(".storage-format")
+        } == unchanged
+
+
 @pytest.mark.asyncio
 async def test_tui_current_session_repair_updates_live_memory_owner(
     tmp_path: Path,
