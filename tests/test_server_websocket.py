@@ -542,11 +542,13 @@ async def test_websocket_prints_connect_url_once_without_logging_token(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
     server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
-    with caplog.at_level(logging.DEBUG):
-        await server.start()
+    caplog.set_level(logging.DEBUG)
+    await server.start()
+    try:
         assert server._websocket is not None
         token = server._websocket.token
         port = server._websocket.port
+    finally:
         await close_serve(server)
     captured = capsys.readouterr()
     assert captured.out == ""
