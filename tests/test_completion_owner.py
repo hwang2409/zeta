@@ -21,11 +21,13 @@ from zeta.providers.completion import (
     CompletionRetryBudget,
     CompletionRun,
     DeadlineClock,
+    IteratorProviderAttempt,
     ProviderAttempt,
     ResetPolicy,
     TaskDeadlineExceeded,
     TransportActivity,
 )
+from zeta.providers.transport import HTTPClientLease
 
 
 async def _within[T](awaitable: Awaitable[T]) -> T:
@@ -778,3 +780,42 @@ async def test_outer_cancel_during_task_deadline_drain_waits_for_close() -> None
         if not closing.done():
             closing.cancel()
         await _within(asyncio.gather(closing, return_exceptions=True))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "serve close hangs: a cancelled IteratorProviderAttempt.aclose leaves the "
+        "source generator holding its HTTP lease borrow, so HTTPClientLease.aclose "
+        "waits forever at transport.py `_close_owned` `await self._drained.wait()`"
+    ),
+)
+@pytest.mark.asyncio
+async def test_cancelled_attempt_close_still_lets_the_lease_close() -> None:
+    # The shape the bench serve probe hung in (4 of 286 local runs): the wake
+    # turn's Ollama stream reached MESSAGE_END, then a second cancellation hit
+    # the attempt's close, and server close waited on the lease forever.
+    lease = HTTPClientLease(None)
+
+    async def source():
+        async with lease.borrow():  # as OllamaBackend._complete_once does
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(StreamEventType.MESSAGE_END)
+
+    attempt = IteratorProviderAttempt(source())
+    try:
+        await await_or_fail(attempt.__anext__(), what="first event")
+        await await_or_fail(attempt.__anext__(), what="last event")
+        closing = asyncio.create_task(attempt.aclose())
+        await asyncio.sleep(0)  # one step: close has cancelled the producer and waits on it
+        closing.cancel()
+        await await_or_fail(
+            asyncio.gather(closing, return_exceptions=True), what="cancelled close"
+        )
+        await await_or_fail(attempt.aclose(), what="retried close")
+
+        assert lease._active_borrows == 0, "the closed attempt still holds a borrow"
+        await await_or_fail(lease.aclose(), what="lease close")
+    finally:
+        if not lease.client.is_closed:
+            await lease.client.aclose()
