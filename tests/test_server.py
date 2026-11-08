@@ -1327,6 +1327,44 @@ async def test_session_history_and_subscribe_joins_live_sequence_on_unix_socket(
 
 
 @pytest.mark.asyncio
+async def test_session_replay_join_admits_response_before_held_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = _Client._write_physical
+
+    async def gated(client: _Client, payload: bytes) -> bool:
+        if b'"id":3' in payload:
+            entered.set()
+            await release.wait()
+        return await original(client, payload)
+
+    monkeypatch.setattr(_Client, "_write_physical", gated)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1", "features": ["session_replay_seq"]})
+        session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
+        join = asyncio.create_task(_request(reader, writer, 3, "session_history_and_subscribe", {"session_id": session["session_id"]}))
+        await await_or_fail(entered.wait(), what="join response write")
+        for _ in range(3):
+            await server.control._notify(EventDescriptor.TURN_START, session["session_id"], data={})
+        release.set()
+        assert (await join)[-1]["result"]["replay"]["history_seq"] == 0
+        events = [await _event(reader, "turn_start") for _ in range(3)]
+        assert [event["seq"] for event in events] == [1, 2, 3]
+    finally:
+        release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("decision", ["allow", "deny", "abort"])
 async def test_session_history_matches_live_approval_lifecycle(
     tmp_path: Path, decision: str

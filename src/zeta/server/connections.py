@@ -319,6 +319,21 @@ class ConnectionRegistry:
     def replay_session_replaced(self) -> None:
         self.replay.session_replaced()
 
+    def _discard_replay_scope(self, scope: ReplayScopeId) -> None:
+        for state in tuple(self._connections.values()):
+            output = state.output
+            if output is None:
+                continue
+            kept: deque[_OutputFrame] = deque()
+            while output.queue:
+                item = output.queue.popleft()
+                if item.replay_scope == scope:
+                    self._finish_frame_accounting(output, item)
+                else:
+                    kept.append(item)
+            output.queue = kept
+            self._assert_retained_accounting(output)
+
     def _publish_replay(
         self,
         state: _Connection,
@@ -329,14 +344,17 @@ class ConnectionRegistry:
     ) -> bool:
         if "session_replay_seq" not in state.features or session_id is None:
             return False
+        scope = ReplayScopeId.top(session_id)
         published = self.replay.publish(
             state.connection,
-            ReplayScopeId.top(session_id),
+            scope,
             event,
             {**fields, "_session_id": session_id},
             frame_size,
         )
         if published is None:
+            for invalidated in self.replay.take_invalidated():
+                self._discard_replay_scope(invalidated)
             return False
         payload = {"stream_id": published.stream_id, "seq": published.seq, **fields}
         replay_scope = payload.pop("_replay_scope", None)
@@ -363,27 +381,39 @@ class ConnectionRegistry:
         )
         return True
 
-    def drain_replay(self, connection: Any) -> None:
+    async def admit_join_response(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
-        if state is None or state.output is None:
-            return
-        for event, fields in self.replay.response_written(connection):
+        if state is None or state.output is None or not self._admit(state, frame):
+            return False
+        output = state.output
+        held = self.replay.activate_join(connection)
+        items: list[_OutputFrame] = [_OutputFrame(frame)]
+        for event, fields in held:
             session_id = fields.pop("_session_id", None)
             replay_scope = fields.pop("_replay_scope", None)
             replay_size = fields.pop("_replay_size", 0)
-            frame = connection.codec.notification(event, session_id, **fields)
-            if frame is None or not self._admit(state, frame):
+            payload = connection.codec.notification(event, session_id, **fields)
+            if payload is None or not self._admit(state, payload):
                 self.replay.connection_closed(connection)
-                return
-            self._enqueue(
-                state.output,
+                return False
+            items.append(
                 _OutputFrame(
-                    frame,
+                    payload,
                     replay_stream_id=fields.get("stream_id"),
                     replay_scope=replay_scope,
                     replay_size=replay_size,
-                ),
+                )
             )
+        for item in items:
+            self._enqueue(output, item, wake=False)
+        output.wake.set()
+        future = self.loop.create_future()
+        items[0].future = future
+        self._begin_caller(output)
+        try:
+            return await asyncio.shield(future)
+        finally:
+            self._finish_caller(output)
 
     async def publish_controller(
         self,

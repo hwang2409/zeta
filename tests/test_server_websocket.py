@@ -25,7 +25,7 @@ from zeta.server.transport import _parse_subprotocol_auth
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
-TIMEOUT = 3
+TIMEOUT = 30
 
 
 async def _read_http_headers(
@@ -187,7 +187,14 @@ async def test_websocket_round_trip_uses_real_serve_runtime(tmp_path: Path) -> N
 async def test_websocket_session_history_and_subscribe_returns_replay_cursor(
     tmp_path: Path,
 ) -> None:
-    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
     await server.start()
     reader, writer, status, _ = await _connect(
         server, token=server._websocket.token

@@ -70,6 +70,7 @@ class SessionReplay:
         self._next_ordinal = 0
         self._records = 0
         self._bytes = 0
+        self._invalidated: set[ReplayScopeId] = set()
 
     def _scope(self, scope: ReplayScopeId) -> _Scope:
         current = self._scopes.get(scope)
@@ -78,6 +79,14 @@ class SessionReplay:
             self._next_ordinal += 1
             self._scopes[scope] = current
         return current
+
+    def _invalidate_scope(self, scope: ReplayScopeId) -> None:
+        self._invalidated.add(scope)
+        self._drop_scope(scope)
+
+    def take_invalidated(self) -> set[ReplayScopeId]:
+        invalidated, self._invalidated = self._invalidated, set()
+        return invalidated
 
     def _drop_scope(self, scope: ReplayScopeId) -> None:
         current = self._scopes.pop(scope, None)
@@ -106,14 +115,12 @@ class SessionReplay:
 
     def _reserve(self, scope: ReplayScopeId, size: int) -> bool:
         owner = self._scope(scope)
-        while owner.records + 1 > REPLAY_SCOPE_MAX_RECORDS or owner.bytes + size > REPLAY_SCOPE_MAX_BYTES:
-            if not owner.charges:
-                return False
-            old = owner.charges.pop(0)
-            owner.records -= 1
-            owner.bytes -= old
-            self._records -= 1
-            self._bytes -= old
+        if (
+            owner.records + 1 > REPLAY_SCOPE_MAX_RECORDS
+            or owner.bytes + size > REPLAY_SCOPE_MAX_BYTES
+        ):
+            self._invalidate_scope(scope)
+            return False
         while (
             self._records + 1 > REPLAY_MAX_RECORDS
             or self._bytes + size > REPLAY_MAX_BYTES
@@ -121,14 +128,9 @@ class SessionReplay:
             victim = self._largest_scope()
             if victim is None:
                 return False
-            victim_owner = self._scopes[victim]
-            if not victim_owner.charges:
+            self._invalidate_scope(victim)
+            if victim == scope:
                 return False
-            old = victim_owner.charges.pop(0)
-            victim_owner.records -= 1
-            victim_owner.bytes -= old
-            self._records -= 1
-            self._bytes -= old
         owner = self._scope(scope)
         owner.records += 1
         owner.bytes += size
@@ -157,7 +159,7 @@ class SessionReplay:
         subscription.held.extend(pending.frames)
         return {**history_snapshot, "replay": {"stream_id": pending.stream_id, "history_seq": 0}}
 
-    def response_written(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
+    def activate_join(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
         subscription = self._subscriptions.get(connection)
         if subscription is None:
             return []
@@ -180,9 +182,7 @@ class SessionReplay:
             "_replay_size": frame_size,
             **fields,
         }
-        if pending is not None and subscription is None:
-            pending.frames.append((event, payload))
-        else:
+        if pending is not None or subscription is not None and subscription.pending:
             target.held.append((event, payload))
         return PublishedSessionEvent(target.stream_id, seq)
 
@@ -201,13 +201,6 @@ class SessionReplay:
         if owner.records <= 0:
             self._scopes.pop(scope, None)
 
-    def drain_for_connection(self, connection: Any) -> list[tuple[Any, dict[str, object]]]:
-        subscription = self._subscriptions.get(connection)
-        if subscription is None:
-            return []
-        held, subscription.held = subscription.held, []
-        return held
-
     def connection_closed(self, connection: Any) -> None:
         pending = self._pending.pop(connection, None)
         subscription = self._subscriptions.pop(connection, None)
@@ -225,5 +218,7 @@ class SessionReplay:
             pending.stale = True
         self._pending.clear()
         self._subscriptions.clear()
+        for scope in tuple(self._scopes):
+            self._invalidate_scope(scope)
         self._scopes.clear()
         self._records = self._bytes = 0
