@@ -640,12 +640,7 @@ class AsyncDurableWritesMixin:
 
     @staticmethod
     def _reload_durable_writer_if_changed(writer: ConversationStore) -> None:
-        stat = writer.path.stat()
-        if (
-            writer._log_identity != (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
-            or writer._log_offset != stat.st_size
-            or writer._log_mtime_ns != stat.st_mtime_ns
-        ):
+        if not writer._log_metadata_matches():
             with writer._append_lock():
                 pass
 
@@ -1034,6 +1029,7 @@ class AsyncDurableWritesMixin:
         with self._durable_write_condition:
             self._closing = True
             while self._durable_writes_in_flight:
+                # test-contract: durability close must drain submitted writes
                 self._durable_write_condition.wait()
             if self._closed:
                 return False
