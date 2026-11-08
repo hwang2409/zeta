@@ -190,15 +190,19 @@ def test_read_pty_until_names_early_exit_and_output() -> None:
         stdout=slave,
         stderr=slave,
     )
-    os.close(slave)
-    output = bytearray()
+    process.wait()
+    output = bytearray(os.read(master, 4096))
     try:
+        os.close(slave)
+        slave = -1
         with pytest.raises(AssertionError, match="partial"):
             read_pty_until(master, b"missing", process=process, output=output)
         assert reap_process(process) == 4
     finally:
         if process.poll() is None:
             reap_process(process, timeout=0)
+        if slave >= 0:
+            os.close(slave)
         os.close(master)
 
 
