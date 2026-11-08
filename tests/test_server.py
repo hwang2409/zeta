@@ -385,6 +385,60 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
 
 
 @pytest.mark.asyncio
+async def test_server_close_owns_cancellation_resistant_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
+    started = asyncio.Event()
+
+    class Writer:
+        class Transport:
+            def abort(self) -> None:
+                pass
+
+        transport = Transport()
+
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            started.set()
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if getattr(self, "cancels", 0) < 2:
+                        self.cancels = getattr(self, "cancels", 0) + 1
+                        continue
+                    raise
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    client = _Client(server, asyncio.StreamReader(), Writer())
+    write = asyncio.create_task(client._write_physical(client.codec.response(None, {})))
+    try:
+        await await_or_fail(started.wait(), what="write start")
+        write.cancel()
+        with pytest.raises(protocol_module.FrameWriteCancelled):
+            await await_or_fail(write, what="canceled write")
+        orphaned_writes = getattr(server, "_orphaned_writes", None)
+        assert orphaned_writes is not None
+        assert len(orphaned_writes) == 1
+
+        orphaned = tuple(orphaned_writes)
+        await await_or_fail(server.close(), what="server close")
+        assert not orphaned_writes
+        assert all(task.done() or task.cancelled() for task in orphaned)
+    finally:
+        if not write.done():
+            write.cancel()
+        await await_or_fail(
+            asyncio.gather(write, return_exceptions=True), what="write cleanup"
+        )
+        if server.connections is not None:
+            await await_or_fail(server.close(), what="server cleanup")
+
+
+@pytest.mark.asyncio
 async def test_repeated_stalled_unix_writes_close_each_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

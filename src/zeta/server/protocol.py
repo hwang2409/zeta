@@ -272,7 +272,13 @@ class FrameWriteCancelled(asyncio.CancelledError):
 FRAME_CANCEL_GRACE = 1.0
 
 
-async def finish_frame_write(codec: FrameCodec, writer: Any, payload: _Frame) -> bool:
+async def finish_frame_write(
+    codec: FrameCodec,
+    writer: Any,
+    payload: _Frame,
+    *,
+    orphaned_writes: set[asyncio.Future[bool]] | None = None,
+) -> bool:
     """Write one frame; through cancellation, report whether it was written.
 
     Cancellation before this call writes nothing. Cancellation during the
@@ -285,10 +291,17 @@ async def finish_frame_write(codec: FrameCodec, writer: Any, payload: _Frame) ->
         return await asyncio.shield(task)
     except asyncio.CancelledError:
         pass
-    raise FrameWriteCancelled(await _settle_canceled_write(task, writer))
+    raise FrameWriteCancelled(
+        await _settle_canceled_write(task, writer, orphaned_writes=orphaned_writes)
+    )
 
 
-async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> bool:
+async def _settle_canceled_write(
+    task: asyncio.Future[bool],
+    writer: Any,
+    *,
+    orphaned_writes: set[asyncio.Future[bool]] | None = None,
+) -> bool:
     """Wait for the deadline, abort the transport, then finish cleanup."""
 
     loop = asyncio.get_running_loop()
@@ -301,7 +314,13 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
                 # Supported transports settle after abort. Keep observing an
                 # abnormal transport without retaining it in process-global
                 # state or coupling it to another connection.
-                task.add_done_callback(_observe_write)
+                if orphaned_writes is not None:
+                    orphaned_writes.add(task)
+                    task.add_done_callback(
+                        lambda completed: _forget_write(completed, orphaned_writes)
+                    )
+                else:
+                    task.add_done_callback(_observe_write)
                 return False
             aborted = True
             deadline = loop.time() + FRAME_CANCEL_GRACE
@@ -328,6 +347,13 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
 def _observe_write(task: asyncio.Future[bool]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _forget_write(
+    task: asyncio.Future[bool], orphaned_writes: set[asyncio.Future[bool]]
+) -> None:
+    orphaned_writes.discard(task)
+    _observe_write(task)
 
 
 class ProtocolError(Exception):
