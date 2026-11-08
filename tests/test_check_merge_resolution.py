@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(
     os.environ.get(
@@ -347,6 +350,27 @@ def make_merge(
     return merge, parents[1], parents[2]
 
 
+def _make_conflict_merge(r: Path) -> str:
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "b"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def branch(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def main(): pass\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "b"], cwd=r, check=False)
+    (r / "src/a.py").write_text(
+        "def main(): pass\n<<<<<<< HEAD\ndef branch(): pass\n>>>>>>> b\n"
+    )
+    commit(r, "unresolved")
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+
+
 def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
@@ -376,6 +400,307 @@ def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     assert "merge does not parse:" in result.stderr
     assert "src/a.py:" in result.stderr
     assert "main:" not in result.stdout
+
+
+def _final_loss(
+    r: Path,
+    main_text: str,
+    branch_text: str,
+    merge_text: str,
+    final_text: str | None = None,
+    final_path: str = "src/a.py",
+    merge_extra: tuple[str, str] | None = None,
+) -> tuple[str, str]:
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("base = 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(branch_text)
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(main_text)
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(merge_text)
+    if merge_extra is not None:
+        extra_path, extra_text = merge_extra
+        extra = r / extra_path
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text(extra_text)
+    commit(r, "merge")
+    merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    if final_text is None:
+        return merge, merge
+    target = r / final_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(final_text)
+    commit(r, "final")
+    final = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    return merge, final
+
+
+def _final_marker_case(r: Path, case: str) -> tuple[str, str, int, str] | None:
+    if case == "fixed marker":
+        merge = _make_conflict_merge(r)
+        (r / "src/a.py").write_text("def main(): pass\ndef branch(): pass\n")
+        commit(r, "fix")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 0, "fixed later"
+    if case == "final marker":
+        merge = _make_conflict_merge(r)
+        return merge, merge, 2, "merge does not parse"
+    if case == "parse allow-list":
+        merge = _make_conflict_merge(r)
+        body = r / "body.txt"
+        body.write_text("merge-resolution: src/a.py parse -> intentional\n")
+        return merge, body.as_posix(), 0, "allowed merge parse diagnostic"
+    return None
+
+
+def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
+    if case == "unrelated same-name def":
+        return (
+            *_final_loss(
+                r,
+                "def helper(): return 1\n",
+                "def branch(): pass\n",
+                "base = 1\n",
+                "def helper(): return 2\n",
+                "src/b.py",
+            ),
+            1,
+            "def helper",
+        )
+    if case == "true move":
+        return (
+            *_final_loss(
+                r,
+                "def helper(): return 1\n",
+                "def branch(): pass\n",
+                "base = 1\n",
+                "def helper(): return 1\n",
+                "src/b.py",
+            ),
+            0,
+            "moved/restored later: src/b.py",
+        )
+    if case == "restored in place":
+        return (
+            *_final_loss(
+                r,
+                "def helper(): return 1\n",
+                "def branch(): pass\n",
+                "base = 1\n",
+                "def helper(): return 1\n",
+            ),
+            0,
+            "moved/restored later: src/a.py",
+        )
+    if case == "element unrelated":
+        return (
+            *_final_loss(
+                r,
+                'TARGET = {"lost"}\n',
+                'TARGET = {"lost"}\n',
+                "TARGET = set()\n",
+                'OTHER = {"lost"}\n',
+                "src/b.py",
+            ),
+            1,
+            "TARGET",
+        )
+    if case == "element restored":
+        return (
+            *_final_loss(
+                r,
+                'TARGET = {"lost"}\n',
+                'TARGET = {"lost"}\n',
+                "TARGET = set()\n",
+                'TARGET = {"lost"}\n',
+            ),
+            0,
+            "moved/restored later: src/a.py",
+        )
+    if case == "constant different value":
+        return (
+            *_final_loss(r, "VALUE = 1\n", "VALUE = 2\n", "VALUE = 3\n", "VALUE = 4\n"),
+            1,
+            "VALUE",
+        )
+    if case == "constant moved same value":
+        return (
+            *_final_loss(
+                r,
+                "VALUE = 1\n",
+                "VALUE = 2\n",
+                "base = 1\n",
+                "VALUE = 1\n",
+                "src/b.py",
+            ),
+            0,
+            "moved/restored later: src/b.py",
+        )
+    if case == "constant duplicate final":
+        merge, final = _final_loss(
+            r,
+            "VALUE = 1\n",
+            "VALUE = 2\n",
+            "base = 1\n",
+            "VALUE = 1\n",
+            "src/b.py",
+        )
+        (r / "src/c.py").write_text("VALUE = 1\n")
+        commit(r, "duplicate final constant")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 1, "VALUE"
+    if case == "class moved with member":
+        return (
+            *_final_loss(
+                r,
+                "class Box:\n    value = 1\n    def method(self): return 1\n",
+                "class Branch:\n    pass\n",
+                "base = 1\n",
+                "class Box:\n    value = 1\n    def method(self): return 1\n",
+                "src/b.py",
+            ),
+            0,
+            "moved/restored later: src/b.py",
+        )
+    if case == "element same-named collection moved":
+        merge, final = _final_loss(
+            r,
+            'TARGET = {"lost"}\n',
+            'TARGET = {"lost"}\n',
+            "TARGET = set()\n",
+            'TARGET = {"lost"}\n',
+            "src/b.py",
+        )
+        (r / "src/a.py").unlink()
+        commit(r, "move final collection")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 0, "moved/restored later: src/b.py"
+    if case == "duplicate final collection":
+        merge, final = _final_loss(
+            r,
+            'TARGET = {"lost"}\n',
+            'TARGET = {"lost"}\n',
+            "TARGET = set()\n",
+            'TARGET = {"lost"}\n',
+            "src/b.py",
+        )
+        (r / "src/c.py").write_text('TARGET = {"lost"}\n')
+        commit(r, "duplicate final collection")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 1, "TARGET"
+    if case == "dispatch restored":
+        return (
+            *_final_loss(
+                r,
+                'def route(name):\n    return name == "mcp"\n',
+                "def branch(): pass\n",
+                "base = 1\n",
+                'def route(name):\n    return name == "mcp"\n',
+            ),
+            0,
+            "moved/restored later: src/a.py",
+        )
+    if case == "dispatch other function":
+        return (
+            *_final_loss(
+                r,
+                'def route(name):\n    return name == "mcp"\n',
+                "def branch(): pass\n",
+                "base = 1\n",
+                'def other(name):\n    return name == "mcp"\n',
+            ),
+            1,
+            "route",
+        )
+    if case.startswith("checked merge collision"):
+        merge, _ = _final_loss(
+            r,
+            "def helper(): return 1\n",
+            "def branch(): pass\n",
+            "base = 1\n",
+            merge_extra=("src/b.py", "def helper(): return 1\n"),
+        )
+        final = {
+            "checked merge collision full": merge,
+            "checked merge collision short": merge[:7],
+            "checked merge collision HEAD": "HEAD",
+        }[case]
+        return merge, final, 1, "def helper"
+    if case == "checked merge":
+        return (
+            *_final_loss(
+                r, "def helper(): return 1\n", "def branch(): pass\n", "base = 1\n"
+            ),
+            1,
+            "def helper",
+        )
+    marker_case = _final_marker_case(r, case)
+    if marker_case is not None:
+        return marker_case
+    raise AssertionError(f"unknown final case: {case}")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected", "needle"),
+    [
+        ("unrelated same-name def", 1, "def helper"),
+        ("true move", 0, "moved/restored later: src/b.py"),
+        ("restored in place", 0, "moved/restored later: src/a.py"),
+        ("element unrelated", 1, "TARGET"),
+        ("element restored", 0, "moved/restored later: src/a.py"),
+        ("constant different value", 1, "VALUE"),
+        ("constant moved same value", 0, "moved/restored later: src/b.py"),
+        ("constant duplicate final", 1, "VALUE"),
+        ("class moved with member", 0, "moved/restored later: src/b.py"),
+        ("element same-named collection moved", 0, "moved/restored later: src/b.py"),
+        ("duplicate final collection", 1, "TARGET"),
+        ("dispatch restored", 0, "moved/restored later: src/a.py"),
+        ("dispatch other function", 1, "route"),
+        ("checked merge collision full", 1, "def helper"),
+        ("checked merge collision short", 1, "def helper"),
+        ("checked merge collision HEAD", 1, "def helper"),
+        ("checked merge", 1, "def helper"),
+        ("fixed marker", 0, "fixed later"),
+        ("final marker", 2, "merge does not parse"),
+        ("parse allow-list", 0, "allowed merge parse diagnostic"),
+    ],
+)
+def test_final_head_identity_table(
+    tmp_path: Path, case: str, expected: int, needle: str
+) -> None:
+    r = repo(tmp_path)
+    merge, final_or_body, expected_code, expected_line = _final_case(r, case)
+    assert expected_code == expected
+    args = (
+        ("--pr-body-file", final_or_body)
+        if case == "parse allow-list"
+        else ("--final", final_or_body)
+    )
+    result = run(r, merge, *args)
+    output = result.stdout + result.stderr
+    assert result.returncode == expected
+    assert expected_line in output
+    if case.startswith("checked merge collision"):
+        assert "moved/restored later" not in output
 
 
 def _api_repo(r: Path) -> None:
@@ -515,7 +840,234 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
     return merge, train_merge, pr_head, "main_only"
 
 
-import pytest
+@pytest.mark.parametrize("case", ["lost line", "renamed owner"])
+def test_pr_side_line_table(tmp_path: Path, case: str) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    return 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
+    commit(r, "branch addition")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        "def renamed():\n    return 1\n" if case == "renamed owner" else "def check():\n    return 3\n"
+    )
+    commit(r, "main edit")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(
+        "def renamed():\n    added = 2\n    return 1\n"
+        if case == "renamed owner"
+        else "def check():\n    return 3\n"
+    )
+    commit(r, "merge")
+    result = run(r)
+    assert (result.returncode == 0) is (case == "renamed owner")
+    if case == "lost line":
+        assert "pr-line" in result.stdout
+
+
+
+def test_pr_line_count_subtracts_base_and_main_copies(tmp_path: Path) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    emit()\n    anchor()\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    emit()\n    anchor()\n    emit()\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    anchor()\n")
+    commit(r, "main removes base copy")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    (r / "src/a.py").write_text("def check():\n    anchor()\n    emit()\n")
+    commit(r, "merge keeps pr copy")
+    result = run(r)
+    assert result.returncode == 0
+    assert "pr-line" not in result.stdout
+
+
+def test_pr_line_final_exact_restore_and_modified_restore(tmp_path: Path) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    return 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    commit(r, "lost merge")
+    merge = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 3\n")
+    commit(r, "exact restoration")
+    exact = run(r, merge, "--final", "HEAD")
+    assert exact.returncode == 0
+    (r / "src/a.py").write_text("def check():\n    added = 999\n    return 3\n")
+    commit(r, "modified restoration")
+    modified = run(r, merge, "--final", "HEAD")
+    assert modified.returncode == 1
+    assert "pr-line" in modified.stdout
+
+
+def _public_line_case(
+    r: Path, base_text: str, branch_text: str, main_text: str, merge_text: str, final_text: str
+) -> tuple[str, str]:
+    repo(r)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(base_text)
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(branch_text)
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(main_text)
+    (r / "main-note.txt").write_text("main\n")
+    commit(r, "main")
+    main = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", main], cwd=r, check=True)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    (r / "src/a.py").write_text(merge_text)
+    commit(r, "merge")
+    merge = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    (r / "src/a.py").write_text(final_text)
+    (r / "final-note.txt").write_text("final\n")
+    commit(r, "final")
+    final = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    return merge, final
+
+
+def test_pr_line_final_multiset_and_insertion_table(tmp_path: Path) -> None:
+    cases = [
+        (
+            "two identical lines lost, final restores one",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n    emit()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n",
+            1,
+            "emit()",
+        ),
+        (
+            "two identical lines lost, final restores both",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n    emit()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n    emit()\n",
+            0,
+            "moved/restored later",
+        ),
+        (
+            "pr-line unique move under final",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n",
+            "def g():\n    one()\n    emit()\n",
+            0,
+            "moved/restored later",
+        ),
+        (
+            "ambiguous move",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n",
+            "def g():\n    emit()\n    one()\ndef h():\n    emit()\n",
+            1,
+            "emit()",
+        ),
+        (
+            "insertion inside main replacement",
+            "one()\ntwo()\n",
+            "one()\nadded()\ntwo()\n",
+            "main()\n",
+            "main()\n",
+            "main()\n",
+            0,
+            "clean merge",
+        ),
+    ]
+    for name, base, branch, main, merge_text, final, expected, needle in cases:
+        r = tmp_path / name.replace(" ", "_")
+        r.mkdir()
+        merge, final_revision = _public_line_case(r, base, branch, main, merge_text, final)
+        result = run(r, merge, "--final", final_revision)
+        output = result.stdout + result.stderr
+        assert result.returncode == expected, name
+        assert needle in output, name
+
+
+def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> None:
+    for revision in ("628344f0", "f8ccd8fb"):
+        present = subprocess.run(
+            ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+            cwd=Path(__file__).parents[1], check=False,
+        )
+        if present.returncode:
+            if os.environ.get("CI"):
+                raise AssertionError(
+                    f"historical commit {revision} is absent from the CI checkout"
+                )
+            pytest.skip(f"historical commit {revision} is absent from this local checkout")
+    repo_root = Path(__file__).parents[1]
+    first = run(repo_root, "628344f0")
+    first_output = first.stdout + first.stderr
+    assert "pr-line SlashHandlerMixin._show_accounts_picker" in first_output
+    assert "pr-line ServerSlashSession.slash_accounts" in first_output
+    assert "main parent line" not in first_output
+    assert "pr/branch parent line" in first_output
+    second = run(repo_root, "f8ccd8fb")
+    second_output = second.stdout + second.stderr
+    for expected in (
+        "tests/test_server_mcp_tool_filter.py: pr-line <module>@",
+        "tests/test_mcp_oauth.py: pr-line <module>@",
+        "tests/test_mcp_oauth.py: pr-line _monkey_home@",
+        "src/zeta/tui/cards/mcp_manager.py: pr-line <module>@",
+    ):
+        assert expected in second_output
+
+
+
+def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    return 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    (r / "src/a.py").write_text("def check():\n    return 1\n")
+    commit(r, "merge")
+    result = run(r)
+    line = next(line for line in result.stdout.splitlines() if ": pr-line " in line)
+    name = line.split("pr-line ", 1)[1].split(":", 1)[0]
+    owner, digest = name.rsplit("@", 1)
+    marker = next(line for line in result.stdout.splitlines() if line.startswith("suggested override: "))
+    printed = marker.removeprefix("suggested override: ")
+    assert printed.startswith(f"merge-resolution: src/a.py pr-lines {owner}@")
+    group = hashlib.sha256(f"{name}=added = 2".encode()).hexdigest()[:12]
+    assert printed.split("@", 1)[1].split(" ", 1)[0] == group
+    body = tmp_path / "body"
+    body.write_text(f"{printed[:-8]}intentional\n")
+    assert run(r, "--pr-body-file", str(body)).returncode == 0
+    body.write_text(f"merge-resolution: src/a.py pr-lines {owner}@{digest} -> stale\n")
+    assert run(r, "--pr-body-file", str(body)).returncode == 1
 
 
 @pytest.mark.parametrize(

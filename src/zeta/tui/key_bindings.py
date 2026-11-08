@@ -32,6 +32,7 @@ from prompt_toolkit.keys import ALL_KEYS, Keys
 from prompt_toolkit.layout import Dimension
 from prompt_toolkit.output import Output
 
+from .errors import TerminalRenderError
 from .word_wrap import WordWrapWindow
 
 # --- keybinding remap layer ------------------------------------------------
@@ -193,10 +194,6 @@ def _enable_wheel_reporting(output: Output) -> None:
     output.write_raw("\x1b[?1000h")  # click and wheel reporting
     output.write_raw("\x1b[?1015h")  # urxvt extended coordinates
     output.write_raw("\x1b[?1006h")  # SGR extended coordinates
-
-
-class TerminalRenderError(RuntimeError):
-    """A redraw failed; unwind the TUI before reporting the failure."""
 
 
 def _guard_redraw(application: Application[str]) -> None:
