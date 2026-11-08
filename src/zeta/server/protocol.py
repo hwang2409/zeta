@@ -314,13 +314,7 @@ async def _settle_canceled_write(
                 # Supported transports settle after abort. Keep observing an
                 # abnormal transport without retaining it in process-global
                 # state or coupling it to another connection.
-                if orphaned_writes is not None:
-                    orphaned_writes.add(task)
-                    task.add_done_callback(
-                        lambda completed: _forget_write(completed, orphaned_writes)
-                    )
-                else:
-                    task.add_done_callback(_observe_write)
+                _track_orphaned_write(task, orphaned_writes)
                 return False
             aborted = True
             deadline = loop.time() + FRAME_CANCEL_GRACE
@@ -347,6 +341,19 @@ async def _settle_canceled_write(
 def _observe_write(task: asyncio.Future[bool]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _track_orphaned_write(
+    task: asyncio.Future[bool],
+    orphaned_writes: set[asyncio.Future[bool]] | None,
+) -> None:
+    if orphaned_writes is None:
+        task.add_done_callback(_observe_write)
+        return
+    orphaned_writes.add(task)
+    task.add_done_callback(
+        lambda completed: _forget_write(completed, orphaned_writes)
+    )
 
 
 def _forget_write(

@@ -450,6 +450,76 @@ async def test_server_close_owns_cancellation_resistant_write(
 
 
 @pytest.mark.asyncio
+async def test_server_close_drains_write_registered_during_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Writer:
+        class Transport:
+            def abort(self) -> None:
+                pass
+
+        transport = Transport()
+
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            started.set()
+            while not release.is_set():
+                try:
+                    await asyncio.wait_for(release.wait(), 10)
+                except asyncio.CancelledError:
+                    self.cancels = getattr(self, "cancels", 0) + 1
+                    if self.cancels >= 3:
+                        raise
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    client = _Client(server, asyncio.StreamReader(), Writer())
+    assert server.connections is not None
+    registry = server.connections
+    registry.negotiate_role(client, "controller", "1.0", frozenset())
+    before = set(asyncio.all_tasks())
+    sending = asyncio.create_task(registry.send(client, client.codec.response(None, {})))
+    real_aclose = registry.aclose
+
+    async def skip_aclose() -> None:
+        pass
+
+    registry.aclose = skip_aclose  # type: ignore[method-assign]
+    try:
+        await await_or_fail(started.wait(), what="registered write start")
+        physical = tuple(
+            task
+            for task in asyncio.all_tasks()
+            if task not in before
+            and not task.done()
+            and task.get_coro().__qualname__ == "FrameCodec.write"
+        )
+        assert len(physical) == 1
+        await await_or_fail(server.close(), what="server close")
+        assert all(task.done() or task.cancelled() for task in physical)
+    finally:
+        release.set()
+        for task in asyncio.all_tasks():
+            if task not in before and not task.done():
+                task.cancel()
+        await await_or_fail(
+            asyncio.gather(sending, return_exceptions=True), what="registered write cleanup"
+        )
+        await await_or_fail(real_aclose(), what="registry cleanup")
+
+
+@pytest.mark.asyncio
 async def test_repeated_stalled_unix_writes_close_each_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

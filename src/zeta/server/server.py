@@ -245,6 +245,7 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
+        self._active_writes: set[asyncio.Task[bool]] = set()
         self._orphaned_writes: set[asyncio.Future[bool]] = set()
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
@@ -321,17 +322,15 @@ class ZetaServer:
                     self._unix_listener = None
 
     async def _close_orphaned_writes(self) -> None:
-        writes = tuple(self._orphaned_writes)
-        if writes:
-            deadline = asyncio.get_running_loop().time() + 2 * FRAME_CANCEL_GRACE
-            pending = set(writes)
-            while pending:
-                for write in pending:
-                    write.cancel()
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                _, pending = await asyncio.wait(pending, timeout=remaining)
+        deadline = asyncio.get_running_loop().time() + 2 * FRAME_CANCEL_GRACE
+        while self._active_writes or self._orphaned_writes:
+            pending = set(self._active_writes) | self._orphaned_writes
+            for write in pending:
+                write.cancel()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            await asyncio.wait(pending, timeout=remaining)
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -1177,13 +1176,19 @@ class _Client:
         return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
-        async with self._write_lock:
-            return await finish_frame_write(
-                self.codec,
-                self.writer,
-                payload,
-                orphaned_writes=self.server._orphaned_writes,
-            )
+        task = asyncio.current_task()
+        assert task is not None
+        self.server._active_writes.add(task)
+        try:
+            async with self._write_lock:
+                return await finish_frame_write(
+                    self.codec,
+                    self.writer,
+                    payload,
+                    orphaned_writes=self.server._orphaned_writes,
+                )
+        finally:
+            self.server._active_writes.discard(task)
 
 
 def _home() -> Path:
