@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import os
 import threading
+from functools import partial
 from io import StringIO
 from pathlib import Path
 
@@ -26,10 +27,15 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, MessageRole, TextContent
 from zeta.runtime.composition import compose_runtime
 from zeta.runtime.loop import AgentLoop, RuntimePrompt
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.runtime.prompt_resume import resume_prompt
 from zeta.server.server import ZetaServer
 from zeta.skills import SkillCatalog, discover_session_skills
 from zeta.tui.app import TUIApp
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
 
 
 def _owned_runtime_prompt(
@@ -578,6 +584,7 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_skill_refresh
             context_loader=lambda **kwargs: (_ for _ in ()).throw(
                 AssertionError(f"unexpected default rebuild: {kwargs}")
             ),
+            registry=manager.project_registry_state,
         )
     )
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
@@ -697,11 +704,6 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
     await loop.close()
     opened.store.close()
 
-    refreshed_memory = "current project memory"
-    monkeypatch.setattr(
-        "zeta.runtime.prompt_resume.refresh_project_memory",
-        lambda value, **kwargs: value.replace(memory, refreshed_memory),
-    )
     resumed = manager.open(opened.metadata.session_id)
     try:
         result = await asyncio.to_thread(
@@ -715,6 +717,7 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
                 context_loader=lambda **kwargs: (_ for _ in ()).throw(
                     AssertionError(f"unexpected default rebuild: {kwargs}")
                 ),
+                registry=manager.project_registry_state,
             )
         )
         component = result.context.prompt_components["project_memory"]
@@ -722,10 +725,10 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
         length = int(component["length"])
         assert "live description" in result.context.system_prompt
         assert (
-            result.context.system_prompt[offset : offset + length] == refreshed_memory
+            result.context.system_prompt[offset : offset + length] == memory
         )
         assert (
-            component["digest"] == hashlib.sha256(refreshed_memory.encode()).hexdigest()
+            component["digest"] == hashlib.sha256(memory.encode()).hexdigest()
         )
         saved = manager.read_metadata(opened.metadata.session_id)
         assert saved.system_prompt == result.context.system_prompt

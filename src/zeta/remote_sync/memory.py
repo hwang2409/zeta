@@ -407,6 +407,8 @@ def fetch_local_project(
         ) as project_fd:
             return snapshot(project_fd)
     except ProjectRegistryError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return _MISSING
         raise RemoteSyncError(f"project registry busy on {peer}; retry") from exc
 
 

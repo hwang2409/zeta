@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -33,10 +34,15 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.providers.anthropic_payload import build_messages_payload
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools.registry import ToolDefinition, ToolRegistry
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
 
 
 def _session(home: Path, *, project_id: str | None = None):

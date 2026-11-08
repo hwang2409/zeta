@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import threading
 import time
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -17,7 +19,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta import project_registry as registry_module
 from zeta.core import session_files
 from zeta.core.abort import AbortGenerationRegistry
-from zeta.core.project_context import load_project_context, refresh_project_memory
+from zeta.core.project_context import load_project_context
 from zeta.core.session import SessionManager
 from zeta.project_memory_history import MemorySnapshot
 from zeta.project_registry import (
@@ -29,9 +31,14 @@ from zeta.project_registry import (
 )
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.skills import SkillCatalog
-from zeta.storage_format import open_writer
+from zeta.storage_format import advance, open_writer
 from zeta.tools import ToolRegistry
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
 
 
 async def _cancel_and_drain(tasks: list[asyncio.Task[object]]) -> None:
@@ -45,9 +52,8 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
-    )
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope", repository)
 
     enabled = load_project_context(
         cwd=repository,
@@ -56,6 +62,7 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        registry=registry,
     )
     disabled = load_project_context(
         cwd=repository,
@@ -65,6 +72,7 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
         session_project=project,
         cwd_project=project,
         inbox_enabled=False,
+        registry=registry,
     )
 
     assert "You work on project demo" in enabled.system_prompt
@@ -80,6 +88,7 @@ def test_memory_snapshot_releases_domain_lock_after_pinning_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / ".zeta"
+    advance(home, expected_epoch=0)
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("demo", "scope")
     registry.initialize_memory(project.project_id)
@@ -96,10 +105,21 @@ def test_memory_snapshot_releases_domain_lock_after_pinning_files(
     snapshots: list[MemorySnapshot] = []
     errors: list[BaseException] = []
     real_read = os.read
+    blob = next(
+        (home / "projects" / project.project_id).rglob(
+            hashlib.sha256(b"before").hexdigest()
+        )
+    )
+    blob_info = blob.stat()
     reader_id: int | None = None
 
     def gated_read(fd: int, size: int) -> bytes:
-        if threading.get_ident() == reader_id and not read_started.is_set():
+        info = os.fstat(fd)
+        if (
+            threading.get_ident() == reader_id
+            and (info.st_dev, info.st_ino) == (blob_info.st_dev, blob_info.st_ino)
+            and not read_started.is_set()
+        ):
             read_started.set()
             if not release_read.wait(10):
                 raise AssertionError("snapshot read release was not signalled")
@@ -167,6 +187,7 @@ def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=None,
+        registry=registry,
     )
     assert "shipping the first version" in context.system_prompt
     assert any(path.name == "state.md" for path in context.files)
@@ -463,37 +484,6 @@ def test_new_session_link_preserves_registry_validation_and_append(
     reopened = SessionManager(home).open(session_id)
     reopened.store.close()
     assert links_path.read_bytes() == first_append
-
-
-def test_resume_replaces_only_current_project_memory(tmp_path: Path) -> None:
-    home = tmp_path / ".zeta"
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
-    )
-    context = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-    )
-    ProjectRegistry(home / "projects").update_memory(
-        project.project_id, {"state.md": "# Current state\\nnew state"}
-    )
-    resumed = refresh_project_memory(
-        context.system_prompt,
-        home=home,
-        cwd=repository,
-        project_id=context.memory_project_id,
-        memory_offset=context.memory_offset,
-        memory_length=context.memory_length,
-        memory_digest=context.memory_digest,
-    )
-    assert "new state" in resumed
-    assert "# Current state\\n" not in resumed or "new state" in resumed
 
 
 def test_project_tool_is_read_only_and_available(tmp_path: Path) -> None:

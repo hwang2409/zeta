@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,9 +22,14 @@ from zeta.memory.entry_store import (
 )
 from zeta.memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
 from zeta.project_registry import ProjectRegistry
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
 
 
 def _context_projects(registry: ProjectRegistry, project_id: str) -> dict[str, object]:

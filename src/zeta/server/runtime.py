@@ -409,7 +409,7 @@ class ServerRuntime:
             session_project=session_project,
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
-            registry=registry,
+            registry=self.manager.project_registry_state,
             project_projection=projection,
         )
         return config, skill_catalog, agent_catalog, context, session_project
@@ -446,7 +446,7 @@ class ServerRuntime:
             session_project=session_project,
             cwd_project=cwd_project,
             project_features_enabled=registry is not None,
-            registry=registry,
+            registry=self.manager.project_registry_state,
             project_projection=projection,
         )
         return config, resumed_prompt

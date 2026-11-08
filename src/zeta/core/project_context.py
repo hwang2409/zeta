@@ -61,7 +61,6 @@ from ..prompts import (
 from ..runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
-    project_registry,
 )
 from ..skills import SkillCatalog
 from .process_env import subprocess_env
@@ -832,7 +831,7 @@ def load_project_context(
     session_project: Project | None = None,
     cwd_project: Project | None = None,
     inbox_enabled: bool = True,
-    registry: ProjectRegistry | None = None,
+    registry: ProjectRegistry | ProjectRegistryState,
     project_projection: ProjectContextProjection | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
@@ -921,9 +920,15 @@ def load_project_context(
         # A malformed or unsafe optional registry must not prevent a session from
         # starting; surface it as a startup notice instead.
         try:
-            registry = registry or project_registry(home / "projects")
             project = session_project
             if project is not None:
+                available_registry = (
+                    registry.registry
+                    if isinstance(registry, ProjectRegistryState)
+                    else registry
+                )
+                if available_registry is None and project_projection is None:
+                    raise ProjectRegistryError("project registry is unavailable")
                 manual_memory_sections: list[str] = []
                 automatic_memory_sections: list[str] = []
                 # Budget the complete envelope on every trial admission: the
@@ -967,12 +972,13 @@ def load_project_context(
                             context_entries = (
                                 project_projection.memory
                                 if project_projection is not None
-                                else registry.load_memory_for_context(
+                                else available_registry.load_memory_for_context(
                                     project.project_id
                                 )
                             )
                         except UnsupportedMemoryFormatError:
-                            snapshot = registry._entry_memory_state_for_context(
+                            assert available_registry is not None
+                            snapshot = available_registry._entry_memory_state_for_context(
                                 project.project_id
                             )
                             entry_projection = render_entry_memory(
@@ -984,7 +990,8 @@ def load_project_context(
                         else:
                             for entry in context_entries:
                                 path = (
-                                    registry.root
+                                    home
+                                    / "projects"
                                     / project.project_id
                                     / "memory"
                                     / entry.name
@@ -1094,97 +1101,6 @@ def load_project_context(
         prompt_components=components,
         health=(project_projection.health if project_projection is not None else None),
     )
-
-
-def refresh_project_memory(
-    system_prompt: str,
-    *,
-    home: Path,
-    cwd: Path | None = None,
-    project_id: str | None = None,
-    memory_offset: int | None = None,
-    memory_length: int | None = None,
-    memory_digest: str | None = None,
-) -> str:
-    """Replace the single owned memory block by structured offset, never search.
-
-    The owned block is located by the byte-less character span recorded at
-    assembly time (``memory_offset`` / ``memory_length``), validated by the
-    hash of the exact owned block (``memory_digest``).  The flattened prompt is
-    never scanned for a marker pair, so a forged ``<zeta-project-memory>``
-    envelope planted in identity or append text can never be selected.
-
-    Sessions that predate structured components (missing any of offset, length,
-    or digest) are left byte-identical -- the triple is treated as all-or-none
-    and marker search is deliberately not attempted for them.  A ``project_id``
-    of ``None`` also leaves the prompt unchanged.
-    """
-    del cwd  # runtime cwd must never re-select a project on resume
-    if project_id is None:
-        return system_prompt
-    # The structured span is all-or-none: without every component (offset,
-    # length, and the digest that proves the persisted prompt still matches)
-    # there is nothing safe to replace, so the prompt is returned unchanged.
-    if memory_offset is None or memory_length is None or memory_digest is None:
-        return system_prompt
-    start = memory_offset
-    end = memory_offset + memory_length
-    if start < 0 or memory_length < 0 or end > len(system_prompt):
-        return system_prompt
-    owned = system_prompt[start:end]
-    if _owned_block_digest(owned) != memory_digest:
-        return system_prompt
-    try:
-        registry = project_registry(home / "projects")
-        project = registry.show_project(project_id)
-        if project is None:
-            return system_prompt
-        try:
-            entries = registry.load_memory_for_context(project.project_id)
-        except UnsupportedMemoryFormatError:
-            entries = None
-            entry_state = registry._entry_memory_state_for_context(
-                project.project_id
-            ).state
-    except (ProjectRegistryError, OSError):
-        return system_prompt
-    prefix = system_prompt[:start]
-    suffix = system_prompt[end:]
-    if entries is None:
-        remaining = max(
-            0,
-            CONTEXT_BYTE_CAP
-            - len(prefix.encode("utf-8"))
-            - len(suffix.encode("utf-8")),
-        )
-        block = render_entry_memory(
-            entry_state,
-            now=utc_now(),
-            byte_cap=min(MEMORY_PROMPT_BYTE_CAP, remaining),
-        ).block
-        return prefix + block + suffix
-    kept_manual: list[str] = []
-    kept_automatic: list[str] = []
-    for entry in entries:
-        section = _format_section(
-            registry.root / project.project_id / "memory" / entry.name,
-            entry.content,
-        )
-        candidate_manual = list(kept_manual)
-        candidate_automatic = list(kept_automatic)
-        target = candidate_automatic if entry.automatic else candidate_manual
-        target.append(section)
-        candidate = _render_memory_block(
-            project.project_id, candidate_manual, candidate_automatic
-        )
-        if len((prefix + candidate + suffix).encode()) > CONTEXT_BYTE_CAP:
-            break
-        kept_manual = candidate_manual
-        kept_automatic = candidate_automatic
-    # Only the owned span is replaced; the prefix and suffix stay byte-identical,
-    # so any forged envelope elsewhere in the prompt is preserved untouched.
-    block = _render_memory_block(project.project_id, kept_manual, kept_automatic)
-    return prefix + block + suffix
 
 
 __all__ = [

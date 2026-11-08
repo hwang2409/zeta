@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,7 +20,7 @@ import pytest
 
 from tests.support.storage_homes import initialize_storage_home
 from zeta.cli import project as project_cli
-from zeta.core.project_context import load_project_context, refresh_project_memory
+from zeta.core.project_context import load_project_context
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_store import (
     AddOperation,
@@ -53,12 +54,17 @@ from zeta.remote_sync.project_publish import (
 )
 from zeta.remote_sync.project_publish import publish_version as publish_remote_version
 from zeta.remote_sync.ssh import SshTransport
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
 from zeta.tui.slash_handlers import SlashHandlerMixin
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
 
 
 @pytest.fixture
@@ -341,14 +347,6 @@ async def test_public_migration_end_to_end_with_real_content(
     second = tmp_path / "second"
     workspace = tmp_path / "workspace"
     registry, project_id, original_contents = _legacy_fixture(tmp_path)
-    starting_context = load_project_context(
-        cwd=workspace,
-        repo_root=workspace,
-        zeta_home=first,
-        catalog=SkillCatalog.empty(),
-        session_project=registry.show_project(project_id),
-        cwd_project=registry.show_project(project_id),
-    )
     monkey_home = os.environ.get("ZETA_HOME")
     os.environ["ZETA_HOME"] = str(first)
     try:
@@ -416,15 +414,17 @@ async def test_public_migration_end_to_end_with_real_content(
         for entry in registry._entry_memory_state(project_id).state.entries.values()
         if isinstance(entry, MemoryEntry) and entry.text == "PR 5 is ready."
     )
-    resumed = refresh_project_memory(
-        starting_context.system_prompt,
-        home=first,
-        project_id=project_id,
-        memory_offset=starting_context.memory_offset,
-        memory_length=starting_context.memory_length,
-        memory_digest=starting_context.memory_digest,
+    resumed = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=first,
+        catalog=SkillCatalog.empty(),
+        session_project=registry.show_project(project_id),
+        cwd_project=registry.show_project(project_id),
+        registry=registry,
+        project_projection=registry.project_context_projection(project_id),
     )
-    assert "PR 5 is ready." in resumed
+    assert "PR 5 is ready." in resumed.system_prompt
     assert entry_id in run_memory_command(registry, project_id, "log")
     assert (
         run_memory_command(
