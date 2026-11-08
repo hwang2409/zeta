@@ -448,7 +448,9 @@ async def test_hung_decisions_scan_renders_unavailable(
             unavailable.set() if app.decisions_error is not None else None
         )
         monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
+        # test-contract: seam timeout is shortened; the toolbar render is unchanged
         monkeypatch.setattr(panel_module, "_SCAN_TIMEOUT", 0.01, raising=False)
+        # test-contract: seam backoff is shortened; the toolbar render is unchanged
         monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
         app.start_decisions_poll()
         try:
