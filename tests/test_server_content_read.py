@@ -259,10 +259,12 @@ async def test_handle_survives_server_restart(tmp_path: Path) -> None:
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_history_fidelity", "content_read"]})
     session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
     store = server.runtime.opened.store
-    store.append_message(with_message_origin(Message(MessageRole.USER, [ImageContent(base64.b64encode(raw).decode(), "image/png")]), MessageOrigin.USER))
-    _, attachments, _ = await _history_with_image(reader, writer, request_id=4, session_id=session["session_id"])
-    handle = attachments[0]["handle"]
-    await close_serve(server, writer)
+    try:
+        store.append_message(with_message_origin(Message(MessageRole.USER, [ImageContent(base64.b64encode(raw).decode(), "image/png")]), MessageOrigin.USER))
+        _, attachments, _ = await _history_with_image(reader, writer, request_id=4, session_id=session["session_id"])
+        handle = attachments[0]["handle"]
+    finally:
+        await close_serve(server, writer)
     restarted = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(restarted)
     try:
