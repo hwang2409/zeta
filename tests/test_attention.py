@@ -771,6 +771,7 @@ def test_p06_6_attention_resolution_commits_message_and_record_or_neither(
                 competed.append(True)
                 self.resolve(attention_id, session_id=session_id, decision="chat answer")
 
+        # test-contract: seam competitor commits after the first resolution-lock hold
         monkeypatch.setattr(AttentionStore, "_resolution_lock", lock_then_compete)
         result = deliver_attention_decision(
             tmp_path, record, "popup answer", from_session=fork_id
@@ -805,7 +806,9 @@ def test_p06_6_attention_resolution_commits_message_and_record_or_neither(
                     os.close(fd)
             return original_lock(self)
 
+        # test-contract: seam gate the fork release just before its record write
         monkeypatch.setattr(attention_records, "write_session_file", gated_write)
+        # test-contract: seam observe the deliverer waiting on .resolution.lock
         monkeypatch.setattr(AttentionStore, "_resolution_lock", probing_lock)
         with (
             ThreadPoolExecutor(1, thread_name_prefix="fork-release") as releaser,
