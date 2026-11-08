@@ -139,6 +139,7 @@ class ServeControl:
             ),
             offload=lambda job: self._run_blocking(job),
             is_closing=lambda: self.closing,
+            grant_published=self._publish_session_grant,
         )
 
     def start_turn(
@@ -432,16 +433,10 @@ class ServeControl:
         policy = self.server.runtime.policy
         if loop is None or policy is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
-        grants_before = policy.session_allow
         result, core_key = await self._approvals.transition(
             Decide(method, request_id, scope)
         )
         assert isinstance(result, dict)
-        added = tuple(sorted(map(str, policy.session_allow - grants_before)))
-        if added:
-            await self.publish_session_grant_change(
-                session_grant_change(policy, "grant", added)
-            )
         if (
             not self.turn_busy()
             and isinstance(core_key, str)
@@ -454,6 +449,13 @@ class ServeControl:
                 self._resume_tool(core_key, host_commands, turn_id=uuid.uuid4().hex)
             )
         return result
+
+    async def _publish_session_grant(self, tool: str) -> None:
+        policy = self.server.runtime.policy
+        if policy is not None:
+            await self.publish_session_grant_change(
+                session_grant_change(policy, "grant", (tool,))
+            )
 
     async def publish_session_grant_change(self, change: SessionGrantChange) -> None:
         connections = self.server.connections
@@ -479,9 +481,7 @@ class ServeControl:
         reason: str = "turn_canceled",
     ) -> Awaitable[object]:
         return asyncio.create_task(
-            self._approvals.transition(
-                Cancel(request_id, child_instance_id, reason)
-            )
+            self._approvals.transition(Cancel(request_id, child_instance_id, reason))
         )
 
     def request_approval_abort_gate(
@@ -882,9 +882,7 @@ class ServeControl:
             if not foreground and self._approvals.release_or_hold_terminal(
                 _approval_key(event), session_id, fields
             ):
-                await self._notify(
-                    wire_event, session_id, _admitted=True, **fields
-                )
+                await self._notify(wire_event, session_id, _admitted=True, **fields)
                 return
             await self._notify(wire_event, session_id, **fields)
             return
