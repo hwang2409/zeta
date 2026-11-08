@@ -11,6 +11,7 @@ poller keeps fresh while the app is open.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 from prompt_toolkit.document import Document
@@ -57,7 +58,7 @@ class DecisionsMixin:
         self._decisions_count = 0
         self._decisions_error: str | None = None
         self._decisions_scan_task: asyncio.Task[None] | None = None
-        self._decisions_scan_work: asyncio.Task[tuple] | None = None
+        self._decisions_scan_work: asyncio.Future[tuple] | None = None
         self._decisions_scan_requested = asyncio.Event()
         self._decisions_stopping = False
         self._decisions_restore_text = ""
@@ -180,15 +181,34 @@ class DecisionsMixin:
 
         work = getattr(self, "_decisions_scan_work", None)
         if work is None:
-            work = asyncio.create_task(
-                asyncio.to_thread(
-                    open_decisions,
-                    self._home,
-                    self._decisions_session_id,
-                    _registry_state(self),
-                )
-            )
+            loop = asyncio.get_running_loop()
+            work = loop.create_future()
             self._decisions_scan_work = work
+            args = (self._home, self._decisions_session_id, _registry_state(self))
+
+            def deliver(result: tuple | Exception) -> None:
+                if work.done():
+                    return
+                if isinstance(result, Exception):
+                    work.set_exception(result)
+                else:
+                    work.set_result(result)
+
+            def scan() -> None:
+                try:
+                    result = open_decisions(*args)
+                except Exception as exc:  # noqa: BLE001 - publish scan failures
+                    result = exc
+                if loop.is_closed():
+                    return
+                try:
+                    loop.call_soon_threadsafe(deliver, result)
+                except RuntimeError:
+                    pass  # The loop closed after the check.
+
+            threading.Thread(
+                target=scan, name="zeta-decisions-scan", daemon=True
+            ).start()
         try:
             return await asyncio.wait_for(asyncio.shield(work), timeout=timeout)
         finally:

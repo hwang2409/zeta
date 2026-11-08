@@ -6,6 +6,7 @@ from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from threading import Event as ThreadEvent
+from threading import Thread
 from types import SimpleNamespace
 
 import pytest
@@ -523,6 +524,55 @@ async def test_stopping_decisions_scan_drains_owner_without_error(
         await _stop_decisions(app)
         await app.loop.tool_registry.close()
         current.store.close()
+
+
+def test_stuck_decisions_scan_does_not_block_asyncio_run_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.attention_decisions as decisions_module
+
+    entered = ThreadEvent()
+    release = ThreadEvent()
+    finished = ThreadEvent()
+    errors: list[Exception] = []
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = _session(tmp_path, project.project_id)
+    app = _decisions_app(tmp_path, current)
+
+    def hung_open(*_args, **_kwargs):
+        entered.set()
+        release.wait()
+        return ()
+
+    async def run_tui_lifecycle() -> None:
+        try:
+            app.start_decisions_poll()
+            while not entered.is_set():
+                await asyncio.sleep(0)
+            await app.stop_decisions_poll()
+        finally:
+            await app.loop.tool_registry.close()
+            current.store.close()
+
+    def run() -> None:
+        try:
+            asyncio.run(run_tui_lifecycle())
+        except Exception as exc:  # noqa: BLE001 - surfaced in the parent assertion
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
+    thread = Thread(target=run, name="test-tui-lifecycle")
+    thread.start()
+    try:
+        assert entered.wait(timeout=5), f"decision scan did not start: {errors!r}"
+        assert finished.wait(timeout=5), "asyncio.run() waited for the held decision scan"
+        assert not release.is_set() and not errors
+    finally:
+        release.set()
+        thread.join(timeout=5)
 
 
 def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) -> None:
