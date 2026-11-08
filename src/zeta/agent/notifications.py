@@ -225,6 +225,7 @@ class AgentNotificationMixin:
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
+        self._abort_admitted = False
         passive_notice = None
         if self.wake_scheduler is not None:
             self.wake_scheduler.begin_external_run()
