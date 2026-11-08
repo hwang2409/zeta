@@ -4303,7 +4303,8 @@ def test_render_event_error_is_visible() -> None:
 def test_no_progress_loop_renders_as_named_non_retryable_error() -> None:
     message = (
         "the model was called 2 times with the same request and nothing new was "
-        "saved; stopped to avoid repeat spend. Send a new message to continue."
+        "saved; stopped to avoid repeat spend. The input was not run; it is held "
+        "and goes with your next message."
     )
     rendered = render_event(
         StreamEvent(StreamEventType.ERROR, error=ErrorInfo("no_progress_loop", message))
@@ -4312,7 +4313,7 @@ def test_no_progress_loop_renders_as_named_non_retryable_error() -> None:
     assert isinstance(rendered, Panel)
     plain = renderable_plain(rendered)
     assert "model loop stopped · no_progress_loop" in plain
-    assert "Send a new message to continue." in plain
+    assert "goes with your next message." in plain
     assert "retry: ctrl+y" not in plain
 
 

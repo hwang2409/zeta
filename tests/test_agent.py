@@ -3974,10 +3974,11 @@ async def test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget(
 
 
 class CancelledBeforeAnswerBackend(CompletionBackend):
-    """The first two calls wait until the caller cancels them; later calls answer."""
+    """The first calls wait until the caller cancels them; later calls answer."""
 
-    def __init__(self) -> None:
+    def __init__(self, cancelled_calls: int = 2) -> None:
         self.calls = 0
+        self.cancelled_calls = cancelled_calls
         self.started = asyncio.Event()
 
     @owned_completion
@@ -3989,7 +3990,7 @@ class CancelledBeforeAnswerBackend(CompletionBackend):
         del messages, tool_schemas
         self.calls += 1
         self.started.set()
-        if self.calls <= 2:
+        if self.calls <= self.cancelled_calls:
             await await_or_fail(asyncio.Event().wait(), what="caller cancels the call")
         yield StreamEvent(StreamEventType.MESSAGE_START)
         yield StreamEvent(
@@ -4028,6 +4029,58 @@ async def test_top_level_loop_stops_repeated_no_progress_notification_turns(
         errors = [event.error for event in events if event.type is StreamEventType.ERROR]
         assert [error.code for error in errors] == ["no_progress_loop"]
         assert len(store.agent_notifications()) == 1
+    finally:
+        await await_or_fail(loop.close(), what="agent loop close")
+
+
+@pytest.mark.asyncio
+async def test_no_progress_dispatches_between_committed_items_never_stop(
+    tmp_path: Path,
+) -> None:
+    """One cancelled call, then one saved item, for many cycles: the bound resets each time."""
+
+    cycles = 20
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    backend = CancelledBeforeAnswerBackend(cancelled_calls=cycles)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    try:
+        for cycle in range(cycles):
+            backend.started.clear()
+            run = asyncio.create_task(_collect(loop.run_notification_turn()))
+            started = asyncio.create_task(
+                await_or_fail(backend.started.wait(), what="provider call started")
+            )
+            await await_or_fail(
+                asyncio.wait({run, started}, return_when=asyncio.FIRST_COMPLETED),
+                what="provider call or turn end",
+            )
+            stopped_early = run.done() and not backend.started.is_set()
+            run.cancel()
+            started.cancel()
+            results = await await_or_fail(
+                asyncio.gather(run, started, return_exceptions=True),
+                what="cancelled turn",
+            )
+            assert not stopped_early, (
+                f"cycle {cycle} stopped: "
+                f"{[e.error for e in results[0] if e.type is StreamEventType.ERROR]}"
+            )
+            store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent(f"progress {cycle}")])
+            )
+        events = await await_or_fail(
+            _collect(loop.run_notification_turn()), what="final notification turn"
+        )
+        assert [event.error for event in events if event.type is StreamEventType.ERROR] == []
+        assert backend.calls == cycles + 1
+        assert store.messages()[-1].content == [TextContent("answered")]
     finally:
         await await_or_fail(loop.close(), what="agent loop close")
 
@@ -4130,12 +4183,12 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
         skill_catalog=SkillCatalog.empty(),
     )
     terminal_published = asyncio.Event()
-    published: list[str] = []
+    published: list[tuple[str, str]] = []
     original_publish = owner.conversation_channel.publish_completion
 
     async def observe_publish(**kwargs):
         if kwargs["child_instance_id"].count(":") == 1:
-            published.append(kwargs["text"])
+            published.append((kwargs["status"], kwargs["text"]))
             terminal_published.set()
         return await original_publish(**kwargs)
 
@@ -4167,8 +4220,12 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             "fresh external prompt",
             channel=owner.conversation_channel,
         )
-        terminal = asyncio.create_task(terminal_published.wait())
-        third = asyncio.create_task(backend.third_fresh_call.wait())
+        terminal = asyncio.create_task(
+            await_or_fail(terminal_published.wait(), what="terminal publication")
+        )
+        third = asyncio.create_task(
+            await_or_fail(backend.third_fresh_call.wait(), what="third provider call")
+        )
         done, pending = await await_or_fail(
             asyncio.wait({terminal, third}, return_when=asyncio.FIRST_COMPLETED),
             what="terminal publication or a third identical provider call",
@@ -4182,9 +4239,10 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             f"identical provider calls with nothing committed: {backend.fresh_calls}"
         )
         assert terminal in done
-        child_store = loop._background_owner.conversation_channel._delivery_targets[
+        flow = loop._background_owner.conversation_channel._delivery_targets[
             child_handle
-        ].flow.store
+        ].flow
+        child_store = flow.store
         stopped = [
             message.metadata[FAILED_TURN_ERROR]["code"]
             for message in child_store.messages()
@@ -4192,15 +4250,24 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
         ]
         if timeouts == "every_fresh_call":
             assert stopped == ["no_progress_loop"]
-            assert published[0].startswith(
+            status, text = published[0]
+            # a recoverable stop leaves the child idle, not failed.
+            assert status == "completed", text
+            assert text.startswith(
                 "agent error: the model was called 2 times with the same request"
             )
+            assert "goes with your next message" in text
+            # the prompt stays saved but no longer wakes the model on its own.
+            (held,) = child_store._active_pending_prompt_entries
+            assert held not in flow.pending_ids()
         else:
             assert stopped == []
-            assert published[0].startswith("Handed off running background work.")
+            assert published[0][1].startswith("Handed off running background work.")
     finally:
         backend.on_fresh_call = lambda: None
         backend.release_grandchild.set()
+        # a child that keeps re-waking must not hide the assertion above.
+        owner.cancel_all()
         await await_or_fail(owner.wait(), what="background owner completion")
         await await_or_fail(loop.close(), what="agent loop close")
 

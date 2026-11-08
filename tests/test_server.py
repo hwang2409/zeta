@@ -1155,7 +1155,7 @@ async def test_serve_reports_no_progress_stop_and_accepts_next_message(
         events = [frame["params"] for frame in frames if frame.get("method") == "event"]
         error = next(event for event in events if event["event"] == "error")
         assert error["error"]["code"] == "no_progress_loop"
-        assert "Send a new message to continue." in error["error"]["message"]
+        assert "The input was not run; it is held and goes with your next message." in error["error"]["message"]
         assert not any(event["event"] == "assistant_message" for event in events)
 
         monkeypatch.setattr(DispatchProgress, "admit", original_admit)

@@ -191,7 +191,8 @@ class DispatchProgress:
             NO_PROGRESS_LOOP_CODE,
             f"the model was called {MAX_REPEATED_DISPATCHES + 1} times with the "
             "same request and nothing new was saved; stopped to avoid repeat "
-            "spend. Send a new message to continue.",
+            "spend. The input was not run; it is held and goes with your next "
+            "message.",
         )
 
 
