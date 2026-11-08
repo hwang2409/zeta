@@ -81,10 +81,7 @@ from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
 from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from ...tools._shared.process import TaskExitInput
-from ...tools.registry import (
-    ToolExecutionContext,
-    _validate_unique_tool_call_ids,
-)
+from ...tools.registry import ToolExecutionContext, _validate_unique_tool_call_ids
 from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
@@ -177,9 +174,8 @@ class AgentLoop(
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
     ) -> None:
-        if (
-            type(max_agent_depth) is not int
-            or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
+        if type(max_agent_depth) is not int or not (
+            0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
         ):
             raise ValueError(
                 f"maximum agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
@@ -199,12 +195,10 @@ class AgentLoop(
         self.parent_session_id = parent_session_id
         # Nested loops publish lineage through the root session directory.
         self.root_session_dir = (
-            root_session_dir if root_session_dir is not None else store.session_dir
-        )
+            root_session_dir if root_session_dir is not None else store.session_dir)
         self.project_registry = project_registry
         self._configure_project_context_recovery(
-            registry=None, project_id=None, health=None, prepare=None
-        )
+            registry=None, project_id=None, health=None, prepare=None)
         self._child_lineage_publisher = child_lineage_publisher
         if (
             self._child_lineage_publisher is None
@@ -212,9 +206,7 @@ class AgentLoop(
             and project_registry is not None
         ):
             self._child_lineage_publisher = ChildLineagePublisher(
-                project_registry,
-                self.root_session_dir,
-                self.store._storage_lease,
+                project_registry, self.root_session_dir, self.store._storage_lease
             )
         self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
@@ -345,9 +337,7 @@ class AgentLoop(
         return canonical_tool_schemas(schemas)
     def _account_safe_context(self, messages: list[Message]) -> list[Message]:
         account_context = getattr(self, "account_context", None)
-        provider = (
-            account_context.active_provider if account_context is not None else None
-        )
+        provider = account_context.active_provider if account_context is not None else None
         sequence = account_context.switch_sequence if account_context is not None else 0
         if provider is None or sequence == 0:
             return messages
@@ -815,8 +805,7 @@ class AgentLoop(
                 self._turn_output_tokens = None
                 self.tool_registry.start_batch()
                 yield StreamEvent(
-                    StreamEventType.TURN_START,
-                    data={"turn": turn_number},
+                    StreamEventType.TURN_START, data={"turn": turn_number}
                 )
             turn_abort_signal = abort_signal or self.tool_registry.abort_signal
             partial_blocks: list[ContentBlock] = []

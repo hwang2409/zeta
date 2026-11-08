@@ -1570,6 +1570,7 @@ class IdleParentRoutingBackend(CompletionBackend):
             for message in messages
         )
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8776,6 +8777,7 @@ class TerminalSendBackend(CompletionBackend):
         self.release_child = asyncio.Event()
         self.child_calls = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
