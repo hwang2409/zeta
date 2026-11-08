@@ -9888,6 +9888,81 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
 
 
 @pytest.mark.asyncio
+async def test_slash_run_busy_policy_keeps_safe_forms_and_blocks_mutation(
+    tmp_path: Path,
+) -> None:
+    from tests.support.server_backend import ServerFakeBackend
+    from zeta.protocol.types import StreamEventType
+
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "init", "--quiet", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class GatedBackend(ServerFakeBackend):
+        async def complete(self, messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+                if event.type == StreamEventType.MESSAGE_UPDATE:
+                    started.set()
+                    await await_or_fail(
+                        release.wait(), timeout=60, what="gated backend release"
+                    )
+
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=tmp_path,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_args: (GatedBackend(delay=0), "offline"),
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "slow"})
+        await await_or_fail(started.wait(), what="gated backend start")
+
+        approve = (
+            await _request(
+                reader,
+                writer,
+                4,
+                "slash_run",
+                {"session_id": sid, "text": "/approve"},
+            )
+        )[-1]
+        assert approve.get("result") == {"kind": "client_only", "name": "approve"}
+
+        status = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]
+        assert status.get("result", {}).get("kind") == "output"
+
+        mutation = (
+            await _request(
+                reader,
+                writer,
+                6,
+                "slash_run",
+                {"session_id": sid, "text": "/plan on"},
+            )
+        )[-1]
+        assert mutation.get("error", {}).get("code") == -32004
+    finally:
+        release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_session_loads_private_instructions_from_linked_worktree(
     tmp_path: Path,
 ) -> None:
