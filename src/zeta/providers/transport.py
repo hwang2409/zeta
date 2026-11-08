@@ -32,8 +32,32 @@ DEFAULT_STREAM_STALL_RETRIES = 2
 _BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
 _BACKGROUND_CLEANUP_REPORT_TASKS: set[asyncio.Task[object]] = set()
 _MAX_BACKGROUND_CLEANUP_REPORTS = 16
+_JSON_YIELD_BYTES = 256 * 1024
 _dropped_cleanup_reports = 0
 CloseFailureReporter = Callable[[int, BaseException], None]
+
+
+async def encode_json_payload(
+    payload: Mapping[str, Any],
+    *,
+    ensure_ascii: bool = True,
+    sort_keys: bool = False,
+    separators: tuple[str, str] | None = None,
+) -> bytes:
+    """Encode JSON while yielding between bounded pieces of the payload."""
+    encoder = json.JSONEncoder(
+        ensure_ascii=ensure_ascii, sort_keys=sort_keys, separators=separators
+    )
+    body = bytearray()
+    pending = 0
+    for fragment in encoder.iterencode(payload):
+        encoded = fragment.encode()
+        body.extend(encoded)
+        pending += len(encoded)
+        if pending >= _JSON_YIELD_BYTES:
+            await asyncio.sleep(0)
+            pending = 0
+    return bytes(body)
 
 
 @dataclass(frozen=True, slots=True)

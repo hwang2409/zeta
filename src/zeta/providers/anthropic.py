@@ -45,6 +45,7 @@ from .stream_errors import decode_stream_error
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
+    encode_json_payload,
     HTTPClientLease,
     SSEEventAccumulator,
     StreamFinished,
@@ -574,7 +575,12 @@ class AnthropicBackend(CompletionBackend):
                 "POST",
                 self.base_url,
                 headers=headers,
-                content=serialize_request_payload(payload),
+                content=await encode_json_payload(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             )
             response = await wait_for_response_headers(
                 stream_context.__aenter__(), self.stall_seconds,

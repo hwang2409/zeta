@@ -32,11 +32,65 @@ from zeta.providers.transport import (
     build_response_error,
     cleanup_transport,
     close_transport_resources,
+    encode_json_payload,
     retry_provider_completion,
     stall_watchdog,
 )
 from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.loop_errors import run_prompt_toolkit
+
+
+@pytest.mark.asyncio
+async def test_encode_json_payload_matches_canonical_bytes() -> None:
+    payload = {"z": "héllo", "a": [1, {"工具": "值"}], "nan": float("nan")}
+    encoded = await encode_json_payload(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    assert encoded == json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_encoded_payload_uses_known_length_without_chunked_framing() -> None:
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, request=request)
+
+    body = await encode_json_payload(
+        {"message": "héllo"}, ensure_ascii=False, separators=(",", ":")
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await client.post(
+            "https://provider.invalid",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+    assert response.status_code == 200
+    assert seen[0].content == body
+    assert seen[0].headers["content-length"] == str(len(body))
+    assert "transfer-encoding" not in seen[0].headers
+
+
+@pytest.mark.asyncio
+async def test_encode_json_payload_yields_during_large_encoding() -> None:
+    progressed = asyncio.Event()
+
+    async def observer() -> None:
+        await asyncio.sleep(0)
+        progressed.set()
+
+    observer_task = asyncio.create_task(observer())
+    try:
+        await encode_json_payload({"text": "x" * (512 * 1024)})
+        await asyncio.wait_for(observer_task, 10)
+        assert progressed.is_set()
+    finally:
+        if not observer_task.done():
+            observer_task.cancel()
+            await asyncio.wait_for(observer_task, 10)
 
 
 class _PartialErrorBody(httpx.AsyncByteStream):

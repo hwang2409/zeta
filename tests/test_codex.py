@@ -3986,7 +3986,7 @@ async def test_non_http_stream_exception_is_not_remapped(tmp_path: Path) -> None
             return None
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
     with pytest.raises(ValueError, match="stream parser bug"):
@@ -4015,7 +4015,7 @@ async def test_non_http_cleanup_exception_is_typed_diagnostic(tmp_path: Path) ->
             raise ValueError("cleanup bug")
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
     diagnostics_path = tmp_path / "diagnostics.jsonl"
@@ -4113,7 +4113,7 @@ class _CleanupClient:
         self.stream_error = stream_error
         self.client_error = client_error
 
-    def stream(self, method, url, *, headers, json):
+    def stream(self, method, url, *, headers, content):
         return _CleanupStream(self.events, self.stream_error)
 
     async def aclose(self):
@@ -4257,7 +4257,7 @@ async def test_consumer_aclose_finishes_without_leaking_cleanup(
             cleanup_finished.set()
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
     iterator = CodexBackend(
@@ -4291,7 +4291,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
             await never.wait()
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
     store = store_for(tmp_path / "codex.json")
