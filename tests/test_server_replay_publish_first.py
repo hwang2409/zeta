@@ -378,9 +378,12 @@ async def test_join_while_user_row_is_held_sees_echo_once(
         gates.release("mcp")
         await _event(serve.controller, "agent_end")
         joins["after_turn"] = await serve.joined()
-        assert await _counts(serve, joins, marker) == {
-            "before": 1, "before_row": 1, "after_row": 1, "after_turn": 1
-        }
+        frames = {name: await serve.live(client) for name, (client, _history) in joins.items()}
+        counts = {name: _count(joins[name][1], frames[name], marker) for name in joins}
+        assert counts == {"before": 1, "before_row": 1, "after_row": 1, "after_turn": 1}
+        # latency bound: a replay stream's echo goes out with AGENT_START, not later
+        kinds = [frame["event"] for frame in frames["before"]]
+        assert kinds.index("user_message") < kinds.index("agent_start"), kinds
     finally:
         await serve.close()
 

@@ -1320,7 +1320,17 @@ error code and message. Provider status and origin remain internal.
   receive controller session events only through a successful join.
   An event whose history row is already in the join's history is not sent on
   that stream and spends no `seq`, so each effect appears once, in history or
-  live. A stream ends only on session replacement, replay pressure, a second join on
+  live. `assistant_message` and the `user_message` echo of a `send` or
+  `send_images` without `delivery_id` are published before their history row is
+  written, so on a replay stream (also a controller's own, when it negotiated
+  `session_replay_seq`) they can arrive later than on a connection without
+  `session_replay_seq`: with the first event after the row is written (for the
+  echo, before `agent_start`, which can follow MCP server startup), or at the end
+  of the turn. When the row is never written (for example an aborted reply whose
+  partial row failed to persist, or a reply replaced by a retry), the stream
+  still gets the event once, but a client that joins later sees it in neither
+  history nor live: such an event is provisional across a stream end.
+  A stream ends only on session replacement, replay pressure, a second join on
   the same connection (even a rejected one), a failed write or admission on the
   connection, or the connection's close; it also ends with `evicted` when a late
   event's history row is too old to place against the join's history, and with
@@ -1341,7 +1351,8 @@ error code and message. Provider status and origin remain internal.
   Connections without `session_replay_seq` never receive the event. In every
   case the client sends a new join.
   The server retains at most 64 records/1 MiB per scope and 256 records/4 MiB
-  globally, evicting the largest scope first. Older pages continue to use
+  globally, evicting the largest scope first; a scope holds at most two waiting
+  events (one `assistant_message`, one echo), counted in these limits. Older pages continue to use
   `session_history` and do not change the live stream.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
