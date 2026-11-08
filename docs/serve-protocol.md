@@ -1473,8 +1473,8 @@ implementation for the frontend client. Two RPCs cover the surface.
   must send the command and handle `-32004`.
 - `slash_run`: params `session_id` and `text` (the raw composer value
   starting with `/`). When a turn is running, it rejects the forms that
-  `runs_while_busy` does not allow with `-32004`. Returns a `kind`
-  discriminator:
+  `runs_while_busy` does not allow with `-32004`.
+  Returns a `kind` discriminator:
   - `output`: `text` is the composed notice to render as a quiet receipt. For
     `/status`, this is the same operational view as the TUI, including configured
     hooks, recent cache-hit history, and model-attributed estimated cost. The
