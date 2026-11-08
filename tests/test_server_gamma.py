@@ -300,6 +300,7 @@ async def test_active_resume_rejects_a_session_whose_cwd_was_removed(
         await _legacy_hello(reader, writer)
         created = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]
         session_id = created["session"]["session_id"]
+        assert server.runtime.session_id == session_id
         shutil.rmtree(original)
 
         resumed = await _request(

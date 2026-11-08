@@ -451,26 +451,26 @@ class ServerRuntime:
         )
         return config, resumed_prompt
 
-    async def resume_session(
-        self, session_id: str, *, force: bool = False
-    ) -> SessionMetadata:
-        if self._state is not None and self._state.session_id == session_id:
-            if not force:
-                metadata = self.metadata
-            else:
-                await self.close()
-                metadata = await asyncio.to_thread(
-                    self.manager.read_metadata, session_id
-                )
-        else:
-            metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
-        if metadata.provider == "fake":
-            raise ValueError(REMOVED_PROVIDER_ERROR)
+    async def _session_cwd(self, metadata: SessionMetadata) -> Path:
         session_cwd = Path(metadata.cwd)
         if not await asyncio.to_thread(session_cwd.is_dir):
             raise ValueError(
                 f"session working directory no longer exists: {metadata.cwd}"
             )
+        return session_cwd
+
+    async def resume_session(
+        self, session_id: str, *, force: bool = False
+    ) -> SessionMetadata:
+        if self._state is not None and self._state.session_id == session_id:
+            if not force:
+                await self._session_cwd(self.metadata)
+                return self.metadata
+            await self.close()
+        metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
+        if metadata.provider == "fake":
+            raise ValueError(REMOVED_PROVIDER_ERROR)
+        session_cwd = await self._session_cwd(metadata)
 
         composition = await self._run_setup(session_cwd, session_id=session_id)
         await self._replace(composition)
