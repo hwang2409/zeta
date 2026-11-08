@@ -193,6 +193,8 @@ def render_error_card(event: StreamEvent) -> Panel:
     retryable = is_retryable_error(error)
     if code == "account_lock_timeout":
         title = "account busy"
+    elif code == "no_progress_loop":
+        title = "model loop stopped"
     elif code == "project_registry_busy":
         title = "project registry busy"
     elif code == "auth_error":

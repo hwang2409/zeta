@@ -98,6 +98,7 @@ from ._store_writes import StoreWriteMixin
 from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
+    DispatchProgress,
     EmptyTurnRecoveryState,
     build_nudge_message,
     build_tool_limit_recovery_message,
@@ -282,6 +283,7 @@ class AgentLoop(
             tool_schemas if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
+        self._dispatch_progress = DispatchProgress()
         if system_prompt is None:
             system_prompt = load_identity(catalog=self.tool_registry.skill_catalog)
         self.context_assembler = context_assembler or ContextAssembler(
@@ -890,6 +892,8 @@ class AgentLoop(
                     notification_turn=notification_turn,
                     notice_sink=self._mcp_notice_sink,
                 )
+                if disposition == "dispatch":
+                    disposition = self._dispatch_progress.admit(self.store, prepared_delivery, step_delivery, retrying_context)
                 if disposition == "deferred":
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
@@ -1068,6 +1072,7 @@ class AgentLoop(
                             original,
                             provider_error=getattr(original, "provider_error", True),
                         )
+                self._dispatch_progress.reset()
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )

@@ -4300,6 +4300,22 @@ def test_render_event_error_is_visible() -> None:
     assert "reason: provider stopped" in renderable_plain(rendered)
 
 
+def test_no_progress_loop_renders_as_named_non_retryable_error() -> None:
+    message = (
+        "the model was called 2 times with the same request and nothing new was "
+        "saved; stopped to avoid repeat spend. Send a new message to continue."
+    )
+    rendered = render_event(
+        StreamEvent(StreamEventType.ERROR, error=ErrorInfo("no_progress_loop", message))
+    )
+
+    assert isinstance(rendered, Panel)
+    plain = renderable_plain(rendered)
+    assert "model loop stopped · no_progress_loop" in plain
+    assert "Send a new message to continue." in plain
+    assert "retry: ctrl+y" not in plain
+
+
 def test_account_lock_timeout_renders_as_retryable_error() -> None:
     message = (
         "cannot access codex:work: another process holds the account lock; "

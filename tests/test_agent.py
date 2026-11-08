@@ -73,6 +73,7 @@ from zeta.core.store import _step_delivery as step_delivery_store_module
 from zeta.core.store._pending_prompts import PendingPromptLoopThreadLockError
 from zeta.mcp import MCPMount
 from zeta.protocol.types import (
+    FAILED_TURN_ERROR,
     CompletionBackend,
     ErrorInfo,
     Message,
@@ -3970,6 +3971,117 @@ async def test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget(
     assert backend.fresh_prompt_seen.is_set()
 
 
+
+
+class RepeatedTimeoutBackend(PostCapBudgetBackend):
+    """Each fresh-prompt call outlives the gate's per-turn model bound."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fresh_calls = 0
+        self.third_fresh_call = asyncio.Event()
+        self.on_fresh_call: Callable[[], None] = lambda: None
+
+    @owned_completion
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        if _user_texts(messages)[-1:] == ["fresh external prompt"]:
+            self.fresh_calls += 1
+            if self.fresh_calls == 3:
+                self.third_fresh_call.set()
+            # the model bound expires before the provider sends anything, so
+            # nothing is committed and the gate dispatches the same request again.
+            self.on_fresh_call()
+        async for event in PostCapBudgetBackend.complete.__wrapped__(
+            self, messages, tool_schemas
+        ):
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_repeated_gate_timeouts_stop_identical_provider_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch, hold_child_bound=True)
+    backend = RepeatedTimeoutBackend()
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store, finish_gate_max_turns=1, finish_gate_timeout=60)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    terminal_published = asyncio.Event()
+    published: list[str] = []
+    original_publish = owner.conversation_channel.publish_completion
+
+    async def observe_publish(**kwargs):
+        if kwargs["child_instance_id"].count(":") == 1:
+            published.append(kwargs["text"])
+            terminal_published.set()
+        return await original_publish(**kwargs)
+
+    monkeypatch.setattr(
+        owner.conversation_channel, "publish_completion", observe_publish
+    )
+    try:
+        await await_or_fail(
+            _collect(loop.run_turn("start", origin=MessageOrigin.USER)),
+            what="root turn",
+        )
+        await await_or_fail(
+            backend.post_cap_exhausted.wait(), what="post-cap exhaustion"
+        )
+        child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
+        state = next(
+            state
+            for state, _configured_timeout in deadlines.started
+            if deadlines._wakes[id(state)][1] == child_handle
+        )
+        backend.on_fresh_call = lambda: deadlines._expire_active(state)
+        await send_to_run(
+            store,
+            child_handle,
+            "fresh external prompt",
+            channel=owner.conversation_channel,
+        )
+        terminal = asyncio.create_task(terminal_published.wait())
+        third = asyncio.create_task(backend.third_fresh_call.wait())
+        done, pending = await await_or_fail(
+            asyncio.wait({terminal, third}, return_when=asyncio.FIRST_COMPLETED),
+            what="terminal publication or a third identical provider call",
+        )
+        for task in pending:
+            task.cancel()
+        await await_or_fail(
+            asyncio.gather(*pending, return_exceptions=True), what="race cleanup"
+        )
+        assert backend.fresh_calls == 2, (
+            f"identical provider calls with nothing committed: {backend.fresh_calls}"
+        )
+        assert terminal in done
+        child_store = loop._background_owner.conversation_channel._delivery_targets[
+            child_handle
+        ].flow.store
+        stopped = [
+            message.metadata[FAILED_TURN_ERROR]
+            for message in child_store.messages()
+            if FAILED_TURN_ERROR in message.metadata
+        ]
+        assert [error["code"] for error in stopped] == ["no_progress_loop"]
+        assert published[0].startswith(
+            "agent error: the model was called 2 times with the same request"
+        )
+    finally:
+        backend.on_fresh_call = lambda: None
+        backend.release_grandchild.set()
+        await await_or_fail(owner.wait(), what="background owner completion")
+        await await_or_fail(loop.close(), what="agent loop close")
 
 
 @pytest.mark.asyncio
