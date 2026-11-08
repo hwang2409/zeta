@@ -479,9 +479,12 @@ class AccountStore(_AccountRegistry):
                         or self._has_unregistered_account_directories(home_fd, set())
                     ):
                         warnings.append(_UNSAFE_REGISTRY_WARNINGS[state])
-                        logger.warning("%s", warnings[-1])
                     if state is _Registry.BROKEN:
+                        # Not logged: every later registry read raises this
+                        # same line, so the CLI would print it twice.
                         return tuple(warnings)
+                    if state is _Registry.MISSING and warnings:
+                        logger.warning("%s", warnings[-1])
                 for provider in ("anthropic", "codex"):
                     self._migrate_provider(home_fd, provider, warnings)
         return tuple(warnings)
@@ -561,7 +564,9 @@ class AccountStore(_AccountRegistry):
         try:
             _registry_reference_index(value)
         except (KeyError, TypeError, ValueError) as exc:
-            raise AccountError("accounts.json is invalid; use /accounts") from exc
+            raise AccountError(
+                "account registry change is invalid; accounts.json was not changed"
+            ) from exc
         raw = _read_optional(home_fd, "accounts.json")
         current = json.loads(raw) if raw is not None else {}
         mutations = [

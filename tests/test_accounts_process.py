@@ -261,7 +261,7 @@ def _headless_start(home: Path) -> subprocess.CompletedProcess[str]:
     ("registry", "warning"),
     [
         (None, "accounts.json is missing; kept every account directory"),
-        (b"{not json\n", "accounts.json is invalid; kept it and every account"),
+        (b"{not json\n", "accounts.json is unreadable; kept it and every account"),
     ],
     ids=("missing", "broken"),
 )
@@ -283,6 +283,7 @@ def test_start_without_a_loaded_registry_keeps_every_account_file(
 
     assert _account_files(tmp_path) == before, result.stderr
     assert warning in result.stderr
+    assert result.stderr.count("accounts.json is") == 1, result.stderr
     if registry is None:
         assert not (tmp_path / "accounts.json").exists()
     else:
