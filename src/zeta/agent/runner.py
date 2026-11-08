@@ -60,9 +60,14 @@ from .presets import (
     AgentPreset,
     resolve_child_profile_tools,
 )
-from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
+from .receipt import (
+    MAX_AGENT_RESULT_BYTES,
+    TerminalState,
+    child_cleanup_details,
+    recoverable_error_result,
+)
 from .run_consumer import consume_run as consume_follow_up_run
-from .terminal_fence import TerminalTransitionFence
+from .terminal_fence import TerminalTransitionFence, persist_confirmed_cancel
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
@@ -283,19 +288,7 @@ async def consume_child(
         failure_message = error_message(exc)
     if failure_message is not None:
         if failure_error is not None and failure_error[0] == "account_lock_timeout":
-            result = terminal_result(
-                state="idle",
-                text=f"agent error: {failure_message}",
-                error=False,
-                status="running",
-            )
-            structured = result.get("structuredContent")
-            if isinstance(structured, dict):
-                structured["recoverable_error"] = {
-                    "code": failure_error[0],
-                    "message": failure_error[1],
-                }
-            return result
+            return recoverable_error_result(terminal_result, failure_message, *failure_error)
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
@@ -1052,20 +1045,12 @@ async def run_agent_tool(
         # child's own abort path) must not both write; a failed write releases it.
         child_canceled = True
         try:
-            if terminal_fence is not None and not await terminal_fence.cancel():
-                transition = await child_store._to_thread_durable(
-                    child_store._terminal_transition
-                )
-                lifecycle = child_store.agent_lifecycle() or {}
-                if transition != "cancel" or lifecycle.get("state") == "canceled":
-                    return False
-            await child_store._to_thread_agent_state(
-                child_store.mark_agent_canceled, tool_call.id
+            return await persist_confirmed_cancel(
+                terminal_fence, child_store, tool_call.id
             )
         except BaseException:
             child_canceled = False
             raise
-        return True
 
     async def cleanup_canceled_child(
         confirmation: asyncio.Task[bool],
