@@ -53,6 +53,7 @@ class Probe:
     forever: asyncio.Event = field(default_factory=asyncio.Event)
     delivered: int = 0
     requests: int | None = None
+    caller: asyncio.Task[Any] | None = None
 
     async def __call__(
         self, arguments: dict[str, Any], abort_signal: AbortSignal
@@ -63,6 +64,10 @@ class Probe:
         self.started.set()
         try:
             if self.mode == "value":
+                return "done"
+            if self.mode == "value_then_cancel_caller":
+                assert self.caller is not None
+                self.caller.cancel()
                 return "done"
             if self.mode == "raises":
                 raise ValueError("boom")
@@ -200,6 +205,7 @@ async def owner_call(
     signal = AbortSignal()
     caller = asyncio.current_task()
     assert caller is not None
+    probe.caller = caller
     if signal_first:
         signal.abort()
     if cancel_first:
@@ -457,6 +463,11 @@ async def next_turn_after_abort(h: Harness) -> Outcome:
 ROWS: list[Any] = [
     # The owner's own mapping, called the way registry.execute calls it.
     pytest.param(direct("value"), 1, False, Outcome((0,), (0,), ("done",)), id="success"),
+    pytest.param(
+        direct("value_then_cancel_caller"), 1, False,
+        Outcome((0,), (0,), ("done",)),
+        id="outer-cancel-after-handler-returned",
+    ),
     pytest.param(direct("raises"), 1, False, Outcome((0,), (0,), ("error:boom",)), id="body-raises"),
     pytest.param(direct("tool_canceled"), 1, False, Outcome((0,), (0,), ("canceled",)), id="tool-canceled"),
     pytest.param(

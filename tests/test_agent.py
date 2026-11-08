@@ -25,7 +25,6 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.core.store._log as store_log_module
-import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
 import zeta.tui.cards.agent as agent_card_module
 from tests.support.agent_lifecycle import (
@@ -10724,77 +10723,6 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert [
-        entry.data["text"]
-        for entry in await asyncio.to_thread(child_store.pending_prompts)
-    ] == ["follow up"]
-
-
-@pytest.mark.asyncio
-async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    parent_store = ConversationStore(tmp_path / "parent")
-    child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
-    call = _run_agent_call()
-    child_store.mark_agent_parent(call.id, agent_type="run")
-    parent_store.allocate_agent_index()
-    parent_store.register_agent_child(
-        call,
-        child_session_path=str(child_store.session_dir),
-        description="long horizon run",
-        agent_type="run",
-        background=True,
-        child_instance_id="parent:1",
-        accepts_follow_ups=True,
-    )
-
-    cleanup_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
-    original_gather = execution_module.asyncio.gather
-
-    async def blocked_cleanup(*args, **kwargs):
-        cleanup_started.set()
-        await release_cleanup.wait()
-        return await original_gather(*args, **kwargs)
-
-    monkeypatch.setattr(execution_module.asyncio, "gather", blocked_cleanup)
-    registry = ToolRegistry(
-        tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
-    )
-    owner = BackgroundAgentOwner(parent_store)
-    owner.conversation_channel.register_delivery_flow(
-        "parent:1", pending_delivery_module.StepDeliveryFlow(child_store)
-    )
-    registry._agent_owner = owner
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "agent-send-cleanup-cancel",
-                "agent_send",
-                {"child_instance_id": "parent:1", "message": "follow up"},
-            )
-        )
-    )
-
-    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
-    task.cancel()
-    release_cleanup.set()
-    result = await task
-
-    assert result["isError"] is False
-    assert result["content"][0]["text"] == (
-        "queued a follow-up for parent:1; a running child receives it after its "
-        "current tool call, before its next model call; an idle child receives it "
-        "at its next turn"
-    )
-    assert registry.definitions_by_name["agent_send"].description == (
-        "Send a follow-up to an eligible child you started. A running child "
-        "receives it after its current tool call, before its next model call. An "
-        "idle child receives it at its next turn. When answering ask_parent, you "
-        "can reference its question id in the message."
-    )
     assert [
         entry.data["text"]
         for entry in await asyncio.to_thread(child_store.pending_prompts)
