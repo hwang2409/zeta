@@ -41,9 +41,7 @@ from .protocol import (
     _LOGIN_METHODS,
     _PROJECT_METHODS,
     FEATURES,
-    HANDLERS,
     MAX_FRAME_BYTES,
-    Access,
     ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
@@ -56,6 +54,7 @@ from .protocol import (
     negotiate_protocol_version,
     protocol_error,
 )
+from .protocol import _dispatch as _dispatch_request
 from .runtime import BackendFactory, ServerRuntime
 from .session_replay import ReplayScopeId
 from .transport import WebSocketServer
@@ -585,34 +584,7 @@ class _Client:
             await self.server.control.publish_session_grant_change(change)
         return result
 
-    async def _dispatch(
-        self, request_id: str | int, method: str, params: dict[str, Any]
-    ) -> object:
-        handled, result = await self._route_request(request_id, method, params)
-        if handled:
-            return result
-        descriptor = MethodDescriptor.for_wire(method)
-        if self.role == "observer" and (
-            descriptor is None or descriptor.access is not Access.READ
-        ):
-            raise ProtocolError(
-                ErrorDescriptor.OBSERVER_READ_ONLY,
-                "method is unavailable to read-only observers",
-                {"method": method},
-            )
-        if descriptor is None:
-            raise ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
-            )
-        if descriptor.access is Access.SESSION_MUTATION:
-            self.server.control._reject_if_unhealthy()
-        if descriptor.since is not None and tuple(
-            int(part) for part in self.protocol_version.split(".")
-        ) < tuple(int(part) for part in descriptor.since.split(".")):
-            raise self._descriptor_protocol_error(descriptor)
-        if descriptor.feature is not None and descriptor.feature not in self.features:
-            raise self._descriptor_feature_error(descriptor)
-        return await HANDLERS[descriptor](self, request_id, params)
+    _dispatch = _dispatch_request
 
     _descriptor_protocol_error = staticmethod(protocol_error)
     _descriptor_feature_error = staticmethod(feature_error)

@@ -5,7 +5,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
-from .protocol import ErrorDescriptor, ProtocolError
+from ..protocol import ErrorDescriptor, ProtocolError
 
 REPLAY_MAX_RECORDS = 256
 REPLAY_MAX_BYTES = 4 * 1024 * 1024

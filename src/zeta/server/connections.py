@@ -6,7 +6,6 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any, Literal
 
 from . import content, ergonomics
@@ -19,7 +18,8 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
-from .session_replay import ReplayScopeId, SessionReplay
+from .session_replay import SessionReplay
+from .session_replay.output import ReplayOutput, _OutputFrame
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
@@ -69,16 +69,6 @@ class ControllerMetadata:
 
 
 @dataclass
-class _OutputFrame:
-    payload: _Frame
-    future: asyncio.Future[bool] | None = None
-    replay_stream_id: str | None = None
-    replay_scope: ReplayScopeId | None = None
-    replay_size: int = 0
-    join_response: bool = False
-
-
-@dataclass
 class _OutputState:
     phase: Literal["claimed_buffering", "flushing", "ready", "overflowing"] = (
         "claimed_buffering"
@@ -109,7 +99,7 @@ class _Connection:
     output: _OutputState | None = None
 
 
-class ConnectionRegistry:
+class ConnectionRegistry(ReplayOutput):
     """Owns connection claims, output, and bounded observer reads."""
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -273,18 +263,6 @@ class ConnectionRegistry:
             and fields["data"].get("reason") == "grace_expired"
         )
 
-    def _publish_observer_replay(
-        self,
-        event: EventDescriptor,
-        session_id: str | None,
-        required_feature: str | None,
-        fields: dict[str, object],
-    ) -> None:
-        """Send a controller event to observers that joined its replay scope."""
-        for observer in tuple(self._observers):
-            if not self._feature_rejected(observer, event, required_feature, fields):
-                self._publish_replay(observer, event, session_id, fields)
-
     def try_admit_controller(
         self,
         event: EventDescriptor,
@@ -316,162 +294,6 @@ class ConnectionRegistry:
             wake=True,
         )
         return outcome
-
-    def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        self.invalidate_replay_connection(connection)
-        self.replay.begin_join(connection, scope)
-
-    def invalidate_replay_connection(
-        self, connection: Any, stream_id: str | None = None
-    ) -> None:
-        """End one connection's replay stream; with stream_id, only that generation."""
-        if stream_id is not None and self.replay.stream_id(connection) != stream_id:
-            return
-        self.replay.connection_closed(connection)
-        self._discard_connection_replay(connection)
-
-    def invalidate_replay_scope(self, scope: ReplayScopeId) -> None:
-        self.replay.invalidate_scope(scope)
-        self._discard_replay_scope(scope)
-
-    def replay_session_replaced(self) -> None:
-        for scope in self.replay.scopes():
-            self.invalidate_replay_scope(scope)
-
-    def _discard_connection_replay(self, connection: Any) -> None:
-        state = self._connections.get(connection)
-        if state is None or state.output is None:
-            return
-        output = state.output
-        kept: deque[_OutputFrame] = deque()
-        while output.queue:
-            item = output.queue.popleft()
-            if item.replay_scope is not None:
-                self._finish_frame_accounting(output, item)
-            else:
-                kept.append(item)
-        output.queue = kept
-        self._assert_retained_accounting(output)
-
-    def _discard_replay_scope(self, scope: ReplayScopeId) -> None:
-        for state in tuple(self._connections.values()):
-            output = state.output
-            if output is None:
-                continue
-            kept: deque[_OutputFrame] = deque()
-            while output.queue:
-                item = output.queue.popleft()
-                if item.replay_scope == scope:
-                    self._finish_frame_accounting(output, item)
-                else:
-                    kept.append(item)
-            output.queue = kept
-            self._assert_retained_accounting(output)
-
-    def _publish_replay(
-        self,
-        state: _Connection,
-        event: EventDescriptor,
-        session_id: str | None,
-        fields: dict[str, object],
-    ) -> bool:
-        if "session_replay_seq" not in state.features or session_id is None:
-            return False
-        scope = ReplayScopeId.top(session_id)
-        prepared = self.replay.prepare(state.connection, scope)
-        if prepared is None or state.output is None:
-            return False
-        payload = {"stream_id": prepared.stream_id, "seq": prepared.seq, **fields}
-        frame = state.connection.codec.notification(event, session_id, **payload)
-        if frame is None:
-            return False
-        while (victim := self.replay.reserve(scope, len(frame))) is not None:
-            self.invalidate_replay_scope(victim)
-            prepared = self.replay.prepare(state.connection, scope)
-            if prepared is None:
-                return True
-        published = self.replay.commit(
-            state.connection,
-            event,
-            {**fields, "_session_id": session_id},
-            prepared,
-            len(frame),
-        )
-        if published is None:
-            self.replay.release(scope, len(frame))
-            return True
-        if self.replay.is_pending(state.connection):
-            return True
-        if not self._admit(state, frame):
-            self.replay.release(scope, published.size)
-            self.invalidate_replay_connection(state.connection)
-            return True
-        self._enqueue(
-            state.output,
-            _OutputFrame(
-                frame,
-                replay_stream_id=published.stream_id,
-                replay_scope=published.scope,
-                replay_size=published.size,
-            ),
-        )
-        return True
-
-    async def admit_join_response(self, connection: Any, frame: _Frame) -> bool:
-        state = self._connections.get(connection)
-        if state is None or state.output is None:
-            self.invalidate_replay_connection(connection)
-            return False
-        output = state.output
-        if output.phase not in {"claimed_buffering", "flushing", "ready"}:
-            self.invalidate_replay_connection(connection)
-            return False
-        held = self.replay.pending_tail(connection)
-        items: list[_OutputFrame] = [_OutputFrame(frame)]
-        for event, fields in held:
-            public = {
-                key: value
-                for key, value in fields.items()
-                if key not in {"_session_id", "_replay_scope", "_replay_size"}
-            }
-            payload = connection.codec.notification(
-                event, fields["_session_id"], **public
-            )
-            if payload is None:
-                self.invalidate_replay_connection(connection)
-                return False
-            items.append(
-                _OutputFrame(
-                    payload,
-                    replay_stream_id=public["stream_id"],
-                    replay_scope=fields["_replay_scope"],
-                    replay_size=fields["_replay_size"],
-                )
-            )
-        if (
-            output.retained_bytes
-            + sum(len(item.payload) for item in items)
-            + len(output.overflow_frame or b"")
-            > OUTPUT_MAX_BYTES
-            or output.retained_frames + len(items) + 1 > OUTPUT_MAX_FRAMES
-        ):
-            self.invalidate_replay_connection(connection)
-            self._begin_overflow(state, enqueue_control=True)
-            return False
-        items[0].join_response = True
-        for item in items:
-            self._enqueue(output, item, wake=False)
-        self.replay.activate_join(connection)
-        # the response is not a stream frame: invalidation keeps it, its failure ends the stream
-        items[0].replay_stream_id = self.replay.stream_id(connection)
-        output.wake.set()
-        future = self.loop.create_future()
-        items[0].future = future
-        self._begin_caller(output)
-        try:
-            return await asyncio.shield(future)
-        finally:
-            self._finish_caller(output)
 
     async def publish_controller(
         self,
@@ -564,7 +386,7 @@ class ConnectionRegistry:
         if (
             output.overflow_frame is not None
             and not output.overflowed
-            and not self._fits(output, frame)
+            and not self._fits(output, len(frame))
         ):
             self._begin_overflow(state, enqueue_control=False)
         hello = _OutputFrame(frame)
@@ -704,10 +526,6 @@ class ConnectionRegistry:
         if not result and output.phase == "flushing":
             self._reset_flush(output, False)
 
-    def _fail_replay_frame(self, state: _Connection, item: _OutputFrame) -> None:
-        if item.replay_stream_id is not None:
-            self.invalidate_replay_connection(state.connection, item.replay_stream_id)
-
     async def _complete_output_phase(
         self, state: _Connection, output: _OutputState
     ) -> bool:
@@ -751,12 +569,12 @@ class ConnectionRegistry:
             return
         self._enqueue(output, _OutputFrame(frame))
 
-    def _fits(self, output: _OutputState, frame: _Frame) -> bool:
+    def _fits(self, output: _OutputState, size: int, frames: int = 1) -> bool:
         control = output.overflow_frame
         assert control is not None
         return (
-            output.retained_bytes + len(frame) + len(control) <= OUTPUT_MAX_BYTES
-            and output.retained_frames + 2 <= OUTPUT_MAX_FRAMES
+            output.retained_bytes + size + len(control) <= OUTPUT_MAX_BYTES
+            and output.retained_frames + frames + 1 <= OUTPUT_MAX_FRAMES
         )
 
     def _admit(self, state: _Connection, frame: _Frame) -> bool:
@@ -764,7 +582,7 @@ class ConnectionRegistry:
         assert output is not None
         if output.overflowed:
             return False
-        if self._fits(output, frame):
+        if self._fits(output, len(frame)):
             return True
         self._begin_overflow(state, enqueue_control=output.phase != "claimed_buffering")
         return False
@@ -965,30 +783,6 @@ class ConnectionRegistry:
             raise ProtocolError(
                 ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
             )
-        return result
-
-    async def read_replay_history(
-        self, connection: Any, session_id: str
-    ) -> dict[str, object]:
-        """Read the newest history page of the pinned active store off-loop."""
-        store = ergonomics.active(connection.server.runtime, {"session_id": session_id})
-        pinned = SimpleNamespace(opened=SimpleNamespace(store=store))
-        features = self._connections[connection].features
-        result = await self.run_read(
-            connection,
-            lambda: ergonomics.history(
-                pinned,
-                {"session_id": session_id, "before": None},
-                include_delivery_id={
-                    "delivery_id", "user_message_event", "user_message_delivery_id"
-                } <= features,
-                backward_enabled=True,
-                fidelity=True,
-                content_read="content_read" in features,
-                served_turn_end="served_turn_end" in features,
-            ),
-        )
-        assert isinstance(result, dict)
         return result
 
     async def read_session(

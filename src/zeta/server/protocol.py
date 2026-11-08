@@ -515,6 +515,36 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
     return requested
 
 
+async def _dispatch(
+    self, request_id: str | int, method: str, params: dict[str, Any]
+) -> object:
+    handled, result = await self._route_request(request_id, method, params)
+    if handled:
+        return result
+    descriptor = MethodDescriptor.for_wire(method)
+    if self.role == "observer" and (
+        descriptor is None or descriptor.access is not Access.READ
+    ):
+        raise ProtocolError(
+            ErrorDescriptor.OBSERVER_READ_ONLY,
+            "method is unavailable to read-only observers",
+            {"method": method},
+        )
+    if descriptor is None:
+        raise ProtocolError(
+            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
+        )
+    if descriptor.access is Access.SESSION_MUTATION:
+        self.server.control._reject_if_unhealthy()
+    if descriptor.since is not None and tuple(
+        int(part) for part in self.protocol_version.split(".")
+    ) < tuple(int(part) for part in descriptor.since.split(".")):
+        raise self._descriptor_protocol_error(descriptor)
+    if descriptor.feature is not None and descriptor.feature not in self.features:
+        raise self._descriptor_feature_error(descriptor)
+    return await HANDLERS[descriptor](self, request_id, params)
+
+
 def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
     async def handle(
         client: object, request_id: str | int, params: dict[str, Any]
