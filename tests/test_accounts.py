@@ -958,7 +958,7 @@ def test_migration_is_noop_when_already_migrated(tmp_path: Path) -> None:
     )
 
 
-def test_migration_does_not_delete_legacy_file_newer_than_migrated_copy(
+def test_migration_does_not_lose_a_legacy_login_that_expires_later_than_migrated_copy(
     tmp_path: Path,
 ) -> None:
     _write_legacy(tmp_path, "codex")
@@ -969,13 +969,49 @@ def test_migration_does_not_delete_legacy_file_newer_than_migrated_copy(
     newer = OAuthTokens("newer-access", "newer-refresh", 10_000_000_000.0)
     legacy = tmp_path / "codex-oauth.json"
     legacy.write_text(json.dumps(newer.to_dict()))
-    newer_mtime = destination_mtime + 1_000_000_000
-    os.utime(legacy, ns=(newer_mtime, newer_mtime))
+    # a restored copy: the newer login carries the older mtime
+    older_mtime = destination_mtime - 1_000_000_000
+    os.utime(legacy, ns=(older_mtime, older_mtime))
 
     store.migrate()
 
     assert json.loads(destination.read_text()) == newer.to_dict()
     assert not legacy.exists()
+
+
+# in-process: a headless start would try a network refresh of the 0-expiry account token
+@pytest.mark.parametrize("registry", [False, True], ids=("registry-missing", "registry-loaded"))
+@pytest.mark.parametrize("legacy_mtime_newer", [False, True], ids=("account-mtime-newer", "legacy-mtime-newer"))
+def test_migration_keeps_both_logins_when_the_account_file_has_no_expiry(
+    tmp_path: Path, legacy_mtime_newer: bool, registry: bool
+) -> None:
+    account = AccountId("codex", "default")
+    store = build_account_home(tmp_path, (account,), available=(account,), defaults=(account,))
+    registry_bytes = store.registry.read_bytes()
+    if not registry:
+        store.registry.unlink()
+    destination = store.credential_path(account)
+    destination.write_text(json.dumps({"access_token": "old-access", "refresh_token": "old-refresh"}))
+    legacy = tmp_path / "codex-oauth.json"
+    legacy.write_text(json.dumps(OAuthTokens("new-access", "new-refresh", 9.5e9).to_dict()))
+    newer, older = 1_700_000_001_000_000_000, 1_700_000_000_000_000_000
+    os.utime(legacy, ns=(newer, newer) if legacy_mtime_newer else (older, older))
+    os.utime(destination, ns=(older, older) if legacy_mtime_newer else (newer, newer))
+    account_bytes, legacy_bytes = destination.read_bytes(), legacy.read_bytes()
+
+    warnings = AccountStore(tmp_path).migrate()
+
+    assert destination.read_bytes() == account_bytes
+    assert legacy.read_bytes() == legacy_bytes
+    warning = (
+        f"kept {destination} and {legacy}: could not tell which login is newer; "
+        "delete the one you do not want, then restart zeta"
+    )
+    assert [w for w in warnings if "could not tell which login is newer" in w] == [warning]
+    if registry:
+        assert store.registry.read_bytes() == registry_bytes
+    else:
+        assert not store.registry.exists()
 
 
 def test_account_files_are_0600_and_dirs_are_private(tmp_path: Path) -> None:
