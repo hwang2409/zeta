@@ -39,13 +39,12 @@ from .project_requests import (
 )
 from .protocol import (
     FEATURES,
-    FRAME_CANCEL_GRACE,
     MAX_FRAME_BYTES,
     ErrorDescriptor,
     FrameCodec,
+    FrameWriteOwner,
     ProtocolError,
     _Frame,
-    finish_frame_write,
     hello_result,
     negotiate_protocol_version,
 )
@@ -245,8 +244,7 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
-        self._active_writes: set[asyncio.Task[bool]] = set()
-        self._orphaned_writes: set[asyncio.Future[bool]] = set()
+        self._frame_writes = FrameWriteOwner()
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
@@ -308,7 +306,7 @@ class ZetaServer:
                 if self.connections is not None:
                     await self.connections.aclose()
                     self.connections = None
-                await self._close_orphaned_writes()
+                await self._frame_writes.aclose()
                 try:
                     if self._websocket is not None:
                         await self._websocket.close()
@@ -320,17 +318,6 @@ class ZetaServer:
                 finally:
                     self._server = None
                     self._unix_listener = None
-
-    async def _close_orphaned_writes(self) -> None:
-        deadline = asyncio.get_running_loop().time() + 2 * FRAME_CANCEL_GRACE
-        while self._active_writes or self._orphaned_writes:
-            pending = set(self._active_writes) | self._orphaned_writes
-            for write in pending:
-                write.cancel()
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return
-            await asyncio.wait(pending, timeout=remaining)
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -1176,19 +1163,9 @@ class _Client:
         return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
-        task = asyncio.current_task()
-        assert task is not None
-        self.server._active_writes.add(task)
-        try:
-            async with self._write_lock:
-                return await finish_frame_write(
-                    self.codec,
-                    self.writer,
-                    payload,
-                    orphaned_writes=self.server._orphaned_writes,
-                )
-        finally:
-            self.server._active_writes.discard(task)
+        return await self.server._frame_writes.write(
+            self.codec, self.writer, payload, self._write_lock
+        )
 
 
 def _home() -> Path:
