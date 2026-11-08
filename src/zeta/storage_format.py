@@ -635,6 +635,7 @@ def advance(
     if target_epoch > WRITER_EPOCH or target_epoch <= expected_epoch:
         raise StorageFormatError("stored-format target must be newer and supported")
     canonical = _canonical_home(home)
+    drain_releases()  # a lease this process dropped must not count as an active writer
     fd = _open_lock(canonical)
     try:
         try:

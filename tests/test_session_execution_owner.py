@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import functools
+import gc
 import multiprocessing
 import os
 import select
@@ -23,6 +24,7 @@ from zeta.core.session_execution import (
     SessionExecutionLease,
     session_owner_status,
 )
+from zeta.storage_format import drain_releases
 
 _WAIT_TIMEOUT_SECONDS = 10.0
 
@@ -215,6 +217,10 @@ def _open_with_format_lock_probe(home: str, session_id: str, result: Any) -> Non
 def test_execution_acquire_uses_only_nonblocking_flock_and_never_fsyncs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Leases that earlier tests dropped are released at acquire's drain point;
+    # release them first so only acquire's own flock is recorded.
+    gc.collect()
+    drain_releases()
     operations: list[int] = []
     fsync_calls: list[int] = []
     real_flock = fcntl.flock
