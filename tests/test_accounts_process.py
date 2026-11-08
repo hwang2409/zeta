@@ -245,7 +245,7 @@ def _account_files(home: Path) -> dict[str, bytes]:
 def _headless_start(home: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         (_entrypoint(), "--provider", "codex", "-p", "/status"),
-        cwd=home,
+        cwd=Path.cwd(),
         env=_environment(home),
         stdin=subprocess.DEVNULL,
         capture_output=True,
