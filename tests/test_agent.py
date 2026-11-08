@@ -4144,6 +4144,8 @@ class RepeatedTimeoutBackend(PostCapBudgetBackend):
         self.fresh_calls = 0
         self.third_fresh_call = asyncio.Event()
         self.on_fresh_call: Callable[[], None] = lambda: None
+        self.follow_up_requests: list[list[str]] = []
+        self.follow_up_answered = asyncio.Event()
 
     @owned_completion
     async def complete(
@@ -4151,6 +4153,17 @@ class RepeatedTimeoutBackend(PostCapBudgetBackend):
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
+        if _user_texts(messages)[-1:] == ["follow-up"]:
+            self.follow_up_requests.append(_user_texts(messages))
+            blocks = [TextContent("follow-up done")]
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
+            self.follow_up_answered.set()
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+            return
         if _user_texts(messages)[-1:] == ["fresh external prompt"]:
             self.fresh_calls += 1
             if self.fresh_calls == 3:
@@ -4162,6 +4175,16 @@ class RepeatedTimeoutBackend(PostCapBudgetBackend):
             self, messages, tool_schemas
         ):
             yield event
+
+
+def _not_delivered_texts(events: Sequence[StreamEvent]) -> list[str]:
+    return [
+        event.data["text"]
+        for event in events
+        if event.type is StreamEventType.AGENT_NOTIFICATION
+        and event.data.get("display_only") is True
+        and "not delivered" in str(event.data.get("text"))
+    ]
 
 
 @pytest.mark.asyncio
@@ -4195,6 +4218,8 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
     monkeypatch.setattr(
         owner.conversation_channel, "publish_completion", observe_publish
     )
+    root_events: list[StreamEvent] = []
+    loop.set_background_event_sink(root_events.append)
     try:
         await await_or_fail(
             _collect(loop.run_turn("start", origin=MessageOrigin.USER)),
@@ -4256,10 +4281,30 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             assert text.startswith(
                 "agent error: the model was called 2 times with the same request"
             )
-            assert "goes with your next message" in text
+            assert "goes with the next message" in text
             # the prompt stays saved but no longer wakes the model on its own.
             (held,) = child_store._active_pending_prompt_entries
             assert held not in flow.pending_ids()
+            # the user sees what was held, on the root transcript, durably.
+            assert _not_delivered_texts(root_events) == [text.split(" · ")[0].removeprefix("agent error: ")]
+            assert [
+                entry.data["text"]
+                for entry in store.agent_notifications(pending_only=False)
+                if "not delivered" in entry.data.get("text", "")
+            ] == _not_delivered_texts(root_events)
+            # the notice woke nothing: the next call is the follow-up, carrying
+            # the held prompt exactly once.
+            await send_to_run(
+                store, child_handle, "follow-up", channel=owner.conversation_channel
+            )
+            await await_or_fail(
+                backend.follow_up_answered.wait(), what="follow-up answer"
+            )
+            assert backend.fresh_calls == 2
+            assert [
+                [text for text in request if text in {"fresh external prompt", "follow-up"}]
+                for request in backend.follow_up_requests
+            ] == [["fresh external prompt", "follow-up"]]
         else:
             assert stopped == []
             assert published[0][1].startswith("Handed off running background work.")

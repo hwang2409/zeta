@@ -97,6 +97,7 @@ from ._completion import (
 from ._store_writes import StoreWriteMixin
 from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
+    NO_PROGRESS_LOOP_CODE,
     OUTPUT_LIMIT_ERROR_MESSAGE,
     DispatchProgress,
     EmptyTurnRecoveryState,
@@ -901,6 +902,14 @@ class AgentLoop(
                     self._persist_partial_with_cancelled_tools(
                         [], None, failure=disposition
                     )
+                    if (
+                        disposition.code == NO_PROGRESS_LOOP_CODE
+                        and self.agent_instance_id is not None
+                        and self._background_owner is not None
+                    ):
+                        await self._background_owner.conversation_channel.publish_not_delivered(
+                            self, disposition.message
+                        )
                     yield StreamEvent(StreamEventType.ERROR, error=disposition)
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return

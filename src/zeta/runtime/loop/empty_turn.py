@@ -189,11 +189,18 @@ class DispatchProgress:
         flow.suppress_pending(stopped)
         return ErrorInfo(
             NO_PROGRESS_LOOP_CODE,
-            f"the model was called {MAX_REPEATED_DISPATCHES + 1} times with the "
-            "same request and nothing new was saved; stopped to avoid repeat "
-            "spend. The input was not run; it is held and goes with your next "
-            "message.",
+            not_delivered_text(
+                f"the model was called {MAX_REPEATED_DISPATCHES + 1} times with "
+                "the same request and nothing new was saved; stopped to avoid "
+                "repeat spend"
+            ),
         )
+
+
+def not_delivered_text(reason: str) -> str:
+    """Word every stop that holds input back (repeat bound, causal budget) alike."""
+
+    return f"{reason}. Input not delivered: it is held and goes with the next message."
 
 
 def build_nudge_message() -> Message:
