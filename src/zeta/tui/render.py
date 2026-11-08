@@ -688,8 +688,8 @@ def render_event(
             return Text("model refused to answer", style=theme.WARNING)
         if completion == "content_filter":
             return Text("model response blocked by content filter", style=theme.WARNING)
-        if completion == "empty":
-            return Text("model returned an empty response", style=theme.WARNING)
+        # "empty" is not shown: user turns get the "no response" fallback and
+        # a silent notification turn is a valid "nothing to report".
         return None
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         return render_agent_notification(event, identity_index)

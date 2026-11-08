@@ -6898,13 +6898,16 @@ def test_turn_end_completion_classification_is_visible() -> None:
     for completion, expected in (
         ("refusal", "model refused to answer"),
         ("content_filter", "model response blocked by content filter"),
-        ("empty", "model returned an empty response"),
     ):
         rendered = render_event(
             StreamEvent(StreamEventType.TURN_END, data={"completion": completion})
         )
         assert rendered is not None
         assert expected in rendered.plain
+    assert (
+        render_event(StreamEvent(StreamEventType.TURN_END, data={"completion": "empty"}))
+        is None
+    )
 
 
 def test_retry_notice_is_dim() -> None:
@@ -10953,8 +10956,6 @@ async def test_empty_completion_removes_preview_region_before_fallback(
         "",
         "prompt",
         "",
-        "model returned an empty response",
-        "model returned an empty response",
         "",
         "no response",
     ]
@@ -13980,6 +13981,7 @@ async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
     await app._consume_turn("", notification=True)
 
     rendered = Text.from_ansi(output.getvalue()).plain
+    assert "model returned an empty response" not in rendered
     assert "no response" not in rendered
 
 
@@ -14002,7 +14004,8 @@ async def test_user_turn_still_shows_no_response_after_failed_nudge(
     # The nudge ran a second completion and still came back empty.
     assert len(backend.calls) == 2
     rendered = Text.from_ansi(output.getvalue()).plain
-    assert "no response" in rendered
+    assert "model returned an empty response" not in rendered
+    assert rendered.count("no response") == 1
 
 
 @pytest.mark.asyncio
