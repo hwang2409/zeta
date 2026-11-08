@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,53 @@ def test_select_predecessor_checks_adjacent_merges_for_pull_and_push(tmp_path: P
 
 def test_selected_writer_round_trips_and_reopens_candidate_data() -> None:
     _run_roundtrips(Path(__file__).parents[1], WRITER_EPOCH)
+
+
+def test_main_runs_selected_predecessor_roundtrip_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    predecessor = "a" * 40
+    phases: list[tuple[bool, int]] = []
+
+    def fake_git(*args: str) -> str:
+        if args[0] == "archive":
+            Path(args[-1]).touch()
+        return predecessor
+
+    def fake_run(command: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[0] == "uv":
+            return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(_COMPAT, "_git", fake_git)
+    monkeypatch.setattr(_COMPAT, "select_predecessor", lambda **kwargs: (predecessor, [predecessor]))
+    monkeypatch.setattr(_COMPAT, "has_probe", lambda commit: False)
+    monkeypatch.setattr(_COMPAT, "_writer_epoch", lambda source: WRITER_EPOCH)
+    monkeypatch.setattr(_COMPAT, "_run_phase", fake_run)
+    monkeypatch.setattr(
+        _COMPAT,
+        "_copy_predecessor_lock",
+        lambda commit, destination: destination.write_text("stub-lock\n"),
+    )
+    monkeypatch.setattr(
+        _COMPAT,
+        "_run_roundtrips",
+        lambda source, epoch: phases.append((source.is_dir(), epoch)),
+    )
+    monkeypatch.setattr(sys, "argv", ["storage_format_compatibility.py", "--output-dir", str(tmp_path)])
+
+    assert _COMPAT.main() == 0
+    assert phases == [(True, WRITER_EPOCH)]
+
+
+def test_subprocess_timeout_names_the_failed_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    def timeout(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(("uv", "run"), 180)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+
+    with pytest.raises(RuntimeError, match="candidate writer timed out after 7 seconds"):
+        _COMPAT._run_phase(("uv", "run"), phase="candidate writer", timeout=7)
 
 
 def test_mutation_delta_rejects_non_declared_path(tmp_path: Path) -> None:
