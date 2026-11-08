@@ -448,7 +448,7 @@ class SlashCommandRegistry:
         if not is_slash_safe_name(name):
             return None
         args = parts[1] if len(parts) == 2 else ""
-        label = f"/{name}"
+        label = " ".join((f"/{name}", *args.split(maxsplit=1)[:1]))
         command = self._commands.get(name)
         if command is not None and self.available(command):
             return label, lambda lock: command.run(session, args, lock)

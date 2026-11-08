@@ -442,7 +442,7 @@ async def test_public_migration_end_to_end_with_real_content(
         authorization=MemoryMutationAuthorization.direct_slash(),
     )
 
-    shown = await ProjectRequests(
+    shown = ProjectRequests(
         home=first,
         runtime=SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list)),
         codec=FrameCodec(),
@@ -1004,7 +1004,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             await ServerSlashSession(runtime).slash_memory(action)
     elif entry_point == "serve-project-request":
         runtime = SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list))
-        await ProjectRequests(
+        ProjectRequests(
             home=home, runtime=runtime, codec=FrameCodec(), registry=registry
         ).dispatch(1, "project_show", {"project_id": project_id})
     elif entry_point == "sync-push":
