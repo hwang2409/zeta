@@ -15343,7 +15343,7 @@ async def test_idle_child_is_running_during_wake_turn(
         calls += 1
         if calls == 2:
             wake_started.set()
-            await release_wake.wait()
+            await await_or_fail(release_wake.wait(), what="release wake turn")
         kwargs["finish_lifecycle"]("idle", "WAIT")
         if calls == 1:
             first_idle.set()
@@ -15389,7 +15389,7 @@ async def test_idle_child_is_running_during_wake_turn(
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="cancel idle child run")
     owner.conversation_channel.unregister_loop("parent:1")
     await registry.close()
     child_store.close()
