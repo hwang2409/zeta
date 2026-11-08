@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import sqlite3
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -738,6 +739,653 @@ def test_inflight_refresh_cannot_repopulate_unbound_project(
 
     assert not refresh.is_alive()
     assert index.search("binding canary") == ()
+
+
+def test_search_progresses_while_append_projects_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "old searchable canary"),
+            _row(2, "assistant", "old answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    _write_rows(
+        source,
+        [
+            _row(1, "user", "old searchable canary"),
+            _row(2, "assistant", "old answer", state="completed"),
+            _row(3, "user", "new question"),
+            _row(4, "assistant", "new answer", state="completed"),
+        ],
+    )
+    projection_entered = threading.Event()
+    release_projection = threading.Event()
+    search_done = threading.Event()
+    original = index_module.render_transcript_units
+    hits = ()
+
+    def controlled(*args):
+        projection_entered.set()
+        assert release_projection.wait(10)
+        return original(*args)
+
+    def search() -> None:
+        nonlocal hits
+        hits = index.search("old searchable canary")
+        search_done.set()
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    append = threading.Thread(target=index.append, args=(source,))
+    search_thread = threading.Thread(target=search)
+    try:
+        append.start()
+        assert projection_entered.wait(10)
+        search_thread.start()
+        assert search_done.wait(10), "public search blocked on source projection"
+        assert [hit.unit.session_id for hit in hits] == ["one"]
+    finally:
+        release_projection.set()
+        append.join(10)
+        search_thread.join(10)
+    assert not append.is_alive() and not search_thread.is_alive()
+
+
+def test_direct_append_three_cas_losses_preserve_winners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [
+        _row(1, "user", "initial question"),
+        _row(2, "assistant", "initial answer", state="completed"),
+    ]
+    source = _source(tmp_path / "sessions", "one", rows)
+    stale = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    winner = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    entered = [threading.Event() for _ in range(3)]
+    releases = [threading.Event() for _ in range(3)]
+    original = index_module.render_transcript_units
+    stale_thread_id: int | None = None
+    attempts = 0
+    error: BaseException | None = None
+    winner_threads: list[threading.Thread] = []
+
+    def controlled(*args):
+        nonlocal attempts
+        if threading.get_ident() == stale_thread_id:
+            attempt = attempts
+            attempts += 1
+            entered[attempt].set()
+            assert releases[attempt].wait(10)
+        return original(*args)
+
+    def append_stale() -> None:
+        nonlocal stale_thread_id, error
+        stale_thread_id = threading.get_ident()
+        try:
+            stale.append(source)
+        except index_module.TranscriptIndexError as exc:
+            error = exc
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    thread = threading.Thread(target=append_stale)
+    try:
+        thread.start()
+        for attempt in range(3):
+            assert entered[attempt].wait(10)
+            seq = len(rows) + 1
+            rows.extend(
+                [
+                    _row(seq, "user", f"winner {attempt} question"),
+                    _row(seq + 1, "assistant", "winner answer", state="completed"),
+                ]
+            )
+            _write_rows(source, rows)
+            winner_done = threading.Event()
+
+            def append_winner(done: threading.Event = winner_done) -> None:
+                winner.append(source)
+                done.set()
+
+            winner_thread = threading.Thread(target=append_winner)
+            winner_threads.append(winner_thread)
+            winner_thread.start()
+            assert winner_done.wait(10), "competing public append blocked on projection"
+            winner_thread.join(10)
+            releases[attempt].set()
+    finally:
+        for release in releases:
+            release.set()
+        thread.join(10)
+        for winner_thread in winner_threads:
+            winner_thread.join(10)
+    assert not thread.is_alive()
+    assert attempts == 3
+    assert isinstance(error, index_module.TranscriptIndexError)
+    assert str(error) == "transcript changed during index refresh; retry required"
+    assert stale.status().cursors["one"] == 8
+    assert len(stale.search("winner question", limit=20)) == 3
+
+
+@pytest.mark.asyncio
+async def test_refresh_three_cas_losses_retains_pending_then_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects_root = tmp_path / "projects"
+    rows = [
+        _row(1, "user", "initial question"),
+        _row(2, "assistant", "initial answer", state="completed"),
+    ]
+    source = _source(tmp_path / "sessions", "one", rows)
+    (source.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
+    )
+    winner = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
+    entered = [threading.Event() for _ in range(3)]
+    releases = [threading.Event() for _ in range(3)]
+    original = index_module.render_transcript_units
+    winner_active = threading.Event()
+    attempts = 0
+
+    def controlled(*args):
+        nonlocal attempts
+        if not winner_active.is_set():
+            attempt = attempts
+            attempts += 1
+            entered[attempt].set()
+            assert releases[attempt].wait(10)
+        return original(*args)
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    refresh = asyncio.create_task(
+        refresh_transcript_index(
+            projects_root, PROJECT_A, source.session_id, source.session_dir
+        )
+    )
+    try:
+        for attempt in range(3):
+            assert await asyncio.to_thread(entered[attempt].wait, 10)
+            seq = len(rows) + 1
+            rows.extend(
+                [
+                    _row(seq, "user", f"async winner {attempt} question"),
+                    _row(seq + 1, "assistant", "winner answer", state="completed"),
+                ]
+            )
+            _write_rows(source, rows)
+            winner_active.set()
+            try:
+                await asyncio.to_thread(winner.append, source)
+            finally:
+                winner_active.clear()
+            releases[attempt].set()
+        with pytest.raises(
+            index_module.TranscriptIndexError,
+            match="transcript changed during index refresh; retry required",
+        ):
+            await asyncio.wait_for(refresh, 10)
+    finally:
+        for release in releases:
+            release.set()
+        if not refresh.done():
+            refresh.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await refresh
+    assert attempts == 3
+    failure = transcript_index_refresh_failure(
+        projects_root, PROJECT_A, source.session_id
+    )
+    assert failure is not None and "retry required" in failure
+
+    monkeypatch.setattr(index_module, "render_transcript_units", original)
+    await asyncio.wait_for(
+        refresh_transcript_index(
+            projects_root, PROJECT_A, source.session_id, source.session_dir
+        ),
+        10,
+    )
+    restarted = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
+    assert restarted.status().cursors["one"] == 8
+    assert len(restarted.search("async winner", limit=20)) == 3
+    assert transcript_index_refresh_failure(
+        projects_root, PROJECT_A, source.session_id
+    ) is None
+
+
+def test_source_replacement_after_prepare_retries_fresh_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "stale-only canary"),
+            _row(2, "assistant", "old answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    projection_entered = threading.Event()
+    release_projection = threading.Event()
+    original = index_module.render_transcript_units
+    calls = 0
+
+    def controlled(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            projection_entered.set()
+            assert release_projection.wait(10)
+        return original(*args)
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    append = threading.Thread(target=index.append, args=(source,))
+    try:
+        append.start()
+        assert projection_entered.wait(10)
+        replacement = source.conversation_path.with_suffix(".replacement")
+        replacement.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in [
+                    _row(1, "user", "replacement canary"),
+                    _row(2, "assistant", "new answer", state="completed"),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        replacement.replace(source.conversation_path)
+    finally:
+        release_projection.set()
+        append.join(10)
+    assert not append.is_alive()
+    assert calls == 2
+    assert index.search("stale-only") == ()
+    assert index.search("replacement canary")
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["begin", "unit-delete", "cursor-delete", "commit"]
+)
+def test_metadata_cleanup_precommit_failure_preserves_complete_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "retained cleanup canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    metadata = source.session_dir / "meta.json"
+    metadata.write_text(json.dumps({"project_id": PROJECT_A}), encoding="utf-8")
+    bound = TranscriptSource("one", source.session_dir, PROJECT_A)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(bound)
+    metadata.write_text("not json", encoding="utf-8")
+    original_connect = index._connect
+
+    class FailingConnection:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+            self.in_cleanup = False
+
+        def execute(self, sql, parameters=()):
+            normalized = " ".join(sql.split())
+            if normalized == "BEGIN IMMEDIATE":
+                if failure_stage == "begin":
+                    raise sqlite3.OperationalError("injected begin failure")
+                self.in_cleanup = True
+            if (
+                self.in_cleanup
+                and normalized.startswith("DELETE FROM units")
+                and failure_stage == "unit-delete"
+            ):
+                raise sqlite3.OperationalError("injected unit delete failure")
+            if (
+                self.in_cleanup
+                and normalized.startswith("DELETE FROM session_cursors")
+                and failure_stage == "cursor-delete"
+            ):
+                raise sqlite3.OperationalError("injected cursor delete failure")
+            return self.connection.execute(sql, parameters)
+
+        def commit(self) -> None:
+            if self.in_cleanup and failure_stage == "commit":
+                raise sqlite3.OperationalError("injected commit failure")
+            self.connection.commit()
+
+        def rollback(self) -> None:
+            self.connection.rollback()
+
+        def close(self) -> None:
+            self.connection.close()
+
+    monkeypatch.setattr(index, "_connect", lambda: FailingConnection(original_connect()))
+    with pytest.raises(index_module.TranscriptIndexError, match="injected"):
+        index.append(bound)
+    monkeypatch.setattr(index, "_connect", original_connect)
+
+    restarted = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    assert restarted.status().cursors == {"one": 2}
+    assert restarted.search("retained cleanup canary")
+
+
+def test_post_commit_nonready_status_is_durable_and_not_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "removed status canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    metadata = source.session_dir / "meta.json"
+    metadata.write_text(json.dumps({"project_id": PROJECT_A}), encoding="utf-8")
+    bound = TranscriptSource("one", source.session_dir, PROJECT_A)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(bound)
+    metadata.write_text("not json", encoding="utf-8")
+    ready = index.status()
+    status_calls = 0
+
+    def status_after_commit():
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls <= 2:
+            return ready
+        return replace(
+            ready, ready=False, detail="index is unreadable and requires rebuild: injected"
+        )
+
+    monkeypatch.setattr(index, "_status", status_after_commit)
+    status = index.append(bound)
+
+    assert not status.ready
+    restarted = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    assert restarted.status().cursors == {}
+    assert restarted.search("removed status canary") == ()
+    restarted.append(bound)
+    assert restarted.status().cursors == {}
+
+
+@pytest.mark.asyncio
+async def test_refresh_clears_pending_after_durable_nonready_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects_root = tmp_path / "projects"
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "coordinator removed canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    metadata = source.session_dir / "meta.json"
+    metadata.write_text(json.dumps({"project_id": PROJECT_A}), encoding="utf-8")
+    await refresh_transcript_index(
+        projects_root, PROJECT_A, source.session_id, source.session_dir
+    )
+    metadata.write_text("not json", encoding="utf-8")
+    original_status = index_module.TranscriptIndex._status
+    status_calls = 0
+
+    def status_after_commit(index):
+        nonlocal status_calls
+        status_calls += 1
+        status = original_status(index)
+        if status_calls <= 2:
+            return status
+        return replace(
+            status,
+            ready=False,
+            detail="index is unreadable and requires rebuild: injected",
+        )
+
+    monkeypatch.setattr(index_module.TranscriptIndex, "_status", status_after_commit)
+    await asyncio.wait_for(
+        refresh_transcript_index(
+            projects_root, PROJECT_A, source.session_id, source.session_dir
+        ),
+        10,
+    )
+    assert transcript_index_refresh_failure(
+        projects_root, PROJECT_A, source.session_id
+    ) is None
+    monkeypatch.setattr(index_module.TranscriptIndex, "_status", original_status)
+    restarted = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
+    assert restarted.status().cursors == {}
+    assert restarted.search("coordinator removed canary") == ()
+
+
+def test_missing_safe_open_flag_fails_closed_without_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "missing flag canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    metadata = source.session_dir / "meta.json"
+    metadata.write_text(json.dumps({"project_id": PROJECT_A}), encoding="utf-8")
+    bound = TranscriptSource("one", source.session_dir, PROJECT_A)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(bound)
+    projection_entered = threading.Event()
+    release_projection = threading.Event()
+    original_render = index_module.render_transcript_units
+    original_open = index_module.os.open
+    opened_paths: list[Path] = []
+
+    def controlled(*args):
+        projection_entered.set()
+        assert release_projection.wait(10)
+        return original_render(*args)
+
+    def observed_open(path, *args, **kwargs):
+        opened_paths.append(Path(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    append = threading.Thread(target=index.append, args=(bound,))
+    try:
+        append.start()
+        assert projection_entered.wait(10)
+        monkeypatch.setattr(
+            index_module,
+            "_REQUIRED_SAFE_OPEN_NAMES",
+            ("O_NOFOLLOW", "O_NONBLOCK", "O_MISSING_FOR_TEST"),
+        )
+        monkeypatch.setattr(index_module.os, "open", observed_open)
+        release_projection.set()
+        append.join(10)
+    finally:
+        release_projection.set()
+        monkeypatch.setattr(index_module.os, "open", original_open)
+    assert not append.is_alive()
+    assert source.conversation_path not in opened_paths
+    assert source.session_dir / "meta.json" not in opened_paths
+    assert index.status().cursors == {}
+    assert index.search("missing flag canary") == ()
+
+
+@pytest.mark.parametrize("mutation_offset", [0, 70 * 1024])
+def test_same_inode_mutation_after_prepare_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation_offset: int
+) -> None:
+    filler = "x" * (80 * 1024)
+    old = filler[:mutation_offset] + " oldmark " + filler[mutation_offset + 9 :]
+    new = filler[:mutation_offset] + " newmark " + filler[mutation_offset + 9 :]
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [_row(1, "user", old), _row(2, "assistant", "answer", state="completed")],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    entered = threading.Event()
+    release = threading.Event()
+    original = index_module.render_transcript_units
+    calls = 0
+
+    def controlled(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(10)
+        return original(*args)
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    append = threading.Thread(target=index.append, args=(source,))
+    try:
+        append.start()
+        assert entered.wait(10)
+        replacement = "".join(
+            json.dumps(row) + "\n"
+            for row in [
+                _row(1, "user", new),
+                _row(2, "assistant", "answer", state="completed"),
+            ]
+        ).encode()
+        with source.conversation_path.open("r+b") as handle:
+            handle.write(replacement)
+            handle.truncate()
+            handle.flush()
+            index_module.os.fsync(handle.fileno())
+    finally:
+        release.set()
+        append.join(10)
+    assert not append.is_alive()
+    assert calls == 2
+    assert index.search("oldmark") == ()
+    assert index.search("newmark")
+
+
+def test_bind_away_back_with_source_replacement_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "stalebindingonly"),
+            _row(2, "assistant", "old answer", state="completed"),
+        ],
+    )
+    metadata = source.session_dir / "meta.json"
+    metadata.write_text(json.dumps({"project_id": PROJECT_A}), encoding="utf-8")
+    bound = TranscriptSource("one", source.session_dir, PROJECT_A)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    entered = threading.Event()
+    release = threading.Event()
+    original = index_module.render_transcript_units
+    calls = 0
+
+    def controlled(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(10)
+        return original(*args)
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    append = threading.Thread(target=index.append, args=(bound,))
+    try:
+        append.start()
+        assert entered.wait(10)
+        metadata.write_text(json.dumps({"project_id": PROJECT_B}), encoding="utf-8")
+        replacement = source.conversation_path.with_suffix(".replacement")
+        replacement.write_text(
+            "".join(
+                json.dumps(row) + "\n"
+                for row in [
+                    _row(1, "user", "freshbindingonly"),
+                    _row(2, "assistant", "new answer", state="completed"),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        replacement.replace(source.conversation_path)
+        metadata.write_text(json.dumps({"project_id": PROJECT_A}), encoding="utf-8")
+    finally:
+        release.set()
+        append.join(10)
+    assert not append.is_alive()
+    assert calls == 2
+    assert index.search("stalebindingonly") == ()
+    assert index.search("freshbindingonly")
+
+
+def test_source_mutation_after_sql_before_commit_rolls_back_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", " oldcommit "),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    original_connect = index._connect
+    mutated = False
+
+    class MutatingConnection:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+
+        def execute(self, sql, parameters=()):
+            nonlocal mutated
+            result = self.connection.execute(sql, parameters)
+            if not mutated and "INSERT INTO session_cursors" in sql:
+                replacement = "".join(
+                    json.dumps(row) + "\n"
+                    for row in [
+                        _row(1, "user", " newcommit "),
+                        _row(2, "assistant", "answer", state="completed"),
+                    ]
+                ).encode()
+                with source.conversation_path.open("r+b") as handle:
+                    handle.write(replacement)
+                    handle.truncate()
+                    handle.flush()
+                    index_module.os.fsync(handle.fileno())
+                mutated = True
+            return result
+
+        def executemany(self, sql, parameters):
+            return self.connection.executemany(sql, parameters)
+
+        def commit(self) -> None:
+            self.connection.commit()
+
+        def rollback(self) -> None:
+            self.connection.rollback()
+
+        def close(self) -> None:
+            self.connection.close()
+
+    monkeypatch.setattr(index, "_connect", lambda: MutatingConnection(original_connect()))
+    index.append(source)
+    monkeypatch.setattr(index, "_connect", original_connect)
+
+    assert mutated
+    assert index.search("oldcommit") == ()
+    assert index.search("newcommit")
+    restarted = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    assert restarted.search("oldcommit") == ()
+    assert restarted.search("newcommit")
 
 
 def test_version_mismatch_refuses_old_rows_and_rebuild_restores(tmp_path: Path) -> None:
