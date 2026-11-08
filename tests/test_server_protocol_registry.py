@@ -85,7 +85,6 @@ def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
         "inbox",
         "memory",
         "model",
-        "plan",
         "project",
         "status",
         "vim",
@@ -97,7 +96,7 @@ def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
     )
     assert registry.command_for("memory").serve.can_run_while_busy("")
     assert not registry.command_for("memory").serve.can_run_while_busy("undo")
-    assert registry.command_for("plan").serve.can_run_while_busy("")
+    assert not registry.command_for("plan").serve.can_run_while_busy("")
     assert not registry.command_for("plan").serve.can_run_while_busy("on")
     assert not registry.command_for("plan").serve.can_run_while_busy("write a plan")
     assert not registry.command_for("implement").serve.can_run_while_busy("")

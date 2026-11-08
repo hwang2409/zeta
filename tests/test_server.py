@@ -7986,6 +7986,35 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             )
         )[-1]["result"]
         assert plan_mode["plan_mode"] is False
+        bare = (
+            await _request(
+                reader,
+                writer,
+                "plan-bare",
+                "slash_run",
+                {"session_id": sid, "text": "/plan"},
+            )
+        )[-1]["result"]
+        assert bare == {
+            "kind": "output",
+            "text": "plan mode: on (read-only tools; deliver the plan as your answer)",
+        }
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-bare-settings",
+                "session_settings",
+                {"session_id": sid},
+            )
+        )[-1]["result"]["plan_mode"] is True
+        await _request(
+            reader,
+            writer,
+            "plan-off",
+            "slash_run",
+            {"session_id": sid, "text": "/plan off"},
+        )
         enabled = (
             await _request(
                 reader,
@@ -9376,12 +9405,17 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
         # /plan was a serve command and must never be captured from the head.
         rows.extend(
             [
-                {"text": "/plan", "result_kind": "output"},
+                {"text": "/plan", "error_code": -32004},
                 {"text": "/plan on", "error_code": -32004},
                 {"text": "/plan write a plan", "error_code": -32004},
                 {"text": "/implement", "error_code": -32004},
             ]
         )
+        before = (
+            await _request(
+                reader, writer, "before-plan", "session_settings", {"session_id": sid}
+            )
+        )[-1]["result"]["plan_mode"]
         for request_id, row in enumerate(rows, start=4):
             text = row["text"]
             response = await _request(
@@ -9392,6 +9426,17 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
                 {"session_id": sid, "text": text},
             )
             message = response[-1]
+            if text == "/plan":
+                after = (
+                    await _request(
+                        reader,
+                        writer,
+                        "after-plan",
+                        "session_settings",
+                        {"session_id": sid},
+                    )
+                )[-1]["result"]["plan_mode"]
+                assert after is before
             if "result" in row:
                 assert "result" in message and "error" not in message, message
                 assert message["result"] == row["result"]

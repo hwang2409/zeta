@@ -1099,7 +1099,7 @@ def create_slash_registry(
             "plan",
             _run_plan,
             "show or change plan mode",
-            ServeSlash(mutates=_has_args, runs_while_busy=_no_args),
+            ServeSlash(),
         )
     )
     registry.register(
