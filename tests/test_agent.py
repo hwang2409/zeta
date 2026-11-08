@@ -3618,12 +3618,18 @@ async def _run_post_cap_tool_cycle(
     monkeypatch.setattr(
         owner.conversation_channel, "publish_completion", observe_publish
     )
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await await_or_fail(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)),
+        what="root turn",
+    )
 
     exhausted_wait = asyncio.create_task(backend.post_cap_exhausted.wait())
     terminal_wait = asyncio.create_task(terminal_published.wait())
-    done, pending = await asyncio.wait(
-        {exhausted_wait, terminal_wait}, return_when=asyncio.FIRST_COMPLETED
+    done, pending = await await_or_fail(
+        asyncio.wait(
+            {exhausted_wait, terminal_wait}, return_when=asyncio.FIRST_COMPLETED
+        ),
+        what="post-cap exhaustion or terminal publication",
     )
     assert exhausted_wait in done
     assert terminal_wait not in done
@@ -3642,18 +3648,28 @@ async def _run_post_cap_tool_cycle(
             )
             is None
         )
-        await backend.fresh_prompt_seen.wait()
+        await await_or_fail(
+            backend.fresh_prompt_seen.wait(), what="fresh prompt completion"
+        )
 
-    state = next(
-        state
-        for state, _configured_timeout in deadlines.started
-        if deadlines._wakes[id(state)][1] == child_handle
+    if not send_fresh_prompt:
+        state = next(
+            state
+            for state, _configured_timeout in deadlines.started
+            if deadlines._wakes[id(state)][1] == child_handle
+        )
+        deadlines.expire_child_bound(state)
+    await await_or_fail(
+        terminal_published.wait(),
+        what=(
+            "terminal publication after fresh prompt"
+            if send_fresh_prompt
+            else "terminal publication after child deadline"
+        ),
     )
-    deadlines.expire_child_bound(state)
-    await terminal_published.wait()
     backend.release_grandchild.set()
-    await owner.wait()
-    await loop.close()
+    await await_or_fail(owner.wait(), what="background owner completion")
+    await await_or_fail(loop.close(), what="agent loop close")
     return backend
 
 
@@ -8635,7 +8651,9 @@ class FollowUpFinishBackend(CompletionBackend):
         elif not self.child_prompts:
             self.child_prompts.append(last_user)
             self.child_started.set()
-            await self.release_child.wait()
+            await await_or_fail(
+                self.release_child.wait(), what="finish child release"
+            )
             blocks = [TextContent("first pass done")]
         elif (
             self.finish_attempts
@@ -8663,7 +8681,9 @@ class FollowUpFinishBackend(CompletionBackend):
             ]
         yield StreamEvent(StreamEventType.MESSAGE_START)
         if pause_before_blocks:
-            await self.release_finish.wait()
+            await await_or_fail(
+                self.release_finish.wait(), what="finish response release"
+            )
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
         yield StreamEvent(
@@ -8713,7 +8733,9 @@ class AskParentFinishBackend(CompletionBackend):
             blocks = [ToolUseContent(_run_agent_call())]
         elif not question_asked:
             self.child_started.set()
-            await self.release_child.wait()
+            await await_or_fail(
+                self.release_child.wait(), what="question child release"
+            )
             blocks = [
                 ToolUseContent(
                     ToolCall(
@@ -8736,7 +8758,10 @@ class AskParentFinishBackend(CompletionBackend):
             ]
         else:
             self.question_published.set()
-            await self.release_question_finish.wait()
+            await await_or_fail(
+                self.release_question_finish.wait(),
+                what="question finish release",
+            )
             blocks = [
                 ToolUseContent(
                     ToolCall(
@@ -9477,7 +9502,9 @@ async def test_root_delivery_committed_after_terminal_check_rearms_idle_wake(
         events.append(event)
         if event.type is StreamEventType.AGENT_END:
             assert producer is not None
-            notification = await producer
+            notification = await await_or_fail(
+                producer, what="terminal notification production"
+            )
             assert notification.changed
             assert not woke.is_set()
 
