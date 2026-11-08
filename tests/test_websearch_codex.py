@@ -530,7 +530,7 @@ async def test_codex_deadline_covers_credential_acquisition(monkeypatch, registr
 
     async def blocked_access_token(_store, _client, **_kwargs):
         acquisition_started.set()
-        await release_acquisition.wait()
+        await await_or_fail(release_acquisition.wait(), what="acquisition release")
         acquisition_finished.set()
         return "test-token"
 
@@ -569,7 +569,7 @@ async def test_concurrent_searches_share_one_credential_acquisition(
         acquisition_calls += 1
         active_acquisitions += 1
         try:
-            await release_acquisition.wait()
+            await await_or_fail(release_acquisition.wait(), what="acquisition release")
             return "test-token"
         finally:
             active_acquisitions -= 1
@@ -582,7 +582,7 @@ async def test_concurrent_searches_share_one_credential_acquisition(
 
     try:
         searches = [execute(registry) for _ in range(8)]
-        results = await asyncio.gather(*searches)
+        results = await await_or_fail(asyncio.gather(*searches), what="concurrent searches")
 
         assert all(
             result["structuredContent"]["backend"] == "duckduckgo"
@@ -647,7 +647,7 @@ async def test_codex_deadline_does_not_cancel_token_refresh(monkeypatch, registr
         nonlocal refresh_cancelled
         refresh_started.set()
         try:
-            await allow_refresh_to_finish.wait()
+            await await_or_fail(allow_refresh_to_finish.wait(), what="refresh release")
             refresh_persisted.set()
             return "test-token"
         except asyncio.CancelledError:
@@ -689,7 +689,7 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
         nonlocal refresh_cancelled
         refresh_started.set()
         try:
-            await allow_refresh_to_finish.wait()
+            await await_or_fail(allow_refresh_to_finish.wait(), what="refresh release")
             refresh_persisted.set()
             return "test-token"
         except asyncio.CancelledError:
@@ -705,7 +705,7 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="credential task")
     allow_refresh_to_finish.set()
     await asyncio.wait_for(refresh_persisted.wait(), timeout=10)
 
