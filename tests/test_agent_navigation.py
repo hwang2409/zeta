@@ -8,7 +8,6 @@ import logging
 import os
 import shutil
 import threading
-import time
 from collections.abc import Iterable
 from io import StringIO
 from itertools import product
@@ -2653,19 +2652,27 @@ async def test_agent_discovery_is_off_loop_and_coalesced(
         )
 
     calls: list[int] = []
+    started = threading.Event()
+    completed = threading.Event()
+    published = asyncio.Event()
     original = agent_card.agent_child_paths
 
     def delayed_paths(path: Path, candidates: set[Path] | None):
         calls.append(threading.get_ident())
-        time.sleep(0.02)
-        return original(path, candidates)
+        started.set()
+        result = original(path, candidates)
+        completed.set()
+        return result
 
     monkeypatch.setattr(agent_card, "agent_child_paths", delayed_paths)
     loop_thread = threading.get_ident()
     navigation = AgentNavigation(root)
+    navigation._invalidate = published.set
     for _ in range(5):
         navigation.refresh(force=True)
-    await asyncio.sleep(0.15)
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait, 10), 10)
+    assert await asyncio.wait_for(asyncio.to_thread(completed.wait, 10), 10)
+    assert await asyncio.wait_for(published.wait(), 10)
 
     assert calls
     assert set(calls) != {loop_thread}
