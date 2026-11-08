@@ -16,6 +16,25 @@ from zeta.core.commands.completion import completion_script
 from zeta.project_registry import ProjectRegistry
 
 
+def test_cli_import_does_not_import_command_only_modules() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import zeta.cli.main; "
+                "assert not any(name in sys.modules for name in ("
+                "'httpx', 'prompt_toolkit.patch_stdout', 'zeta.accounts.login', "
+                "'zeta.providers.factory', 'zeta.tui.errors'))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == ""
+
+
 def test_cli_import_does_not_import_tui_app() -> None:
     result = subprocess.run(
         [
