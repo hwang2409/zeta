@@ -741,7 +741,7 @@ class ServeControl:
         )
         if controller is None or "live_config_changed" not in controller.features:
             return
-        await self._end_stale_approvals(session_id)
+        self._end_stale_approvals(session_id)
         await self._notify(
             event_contract.STREAM_EVENT_WIRE_EVENTS[event.type],
             session_id,
