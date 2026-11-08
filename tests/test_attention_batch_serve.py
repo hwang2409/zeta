@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from tests.support.owned import await_or_fail
+from tests.support.serve_close import close_serve
 from tests.test_server import (
-    _close,
     _ready_extensions,
     _request,
     _seed_slash_fixtures,
@@ -197,7 +197,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
     finally:
         if watcher is not None:
             await _stop_publication_watcher(watcher)
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 async def _seed_attention_record(
@@ -277,7 +277,7 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
     finally:
         if watcher is not None:
             await _stop_publication_watcher(watcher)
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -342,7 +342,7 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
     finally:
         if watcher is not None:
             await _stop_publication_watcher(watcher)
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -418,7 +418,7 @@ async def test_cancelled_serve_adapter_still_checks_late_publication(
         release.set()
         if watcher is not None:
             await _stop_publication_watcher(watcher)
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -468,4 +468,4 @@ async def test_cross_process_style_send_uses_existing_two_second_poll(
     finally:
         if watcher is not None:
             await _stop_publication_watcher(watcher)
-        await _close(server, writer)
+        await close_serve(server, writer)
