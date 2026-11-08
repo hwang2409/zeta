@@ -9058,8 +9058,10 @@ def test_pending_prompt_queue_round_trips(tmp_path: Path) -> None:
         store.acknowledge_pending_prompt("nonexistent")
 
 
-def test_close_pending_queue_if_empty_locks_out_new_prompts(tmp_path: Path) -> None:
-    """Once a run declares itself done, further follow-ups must be rejected."""
+def test_closed_pending_queue_allows_only_new_episode_before_terminal(
+    tmp_path: Path,
+) -> None:
+    """A live run can start a new episode; a terminal run cannot."""
 
     store = ConversationStore(tmp_path, session_id="run")
 
@@ -9077,6 +9079,16 @@ def test_close_pending_queue_if_empty_locks_out_new_prompts(tmp_path: Path) -> N
     other = ConversationStore(tmp_path, session_id="run")
     with pytest.raises(PendingPromptsClosedError):
         other.append_pending_prompt("also too late")
+
+    follow_up = other.pending_prompt_queue.append(
+        "new episode", starts_new_episode=True
+    )
+    other.acknowledge_pending_prompt(follow_up.id)
+    assert other.pending_prompt_queue.accept_explicit_finish(
+        {"status": "done", "summary": "done"}
+    ) is None
+    with pytest.raises(PendingPromptsClosedError):
+        other.pending_prompt_queue.append("after finish", starts_new_episode=True)
 
 
 @pytest.mark.asyncio
@@ -10298,8 +10310,10 @@ async def test_turn_boundary_close_races_agent_send_atomically(
     terminal = await asyncio.wait_for(close, timeout=10)
     assert terminal.pending is False
     assert terminal.closed_empty is True
-    error = await asyncio.wait_for(send, timeout=10)
-    assert error is not None and "no live run" in error
+    assert await asyncio.wait_for(send, timeout=10) is None
+    assert [
+        entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)
+    ] == ["close first"]
 
 
 @pytest.mark.asyncio
@@ -10631,8 +10645,10 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
 
 
 @pytest.mark.asyncio
-async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> None:
-    """The race the closed-queue marker prevents: a queued prompt after finish."""
+async def test_agent_send_starts_new_episode_after_previous_turn_closed(
+    tmp_path: Path,
+) -> None:
+    """A closed turn does not make its still-resident run unreachable."""
 
     from zeta.tools.agent import send_to_run
 
@@ -10644,8 +10660,8 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
     handle = _run_handle_from_receipt(store)
 
-    # Simulate the race: parent looked at the marker before the run finished,
-    # then the run drained and closed its queue before the parent got here.
+    # Simulate the race: the previous turn closes its prompt episode after the
+    # parent sees the marker, while the background run remains resident.
     marker = store.agent_children()[handle]
     child_path = Path(str(marker["child_session_path"]))
     child_store = ConversationStore(
@@ -10657,13 +10673,17 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     assert terminal.closed_empty
     assert terminal.pending is False
 
-    error = await send_to_run(
-        store,
-        handle,
-        "too late",
-        channel=loop._background_owner.conversation_channel,
+    assert (
+        await send_to_run(
+            store,
+            handle,
+            "next episode",
+            channel=loop._background_owner.conversation_channel,
+        )
+        is None
     )
-    assert error is not None and "no live run" in error
+    prompts = await child_store._to_thread_durable(child_store.pending_prompts)
+    assert [entry.data["text"] for entry in prompts] == ["next episode"]
 
     backend.release_child.set()
     await wait_background_owner(loop)
@@ -17370,11 +17390,15 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         assert marker["background"] is True
         assert marker["accepts_follow_ups"] is True
         assert lead_handle in loop._background_owner.active_instance_ids
+        # Recreate the durable row present in the affected lead's real transcript.
+        await lead_store._to_thread_durable(lead_store.close_pending_queue)
 
         status = await loop.tool_registry.execute(
             ToolCall("lead-status", "agent_status", {"handle": lead_handle})
         )
         assert status["structuredContent"]["children"][0]["state"] == "idle"
+        # test-contract: durability proves the old prompt episode is closed
+        assert any(entry.type == "pending_queue_closed" for entry in lead_store.replay())
 
         lead_idle.clear()
         sent = await loop.tool_registry.execute(
