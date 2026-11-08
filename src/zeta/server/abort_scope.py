@@ -59,9 +59,9 @@ async def abort_active_turn(
     if task is None or task.done():
         return False
     foreground_only = scope == "foreground"
-    await terminate_approvals(foreground_only=foreground_only)
     if loop is not None:
         loop.abort(foreground_only=foreground_only, steering_drop_reason=None)
+    await terminate_approvals(foreground_only=foreground_only)
     before_cancel()
     if cancel_task:
         task.cancel()

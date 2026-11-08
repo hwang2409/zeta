@@ -585,7 +585,8 @@ class AgentTranscriptSource:
         reason = (
             (
                 f"{error}; run {command}"
-                if (command := repair_command_for_child_path(path))
+                if error.repair_available
+                and (command := repair_command_for_child_path(path))
                 else str(error)
             )
             if isinstance(error, TranscriptLoadError)
