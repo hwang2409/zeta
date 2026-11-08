@@ -96,6 +96,7 @@ class ContextPreparation:
         reserved_estimator_tokens: int,
         system_append: str,
     ) -> bool:
+        self.discard()
         try:
             while True:
                 assembly_budget = self.budget(reserved_estimator_tokens)

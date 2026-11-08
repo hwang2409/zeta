@@ -88,6 +88,7 @@ async def _append_during_preparation(
             assert release_preparation.wait(2)
         return real_prepare(self, *args, **kwargs)
 
+    # test-contract: seam instrumentation verifies stale-head retry.
     monkeypatch.setattr(ContextAssembler, "_prepare_assembly", blocked_prepare)
     assembler = assembler_factory()
     assembly = asyncio.create_task(assembler.assemble_context())
@@ -209,6 +210,36 @@ async def test_budget_update_during_preparation_retries_with_new_budget(
     await asyncio.wait_for(assembler.assemble_context(), 10)
 
     assert budgets[:2] == [10_000, 5_000]
+
+
+@pytest.mark.asyncio
+async def test_failed_replacement_discards_previous_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "hello"))
+    calls = 0
+    fail = False
+    real_prepare = ContextAssembler._prepare_assembly
+
+    def observed_prepare(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if fail:
+            raise RuntimeError("replacement failed")
+        return real_prepare(self, *args, **kwargs)
+
+    # test-contract: seam instrumentation proves failed replacement is not consumed.
+    monkeypatch.setattr(ContextAssembler, "_prepare_assembly", observed_prepare)
+    assembler = ContextAssembler(store, token_budget=10_000)
+    await assembler.prepare_context()
+    fail = True
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(assembler.prepare_context(), 10)
+    fail = False
+    await asyncio.wait_for(assembler.assemble_context(), 10)
+
+    assert calls == 3
 
 
 @pytest.mark.asyncio
