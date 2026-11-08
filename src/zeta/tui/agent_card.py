@@ -814,6 +814,9 @@ class AgentNavigation:
         self._refresh_signature: tuple[object, ...] | None = None
         self._last_refresh_at = float("-inf")
         self._refresh_handle: asyncio.TimerHandle | None = None
+        self._discovery_task: asyncio.Task[None] | None = None
+        self._discovery_pending = False
+        self._discovery_generation = 0
         self._invalidate: Callable[[], None] | None = None
         self.refresh(force=True)
 
@@ -903,6 +906,10 @@ class AgentNavigation:
         if self._refresh_handle is not None:
             self._refresh_handle.cancel()
             self._refresh_handle = None
+        if self._discovery_task is not None:
+            self._discovery_task.cancel()
+            self._discovery_task = None
+        self._discovery_pending = False
         self._invalidate = None
         self._layout = None
         self._composer_buffer = None
@@ -979,7 +986,114 @@ class AgentNavigation:
         self._schedule_refresh(delay)
 
     def refresh(self, *, force: bool = False) -> bool:
-        """Refresh at most once per second unless fresh state is required."""
+        """Refresh cached state and schedule filesystem discovery when needed."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._refresh_sync(force=force)
+        return self._schedule_discovery(force=force)
+
+    def _schedule_discovery(self, *, force: bool) -> bool:
+        if self._discovery_task is not None:
+            self._discovery_pending = True
+            return False
+        self._discovery_generation += 1
+        generation = self._discovery_generation
+        path = self.current_path
+        signature = self._agent_tree_signature_cached()
+        fallback = {
+            Path(marker["child_session_path"]): marker
+            for marker in getattr(self.store, "_agent_children", {}).values()
+            if isinstance(marker, dict) and isinstance(marker.get("child_session_path"), str)
+        }
+        known = {entry.path for entry in self.entries if entry.path.parent == path / "agents"}
+        if fallback and path == self.root_path:
+            self._publish_discovery((signature, list(fallback.items())))
+        previous = self._refresh_signature
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        if not hasattr(loop, "create_task"):
+            return self._refresh_sync(force=force)
+        self._discovery_task = loop.create_task(
+            self._discover_async(generation, path, signature, previous, fallback, known, force)
+        )
+        return False
+
+    def _agent_tree_signature_cached(self) -> tuple[object, ...]:
+        """Use the last worker result; filesystem signatures belong off the loop."""
+        return self._refresh_signature or (self.current_path, self.selected_index, (None, None), ())
+
+    async def _discover_async(
+        self, generation: int, path: Path, signature: tuple[object, ...],
+        previous: tuple[object, ...] | None, fallback: dict[Path, dict[str, Any]],
+        known: set[Path], force: bool,
+    ) -> None:
+        try:
+            result = await asyncio.to_thread(
+                self._discover_snapshot, path, signature, previous, fallback, known, force
+            )
+            if generation != self._discovery_generation or path != self.current_path:
+                return
+            self._publish_discovery(result)
+            if self._invalidate is not None:
+                self._invalidate()
+        finally:
+            self._discovery_task = None
+            if self._discovery_pending:
+                self._discovery_pending = False
+                self._schedule_discovery(force=True)
+
+    def _discover_snapshot(
+        self, path: Path, signature: tuple[object, ...],
+        previous: tuple[object, ...] | None, fallback: dict[Path, dict[str, Any]],
+        known: set[Path], force: bool,
+    ) -> tuple[tuple[object, ...], list[tuple[Path, dict[str, Any]]]]:
+        signature = agent_tree_signature(
+            path, self.selected_index,
+            (entry.path for entry in self.entries
+             if entry.state not in _TERMINAL_AGENT_STATES
+             and (entry.path != self.root_path or self.child_view_active)),
+            self._path_signature,
+        )
+        fallback = registered_child_markers(path)
+        candidates = candidate_paths(signature, previous, fallback, known, force)
+        children = agent_child_paths(path, candidates)
+        return signature, [
+            (child, _agent_metadata(child, fallback.get(child))) for child in children
+        ]
+
+    def _publish_discovery(
+        self, result: tuple[tuple[object, ...], list[tuple[Path, dict[str, Any]]]]
+    ) -> None:
+        signature, children = result
+        at_root = self.current_path == self.root_path
+        self._metadata_cache = {
+            child: cached for child, cached in self._metadata_cache.items()
+            if child == self.root_path or any(child == path for path, _ in children)
+        }
+        entries = [
+            AgentEntry(path, str(metadata.get("description") or f"child {path.name}"),
+                       str(metadata.get("agent_type") or "child"),
+                       str(metadata.get("state") or "running"))
+            for path, metadata in children
+            if str(metadata.get("state") or "running") not in _TERMINAL_AGENT_STATES
+        ]
+        main_entry = [self._main_entry()] if self._fork_main_path is not None and at_root else []
+        root_entry = AgentEntry(
+            self.root_path,
+            f"discussion: {self._fork_title}" if self._fork_title is not None else "main",
+            "discussion" if self._fork_title is not None else "main",
+            "running",
+        )
+        self.entries = [root_entry, *main_entry, *entries] if (entries or main_entry or not at_root) else []
+        self.selected_index = min(self.selected_index, max(0, len(self.entries) - 1))
+        self._resize_list_window()
+        self._refresh_signature = signature
+
+    def _refresh_sync(self, *, force: bool = False) -> bool:
+        """Synchronous compatibility path used before an event loop exists."""
 
         now = _monotonic()
         elapsed = now - self._last_refresh_at
