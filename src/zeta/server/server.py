@@ -61,28 +61,6 @@ from .session_replay import ReplayScopeId
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
-LOADED_SESSION_MUTATIONS = frozenset(
-    {
-        "abort",
-        "approve",
-        "clear_steering",
-        "deny",
-        "fork_message",
-        "rename_session",
-        "repair_transcript",
-        "revoke_session_grants",
-        "send",
-        "send_images",
-        "set_compaction",
-        "set_settings",
-        "set_turn_context",
-        "slash_run",
-        "steer",
-        "switch_branch",
-    }
-)
-
-
 
 class _UnixSocketListener:
     def __init__(
@@ -417,8 +395,6 @@ class _Client:
                             exc.data,
                         )
                     )
-                    if request["method"] == "session_history_and_subscribe":
-                        self.connections.replay.connection_closed(self)
                     if not self.handshaken:
                         self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
@@ -671,24 +647,31 @@ class _Client:
                 features=self.features,
             )
         if descriptor is MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE:
-            if set(params) != {"session_id"} or not isinstance(
-                params.get("session_id"), str
-            ) or not params["session_id"]:
-                raise ProtocolError(
-                    ErrorDescriptor.INVALID_PARAMS,
-                    "session_history_and_subscribe requires session_id",
+            # any rejected or failed join ends this connection's old and pending stream
+            try:
+                if set(params) != {"session_id"} or not isinstance(
+                    params.get("session_id"), str
+                ) or not params["session_id"]:
+                    raise ProtocolError(
+                        ErrorDescriptor.INVALID_PARAMS,
+                        "session_history_and_subscribe requires session_id",
+                    )
+                session_id = params["session_id"]
+                if self.server.runtime.session_id != session_id:
+                    raise ProtocolError(
+                        ErrorDescriptor.NO_ACTIVE_SESSION,
+                        "session is not active",
+                    )
+                self.server.connections.begin_replay_join(
+                    self, ReplayScopeId.top(session_id)
                 )
-            session_id = params["session_id"]
-            if self.server.runtime.session_id != session_id:
-                raise ProtocolError(
-                    ErrorDescriptor.NO_ACTIVE_SESSION,
-                    "session is not active",
+                history = await self.server.connections.read_replay_history(
+                    self, session_id
                 )
-            self.server.connections.begin_replay_join(
-                self, ReplayScopeId.top(session_id)
-            )
-            history = await self.server.connections.read_replay_history(self, params)
-            return await self.server.connections.finish_replay_join(self, history)
+                return self.server.connections.replay.finish_join(self, history)
+            except BaseException:
+                self.server.connections.invalidate_replay_connection(self)
+                raise
         if descriptor is MethodDescriptor.LIST_SESSIONS:
             result, _page_ids = await self.connections.run_read(
                 self, lambda: self._list_sessions(request_id, params)

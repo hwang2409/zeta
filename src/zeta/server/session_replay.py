@@ -93,6 +93,9 @@ class SessionReplay:
         state = self._subscriptions.get(connection) or self._pending.get(connection)
         return None if state is None else state.scope
 
+    def is_pending(self, connection: Any) -> bool:
+        return connection in self._pending
+
     def stream_id(self, connection: Any) -> str | None:
         subscription = self._subscriptions.get(connection)
         return None if subscription is None else subscription.stream_id

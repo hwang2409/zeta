@@ -1310,10 +1310,16 @@ error code and message. Provider status and origin remain internal.
 - `session_history_and_subscribe`: with `session_replay_seq`, takes exactly one
   active `session_id` and atomically returns the newest bounded history page plus
   `replay: {"stream_id": "...", "history_seq": 0}`. Events admitted after the
-  join carry that opaque stream id and monotonically increasing `seq`, starting at
-  1. A second join replaces the connection's prior stream. Session replacement,
-  controller handoff, replay pressure, or a lost frontier ends the stream with
-  `-32009` and data code `stale_event_sequence`; clients must perform a new join.
+  join carry that opaque stream id and monotonically increasing `seq`, starting
+  at 1. The result has the same shape as `session_history` with `before: null`
+  (`messages`, `next_before`, `history_validator`). Observers receive controller
+  session events only through a successful join. Session replacement, controller
+  handoff, replay pressure, or a failed write or admission on the connection
+  ends its stream. A join that is still pending returns `-32009` with data code
+  `stale_event_sequence`. An active stream ends silently: later controller events
+  carry no `stream_id` or `seq`, and observers receive none. The client must send
+  a new join. A second join on the same connection, even a rejected one, ends
+  the old stream.
   The server retains at most 64 records/1 MiB per scope and 256 records/4 MiB
   globally, evicting the largest scope first. Older pages continue to use
   `session_history` and do not change the live stream.
