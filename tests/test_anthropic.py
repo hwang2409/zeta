@@ -90,6 +90,60 @@ data: {"type":"message_stop"}
 """
 
 
+def test_tool_argument_deltas_do_not_parse_until_message_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loads = 0
+    original_loads = anthropic_module.json.loads
+
+    def counting_loads(value, *args, **kwargs):
+        nonlocal loads
+        loads += 1
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(anthropic_module.json, "loads", counting_loads)
+    blocks: dict[int, anthropic_module._BlockState] = {}
+    active = set()
+    stopped = set()
+    usage: dict[str, object] = {}
+    anthropic_module._translate_event(
+        "content_block_start",
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "call-1", "name": "write"}},
+        blocks,
+        active,
+        stopped,
+        usage,
+    )
+    parts = ['{"content":"', "x" * 100, '"}']
+    deltas = [
+        anthropic_module._translate_event(
+            "content_block_delta",
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": part}},
+            blocks,
+            active,
+            stopped,
+            usage,
+        )
+        for part in parts
+    ]
+    assert loads == 0
+    assert [event.tool_call.arguments for event in deltas if event and event.tool_call] == [{}, {}, {}]
+    anthropic_module._translate_event(
+        "content_block_stop",
+        {"type": "content_block_stop", "index": 0},
+        blocks,
+        active,
+        stopped,
+        usage,
+    )
+    finished = anthropic_module._translate_event(
+        "message_stop", {"type": "message_stop"}, blocks, active, stopped, usage
+    )
+    assert loads == 1
+    assert finished is not None and finished.message is not None
+    assert finished.message.content[0].tool_call.arguments == {"content": "x" * 100}
+
+
 def request_payload(
     messages: list[Message], tool_schemas: list[dict[str, object]]
 ) -> dict[str, object]:
