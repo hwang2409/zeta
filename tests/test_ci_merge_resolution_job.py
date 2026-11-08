@@ -162,10 +162,10 @@ def test_pytest_workflows_fetch_full_history() -> None:
     workflows_dir = ROOT / ".github/workflows"
     for workflow in workflows_dir.glob("*.y*ml"):
         text = workflow.read_text()
-        if "./.github/workflows/pytest" not in text:
+        if "pytest" not in text:
             continue
         checkout_before_pytest = re.search(
-            r"(?ms)^      - uses: actions/checkout@v4\n(.*?)(?=^      - uses:|\Z).*?^      - uses: ./\.github/workflows/pytest$",
+            r"(?ms)^      - uses: actions/checkout@v4\n(.*?)(?=^      - uses:|\Z).*?(?:^      - uses: ./\.github/workflows/pytest$|^        run: .*pytest)",
             text,
         )
         assert checkout_before_pytest is not None, workflow
