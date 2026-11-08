@@ -12588,6 +12588,8 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
             "heredoc-secret",
         ),
     ],
+    # Stable ids: the commands embed sys.executable, which differs per machine.
+    ids=["bearer-arg", "env-token", "password-flag", "stdin-path", "fd-url", "heredoc"],
 )
 async def test_killed_task_receipt_never_contains_command_secrets(
     tmp_path: Path,
