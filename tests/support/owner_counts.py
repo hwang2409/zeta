@@ -28,6 +28,17 @@ CLOSE_GUIDANCE = {
 
 OwnerRow = tuple[str, str, int]
 
+_installed: OwnerCounts | None = None
+
+
+def dropped_for_gc(owner: Any, reason: str) -> Any:
+    """Stop counting this one owner: the test drops it on purpose so the GC
+    finalizes it. Other owners in the same test still count. Returns the owner."""
+    assert reason, "say why the test needs the collector to free this owner"
+    if _installed is not None:
+        _installed.forget(owner)
+    return owner
+
 
 class OwnerCounts:
     def __init__(self) -> None:
@@ -73,10 +84,20 @@ class OwnerCounts:
                 self._counts[record[1:]][1] += 1
             self._records.pop(id(obj), None)
 
+    def forget(self, obj: Any) -> None:
+        with self._lock:
+            record = self._records.get(id(obj))
+            if record is None or record[0]() is not obj:
+                return
+            self._counts[record[1:]][0] -= 1
+            self._records.pop(id(obj))
+
     def rows(self) -> list[OwnerRow]:
         return sorted(self._rows)
 
     def install(self) -> None:
+        global _installed
+        _installed = self
         from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
         from zeta.core.store import ConversationStore
         from zeta.memory.auto import AutoMemoryReconciler
@@ -144,6 +165,8 @@ class OwnerCounts:
             setattr(cls, close_name, close)
 
     def uninstall(self) -> None:
+        global _installed
+        _installed = None
         for cls, name, original in reversed(self._originals):
             setattr(cls, name, original)
 
@@ -197,7 +220,9 @@ def gate_failures(rows: list[OwnerRow], baseline_path: Path) -> list[str]:
         failures.append(
             f"owner leak ratchet: {nodeid} left {unclosed} {kind} owner(s) unclosed "
             f"(baseline {allowed}); close the owner with {guidance}; "
-            "do not add rows to tests/owner_leak_ratchet.txt"
+            "do not add rows to tests/owner_leak_ratchet.txt; if the test drops "
+            "it on purpose for the GC, pass it through dropped_for_gc(owner, reason) "
+            "(tests/support/owner_counts.py)"
         )
     return failures
 

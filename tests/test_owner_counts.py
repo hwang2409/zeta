@@ -99,12 +99,41 @@ def test_baseline_may_only_shrink() -> None:
     ]
 
 
+def test_baseline_guard_rejects_a_bad_ref_and_passes_a_deleted_baseline(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    (tmp_path / "scripts").mkdir()
+    shutil.copy(root / "scripts/check_owner_leak_baseline.py", tmp_path / "scripts")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/support").symlink_to(root / "tests/support")
+    baseline = tmp_path / "tests/owner_leak_ratchet.txt"
+    baseline.write_text("tests/test_a.py::test_a::AgentLoop=1\n")
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            args, cwd=tmp_path, capture_output=True, text=True, check=False, timeout=60
+        )
+
+    git = ("git", "-c", "user.name=t", "-c", "user.email=t@t")
+    assert run(*git, "init", "-q").returncode == 0
+    assert run(*git, "add", "scripts", "tests/owner_leak_ratchet.txt").returncode == 0
+    assert run(*git, "commit", "-qm", "base").returncode == 0
+    guard = (sys.executable, "scripts/check_owner_leak_baseline.py")
+
+    bad_ref = run(*guard, "no-such-ref")
+    assert bad_ref.returncode == 2, bad_ref.stdout + bad_ref.stderr
+    baseline.unlink()
+    deleted = run(*guard, "HEAD")
+    assert deleted.returncode == 0, deleted.stdout + deleted.stderr
+
+
 def _run_store_test(
     pytester: pytest.Pytester,
     monkeypatch: pytest.MonkeyPatch,
     *,
     baseline_count: int,
-    close: bool,
+    body: str = "",
 ) -> pytest.RunResult:
     # A test with no baseline row is allowed 0, so write no row for 0.
     row = (
@@ -145,15 +174,15 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 '''
     )
-    close_line = "store.close()" if close else ""
     pytester.makepyfile(
         test_owner=f'''
+from tests.support.owner_counts import dropped_for_gc
 from zeta.core.store import ConversationStore
 
 
 def test_owner(tmp_path):
     store = ConversationStore(tmp_path / "sessions")
-    {close_line}
+    {body}
 '''
     )
     root = str(Path(__file__).resolve().parents[1])
@@ -168,7 +197,7 @@ def test_owner(tmp_path):
 def test_new_conversation_store_leak_fails_with_named_fix(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    result = _run_store_test(pytester, monkeypatch, baseline_count=0, close=False)
+    result = _run_store_test(pytester, monkeypatch, baseline_count=0)
 
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result.stdout.fnmatch_lines(
@@ -183,10 +212,35 @@ def test_new_conversation_store_leak_fails_with_named_fix(
     )
 
 
+def test_owner_dropped_for_gc_is_not_counted_but_a_second_leak_is(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _run_store_test(
+        pytester,
+        monkeypatch,
+        baseline_count=0,
+        body=(
+            'dropped_for_gc(store, "finalizer test")\n'
+            '    ConversationStore(tmp_path / "other")'
+        ),
+    )
+
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.stdout.fnmatch_lines(
+        [
+            (
+                "*owner leak ratchet: test_owner.py::test_owner left 1 "
+                "ConversationStore owner(s) unclosed (baseline 0)*"
+                "dropped_for_gc(owner, reason)*"
+            )
+        ]
+    )
+
+
 def test_closed_conversation_store_passes_gate(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    result = _run_store_test(pytester, monkeypatch, baseline_count=0, close=True)
+    result = _run_store_test(pytester, monkeypatch, baseline_count=0, body="store.close()")
 
     assert result.ret == pytest.ExitCode.OK
     result.assert_outcomes(passed=1)
@@ -195,7 +249,7 @@ def test_closed_conversation_store_passes_gate(
 def test_lower_count_passes_and_refresh_lowers_baseline(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    result = _run_store_test(pytester, monkeypatch, baseline_count=2, close=False)
+    result = _run_store_test(pytester, monkeypatch, baseline_count=2)
     assert result.ret == pytest.ExitCode.OK
 
     baseline = pytester.path / "baseline.txt"
