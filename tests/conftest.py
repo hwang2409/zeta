@@ -619,8 +619,7 @@ def _fd_summary() -> str:
     )
 
 
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    del exitstatus
+def _finish_owner_counts(session: pytest.Session) -> None:
     from tests.support.owner_counts import gate_failures, merge_rows, write_rows
 
     if _OWNER_COUNTS is not None:
@@ -644,6 +643,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             print(failure, flush=True)
         if _OWNER_COUNT_ERRORS:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    del exitstatus
+    if _IS_REPOSITORY_TESTS:
+        _finish_owner_counts(session)
 
     gc.collect()
     end = _open_file_descriptors()
