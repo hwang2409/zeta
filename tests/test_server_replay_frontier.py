@@ -210,7 +210,7 @@ class BlockingBackend:
     async def complete(self, messages: Any, tool_schemas: Any) -> Any:
         del messages, tool_schemas
         self.started.set()
-        await self.release.wait()
+        await await_or_fail(self.release.wait(), what="blocked turn release")
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
@@ -608,10 +608,12 @@ async def test_store_reset_ends_streams_instead_of_dropping_renumbered_rows(
         await serve.controller.request(
             serve.request_id(), "send", {"text": "after-reset", "delivery_id": "d-reset"}
         )
-        ended = await serve.observer.event("replay_stream_ended")
-        assert (ended["stream_id"], ended["reason"]) == (stream_id, "session_replaced")
-        history = (await serve.join(serve.observer))["messages"]
         await _wait_event(serve.controller, "agent_end")
+        frames = await serve.live(serve.observer)
+        ended = [(f["stream_id"], f["reason"]) for f in frames if f["event"] == "replay_stream_ended"]
+        echoed = [f.get("text") for f in frames if f["event"] == "user_message"]
+        assert ended == [(stream_id, "session_replaced")], f"ended={ended} live echo={echoed}"
+        history = (await serve.join(serve.observer))["messages"]
         live = [
             frame.get("text") for frame in await serve.live(serve.observer) if frame["event"] == "user_message"
         ]

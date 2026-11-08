@@ -213,7 +213,6 @@ async def test_background_terminal_card_reaches_each_stream_once(
         controller = await window.start()
         early = await window.observer()
         late = await window.observer()
-        await window.join(early)
         control = window.server.control
         original = control._event
         held_ids: list[str] = []
@@ -228,6 +227,8 @@ async def test_background_terminal_card_reaches_each_stream_once(
         control._event = gated  # type: ignore[method-assign]
         await controller.request(3, "send", {"text": "delegate"})
         request = await _event(controller, "approval_request", delegated=True)
+        # joined after the agent call's "started" result row, before the child completes
+        await window.join(early)
         await controller.request(4, "approve", {"request_id": request["request_id"]})
         await await_or_fail(window.entered.wait(), what="child completion row installed")
         history = await window.join(late)
