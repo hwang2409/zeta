@@ -27,6 +27,7 @@ from ..protocol.types import (
 from .payload_common import (
     HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
     is_harness_notification,
+    provider_messages,
 )
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
@@ -107,7 +108,7 @@ def _content(message: Message) -> str:
 
 
 def _messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
-    messages = without_incomplete_tool_batches(messages)
+    messages = provider_messages(without_incomplete_tool_batches(messages))
     result: list[dict[str, Any]] = []
     prior_calls: dict[str, ToolCall] = {}
     for message in messages:

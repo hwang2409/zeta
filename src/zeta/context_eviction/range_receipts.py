@@ -7,9 +7,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from ..protocol.types import Message, MessageRole, TextContent, ToolUseContent
-from .receipt_constructors import RECEIPT_FIELDS_METADATA, RECEIPT_KIND_METADATA
-
-_RANGE_LIMIT = 440
+from .receipt_constructors import (
+    RANGE_RECEIPT_PREFIX,
+    RANGE_RECEIPT_SUFFIX,
+    RECEIPT_FIELDS_METADATA,
+    RECEIPT_KIND_METADATA,
+    reasoning_marker,
+)
+from .receipt_constructors import RANGE_RECEIPT_LIMIT as _RANGE_LIMIT
 _MAX_TOOL_KINDS = 12
 
 
@@ -210,11 +215,10 @@ def _receipt_unit(
 
 
 def _is_compacted_tool_call_receipt(message: Message, seq: int) -> bool:
-    marker = f"[assistant reasoning evicted · seq {seq}]"
     if (
         not message.content
         or not isinstance(message.content[-1], TextContent)
-        or message.content[-1].text != marker
+        or message.content[-1].text != reasoning_marker(seq)
     ):
         return False
     calls = [
@@ -402,7 +406,8 @@ def _range_receipt(
                 users.extend(
                     excerpt for excerpt in excerpts if isinstance(excerpt, str)
                 )
-    suffix = f"; recall_history seq_start={start}, seq_end={end} for exact content"
+    prefix = RANGE_RECEIPT_PREFIX.format(start=start, end=end)
+    suffix = RANGE_RECEIPT_SUFFIX.format(start=start, end=end)
     if user_count:
         excerpts = [
             excerpt[:77] + "..." if len(excerpt) > 80 else excerpt for excerpt in users
@@ -413,19 +418,19 @@ def _range_receipt(
                 + "; ".join(excerpts)
             )
             summary = ", ".join([*parts, user_summary])
-            text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+            text = f"{prefix}{summary}{suffix}"
             if len(text) <= _RANGE_LIMIT:
                 break
             excerpts.pop(0)
         else:
             label = "request" if user_count == 1 else "requests"
             summary = ", ".join([*parts, f"{user_count} user {label}"])
-            text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+            text = f"{prefix}{summary}{suffix}"
     else:
         summary = ", ".join(parts)
-        text = f"[evicted range] seq {start}-{end}: {summary}{suffix}"
+        text = f"{prefix}{summary}{suffix}"
     if len(text) > _RANGE_LIMIT:
-        text = f"[evicted range] seq {start}-{end}: {len(units)} receipt items{suffix}"
+        text = f"{prefix}{len(units)} receipt items{suffix}"
     metadata = {
         "context_evicted": True,
         RECEIPT_KIND_METADATA: "range",

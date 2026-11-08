@@ -25,6 +25,7 @@ from .receipt_constructors import (
     RECEIPT_KIND_METADATA as RECEIPT_KIND_METADATA,
 )
 from .receipt_constructors import (
+    REASONING_KIND,
     _assistant_receipt,
     _collapsed_assistant_receipt,
     _generic_result_receipt,
@@ -33,6 +34,7 @@ from .receipt_constructors import (
     _semantic_result_receipt,
     _structured_result_receipt,
     _tool_call_receipt,
+    reasoning_marker,
 )
 from .token_estimates import estimated_text_tokens, estimated_tokens  # noqa: F401
 from .tool_exchange_fold import fold_consumed_tool_exchanges
@@ -269,11 +271,11 @@ def _evict_deterministic(
             if not isinstance(block, (ThinkingContent, RedactedThinkingContent))
         ]
         replacement = (
-            _assistant_receipt(seq, "assistant reasoning", role=message.role)
+            _assistant_receipt(seq, REASONING_KIND, role=message.role)
             if not content and message.tool_result is None
             else Message(
                 message.role,
-                [*content, TextContent(f"[assistant reasoning evicted · seq {seq}]")],
+                [*content, TextContent(reasoning_marker(seq))],
                 tool_result=message.tool_result,
                 metadata={"context_evicted": True, "source_seq": seq},
             )
