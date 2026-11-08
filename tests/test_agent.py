@@ -13845,9 +13845,7 @@ class _ParentTaskExplicitFinishBackend(CompletionBackend):
 async def test_explicit_finish_ignores_parent_run_background_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    backend = _ParentTaskExplicitFinishBackend(
-        _python("import time; time.sleep(30)")
-    )
+    backend = _ParentTaskExplicitFinishBackend(_python("import sys; sys.stdin.read()"))
     store = ConversationStore(tmp_path)
     catalog = _nested_handler_catalog()
     registry = ToolRegistry(
