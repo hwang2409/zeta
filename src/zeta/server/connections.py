@@ -1028,7 +1028,11 @@ def perform_child_history_read(
         raise ProtocolError(
             ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found"
         ) from exc
-    runtime = type("ObserverRuntime", (), {"opened": type("Opened", (), {"store": reader})()})()
+    runtime = type(
+        "ObserverRuntime",
+        (),
+        {"session_id": target[0], "opened": type("Opened", (), {"store": reader})()},
+    )()
     history_params = {key: value for key, value in params.items() if key != "run_id"}
     return ergonomics.history(
         runtime,
