@@ -35,7 +35,7 @@ from ...protocol.types import (
     ToolUseContent,
     require_new_message_origin,
 )
-from ...storage_format import WriterLease, open_writer, reject_unknown_keys
+from ...storage_format import WriterLease, open_writer
 from .. import session_execution
 from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
@@ -44,6 +44,16 @@ from ..checkpoints import (
     ConversationIntegrityError,
     active_branch,
     load_session_json,
+)
+from ..checkpoints.entry_types import (
+    sent_message_receipts,
+    validate_conversation_entry,
+)
+from ..checkpoints.mutation import (
+    AppendConversationRows,
+    ConversationGenerationConflict,
+    ConversationRow,
+    register_conversation_target,
 )
 from ..session_files import (
     child_directory,
@@ -61,15 +71,11 @@ from ..transcript_recovery import (
 from ._approval_display import (
     ApprovalAuditRequest,
     normalize_approval_requests,
-    validated_approval_display,
 )
-from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_history_data
-from ._async_writes import AsyncDurableWritesMixin
-from ._child_runs import (
-    ChildRunStoreMixin,
-    validate_child_run_started_data,
-)
-from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
+from ._approval_history import ApprovalHistoryStoreMixin
+from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
+from ._child_runs import ChildRunStoreMixin
+from ._client_delivery import ClientDeliveryMixin
 from ._execution_owner import ExecutionOwnerStoreMixin
 from ._incremental_validation import (
     IncrementalValidationMixin,
@@ -79,24 +85,21 @@ from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
-    MAX_PENDING_PROMPT_TEXT,
+    MAX_PENDING_PROMPT_TEXT,  # noqa: F401 - re-exported by store facade
     PendingPromptCommitTimeoutError,  # noqa: F401 - re-exported by store facade
     PendingPromptQueue,
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
 from ._session_state import SessionStatePersistenceMixin
-from ._startup_facts import StartupFactsMixin, sent_message_receipts
+from ._startup_facts import StartupFactsMixin
 from ._step_delivery import StepDeliveryStoreMixin
-from ._turn_history import TurnHistoryMixin, validate_turn_end_data
+from ._turn_history import TurnHistoryMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
-    validate_compaction_data,
-    validate_notification_data,
-    validate_terminal_transition_data,
 )
 
 
@@ -135,6 +138,7 @@ class ConversationStore(
         _execution_lease: session_execution.SessionExecutionLease | None = None,
         _owner_surface: session_execution.OwnerSurface = "tui",
         _recovery_owner: bool = False,
+        _mutation_target: bool = False,
         _repair_explicit: bool = False,
         _repair_target: RepairTarget | None = None,
     ) -> None:
@@ -167,6 +171,7 @@ class ConversationStore(
             self.session_dir = self.root_dir / self.session_id
             self._read_only = _read_only
             self._must_exist = _must_exist
+            self._mutation_target = _mutation_target
             self._repair_explicit = _repair_explicit
             self._repair_target = _repair_target or repair_target_for_session_dir(
                 self.session_dir, self.session_id
@@ -250,6 +255,8 @@ class ConversationStore(
                     self._storage_lease,
                 )
             storage_ownership.pop_all()
+        if not _read_only and not _mutation_target:
+            register_conversation_target(self)
 
     @property
     def last_repair_result(self) -> RepairResult | None:
@@ -515,98 +522,7 @@ class ConversationStore(
 
     def _validate_entry_payload(self, entry: ConversationEntry) -> None:
         try:
-            if entry.type == "message":
-                message = entry.data.get("message")
-                if type(message) is not dict:
-                    raise ValueError("message entry payload must contain an object")
-                parsed_message = Message.from_dict(message)
-                approval_requests = entry.data.get("approval_requests", [])
-                if type(approval_requests) is not list:
-                    raise ValueError("message approval_requests must be an array")
-                request_ids: set[str] = set()
-                for request in approval_requests:
-                    if type(request) is not dict:
-                        raise ValueError("message approval request must be an object")
-                    request_id = request.get("request_id")
-                    tool_call = request.get("tool_call")
-                    if type(request_id) is not str or not request_id:
-                        raise ValueError(
-                            "approval request id must be a nonempty string"
-                        )
-                    if request_id in request_ids:
-                        raise ValueError(f"duplicate approval request: {request_id}")
-                    request_ids.add(request_id)
-                    if type(tool_call) is not dict:
-                        raise ValueError("approval request tool_call must be an object")
-                    parsed_tool_call = ToolCall.from_dict(tool_call)
-                    if "approval_display" in request:
-                        validated_approval_display(request["approval_display"])
-                    anchored_call = next(
-                        (
-                            block.tool_call
-                            for block in parsed_message.content
-                            if isinstance(block, ToolUseContent)
-                            and block.tool_call.id == parsed_tool_call.id
-                        ),
-                        None,
-                    )
-                    if anchored_call != parsed_tool_call:
-                        raise ValueError(
-                            "approval request must match an anchored tool call"
-                        )
-            elif entry.type == "child_run_started":
-                validate_child_run_started_data(entry.data)
-            elif entry.type == "compaction":
-                validate_compaction_data(entry.data)
-            elif entry.type == "client_delivery":
-                validate_client_delivery_data(entry.data, self.session_id)
-            elif entry.type == "warning":
-                if type(entry.data.get("message")) is not str:
-                    raise ValueError("warning message must be a string")
-            elif entry.type in {"checkpoint", "fork"}:
-                self._validate_checkpoint_or_fork_payload(entry)
-            elif entry.type == "approval_resolution":
-                request_id = entry.data.get("request_id")
-                decision = entry.data.get("decision")
-                if type(request_id) is not str or not request_id:
-                    raise ValueError("approval resolution id must be a nonempty string")
-                if decision not in {"allow", "deny", "abort"}:
-                    raise ValueError("invalid approval resolution")
-                validate_approval_reason(decision, entry.data.get("reason"))
-            elif entry.type == "approval_history":
-                validate_approval_history_data(entry.data)
-            elif entry.type == "turn_end":
-                validate_turn_end_data(entry.data)
-            elif entry.type == "notification":
-                kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
-                if kind in NOTIFICATION_KINDS:
-                    validate_notification_data(entry.data)
-                # Unknown kinds remain readable for forward compatibility.
-            elif entry.type == "notification_ack":
-                notification_id = entry.data.get("notification_id")
-                if type(notification_id) is not str or not notification_id:
-                    raise ValueError("notification id must be a nonempty string")
-            elif entry.type == "notification_tui_presented":
-                notification_id = entry.data.get("notification_id")
-                if type(notification_id) is not str or not notification_id:
-                    raise ValueError("notification id must be a nonempty string")
-                reject_unknown_keys(entry.data, "notification_marker")
-            elif entry.type == "pending_prompt":
-                text = entry.data.get("text")
-                if type(text) is not str or not text:
-                    raise ValueError("pending prompt text must be a nonempty string")
-                if len(text) > MAX_PENDING_PROMPT_TEXT:
-                    raise ValueError("pending prompt text is too long")
-            elif entry.type == "pending_prompt_ack":
-                prompt_id = entry.data.get("prompt_id")
-                if type(prompt_id) is not str or not prompt_id:
-                    raise ValueError("pending prompt id must be a nonempty string")
-            elif entry.type == "pending_queue_closed":
-                reject_unknown_keys(entry.data, "pending_queue_closed")
-            elif entry.type == "terminal_transition":
-                validate_terminal_transition_data(entry.data)
-            else:
-                raise ValueError(f"unsupported conversation entry type: {entry.type}")
+            validate_conversation_entry(self, entry)
         except (KeyError, TypeError, ValueError) as exc:
             raise ConversationIntegrityError(
                 f"invalid payload for conversation entry {entry.id}"
@@ -626,10 +542,16 @@ class ConversationStore(
         data: dict[str, Any],
         parent_id: str | None = None,
     ) -> ConversationEntry:
-        with self._append_lock():
-            return self._snapshot_entry(
-                self._append_row_unlocked(entry_type, data, parent_id)
-            )
+        command = AppendConversationRows(
+            (ConversationRow(entry_type, data, parent_id),)
+        )
+        for _attempt in range(3):
+            try:
+                delta = self.commit(command, self.conversation_generation)
+                return delta.committed_entries[0]
+            except ConversationGenerationConflict:
+                continue
+        raise ConversationIntegrityError("conversation kept changing during append")
 
     def append_many(
         self, rows: Iterable[tuple[str, dict[str, Any]]]
@@ -642,11 +564,18 @@ class ConversationStore(
         materialized = [(entry_type, dict(data)) for entry_type, data in rows]
         if not materialized:
             return []
-        with self._append_lock():
-            return [
-                self._snapshot_entry(entry)
-                for entry in self._append_many_unlocked(materialized)
-            ]
+        command = AppendConversationRows(
+            tuple(
+                ConversationRow(entry_type, data) for entry_type, data in materialized
+            )
+        )
+        for _attempt in range(3):
+            try:
+                delta = self.commit(command, self.conversation_generation)
+                return list(delta.committed_entries)
+            except ConversationGenerationConflict:
+                continue
+        raise ConversationIntegrityError("conversation kept changing during append")
 
     def _append_many_unlocked(
         self, rows: list[tuple[str, dict[str, Any]]]
@@ -782,9 +711,10 @@ class ConversationStore(
         on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         """Append off-loop and run ``on_persisted`` before deferred cancellation."""
-        kwargs = {"parent_id": parent_id} if parent_id is not None else {}
-        return await self._to_thread_durable(
-            self.append_message, message, _on_persisted=on_persisted, **kwargs
+        return await self._commit_storage_command(
+            _AppendMessageCommand(
+                message=message, parent_id=parent_id, callback=on_persisted
+            )
         )
 
     def append_compaction_marker(

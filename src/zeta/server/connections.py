@@ -278,7 +278,7 @@ class ConnectionRegistry:
         self._enqueue(
             output,
             _OutputFrame(frame),
-            wake=True,
+            wake=output.phase != "claimed_buffering",
         )
         return outcome
 
