@@ -34,6 +34,7 @@ from .codex_payload import (
     _cache_affinity_json,
     build_responses_payload,
 )
+from .codex_request import prepare_large_image_request
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -255,9 +256,16 @@ class CodexBackend(CompletionBackend):
                 payload["prompt_cache_key"] = cache_key
             headers = self.token_store.auth_headers(access_token)
             headers["session-id"] = cache_key
-            stream_context = client.stream(
-                "POST", self.base_url, headers=headers, json=payload
-            )
+            prepared = prepare_large_image_request(payload)
+            if prepared is None:
+                stream_context = client.stream(
+                    "POST", self.base_url, headers=headers, json=payload
+                )
+            else:
+                headers.update(prepared.headers)
+                stream_context = client.stream(
+                    "POST", self.base_url, headers=headers, content=prepared.content
+                )
             response = await wait_for_response_headers(
                 stream_context.__aenter__(),
                 self.stall_seconds,

@@ -1431,6 +1431,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
             assert release_delta.wait(timeout=10)
         return copied
 
+    # test-contract: seam blocks the worker snapshot to prove owner-write publication ordering
     monkeypatch.setattr(
         ConversationStore, "_owned_installed_delta", staticmethod(block_first_worker_delta)
     )
