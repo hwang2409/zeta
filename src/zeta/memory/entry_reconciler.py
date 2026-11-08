@@ -725,6 +725,7 @@ async def _invoke(
         else:
             response = invoke(prompt, budget)
         if inspect.isawaitable(response):
+            # test-contract: seam provider completion owns its request deadlines
             response = await response
     if isinstance(response, ReconciliationResponse):
         return (

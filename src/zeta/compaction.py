@@ -700,6 +700,7 @@ class CompactionPolicy:
         if on_success is not None:
             success_result = on_success()
             if inspect.isawaitable(success_result):
+                # test-contract: seam caller owns the compaction callback
                 await success_result
         return summary
 

@@ -75,6 +75,7 @@ class MonotonicDeadlineClock:
         ready = loop.create_future()
         timer = loop.call_at(deadline, ready.set_result, None)
         try:
+            # test-contract: seam this future is the injected deadline clock
             await ready
         finally:
             timer.cancel()
@@ -324,6 +325,7 @@ class IteratorProviderAttempt:
         token = _ACTIVITY_REPORTER.set(self._report)
         try:
             while True:
+                # test-contract: seam the owner cancels the attempt producer
                 await self._resume.wait()
                 self._resume.clear()
                 event = await self._source.__anext__()
@@ -360,6 +362,7 @@ class IteratorProviderAttempt:
         self._closed = True
         if self._producer is not None and not self._producer.done():
             self._producer.cancel()
+            # test-contract: seam producer cancellation must drain fully
             await asyncio.gather(self._producer, return_exceptions=True)
             # this close cancelled the producer; a bare cancellation is not a
             # source outcome (a chained one still carries the source error).
@@ -369,6 +372,7 @@ class IteratorProviderAttempt:
             ):
                 self._producer_error = None
         elif self._producer is not None:
+            # test-contract: seam producer completion must drain fully
             await asyncio.gather(self._producer, return_exceptions=True)
         close = getattr(self._source, "aclose", None)
         if close is not None:
@@ -787,6 +791,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         deadline_wins_tie: bool = True,
     ) -> Any:
         if deadline is None and abort is None:
+            # test-contract: seam caller cancellation directly owns this step
             return await step
         timer_task = (
             asyncio.create_task(self._clock.wait_until(deadline))
@@ -794,11 +799,13 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             else None
         )
         step_task = asyncio.ensure_future(step)
+        # test-contract: seam the abort signal bounds this owner wait
         abort_task = asyncio.create_task(abort.wait()) if abort is not None else None
         tasks = tuple(
             task for task in (step_task, timer_task, abort_task) if task is not None
         )
         try:
+            # test-contract: seam timer or abort bounds the owned step tasks
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             if timer_task is not None and timer_task in done and (
                 deadline_wins_tie or step_task not in done
@@ -811,6 +818,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            # test-contract: seam every losing step task must drain fully
             await self._drain_preserving_cancellation(*tasks)
 
     def _record_failure_decision(self, error: object, *, will_retry: bool) -> None:
@@ -872,6 +880,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         cancelled = False
         while not drain.done():
             try:
+                # test-contract: seam cancellation cannot interrupt owner cleanup
                 await asyncio.shield(drain)
             except asyncio.CancelledError:
                 cancelled = True

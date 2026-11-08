@@ -889,6 +889,7 @@ class AutoMemoryReconciler:
         else:
             raw = self.invoke(prompt, budget)
         if inspect.isawaitable(raw):
+            # test-contract: seam provider completion owns its request deadlines
             raw = await raw
         if isinstance(raw, ReconciliationResponse):
             return raw.text, dict(raw.usage)

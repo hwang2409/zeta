@@ -833,7 +833,9 @@ class DisconnectThenSucceedBackend:
         self.calls += 1
         if self.calls == 1:
             self.started.set()
-            await asyncio.Event().wait()
+            await await_or_fail(
+                asyncio.Event().wait(), what="first completion cancellation"
+            )
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("retried")]),
@@ -852,7 +854,9 @@ class AbortTwiceThenSucceedBackend:
         call_index = len(self.calls) - 1
         if call_index < len(self.started):
             self.started[call_index].set()
-            await asyncio.Event().wait()
+            await await_or_fail(
+                asyncio.Event().wait(), what="repeated completion cancellation"
+            )
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("retried")]),
@@ -871,7 +875,9 @@ class BlockingThenCaptureBackend:
         self.calls.append(messages)
         if len(self.calls) == 1:
             self.started.set()
-            await asyncio.Event().wait()
+            await await_or_fail(
+                asyncio.Event().wait(), what="captured completion cancellation"
+            )
         elif len(self.calls) == 2:
             self.second_started.set()
         yield StreamEvent(
@@ -966,7 +972,9 @@ class BackgroundChildAndForegroundToolBackend:
                 ]
             elif last_user == "child work":
                 self.child_started.set()
-                await self.release_child.wait()
+                await await_or_fail(
+                    self.release_child.wait(), what="release background child"
+                )
                 blocks = [TextContent("child complete")]
             elif last_user == "run slowly":
                 blocks = [
@@ -7556,6 +7564,7 @@ async def test_runtime_failure_releases_all_session_leases(
         incoming.append(composition)
         return composition
 
+    # test-contract: seam capture composed runtimes to prove cleanup
     monkeypatch.setattr(runtime, "_compose", retain_composition)
 
     async def fail_close():
@@ -7582,7 +7591,7 @@ async def test_runtime_failure_releases_all_session_leases(
         else:
             operation = runtime.create_session()
         with pytest.raises(RuntimeError, match="failed"):
-            await operation
+            await await_or_fail(operation, what=f"{failure} runtime transition")
         assert runtime.state is None
         assert old_store._closed
         assert all(composition.opened.store._closed for composition in incoming)

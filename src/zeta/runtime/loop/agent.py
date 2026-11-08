@@ -1091,6 +1091,7 @@ class AgentLoop(
             if completion_succeeded and self.on_completion_success is not None:
                 completion_result = self.on_completion_success()
                 if inspect.isawaitable(completion_result):
+                    # test-contract: seam caller owns the completion callback
                     await completion_result
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)

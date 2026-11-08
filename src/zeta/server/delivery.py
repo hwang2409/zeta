@@ -142,6 +142,7 @@ class DeliveryRequests:
             asyncio.to_thread(image_delivery.prepare_image_delivery, runtime, params)
         )
         try:
+            # test-contract: seam request cancellation owns and cleans up this worker
             prepared = await asyncio.shield(worker)
         except asyncio.CancelledError:
             await _cleanup_canceled_image_delivery(worker, runtime)

@@ -13440,12 +13440,14 @@ async def test_undo_keeps_a_draft_typed_during_streaming(tmp_path: Path) -> None
     app._active_session = session
     task = asyncio.create_task(app._consume_turn("sent message"))
     app._active_task = task
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="undo backend start")
     session.default_buffer.insert_text("new draft")
     app._undo_candidate = UndoCandidate("sent message")
 
     app.undo_sent_turn()
-    await asyncio.gather(task, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(task, return_exceptions=True), what="undo turn cancellation"
+    )
     await app._draft.flush_pending()
 
     assert session.app.current_buffer.text == "new draft"
@@ -13512,9 +13514,12 @@ async def test_undo_restores_next_image_token_after_deleted_token(
     app._next_image_token = 3
 
     await app._handle_prompt_value("inspect [Image #2]")
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="image undo backend start")
     app.undo_sent_turn()
-    await asyncio.gather(app._active_task, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(app._active_task, return_exceptions=True),
+        what="image undo turn cancellation",
+    )
 
     monkeypatch.setattr(
         "zeta.tui.paste_runtime.paste_image", lambda _, **kwargs: pasted

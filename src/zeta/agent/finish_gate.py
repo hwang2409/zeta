@@ -247,8 +247,10 @@ class FinishGateState:
                         close_task = asyncio.create_task(close())
                         if loop.time() >= self._task_deadline():
                             close_task.cancel()
+                            # test-contract: seam canceled completion close must drain
                             await asyncio.gather(close_task, return_exceptions=True)
                         else:
+                            # test-contract: seam timeout_at owns the close deadline
                             await close_task
         except TimeoutError:
             if task_running_at_entry and loop.time() >= self._task_deadline():
@@ -313,6 +315,7 @@ class FinishGateState:
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
         try:
             async with asyncio.timeout_at(deadline):
+                # test-contract: seam timeout_at owns the transition deadline
                 await child_loop._background_owner.conversation_channel.wait(
                     child_loop.agent_instance_id or ""
                 )
@@ -387,6 +390,7 @@ async def await_owned_work(
             return
         try:
             async with asyncio.timeout_at(deadline):
+                # test-contract: seam timeout_at owns the transition deadline
                 await child_loop._background_owner.conversation_channel.wait(
                     child_loop.agent_instance_id or ""
                 )
