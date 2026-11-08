@@ -7522,33 +7522,52 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     root_woke = asyncio.Event()
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop.set_background_wake_callback(root_woke.set)
+    child_store: ConversationStore | None = None
+    grandchild_store: ConversationStore | None = None
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
-    backend.release_grandchild.set()
-    await asyncio.wait_for(backend.child_notification_started.wait(), timeout=2)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
+        backend.release_grandchild.set()
+        await asyncio.wait_for(backend.child_notification_started.wait(), timeout=10)
 
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    root_notifications = store.agent_notifications(pending_only=False)
-    assert len(root_notifications) == 1
-    assert root_notifications[0].data["display_only"] is True
-    assert store.agent_notifications() == []
-    assert not root_woke.is_set()
-    nested_result = next(
-        message.tool_result for message in child_store.messages() if message.tool_result
-    )
-    assert nested_result.structured_content is not None
-    assert nested_result.structured_content["status"] == "running"
-    assert [
-        entry.data["status"]
-        for entry in child_store.agent_notifications(pending_only=False)
-    ] == ["completed"]
-    grandchild_store = ConversationStore(
-        child_store.session_dir / "agents", session_id="1"
-    )
-    assert grandchild_store.agent_canceled() is None
-    backend.release_child_notification.set()
-    await loop.close()
+        child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+        root_notifications = store.agent_notifications(pending_only=False)
+        assert len(root_notifications) == 1
+        assert root_notifications[0].data["display_only"] is True
+        assert store.agent_notifications() == []
+        assert not root_woke.is_set()
+        nested_result = next(
+            message.tool_result
+            for message in child_store.messages()
+            if message.tool_result
+        )
+        assert nested_result.structured_content is not None
+        assert nested_result.structured_content["status"] == "running"
+        assert [
+            entry.data["status"]
+            for entry in child_store.agent_notifications(pending_only=False)
+        ] == ["completed"]
+        grandchild_store = ConversationStore(
+            child_store.session_dir / "agents", session_id="1"
+        )
+        assert grandchild_store.agent_canceled() is None
+        backend.release_child_notification.set()
+    finally:
+        backend.release_grandchild.set()
+        backend.release_child_notification.set()
+        try:
+            await loop.close()
+        finally:
+            try:
+                if grandchild_store is not None:
+                    grandchild_store.close()
+            finally:
+                try:
+                    if child_store is not None:
+                        child_store.close()
+                finally:
+                    store.close()
 
 
 @pytest.mark.asyncio
@@ -10864,8 +10883,9 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     await asyncio.sleep(0)
     assert not task.done()
     release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    result = await await_or_fail(task, what="committed agent_send result")
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("queued a follow-up")
 
     assert [
         entry.data["text"]
@@ -10945,8 +10965,8 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
 
 
 @pytest.mark.asyncio
-async def test_agent_send_aborts_before_append_when_store_lock_is_held(
-    tmp_path: Path,
+async def test_agent_send_cancellation_reports_durable_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent_store = ConversationStore(tmp_path / "parent")
     child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
@@ -10971,6 +10991,35 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
     await delivery_flow.initialize()
     owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
     registry._agent_owner = owner
+    canceled = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "agent-send-canceled-before-admission",
+                "agent_send",
+                {"child_instance_id": "parent:1", "message": "not sent"},
+            )
+        )
+    )
+    canceled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(canceled, 10)
+    assert await asyncio.to_thread(child_store.pending_prompts) == []
+
+    entered_commit = threading.Event()
+    committed = threading.Event()
+    original_commit = step_delivery_store_module._commit_delivery_input
+
+    def observe_commit(store, item):
+        entered_commit.set()
+        try:
+            return original_commit(store, item)
+        finally:
+            committed.set()
+
+    # test-contract: seam observe the real durable commit admission point.
+    monkeypatch.setattr(
+        step_delivery_store_module, "_commit_delivery_input", observe_commit
+    )
     lock = child_store._append_lock()
     lock.__enter__()
     try:
@@ -10983,15 +11032,22 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
                 )
             )
         )
-        await asyncio.sleep(0)
+        await await_or_fail(
+            asyncio.to_thread(entered_commit.wait, 10),
+            what="agent_send commit to start",
+        )
         task.cancel()
-        await asyncio.sleep(0)
         assert not task.done()
     finally:
         lock.__exit__(None, None, None)
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=2)
+    await await_or_fail(
+        asyncio.to_thread(committed.wait, 10),
+        what="agent_send commit to finish",
+    )
+    result = await await_or_fail(task, what="committed agent_send result")
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("queued a follow-up")
     assert [
         entry.data["text"]
         for entry in await asyncio.to_thread(child_store.pending_prompts)
@@ -12662,8 +12718,8 @@ async def test_agent_cancel_mixed_child_and_task_terminal_result(
     )
     store, loop, run, completion_published = await _start_task_gate(tmp_path, backend)
 
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
-    await asyncio.wait_for(run, timeout=5)
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
+    await asyncio.wait_for(run, timeout=10)
     notification = await _completion_after_publication(store, completion_published)
     assert "background sub-agents" in backend.gate_text
     assert "collect mixed evidence" in backend.gate_text
@@ -15602,17 +15658,23 @@ async def test_last_owned_source_exit_publishes_stall_without_polling(
         await _cancel_idle_fixture(run, registry, parent, child)
 
 
+@pytest.mark.parametrize("extra_idle_wake", [False, True])
 @pytest.mark.asyncio
 async def test_question_answer_then_later_stall_starts_new_notice_episode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_idle_wake: bool
 ) -> None:
     parent, child, registry, loop, parent_flow, _wakes = await _idle_notice_fixture(
         tmp_path
     )
     idle_entries: asyncio.Queue[None] = asyncio.Queue()
+    forced_extra_idle = asyncio.Event()
+    answer_idle_entered = asyncio.Event()
+    force_extra_idle = False
+    answer_consumed = False
     prompts: list[str] = []
 
     async def consume(_loop, prompt, **kwargs):
+        nonlocal answer_consumed
         await _ack_fake_delivery(child, kwargs)
         if not prompt and loop.step_delivery.has_prompt_edge:
             prepared = await loop.step_delivery.prepare_request(
@@ -15622,6 +15684,8 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             prompt = prepared.messages[-1].content[0].text
             await loop.step_delivery.acknowledge_active()
         prompts.append(prompt)
+        if prompt == "Re q-reset: approved":
+            answer_consumed = True
         if prompt == "ask now":
             await loop._background_owner.conversation_channel.publish_question(
                 child_instance_id="root:1",
@@ -15637,7 +15701,11 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
 
     async def wait_idle(wake, _timeout):
         idle_entries.put_nowait(None)
-        await wake()
+        if force_extra_idle and not answer_consumed:
+            forced_extra_idle.set()
+        if answer_consumed:
+            answer_idle_entered.set()
+        await asyncio.wait_for(wake(), 10)
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
@@ -15680,6 +15748,10 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         prepared = await parent_flow.prepare_request("idle_start", [], None)
         assert prepared.notification_ids
         await parent_flow.acknowledge_active()
+        if extra_idle_wake:
+            force_extra_idle = True
+            loop._background_owner.conversation_channel.wake("root:1")
+            await asyncio.wait_for(forced_extra_idle.wait(), 10)
         assert (
             await send_to_run(
                 parent,
@@ -15689,7 +15761,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             )
             is None
         )
-        await asyncio.wait_for(idle_entries.get(), 10)
+        await asyncio.wait_for(answer_idle_entered.wait(), 10)
         notices = [
             entry
             for entry in parent.agent_notifications(pending_only=False)

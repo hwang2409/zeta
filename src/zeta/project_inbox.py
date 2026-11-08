@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
@@ -404,6 +404,7 @@ class ProjectInbox:
         in_reply_to: str | None = None,
         message_id: str | None = None,
         to_session: str | None = None,
+        on_visible: Callable[[], None] | None = None,
     ) -> str:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
@@ -477,6 +478,12 @@ class ProjectInbox:
                 expected["body"] = body
                 if comparable != expected:
                     raise InboxError("message id already exists with different content")
+        if on_visible is not None:
+            try:
+                on_visible()
+            except Exception:  # noqa: BLE001,S110
+                # The durable record remains authoritative if its wake cannot run.
+                pass
         tracker = (
             self.sent_tracker
             if self.sent_tracker is not None and self.sent_tracker.session_id == session

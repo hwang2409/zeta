@@ -24,12 +24,9 @@ from rich.console import Console
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.attention_decisions import DecisionItem, open_decisions
-from zeta.attention_forks import (
-    create_discussion_fork,
-    deliver_attention_decision,
-    release_discussion_fork,
-)
+from zeta.attention_forks import create_discussion_fork, release_discussion_fork
 from zeta.attention_records import AttentionStore
+from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
@@ -283,10 +280,9 @@ async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
         app.start_decisions_poll()
         await await_or_fail(failed.wait(), what="failing decision poll")
         await asyncio.to_thread(
-            AttentionStore(current.store.session_dir).resolve,
+            AttentionReplies(tmp_path, current.store.session_id).resolve_local,
             record.id,
-            session_id=current.store.session_id,
-            decision="done",
+            "done",
         )
         release_failure.set()
         try:
@@ -339,10 +335,9 @@ async def test_persistent_decisions_failure_renders_unavailable_then_recovers(
 
         monkeypatch.setattr(decisions_module, "open_decisions", real_open)
         await asyncio.to_thread(
-            AttentionStore(current.store.session_dir).resolve,
+            AttentionReplies(tmp_path, current.store.session_id).resolve_local,
             record.id,
-            session_id=current.store.session_id,
-            decision="done",
+            "done",
         )
         app.request_decisions_refresh()
         try:
@@ -615,6 +610,10 @@ async def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> Non
         _home=tmp_path,
         _decisions_session_id=current.store.session_id,
         loop=current,
+        _run_attention_operation=lambda operation, *args: asyncio.to_thread(
+            operation, *args
+        ),
+        _attention_replies=lambda session_id: AttentionReplies(tmp_path, session_id),
     )
     output = await DecisionsMixin.slash_decisions(app, "")
     assert "Current" in output
@@ -730,23 +729,26 @@ def test_quick_answer_delivers_to_asking_session_and_closes(tmp_path: Path) -> N
     answerer = _session(tmp_path, project.project_id)
     record = _request(asker, project.project_id, "Pick DB", "Choose one.")
 
-    message_id, _, already = deliver_attention_decision(
-        tmp_path, record, "Use SQLite.", from_session=answerer.store.session_id
+    outcome = AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=answerer.store.session_id
     )
-    assert already is False
+    assert not outcome.already_resolved
+    assert outcome.message_id is not None
 
     inbox = ProjectInbox(manager.project_registry, sessions_root=tmp_path / "sessions")
     new = inbox.new_ids(project.project_id, session_id=asker.store.session_id)
-    assert new == (message_id,)
-    message = inbox.claim(project.project_id, message_id, asker.store.session_id)
+    assert new == (outcome.message_id,)
+    message = inbox.claim(
+        project.project_id, outcome.message_id, asker.store.session_id
+    )
     assert "Use SQLite." in message["body"]
     assert AttentionStore(asker.store.session_dir).get(record.id).status == "resolved"
 
     # A repeat is idempotent and reports the prior delivery.
-    _, _, again = deliver_attention_decision(
-        tmp_path, record, "Use SQLite.", from_session=answerer.store.session_id
+    again = AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=answerer.store.session_id
     )
-    assert again is True
+    assert again.already_resolved
 
     asker.store.close()
     answerer.store.close()
@@ -847,11 +849,8 @@ def test_return_after_decision_keeps_resolved_binding(tmp_path: Path) -> None:
         entry_seq=anchor.seq,
     )
     fork_id = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
-    deliver_attention_decision(
-        tmp_path,
-        AttentionStore(asker.store.session_dir).get(record.id),
-        "Use SQLite.",
-        from_session=fork_id,
+    AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=fork_id
     )
     source = release_discussion_fork(tmp_path, fork_id)
     assert source == asker.store.session_id
@@ -928,7 +927,7 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
             recommendation="Use the first option because it is safest.",
         )
         app._decisions_panel.set_items([item])
-        app.open_decisions_panel()
+        await app._open_decisions_panel()
 
         async def render() -> tuple[Screen, MouseHandlers]:
             session.app.output = _FixedSizeOutput(width, height)
