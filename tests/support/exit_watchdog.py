@@ -26,6 +26,9 @@ import pytest
 # durations of any CI job), so this only fires on a real hang.
 EXIT_WATCHDOG_SECONDS = 120
 
+# Disarmed, the dump thread only wakes on arm(); this bounds each idle wait.
+_IDLE_RECHECK_SECONDS = 3600.0
+
 _stderr_fd: int | None = None
 _seconds = float(EXIT_WATCHDOG_SECONDS)
 
@@ -68,11 +71,11 @@ class _TaskDumper:
         with self._changed:
             while True:
                 if self._deadline is None:
-                    self._changed.wait()
-                    continue
-                remaining = self._deadline - time.monotonic()
+                    remaining = _IDLE_RECHECK_SECONDS
+                else:
+                    remaining = self._deadline - time.monotonic()
                 if remaining > 0:
-                    self._changed.wait(remaining)
+                    self._changed.wait(timeout=remaining)
                     continue
                 self._deadline = None
                 _write(_describe_threads_and_tasks())
