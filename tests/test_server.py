@@ -94,7 +94,7 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
-from zeta.server.connections import ConnectionRegistry
+from zeta.server.connections import Admission, ConnectionRegistry
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
@@ -1751,15 +1751,16 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     agent_ended = asyncio.Event()
-    publish_approval = server.control._approvals._publish
+    append_history = server.control._approvals._append_delegated_history
     notify = server.control._notify
 
     async def delay_delegated_approval_end(
-        event: str, session_id: str | None = None, **fields: object
-    ) -> bool:
-        if event == "approval_end" and fields.get("request_id") != raw_id:
-            await asyncio.wait_for(agent_ended.wait(), 10)
-        return await publish_approval(event, session_id, **fields)
+        record: object, payload: dict[str, object] | None
+    ) -> object:
+        if isinstance(record.target.key, tuple):
+            async with asyncio.timeout(10):
+                await agent_ended.wait()
+        return await append_history(record, payload)
 
     async def record_agent_end(
         event: str, session_id: str | None = None, **fields: object
@@ -1769,9 +1770,11 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             agent_ended.set()
         return published
 
-    # test-contract: seam forces approval-end publication ordering
+    # test-contract: seam holds the delegated approval-end admission until agent_end
     monkeypatch.setattr(
-        server.control._approvals, "_publish", delay_delegated_approval_end
+        server.control._approvals,
+        "_append_delegated_history",
+        delay_delegated_approval_end,
     )
     monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
@@ -2688,25 +2691,31 @@ async def test_abort_captures_turn_before_approval_end_write(
         await _event(reader, "approval_request")
 
         assert server._client is not None
-        original_publish = server.connections.publish_controller
+        turn_task = server.control._turn_task
+        assert turn_task is not None
+        original_write_physical = server.connections._write_physical
         approval_end_started = asyncio.Event()
         allow_approval_end = asyncio.Event()
 
-        async def pause_approval_end(
-            event: str, session_id: str | None, **fields: object
-        ) -> bool:
-            if event == "approval_end":
+        async def pause_approval_end(connection: object, payload: object) -> object:
+            frame = json.loads(payload)
+            if frame.get("params", {}).get("event") == "approval_end":
                 approval_end_started.set()
-                await asyncio.wait_for(allow_approval_end.wait(), 10)
-            return await original_publish(event, session_id, **fields)
+                async with asyncio.timeout(TIMEOUT):
+                    await allow_approval_end.wait()
+            return await original_write_physical(connection, payload)
 
-        server.connections.publish_controller = pause_approval_end  # type: ignore[method-assign]
+        # test-contract: seam hold the physical approval-end write until turn capture
+        server.connections._write_physical = pause_approval_end  # type: ignore[method-assign]
         abort = asyncio.create_task(
             _request(reader, writer, 4, "abort", {"scope": scope})
         )
         await asyncio.wait_for(approval_end_started.wait(), TIMEOUT)
-        while server.control._turn_task is not None:
-            await asyncio.sleep(0)
+        # The abort captured this turn before the approval_end frame reached the
+        # wire: it marked the cancellation outcome, so the turn cannot finish yet
+        # because its post-gate output is queued behind the held approval_end write.
+        assert server.control._turn_task is turn_task
+        assert server.control._turn_cancel_outcome is not None
         allow_approval_end.set()
 
         frames = await asyncio.wait_for(abort, TIMEOUT)
@@ -3591,16 +3600,16 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
 
 
 def _bare_approval_lifecycle(tmp_path: Path) -> ApprovalLifecycle:
-    async def publish(*args: object, **kwargs: object) -> bool:
+    def admit(*args: object, **kwargs: object) -> Admission:
         del args, kwargs
-        return True
+        return Admission("admitted")
 
     async def offload(job: Callable[[], object]) -> object:
         return job()
 
     policy = ApprovalPolicy(store=ConversationStore(tmp_path / "parent"))
     return ApprovalLifecycle(
-        publish=publish,
+        admit=admit,
         request_turn_failure=lambda: None,
         policy=lambda: policy,
         session_id=lambda: "session",
@@ -3803,7 +3812,7 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
 
 @pytest.mark.asyncio
 async def test_live_approval_without_exact_pending_request_is_not_approvable(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
     client = ServeControl(
@@ -3815,12 +3824,14 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 
     client._run_blocking = run_blocking
     notifications: list[tuple[str, dict[str, object]]] = []
+    original_admit = client._admit_controller
 
-    async def notify(event: str, session_id: str | None, **fields: object) -> None:
-        del session_id
+    def admit(event: str, session_id: str | None, **fields: object) -> Admission:
         notifications.append((event, fields))
+        return original_admit(event, session_id, **fields)
 
-    client._notify = notify
+    # test-contract: seam observe approval admission through the single publication route
+    monkeypatch.setattr(client, "_admit_controller", admit)
     call = ToolCall("missing", "write", {"path": "provider/path"})
     await client._event(
         StreamEvent(
@@ -11136,7 +11147,11 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     assert controller is not None
     connection = controller.connection
     original_write = connection._write_physical
-    original_notify = server.control._notify
+    original_enqueue = server.connections._enqueue
+    original_finish_record = server.control._approvals._finish_record
+    settlement_finish_started = asyncio.Event()
+    competing_finish_started = asyncio.Event()
+    release_settlement_finish = asyncio.Event()
     tool_end_started = asyncio.Event()
 
     async def gated_write(payload: bytes) -> bool:
@@ -11146,15 +11161,26 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             await asyncio.wait_for(release_write.wait(), timeout=10)
         return await original_write(payload)
 
-    async def record_tool_end(event, *args, **kwargs):
-        if event == "tool_end":
+    def record_enqueue(output, frame, *, wake=True):
+        payload = json.loads(frame.payload)
+        if payload.get("params", {}).get("event") == "tool_end":
             tool_end_started.set()
-        return await original_notify(event, *args, **kwargs)
+        return original_enqueue(output, frame, wake=wake)
+
+    async def gated_finish_record(*args, **kwargs):
+        if not settlement_finish_started.is_set():
+            settlement_finish_started.set()
+            await asyncio.wait_for(release_settlement_finish.wait(), timeout=10)
+        else:
+            competing_finish_started.set()
+        return await original_finish_record(*args, **kwargs)
 
     # test-contract: seam the transport has no public physical-write backpressure hook
     monkeypatch.setattr(connection, "_write_physical", gated_write)
-    # test-contract: seam wire output cannot expose an admitted frame behind backpressure
-    monkeypatch.setattr(server.control, "_notify", record_tool_end)
+    # test-contract: seam the bounded queue has no public admission hook
+    monkeypatch.setattr(server.connections, "_enqueue", record_enqueue)
+    # test-contract: seam approval settlement has no public pre-publication hook
+    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish_record)
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
@@ -11188,6 +11214,9 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         )
         await writer.drain()
         async with asyncio.timeout(10):
+            await settlement_finish_started.wait()
+            await competing_finish_started.wait()
+            release_settlement_finish.set()
             await write_started.wait()
             await tool_end_started.wait()
             release_write.set()
@@ -11204,5 +11233,6 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         tool_owner = ("tool_end", approval["session_id"], call.id)
         assert_event_order(frames, approval_owner, tool_owner, turn_end_owner)
     finally:
+        release_settlement_finish.set()
         release_write.set()
         await close_serve(server, writer)
