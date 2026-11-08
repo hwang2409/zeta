@@ -96,6 +96,73 @@ def _hold_registry_lock(
         release.wait()
 
 
+def _refresh_account_token(
+    home: str,
+    account: AccountId,
+    started: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 5.0
+    credential = named_account_credentials(home, account.provider, account.name)
+
+    async def refresh(*_args: object) -> OAuthTokens:
+        started.set()
+        await asyncio.wait_for(asyncio.to_thread(release.wait), timeout=10)
+        return OAuthTokens("refreshed-access", "rotated-refresh", 9_999_999_999.0)
+
+    credential.refresh = refresh  # type: ignore[method-assign]
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(client)
+
+    try:
+        result.put(("ok", asyncio.run(access())))
+    except Exception as exc:  # noqa: BLE001 - return child failure to the parent
+        result.put(("error", type(exc).__name__, str(exc)))
+
+
+def _wait_for_refreshed_account_token(
+    home: str,
+    account: AccountId,
+    old_bound_crossed: multiprocessing.synchronize.Event,
+    holder_release: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 5.0
+    calls = 0
+
+    def monotonic() -> float:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            old_bound_crossed.set()
+            return 5.0
+        return 0.0
+
+    def wait_for_holder(_seconds: float) -> None:
+        if not holder_release.wait(timeout=10):
+            raise TimeoutError("refresh holder was not released")
+
+    account_store.time = SimpleNamespace(monotonic=monotonic, sleep=wait_for_holder)
+    credential = named_account_credentials(home, account.provider, account.name)
+
+    async def unexpected_refresh(*_args: object) -> OAuthTokens:
+        raise AssertionError("waiter started a second token refresh")
+
+    credential.refresh = unexpected_refresh  # type: ignore[method-assign]
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(client)
+
+    try:
+        result.put(("ok", asyncio.run(access())))
+    except Exception as exc:  # noqa: BLE001 - return child failure to the parent
+        result.put(("error", type(exc).__name__, str(exc)))
+
+
 def _access_turn_credentials(
     home: str,
     account: AccountId,
@@ -111,6 +178,52 @@ def _access_turn_credentials(
         result.put((exc.code, exc.retryable, str(exc)))
     else:
         result.put(None)
+
+
+def test_waiter_outlives_refresh_bound_and_reuses_refreshed_tokens(
+    tmp_path: Path,
+) -> None:
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, account.provider, account.name).save(
+        OAuthTokens("expired", "refresh-secret", 1.0)
+    )
+    context = multiprocessing.get_context("spawn")
+    refresh_started = context.Event()
+    old_bound_crossed = context.Event()
+    release = context.Event()
+    holder_result = context.Queue()
+    waiter_result = context.Queue()
+    holder = context.Process(
+        target=_refresh_account_token,
+        args=(str(tmp_path), account, refresh_started, release, holder_result),
+    )
+    waiter = context.Process(
+        target=_wait_for_refreshed_account_token,
+        args=(str(tmp_path), account, old_bound_crossed, release, waiter_result),
+    )
+    holder.start()
+    try:
+        assert refresh_started.wait(timeout=5), "holder did not enter token refresh"
+        waiter.start()
+        assert old_bound_crossed.wait(timeout=5), "waiter did not cross the old bound"
+        release.set()
+        waiter.join(timeout=10)
+        holder.join(timeout=10)
+        assert waiter.exitcode == 0
+        assert holder.exitcode == 0
+        assert waiter_result.get(timeout=1) == ("ok", "refreshed-access")
+        assert holder_result.get(timeout=1) == ("ok", "refreshed-access")
+    finally:
+        release.set()
+        for process in (waiter, holder):
+            if process.pid is not None and process.is_alive():
+                process.kill()
+            if process.pid is not None:
+                process.join(timeout=5)
+                process.close()
+        for queue in (holder_result, waiter_result):
+            queue.close()
+            queue.join_thread()
 
 
 @pytest.mark.parametrize("method", ["read", "bootstrap"])

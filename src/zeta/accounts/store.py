@@ -69,6 +69,11 @@ _MAX_SWEEP_WARNING_PATHS = 5
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 
+def _credential_wait_timeout_seconds() -> float:
+    # Leave one refresh-sized interval for durable publication and lock release.
+    return OAUTH_REFRESH_TIMEOUT_SECONDS * 2
+
+
 def _account_label(value: str) -> str:
     if type(value) is not str:
         raise ValueError("invalid account label")
@@ -286,7 +291,7 @@ class AccountStore:
 
     def contains(self, account: AccountId) -> bool:
         with self.credential_guard(
-            account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            account, timeout=_credential_wait_timeout_seconds()
         ) as home_fd:
             return str(account) in self._read_registry(home_fd)["accounts"]
 
@@ -395,7 +400,7 @@ class AccountStore:
             raise ValueError("account provider does not match")
         resolved = account or self.default(provider) or AccountId(provider, "default")
         with self.credential_guard(
-            resolved, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            resolved, timeout=_credential_wait_timeout_seconds()
         ) as home_fd:
             self._recover_account(home_fd, resolved)
         return resolved
@@ -809,7 +814,7 @@ class AccountCredentials:
     def read(self, *, lock_timeout: float | None = None) -> OAuthTokens | None:
         with self.store.lifecycle_guard(
             self.account,
-            timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            timeout=_credential_wait_timeout_seconds()
             if lock_timeout is None
             else lock_timeout,
         ) as home_fd:
@@ -828,7 +833,7 @@ class AccountCredentials:
 
     def bootstrap(self) -> OAuthTokens | None:
         with self.store.credential_guard(
-            self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            self.account, timeout=_credential_wait_timeout_seconds()
         ) as home_fd:
             tokens = self.store._recover_account(home_fd, self.account)
             if tokens is not None:
@@ -849,16 +854,6 @@ class AccountCredentials:
                 if tokens.is_valid():
                     return tokens.access_token
                 return await self._refresh_locked(home_fd, tokens, client)
-
-    async def _access_token_locked(
-        self, home_fd: int, client: httpx.AsyncClient
-    ) -> str:
-        tokens = _read_account_tokens(home_fd, self.account)
-        if tokens is None:
-            raise self.login_required_error()
-        if tokens.is_valid():
-            return tokens.access_token
-        return await self._refresh_locked(home_fd, tokens, client)
 
     async def refresh_token(self, client: httpx.AsyncClient) -> str:
         async with self._async_lock:
@@ -968,11 +963,11 @@ class AccountCredentials:
         stack = ExitStack()
         guard = (
             self.store.credential_guard(
-                self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+                self.account, timeout=_credential_wait_timeout_seconds()
             )
             if registry
             else self.store.lifecycle_guard(
-                self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+                self.account, timeout=_credential_wait_timeout_seconds()
             )
         )
         home_fd = await asyncio.to_thread(stack.enter_context, guard)
