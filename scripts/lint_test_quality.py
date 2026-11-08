@@ -117,6 +117,13 @@ RAW_SERVE_READ_ERROR = (
 # shared client can replace; readuntil/readexactly read HTTP or websocket framing.
 RAW_SERVE_READ_METHODS = {"readline"}
 SERVE_CLIENT_MODULE = Path("tests/support/server_client.py")
+RAW_SERVE_WRITE_CODE = "TQ009"
+RAW_SERVE_WRITE_ERROR = (
+    "send serve requests with tests/support/server_client.py send() so read "
+    "helpers and close_serve read the response; mark a deliberate malformed or "
+    "raw-transport frame with '# test-contract: transport <reason>'"
+)
+RAW_SERVE_WRITE_METHODS = {"write", "writelines"}
 
 
 @dataclass(frozen=True)
@@ -759,6 +766,7 @@ def _scan_added_nodes(
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
         findings.extend(_contract_findings(path, node, lines, new_private_patches))
         findings.extend(_raw_serve_read_findings(path, node, lines))
+        findings.extend(_raw_serve_write_findings(path, node, lines))
     return findings
 
 
@@ -785,6 +793,53 @@ def _raw_serve_read_findings(
             node.col_offset + 1,
             RAW_SERVE_READ_CODE,
             RAW_SERVE_READ_ERROR,
+        )
+    ]
+
+
+def _is_jsonrpc_request(node: ast.AST) -> bool:
+    """True for a request literal: a dict, or str/bytes text, with both id and method.
+
+    A response has no method and a notification has no id; neither expects a
+    response, so neither is a request.
+    """
+    for child in ast.walk(node):
+        if isinstance(child, ast.Dict):
+            keys = {key.value for key in child.keys if isinstance(key, ast.Constant)}
+            if {"id", "method"} <= keys:
+                return True
+    text = "".join(
+        child.value if isinstance(child.value, str) else child.value.decode("latin-1")
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, (str, bytes))
+    )
+    return '"id"' in text and '"method"' in text
+
+
+def _raw_serve_write_findings(
+    path: Path, node: ast.AST, lines: list[str]
+) -> list[Finding]:
+    """Flag a JSON-RPC request literal written to a stream outside the shared client.
+
+    shortcut: a request built in a variable first is not seen; widen to name
+    tracking if such writes show up.
+    """
+    if (
+        path == SERVE_CLIENT_MODULE
+        or not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Attribute)
+        or node.func.attr not in RAW_SERVE_WRITE_METHODS
+        or not any(_is_jsonrpc_request(arg) for arg in node.args)
+        or _has_marker(lines, node.lineno, {"transport"})
+    ):
+        return []
+    return [
+        Finding(
+            path,
+            node.lineno,
+            node.col_offset + 1,
+            RAW_SERVE_WRITE_CODE,
+            RAW_SERVE_WRITE_ERROR,
         )
     ]
 

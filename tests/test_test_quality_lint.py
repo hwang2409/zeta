@@ -1409,3 +1409,108 @@ def test_transport_marker_does_not_excuse_a_missing_deadline(tmp_path: Path) -> 
     findings = _lint(tmp_path, source)
 
     assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
+# The three shapes the review named (tests/test_server.py:9002 and :11936,
+# tests/test_server_session_grants.py:1041): requests nothing tracked, so the
+# read helpers and close_serve could stop before their responses arrived.
+_RAW_DUMPS_ENCODE_PLUS_NEWLINE = """
+def f(writer, sid):
+    writer.write(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "blocked-status",
+                "method": "slash_run",
+                "params": {"session_id": sid, "text": "/status"},
+            }
+        ).encode()
+        + b"\\n"
+    )
+"""
+_RAW_PARENTHESIZED_DUMPS_ENCODE = """
+def f(writer, approval):
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "deny",
+                    "params": {"request_id": approval["request_id"]},
+                }
+            )
+            + "\\n"
+        ).encode()
+    )
+"""
+_RAW_BYTES_LITERAL = (
+    "def f(writer):\n"
+    "    writer.write(b'{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"status\"}\\n')\n"
+)
+_RAW_FSTRING = (
+    "def f(writer, n):\n"
+    "    writer.write(f'{{\"id\": {n}, \"method\": \"status\"}}\\n'.encode())\n"
+)
+_RAW_WRITELINES = (
+    "def f(writer):\n"
+    "    writer.writelines([json.dumps({'id': 1, 'method': 'status'}).encode()])\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "flagged"),
+    [
+        ("tests/test_x.py", _RAW_DUMPS_ENCODE_PLUS_NEWLINE, True),
+        ("tests/test_x.py", _RAW_PARENTHESIZED_DUMPS_ENCODE, True),
+        ("tests/test_x.py", _RAW_BYTES_LITERAL, True),
+        ("tests/test_x.py", _RAW_FSTRING, True),
+        ("tests/test_x.py", _RAW_WRITELINES, True),
+        ("tests/support/server_client.py", _RAW_PARENTHESIZED_DUMPS_ENCODE, False),
+        # A response has no method and a notification has no id: neither gets a
+        # response, so neither leaves a frame for a reader to miss.
+        (
+            "tests/test_x.py",
+            "def f(writer):\n    writer.write(json.dumps({'id': 1, 'result': {}}))\n",
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            "def f(writer):\n    writer.write(json.dumps({'method': 'cancel'}))\n",
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "def f(writer):\n"
+                "    # test-contract: transport malformed frame the server must reject\n"
+                "    writer.write(b'{\"id\":1,\"method\":NaN}\\n')\n"
+            ),
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "def f(writer):\n"
+                "    # test-contract: seam wrong kind for a raw request\n"
+                "    writer.write(b'{\"id\":1,\"method\":\"status\"}\\n')\n"
+            ),
+            True,
+        ),
+    ],
+)
+def test_raw_serve_requests_must_use_the_shared_client(
+    tmp_path: Path, path: str, source: str, flagged: bool
+) -> None:
+    findings = [
+        finding
+        for finding in _lint(tmp_path, source, path=path)
+        if finding.code == "TQ009"
+    ]
+
+    assert bool(findings) is flagged
+    assert all(
+        "send serve requests with tests/support/server_client.py send()" in f.message
+        and "'# test-contract: transport <reason>'" in f.message
+        for f in findings
+    )
