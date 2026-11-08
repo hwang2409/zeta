@@ -4,18 +4,21 @@ import asyncio
 import hashlib
 import json
 import os
-from contextlib import contextmanager
+import threading
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta import attention_replies
 from zeta.attention_records import AttentionRecord, AttentionStore
 from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox, SentMessageTracker
+from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
 
 
 @dataclass
@@ -88,21 +91,6 @@ def _make_information_item(fixture: ReplyFixture, record: AttentionRecord) -> No
         '"status":"open"', '"kind":"answer","status":"open"'
     )
     path.write_text(value, encoding="utf-8")
-
-
-def _tui_wake_count(outcome: Any) -> int:
-    from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin
-
-    class WakeAdapter:
-        def __init__(self) -> None:
-            self.count = 0
-
-        def _schedule_background_wake(self) -> None:
-            self.count += 1
-
-    adapter = WakeAdapter()
-    DecisionsMixin._wake_for_attention_outcome(adapter, outcome)
-    return adapter.count
 
 
 def _stage_all(fixture: ReplyFixture, replies: list[str] | None = None) -> list[str]:
@@ -197,6 +185,58 @@ _CONCURRENT_ROWS = [
     for operation in _OPERATIONS
     for selection in ("unrelated", "selected")
 ]
+_PUBLICATION_ROWS = (
+    "publication-success",
+    "publication-exception-after",
+    "publication-cancel-after",
+    "publication-duplicate",
+    "publication-recovery",
+    "publication-none",
+    "publication-callback-error",
+)
+
+
+@pytest.mark.asyncio
+async def test_publication_callback_only_signals_watcher_on_event_loop() -> None:
+    class Owner(ProjectInboxNotificationMixin):
+        def __init__(self) -> None:
+            self._project_inbox_owner_loop = asyncio.get_running_loop()
+            self._project_inbox_publication_event = asyncio.Event()
+            self.calls: list[tuple[bool, int]] = []
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def _check_project_inbox(self, *, periodic: bool = False) -> None:
+            self.calls.append((periodic, threading.get_ident()))
+            self.started.set()
+            await asyncio.wait_for(self.release.wait(), 10)
+            self.finished.set()
+
+    owner = Owner()
+    watcher = asyncio.create_task(owner._watch_project_inbox())
+    notifier_thread = 0
+
+    def publish_burst() -> None:
+        nonlocal notifier_thread
+        notifier_thread = threading.get_ident()
+        owner.notify_project_inbox_publication()
+        owner.notify_project_inbox_publication()
+
+    try:
+        await await_or_fail(asyncio.to_thread(publish_burst), what="signal publication")
+        await await_or_fail(owner.started.wait(), what="watcher inbox check start")
+        assert notifier_thread != threading.get_ident()
+        assert owner.calls == [(False, threading.get_ident())]
+        owner.release.set()
+        await await_or_fail(owner.finished.wait(), what="watcher inbox check finish")
+        await asyncio.sleep(0)
+        assert len(owner.calls) == 1
+    finally:
+        owner.release.set()
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(watcher, 10)
 
 
 _FAULT_ROWS = [
@@ -221,6 +261,7 @@ _FAULT_ROWS = [
     "case",
     [
         "success",
+        *_PUBLICATION_ROWS,
         *_OPERATION_ROWS,
         *_CONCURRENT_ROWS,
         *_FAULT_ROWS,
@@ -238,7 +279,87 @@ def test_attention_replies_public_table(
 ) -> None:
     """Exercise durable reply outcomes only through the public AttentionReplies API."""
     fixture = _fixture(tmp_path, count=3)
-    replies = fixture.replies
+    publications: list[bool] = []
+    replies = AttentionReplies(
+        fixture.home,
+        fixture.session_id,
+        on_inbox_visible=lambda: publications.append(True),
+    )
+
+    if case.startswith("publication-"):
+        target = fixture.records[0]
+        if case == "publication-none":
+            replies.stage(target.id, "answer")
+            assert publications == []
+            return
+        if case == "publication-recovery":
+            sealer = AttentionReplies(fixture.home, fixture.session_id)
+
+            def stop_before_send(_journal: Path) -> None:
+                raise RuntimeError("leave journal sealed")
+
+            # test-contract: seam leave sealed work for public recovery
+            monkeypatch.setattr(sealer, "_send_journal", stop_before_send)
+            with pytest.raises(RuntimeError, match="leave journal sealed"):
+                sealer.reply(target.id, "answer", fixture.answerer_session_id)
+            replies.recover()
+            assert len(publications) == 1
+            return
+        if case == "publication-callback-error":
+            failing = AttentionReplies(
+                fixture.home,
+                fixture.session_id,
+                on_inbox_visible=lambda: (_ for _ in ()).throw(
+                    RuntimeError("wake unavailable")
+                ),
+            )
+            outcome = failing.reply(
+                target.id, "answer", fixture.answerer_session_id
+            )
+            assert outcome.message_id is not None
+            assert len(fixture.inbox_messages()) == 1
+            return
+        if case in {"publication-exception-after", "publication-cancel-after"}:
+            failure = (
+                asyncio.CancelledError()
+                if case == "publication-cancel-after"
+                else RuntimeError("tracker failed")
+            )
+
+            def fail_tracker(_tracker: SentMessageTracker, *_args: Any) -> None:
+                raise failure
+
+            # test-contract: seam fail after the inbox record becomes visible
+            monkeypatch.setattr(SentMessageTracker, "record", fail_tracker)
+            with pytest.raises((RuntimeError, asyncio.CancelledError)):
+                replies.reply(target.id, "answer", fixture.answerer_session_id)
+            assert len(publications) == 1
+            assert len(fixture.inbox_messages()) == 1
+            return
+        if case == "publication-duplicate":
+            real_finish = replies._finish_journal_locked
+            failed = False
+
+            def fail_after_send(journal: Path) -> None:
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise RuntimeError("finish failed")
+                real_finish(journal)
+
+            # test-contract: seam retain a journal after its first durable send
+            monkeypatch.setattr(replies, "_finish_journal_locked", fail_after_send)
+            with pytest.raises(RuntimeError, match="finish failed"):
+                replies.reply(target.id, "answer", fixture.answerer_session_id)
+            replies.recover()
+            assert len(publications) == 2
+            assert len(fixture.inbox_messages()) == 1
+            return
+        assert case == "publication-success"
+        replies.reply(target.id, "answer", fixture.answerer_session_id)
+        assert len(publications) == 1
+        assert len(fixture.inbox_messages()) == 1
+        return
 
     if case.startswith("operation-"):
         operation, scenario = case.removeprefix("operation-").rsplit("-", 1)
@@ -277,12 +398,10 @@ def test_attention_replies_public_table(
 
         outcome = run_operation()
         publishes = operation in {"flush", "reply", "stage_and_flush", "recover"}
-        assert outcome.published is publishes
-        assert _tui_wake_count(outcome) == int(publishes)
+        assert len(publications) == int(publishes)
         if scenario == "duplicate":
             duplicate = run_operation()
-            assert not duplicate.published
-            assert _tui_wake_count(duplicate) == 0
+            assert len(publications) == int(publishes)
             if duplicate.items:
                 assert all(
                     item.status in {"duplicate", "already-resolved"}
@@ -345,19 +464,19 @@ def test_attention_replies_public_table(
         else:
             assert operation == "recover"
             outcome = replies.recover()
-        assert outcome is not None, "terminal operation lost its recovery publication"
-        assert hasattr(outcome, "published"), (
+        assert outcome is not None, "terminal operation lost its recovery result"
+        publishes_target = operation == "flush" or (
+            operation in {"reply", "stage_and_flush"} and selection == "unrelated"
+        )
+        assert len(publications) == 1 + int(publishes_target), (
             "terminal operation lost its recovery publication"
         )
-        assert outcome.published, "terminal operation lost its recovery publication"
-
-        assert _tui_wake_count(outcome) == 1
         return
 
     if case == "success":
         values = _stage_all(fixture)
-        result = replies.flush(fixture.session_id)
-        assert result.published
+        replies.flush(fixture.session_id)
+        assert len(publications) == 1
         messages = fixture.inbox_messages()
         assert len(messages) == 1
         assert all(value in messages[0]["body"] for value in values)
@@ -577,10 +696,9 @@ def test_attention_replies_public_table(
         ):
             with pytest.raises(
                 attention_replies.ReplyConflict, match="TUI decisions popup"
-            ) as raised:
+            ):
                 operation()
-            assert raised.value.outcome.items[0].status == "conflict"
-            assert not raised.value.outcome.published
+            assert publications == []
         replies.reply(immediate.id, "unrelated", fixture.session_id)
         replies.dismiss(dismissed.id)
         after = {path.name: path.read_bytes() for path in staged_dir.iterdir()}

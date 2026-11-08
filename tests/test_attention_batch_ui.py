@@ -83,6 +83,13 @@ async def _make_app(
     app._active_session = session
     app._install_full_screen_layout(session)
     app._decisions_panel.set_items(open_decisions(home, source_session_id))
+    await app.loop._activate_project_inbox()
+    if app.loop._project_inbox_publication_event is None:
+        app.loop._project_inbox_owner_loop = asyncio.get_running_loop()
+        app.loop._project_inbox_publication_event = asyncio.Event()
+        watcher = asyncio.create_task(app.loop._watch_project_inbox())
+        app.loop._tracked_tasks.add(watcher)
+        watcher.add_done_callback(app.loop._tracked_tasks.discard)
     if open_panel:
         opening = app.open_decisions_panel()
         if opening is not None:
@@ -172,11 +179,11 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(
     wakes: list[bool] = []
     wake_event = asyncio.Event()
 
-    def record_wake() -> None:
+    async def record_wake(*, periodic: bool = False) -> None:
         wakes.append(True)
         wake_event.set()
 
-    app._schedule_background_wake = record_wake
+    app.loop._check_project_inbox = record_wake
     try:
         app._active_session.app.output = _FixedOutput()
         screen = Screen()
@@ -247,11 +254,11 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
     wakes: list[bool] = []
     wake_event = asyncio.Event()
 
-    def record_wake() -> None:
+    async def record_wake(*, periodic: bool = False) -> None:
         wakes.append(True)
         wake_event.set()
 
-    app._schedule_background_wake = record_wake
+    app.loop._check_project_inbox = record_wake
     try:
         _press(app, "1")
         await asyncio.sleep(0)
@@ -296,4 +303,70 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
     finally:
         owner.store.close()
         answerer.store.close()
+        await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tui_adapter_still_checks_late_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "cancel tui", "test"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    record = await asyncio.to_thread(
+        _request, owner, project.project_id, "late publication"
+    )
+    app = await _make_app(tmp_path, owner, owner.store.session_id, open_panel=False)
+    release = threading.Event()
+    worker_started = threading.Event()
+    worker_done = threading.Event()
+    loop = app.loop
+    checks: list[bool] = []
+
+    async def count_check(*, periodic: bool = False) -> None:
+        checks.append(periodic)
+
+    real_send = ProjectInbox.send
+
+    def blocked_send(inbox: ProjectInbox, **kwargs):
+        worker_started.set()
+        assert release.wait(10), "TUI publication gate was not released"
+        try:
+            return real_send(inbox, **kwargs)
+        finally:
+            worker_done.set()
+
+    # test-contract: seam hold the real TUI worker before durable publication
+    monkeypatch.setattr(ProjectInbox, "send", blocked_send)
+    # test-contract: seam count admission owned by the project-inbox watcher
+    monkeypatch.setattr(loop, "_check_project_inbox", count_check)
+    try:
+        replies = app._attention_replies(owner.store.session_id)
+        task = asyncio.create_task(
+            app._run_attention_operation(
+                replies.reply, record.id, "yes", owner.store.session_id
+            )
+        )
+        assert await await_or_fail(
+            asyncio.to_thread(worker_started.wait, 10), what="TUI worker start"
+        )
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        release.set()
+        assert await await_or_fail(
+            asyncio.to_thread(worker_done.wait, 10), what="TUI worker finish"
+        )
+        for _ in range(10):
+            if checks:
+                break
+            await asyncio.sleep(0)
+        assert checks.count(False) == 1, (
+            "cancelled TUI adapter lost its late publication check"
+        )
+    finally:
+        release.set()
+        owner.store.close()
         await app.loop.close()

@@ -577,10 +577,6 @@ class AgentLoop(
             )
         )
 
-    async def _check_attention_outcome(self, outcome: Any) -> None:
-        if outcome.published:
-            await self._check_project_inbox()
-
     async def activate(self) -> None:
         """Run frontend startup hooks after the frontend installs its sinks."""
 
@@ -592,15 +588,15 @@ class AgentLoop(
         # blocking filesystem and inbox work, so keep it off the event loop.
         from ...attention_replies import AttentionReplies
 
-        recovered = await asyncio.to_thread(
+        await asyncio.to_thread(
             AttentionReplies(
                 self.store.session_dir.parent.parent,
                 self.store.session_id,
                 registry_state=self.tool_registry.project_registry_state,
+                on_inbox_visible=self.notify_project_inbox_publication,
             ).recover
         )
         await self._ensure_step_delivery()
-        await self._check_attention_outcome(recovered)
         for item in self._pending_task_recovery:
             await self.tool_registry.background_tasks._notify_exit(
                 item.task_id,

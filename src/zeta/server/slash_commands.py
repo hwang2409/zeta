@@ -156,27 +156,21 @@ class ServerSlashSession:
     def _attention_replies(self, session_id: str):
         from ..attention_replies import AttentionReplies
 
+        loop, _opened = self._active_loop_and_session()
+        on_visible = (
+            loop.notify_project_inbox_publication
+            if session_id == loop.store.session_id
+            else None
+        )
         return AttentionReplies(
             self._runtime.home,
             session_id,
             registry_state=self._runtime.manager.project_registry_state,
+            on_inbox_visible=on_visible,
         )
 
-    async def _check_attention_outcome(self, outcome) -> None:
-        if outcome.published:
-            loop, _opened = self._active_loop_and_session()
-            await loop._check_project_inbox()
-
     async def _run_attention_operation(self, operation, *args):
-        from ..attention_replies import ReplyOperationError
-
-        try:
-            outcome = await asyncio.to_thread(operation, *args)
-        except ReplyOperationError as exc:
-            await self._check_attention_outcome(exc.outcome)
-            raise
-        await self._check_attention_outcome(outcome)
-        return outcome
+        return await asyncio.to_thread(operation, *args)
 
     async def _slash_decisions_batch(self, payload: str, from_session: str) -> str:
         if not payload:

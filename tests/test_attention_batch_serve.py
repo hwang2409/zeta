@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,18 @@ from zeta.server import ZetaServer
 from zeta.server.slash_commands import ServerSlashSession
 
 
+def _start_publication_watcher(loop) -> asyncio.Task[None]:
+    loop._project_inbox_owner_loop = asyncio.get_running_loop()
+    loop._project_inbox_publication_event = asyncio.Event()
+    return asyncio.create_task(loop._watch_project_inbox())
+
+
+async def _stop_publication_watcher(watcher: asyncio.Task[None]) -> None:
+    watcher.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(watcher, 10)
+
+
 @pytest.mark.asyncio
 async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -27,6 +40,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
+    watcher = None
     try:
         opened = server.runtime.opened
         assert opened is not None
@@ -153,15 +167,18 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
         loop = server.runtime.loop
         assert loop is not None
         checks = 0
+        checked = asyncio.Event()
 
-        async def count_check() -> None:
+        async def count_check(*, periodic: bool = False) -> None:
             nonlocal checks
             checks += 1
+            checked.set()
 
         # test-contract: seam seal a second journal immediately before serve dismiss locks
         monkeypatch.setattr(AttentionReplies, "dismiss", dismiss_after_concurrent_seal)
         # test-contract: seam count the real serve adapter's inbox checks
         monkeypatch.setattr(loop, "_check_project_inbox", count_check)
+        watcher = _start_publication_watcher(loop)
         dismissed = (
             await _request(
                 reader,
@@ -175,8 +192,11 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
             )
         )[-1]["result"]
         assert dismissed["text"] == f"dismissed {dismissible.id}"
+        await await_or_fail(checked.wait(), what="serve owner inbox check")
         assert checks == 1
     finally:
+        if watcher is not None:
+            await _stop_publication_watcher(watcher)
         await _close(server, writer)
 
 
@@ -203,6 +223,7 @@ def _leave_sealed_reply(
     def stop_after_seal(_journal: Path) -> None:
         raise RuntimeError("leave journal sealed")
 
+    # test-contract: seam leave a sealed journal before the public adapter runs
     monkeypatch.setattr(replies, "_send_journal", stop_after_seal)
     with pytest.raises(Exception, match="leave journal sealed"):
         replies.reply(attention_id, "yes", session_id)
@@ -215,6 +236,7 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
+    watcher = None
     try:
         opened = server.runtime.opened
         assert opened is not None
@@ -232,7 +254,7 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
         assert loop is not None
         checks = 0
 
-        async def count_check() -> None:
+        async def count_check(*, periodic: bool = False) -> None:
             nonlocal checks
             checks += 1
 
@@ -253,6 +275,8 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
         assert store.get(sealed.id).status == "open"
         assert checks == 0
     finally:
+        if watcher is not None:
+            await _stop_publication_watcher(watcher)
         await _close(server, writer)
 
 
@@ -263,6 +287,7 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
+    watcher = None
     try:
         opened = server.runtime.opened
         assert opened is not None
@@ -286,22 +311,18 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
         loop = server.runtime.loop
         assert loop is not None
         checks = 0
-        outcomes = []
-        real_check = ServerSlashSession._check_attention_outcome
+        checked = asyncio.Event()
 
-        async def count_check() -> None:
+        async def count_check(*, periodic: bool = False) -> None:
             nonlocal checks
             checks += 1
-
-        async def capture_outcome(session: ServerSlashSession, outcome) -> None:
-            outcomes.append(outcome)
-            await real_check(session, outcome)
+            checked.set()
 
         # test-contract: seam fail after recovery publishes but before the action completes
         monkeypatch.setattr(AttentionReplies, "_record", fail_target)
-        # test-contract: seam inspect the outcome passed through the real serve adapter
-        monkeypatch.setattr(ServerSlashSession, "_check_attention_outcome", capture_outcome)
+        # test-contract: seam count publisher-driven admission after the operation error
         monkeypatch.setattr(loop, "_check_project_inbox", count_check)
+        watcher = _start_publication_watcher(loop)
         error = (
             await _request(
                 reader,
@@ -316,8 +337,134 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
         )[-1]["error"]
 
         assert "unexpected operation failure" in error["message"]
-        assert len(outcomes) == 1
-        assert outcomes[0].published
+        await await_or_fail(checked.wait(), what="serve recovery inbox check")
         assert checks == 1
     finally:
+        if watcher is not None:
+            await _stop_publication_watcher(watcher)
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_serve_adapter_still_checks_late_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    _reader, writer, session_id = await _ready_extensions(server)
+    release = threading.Event()
+    worker_started = threading.Event()
+    worker_done = threading.Event()
+    watcher = None
+    try:
+        opened = server.runtime.opened
+        loop = server.runtime.loop
+        assert opened is not None and loop is not None
+        registry = server.runtime.manager.project_registry
+        project_id = (
+            await asyncio.to_thread(registry.create_project, "cancel serve", "test")
+        ).project_id
+        record = await _seed_attention_record(
+            AttentionStore(opened.store.session_dir), session_id, project_id, "late"
+        )
+        real_send = ProjectInbox.send
+
+        def blocked_send(inbox: ProjectInbox, **kwargs):
+            worker_started.set()
+            assert release.wait(10), "serve publication gate was not released"
+            try:
+                return real_send(inbox, **kwargs)
+            finally:
+                worker_done.set()
+
+        checks: list[bool] = []
+        real_check = loop._check_project_inbox
+
+        async def count_check(*, periodic: bool = False) -> None:
+            checks.append(periodic)
+            await real_check(periodic=periodic)
+
+        # test-contract: seam hold the real serve worker before durable publication
+        monkeypatch.setattr(ProjectInbox, "send", blocked_send)
+        # test-contract: seam count admission owned by the project-inbox watcher
+        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
+        watcher = _start_publication_watcher(loop)
+        adapter = ServerSlashSession(server.runtime)
+        replies = adapter._attention_replies(session_id)
+        task = asyncio.create_task(
+            adapter._run_attention_operation(
+                replies.reply, record.id, "yes", session_id
+            )
+        )
+        assert await await_or_fail(
+            asyncio.to_thread(worker_started.wait, 10), what="serve worker start"
+        )
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        release.set()
+        assert await await_or_fail(
+            asyncio.to_thread(worker_done.wait, 10), what="serve worker finish"
+        )
+        for _ in range(10):
+            if checks:
+                break
+            await asyncio.sleep(0)
+        assert checks.count(False) == 1, (
+            "cancelled serve adapter lost its late publication check"
+        )
+    finally:
+        release.set()
+        if watcher is not None:
+            await _stop_publication_watcher(watcher)
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_cross_process_style_send_uses_existing_two_second_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    _reader, writer, session_id = await _ready_extensions(server)
+    watcher = None
+    try:
+        loop = server.runtime.loop
+        assert loop is not None
+        registry = server.runtime.manager.project_registry
+        project_id = (
+            await asyncio.to_thread(registry.create_project, "poll send", "test")
+        ).project_id
+        loop.tool_registry.project_id = project_id
+        periodic_check = asyncio.Event()
+        calls: list[bool] = []
+        real_check = loop._check_project_inbox
+
+        async def count_check(*, periodic: bool = False) -> None:
+            calls.append(periodic)
+            await real_check(periodic=periodic)
+            if periodic:
+                periodic_check.set()
+
+        # test-contract: seam identify the existing idle watcher's periodic check
+        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
+        watcher = _start_publication_watcher(loop)
+        separate_inbox = ProjectInbox(
+            registry, sessions_root=tmp_path / "home" / "sessions"
+        )
+        await asyncio.to_thread(
+            separate_inbox.send,
+            from_project=project_id,
+            from_session="f" * 32,
+            to_project=project_id,
+            to_session=session_id,
+            kind="info",
+            title="cross-process style",
+            body="no in-process callback",
+        )
+        await await_or_fail(periodic_check.wait(), what="two-second inbox poll")
+        assert calls == [True]
+    finally:
+        if watcher is not None:
+            await _stop_publication_watcher(watcher)
         await _close(server, writer)
