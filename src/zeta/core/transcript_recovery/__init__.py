@@ -21,6 +21,8 @@ from ...storage_format import (
 from ..checkpoints import ConversationEntry, load_session_json
 from ..session_files import open_session_file, write_json_file
 
+TRANSCRIPT_REPAIR_EPOCH = 4
+
 _BUFFER_SIZE = 1024 * 1024
 _MAX_RECORD_BYTES = 64 * 1024
 _MAX_RECORDS = 1024
