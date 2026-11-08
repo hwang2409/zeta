@@ -312,6 +312,26 @@ def test_await_deadline_rule_rejects_unbounded_waits(
             [],
         ),
         (
+            "module star import vetoes asyncio",
+            "import asyncio\nfrom x import *\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "function star import vetoes asyncio",
+            "import asyncio\nasync def test_spin():\n    from x import *\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "module star import vetoes anyio",
+            "import anyio\nfrom x import *\nasync def test_spin():\n    while not ready:\n        await anyio.sleep(0)\n",
+            [],
+        ),
+        (
+            "function star import vetoes anyio",
+            "import anyio\nasync def test_spin():\n    from x import *\n    while not ready:\n        await anyio.sleep(0)\n",
+            [],
+        ),
+        (
             "ast parse only syntax",
             "import asyncio\ndef test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
             [],

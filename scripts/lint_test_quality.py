@@ -592,7 +592,7 @@ def _binds_name(node: ast.AST, name: str, direct_imports: set[int]) -> bool:
         return node.arg == name
     if isinstance(node, ast.alias):
         bound = node.asname or node.name.split(".")[0]
-        return bound == name and id(node) not in direct_imports
+        return (node.name == "*" or bound == name) and id(node) not in direct_imports
     return any(
         value == name or isinstance(value, list) and name in value
         for field in ("name", "names", "rest")
@@ -601,28 +601,30 @@ def _binds_name(node: ast.AST, name: str, direct_imports: set[int]) -> bool:
 
 
 def _direct_sleep_modules(tree: ast.Module) -> set[str]:
-    direct_aliases = {
-        id(imported)
-        for statement in tree.body
-        if isinstance(statement, ast.Import)
-        for imported in statement.names
-        if imported.name in {"asyncio", "anyio"} and imported.asname is None
-    }
-    direct_imports = Counter(
-        imported.name
-        for statement in tree.body
-        if isinstance(statement, ast.Import)
-        for imported in statement.names
-        if id(imported) in direct_aliases
-    )
-    return {
-        module
-        for module, count in direct_imports.items()
-        if count == 1
-        and not any(
-            _binds_name(node, module, direct_aliases) for node in ast.walk(tree)
-        )
-    }
+    """Return direct sleep modules whose names have no uncertain binding.
+
+    An unrelated binding anywhere in the file, including a trailing ``del asyncio``
+    or a star import, disables that module for the whole file. This deliberate false
+    negative avoids scoping false positives.
+    """
+    direct_aliases: set[int] = set()
+    direct_imports: Counter[str] = Counter()
+    for statement in filter(lambda node: isinstance(node, ast.Import), tree.body):
+        for imported in statement.names:
+            if (imported.name, imported.asname) in {("asyncio", None), ("anyio", None)}:
+                direct_aliases.add(id(imported))
+                direct_imports[imported.name] += 1
+
+    candidates: set[str] = set()
+    for module, count in direct_imports.items():
+        if count == 1:
+            candidates.add(module)
+
+    for node in ast.walk(tree):
+        for module in tuple(candidates):
+            if _binds_name(node, module, direct_aliases):
+                candidates.remove(module)
+    return candidates
 
 
 def _literal_zero_sleep(node: ast.AST, modules: set[str]) -> bool:
