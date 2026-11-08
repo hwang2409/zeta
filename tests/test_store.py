@@ -945,6 +945,7 @@ async def test_async_linear_append_does_not_snapshot_complete_history(
     def reject_snapshot(_store: ConversationStore) -> None:
         raise AssertionError("ordinary async append copied complete store state")
 
+    # test-contract: seam detects complete-state copying behind the public append
     monkeypatch.setattr(ConversationStore, "_snapshot_log_state", reject_snapshot)
 
     entry = await store.append_message_async(
@@ -1273,7 +1274,9 @@ async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_c
         snapshot_threads.append(threading.get_ident())
         return original_snapshot(candidate)
 
+    # test-contract: seam proves full loading stays off the owner event-loop thread
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
+    # test-contract: seam proves uncertain foreign state takes the full fallback
     monkeypatch.setattr(ConversationStore, "_snapshot_log_state", observed_snapshot)
     if foreign_change == "branch":
         foreign = ConversationStore(tmp_path, session_id=store.session_id)
@@ -1311,6 +1314,7 @@ async def test_async_linear_foreign_append_uses_full_state_fallback(
         snapshot_threads.append(threading.get_ident())
         return original_snapshot(candidate)
 
+    # test-contract: seam proves a linear foreign write takes the full fallback
     monkeypatch.setattr(ConversationStore, "_snapshot_log_state", observed_snapshot)
 
     await store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
@@ -1465,16 +1469,22 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
             assert release_delta.wait(timeout=10)
         return copied
 
+    # test-contract: seam forces the owner mutation between worker commit and publish
     monkeypatch.setattr(
         ConversationStore, "_owned_installed_delta", staticmethod(block_first_worker_delta)
     )
     write = asyncio.create_task(
         store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
     )
-    assert await asyncio.to_thread(delta_ready.wait, 10)
-    store.append_message(message(MessageRole.ASSISTANT, "owner"))
-    release_delta.set()
-    await write
+    try:
+        assert await asyncio.to_thread(delta_ready.wait, 10)
+        store.append_message(message(MessageRole.ASSISTANT, "owner"))
+        release_delta.set()
+        await asyncio.wait_for(write, 10)
+    finally:
+        release_delta.set()
+        if not write.done():
+            await asyncio.wait_for(asyncio.shield(write), 10)
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
