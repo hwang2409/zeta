@@ -158,6 +158,11 @@ class SlashErrorCodeDescriptor(StrEnum):
     MCP_CREDENTIAL_STORE = "mcp_credential_store"
 
 
+class ApprovalDecision(StrEnum):
+    APPROVE = "approve"
+    DENY = "deny"
+
+
 class EventDescriptor(StrEnum):
     """One documented JSON-RPC event name."""
 
@@ -324,6 +329,39 @@ class MethodDescriptor(Enum):
 
 
 Handler = Callable[[object, str | int, dict[str, object]], object]
+
+
+_LOGIN_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
+)
+_ERGONOMICS_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in (
+        "RENAME_SESSION",
+        "DELETE_SESSION",
+        "SESSION_TREE",
+        "SESSION_HISTORY",
+        "CONTENT_READ",
+        "MODEL_CATALOG",
+        "SESSION_SETTINGS",
+        "SET_SETTINGS",
+        "SET_COMPACTION",
+        "SEND_IMAGES",
+        "SWITCH_BRANCH",
+        "FORK_MESSAGE",
+        "SLASH_LIST",
+        "SLASH_RUN",
+        "ACCOUNT_LIST",
+        "ACCOUNT_LOGOUT",
+        "ACCOUNT_REFRESH",
+        "ACCOUNT_SWITCH",
+    )
+)
+_PROJECT_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
+)
 
 
 MAX_FRAME_BYTES = 1_048_576

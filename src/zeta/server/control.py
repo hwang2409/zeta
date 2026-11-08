@@ -30,7 +30,6 @@ from ..protocol.types import (
 )
 from . import abort_scope, event_contract, model_selection
 from .approval_lifecycle import (
-    ApprovalDecision,
     ApprovalKey,
     ApprovalLifecycle,
     BeginGrace,
@@ -46,6 +45,7 @@ from .approval_lifecycle import (
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
 from .protocol import (
+    ApprovalDecision,
     ErrorDescriptor,
     EventDescriptor,
     FrameWriteCancelled,

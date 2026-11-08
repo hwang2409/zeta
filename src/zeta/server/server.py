@@ -24,7 +24,6 @@ from . import (
     slash_commands,
 )
 from . import control as session_grants
-from .approval_lifecycle import ApprovalDecision
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
@@ -34,9 +33,13 @@ from .project_requests import (
     project_request_error,
 )
 from .protocol import (
+    _ERGONOMICS_METHODS,
+    _LOGIN_METHODS,
+    _PROJECT_METHODS,
     FEATURES,
     MAX_FRAME_BYTES,
     Access,
+    ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
     Handler,
@@ -86,39 +89,6 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
-
-_LOGIN_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
-)
-_ERGONOMICS_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in (
-        "RENAME_SESSION",
-        "DELETE_SESSION",
-        "SESSION_TREE",
-        "SESSION_HISTORY",
-        "CONTENT_READ",
-        "MODEL_CATALOG",
-        "SESSION_SETTINGS",
-        "SET_SETTINGS",
-        "SET_COMPACTION",
-        "SEND_IMAGES",
-        "SWITCH_BRANCH",
-        "FORK_MESSAGE",
-        "SLASH_LIST",
-        "SLASH_RUN",
-        "ACCOUNT_LIST",
-        "ACCOUNT_LOGOUT",
-        "ACCOUNT_REFRESH",
-        "ACCOUNT_SWITCH",
-    )
-)
-_PROJECT_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
-)
-
 
 class _UnixSocketListener:
     def __init__(
