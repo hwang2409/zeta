@@ -174,6 +174,6 @@ def test_title_only_edited_pull_request_still_runs_merge_resolution() -> None:
     assert "group: merge-resolution-${{ github.event.pull_request.number || github.run_id }}" in workflow
     assert "github.event.action" not in workflow
     assert "github.event.changes" not in workflow
-    assert "timeout-minutes: 10" in workflow
+    assert "timeout-minutes: 45" in workflow
     assert "PR_BODY:" not in workflow
     assert "merge-resolution:" not in Path(ROOT / ".github/workflows/ci.yml").read_text()
