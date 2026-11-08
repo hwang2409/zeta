@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+
+from ..core.path_completion import PathCompletion, complete_paths
+from .protocol import ErrorDescriptor, ProtocolError
+
+MAX_TEXT_BEFORE_CURSOR_BYTES = 4096
+
+
+async def request(
+    params: dict[str, object],
+    *,
+    base_dir: Path,
+    run_blocking: Callable[
+        [Callable[[], tuple[list[PathCompletion], bool]]],
+        Awaitable[tuple[list[PathCompletion], bool]],
+    ],
+) -> dict[str, object]:
+    text = params.get("text_before_cursor")
+    if not isinstance(text, str):
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            "text_before_cursor must be a string",
+        )
+    if len(text.encode("utf-8")) > MAX_TEXT_BEFORE_CURSOR_BYTES:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            "text_before_cursor must be at most 4096 UTF-8 bytes",
+        )
+    rows, truncated = await run_blocking(lambda: complete_paths(text, base_dir))
+    return {
+        "entries": [
+            {
+                "text": row.text,
+                "start_position": row.start_position,
+                "display": row.display,
+                "kind": row.kind,
+            }
+            for row in rows
+        ],
+        "truncated": truncated,
+    }
+
+
+__all__ = ["request"]

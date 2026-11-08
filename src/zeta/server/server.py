@@ -25,6 +25,7 @@ from . import (
     ergonomics,
     login,
     model_selection,
+    path_completion,
     slash_commands,
 )
 from . import control as session_grants
@@ -353,6 +354,18 @@ async def _handle_send_images(
     return await client.server.control.deliveries.send_images(params, client.features)  # type: ignore[attr-defined]
 
 
+async def _handle_path_complete(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    runtime = client.server.runtime  # type: ignore[attr-defined]
+    store = ergonomics.active(runtime, params)
+    return await path_completion.request(
+        params,
+        base_dir=store.cwd,
+        run_blocking=client.server.control._run_blocking,  # type: ignore[attr-defined]
+    )
+
+
 async def _handle_slash_list(
     client: object, request_id: str | int, params: dict[str, Any]
 ) -> object:
@@ -506,6 +519,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.SET_SETTINGS: _handle_set_settings,
     MethodDescriptor.SET_COMPACTION: _handle_set_compaction,
     MethodDescriptor.SEND_IMAGES: _handle_send_images,
+    MethodDescriptor.PATH_COMPLETE: _handle_path_complete,
     MethodDescriptor.SLASH_LIST: _handle_slash_list,
     MethodDescriptor.SLASH_RUN: _handle_slash_run,
     MethodDescriptor.ACCOUNT_LIST: _handle_account_list,

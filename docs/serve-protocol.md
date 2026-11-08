@@ -163,6 +163,7 @@ feature. Observer connections receive only methods with `read` access.
 | `set_settings` | `1.1` | `none` | `session_mutation` |
 | `set_compaction` | `1.1` | `none` | `session_mutation` |
 | `send_images` | `1.1` | `none` | `delivery` |
+| `path_complete` | `1.0` | `path_completion` | `controller_read` |
 | `slash_list` | `1.1` | `none` | `controller_read` |
 | `slash_run` | `1.1` | `none` | `session_mutation` |
 | `account_list` | `1.1` | `none` | `controller_read` |
@@ -1443,6 +1444,21 @@ or one stored by a release that predates the field), and older 1.0 servers
 omit the key entirely. Clients must fall back to their configured default in
 both cases.
 
+### Workspace path completion
+
+With `path_completion` negotiated, `path_complete` accepts `session_id` and
+`text_before_cursor`. The text is limited to 4,096 UTF-8 bytes. The request
+completes the active `@` path token relative to the session working directory.
+It returns `entries` and `truncated`; each entry has `text`, `display`, `kind`
+(`directory` or `file`), and `start_position`. The start position is zero or
+negative and is measured in Unicode code points. Clients that use UTF-16 text
+indices must convert it before replacing the active token.
+
+The result uses the same hidden-file, quoting, sorting, and scan limits as the
+TUI composer. The request returns `-32003` when `session_id` is not the active
+session, `-32602` for invalid parameters, and `-32601` when the feature was not
+negotiated. It emits no event and is not available to observer connections.
+
 ### Slash commands (ZETA-130)
 
 Protocol 1.1 exposes the shared slash dispatcher without forking a second
@@ -1586,6 +1602,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
+| `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
@@ -1603,7 +1620,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 
