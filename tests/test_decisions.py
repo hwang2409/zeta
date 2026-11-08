@@ -266,6 +266,7 @@ async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
         return real_open(*args, **kwargs)
 
     monkeypatch.setattr(decisions_module, "open_decisions", flaky_open)
+    # test-contract: seam retry delay is private; result uses the real status render
     monkeypatch.setattr(panel_module, "_POLL_RESTART_BASE", 0, raising=False)
     try:
         app.start_decisions_poll()
@@ -313,6 +314,7 @@ async def test_persistent_decisions_failure_renders_unavailable_then_recovers(
         raise RuntimeError("projection failed")
 
     monkeypatch.setattr(decisions_module, "open_decisions", broken_open)
+    # test-contract: seam retry delay is private; result uses the real status render
     monkeypatch.setattr(panel_module, "_POLL_RESTART_BASE", 0, raising=False)
     try:
         app.start_decisions_poll()
