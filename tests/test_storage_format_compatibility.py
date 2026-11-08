@@ -103,16 +103,23 @@ def test_main_runs_selected_predecessor_roundtrip_phases(
             return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
+    # test-contract: seam isolate the command entry from git and package installation
     monkeypatch.setattr(_COMPAT, "_git", fake_git)
+    # test-contract: seam force the selected predecessor at the command boundary
     monkeypatch.setattr(_COMPAT, "select_predecessor", lambda **kwargs: (predecessor, [predecessor]))
+    # test-contract: seam exercise the bootstrap predecessor command path
     monkeypatch.setattr(_COMPAT, "has_probe", lambda commit: False)
+    # test-contract: seam give the stub predecessor its public writer epoch
     monkeypatch.setattr(_COMPAT, "_writer_epoch", lambda source: WRITER_EPOCH)
+    # test-contract: seam replace bounded child processes while testing command wiring
     monkeypatch.setattr(_COMPAT, "_run_phase", fake_run)
+    # test-contract: seam provide the selected predecessor lock artifact
     monkeypatch.setattr(
         _COMPAT,
         "_copy_predecessor_lock",
         lambda commit, destination: destination.write_text("stub-lock\n"),
     )
+    # test-contract: seam observe whether the command reaches the round-trip gate
     monkeypatch.setattr(
         _COMPAT,
         "_run_roundtrips",
