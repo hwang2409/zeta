@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -1344,3 +1345,85 @@ def test_parent_selection_table(
         chosen = (p1, p2)[expected]
         assert f"main parent: {chosen}" in result.stdout
         assert loss in result.stdout
+
+
+def _stacked_merge(tmp_path: Path) -> tuple[Path, str, str]:
+    """A merge commit that drops main's newer(); its explanation lives in the base PR."""
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def kept(): pass\ndef branch(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def kept(): pass\ndef newer(): pass\n")
+    commit(r, "main")
+    main_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    subprocess.run(["git", "checkout", "branch", "--", "src/a.py"], cwd=r, check=True)
+    commit(r, "merge")
+    merge_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    return r, merge_sha, main_sha
+
+
+def _pull(number: int, body: str, **changes: str) -> dict:
+    head_repo = changes.get("head_repo", "hwang2409/zeta")
+    return {
+        "number": number,
+        "body": body,
+        "user": {"login": changes.get("author", "hwang2409")},
+        "base": {"ref": changes.get("base", "main"), "repo": {"full_name": "hwang2409/zeta"}},
+        "head": {"repo": {"full_name": head_repo}},
+    }
+
+
+OVERRIDE = "merge-resolution: src/a.py def newer -> dropped on purpose in #972"
+
+
+# Each ignored row changes one field of the "base PR lends its line" row.
+@pytest.mark.parametrize(
+    ("case", "returncode", "expected"),
+    [
+        ("base PR lends its line", 0, "borrowed overrides: override lines from #972"),
+        ("fork head", 1, "did not borrow overrides: no PR with a matching override line; skipped: #972 (fork head)"),
+        ("other author", 1, "skipped: #972 (other author)"),
+        ("base not main", 1, "skipped: #972 (base feature)"),
+        ("lookup for another commit", 1, "did not borrow overrides: lookup is for commit {main}, not {merge}"),
+        ("api error 403", 1, "did not borrow overrides: PR lookup failed: gh api exit 1: API rate limit exceeded"),
+        ("conflicting candidates", 1, "did not borrow overrides: conflicting override lines in #972, #973"),
+    ],
+)
+def test_stacked_pr_borrows_override_from_base_pr(
+    tmp_path: Path, case: str, returncode: int, expected: str
+) -> None:
+    r, merge_sha, main_sha = _stacked_merge(tmp_path / "repo")
+    own = _pull(1056, "stacked on #972, no override lines here")
+    pulls: object = [own, _pull(972, OVERRIDE)]
+    lookup_commit, error = merge_sha, None
+    if case == "fork head":
+        pulls = [own, _pull(972, OVERRIDE, head_repo="someone/zeta")]
+    elif case == "other author":
+        pulls = [own, _pull(972, OVERRIDE, author="someone")]
+    elif case == "base not main":
+        pulls = [own, _pull(972, OVERRIDE, base="feature")]
+    elif case == "lookup for another commit":
+        lookup_commit = main_sha
+    elif case == "api error 403":
+        pulls, error = {"message": "API rate limit exceeded", "status": "403"}, "gh api exit 1"
+    elif case == "conflicting candidates":
+        pulls = [own, _pull(972, OVERRIDE), _pull(973, OVERRIDE.replace("#972", "#973"))]
+    body = tmp_path / "body.md"
+    body.write_text(own["body"])
+    lookup = tmp_path / "pulls.json"
+    lookup.write_text(
+        json.dumps({"commit": lookup_commit, "pr": 1056, "author": "hwang2409", "error": error, "pulls": pulls})
+    )
+
+    result = run(r, merge_sha, "--pr-body-file", str(body), "--borrow-file", str(lookup))
+
+    assert expected.format(main=main_sha, merge=merge_sha) in result.stdout, result.stdout + result.stderr
+    assert result.returncode == returncode, result.stdout + result.stderr
+    if returncode:
+        assert "newer" in result.stdout
