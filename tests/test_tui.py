@@ -14756,7 +14756,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait()
+            release.wait(10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
@@ -14764,7 +14764,9 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        await refresh_rendered.wait()
+        await await_or_fail(
+            refresh_rendered.wait(), what="busy account refresh render"
+        )
         assert app._accounts_picker is not None
         assert app._accounts_picker.usages is not None
         assert app._accounts_picker.usages[account].error == (
@@ -14776,7 +14778,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
         assert "refresh failed: account busy" in plain
     finally:
         release.set()
-        holder.join()
+        holder.join(10)
         opened.store.close()
 
 
