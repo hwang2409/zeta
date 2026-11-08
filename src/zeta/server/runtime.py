@@ -661,6 +661,9 @@ class ServerRuntime:
             auto_project=False,
             project_id=project_id,
             post_stream_provider_retry=self._post_stream_provider_retry,
+            require_selected_account=(
+                self.backend_factory is None and not self._test_scripted_provider
+            ),
             **kwargs,
         )
 
