@@ -1,5 +1,6 @@
 """Named subscription accounts and crash-safe legacy migration."""
 
+from .registry import AccountRegistryMissingError
 from .session import (
     AccountListSnapshot,
     SessionAccountContext,
@@ -23,6 +24,7 @@ __all__ = [
     "AccountId",
     "AccountListSnapshot",
     "AccountLoopThreadLockError",
+    "AccountRegistryMissingError",
     "AccountStore",
     "AccountUsage",
     "SessionAccountContext",
