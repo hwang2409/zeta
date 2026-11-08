@@ -154,6 +154,19 @@ class TranscriptLoadError(ConversationIntegrityError):
 
 
 @dataclass(frozen=True, slots=True)
+class _DurableLogDelta:
+    """Small worker-validated suffix plus the durable log facts it produced."""
+
+    entries: tuple[ConversationEntry, ...]
+    installed_delta: tuple[ConversationEntry, ...]
+    entry_prefix_digest: bytes
+    log_identity: tuple[int, int, int]
+    log_offset: int
+    log_mtime_ns: int
+    log_prefix_fingerprint: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class _DetachedLogState:
     """Validated transcript state that is safe to install without file access."""
 

@@ -935,6 +935,26 @@ def test_installed_hook_serializes_two_threads_in_durable_order(
 
 
 @pytest.mark.asyncio
+async def test_async_linear_append_does_not_snapshot_complete_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="async-delta-publication")
+    store.append_many([("warning", {"message": str(index)}) for index in range(400)])
+    store._prepare_durable_writer_snapshot()
+
+    def reject_snapshot(_store: ConversationStore) -> None:
+        raise AssertionError("ordinary async append copied complete store state")
+
+    monkeypatch.setattr(ConversationStore, "_snapshot_log_state", reject_snapshot)
+
+    entry = await store.append_message_async(
+        message(MessageRole.ASSISTANT, "published delta")
+    )
+
+    assert store.entries[-1] == entry
+
+
+@pytest.mark.asyncio
 async def test_async_appends_encode_only_new_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1236,13 +1256,20 @@ async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_c
     store.append_message(message(MessageRole.ASSISTANT, "discarded"))
     owner_thread = threading.get_ident()
     load_threads: list[int] = []
+    snapshot_threads: list[int] = []
     original_load_full = ConversationStore._load_full
+    original_snapshot = ConversationStore._snapshot_log_state
 
     def observed_load_full(candidate: ConversationStore) -> None:
         load_threads.append(threading.get_ident())
         original_load_full(candidate)
 
+    def observed_snapshot(candidate: ConversationStore):
+        snapshot_threads.append(threading.get_ident())
+        return original_snapshot(candidate)
+
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
+    monkeypatch.setattr(ConversationStore, "_snapshot_log_state", observed_snapshot)
     if foreign_change == "branch":
         foreign = ConversationStore(tmp_path, session_id=store.session_id)
         foreign.append_fork(str(checkpoint.seq))
@@ -1257,6 +1284,8 @@ async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_c
 
     assert load_threads
     assert owner_thread not in load_threads
+    assert snapshot_threads
+    assert owner_thread not in snapshot_threads
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries
 
@@ -1391,30 +1420,30 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="publish-generation")
-    snapshot_ready = threading.Event()
-    release_snapshot = threading.Event()
+    delta_ready = threading.Event()
+    release_delta = threading.Event()
     owner_thread = threading.get_ident()
-    original_detach = ConversationStore._detach_log_state
+    original_copy = ConversationStore._owned_installed_delta
     blocked = False
 
-    def block_first_worker_snapshot(candidate: ConversationStore):
+    def block_first_worker_delta(delta: object):
         nonlocal blocked
-        state = original_detach(candidate)
+        copied = original_copy(delta)
         if not blocked and threading.get_ident() != owner_thread:
             blocked = True
-            snapshot_ready.set()
-            assert release_snapshot.wait(timeout=5)
-        return state
+            delta_ready.set()
+            assert release_delta.wait(timeout=10)
+        return copied
 
     monkeypatch.setattr(
-        ConversationStore, "_detach_log_state", block_first_worker_snapshot
+        ConversationStore, "_owned_installed_delta", staticmethod(block_first_worker_delta)
     )
     write = asyncio.create_task(
         store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
     )
-    assert await asyncio.to_thread(snapshot_ready.wait, 2)
+    assert await asyncio.to_thread(delta_ready.wait, 10)
     store.append_message(message(MessageRole.ASSISTANT, "owner"))
-    release_snapshot.set()
+    release_delta.set()
     await write
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
