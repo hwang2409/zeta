@@ -96,6 +96,7 @@ from ._validation import (
     _validate_arguments,
     validate_tool_result,
 )
+from ._web_clients import SessionWebClients
 
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
@@ -347,6 +348,7 @@ class ToolRegistry:
         self._mcp_owned: dict[str, tuple[object, int]] = {}
         self._mcp_hidden: set[str] = set()
         self._closed = False
+        self.web_clients = SessionWebClients()
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
         self._skill_refresher: Callable[[bool], Awaitable[None]] | None = None
@@ -738,6 +740,7 @@ class ToolRegistry:
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        clone.web_clients = SessionWebClients()
         clone._agent_output_cache = OrderedDict()
         clone._agent_output_cache_chars = 0
         clone._mcp_excluded_names = frozenset(exclude_names)
@@ -862,6 +865,7 @@ class ToolRegistry:
 
         callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
         try:
+            await self.web_clients.close()
             for callback in callbacks:
                 await callback()
         finally:
