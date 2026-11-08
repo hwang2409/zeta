@@ -887,6 +887,34 @@ def test_other_background_notices_remain_visible() -> None:
     assert [item.plain for item in rendered] == ["background task task-1 killed"]
 
 
+@pytest.mark.asyncio
+async def test_status_renders_unavailable_accounts_through_tui(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.account_context = SimpleNamespace(unavailable_accounts=("codex:missing",))
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        rendered = await app._slash_commands.dispatch_async(app, "/status")
+        assert isinstance(rendered, str)
+        app._handle_slash_output(rendered)
+
+        assert "unavailable_accounts: codex:missing" in output.getvalue()
+    finally:
+        await loop.close()
+        loop.store.close()
+
+
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(
@@ -1537,6 +1565,7 @@ def terminal_plain(renderable: object) -> str:
 
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
+
 
 def test_task_safety_kill_renders_cause() -> None:
     cause = "explicit-finish child task safety deadline expired after 3600 seconds"
@@ -5102,6 +5131,30 @@ def test_child_message_delivered_background_event_renders_parent_receipt(
     assert "delivered to worker: check the retry" in output.getvalue()
 
 
+def test_nested_stalled_idle_background_event_renders_last_message(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "child_instance_id": "root:1:1",
+                "description": "nested verifier",
+                "status": "child_idle",
+                "text": "nested verifier is waiting for review",
+            },
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "nested verifier" in rendered
+    assert "nested verifier is waiting for review" in rendered
+
+
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path, session_id="child")
     child.start_agent_lifecycle(
@@ -6434,6 +6487,9 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         "".join(text for _style, text in line)
         for line in tui_app_module._status_card_lines(status)
     )
+
+    assert "unavailable_accounts: none\n" in rendered
+    rendered = rendered.replace("unavailable_accounts: none\n", "")
 
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
@@ -8922,6 +8978,27 @@ def test_rebuild_renders_closed_turn_end_reasons(
     assert "turn ended with an error" in rendered
     assert "turn ended when the controller disconnected" in rendered
     assert "completed" not in rendered
+
+
+def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions)
+    with store.path.open("ab") as stream:
+        stream.write(b'{"torn"')
+    with pytest.warns(RuntimeWarning, match="torn"):
+        recovered = ConversationStore(sessions, session_id=store.session_id)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), recovered, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "transcript recovered; preserved corrupt bytes in quarantine" in rendered
+    assert recovered.entries[-1].data["quarantine_id"] in rendered
 
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
@@ -12602,7 +12679,8 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
 
     _patch_draft_publish(monkeypatch, fail_write)
     # test-contract: seam Run the CLI against the controlled application.
-    monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda *_args: app)
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -12664,7 +12742,8 @@ def test_new_session_continues_after_failed_draft_save(
     _patch_draft_publish(monkeypatch, fail_write)
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -12754,7 +12833,8 @@ def test_failed_active_draft_is_printed_on_every_exit(
 
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     # test-contract: seam Observe the CLI restart boundary without replacing the process.
@@ -12838,7 +12918,8 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
 
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     # test-contract: seam Observe the CLI restart boundary without replacing the process.
@@ -12889,7 +12970,8 @@ def test_new_session_with_successful_draft_prints_nothing(
         return False, False
 
     # test-contract: seam Run the CLI against controlled session applications.
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -13851,6 +13933,44 @@ async def test_tui_model_command_does_no_lock_work_on_loop(
 
 
 @pytest.mark.asyncio
+async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    missing = AccountId("codex", "missing")
+    for account in (current, missing):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    AccountStore(home).credential_path(missing).unlink()
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=80).print(rendered[0])
+        assert (
+            "codex:missing  unavailable: credentials missing"
+            in Text.from_ansi(output.getvalue()).plain
+        )
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -13905,9 +14025,9 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     app.accounts_picker_move(1)
     task = app.accounts_picker_select()
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
-    assert off_loop_calls == ["list"]
+    assert off_loop_calls == ["list", "list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
@@ -14657,6 +14777,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
         {"codex": account},
         {account: "henry@example.com"},
         {account: "henry"},
+        unavailable={account},
     )
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(picker.render())
@@ -14664,6 +14785,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
 
     assert "codex:henry" in plain
     assert "henry@example.com" in plain
+    assert "unavailable: credentials missing" in plain
     assert "n rename" in plain
 
 

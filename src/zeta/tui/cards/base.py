@@ -116,8 +116,22 @@ def strip_terminal_controls(value: str) -> str:
 
 
 def safe_text(value: str, *, style: str, wrap: bool = False) -> Text:
+    clean = strip_terminal_controls(value)
+    # Rich's ANSI decoder normalizes control-separated lines, so only bypass it
+    # for text whose shape cannot be changed by decoding.
+    if not any(
+        character in value
+        for character in "\x1b\x9b\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+    ) and not value.endswith("\n"):
+        return Text(
+            clean,
+            style=style,
+            overflow="fold" if wrap else "ellipsis",
+            no_wrap=not wrap,
+            tab_size=8,
+        )
     return Text.from_ansi(
-        strip_terminal_controls(value),
+        clean,
         style=style,
         overflow="fold" if wrap else "ellipsis",
         no_wrap=not wrap,

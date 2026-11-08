@@ -59,6 +59,10 @@ async def _observer(
     )[-1]["result"]
     if "session_history_backward" in requested_features:
         assert "session_history_backward" in hello["capabilities"]["features"]
+    readiness_method = (
+        "session_grants" if "session_grants" in requested_features else "status"
+    )
+    await _request(reader, writer, f"{number}-ready", readiness_method)
     return reader, writer
 
 

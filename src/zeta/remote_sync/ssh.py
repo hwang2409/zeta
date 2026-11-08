@@ -14,6 +14,7 @@ from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
 from .. import memory_migration_plan, project_schema
+from ..storage_format import ACCEPTED_KEY_SETS
 from . import (
     RemoteSyncError,
     _append_resume_hint,
@@ -237,6 +238,22 @@ def _project_install_script() -> str:
     if None in {schema_filename, migration_filename, publisher_filename}:
         raise RemoteSyncError("project publication module source is unavailable")
     schema_source = Path(schema_filename).read_text(encoding="utf-8")
+    accepted = {
+        "entry_memory_snapshot_reference": sorted(
+            ACCEPTED_KEY_SETS["entry_memory_snapshot_reference"]
+        ),
+        "legacy_memory_snapshot": sorted(ACCEPTED_KEY_SETS["legacy_memory_snapshot"]),
+        "memory_state_root": sorted(ACCEPTED_KEY_SETS["memory_state_root"]),
+        "project_registry_record": sorted(ACCEPTED_KEY_SETS["project_registry_record"]),
+    }
+    dependency_free_registry = (
+        f"\nACCEPTED_KEY_SETS = {accepted!r}\n"
+        "def reject_unknown_keys(payload, shape):\n"
+        "    accepted = ACCEPTED_KEY_SETS.get(shape)\n"
+        "    if accepted is None or set(payload) - set(accepted):\n"
+        "        raise ValueError(f'unknown keys for {shape}')\n"
+    )
+    schema_source += dependency_free_registry
     migration_source = Path(migration_filename).read_text(encoding="utf-8").replace(
         "from __future__ import annotations\n\n", "", 1
     )
@@ -251,6 +268,7 @@ def _project_install_script() -> str:
             "    reachable_version_pruning_plan,\n"
             ")\n"
         ),
+        "from ..storage_format import reject_unknown_keys\n",
     )
     if any(dependency not in publisher_source for dependency in dependencies):
         raise RemoteSyncError("project publication dependency import is unavailable")
