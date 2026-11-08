@@ -55,12 +55,13 @@ class ProjectLockingMixin:
         return root_fd, info
 
     @staticmethod
-    def _open_lock(root_fd: int) -> int:
+    def _open_lock(root_fd: int, *, create: bool) -> int | None:
+        flags = os.O_RDWR | os.O_CREAT if create else os.O_RDONLY
         try:
-            lock_fd = os.open(
-                ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=root_fd
-            )
+            lock_fd = os.open(".lock", flags | os.O_NOFOLLOW, 0o600, dir_fd=root_fd)
         except FileNotFoundError:
+            if not create:
+                return None
             raise
         except OSError as exc:
             raise ProjectRegistryError("cannot open registry lock") from exc
@@ -138,24 +139,6 @@ class ProjectLockingMixin:
         finally:
             _ACTIVE_WRITER_LEASE.reset(token)
 
-    @contextmanager
-    def _identity_authority(self, *, exclusive: bool) -> Iterator[int]:
-        require_off_loop_lock("project identity authority", ProjectRegistryError)
-        lease = self._storage_lease
-        with self._lease_context(lease):
-            if exclusive or lease.observed_epoch >= P06_FEATURE_EPOCH:
-                self._ensure_root()
-            if lease.observed_epoch < P06_FEATURE_EPOCH:
-                with identity_lock(), self._locked_home_mode(
-                    exclusive=exclusive
-                ) as root_fd:
-                    yield root_fd
-                return
-            with identity_lock(), self._locked_home_mode(
-                exclusive=exclusive
-            ) as root_fd:
-                yield root_fd
-
     @staticmethod
     def _release_lock(lock_fd: int) -> None:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -194,7 +177,8 @@ class ProjectLockingMixin:
             stack.enter_context(identity_lock())
             root_fd, _ = self._open_root()
             stack.callback(os.close, root_fd)
-            lock_fd = self._open_lock(root_fd)
+            lock_fd = self._open_lock(root_fd, create=True)
+            assert lock_fd is not None
             self._acquire_lock(
                 lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
             )
@@ -242,7 +226,7 @@ class ProjectLockingMixin:
             raise AssertionError("project domains must be unique and sorted")
         lease = self._storage_lease
         with self._lease_context(lease):
-            if exclusive or lease.observed_epoch >= P06_FEATURE_EPOCH:
+            if exclusive:
                 self._ensure_root()
             locks = (
                 self._legacy_project_locks
@@ -253,13 +237,57 @@ class ProjectLockingMixin:
                 yield project_fds
 
     def _identity_read(self, operation: Callable[[int], _T]) -> _T:
-        with self._identity_authority(exclusive=False) as root_fd:
-            return operation(root_fd)
+        """Read one identity snapshot without creating the root or its lock."""
+        require_off_loop_lock("project identity authority", ProjectRegistryError)
+        with self._lease_context(self._storage_lease), identity_lock():
+            for attempt in range(_READ_RETRIES):
+                root_fd, root_info = self._open_root()
+                try:
+                    lock_fd = self._open_lock(root_fd, create=False)
+                    if lock_fd is not None:
+                        try:
+                            self._acquire_lock(lock_fd, fcntl.LOCK_SH)
+                            return operation(root_fd)
+                        finally:
+                            self._release_lock(lock_fd)
+                    try:
+                        result = operation(root_fd)
+                    except Exception:
+                        if self._root_unchanged_without_lock(root_fd, root_info):
+                            raise
+                    else:
+                        if self._root_unchanged_without_lock(root_fd, root_info):
+                            return result
+                finally:
+                    os.close(root_fd)
+                time.sleep(0.001)
+        raise ProjectRegistryError("projects registry changed during read")
+
+    def _root_unchanged_without_lock(
+        self, root_fd: int, original: os.stat_result
+    ) -> bool:
+        try:
+            current = os.stat(self.root, follow_symlinks=False)
+            lock_fd = self._open_lock(root_fd, create=False)
+        except (FileNotFoundError, ProjectNotFoundError):
+            return False
+        if lock_fd is not None:
+            os.close(lock_fd)
+            return False
+        return (
+            stat.S_ISDIR(current.st_mode)
+            and not stat.S_ISLNK(current.st_mode)
+            and current.st_dev == original.st_dev
+            and current.st_ino == original.st_ino
+        )
 
     @contextmanager
     def _identity_write(self) -> Iterator[int]:
-        with self._identity_authority(exclusive=True) as root_fd:
-            yield root_fd
+        require_off_loop_lock("project identity authority", ProjectRegistryError)
+        with self._lease_context(self._storage_lease):
+            self._ensure_root()
+            with identity_lock(), self._locked_home() as root_fd:
+                yield root_fd
 
     @contextmanager
     def _project_lock(
@@ -271,22 +299,21 @@ class ProjectLockingMixin:
             yield project_fds[0]
 
     @contextmanager
-    def _locked_home_mode(self, *, exclusive: bool) -> Iterator[int]:
+    def _locked_home(self) -> Iterator[int]:
         for attempt in range(_READ_RETRIES):
             root_fd, _ = self._open_root()
             try:
                 os.fchmod(root_fd, 0o700)
                 try:
-                    lock_fd = self._open_lock(root_fd)
+                    lock_fd = self._open_lock(root_fd, create=True)
                 except FileNotFoundError as exc:
                     if attempt + 1 == _READ_RETRIES:
                         raise ProjectRegistryError("cannot open registry lock") from exc
                 else:
+                    assert lock_fd is not None
                     try:
                         os.fchmod(lock_fd, 0o600)
-                        self._acquire_lock(
-                            lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-                        )
+                        self._acquire_lock(lock_fd, fcntl.LOCK_EX)
                         yield root_fd
                         return
                     finally:

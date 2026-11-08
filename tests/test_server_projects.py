@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -780,32 +781,37 @@ async def test_project_requests_do_not_modify_filesystem(tmp_path: Path) -> None
         await close_serve(empty_server, writer)
 
     server = _server(tmp_path / "populated")
-    registry = ProjectRegistry(server.home / "projects")
-    project = registry.create_project("alpha", "repo")
-    sender = registry.create_project("sender", "repo")
-    registry.update_memory(project.project_id, {"brief.md": "initial\n"})
-    state = registry.compare_and_swap_memory(
-        project.project_id,
-        expected_digest=registry.memory_digest(project.project_id),
-        updates={"brief.md": "authoritative\n"},
-        provenance={"session_id": "c" * 32, "seq_start": 1, "seq_end": 2},
-    )
-    mirror = server.home / "projects" / project.project_id / "memory" / "brief.md"
-    header = mirror.read_text().splitlines(keepends=True)[0]
-    mirror_mode = mirror.stat().st_mode
-    mirror.chmod(0o600)
-    mirror.write_text(header + "stale mirror\n")
-    mirror.chmod(mirror_mode)
-    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
-    message_id = inbox.send(
-        from_project=sender.project_id,
-        from_session="a" * 32,
-        to_project=project.project_id,
-        kind="info",
-        title="stale claim",
-        body="body",
-    )
-    assert inbox.claim(project.project_id, message_id, "b" * 32) is not None
+
+    def seed() -> tuple[Any, Any, Path, str, str]:
+        registry = ProjectRegistry(server.home / "projects")
+        project = registry.create_project("alpha", "repo")
+        sender = registry.create_project("sender", "repo")
+        registry.update_memory(project.project_id, {"brief.md": "initial\n"})
+        state = registry.compare_and_swap_memory(
+            project.project_id,
+            expected_digest=registry.memory_digest(project.project_id),
+            updates={"brief.md": "authoritative\n"},
+            provenance={"session_id": "c" * 32, "seq_start": 1, "seq_end": 2},
+        )
+        mirror = server.home / "projects" / project.project_id / "memory" / "brief.md"
+        header = mirror.read_text().splitlines(keepends=True)[0]
+        mirror_mode = mirror.stat().st_mode
+        mirror.chmod(0o600)
+        mirror.write_text(header + "stale mirror\n")
+        mirror.chmod(mirror_mode)
+        inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+        message_id = inbox.send(
+            from_project=sender.project_id,
+            from_session="a" * 32,
+            to_project=project.project_id,
+            kind="info",
+            title="stale claim",
+            body="body",
+        )
+        assert inbox.claim(project.project_id, message_id, "b" * 32) is not None
+        return project, state, mirror, header, message_id
+
+    project, state, mirror, header, message_id = await asyncio.to_thread(seed)
     registry_lock = server.home / "projects" / ".lock"
     registry_lock.unlink()
 
