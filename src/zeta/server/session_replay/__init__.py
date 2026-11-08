@@ -75,6 +75,8 @@ class DeferredFrame:
     facts: Any
     key: Any
     size: int
+    # False once a pressure eviction took the scope's charges; the record stays held
+    charged: bool = True
 
 
 @dataclass(slots=True)
@@ -169,9 +171,15 @@ class SessionReplay:
         subscription = self._subscriptions.get(connection)
         return None if subscription is None else subscription.stream_id
 
-    def _drop_scope(self, scope: ReplayScopeId) -> list[tuple[Any, _Subscription]]:
-        # a scope drop closes its deferred records; their charges leave with the scope
-        self._deferred.pop(scope, None)
+    def _drop_scope(
+        self, scope: ReplayScopeId, *, keep_deferred: bool
+    ) -> list[tuple[Any, _Subscription]]:
+        # the scope's charges leave with it; a kept record outlives its streams uncharged
+        if keep_deferred:
+            for record in self._deferred.get(scope, {}).values():
+                record.charged = False
+        else:
+            self._deferred.pop(scope, None)
         current = self._scopes.pop(scope, None)
         if current is not None:
             self._records -= current.records
@@ -191,9 +199,15 @@ class SessionReplay:
             self._next_sequences.pop(connection, None)
         return ended
 
-    def invalidate_scope(self, scope: ReplayScopeId) -> list[tuple[Any, _Subscription]]:
-        """End every stream of one scope; return the active streams that ended."""
-        return self._drop_scope(scope)
+    def invalidate_scope(
+        self, scope: ReplayScopeId, *, keep_deferred: bool
+    ) -> list[tuple[Any, _Subscription]]:
+        """End every stream of one scope; return the active streams that ended.
+
+        With keep_deferred, held publish-first records stay: their rows still
+        install, so a rejoin before the row must get the copy live.
+        """
+        return self._drop_scope(scope, keep_deferred=keep_deferred)
 
     def _largest_scope(self) -> ReplayScopeId | None:
         if not self._scopes:
@@ -244,7 +258,8 @@ class SessionReplay:
         del records[frame.event]
         if not records:
             del self._deferred[scope]
-        self.release(scope, frame.size)
+        if frame.charged:
+            self.release(scope, frame.size)
         return True
 
     def begin_join(

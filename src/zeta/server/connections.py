@@ -18,7 +18,12 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
-from .session_replay import DeferredFrame, SessionReplay, history_features
+from .session_replay import (
+    DeferredFrame,
+    ReplayScopeId,
+    SessionReplay,
+    history_features,
+)
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
 
@@ -289,7 +294,7 @@ class ConnectionRegistry(ReplayOutput):
         if outcome.kind != "admitted" or frame is None or output is None:
             return outcome
         assert self._controller is not None
-        if isinstance(covers, DeferredFrame) and "session_replay_seq" in self._controller.features:
+        if self._replay_holds_copy(self._controller, covers):
             return outcome
         if not isinstance(covers, DeferredFrame) and self._publish_replay(
             self._controller, event, session_id, dict(fields), covers
@@ -303,6 +308,15 @@ class ConnectionRegistry(ReplayOutput):
             wake=True,
         )
         return outcome
+
+    def _replay_holds_copy(self, state: _Connection, covers: object) -> bool:
+        """True when a deferred record will send the controller's copy on its stream.
+
+        A controller with no stream or join in the scope gets the frame plainly now.
+        """
+        return isinstance(covers, DeferredFrame) and self.replay.scope_for(
+            state.connection
+        ) == ReplayScopeId.top(covers.session_id)
 
     async def publish_controller(
         self,
@@ -331,8 +345,7 @@ class ConnectionRegistry(ReplayOutput):
             return False
         state = self._controller
         assert state is not None
-        # a replay controller's copy waits in the deferred record like any stream's
-        if isinstance(covers, DeferredFrame) and "session_replay_seq" in state.features:
+        if self._replay_holds_copy(state, covers):
             return True
         if not isinstance(covers, DeferredFrame) and self._publish_replay(
             state, event, session_id, fields, covers

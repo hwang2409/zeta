@@ -393,7 +393,7 @@ async def test_join_while_user_row_is_held_sees_echo_once(
 async def test_turn_canceled_before_its_first_step_closes_its_echo(
     tmp_path: Path, transport: Transport
 ) -> None:
-    """A turn task canceled before it runs has no pump end; the next echo closes it."""
+    """A turn task canceled before it runs has no pump end; its end closes the echo."""
     gates = Gates()
     serve = await _serve(tmp_path, transport, FakeBackend([ScriptedTurn([TextContent("ok")])]), gates)
     control = serve.server.control
@@ -423,8 +423,8 @@ async def test_turn_canceled_before_its_first_step_closes_its_echo(
         frames = {name: await serve.live(client) for name, (client, _history) in joins.items()}
         lost = {name: _count(joins[name][1], frames[name], "lost-marker") for name in joins}
         kept = {name: _count(joins[name][1], frames[name], "kept-marker") for name in joins}
-        # the canceled send's row never installs: live-only, to streams open at its close
-        assert lost == {"before": 1, "after_cancel": 1, "before_row": 0}
+        # the canceled send's row never installs: live-only, closed when its task ended
+        assert lost == {"before": 1, "after_cancel": 0, "before_row": 0}
         assert kept == {"before": 1, "after_cancel": 1, "before_row": 1}
     finally:
         control.start_turn = start_turn  # type: ignore[method-assign]
@@ -544,5 +544,129 @@ async def test_assistant_row_that_never_installs_is_sent_live_at_turn_end(
         assert await _counts(serve, joins, "orphan-marker") == {
             "before": 1, "window": 1, "after_turn": 0
         }
+    finally:
+        await serve.close()
+
+
+def _assistant_count(history: list[dict[str, Any]], frames: list[dict[str, Any]]) -> int:
+    """Assistant replies in a join's history plus its live frames, text or not."""
+    rows = sum(row.get("role") == "assistant" for row in history)
+    return rows + sum(frame["event"] == "assistant_message" for frame in frames)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_empty_failed_assistant_row_releases_the_held_reply_once(
+    tmp_path: Path, transport: Transport
+) -> None:
+    """An empty reply whose stream fails installs an empty ``failed`` row; it still releases."""
+    gates = Gates()
+    empty = StreamEvent(
+        StreamEventType.MESSAGE_END, message=Message(MessageRole.ASSISTANT, []), data={"truncated": True}
+    )
+    backend = StreamBackend(gates, [empty, "after_end"])
+    serve = await _serve(tmp_path, transport, backend, gates)
+    try:
+        joins = {"before": await serve.joined()}
+        _hold_terminal_admission(serve, gates)
+        await serve.controller.request(serve.request_id(), "send", {"text": "go"})
+        await gates.reached("after_end")
+        joins["before_row"] = await serve.joined()
+        gates.release("after_end")
+        await gates.reached("terminal")
+        rows = [
+            entry.data["message"]
+            for entry in serve.store.entries
+            if entry.type == "message" and entry.data["message"]["role"] == "assistant"
+        ]
+        assert [(row.get("metadata", {}).get("response_state"), row["content"]) for row in rows] == [
+            ("failed", [])
+        ], rows
+        joins["after_row"] = await serve.joined()
+        gates.release("terminal")
+        await _event(serve.controller, "agent_end")
+        counts = {
+            name: _assistant_count(history, await serve.live(client))
+            for name, (client, history) in joins.items()
+        }
+        assert counts == {"before": 1, "before_row": 1, "after_row": 1}
+    finally:
+        await serve.close()
+
+
+async def _until_agent_end(client: ReplayClient) -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    while True:
+        frame = await await_or_fail(client.read(), what="controller frame")
+        if "params" in frame:
+            frames.append(frame["params"])
+            if frame["params"].get("event") == "agent_end":
+                return frames
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_replay_controller_without_a_stream_gets_publish_first_frames_plainly(
+    tmp_path: Path, transport: Transport
+) -> None:
+    """A controller that negotiated replay but never joined, or whose stream ended, still gets them."""
+    backend = FakeBackend([ScriptedTurn([TextContent("reply-one")]), ScriptedTurn([TextContent("reply-two")])])
+    server = replay_server(tmp_path, transport, lambda provider, model, home: (backend, model or "offline"))
+    await server.start()
+    controller = await connect_replay(server, transport)
+    try:
+        await negotiate(controller, extra=FEATURES, protocol_version="1.2")
+        created = await controller.request(2, "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        await controller.request(3, "send", {"text": "echo-one"})
+        never_joined = await _until_agent_end(controller)
+        joined = await controller.request(4, "session_history_and_subscribe", {"session_id": session_id})
+        assert "error" not in joined, joined
+        # a rejected rejoin ends the stream and starts none
+        rejected = await controller.request(5, "session_history_and_subscribe", {"session_id": "missing"})
+        assert "error" in rejected, rejected
+        await controller.request(6, "send", {"text": "echo-two"})
+        after_end = await _until_agent_end(controller)
+        ended = [frame.get("reason") for frame in after_end if frame["event"] == "replay_stream_ended"]
+        assert ended == ["rejoined"], after_end
+        for frames, echo, reply in (
+            (never_joined, "echo-one", "reply-one"),
+            (after_end, "echo-two", "reply-two"),
+        ):
+            kept = [frame for frame in frames if frame["event"] in {"user_message", "assistant_message"}]
+            texts = [text for frame in kept for text in _frame_texts(frame)]
+            assert (texts.count(echo), texts.count(reply)) == (1, 1), texts
+            assert all("stream_id" not in frame and "seq" not in frame for frame in kept), kept
+    finally:
+        await controller.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_pressure_eviction_keeps_a_held_reply_for_a_rejoin_before_its_row(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The evicted stream's rows still install, so its held reply must outlive the eviction."""
+    monkeypatch.setattr("zeta.server.session_replay.REPLAY_SCOPE_MAX_BYTES", 4096)
+    gates = Gates()
+    big = StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="x" * 8192)
+    # a truncated reply keeps the provider stream open; its failed row installs at the end
+    backend = StreamBackend(gates, [_end("kept-marker", truncated=True), "joined", big, "evicted"])
+    serve = await _serve(tmp_path, transport, backend, gates)
+    try:
+        await serve.controller.request(serve.request_id(), "send", {"text": "go"})
+        await gates.reached("joined")
+        client, _history = await serve.joined()
+        gates.release("joined")
+        # the large frame passes the scope's byte bound while the reply is held
+        await gates.reached("evicted")
+        history = await serve.join(client)
+        gates.release("evicted")
+        await _event(serve.controller, "agent_end")
+        frames = await serve.live(client)
+        ended = [frame.get("reason") for frame in frames if frame["event"] == "replay_stream_ended"]
+        assert ended == ["evicted"], frames
+        assert _count(history, frames, "kept-marker") == 1
     finally:
         await serve.close()

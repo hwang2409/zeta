@@ -99,18 +99,43 @@ class ReplayOutput:
         while (victim := self.replay.reserve(scope, frame.size)) is not None:
             self.invalidate_replay_scope(victim, "evicted")
             if victim == scope:
-                return frame
+                # its row still installs: hold it uncharged, like the scope's kept records
+                frame.charged = False
+                break
         self.replay.defer(scope, frame)
         return frame
 
-    def release_deferred_replay(self, session_id: str, *, close: bool = False) -> None:
+    def close_deferred_replay_when_done(
+        self, session_id: str, task: asyncio.Task[Any]
+    ) -> None:
+        """Close the records held when a turn task starts once that task ends.
+
+        A task canceled before its first step runs no pump end, so its echo would
+        wait for a later row and could match another send's row.
+        """
+        held = self.replay.deferred(ReplayScopeId.top(session_id))
+        if held:
+            task.add_done_callback(
+                lambda _: self.release_deferred_replay(session_id, close=True, only=held)
+            )
+
+    def release_deferred_replay(
+        self,
+        session_id: str,
+        *,
+        close: bool = False,
+        only: tuple[DeferredFrame, ...] | None = None,
+    ) -> None:
         """Admit deferred copies whose rows installed, before any later frame.
 
         With close (a turn's end), a record with no row is admitted live-only:
         its row will never install, so it is provisional across a stream end.
+        With only, consider just those records.
         """
         scope = ReplayScopeId.top(session_id)
         records = self.replay.deferred(scope)
+        if only is not None:
+            records = tuple(r for r in records if any(r is h for h in only))
         if not records:
             return
         store = self._replay_store(scope)
@@ -119,6 +144,8 @@ class ReplayOutput:
             seq = None if store is None else store.recent_row_seq(record.key)
             if seq is None and store is not None and record.key.seq + 1 < store.recent_row_floor():
                 # more rows than the lookup window since the mark: fail closed
+                for held in records:
+                    self.replay.take_deferred(scope, held)
                 self.invalidate_replay_scope(scope, "evicted")
                 return
             if seq is not None or close:
@@ -191,7 +218,10 @@ class ReplayOutput:
             self._send_stream_ended(connection, ended, reason)
 
     def invalidate_replay_scope(self, scope: ReplayScopeId, reason: str) -> None:
-        ended = self.replay.invalidate_scope(scope)
+        # a replaced session renumbers rows, so its held records' marks are void
+        ended = self.replay.invalidate_scope(
+            scope, keep_deferred=reason != "session_replaced"
+        )
         self._discard_replay_scope(scope)
         for connection, subscription in ended:
             self._send_stream_ended(connection, subscription, reason)

@@ -168,6 +168,10 @@ class ServeControl:
                 allow_assistant_reset=allow_assistant_reset,
             )
         )
+        connections = self.server.connections
+        session_id = self.server.runtime.session_id
+        if connections is not None and session_id is not None:
+            connections.close_deferred_replay_when_done(session_id, self._turn_task)
 
     def unhealthy(self) -> bool:
         return self._approvals.state.health is not None
