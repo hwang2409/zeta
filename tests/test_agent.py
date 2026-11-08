@@ -3973,6 +3973,116 @@ async def test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget(
 
 
 
+class CancelledBeforeAnswerBackend(CompletionBackend):
+    """The first two calls wait until the caller cancels them; later calls answer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+
+    @owned_completion
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.calls += 1
+        self.started.set()
+        if self.calls <= 2:
+            await await_or_fail(asyncio.Event().wait(), what="caller cancels the call")
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("answered")]),
+        )
+
+
+@pytest.mark.asyncio
+async def test_top_level_loop_stops_repeated_no_progress_notification_turns(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    backend = CancelledBeforeAnswerBackend()
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    try:
+        for _ in range(2):
+            backend.started.clear()
+            run = asyncio.create_task(_collect(loop.run_notification_turn()))
+            await await_or_fail(backend.started.wait(), what="provider call started")
+            run.cancel()
+            await await_or_fail(
+                asyncio.gather(run, return_exceptions=True), what="cancelled turn"
+            )
+        events = await await_or_fail(
+            _collect(loop.run_notification_turn()), what="third notification turn"
+        )
+        assert backend.calls == 2
+        errors = [event.error for event in events if event.type is StreamEventType.ERROR]
+        assert [error.code for error in errors] == ["no_progress_loop"]
+        assert len(store.agent_notifications()) == 1
+    finally:
+        await await_or_fail(loop.close(), what="agent loop close")
+
+
+class _RetryableStall(Exception):
+    is_stall = True
+
+
+class _RetryableProviderError(Exception):
+    retryable = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [AccountCredentialLockTimeoutError, _RetryableStall, _RetryableProviderError],
+    ids=["account_lock", "stall", "provider_error"],
+)
+async def test_completion_retries_do_not_count_as_no_progress_calls(
+    tmp_path: Path, failure: type[Exception]
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+            self._completion_wait = no_wait
+
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            self.calls += 1
+            if self.calls <= 2:
+                raise failure()
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("answered")]),
+            )
+
+    async def no_wait(_delay: float) -> None:
+        return None
+
+    backend = Backend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    try:
+        events = await await_or_fail(
+            _collect(loop.run_turn("hello", origin=MessageOrigin.USER)), what="turn"
+        )
+        assert backend.calls == 3
+        assert not [event for event in events if event.type is StreamEventType.ERROR]
+        assert store.messages()[-1].content == [TextContent("answered")]
+    finally:
+        await await_or_fail(loop.close(), what="agent loop close")
+
+
 class RepeatedTimeoutBackend(PostCapBudgetBackend):
     """Each fresh-prompt call outlives the gate's per-turn model bound."""
 
@@ -4002,9 +4112,12 @@ class RepeatedTimeoutBackend(PostCapBudgetBackend):
 
 
 @pytest.mark.asyncio
-async def test_repeated_gate_timeouts_stop_identical_provider_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("timeouts", ["every_fresh_call", "first_fresh_call_only"])
+async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeouts: str
 ) -> None:
+    """The 13->14 order (one cancelled turn sent again) is legal; a second repeat stops."""
+
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch, hold_child_bound=True)
     backend = RepeatedTimeoutBackend()
     store = ConversationStore(tmp_path)
@@ -4043,7 +4156,11 @@ async def test_repeated_gate_timeouts_stop_identical_provider_calls(
             for state, _configured_timeout in deadlines.started
             if deadlines._wakes[id(state)][1] == child_handle
         )
-        backend.on_fresh_call = lambda: deadlines._expire_active(state)
+        def expire_turn() -> None:
+            if timeouts == "every_fresh_call" or backend.fresh_calls == 1:
+                deadlines._expire_active(state)
+
+        backend.on_fresh_call = expire_turn
         await send_to_run(
             store,
             child_handle,
@@ -4069,14 +4186,18 @@ async def test_repeated_gate_timeouts_stop_identical_provider_calls(
             child_handle
         ].flow.store
         stopped = [
-            message.metadata[FAILED_TURN_ERROR]
+            message.metadata[FAILED_TURN_ERROR]["code"]
             for message in child_store.messages()
             if FAILED_TURN_ERROR in message.metadata
         ]
-        assert [error["code"] for error in stopped] == ["no_progress_loop"]
-        assert published[0].startswith(
-            "agent error: the model was called 2 times with the same request"
-        )
+        if timeouts == "every_fresh_call":
+            assert stopped == ["no_progress_loop"]
+            assert published[0].startswith(
+                "agent error: the model was called 2 times with the same request"
+            )
+        else:
+            assert stopped == []
+            assert published[0].startswith("Handed off running background work.")
     finally:
         backend.on_fresh_call = lambda: None
         backend.release_grandchild.set()
