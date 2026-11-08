@@ -244,7 +244,7 @@ async def test_private_format_two_fixture_reaches_dormant_updater(
     )
     invoked = False
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal invoked
         invoked = True
         return '{"operations":[]}'
