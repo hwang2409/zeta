@@ -825,12 +825,8 @@ class BackgroundTaskRegistry:
                     archive_error = exc
                 except BaseException as exc:
                     archive_error = exc
-                    if record.note is None:
-                        record.note = "background output archive failed; recovery will retry the retained log"
-                    logger.exception(
-                        "failed to archive background task output for %s",
-                        record.task_id,
-                    )
+                    if record.note is None: record.note = "background output archive failed; recovery will retry the retained log"
+                    logger.exception("failed to archive background task output for %s", record.task_id)
             await self._commit_terminal(record, process.returncode)
             if archive_error is not None:
                 raise archive_error
