@@ -170,6 +170,17 @@ def test_finish_gate_message_bounds_long_details_by_utf8_bytes(detail: str) -> N
     assert "task-20: " not in text
 
 
+def test_finish_gate_message_bounds_deep_generated_handles() -> None:
+    children = tuple(
+        ("root:" + ":".join(f"child-{depth}" for depth in range(100)), "worker")
+        for _ in range(20)
+    )
+
+    text = finish_gate_message(children, ()).content[0].text
+
+    assert len(text.encode()) < 5_000
+
+
 def _harness_notice_conversation() -> list[Message]:
     call = ToolCall("call-1", "read", {"path": "README.md"})
     return [
