@@ -17437,12 +17437,12 @@ async def test_question_close_keeps_recipient_targets_stable_during_cleanup(
         item: pending_delivery_module.DeliveryInput,
     ) -> pending_delivery_module.ProducerResult:
         first_started.set()
-        await release_first.wait()
+        await await_or_fail(release_first.wait(), what="release first delivery")
         return await first_produce(item)
 
     first_flow.produce = gated_first_produce  # type: ignore[method-assign]
     closing = asyncio.create_task(channel.close_questions("root:2", reason="finished"))
-    await first_started.wait()
+    await await_or_fail(first_started.wait(), what="first delivery start")
     cleanup_started = asyncio.Event()
     cleanup_finished = asyncio.Event()
 
@@ -17452,18 +17452,21 @@ async def test_question_close_keeps_recipient_targets_stable_during_cleanup(
         cleanup_finished.set()
 
     cleanup = asyncio.create_task(unregister_second_child())
-    await cleanup_started.wait()
+    await await_or_fail(cleanup_started.wait(), what="cleanup start")
     try:
         assert not cleanup_finished.is_set()
         release_first.set()
-        assert await closing == 1
-        await cleanup
+        assert await await_or_fail(closing, what="question close") == 1
+        await await_or_fail(cleanup, what="cleanup")
         assert second_child.agent_notifications()[-1].data["kind"] == (
             "child_question_withdrawn"
         )
     finally:
         release_first.set()
-        await asyncio.gather(closing, cleanup, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(closing, cleanup, return_exceptions=True),
+            what="question cleanup",
+        )
         parent.close()
         first_child.close()
         second_child.close()
