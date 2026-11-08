@@ -382,8 +382,17 @@ class ConnectionRegistry:
             prepared,
             len(frame),
         )
-        for invalidated in self.replay.take_invalidated():
-            self.invalidate_replay_scope(invalidated, "publication")
+        pressure = self.replay.take_pressure()
+        for victim in pressure:
+            self.invalidate_replay_scope(victim, "capacity")
+        if published is None and scope not in pressure:
+            published = self.replay.commit(
+                state.connection,
+                event,
+                {**fields, "_session_id": session_id},
+                prepared,
+                len(frame),
+            )
         if published is None:
             return False
         pending = self.replay._pending.get(state.connection)

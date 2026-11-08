@@ -70,6 +70,7 @@ class SessionReplay:
         self._records = 0
         self._bytes = 0
         self._invalidated: set[ReplayScopeId] = set()
+        self._pressure: set[ReplayScopeId] = set()
 
     def _scope(self, scope: ReplayScopeId) -> _Scope:
         current = self._scopes.get(scope)
@@ -82,6 +83,10 @@ class SessionReplay:
     def _invalidate_scope(self, scope: ReplayScopeId) -> None:
         self._invalidated.add(scope)
         self._drop_scope(scope)
+
+    def take_pressure(self) -> set[ReplayScopeId]:
+        pressure, self._pressure = self._pressure, set()
+        return pressure
 
     def take_invalidated(self) -> set[ReplayScopeId]:
         invalidated, self._invalidated = self._invalidated, set()
@@ -115,31 +120,25 @@ class SessionReplay:
             ),
         )
 
-    def _reserve(self, scope: ReplayScopeId, size: int) -> bool:
+    def _reserve(self, scope: ReplayScopeId, size: int) -> ReplayScopeId | None:
         owner = self._scope(scope)
         if (
             owner.records + 1 > REPLAY_SCOPE_MAX_RECORDS
             or owner.bytes + size > REPLAY_SCOPE_MAX_BYTES
         ):
-            self._invalidate_scope(scope)
-            return False
-        while (
+            return scope
+        if (
             self._records + 1 > REPLAY_MAX_RECORDS
             or self._bytes + size > REPLAY_MAX_BYTES
         ):
-            victim = self._largest_scope()
-            if victim is None:
-                return False
-            self._invalidate_scope(victim)
-            if victim == scope:
-                return False
+            return self._largest_scope() or scope
         owner = self._scope(scope)
         owner.records += 1
         owner.bytes += size
         owner.charges.append(size)
         self._records += 1
         self._bytes += size
-        return True
+        return None
 
     def stream_id(self, connection: Any) -> str | None:
         subscription = self._subscriptions.get(connection)
@@ -189,7 +188,9 @@ class SessionReplay:
     ) -> PublishedSessionEvent | None:
         if self._next_sequences.get(connection, 1) != published.seq:
             return None
-        if not self._reserve(published.scope, frame_size):
+        victim = self._reserve(published.scope, frame_size)
+        if victim is not None:
+            self._pressure.add(victim)
             return None
         self._next_sequences[connection] = published.seq + 1
         payload = {

@@ -1319,7 +1319,13 @@ async def test_session_history_and_subscribe_joins_live_sequence_on_unix_socket(
         await server.control._notify(
             EventDescriptor.TURN_START, session["session_id"], data={}
         )
-        event = await _event(reader, "turn_start")
+        while True:
+            frame = await _read(reader)
+            if frame.get("method") != "event":
+                continue
+            event = frame["params"]
+            if event.get("event") == "turn_start" and "stream_id" in event:
+                break
         assert event["stream_id"] == result["replay"]["stream_id"]
         assert event["seq"] == 1
     finally:
