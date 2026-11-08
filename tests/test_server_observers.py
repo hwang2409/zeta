@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.raw_frames import assert_raw_frames_preserved
 from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import TIMEOUT, _connect, _read, _request
@@ -743,8 +744,8 @@ async def test_controller_frames_are_byte_identical_with_observer(
     expected = (
         Path(__file__).parent / "fixtures" / "server_controller_event_stream.jsonl"
     ).read_bytes()
-    assert (
-        await _controller_event_stream(tmp_path, monkeypatch, observer=True) == expected
+    assert_raw_frames_preserved(
+        await _controller_event_stream(tmp_path, monkeypatch, observer=True), expected
     )
 
 

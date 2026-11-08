@@ -1423,8 +1423,10 @@ implementation for the frontend client. Two RPCs cover the surface.
     its authorship stay server-side.
   - `client_only`: the command exists but must run in the client (name is
     echoed back for the client's dispatch table).
-  - `unknown`: no command matched the leading token.
-  - `error`: the shared dispatcher reported a bounded failure `text`.
+  - `unknown`: the shared dispatcher did not handle the input as a command, so the client may use it as model input; this includes multiline or non-slash-safe input, existing root-absolute paths, and argument-bearing input without a close command match. Path detection uses the host filesystem, so `/tmp` passes through only where that path exists.
+  - `error`: the shared dispatcher reported a bounded failure `text`, such as
+    an unknown slash-safe command. The text tells users to type `//` to send
+    the command as model input and may include a close-match suggestion.
 
 Structured slash error codes are:
 

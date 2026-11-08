@@ -12705,7 +12705,8 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
 
     _patch_draft_publish(monkeypatch, fail_write)
     # test-contract: seam Run the CLI against the controlled application.
-    monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda *_args: app)
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -12767,7 +12768,8 @@ def test_new_session_continues_after_failed_draft_save(
     _patch_draft_publish(monkeypatch, fail_write)
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -12857,7 +12859,8 @@ def test_failed_active_draft_is_printed_on_every_exit(
 
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     # test-contract: seam Observe the CLI restart boundary without replacing the process.
@@ -12941,7 +12944,8 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
 
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     # test-contract: seam Observe the CLI restart boundary without replacing the process.
@@ -12992,7 +12996,8 @@ def test_new_session_with_successful_draft_prints_nothing(
         return False, False
 
     # test-contract: seam Run the CLI against controlled session applications.
-    monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -13565,6 +13570,86 @@ async def test_undo_restores_next_image_token_after_deleted_token(
         "[Image #3]": pasted,
     }
     await app.loop.close()
+
+
+@pytest.mark.parametrize(
+    ("text", "hint"),
+    [
+        ("/quit", None),
+        ("/modle x", "/model?"),
+        ("/statu", "/status?"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unknown_slash_command_is_rendered_without_model_request(
+    tmp_path: Path, text: str, hint: str | None
+) -> None:
+    output = StringIO()
+    backend = FakeBackend([])
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        app._submissions.wake()
+        app._submissions.submit(text, steer=False)
+        await wait_until(lambda: not app._submissions.active)
+
+        assert backend.calls == []
+        assert f"unknown command {text.split(maxsplit=1)[0]}" in output.getvalue()
+        if hint is None:
+            assert "did you mean" not in output.getvalue()
+        else:
+            assert "did you mean" in output.getvalue()
+            assert hint in output.getvalue()
+    finally:
+        await app._submissions.close()
+        await app.loop.close()
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("text", "model_text"),
+    [
+        ("/tmp", "/tmp"),
+        ("/tmp is full", "/tmp is full"),
+        ("/Users/henry/x.py is broken", "/Users/henry/x.py is broken"),
+        ("/this is pasted prose\nsecond line", "/this is pasted prose\nsecond line"),
+        ("//foo", "/foo"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_slash_like_model_text_reaches_model(
+    tmp_path: Path, text: str, model_text: str
+) -> None:
+    backend = FakeBackend([ScriptedTurn()])
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    try:
+        app._submissions.wake()
+        app._submissions.submit(text, steer=False)
+        await wait_until(lambda: not app._submissions.active)
+
+        assert any(
+            any(
+                getattr(block, "text", None) == model_text
+                for message in messages
+                for block in message.content
+            )
+            for messages, _ in backend.calls
+        )
+    finally:
+        await app._submissions.close()
+        await app.loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
