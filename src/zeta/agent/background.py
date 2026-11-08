@@ -369,8 +369,8 @@ class BackgroundAgentOwner:
         return bool(self._cancellers)
 
     @property
-    def active_descriptions(self) -> tuple[str, ...]:
-        return tuple(self._descriptions.values())
+    def active_instance_ids(self) -> frozenset[str]:
+        return frozenset(self._cancellers)
 
     def owned_running(self, parent_instance_id: str) -> tuple[tuple[str, str], ...]:
         """Return running children directly owned by one agent."""

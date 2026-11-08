@@ -833,7 +833,7 @@ async def _agent_status(
     if requested is not None and (type(requested) is not str or not requested):
         return _agent_error("handle must be a nonempty string", max_bytes)
     owner = registry._agent_owner
-    running_handles = frozenset(owner._cancellers) if owner is not None else None
+    running_handles = owner.active_instance_ids if owner is not None else None
     try:
         children = await asyncio.to_thread(
             _read_agent_status,
