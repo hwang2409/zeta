@@ -527,9 +527,10 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.SESSION_GRANTS: _handle_session_grants,
     MethodDescriptor.REVOKE_SESSION_GRANTS: _handle_revoke_session_grants,
 }
-if HANDLERS.keys() != set(MethodDescriptor):
-    raise RuntimeError("serve method handlers are not exhaustive")
-
+if set(HANDLERS) != set(MethodDescriptor) or len(set(HANDLERS.values())) != len(
+    MethodDescriptor
+):
+    raise RuntimeError("serve method handlers must be one-to-one and exhaustive")
 
 
 class _UnixSocketListener:

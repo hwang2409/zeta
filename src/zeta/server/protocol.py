@@ -503,58 +503,6 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
     return requested
 
 
-def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
-    async def handle(
-        client: object, request_id: str | int, params: dict[str, Any]
-    ) -> object:
-        return await client._dispatch_descriptor(request_id, descriptor, params)  # type: ignore[attr-defined]
-
-    return handle
-
-
-HANDLERS: dict[MethodDescriptor, Handler] = {
-    descriptor: _descriptor_handler(descriptor) for descriptor in MethodDescriptor
-}
-if HANDLERS.keys() != set(MethodDescriptor):
-    raise RuntimeError("serve method handlers are not exhaustive")
-
-
-def protocol_error(descriptor: MethodDescriptor) -> ProtocolError:
-    message = {
-        **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),
-        **dict.fromkeys(_ERGONOMICS_METHODS, "request requires protocol 1.1"),
-        MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
-        MethodDescriptor.PING: "ping requires the negotiated ping feature",
-        MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
-        **dict.fromkeys(
-            _PROJECT_METHODS,
-            f"{descriptor.wire} requires the negotiated projects feature",
-        ),
-        MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
-        MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
-    }.get(descriptor, f"{descriptor.wire} requires protocol 1.1")
-    return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
-
-
-def feature_error(descriptor: MethodDescriptor) -> ProtocolError:
-    message = {
-        MethodDescriptor.CLEAR_STEERING: "clear_steering requires the negotiated abort_scope feature",
-        MethodDescriptor.DELIVERY_STATUS: "delivery_status requires negotiated feature 'delivery_id'",
-        MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
-        MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
-        MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
-        MethodDescriptor.PING: "ping requires the negotiated ping feature",
-        MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
-        **dict.fromkeys(
-            _PROJECT_METHODS,
-            f"{descriptor.wire} requires the negotiated projects feature",
-        ),
-    }.get(
-        descriptor,
-        f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
-    )
-    return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
-
 
 class FrameCodec:
     """Parse requests and serialize every bounded wire frame."""
