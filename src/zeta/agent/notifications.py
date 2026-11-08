@@ -9,8 +9,6 @@ from typing import Literal
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.store import ConversationStore
-from ..tools.wake import register_wake
-from .wakes import MAX_WAKE_RUN_COMPLETIONS, WakeActivation, WakeScheduler, wake_notice
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -19,12 +17,14 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..tools.wake import register_wake
 from .pending_delivery import (
     DeliveryPublications,
     StepDeliveryFlow,
     complete_delivery,
     delivery_preview,
 )
+from .wakes import MAX_WAKE_RUN_COMPLETIONS, WakeActivation, WakeScheduler, wake_notice
 
 WakeState = Literal["idle", "scheduled", "running"]
 
@@ -187,11 +187,26 @@ class AgentNotificationMixin:
         notice: Message,
         *,
         max_completions: int | None = None,
+        present_only: bool = False,
     ) -> AsyncIterator[StreamEvent]:
-        """Run one zeta-authored notice without representing it as user input."""
+        """Run or only present one zeta-authored system notice."""
 
         if notice.role is not MessageRole.SYSTEM:
             raise ValueError("harness notice must have the system role")
+        if present_only:
+            async def present() -> AsyncIterator[StreamEvent]:
+                self._turn_active = True
+                try:
+                    await self._append_turn_message(notice)
+                    yield StreamEvent(StreamEventType.AGENT_START)
+                    yield StreamEvent(StreamEventType.TURN_START, data={"turn": 0})
+                    yield StreamEvent(StreamEventType.MESSAGE_START)
+                    yield StreamEvent(StreamEventType.MESSAGE_END, message=notice)
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                finally:
+                    self._turn_active = False
+                    self._notification_turn_scheduled = False
+            return present()
         return self._run_turn(
             "",
             origin=MessageOrigin.HARNESS_NUDGE,
@@ -310,9 +325,11 @@ class AgentNotificationMixin:
         flow = self.step_delivery
         if flow is not None:
             flow.initialize_resident_edges()
-        if flow is None or not flow.has_pending_edge:
-            if self.notification_system_message() is None:
-                return False
+        if (
+            (flow is None or not flow.has_pending_edge)
+            and self.notification_system_message() is None
+        ):
+            return False
         self._notification_turn_scheduled = True
         return True
 
@@ -361,9 +378,11 @@ class AgentNotificationMixin:
         if activation is not None:
             self._scheduled_wake_activation = None
             if activation.admission is None:
-                return self.run_harness_notice_turn(wake_notice(activation))
+                return self.run_harness_notice_turn(wake_notice(activation), present_only=True)
             self.wake_scheduler.begin_wake_run(activation.admission)
-            return self.run_harness_notice_turn(wake_notice(activation))
+            return self.run_harness_notice_turn(
+                wake_notice(activation), max_completions=MAX_WAKE_RUN_COMPLETIONS
+            )
         self._abort_admitted = False
         return self._run_turn(
             "",

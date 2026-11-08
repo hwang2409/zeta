@@ -178,6 +178,7 @@ class AgentLoop(
         skill_home: Path | None = None,
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
+        parent_owned_wake_eligible: bool = False,
     ) -> None:
         if (
             type(max_agent_depth) is not int
@@ -1252,7 +1253,10 @@ class AgentLoop(
             )
         yield StreamEvent(
             StreamEventType.ERROR,
-            error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),
+            error=ErrorInfo(
+                "max_turns",
+                f"maximum turns reached: {max_completions if max_completions is not None else self.max_turns}",
+            ),
         )
         if self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")

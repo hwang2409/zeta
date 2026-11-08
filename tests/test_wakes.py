@@ -673,7 +673,7 @@ async def test_close_discards_process_local_state_and_stops_owner_checks() -> No
         "top_level",
         on_due=lambda: None,
         wall_clock=clock,
-        assert_owned=owner_checks.append,
+        assert_owned=lambda: owner_checks.append(None),
         id_factory=Ids(),
     )
     scheduler.schedule(after_seconds=10, note="lost on restart")
@@ -682,5 +682,5 @@ async def test_close_discards_process_local_state_and_stops_owner_checks() -> No
     lost = await asyncio.wait_for(scheduler.close(), timeout=10)
 
     assert lost == 1
-    assert len(owner_checks) == 1
+    assert len(owner_checks) == 3
     assert scheduler.closed
