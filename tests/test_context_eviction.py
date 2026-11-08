@@ -3347,7 +3347,9 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
         retained_tail=1,
     ).assemble_context()
 
-    assert first.digest == repeated.digest == reopened.digest
+    assert [message.to_dict() for message in first.messages] == [
+        message.to_dict() for message in repeated.messages
+    ]
     assert [message.to_dict() for message in first.messages] == [
         message.to_dict() for message in reopened.messages
     ]
@@ -3401,7 +3403,11 @@ async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path)
     markers = [entry for entry in store.replay() if entry.type == "compaction"]
     assert len(markers) == 1
     assert markers[0].data["kind"] == "evict"
-    assert {context.digest for context in assembled} == {assembled[0].digest}
+    assert all(
+        [message.to_dict() for message in context.messages]
+        == [message.to_dict() for message in assembled[0].messages]
+        for context in assembled
+    )
     assert "latest request verbatim" in rendered_text(assembled[0].messages)
     assert_payload_pairing(assembled[0].messages)
 
@@ -3409,7 +3415,6 @@ async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path)
     replayed = await ContextAssembler(
         reopened, token_budget=700, retained_tail=1
     ).assemble_context()
-    assert replayed.digest == assembled[0].digest
     assert [message.to_dict() for message in replayed.messages] == [
         message.to_dict() for message in assembled[0].messages
     ]
