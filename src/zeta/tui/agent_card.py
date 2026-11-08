@@ -23,6 +23,7 @@ from ..core.agent_progress import live_agent_lifecycle
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
+from ..core.transcript_recovery.runtime import repair_command_for_child_path
 from ..protocol.types import Message, ToolCall, is_passive_harness_message
 from . import theme
 from .cards.agent import (
@@ -519,7 +520,10 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     ]
     if bounded.marker is not None:
         result.insert(0, bounded.marker)
-    return result or ["transcript unavailable"]
+    if result:
+        return result
+    command = repair_command_for_child_path(path)
+    return [f"transcript corrupt; run {command}" if command else "transcript unavailable"]
 
 
 class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):

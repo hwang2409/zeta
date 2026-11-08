@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 3
+WRITER_EPOCH: Final = 4
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -142,7 +142,41 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "project.session_role": frozenset({"session", "orchestrator", "worker"}),
     "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
     "sent_message_ledger.schema_version": frozenset({1}),
+    "transcript_recovery.evidence_schema": frozenset({"zeta.transcript-quarantine.v1"}),
+    "transcript_recovery.state_schema": frozenset({"zeta.transcript-recovery.v1"}),
+    "transcript_recovery.state": frozenset({"pending", "committed", "abandoned"}),
+    "transcript_recovery.memory_step": frozenset(
+        {"not_required", "review_pending", "resumed"}
+    ),
+    "warning.transcript_recovery.kind": frozenset({"transcript_recovery"}),
 }
+
+STRICT_PAYLOAD_KEYS: Final[dict[str, frozenset[str]]] = {
+    "transcript_recovery.evidence": frozenset(
+        {
+            "schema", "quarantine_id", "target", "source_digest", "source_size",
+            "first_bad_row", "first_bad_offset", "valid_prefix_end",
+            "retained_last_sequence", "repaired_digest", "diagnosed_at",
+            "payload_digest", "payload_size",
+        }
+    ),
+    "transcript_recovery.state": frozenset(
+        {
+            "schema", "quarantine_id", "target", "state", "expected_source_digest",
+            "repaired_digest", "cutoff_sequence", "diagnosis_timestamp", "memory_step",
+        }
+    ),
+}
+RECOVERY_STATE_MEMORY_PAIRS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {
+        ("pending", "not_required"),
+        ("pending", "review_pending"),
+        ("committed", "not_required"),
+        ("committed", "review_pending"),
+        ("committed", "resumed"),
+        ("abandoned", "not_required"),
+    }
+)
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
@@ -657,6 +691,13 @@ class WriterLease:
         self.home = home
         self._entry = entry
         self._closed = False
+
+    @property
+    def observed_epoch(self) -> int:
+        """Return the home epoch observed when this lease was acquired."""
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        return self._entry.epoch
 
     def retain(self) -> WriterLease:
         if self._closed:

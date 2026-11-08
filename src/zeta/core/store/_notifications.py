@@ -218,9 +218,7 @@ class NotificationStateMixin:
                 or not options
                 or len(options) > 10
                 or any(
-                    type(option) is not str
-                    or not option.strip()
-                    or len(option) > 1_000
+                    type(option) is not str or not option.strip() or len(option) > 1_000
                     for option in options
                 )
             )
@@ -453,6 +451,7 @@ class NotificationStateMixin:
                 "notification_ack",
                 "notification_tui_presented",
                 "turn_end",
+                "warning",
             }:
                 data = copy.deepcopy(entry.data)
             else:
@@ -477,9 +476,7 @@ class NotificationStateMixin:
             self._active_notifications.values()
             if pending_only
             else (
-                entry
-                for entry in self._active_branch()
-                if entry.type == "notification"
+                entry for entry in self._active_branch() if entry.type == "notification"
             )
         )
         return [

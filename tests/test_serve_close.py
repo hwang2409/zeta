@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import ast
 import asyncio
-import subprocess
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,106 +9,25 @@ import pytest
 
 from tests.support.serve_close import close_serve
 
-_TESTS_ROOT = Path(__file__).resolve().parent
-_CLOSE_SERVE_CONDITION_FIX = (
-    "call close_serve unconditionally; pass optional writers as "
-    "*[w for w in (...) if w is not None]"
-)
 
-
-def _is_close_serve_call(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    return (isinstance(func, ast.Name) and func.id == "close_serve") or (
-        isinstance(func, ast.Attribute) and func.attr == "close_serve"
+def _run_owner_test(pytester: pytest.Pytester, source: str):
+    pytester.makeconftest('pytest_plugins = ("tests.conftest", "pytest_asyncio")')
+    pytester.makeini("[pytest]\nasyncio_mode = auto\n")
+    pytester.makepyfile(test_owner=source)
+    root = str(Path(__file__).resolve().parents[1])
+    old_pythonpath = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = (
+        root
+        if not old_pythonpath
+        else os.pathsep.join((root, old_pythonpath))
     )
-
-
-def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
-    """Line numbers of close_serve calls nested in an if/elif/else body.
-
-    close_serve owns serve-test cleanup; gating it behind a condition is the
-    recurring bug where an early failure skips the server/writer close and
-    leaks descriptors into the next test (PR #881 rounds 1-2). The guard has no
-    exemptions: a call that needs a condition is rewritten to the unconditional
-    form instead.
-    """
-    lines: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.If):
-            for branch in (node.body, node.orelse):
-                for statement in branch:
-                    for inner in ast.walk(statement):
-                        if _is_close_serve_call(inner):
-                            lines.add(inner.lineno)
-    return lines
-
-
-def _test_files() -> list[Path]:
-    root = _TESTS_ROOT.parent
-    result = subprocess.run(
-        ["git", "ls-files", "--", "tests/*.py", "tests/**/*.py"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if not result.stdout.splitlines():
-        raise RuntimeError("no tracked test files found")
-    return [root / path for path in result.stdout.splitlines()]
-
-
-def test_close_serve_is_never_called_under_a_condition() -> None:
-    offenders: list[str] = []
-    for path in _test_files():
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        root = _TESTS_ROOT.parent
-        offenders.extend(
-            f"{path.relative_to(root)}:{line}"
-            for line in sorted(_conditional_close_serve_lines(tree))
-        )
-    assert not offenders, (
-        "close_serve must not be nested inside an if/elif/else body "
-        f"({', '.join(offenders)}): {_CLOSE_SERVE_CONDITION_FIX}"
-    )
-
-
-def test_close_serve_guard_ignores_untracked_runtime_probe() -> None:
-    probe = _TESTS_ROOT / "test_zz_probe_tmp.py"
-    probe.write_text("def test_probe():\n    pass\n", encoding="utf-8")
     try:
-        files = _test_files()
-        assert _TESTS_ROOT / "test_serve_close.py" in files
-        assert probe not in files
+        return pytester.runpytest_subprocess("-q")
     finally:
-        probe.unlink()
-
-
-def test_test_files_fails_on_git_listing_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        raise subprocess.CalledProcessError(1, command, stderr="git listing failed")
-
-    monkeypatch.setattr(subprocess, "run", run)
-
-    with pytest.raises(subprocess.CalledProcessError) as error:
-        _test_files()
-    assert error.value.stderr == "git listing failed"
-
-
-def test_test_files_rejects_empty_git_listing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(command, 0, stdout="")
-
-    monkeypatch.setattr(subprocess, "run", run)
-
-    with pytest.raises(RuntimeError, match="no tracked test files found"):
-        _test_files()
+        if old_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = old_pythonpath
 
 
 @dataclass
@@ -126,6 +44,311 @@ class _Server:
         self.closed = True
         if self.fail:
             raise RuntimeError("server close failed")
+
+
+def test_server_owner_closes_after_body_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from pathlib import Path
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_leaked_server(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    await server.start()
+    original_close = server.close
+    async def close_and_prove():
+        await original_close()
+        assert not server.socket_path.exists()
+        assert server._server is None
+        Path("closed").write_text("closed")
+    server.close = close_and_prove
+    assert False, "original body failure"
+""",
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*AssertionError: original body failure*"])
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_app_owner_closes_after_body_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_leaked_app(tmp_path):
+    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty())
+    app = TUIApp(loop, provider="codex", model="offline")
+    cancelled = asyncio.Event()
+    async def active():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+    app._active_task = asyncio.create_task(active())
+    original_close = app.close
+    async def close_and_prove():
+        await original_close()
+        assert cancelled.is_set()
+        Path("closed").write_text("closed")
+    app.close = close_and_prove
+    assert False, "original body failure"
+""",
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*AssertionError: original body failure*"])
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_app_owner_reports_pending_task_on_closed_loop(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_pending_task_outlives_loop(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    foreign_loop = asyncio.new_event_loop()
+    async def active():
+        await asyncio.Event().wait()
+    task = foreign_loop.create_task(active(), name="outlives-closed-loop")
+    foreign_loop.close()
+    app._active_task = task
+    original_close = app.close
+    async def close_and_prove():
+        await original_close()
+        Path("closed").write_text("closed")
+    app.close = close_and_prove
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(
+        ["*TUIApp active task still pending on a closed event loop: *outlives-closed-loop*created at *"]
+    )
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_app_owner_accepts_done_task_on_closed_loop(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import threading
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_done_task_outlives_loop(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    tasks = []
+    def finish_task():
+        foreign_loop = asyncio.new_event_loop()
+        task = foreign_loop.create_task(asyncio.sleep(0), name="done-closed-loop")
+        foreign_loop.run_until_complete(task)
+        foreign_loop.close()
+        tasks.append(task)
+    thread = threading.Thread(target=finish_task)
+    thread.start()
+    await asyncio.wait_for(asyncio.to_thread(thread.join), 10)
+    app._active_task = tasks[0]
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
+def test_app_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_explicit_close(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    await app.close()
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
+def test_app_owner_reports_bounded_close_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_hanging_app_close(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    async def hang():
+        await asyncio.Event().wait()
+    app.close = hang
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*hang: TUIApp.close did not finish within 10 s*"])
+
+
+def test_two_apps_and_server_close_in_dependency_order(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.server import ZetaServer
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+def app(tmp_path):
+    return TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+
+@pytest.mark.asyncio
+async def test_owners(tmp_path):
+    first = app(tmp_path / "first")
+    second = app(tmp_path / "second")
+    for value in (first, second):
+        original = value.close
+        async def close(original=original):
+            await original()
+            with Path("order").open("a") as marker:
+                marker.write("a")
+        value.close = close
+    server = ZetaServer(home=tmp_path / "server", port=0, provider="codex")
+    await server.start()
+    original = server.close
+    async def close_server():
+        with Path("order").open("a") as marker:
+            marker.write("s")
+        await original()
+    server.close = close_server
+""",
+    )
+    result.assert_outcomes(passed=1)
+    assert (pytester.path / "order").read_text() == "aas"
+
+
+def test_server_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_explicit_close(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    await server.start()
+    await server.close()
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
+def test_server_owner_reports_bounded_close_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import pytest
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_hanging_close(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    async def hang():
+        await asyncio.Event().wait()
+    server.close = hang
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*ZetaServer.close did not finish within 10 s*"])
+
+
+def test_server_owner_closes_all_servers(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from pathlib import Path
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_two_servers(tmp_path):
+    servers = [
+        ZetaServer(home=tmp_path / str(index), port=0, provider="codex")
+        for index in range(2)
+    ]
+    for server in servers:
+        await server.start()
+        original_close = server.close
+        async def close_and_prove(server=server, original_close=original_close):
+            await original_close()
+            assert server._server is None
+            with Path("closed").open("a") as marker:
+                marker.write("x")
+        server.close = close_and_prove
+""",
+    )
+    result.assert_outcomes(passed=1)
+    assert (pytester.path / "closed").read_text() == "xx"
 
 
 class _Writer:
