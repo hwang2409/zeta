@@ -287,14 +287,6 @@ class AgentNotificationMixin:
             return "scheduled"
         return "idle"
 
-    def has_pending_notification_turn(self, notification_turn: bool) -> bool:
-        flow = self.step_delivery
-        return bool(
-            flow is not None
-            and flow.has_pending_edge
-            and (notification_turn or self.agent_depth > 0)
-        )
-
     def run_notification_turn(
         self,
         *,
