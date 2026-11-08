@@ -10,12 +10,14 @@ import logging
 import os
 import secrets
 import stat
+import threading
 from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.cli.main import build_parser
 from zeta.protocol.types import TextContent, ToolCall
@@ -744,4 +746,109 @@ async def test_websocket_child_history_reads_child(tmp_path: Path) -> None:
         result = (await _read_json(reader))["result"]
         assert result["messages"][0]["content"][0]["text"] == "websocket-child"
     finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_websocket_child_history_ignores_production_partial_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import Message, MessageRole
+
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    metadata = await server.runtime.create_session(provider="codex", model="offline", cwd=tmp_path)
+    root = server.runtime.opened.store
+    child = ConversationStore(
+        root.session_dir / "agents",
+        session_id="1",
+        _storage_lease=root._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{metadata.session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    await server.start()
+    reader, writer, status, _ = await _connect(
+        server, token=server._websocket.token, protocol_fields=["zeta.v1"]
+    )
+    assert status == 101
+    append_started = threading.Event()
+    release_append = threading.Event()
+    append_errors: list[BaseException] = []
+    original_write_bytes = ConversationStore._write_bytes
+
+    def split_write(target: ConversationStore, data: bytes) -> None:
+        if target is not child or append_started.is_set():
+            original_write_bytes(target, data)
+            return
+        original_write_bytes(target, data[:-1])
+        append_started.set()
+        assert release_append.wait(10)
+        original_write_bytes(target, data[-1:])
+
+    def append_message() -> None:
+        try:
+            child.append_message(Message(MessageRole.ASSISTANT, [TextContent("partial")]))
+        except BaseException as exc:  # noqa: BLE001 - transfer thread failure
+            append_errors.append(exc)
+
+    async def child_history(request_id: int) -> dict[str, object]:
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "child_run_history",
+                "params": {
+                    "session_id": metadata.session_id,
+                    "run_id": f"{metadata.session_id}:1",
+                },
+            },
+        )
+        return await _read_json(reader)
+
+    try:
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {
+                    "protocol_version": "1.2",
+                    "features": ["child_run_history"],
+                },
+            },
+        )
+        await _read_json(reader)
+        first = await child_history(2)
+        assert first["result"]["messages"][-1]["content"][0]["text"] == "complete"
+        monkeypatch.setattr(ConversationStore, "_write_bytes", split_write)
+        append_thread = threading.Thread(target=append_message)
+        append_thread.start()
+        try:
+            assert await await_or_fail(
+                asyncio.to_thread(append_started.wait, 10),
+                what="websocket production child append prefix",
+            )
+            during = await child_history(3)
+            assert during["result"]["messages"][-1]["content"][0]["text"] == "complete"
+        finally:
+            release_append.set()
+            await await_or_fail(
+                asyncio.to_thread(append_thread.join, 10),
+                what="websocket production child append completion",
+            )
+        assert not append_thread.is_alive()
+        assert not append_errors, append_errors
+        completed = await child_history(4)
+        assert completed["result"]["messages"][-1]["content"][0]["text"] == "partial"
+    finally:
+        release_append.set()
+        child.close()
         await close_serve(server, writer)

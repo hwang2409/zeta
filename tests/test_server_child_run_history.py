@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path
@@ -180,7 +182,7 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
 
 @pytest.mark.asyncio
 async def test_child_history_reads_closed_child_after_serve_restart(tmp_path: Path) -> None:
-    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    server, _reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = ConversationStore(
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
@@ -208,3 +210,285 @@ async def test_child_history_reads_closed_child_after_serve_restart(tmp_path: Pa
         assert continuation["result"]["messages"] == []
     finally:
         await close_serve(resumed, new_writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_rejects_malformed_request_shape_over_unix_socket(
+    tmp_path: Path,
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    invalid = (
+        {},
+        {"run_id": f"{session_id}:1"},
+        {"session_id": session_id},
+        {"session_id": 1, "run_id": f"{session_id}:1"},
+        {"session_id": session_id, "run_id": 1},
+        {"session_id": session_id, "run_id": f"{session_id}:1", "extra": True},
+    )
+    try:
+        for request_id, params in enumerate(invalid, start=3):
+            reply = (
+                await request(
+                    reader, writer, request_id, "child_run_history", params
+                )
+            )[-1]
+            assert reply["error"]["code"] == -32602, (params, reply)
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_reports_cached_stable_torn_tail_with_repair_offer(
+    tmp_path: Path,
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    child.close()
+    params = {"session_id": session_id, "run_id": f"{session_id}:1"}
+    try:
+        first = (await request(reader, writer, 3, "child_run_history", params))[-1]
+        assert "result" in first, first
+        transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+        with transcript.open("ab") as stream:
+            stream.write(b'{"type":"message"')
+        damaged = (await request(reader, writer, 4, "child_run_history", params))[-1]
+        assert damaged["error"]["data"] == {
+            "code": "corrupt_transcript",
+            "kind": "torn_tail",
+            "row": 3,
+            "repairable": True,
+            "session_id": session_id,
+            "actions": [
+                {
+                    "method": "repair_transcript",
+                    "session_id": session_id,
+                    "child_run_id": f"{session_id}:1",
+                    "requires_confirmation": True,
+                }
+            ],
+        }
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_preserves_corrupt_child_diagnosis_over_unix_socket(
+    tmp_path: Path,
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    child.close()
+    transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+    with transcript.open("ab") as stream:
+        stream.write(b"{not json}\n")
+    try:
+        damaged = (
+            await request(
+                reader,
+                writer,
+                3,
+                "child_run_history",
+                {"session_id": session_id, "run_id": f"{session_id}:1"},
+            )
+        )[-1]
+        assert damaged["error"]["code"] == -32000, damaged
+        assert damaged["error"]["data"]["code"] == "corrupt_transcript"
+        assert damaged["error"]["data"]["session_id"] == session_id
+        assert damaged["error"]["data"]["actions"][0]["child_run_id"] == f"{session_id}:1"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_bounds_persistent_source_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    child.close()
+    transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+    original_read_fd = ConversationStore._read_fd
+
+    def replace_after_every_read(fd: int, length: int) -> bytes:
+        raw = original_read_fd(fd, length)
+        if os.fstat(fd).st_ino == transcript.stat().st_ino:
+            replacement = transcript.with_suffix(".replacement")
+            replacement.write_bytes(raw)
+            os.replace(replacement, transcript)
+        return raw
+
+    monkeypatch.setattr(ConversationStore, "_read_fd", staticmethod(replace_after_every_read))
+    try:
+        replies = await await_or_fail(
+            request(
+                reader,
+                writer,
+                3,
+                "child_run_history",
+                {"session_id": session_id, "run_id": f"{session_id}:1"},
+            ),
+            what="bounded child history source-change request",
+        )
+        assert replies[-1]["error"]["code"] == -32009, replies[-1]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_rejects_replacement_during_continuation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("first")]))
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("second")]))
+    child.close()
+    params = {"session_id": session_id, "run_id": f"{session_id}:1"}
+    try:
+        first = (await request(reader, writer, 3, "child_run_history", params))[-1]["result"]
+        transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+        original_read_fd = ConversationStore._read_fd
+        replaced = False
+
+        def replace_after_read(fd: int, length: int) -> bytes:
+            nonlocal replaced
+            raw = original_read_fd(fd, length)
+            if not replaced and os.fstat(fd).st_ino == transcript.stat().st_ino:
+                replacement = transcript.with_suffix(".replacement")
+                replacement.write_bytes(b"".join(raw.splitlines(keepends=True)[:-1]))
+                os.replace(replacement, transcript)
+                replaced = True
+            return raw
+
+        monkeypatch.setattr(ConversationStore, "_read_fd", staticmethod(replace_after_read))
+        continuation = (
+            await request(
+                reader,
+                writer,
+                4,
+                "child_run_history",
+                {
+                    **params,
+                    "before": 1,
+                    "history_validator": first["history_validator"],
+                },
+            )
+        )[-1]
+        assert continuation["error"]["code"] == -32009, continuation
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_unix_ignores_production_partial_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    params = {"session_id": session_id, "run_id": f"{session_id}:1"}
+    append_started = threading.Event()
+    release_append = threading.Event()
+    append_errors: list[BaseException] = []
+    original_write_bytes = ConversationStore._write_bytes
+
+    def split_write(target: ConversationStore, data: bytes) -> None:
+        if target is not child or append_started.is_set():
+            original_write_bytes(target, data)
+            return
+        original_write_bytes(target, data[:-1])
+        append_started.set()
+        assert release_append.wait(10)
+        original_write_bytes(target, data[-1:])
+
+    def append_message() -> None:
+        try:
+            child.append_message(Message(MessageRole.ASSISTANT, [TextContent("partial")]))
+        except BaseException as exc:  # noqa: BLE001 - transfer thread failure
+            append_errors.append(exc)
+
+    try:
+        first = (await request(reader, writer, 3, "child_run_history", params))[-1]
+        assert first["result"]["messages"][-1]["content"][0]["text"] == "complete"
+        monkeypatch.setattr(ConversationStore, "_write_bytes", split_write)
+        append_thread = threading.Thread(target=append_message)
+        append_thread.start()
+        try:
+            assert await await_or_fail(
+                asyncio.to_thread(append_started.wait, 10),
+                what="production child append prefix",
+            )
+            during = (await request(reader, writer, 4, "child_run_history", params))[-1]
+            assert during["result"]["messages"][-1]["content"][0]["text"] == "complete"
+        finally:
+            release_append.set()
+            await await_or_fail(
+                asyncio.to_thread(append_thread.join, 10),
+                what="production child append completion",
+            )
+        assert not append_thread.is_alive()
+        assert not append_errors, append_errors
+        completed = (await request(reader, writer, 5, "child_run_history", params))[-1]
+        assert completed["result"]["messages"][-1]["content"][0]["text"] == "partial"
+    finally:
+        release_append.set()
+        child.close()
+        await close_serve(server, writer)

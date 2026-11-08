@@ -13,7 +13,13 @@ from ..checkpoints.mutation import (
     ConversationTargetOwned,
     commit_conversation_async,
 )
-from ._log import SCHEMA, InstalledEntriesDelta, PersistedAppend, TranscriptLoadError
+from ._log import (
+    SCHEMA,
+    InstalledEntriesDelta,
+    ObserverSnapshotChanged,
+    PersistedAppend,
+    TranscriptLoadError,
+)
 from ._store import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -89,6 +95,7 @@ __all__ = [
     "Mapping",
     "Message",
     "MessageRole",
+    "ObserverSnapshotChanged",
     "Path",
     "PendingPromptCommitTimeoutError",
     "PendingPromptQueue",

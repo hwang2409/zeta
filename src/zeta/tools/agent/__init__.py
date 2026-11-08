@@ -358,7 +358,7 @@ def _read_agent_output(
     limit: int | None,
     max_bytes: int,
     cached: tuple[tuple[int, bytes], str] | None = None,
-) -> tuple[tuple[int, int, int], str, bool, dict[str, object]]:
+) -> tuple[tuple[int, bytes], str, bool, dict[str, object]]:
     identity, output, cacheable = _read_agent_transcript(child_path, cached)
     result = _agent_output_page(
         output,

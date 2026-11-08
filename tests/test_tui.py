@@ -15351,6 +15351,7 @@ def test_agent_transcript_source_keeps_snapshot_during_active_append(
             assert release_writer.wait(10)
             original_write_bytes(target, data[-1:])
 
+        # test-contract: seam pauses one production append after its strict row prefix
         monkeypatch.setattr(ConversationStore, "_write_bytes", split_target_write)
         writer = threading.Thread(
             target=lambda: store.append_message(

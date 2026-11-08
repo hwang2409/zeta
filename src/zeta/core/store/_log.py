@@ -81,6 +81,10 @@ TranscriptFailureKind = Literal[
 ]
 
 
+class ObserverSnapshotChanged(ConversationIntegrityError):
+    """The observer could not validate one authoritative source view."""
+
+
 class TranscriptLoadError(ConversationIntegrityError):
     """A typed transcript refusal that never exposes persisted content or paths."""
 
@@ -99,6 +103,7 @@ class TranscriptLoadError(ConversationIntegrityError):
         source_inode: int,
         source_size: int,
         prefix_digest: str,
+        child_run_id: str | None = None,
         source_facts: TranscriptSourceFacts | None = None,
     ) -> None:
         self.kind = kind
@@ -113,6 +118,7 @@ class TranscriptLoadError(ConversationIntegrityError):
         self.source_inode = source_inode
         self.source_size = source_size
         self.prefix_digest = prefix_digest
+        self.child_run_id = child_run_id
         self._source_facts = source_facts
         location = f" at row {row_number}" if row_number is not None else ""
         detail = {
@@ -145,6 +151,11 @@ class TranscriptLoadError(ConversationIntegrityError):
                     {
                         "method": "repair_transcript",
                         "session_id": self.session_id,
+                        **(
+                            {"child_run_id": self.child_run_id}
+                            if self.child_run_id is not None
+                            else {}
+                        ),
                         "requires_confirmation": True,
                     }
                 ]
@@ -738,7 +749,9 @@ class ConversationLogMixin:
                 # later query synchronizes the append after the writer exits.
                 return
 
-    def _sync_observer_snapshot(self: ConversationStore) -> None:
+    def _sync_observer_snapshot(
+        self: ConversationStore, *, retry_source_change: bool = True
+    ) -> None:
         """Install only a validated prefix from one authoritative source view."""
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
@@ -747,7 +760,12 @@ class ConversationLogMixin:
         finally:
             os.close(fd)
         complete_end = raw.rfind(b"\n") + 1
-        if complete_end == getattr(self, "_log_offset", 0) and complete_end and self._known_prefix_matches_bytes(raw, complete_end):
+        if (
+            complete_end == g0.st_size
+            and complete_end == getattr(self, "_log_offset", 0)
+            and complete_end
+            and self._known_prefix_matches_bytes(raw, complete_end)
+        ):
             return
         candidate = raw[:complete_end]
         baseline = (len(self._entries), self._entry_prefix_digest)
@@ -767,7 +785,10 @@ class ConversationLogMixin:
             g1.st_size,
             g1.st_mtime_ns,
         ):
-            return self._sync_observer_snapshot() if not self._entries else None
+            replaced = (g0.st_dev, g0.st_ino) != (g1.st_dev, g1.st_ino)
+            if retry_source_change and (not self._entries or not replaced):
+                return self._sync_observer_snapshot(retry_source_change=False)
+            raise ObserverSnapshotChanged("observer transcript changed during read")
         if complete_end < g0.st_size and not self._observer_append_active():
             self._load()
             return
@@ -925,7 +946,7 @@ class ConversationLogMixin:
         prefix_end = valid_prefix_end or 0
         return TranscriptLoadError(
             kind=kind,
-            session_id=self.session_id,
+            session_id=self._repair_target.root_session_id,
             row_number=row_number,
             byte_offset=byte_offset,
             valid_prefix_end=valid_prefix_end,
@@ -939,6 +960,7 @@ class ConversationLogMixin:
             source_inode=stat.st_ino,
             source_size=stat.st_size,
             prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
+            child_run_id=self._repair_target.child_run_id,
             source_facts=(
                 TranscriptSourceFacts(
                     device=stat.st_dev,

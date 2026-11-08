@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..core.session_files import descend_directory
-from ..core.store import ConversationStore
+from ..core.store import ConversationStore, ObserverSnapshotChanged
 from ..core.store._child_runs import (
     child_run_segments,
     parse_child_run_id,
@@ -801,8 +801,17 @@ class ConnectionRegistry:
     async def read_child_run_history(
         self, connection: Any, params: dict[str, Any]
     ) -> object:
+        if (
+            set(params) - {"session_id", "run_id", "before", "history_validator"}
+            or type(params.get("session_id")) is not str
+            or type(params.get("run_id")) is not str
+        ):
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "session_id and run_id are required child history parameters",
+            )
         runtime = connection.server.runtime
-        if runtime.opened is None or params.get("session_id") != runtime.session_id:
+        if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
         target = (runtime.session_id, runtime.opened.store)
@@ -1026,9 +1035,16 @@ def perform_child_history_read(
 ) -> object:
     root_store = target[1]
     try:
-        reader = registry._child_reader_for(root_store, params["run_id"])
+        parse_child_run_id(root_store.session_id, params["run_id"])
     except ValueError as exc:
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid child run id") from exc
+    try:
+        reader = registry._child_reader_for(root_store, params["run_id"])
+    except ObserverSnapshotChanged as exc:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "child history source changed during read",
+        ) from exc
     except ProtocolError:
         raise
     except (FileNotFoundError, OSError) as exc:
@@ -1134,14 +1150,6 @@ def capture_read(
     fallback_config: Any = None,
 ) -> tuple[str | None, object]:
     runtime = client.server.runtime
-    if method == "child_run_history":
-        if set(params) - {"session_id", "run_id", "before", "history_validator"}:
-            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid child history parameters")
-        if type(params.get("session_id")) is not str or type(params.get("run_id")) is not str:
-            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id and run_id are required")
-        if runtime.opened is None or params["session_id"] != runtime.session_id:
-            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
-        return runtime.session_id, runtime.opened.store
     if method == "content_read":
         if set(params) - {"handle", "offset", "limit"}:
             raise ProtocolError(
