@@ -268,6 +268,7 @@ class BackgroundAgentOwner:
         for stores in self._active_stores.values():
             referenced.update(stores)
         for store in tuple(self._pending_stores - referenced):
+            # only an observed close failure is eligible for retry.
             existing = self._store_close_tasks_by_store.get(store)
             if existing is not None:
                 if existing not in self._observed_close_failures:
@@ -291,6 +292,7 @@ class BackgroundAgentOwner:
         store = self._store_close_stores.get(task)
         if store is not None:
             self._forget_closed_store(task, store)
+
     def _forget_closed_store(
         self, task: asyncio.Task[Any], store: ConversationStore
     ) -> None:
@@ -299,6 +301,7 @@ class BackgroundAgentOwner:
         self._store_close_tasks_by_store.pop(store, None)
         for collection in (self._pending_stores, self._stores):
             collection.discard(store)
+
     def register(
         self,
         instance_id: str,
