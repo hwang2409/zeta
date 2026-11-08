@@ -18104,7 +18104,9 @@ async def test_concurrent_cancel_requests_write_once_and_retry_after_failure(
         (first,) = owner.cancel_subtree(target_id)
         await asyncio.wait_for(first_write_entered.wait(), 10)
         second = request_child_cancel()
-        second_write = asyncio.create_task(second_write_entered.wait())
+        second_write = asyncio.create_task(
+            asyncio.wait_for(second_write_entered.wait(), 10)
+        )
         try:
             await asyncio.wait(
                 (second.confirmation, second_write),
@@ -18113,7 +18115,9 @@ async def test_concurrent_cancel_requests_write_once_and_retry_after_failure(
             )
         finally:
             second_write.cancel()
-            await asyncio.gather(second_write, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(second_write, return_exceptions=True), 10
+            )
         assert writes == ["mark_agent_canceled"], "second request wrote again"
         assert await asyncio.wait_for(second.confirmation, 10) is False
         await asyncio.wait_for(second.cleanup, 10)
