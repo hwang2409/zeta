@@ -11,6 +11,7 @@ import threading
 import weakref
 
 from ...core.session_files import open_session_file
+from ...storage_format import reject_unknown_keys
 
 _ARCHIVE_NAME = "background-output.archive"
 _JOURNAL_NAME = "background-output.journal"
@@ -253,7 +254,13 @@ class _BackgroundOutputArchive:
 
     @staticmethod
     def _validate_commit(value: object) -> tuple[str, int, int]:
-        if type(value) is not dict or set(value) != {"task_id", "offset", "length"}:
+        if type(value) is not dict:
+            raise OSError("background output journal record is invalid")
+        try:
+            reject_unknown_keys(value, "background_output_journal_commit")
+        except ValueError as exc:
+            raise OSError("background output journal record is invalid") from exc
+        if set(value) != {"task_id", "offset", "length"}:
             raise OSError("background output journal record is invalid")
         task_id = value["task_id"]
         offset = value["offset"]
