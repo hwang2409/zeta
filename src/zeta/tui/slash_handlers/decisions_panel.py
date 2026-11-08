@@ -281,6 +281,14 @@ class DecisionsMixin:
         self.request_decisions_refresh()
         self._invalidate_prompt()
 
+    def _stop_decisions_refresh(self) -> None:
+        # stop an in-flight panel scan before an explicit item action.
+        task = self._decisions_scan_task
+        self._decisions_scan_task = None
+        self._decisions_scan_requested.clear()
+        if task is not None and not task.done():
+            task.cancel()
+
     def close_decisions_panel(self) -> None:
         if not self._decisions_panel_open:
             return
