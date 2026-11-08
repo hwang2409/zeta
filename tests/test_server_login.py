@@ -12,6 +12,7 @@ import pytest
 
 from tests.support.login import block_loop_until_publication_decision_expires
 from tests.support.serve_close import close_serve
+from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _request
 from zeta.accounts import AccountStore
 from zeta.core import login_flow
@@ -127,6 +128,45 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert next(row for row in rows if row["provider"] == provider)["credentials_present"]
         assert (await rpc(reader, writer, "status"))["result"]["state"] == "idle"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.parametrize("orphan_appears", ["before_start", "during_browser"])
+async def test_login_refused_by_missing_registry_reports_the_cause(tmp_path, monkeypatch, orphan_appears):
+    home = tmp_path / "zeta"
+    other = home / "accounts" / "codex" / "work"
+    captured = {}
+    def build(state, challenge, redirect):
+        captured.update(state=state, redirect=redirect)
+        if orphan_appears == "during_browser":
+            other.mkdir(parents=True)
+        return "https://authorize.invalid/"
+    async def exchange(*args):
+        return OAuthTokens("access", "refresh", 4_000_000_000)
+    monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
+    monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
+    if orphan_appears == "before_start":
+        initialize_storage_home(home)
+        other.mkdir(parents=True)
+    server, reader, writer, _ = await connect(tmp_path)
+    expected = {"state": "failed", "error": {"code": "login_save_failed", "message": (
+        "accounts.json is missing but other account directories exist; "
+        "restore accounts.json before adding an account"
+    )}}
+    try:
+        result = (await rpc(reader, writer, "login_start", provider="claude"))["result"]
+        if orphan_appears == "during_browser":
+            assert result["state"] == "pending"
+            assert await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]}) == 200
+            await asyncio.wait_for(server._client.logins.tasks["claude"], 10)
+            result = (await rpc(reader, writer, "login_status", provider="claude"))["result"]
+        assert result == expected
+        if orphan_appears == "before_start":
+            assert captured == {}
+        assert (await rpc(reader, writer, "login_status", provider="claude"))["result"] == expected
+        assert not (home / "accounts.json").exists()
+        assert not (home / "accounts" / "anthropic").exists()
     finally:
         await close_serve(server, writer)
 

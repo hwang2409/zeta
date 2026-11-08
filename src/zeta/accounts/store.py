@@ -133,6 +133,16 @@ class AccountError(RuntimeError):
     """A credential-safe account-store error."""
 
 
+class AccountRegistryMissingError(AccountError):
+    """Adding an account would create a registry that orphans existing ones."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "accounts.json is missing but other account directories exist; "
+            "restore accounts.json before adding an account"
+        )
+
+
 class AccountCredentialLockTimeoutError(AccountError):
     """An account operation could not acquire its lifecycle lock in time."""
 
@@ -524,11 +534,7 @@ class AccountStore:
         value = value or self._read_registry(home_fd)
         self._check_reference_available(value, account, account.name)
         key = str(account)
-        if self._registering_would_orphan(home_fd, account):
-            raise AccountError(
-                "accounts.json is missing but other account directories exist; "
-                "restore accounts.json before adding an account"
-            )
+        self._refuse_orphaning_registration(home_fd, account)
         value["accounts"][key] = {
             "provider": account.provider,
             "name": account.name,
@@ -605,6 +611,16 @@ class AccountStore:
             except FileNotFoundError:
                 continue
         return orphans
+
+    def refuse_orphaning_registration(self, account: AccountId) -> None:
+        """Fail before a login starts if its registration would be refused."""
+
+        with self._home() as home_fd:
+            self._refuse_orphaning_registration(home_fd, account)
+
+    def _refuse_orphaning_registration(self, home_fd: int, account: AccountId) -> None:
+        if self._registering_would_orphan(home_fd, account):
+            raise AccountRegistryMissingError
 
     def _registering_would_orphan(self, home_fd: int, account: AccountId) -> bool:
         """A registry created without existing account dirs would sweep them next."""
@@ -1015,6 +1031,7 @@ class AccountCredentials:
         if registered:
             self._write(home_fd, tokens)
             return
+        self.store._refuse_orphaning_registration(home_fd, self.account)
         with _account_directory(home_fd, self.account) as account_fd:
             self.store._stage_account_tokens(account_fd, self.account, tokens)
         self.store._register_account(home_fd, self.account, value)

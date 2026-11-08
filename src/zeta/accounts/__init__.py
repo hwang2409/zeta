@@ -12,6 +12,7 @@ from .store import (
     AccountError,
     AccountId,
     AccountLoopThreadLockError,
+    AccountRegistryMissingError,
     AccountStore,
 )
 from .usage import AccountUsage
@@ -23,6 +24,7 @@ __all__ = [
     "AccountId",
     "AccountListSnapshot",
     "AccountLoopThreadLockError",
+    "AccountRegistryMissingError",
     "AccountStore",
     "AccountUsage",
     "SessionAccountContext",

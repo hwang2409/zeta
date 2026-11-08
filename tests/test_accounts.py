@@ -29,7 +29,7 @@ import zeta.oauth as oauth_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.login as provider_login_module
 import zeta.server.login as server_login
-from tests.support.account_homes import build_account_home
+from tests.support.account_homes import build_account_home, home_snapshot
 from tests.support.account_processes import (
     crash_logout,
     hold_account_credential_lock,
@@ -47,6 +47,7 @@ from zeta.accounts import (
     AccountStore,
     SessionAccountContext,
 )
+from zeta.accounts.login import login_named_account
 from zeta.agent.runner import resolve_child_backend
 from zeta.core.login_flow import LoginPublicationError
 from zeta.core.session import SessionManager, account_home
@@ -2157,21 +2158,112 @@ def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
     assert not path.parent.exists()
 
 
-def test_login_refuses_to_create_a_registry_that_orphans_existing_accounts(
-    tmp_path: Path,
+_MISSING_REGISTRY_REFUSAL = (
+    "accounts.json is missing but other account directories exist; "
+    "restore accounts.json before adding an account"
+)
+
+
+@pytest.mark.parametrize("step", ["before_browser", "at_publish"])
+def test_refused_login_leaves_the_home_byte_for_byte_unchanged(
+    tmp_path: Path, step: str
 ) -> None:
     existing = AccountId("codex", "work")
+    refused = AccountId("anthropic", "default")
     build_account_home(tmp_path, (existing,), available=(existing,))
+    registry = (tmp_path / "accounts.json").read_bytes()
     (tmp_path / "accounts.json").unlink()
-    credential = AccountStore(tmp_path).credential_path(existing)
-    before = credential.read_bytes()
+    store = AccountStore(tmp_path)
+    # Create every lock file the login opens first, so the snapshot holds them
+    # and any later file, directory, or lock content change is a failure.
+    store.migrate()
+    with store.provider_login_lock(refused.provider):
+        pass
+    with store.credential_guard(refused):
+        pass
+    files_before, directories_before = home_snapshot(tmp_path)
+    flows: list[str] = []
 
-    with pytest.raises(AccountError, match="accounts.json is missing"):
-        named_account_credentials(tmp_path, "anthropic", "new").save(tokens())
-    AccountStore(tmp_path).migrate()
+    async def browser_login(provider, _pkce) -> None:
+        flows.append(provider.name)
+        await asyncio.to_thread(provider.credential_store.save, tokens())
 
-    assert credential.read_bytes() == before
-    assert not (tmp_path / "accounts.json").exists()
+    with pytest.raises(AccountError, match="accounts.json is missing") as refusal:
+        if step == "before_browser":
+            login_named_account(
+                tmp_path, refused.provider, refused.name, login=browser_login
+            )
+        else:
+            named_account_credentials(tmp_path, refused.provider, refused.name).save(
+                tokens()
+            )
+
+    files_after, directories_after = home_snapshot(tmp_path)
+    assert files_after == files_before
+    assert directories_after == directories_before
+    assert flows == []
+    assert str(refusal.value) == _MISSING_REGISTRY_REFUSAL
+    (tmp_path / "accounts.json").write_bytes(registry)
+    store.migrate()
+    store.resolve_account(refused.provider)
+    assert not store.contains(refused)
+    assert store.contains(existing)
+
+
+@pytest.mark.asyncio
+async def test_tui_accounts_login_renders_the_missing_registry_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    existing = AccountId("codex", "work")
+    await asyncio.to_thread(
+        build_account_home, home, (existing,), available=(existing,)
+    )
+    (home / "accounts.json").unlink()
+    flows: list[str] = []
+
+    def build_url(state: str, challenge: str, redirect: str) -> str:
+        flows.append(redirect)
+        raise OSError("browser flow started")
+
+    monkeypatch.setattr(
+        provider_login_module, "build_anthropic_authorization_url", build_url
+    )
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    output = StringIO()
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=output, force_terminal=False, width=240),
+    )
+
+    async def login_rendered() -> None:
+        while "login failed" not in output.getvalue():
+            await asyncio.sleep(0.01)
+
+    try:
+        app._submissions.wake()
+        app._submissions.submit("/accounts login anthropic new", steer=False)
+        await asyncio.wait_for(login_rendered(), 10)
+
+        rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
+        assert f"login failed: {_MISSING_REGISTRY_REFUSAL}" in rendered
+        assert flows == []
+        assert not (home / "accounts" / "anthropic").exists()
+    finally:
+        await app._submissions.close()
+        await app.close()
+        opened.store.close()
 
 
 def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> None:
