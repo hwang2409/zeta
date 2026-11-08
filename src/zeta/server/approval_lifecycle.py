@@ -697,7 +697,7 @@ class ApprovalLifecycle:
         settlement = asyncio.create_task(self._settle_record(record, decision))
         self._change(record, settlement=settlement)
         try:
-            resolution = await settlement
+            resolution = await asyncio.shield(record.admitted)
         except OSError as exc:
             raise ProtocolError(
                 ErrorDescriptor.INTERNAL_ERROR, f"approval persistence failed: {exc}"
@@ -784,8 +784,11 @@ class ApprovalLifecycle:
                     "decision": "abort",
                     "reason": reason or "turn_canceled",
                 }
+                finish = asyncio.create_task(self._finish_record(record, synthetic))
                 try:
-                    await asyncio.shield(self._finish_record(record, synthetic))
+                    await asyncio.shield(finish)
+                except asyncio.CancelledError:
+                    await asyncio.shield(finish)
                 except BaseException as exc:
                     self._release_gate(record, error=exc)
                     raise
@@ -808,8 +811,6 @@ class ApprovalLifecycle:
         except BaseException as exc:
             self._release_gate(record, error=exc)
             raise
-        if result.cancelled:
-            raise asyncio.CancelledError
         return resolution
 
     def request_approval_abort(
