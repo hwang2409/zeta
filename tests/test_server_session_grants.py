@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from dataclasses import replace
 from io import StringIO
@@ -41,6 +42,60 @@ from zeta.tui.app import TUIApp
 
 FEATURES = ["session_grants"]
 PRECEDENCE = ["deny", "ask", "allow", "default"]
+
+
+async def _approve_after_external_end(
+    server: ZetaServer,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str,
+    request_id: int,
+    approval_request_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    approval_module = importlib.import_module("zeta.server.approval_lifecycle")
+    committed = asyncio.Event()
+    release = asyncio.Event()
+    external_entered = asyncio.Event()
+    original_persist = approval_module.persist_durably
+    original_finish = server.control._approvals._finish_record
+
+    async def gated_finish(record: object, resolution: dict[str, str]) -> None:
+        external_entered.set()
+        await original_finish(record, resolution)  # type: ignore[arg-type]
+
+    async def gated_persist(*args: object, **kwargs: object) -> object:
+        result = await original_persist(*args, **kwargs)
+        committed.set()
+        await await_or_fail(release.wait(), what="release durable approval")
+        return result
+
+    monkeypatch.setattr(approval_module, "persist_durably", gated_persist)
+    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
+    approve = asyncio.create_task(
+        _request(
+            reader,
+            writer,
+            request_id,
+            "approve",
+            {"request_id": approval_request_id, "scope": "always_tool"},
+        )
+    )
+    try:
+        await await_or_fail(committed.wait(), what="durable approval commit")
+        external_end = asyncio.create_task(
+            server.control._approvals.transition(
+                approval_module.ExternalEnd(approval_request_id, session_id, {})
+            )
+        )
+        await await_or_fail(external_entered.wait(), what="external approval finish")
+        await await_or_fail(external_end, what="external approval end")
+        release.set()
+        approve_frames = await await_or_fail(approve, what="approve response")
+        return approve_frames, list(_buffer(reader))
+    finally:
+        release.set()
 
 
 class _DelegatedBackend:
@@ -282,6 +337,7 @@ async def _hello_and_create(
 async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transport(
     tmp_path: Path,
     transport: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = ToolCall("call-1", "bash", {"command": "printf first"})
     second = ToolCall("call-2", "bash", {"command": "printf second"})
@@ -309,9 +365,24 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
 
         await _request(reader, writer, 3, "send", {"text": "first"})
         assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
-        await approve_and_collect_grant(
-            reader, writer, 4, "call-1", "always_tool", ["bash"]
+        approve_frames, buffered = await _approve_after_external_end(
+            server,
+            reader,
+            writer,
+            monkeypatch,
+            session_id=session_id,
+            request_id=4,
+            approval_request_id="call-1",
         )
+        assert approve_frames[-1]["result"]["accepted"] is True
+        grant_events = [
+            frame
+            for frame in buffered
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+        ]
+        assert len(grant_events) == 1, buffered
+        assert grant_events[0]["params"]["data"]["changed"] == ["bash"]
+        await _event(reader, "session_grants_changed")
 
         snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
         assert snapshot == {
@@ -1222,12 +1293,28 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
     reader, writer = await _connect(server)
     replacement_writer: asyncio.StreamWriter | None = None
     try:
-        await _hello_and_create(reader, writer)
+        _, session_id = await _hello_and_create(reader, writer)
         await _request(reader, writer, 3, "send", {"text": "grant"})
         await _event(reader, "approval_request")
-        await approve_and_collect_grant(
-            reader, writer, 4, "call-1", "always_tool", ["bash"]
+        approve_frames, buffered = await _approve_after_external_end(
+            server,
+            reader,
+            writer,
+            monkeypatch,
+            session_id=session_id,
+            request_id=4,
+            approval_request_id="call-1",
         )
+        assert approve_frames[-1]["result"]["accepted"] is True
+        grant_events = [
+            frame
+            for frame in buffered
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+        ]
+        assert len(grant_events) == 1, buffered
+        assert grant_events[0]["params"]["data"]["grants"]["session_grants"] == [
+            "bash"
+        ]
         await _frames_until_event(reader, "turn_end")
 
         assert server.connections is not None
