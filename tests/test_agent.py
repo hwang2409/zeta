@@ -19718,7 +19718,6 @@ async def test_session_host_commands_provider_retry_keeps_turn_snapshot(
 async def test_idle_child_wake_tool_count_is_cumulative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from zeta.tools.agent import _read_agent_status
 
-    monkeypatch.setitem(AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True))
     idle_seen = asyncio.Event()
     original_transition = run_consumer_module._transition_idle
 
@@ -19728,8 +19727,8 @@ async def test_idle_child_wake_tool_count_is_cumulative(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
     child_call = ToolCall("background-agent", "agent", {"prompt": "work", "description": "background", "agent_type": "run", "background": True})
-    finish_one = ToolCall("finish-one", "finish", {"status": "done", "summary": "first"})
-    finish_two = ToolCall("finish-two", "finish", {"status": "done", "summary": "second"})
+    finish_one = ToolCall("ask-one", "ask_parent", {"question": "first"})
+    finish_two = ToolCall("ask-two", "ask_parent", {"question": "second"})
     backend = PerActorFakeBackend(
         [ScriptedTurn(tool_calls=[child_call])],
         {"work": [
