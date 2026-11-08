@@ -960,9 +960,9 @@ class _Client:
             )
         if method == "slash_run":
             text = _required_string(params, "text")
-            if (
-                self.server.control.turn_busy()
-                and not await slash_commands.can_run_while_busy(runtime, text)
+            registry = await slash_commands.registry_for_request(runtime)
+            if self.server.control.turn_busy() and not slash_commands.can_run_while_busy(
+                registry, text
             ):
                 await self.server.control.require_idle()
             register = self.server.control.model_input_registrar(self.features)
@@ -973,6 +973,7 @@ class _Client:
                 approval_control=self.server.control,
                 run_blocking=self.server.control._run_blocking,
                 busy=self.server.control.turn_busy(),
+                registry=registry,
             )
         await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
