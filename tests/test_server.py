@@ -9996,6 +9996,81 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
 
 
 @pytest.mark.asyncio
+async def test_slash_list_runs_while_busy_matches_the_busy_gate_for_every_row(
+    tmp_path: Path,
+) -> None:
+    from tests.support.server_backend import ServerFakeBackend
+    from zeta.protocol.types import StreamEventType
+
+    project = _seed_slash_fixtures(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class PausedBackend(ServerFakeBackend):
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
+                yield event
+                if event.type == StreamEventType.MESSAGE_UPDATE:
+                    started.set()
+                    await asyncio.wait_for(release.wait(), 10)
+
+    server = ZetaServer(
+        home=tmp_path / "home",
+        cwd=project,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_args: (PausedBackend(delay=0), "offline"),
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        catalog = (
+            await _request(
+                reader,
+                writer,
+                "catalog",
+                "slash_list",
+                {"session_id": sid, "include_unavailable": True},
+            )
+        )[-1]["result"]["commands"]
+        policies = {row["name"]: row.get("runs_while_busy") for row in catalog}
+        # Every kind of row is covered: builtins, macros, skills.
+        assert {"status", "plan", "approve", "review", "local", "greet"} <= set(
+            policies
+        )
+        # Bare /plan toggles nothing but is still refused while busy (the gate's
+        # policy is ServeSlash() with no read form).
+        assert policies["plan"] == "never"
+        await _request(reader, writer, "send", "send", {"text": "slow"})
+        await asyncio.wait_for(started.wait(), TIMEOUT)
+
+        async def busy_run(text: str) -> dict[str, Any]:
+            return (
+                await _request(
+                    reader, writer, text, "slash_run", {"session_id": sid, "text": text}
+                )
+            )[-1]
+
+        # A form each read_forms command refuses; "x" for commands with no args form.
+        mutating_args = {"plan": "write a plan"}
+        for name, policy in policies.items():
+            bare = await busy_run(f"/{name}")
+            with_args = await busy_run(f"/{name} {mutating_args.get(name, 'x')}")
+            if policy == "always":
+                assert "result" in bare and "result" in with_args, (name, bare, with_args)
+            elif policy == "never":
+                assert bare.get("error", {}).get("code") == -32004, (name, bare)
+                assert with_args.get("error", {}).get("code") == -32004, (name, with_args)
+            else:
+                assert policy == "read_forms", (name, policy)
+                assert "result" in bare, (name, bare)
+                assert with_args.get("error", {}).get("code") == -32004, (name, with_args)
+    finally:
+        release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_session_loads_private_instructions_from_linked_worktree(
     tmp_path: Path,
 ) -> None:

@@ -19,7 +19,7 @@ from typing import Protocol
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
-from ..core.commands.slash_registry import SlashSurface
+from ..core.commands.slash_registry import BusyPolicy, SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
@@ -83,6 +83,7 @@ class SlashCommandInfo:
     source: str
     client_only: bool
     unavailable: str | None
+    runs_while_busy: BusyPolicy | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -92,6 +93,7 @@ class SlashCommandInfo:
             "source": self.source,
             "client_only": self.client_only,
             "unavailable": self.unavailable,
+            "runs_while_busy": self.runs_while_busy,
         }
 
 
@@ -525,20 +527,36 @@ async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
+    policy = _busy_policy(registry, name, text)
+    if policy is BusyPolicy.READ_FORMS:
+        command = registry.command_for(name)
+        return command is not None and command.serve is not None and (
+            command.serve.can_run_while_busy(tail)
+        )
+    return policy is BusyPolicy.ALWAYS
+
+
+def _busy_policy(
+    registry: SlashCommandRegistry, name: str, text: str
+) -> BusyPolicy | None:
+    """Return the busy gate's policy for one command, or None when unknown."""
+
     command = registry.command_for(name)
     if command is not None:
         if not registry.available(command):
-            return True
-        return command.serve is not None and command.serve.can_run_while_busy(tail)
+            return BusyPolicy.ALWAYS
+        return BusyPolicy.NEVER if command.serve is None else command.serve.busy_policy
     custom = registry.custom_command_for(name)
     if custom is not None:
-        return custom.kind == "exec" or registry.needs_inline_shell_resolution(text)
+        resolves_in_client = custom.kind == "exec" or (
+            registry.needs_inline_shell_resolution(text)
+        )
+        return BusyPolicy.ALWAYS if resolves_in_client else BusyPolicy.NEVER
     if any(skill.name == name for skill in registry.skill_entries):
-        return False
-    return any(
-        prompt_name == name
-        for prompt_name, _description, _source in registry.mcp_prompt_entries
-    )
+        return BusyPolicy.NEVER
+    if any(entry[0] == name for entry in registry.mcp_prompt_entries):
+        return BusyPolicy.ALWAYS
+    return None
 
 
 async def run_command(
@@ -653,6 +671,9 @@ def _entries_from_registry(
                     source="builtin",
                     client_only=unavailable is not None,
                     unavailable=unavailable,
+                    runs_while_busy=_busy_policy(
+                        registry, command.name, f"/{command.name}"
+                    ),
                 )
             )
     for command in registry.custom_commands:
@@ -671,6 +692,9 @@ def _entries_from_registry(
                     source=command.source,
                     client_only=unavailable is not None,
                     unavailable=unavailable,
+                    runs_while_busy=_busy_policy(
+                        registry, command.name, f"/{command.name}"
+                    ),
                 )
             )
     for skill in registry.skill_entries:
@@ -682,6 +706,7 @@ def _entries_from_registry(
                 source=skill.source,
                 client_only=False,
                 unavailable=None,
+                runs_while_busy=_busy_policy(registry, skill.name, f"/{skill.name}"),
             )
         )
     if include_unavailable:
@@ -694,6 +719,7 @@ def _entries_from_registry(
                     source=f"mcp:{source}",
                     client_only=True,
                     unavailable=_UNAVAILABLE_REASON,
+                    runs_while_busy=_busy_policy(registry, name, f"/{name}"),
                 )
             )
     return entries
