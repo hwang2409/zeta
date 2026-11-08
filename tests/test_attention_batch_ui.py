@@ -378,3 +378,98 @@ async def test_cancelled_tui_adapter_still_checks_late_publication(
         release.set()
         owner.store.close()
         await app.loop.close()
+
+
+def _rendered_text(app: TUIApp, width: int = 120, height: int = 30) -> str:
+    session = app._active_session
+    session.app.output = _FixedOutput()
+    # A real redraw bumps this; controls cache their text per render.
+    session.app.render_counter += 1
+    screen = Screen()
+    session.layout.update_parents_relations()
+    with set_app(session.app):
+        session.layout.container.write_to_screen(
+            screen, MouseHandlers(), WritePosition(0, 0, width, height), "", False, None
+        )
+        screen.draw_all_floats()
+    return "\n".join(
+        "".join(screen.data_buffer[y][x].char for x in range(width))
+        for y in range(height)
+    )
+
+
+def _wait_for_staged(replies: AttentionReplies, count: int) -> None:
+    deadline = time.monotonic() + 9
+    while time.monotonic() < deadline:
+        if len(replies.recover().staged) == count:
+            return
+        threading.Event().wait(0.01)
+    raise AssertionError(f"{count} replies were not staged before deadline")
+
+
+@pytest.mark.asyncio
+async def test_tui_marks_staged_rows_and_counts_them_until_flush(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "alpha", "git"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    records = await await_or_fail(
+        asyncio.to_thread(_records, owner, project.project_id),
+        what="create attention records",
+    )
+    app = await _make_app(tmp_path, owner, owner.store.session_id)
+    restarted = None
+    replies = AttentionReplies(tmp_path, owner.store.session_id)
+    try:
+        await app._decisions_tick()
+        assert "● 3 attention items" in _rendered_text(app)
+        _press(app, "1")
+        await await_or_fail(
+            asyncio.to_thread(_wait_for_staged, replies, 1), what="stage first"
+        )
+        _press(app, "j")
+        _press(app, "1")
+        await await_or_fail(
+            asyncio.to_thread(_wait_for_staged, replies, 2), what="stage second"
+        )
+        await app._decisions_tick()
+        text = _rendered_text(app)
+        rows = {
+            r.title: line
+            for r in records
+            for line in text.splitlines()
+            if f"{r.title}  decision" in line
+        }
+        assert "staged: yes" in rows["Pick 0"], text
+        assert "staged: yes" in rows["Pick 1"], text
+        assert "staged:" not in rows["Pick 2"], text
+        assert "● 1 open, 2 staged" in text, text
+
+        # A new TUI on the same session reads the staged replies from disk.
+        restarted = await _make_app(tmp_path, owner, owner.store.session_id)
+        await restarted._decisions_tick()
+        assert "● 1 open, 2 staged" in _rendered_text(restarted)
+        restarted.close_decisions_panel()
+
+        _press(app, "escape")
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                _wait_for_records,
+                tmp_path,
+                owner.store.session_id,
+                {r.id for r in records[:2]},
+            ),
+            10,
+        )
+        await app._decisions_tick()
+        text = _rendered_text(app)
+        assert "staged:" not in text and "open," not in text, text
+        assert "● 1 attention item" in text, text
+    finally:
+        owner.store.close()
+        if restarted is not None:
+            await restarted.loop.close()
+        await app.loop.close()
