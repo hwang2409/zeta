@@ -115,7 +115,6 @@ class ProjectRequests:
             registry=self.registry,
             runtime=runtime,
             codec=codec,
-            invalid=RequestValidationError,
         )
 
     def project_sessions(self, project_id: object) -> list[Any]:
@@ -517,12 +516,10 @@ class EntryProjectViews:
         registry: ProjectRegistry,
         runtime: Any,
         codec: FrameCodec,
-        invalid: Callable[[str], Exception],
     ) -> None:
         self.registry = registry
         self.runtime = runtime
         self.codec = codec
-        self.invalid = invalid
 
     def show(self, request_id: str | int, project: Project) -> dict[str, object]:
         sessions = self.runtime.manager.list_sessions_read_only()
@@ -554,7 +551,7 @@ class EntryProjectViews:
         project: Project,
         params: dict[str, Any],
     ) -> dict[str, object]:
-        self._only(
+        ProjectRequests._only(
             params,
             {
                 "project_id",
@@ -569,11 +566,11 @@ class EntryProjectViews:
         version = params.get("version_id")
         entry_id = params.get("entry_id")
         if entry_id is not None and (not isinstance(entry_id, str) or not entry_id):
-            raise self.invalid("entry_id must be a non-empty string")
+            raise RequestValidationError("entry_id must be a non-empty string")
         if version is not None:
             return self._version(request_id, project, params, version, entry_id)
-        offset = self._integer(params, "offset", 0, minimum=0)
-        limit = self._integer(
+        offset = ProjectRequests._integer(params, "offset", 0, minimum=0)
+        limit = ProjectRequests._integer(
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
         records = self.registry._entry_memory_log(
@@ -590,17 +587,17 @@ class EntryProjectViews:
         entry_id: object,
     ) -> dict[str, object]:
         if not isinstance(version, str) or not version:
-            raise self.invalid("version_id must be a non-empty string")
-        offset = self._integer(params, "offset", 0, minimum=0)
-        limit = self._integer(
+            raise RequestValidationError("version_id must be a non-empty string")
+        offset = ProjectRequests._integer(params, "offset", 0, minimum=0)
+        limit = ProjectRequests._integer(
             params,
             "limit",
             DEFAULT_VERSION_ENTRY_LIMIT,
             minimum=1,
             maximum=MAX_VERSION_ENTRY_LIMIT,
         )
-        source_offset = self._integer(params, "source_offset", 0, minimum=0)
-        source_limit = self._integer(
+        source_offset = ProjectRequests._integer(params, "source_offset", 0, minimum=0)
+        source_limit = ProjectRequests._integer(
             params,
             "source_limit",
             DEFAULT_VERSION_SOURCE_LIMIT,
@@ -619,7 +616,9 @@ class EntryProjectViews:
             )
         }
         if entry_id is not None and entry_id not in touched:
-            raise self.invalid(f"memory version does not touch entry: {entry_id}")
+            raise RequestValidationError(
+                f"memory version does not touch entry: {entry_id}"
+            )
         if isinstance(entry_id, str):
             touched = {entry_id}
         before_entries, before_count, before_next = self._entries(
@@ -759,27 +758,6 @@ class EntryProjectViews:
             if self.codec.response_fits(request_id, result) or not page:
                 return result
             page.pop()
-
-    def _only(self, params: dict[str, Any], allowed: set[str]) -> None:
-        unknown = set(params) - allowed
-        if unknown:
-            raise self.invalid(f"unknown parameter: {min(unknown)}")
-
-    def _integer(
-        self,
-        params: dict[str, Any],
-        name: str,
-        default: int,
-        *,
-        minimum: int,
-        maximum: int | None = None,
-    ) -> int:
-        value = params.get(name, default)
-        if type(value) is not int or value < minimum or (
-            maximum is not None and value > maximum
-        ):
-            raise self.invalid(f"{name} is out of range")
-        return value
 
     @staticmethod
     def _project_metadata(project: Project, sessions: list[Any]) -> dict[str, object]:

@@ -24,6 +24,7 @@ from ..protocol.types import (
     with_message_origin,
 )
 from . import event_contract
+from .handlers import validation
 from .protocol import ErrorDescriptor, ProtocolError
 
 if TYPE_CHECKING:
@@ -120,7 +121,7 @@ class DeliveryRequests:
     async def send_images(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
-        from .handlers import send_images, validation
+        from .handlers import send_images
 
         control = self._control
         runtime = control.server.runtime
@@ -226,7 +227,7 @@ class DeliveryRequests:
         control._reject_if_unhealthy()
         if not control.turn_busy():
             raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, "no turn is running")
-        text = _required_string(params, "text")
+        text = validation.required_string(params, "text")
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
         )
@@ -470,15 +471,6 @@ def _require_feature(features: frozenset[str], feature: str, param: str) -> None
             ErrorDescriptor.INVALID_PARAMS,
             f"{param} requires negotiated feature '{feature}'",
         )
-
-
-def _required_string(params: dict[str, Any], name: str) -> str:
-    value = params.get(name)
-    if not isinstance(value, str) or not value:
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string"
-        )
-    return value
 
 
 def _required_delivery_id(params: dict[str, Any]) -> str:
