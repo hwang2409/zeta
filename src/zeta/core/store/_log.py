@@ -746,7 +746,7 @@ class ConversationLogMixin:
             raw = self._read_fd(fd, g0.st_size)
         finally:
             os.close(fd)
-        complete_end = raw.rfind(b"\\n") + 1
+        complete_end = raw.rfind(b"\n") + 1
         if complete_end == getattr(self, "_log_offset", 0) and complete_end and self._known_prefix_matches_bytes(raw, complete_end):
             return
         candidate = raw[:complete_end]
