@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 import zeta.providers.transport as transport_module
+from tests.support.completion import completion_control
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from zeta.protocol.types import StreamEventType
 from zeta.providers.anthropic import (
@@ -121,7 +122,7 @@ def _setup(provider: ProviderContract, tmp_path: Path, handler: Any):
 
 
 async def _collect(backend: Any):
-    return [event async for event in backend.complete([], [])]
+    return [event async for event in backend.complete([], [], control=completion_control())]
 
 
 @pytest.mark.asyncio

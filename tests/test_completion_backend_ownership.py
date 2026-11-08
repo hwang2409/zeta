@@ -16,6 +16,12 @@ from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import Message, StreamEvent, ToolSchema
+from zeta.providers.completion import (
+    CompletionControl,
+    CompletionRetryBudget,
+    ResetPolicy,
+    owned_completion,
+)
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import CloseOutcome, close_transport_resources
 from zeta.runtime.loop import AgentLoop
@@ -27,7 +33,20 @@ async def _within(awaitable):
 
 
 async def _consume(backend) -> list[StreamEvent]:
-    return [event async for event in backend.complete([], [])]
+    completion = backend.complete(
+        [],
+        [],
+        control=CompletionControl(
+            abort=None,
+            reset=ResetPolicy.NO_RESET,
+            budget=CompletionRetryBudget(),
+            task_deadline=None,
+        ),
+    )
+    try:
+        return [event async for event in completion]
+    finally:
+        await completion.aclose()
 
 
 class _Response:
@@ -73,6 +92,7 @@ class _RecordingBackend:
         self.client = _RecordingClient()
         self.retired = False
 
+    @owned_completion
     def complete(
         self, _messages: list[Message], _tool_schemas: list[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
