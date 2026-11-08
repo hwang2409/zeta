@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import uuid
 from contextlib import contextmanager
@@ -2055,10 +2056,16 @@ def test_initial_pointerless_project_snapshot_is_validated_and_published(
     monkeypatch: pytest.MonkeyPatch,
     kind: str,
 ) -> None:
+    # A fresh system temp dir, as on CI: transfer validation must neither depend
+    # on nor write a stored-format manifest there.
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(system_temp))
     snapshot, project_id = _pointerless_project_snapshot(tmp_path)
     remote = tmp_path / "remote"
     _publish_initial_project(kind, remote, snapshot, project_id, tmp_path, monkeypatch)
 
+    assert not (system_temp / "storage-format.json").exists()
     registry = ProjectRegistry(remote / "projects")
     assert registry.show_project(project_id).project_id == project_id
     assert set(dict(registry.load_memory(project_id))) == {

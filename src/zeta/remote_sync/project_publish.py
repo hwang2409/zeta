@@ -84,35 +84,54 @@ def prepare_project_transfer(project: Path) -> PreparedTransfer:
             with path.open("rb") as stream:
                 archive.addfile(member, stream)
     archive_bytes = output.getvalue()
-    with materialize_project_transfer(
-        PreparedTransfer(archive_bytes, ""), project.name, verify_digest=False
-    ) as extracted:
-        digest = transfer_digest(extracted)
+    with _unpacked_transfer(archive_bytes, project.name) as (snapshot, digest):
+        _validate_transfer(snapshot, project.name)
     return PreparedTransfer(archive_bytes, digest)
 
 
 @contextmanager
 def materialize_project_transfer(
-    prepared: PreparedTransfer,
-    project_id: str,
-    *,
-    verify_digest: bool = True,
+    prepared: PreparedTransfer, project_id: str
 ) -> Iterator[Path]:
     """Extract and validate one immutable prepared payload in a private directory."""
 
-    with tempfile.TemporaryDirectory(prefix="zeta-project-transfer-") as temporary:
-        snapshot = Path(temporary) / project_id
-        snapshot.mkdir(mode=0o700)
-        _extract_archive(prepared.archive_bytes, snapshot)
-        digest = transfer_digest(snapshot)
-        if verify_digest and digest != prepared.transfer_digest:
+    with _unpacked_transfer(prepared.archive_bytes, project_id) as (snapshot, digest):
+        if digest != prepared.transfer_digest:
             raise ProjectPublicationError("project transfer digest does not match")
-        _validate_snapshot(snapshot, project_id)
-        if __package__:
-            from .memory import _validate_project_snapshot
-
-            _validate_project_snapshot(snapshot, project_id)
+        _validate_transfer(snapshot, project_id)
         yield snapshot
+
+
+@contextmanager
+def _unpacked_transfer(
+    archive_bytes: bytes, project_id: str
+) -> Iterator[tuple[Path, str]]:
+    """Extract a payload and digest it before validation can add lock files.
+
+    The snapshot sits under its own ``projects`` directory so validation opens a
+    private zeta home, never the system temp directory.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="zeta-project-transfer-") as temporary:
+        if __package__:
+            from ..storage_format import open_writer
+
+            # Bootstrap the private home while it is still empty.
+            with open_writer(temporary):
+                pass
+        snapshot = Path(temporary) / "projects" / project_id
+        snapshot.parent.mkdir(mode=0o700)
+        snapshot.mkdir(mode=0o700)
+        _extract_archive(archive_bytes, snapshot)
+        yield snapshot, transfer_digest(snapshot)
+
+
+def _validate_transfer(snapshot: Path, project_id: str) -> None:
+    _validate_snapshot(snapshot, project_id)
+    if __package__:
+        from .memory import _validate_project_snapshot
+
+        _validate_project_snapshot(snapshot, project_id)
 
 
 def _extract_archive(archive_bytes: bytes, destination: Path) -> None:
