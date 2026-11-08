@@ -174,11 +174,11 @@ async def test_session_project_preparation_does_not_block_ping(
             else server.runtime.resume_session(request["session_id"])
         )
         progress = asyncio.create_task(asyncio.sleep(0))
-        await progress
+        await asyncio.wait_for(progress, 10)
         assert not operation.done()
         release.set()
         holder.join(2)
-        await operation
+        await asyncio.wait_for(operation, 10)
     finally:
         if "release" in locals():
             release.set()
@@ -603,11 +603,11 @@ async def test_serve_project_instructions_does_not_block_loop_tick(
             run_command(server.runtime, "/project-instructions")
         )
         progress = asyncio.create_task(asyncio.sleep(0))
-        await progress
+        await asyncio.wait_for(progress, 10)
         assert not operation.done()
         release.set()
         holder.join(2)
-        result = await operation
+        result = await asyncio.wait_for(operation, 10)
         assert result["kind"] == "output"
     finally:
         if "release" in locals():
@@ -723,7 +723,7 @@ async def test_serve_shutdown_with_registry_reader_held_exits_bounded(
     finally:
         release.set()
         holder.join(2)
-        await asyncio.gather(request, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio

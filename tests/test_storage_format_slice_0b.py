@@ -664,6 +664,7 @@ async def test_tui_project_dispatch_reads_storage_off_loop(
 
     # test-contract: seam records real registry transactions across TUI dispatch
     monkeypatch.setattr(registry, "_identity_read", recording_read)
+    # test-contract: seam records real registry transactions across TUI dispatch
     monkeypatch.setattr(registry, "_project_lock", recording_lock)
 
     class Tui(SlashHandlerMixin):

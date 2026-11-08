@@ -547,11 +547,11 @@ async def test_project_instructions_does_not_block_status_on_registry_lock(
         status = await app._slash_commands.dispatch_async(app, "/status")
         assert status
         progress = asyncio.create_task(asyncio.sleep(0))
-        await progress
+        await asyncio.wait_for(progress, 10)
         assert not operation.done()
         release.set()
         holder.join(2)
-        result = await operation
+        result = await asyncio.wait_for(operation, 10)
         assert result.startswith(f"opened {home / 'projects'}")
         assert result.endswith("/AGENTS.md")
     finally:
