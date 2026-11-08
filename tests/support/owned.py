@@ -69,12 +69,17 @@ async def await_or_fail[T](
 async def close_owned_app(app: TUIApp) -> None:
     """Cancel an app's active task, then close the app."""
     # test-contract: seam test cleanup owns the private active provider task.
-    if app._active_task is not None:
-        await _cancel_and_drain(
-            [app._active_task],
-            timeout=10,
-            what="owned app active task",
-        )
+    task = app._active_task
+    if task is not None:
+        current_loop = asyncio.get_running_loop()
+        if task.get_loop() is current_loop:
+            await _cancel_and_drain(
+                [task],
+                timeout=10,
+                what="owned app active task",
+            )
+        elif not task.get_loop().is_closed():
+            task.cancel()
     await app.close()
 
 
