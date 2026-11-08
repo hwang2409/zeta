@@ -1102,6 +1102,7 @@ async def _collect_second_delegated_approval(
     frames: list[dict[str, Any]] = []
 
     async def collect() -> tuple[dict[str, Any] | None, str]:
+        child_instance_id: str | None = None
         while True:
             buffered = _buffer(reader)
             if buffered:
@@ -1114,6 +1115,20 @@ async def _collect_second_delegated_approval(
             frames.append(frame)
             params = frame.get("params", {})
             event = params.get("event")
+            tool_call = params.get("tool_call", {})
+            if event == "tool_end" and tool_call.get("id") == "agent-2":
+                structured = params.get("tool_result", {}).get(
+                    "structured_content", {}
+                )
+                value = structured.get("child_instance_id")
+                child_instance_id = value if isinstance(value, str) else None
+            if (
+                child_instance_id is not None
+                and event == "sub_agent_receipt"
+                and params.get("data", {}).get("child_instance_id")
+                == child_instance_id
+            ):
+                return None, "child run end"
             if event == "agent_end" and not release_child.is_set():
                 release_child.set()
             if (
