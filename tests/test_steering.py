@@ -20,6 +20,7 @@ from rich.console import Console
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.providers.completion as completion_module
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import BudgetExceeded, ContextAssembler
 from zeta.core.store import ConversationStore
@@ -434,7 +435,7 @@ class _BlockingNotificationBackend(CompletionBackend):
             return
         self.started.set()
         yield StreamEvent(StreamEventType.MESSAGE_START)
-        await self.release.wait()
+        await await_or_fail(self.release.wait(), what="self.release.wait()")
 
 
 def _notification_app(tmp_path: Path, backend: CompletionBackend) -> TUIApp:

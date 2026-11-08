@@ -159,6 +159,8 @@ class AgentNotificationMixin:
     def run_harness_notice_turn(
         self,
         notice: Message,
+        *,
+        task_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Run one zeta-authored notice without representing it as user input."""
 
@@ -168,6 +170,7 @@ class AgentNotificationMixin:
             "",
             origin=MessageOrigin.HARNESS_NUDGE,
             system_message=notice,
+            task_deadline=task_deadline,
         )
 
     def run_turn(
@@ -208,6 +211,7 @@ class AgentNotificationMixin:
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
         allow_assistant_reset: bool = True,
+        task_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         if turn_context is not None:
             if system_message is not None:
@@ -227,6 +231,7 @@ class AgentNotificationMixin:
             host_environment=host_environment,
             host_instruction=host_instruction,
             allow_assistant_reset=allow_assistant_reset,
+            task_deadline=task_deadline,
         )
         try:
             async for event in stream:
@@ -306,6 +311,7 @@ class AgentNotificationMixin:
         on_turn_context_persisted: Callable[[], None] | None = None,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        task_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         if (
             not self._notification_turn_scheduled
@@ -322,4 +328,5 @@ class AgentNotificationMixin:
             on_turn_context_persisted=on_turn_context_persisted,
             host_environment=host_environment,
             host_instruction=host_instruction,
+            task_deadline=task_deadline,
         )

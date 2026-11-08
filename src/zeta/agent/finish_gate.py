@@ -13,7 +13,6 @@ from ..protocol.types import (
     StreamEvent,
     harness_notice,
 )
-from ..providers.completion import reset_active_task_deadline, set_active_task_deadline
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -238,7 +237,6 @@ class FinishGateState:
             deadline = min(deadline, self._task_deadline())
         registry = owner.causal_episodes
         token = registry.enter(episode)
-        deadline_token = set_active_task_deadline(self._task_deadline)
         try:
             async with asyncio.timeout_at(deadline):
                 try:
@@ -270,7 +268,6 @@ class FinishGateState:
                 task_running=task_registry.running_count > 0,
             )
         finally:
-            reset_active_task_deadline(deadline_token)
             registry.leave(token)
         task_existed = (
             task_running_at_entry
@@ -364,6 +361,10 @@ class FinishGateState:
         assert self.child_deadline is not None
         return self.child_deadline
 
+    def completion_task_deadline(self, child_loop: AgentLoop) -> float | None:
+        """Bound a gate turn's provider completion while tasks still run."""
+        return self._task_deadline() if self.owned_tasks(child_loop) else None
+
     def _task_deadline(self) -> float:
         assert self.task_deadline is not None
         return self.task_deadline
@@ -432,7 +433,10 @@ async def _run_finish_gate(
     try:
         result = await state.run_model_turn(
             child_loop,
-            child_loop.run_harness_notice_turn(finish_gate_message(children, tasks)),
+            child_loop.run_harness_notice_turn(
+                finish_gate_message(children, tasks),
+                task_deadline=state.completion_task_deadline(child_loop),
+            ),
             consume_events,
         )
         if result is not None:
@@ -511,7 +515,9 @@ async def _handle_pending_notification(
             return await state.wait_transition(child_loop, tasks_running=tasks_running)
     return await state.run_model_turn(
         child_loop,
-        child_loop.run_notification_turn(),
+        child_loop.run_notification_turn(
+            task_deadline=state.completion_task_deadline(child_loop)
+        ),
         consume_events,
         episode,
     )

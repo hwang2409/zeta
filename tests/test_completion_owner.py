@@ -22,6 +22,7 @@ from zeta.providers.completion import (
     DeadlineClock,
     ProviderAttempt,
     ResetPolicy,
+    TaskDeadlineExceeded,
     TransportActivity,
 )
 
@@ -400,3 +401,93 @@ async def test_transport_only_activity_does_not_reset_model_progress_deadline() 
     assert retry.type is StreamEventType.RETRY
     assert retry.data["is_stall"] is True
     assert stalled.read_cancelled is True
+
+
+class _BlockingCloseAttempt(_SequenceAttempt):
+    """One stream item, then a response-context close that blocks."""
+
+    def __init__(self, *, slow_cancel: asyncio.Event | None = None) -> None:
+        super().__init__(
+            AttemptSignal(
+                TransportActivity.MODEL_PROGRESS,
+                StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="partial"),
+            )
+        )
+        self.slow_cancel = slow_cancel
+        self.close_started = asyncio.Event()
+        self.close_cancelled = asyncio.Event()
+        self.close_finished = asyncio.Event()
+
+    async def aclose(self) -> None:
+        self.close_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.close_cancelled.set()
+            if self.slow_cancel is not None:
+                await self.slow_cancel.wait()
+            raise
+        finally:
+            self.close_finished.set()
+
+
+def _deadline_control(task_deadline: float) -> CompletionControl:
+    return CompletionControl(
+        abort=None,
+        reset=ResetPolicy.ALLOW_ASSISTANT_RESET,
+        budget=CompletionRetryBudget(),
+        task_deadline=task_deadline,
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_deadline_bounds_the_stream_close() -> None:
+    clock = _ManualClock()
+    attempt = _BlockingCloseAttempt()
+    backend = _AttemptBackend([attempt], clock)
+    completion = backend.complete([], [], control=_deadline_control(30.0))
+    event = await _within(completion.__anext__())
+    assert event.delta == "partial"
+    closing = asyncio.create_task(completion.aclose())
+    try:
+        await _within(attempt.close_started.wait())
+        await _within(clock.waiter_added.wait())
+        clock.advance(30.0)
+        with pytest.raises(TaskDeadlineExceeded):
+            await _within(closing)
+        assert attempt.close_cancelled.is_set()
+        assert attempt.close_finished.is_set()
+        assert not backend.client_close_started
+    finally:
+        if not closing.done():
+            closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_outer_cancel_during_task_deadline_drain_waits_for_close() -> None:
+    clock = _ManualClock()
+    slow_cancel = asyncio.Event()
+    attempt = _BlockingCloseAttempt(slow_cancel=slow_cancel)
+    backend = _AttemptBackend([attempt], clock)
+    completion = backend.complete([], [], control=_deadline_control(30.0))
+    await _within(completion.__anext__())
+    closing = asyncio.create_task(completion.aclose())
+    try:
+        await _within(attempt.close_started.wait())
+        await _within(clock.waiter_added.wait())
+        clock.advance(30.0)
+        await _within(attempt.close_cancelled.wait())
+        closing.cancel()
+        await asyncio.sleep(0)
+        assert not closing.done()
+        slow_cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _within(closing)
+        assert attempt.close_finished.is_set()
+        assert not backend.client_close_started
+    finally:
+        slow_cancel.set()
+        if not closing.done():
+            closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)

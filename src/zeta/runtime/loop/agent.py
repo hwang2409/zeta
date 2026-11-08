@@ -75,7 +75,6 @@ from ...providers.completion import (
     CompletionRetryBudget,
     CompletionRun,
     ResetPolicy,
-    active_task_deadline,
 )
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
@@ -725,6 +724,7 @@ class AgentLoop(
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
         allow_assistant_reset: bool = True,
+        task_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         self._advance_project_context_recovery()
@@ -926,7 +926,7 @@ class AgentLoop(
                             else ResetPolicy.NO_RESET
                         ),
                         budget=provider_retry_budget,
-                        task_deadline=active_task_deadline(),
+                        task_deadline=task_deadline,
                     ),
                 )
                 has_active_delivery = prepared_delivery.has_active_delivery

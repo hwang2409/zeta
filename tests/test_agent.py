@@ -1595,7 +1595,7 @@ class FinishGateBackend(CompletionBackend):
             blocks = [ToolUseContent(child)]
         elif last_user == "grandchild prompt":
             self.grandchild_started.set()
-            await self.release_grandchild.wait()
+            await await_or_fail(self.release_grandchild.wait(), what="self.release_grandchild.wait()")
             blocks = [TextContent("evidence ready")]
         elif grandchild_started and gate is None and not notification:
             blocks = [TextContent("premature child answer")]
@@ -1650,7 +1650,7 @@ class FinishGateBackend(CompletionBackend):
                     )
                 ]
             elif self.gate_action == "stall":
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
             else:
                 blocks = [TextContent("I will wait for the evidence.")]
         elif notification:
@@ -1725,7 +1725,7 @@ class PostCapBudgetBackend(CompletionBackend):
             )
             blocks = [ToolUseContent(grandchild)]
         elif last_user == "grandchild prompt":
-            await self.release_grandchild.wait()
+            await await_or_fail(self.release_grandchild.wait(), what="self.release_grandchild.wait()")
             blocks = [TextContent("grandchild complete")]
         elif last_user.startswith("edge prompt"):
             blocks = [TextContent("edge complete")]

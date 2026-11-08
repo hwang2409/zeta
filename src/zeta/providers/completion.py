@@ -267,24 +267,6 @@ class AuthCapableProviderAttempt(ProviderAttempt, Protocol):
 _ACTIVITY_REPORTER: ContextVar[Callable[[TransportActivity], None] | None] = (
     ContextVar("provider_activity_reporter", default=None)
 )
-_ACTIVE_TASK_DEADLINE: ContextVar[float | None | Callable[[], float | None]] = ContextVar(
-    "completion_task_deadline", default=None
-)
-
-
-def active_task_deadline() -> float | None:
-    deadline = _ACTIVE_TASK_DEADLINE.get()
-    return deadline() if callable(deadline) else deadline
-
-
-def set_active_task_deadline(
-    deadline: float | None | Callable[[], float | None],
-) -> object:
-    return _ACTIVE_TASK_DEADLINE.set(deadline)
-
-
-def reset_active_task_deadline(token: object) -> None:
-    _ACTIVE_TASK_DEADLINE.reset(token)  # type: ignore[arg-type]
 
 
 def report_transport_activity(
@@ -550,13 +532,6 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._maximum_progress_gap = 0.0
         self._retry_usage: dict[str, Any] | None = None
 
-    def _task_deadline(self) -> float | None:
-        return (
-            self._control.task_deadline
-            if self._control.task_deadline is not None
-            else active_task_deadline()
-        )
-
     def __aiter__(self) -> CompletionRun:
         return self
 
@@ -596,7 +571,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 raise error
             except BaseException as error:
                 if isinstance(error, asyncio.CancelledError):
-                    deadline = self._task_deadline()
+                    deadline = self._control.task_deadline
                     if deadline is not None and self._clock.now() >= deadline:
                         current = asyncio.current_task()
                         if current is not None:
@@ -666,12 +641,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._model_deadline = now + self._model_idle
 
     async def _read_signal(self, attempt: ProviderAttempt) -> AttemptSignal:
+        task_deadline = self._control.task_deadline
         deadline = min(
             self._transport_deadline,
             self._model_deadline,
-            self._task_deadline()
-            if self._task_deadline() is not None
-            else float("inf"),
+            float("inf") if task_deadline is None else task_deadline,
         )
         read_task = asyncio.create_task(attempt.__anext__())
         timer_task = asyncio.create_task(self._clock.wait_until(deadline))
@@ -681,10 +655,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             )
             if read_task in done:
                 return read_task.result()
-            if (
-                self._task_deadline() is not None
-                and self._task_deadline() <= self._transport_deadline
-                and self._task_deadline() <= self._model_deadline
+            if task_deadline is not None and task_deadline <= min(
+                self._transport_deadline, self._model_deadline
             ):
                 raise TaskDeadlineExceeded("finish-gate task safety bound expired")
             kind = (
@@ -873,6 +845,12 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             await self._close_attempt(attempt)
         except BaseException as cleanup_error:
             primary_error = primary if isinstance(primary, BaseException) else None
+            if isinstance(cleanup_error, TaskDeadlineExceeded) and not (
+                primary_error is not None and is_control_exception(primary_error)
+            ):
+                # the task deadline is terminal and wins over any outcome
+                # except the caller's own cancellation.
+                raise cleanup_error from primary_error
             producer_error = getattr(attempt, "_producer_error", None)
             if (
                 primary_error is None
@@ -917,7 +895,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             raise selected
 
     async def _close_attempt(self, attempt: ProviderAttempt) -> None:
-        deadline = self._task_deadline()
+        deadline = self._control.task_deadline
         if deadline is None:
             await attempt.aclose()
             return
