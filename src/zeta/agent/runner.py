@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
+from ..core.agent_progress import publish_child_started
 from ..core.checkpoints import _now
 from ..core.project_context import ProjectContext
 from ..core.slash import effective_budget_for_model
@@ -721,6 +722,7 @@ async def run_agent_tool(
         raise
     loop._background_owner.store_leases.enter_context(child_store)
     loop._background_owner.track_store(child_store)
+    child_store.accepts_follow_ups = follow_up_loop
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)
     # Persist the parent marker first. A crash after this point is
@@ -752,7 +754,7 @@ async def run_agent_tool(
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     try:
-        await loop.store.append_child_run_started_async(
+        started_entry = await loop.store.append_child_run_started_async(
             child_instance_id,
             parent_identity if loop.agent_instance_id is not None else None,
             stored_agent_type,
@@ -764,6 +766,12 @@ async def run_agent_tool(
         loop._background_owner.release_unused_stores()
         await loop._background_owner.wait_for_store_closes()
         raise
+    publish_child_started(
+        child_instance_id,
+        started_entry.seq,
+        started_entry.data,
+        accepts_follow_ups=follow_up_loop,
+    )
     account_context = getattr(loop, "account_context", None)
     child_account_pins = (
         await asyncio.to_thread(

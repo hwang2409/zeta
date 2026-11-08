@@ -103,6 +103,9 @@ def validate_child_run_started_data(data: Mapping[str, Any]) -> None:
 
 
 class ChildRunStoreMixin:
+    # process-local, never persisted: the runner sets it before the child starts
+    accepts_follow_ups: bool = False
+
     def append_child_run_started(
         self: ConversationStore,
         run_id: str,

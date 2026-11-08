@@ -9,6 +9,8 @@ from collections.abc import Callable, Mapping
 from enum import Enum, StrEnum
 from typing import Any
 
+from ..core.child_run_row import CHILD_RUN_EVENTS_USES
+
 logger = logging.getLogger(__name__)
 
 
@@ -211,6 +213,9 @@ class EventDescriptor(StrEnum):
     USER_MESSAGE = "user_message"
     SESSION_GRANTS_CHANGED = "session_grants_changed"
     REPLAY_STREAM_ENDED = "replay_stream_ended"
+    CHILD_STARTED = "child_started"
+    CHILD_PROGRESS = "child_progress"
+    CHILD_ENDED = "child_ended"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -241,6 +246,7 @@ FEATURES = (
     "session_history_fidelity",
     "session_replay_seq",
     "child_run_history",
+    "child_run_events",
     "served_turn_end",
     "content_read",
     "session_grants",
@@ -279,6 +285,7 @@ class MethodDescriptor(Enum):
         Access.READ,
     )
     CHILD_RUN_HISTORY = ("child_run_history", "1.1", "child_run_history", Access.READ)
+    CHILD_RUN_EVENTS = ("child_run_events", "1.1", "child_run_events", Access.READ)
     CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)
     SWITCH_BRANCH = ("switch_branch", "1.1", None, Access.SESSION_MUTATION)
     FORK_MESSAGE = ("fork_message", "1.1", None, Access.SESSION_MUTATION)
@@ -348,6 +355,14 @@ class MethodDescriptor(Enum):
             and (role != "observer" or item.access is Access.READ)
         ]
         return sorted(methods) if role == "observer" else methods
+
+
+# child_run_events is advertised only when every feature it relies on is negotiated
+CHILD_RUN_EVENTS_PREREQUISITES = frozenset(
+    descriptor.feature
+    for descriptor in map(MethodDescriptor.for_wire, CHILD_RUN_EVENTS_USES)
+    if descriptor is not None and descriptor.feature is not None
+)
 
 
 Handler = Callable[[object, str | int, dict[str, object]], object]

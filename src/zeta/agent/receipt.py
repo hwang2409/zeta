@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, Literal, Protocol
 
+from ..core.agent_progress import publish_child_ended
 from ..core.checkpoints import ConversationEntry
 from ..protocol.types import (
     Message,
@@ -752,13 +753,31 @@ def finalize_agent_results(
             new_results.append((call, result))
         results.append(result)
     for call, result in new_results:
-        owner.store.append_message(
+        foreground_child = (
+            owner._agent_child_stores.get(call.id)
+            if call.name == "agent"
+            and not (
+                result.structured_content is not None
+                and result.structured_content.get("status") == "running"
+            )
+            else None
+        )
+        if foreground_child is not None and result.is_canceled:
+            # the lifecycle is final before the parent installs the receipt
+            foreground_child.mark_agent_canceled(call.id)
+        receipt = owner.store.append_message(
             Message(
                 MessageRole.TOOL_RESULT,
                 [TextContent(result.content)],
                 tool_result=result,
             )
         )
+        if foreground_child is not None:
+            handle = foreground_child.agent_handle()
+            if handle is not None:
+                publish_child_ended(
+                    handle, receipt.seq, foreground_child.agent_lifecycle()
+                )
         if owner.hooks is not None:
             owner.hooks.post_tool(call.name, result.content)
         if call.name == "agent":
@@ -769,19 +788,16 @@ def finalize_agent_results(
             if is_background:
                 continue
             child_store = owner._agent_child_stores.pop(call.id, None)
-            if child_store is not None:
-                if result.is_canceled:
-                    child_store.mark_agent_canceled(call.id)
-                else:
-                    from .adoption import adopt_agent_children
+            if child_store is not None and not result.is_canceled:
+                from .adoption import adopt_agent_children
 
-                    adopt_agent_children(
-                        child_store,
-                        owner.store,
-                        background_owner=owner._background_owner,
-                        parent_instance_id=owner.agent_instance_id,
-                    )
-                    child_store.finish_agent_parent()
+                adopt_agent_children(
+                    child_store,
+                    owner.store,
+                    background_owner=owner._background_owner,
+                    parent_instance_id=owner.agent_instance_id,
+                )
+                child_store.finish_agent_parent()
             if child_store is not None:
                 prefix = owner.agent_instance_id or owner.store.session_id
                 owner.store.finish_agent_child(f"{prefix}:{child_store.session_id}")
