@@ -2,7 +2,7 @@ from zeta.skills import SkillCatalog
 
 import asyncio
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from io import StringIO
 from pathlib import Path
@@ -21,6 +21,7 @@ from zeta.core.context import ContextAssembler
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.model_input import ModelInputEnvelope
 from zeta.core.slash import (
+    SlashStatusSnapshot,
     MODEL_CONTEXT_WINDOWS,
     MODEL_PRICES,
     CompactionSummary,
@@ -36,6 +37,8 @@ from zeta.core.slash import (
     budget_for_model,
     resolve_session_budget,
 )
+from zeta.core.commands.slash_registry import SlashLock
+from zeta.context_eviction.token_estimates import estimated_tokens
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.providers import PROVIDER_MODELS
@@ -65,10 +68,11 @@ from zeta.protocol.types import (
 @dataclass(frozen=True, slots=True)
 class FakeSlashSession:
     status: SlashStatus
+    slash_lock: SlashLock = field(default_factory=SlashLock)
 
-    def slash_status_command(self, args: str) -> str:
+    def slash_status_input(self, args: str) -> tuple[bool, SlashStatusSnapshot]:
         del args
-        return _format_status(self.status)
+        return False, SlashStatusSnapshot(self.status, (), estimated_tokens)
 
     def slash_status(self) -> SlashStatus:
         return self.status
@@ -461,7 +465,7 @@ skill_catalog=SkillCatalog.empty(),
         model="model-live",
         approval_policy=policy,
     )
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
+    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
 
     assert output is not None
     assert f"session_id: {store.session_id}" in output
@@ -487,15 +491,17 @@ skill_catalog=SkillCatalog.empty(),
     assert "output_tokens_this_session: 4" in output
 
 
+
+def _compaction_token_count(message: Message) -> int:
+    # Module level: /status passes the counter to its worker thread.
+    if message.role is MessageRole.COMPACTION or message.metadata.get(
+        "compaction_summary"
+    ):
+        return 1
+    return 40
+
 @pytest.mark.asyncio
 async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
-    def token_count(message: Message) -> int:
-        if message.role is MessageRole.COMPACTION or message.metadata.get(
-            "compaction_summary"
-        ):
-            return 1
-        return 40
-
     backend = FakeBackend(
         [
             ScriptedTurn(
@@ -518,7 +524,7 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         backend=backend,
         token_budget=164,
         retained_tail=1,
-        token_counter=token_count,
+        token_counter=_compaction_token_count,
     )
     loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
@@ -526,7 +532,7 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
     await app._consume_turn("first")
     await app._consume_turn("second")
 
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
+    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
 
     assert output is not None
     assert "tokens_used_this_session: 70" in output
@@ -1137,8 +1143,7 @@ def test_status_renders_compaction_history_and_empty_state() -> None:
         session().status,
         compaction_history=(CompactionSummary(3, 4, 120),),
     )
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(FakeSlashSession(status), "/status")
-    assert output is not None
+    output = _format_status(status)
     assert "compaction_history:\n  turn 3: 4 entries, 120 tokens saved" in output
 
 
@@ -1446,6 +1451,8 @@ def test_empty_message_does_nothing() -> None:
 
 def test_model_command_shows_and_changes_the_model() -> None:
     class ModelSession:
+        slash_lock = SlashLock()
+
         def __init__(self) -> None:
             self.model = "offline"
 
@@ -1470,6 +1477,8 @@ def test_model_command_shows_and_changes_the_model() -> None:
 @pytest.mark.asyncio
 async def test_compact_command_uses_async_dispatch() -> None:
     class CompactSession:
+        slash_lock = SlashLock()
+
         def slash_status(self) -> SlashStatus:
             return session().status
 
@@ -1488,6 +1497,8 @@ async def test_compact_command_uses_async_dispatch() -> None:
 @pytest.mark.asyncio
 async def test_mcp_command_dispatches_status_and_reconnect() -> None:
     class MCPTestSession:
+        slash_lock = SlashLock()
+
         async def slash_mcp(self, args: str) -> str:
             return f"mcp args: {args}"
 

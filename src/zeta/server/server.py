@@ -971,7 +971,7 @@ class _Client:
                 text,
                 register_model_input=register,
                 approval_control=self.server.control,
-                run_blocking=self.server.control._run_blocking,
+                slash_lock=self.server.control.slash_lock,
                 busy=self.server.control.turn_busy(),
             )
         await self.server.control.require_idle()
@@ -1090,6 +1090,9 @@ class _Client:
             "store": runtime.opened.store if runtime.opened is not None else None,
         }
         status.update(suffix)
+        slash_command = self.server.control.slash_lock.status()
+        if slash_command is not None:
+            status["slash_command"] = slash_command
         return status
 
     def _list_sessions(

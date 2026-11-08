@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, fields, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from pathlib import PurePath
+from types import FunctionType, MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 from ...mcp.client import MCPPrompt
 from ...mcp.prompt_commands import MCPPromptCommands, SlashPromptError, dispatch_prompt
@@ -15,6 +18,7 @@ from ...model_input import ModelInputEnvelope, skill_model_input
 from ...protocol.types import MessageOrigin
 from ...skills import SkillCatalog, SkillMeta, is_slash_safe_name, load_skill_prompt
 from ...skills.invocation import dollar_skill_mentions
+from ..checkpoints import ConversationEntry
 from .custom_commands import (
     CustomCommand,
     InlineShellRunner,
@@ -34,6 +38,12 @@ type SlashResult = (
     | Awaitable[str | ModelInputEnvelope | SlashPromptError]
 )
 type SlashHandler = Callable[[SlashSession, str], SlashResult]
+type _Outcome = str | ModelInputEnvelope | SlashPromptError | None
+type _Route = tuple[str | None, Callable[[SlashLock], Awaitable[_Outcome]]]
+
+
+async def _resolved(value: _Outcome) -> _Outcome:
+    return value
 
 
 def _never(_args: str) -> bool:
@@ -60,17 +70,217 @@ class SlashSurface(StrEnum):
     SERVE = "serve"
 
 
+def waiting_message(holder: str) -> str:
+    return f"waiting for {holder} to finish"
+
+
+def _ignore(_value: object) -> None:
+    return None
+
+
+class SlashLock:
+    """One per live session: serializes slash dispatch.
+
+    Lock order: runtime session-execution lease (process lifetime) -> this
+    asyncio lock -> operation-local identity/project/shape file locks. It is
+    awaited only in ``hold``, from ``SlashCommandRegistry.dispatch_async`` on an
+    event-loop task; those file locks are taken in synchronous code, which
+    cannot await this lock while it holds one.
+    """
+
+    def __init__(
+        self,
+        *,
+        contended: Callable[[str], None] = _ignore,
+        waiting: Callable[[str], None] = _ignore,
+        # Both receive the holder label, such as "/status".
+        late_output: Callable[[object], None] = _ignore,
+    ) -> None:
+        self._lock = asyncio.Lock()
+        self._contended = contended
+        self._waiting = waiting
+        self.late_output = late_output
+        self._owner: asyncio.Task[Any] | None = None
+        self._holder: str | None = None
+        self._state = "running"
+
+    @property
+    def holder(self) -> str | None:
+        return self._holder
+
+    def status(self) -> dict[str, str] | None:
+        """Project the current holder for status surfaces."""
+
+        if self._holder is None:
+            return None
+        return {"name": self._holder, "state": self._state}
+
+    @asynccontextmanager
+    async def hold(self, label: str) -> AsyncIterator[None]:
+        task = asyncio.current_task()
+        if task is not None and self._owner is task:
+            raise RuntimeError(
+                f"{self._holder} cannot dispatch {label} while holding the slash lock"
+            )
+        if self._lock.locked() and self._holder is not None:
+            self._contended(self._holder)
+        async with self._lock:
+            self._owner, self._holder, self._state = task, label, "running"
+            try:
+                yield
+            finally:
+                self._owner = self._holder = None
+
+    def defer_cancellation(self) -> None:
+        """Show that a cancelled holder is finishing its started worker."""
+
+        self._state = "waiting"
+        if self._holder is not None:
+            self._waiting(self._holder)
+
+
+_SCALARS = (type(None), bool, int, float, str, bytes, PurePath)
+
+
+def _check_frozen(value: object, name: str) -> None:
+    if isinstance(value, _SCALARS):
+        return
+    if type(value) is tuple:
+        for item in value:
+            _check_frozen(item, name)
+        return
+    if type(value) is MappingProxyType:
+        for key, item in value.items():
+            _check_frozen(key, name)
+            _check_frozen(item, name)
+        return
+    if isinstance(value, ConversationEntry):
+        return  # resident append-only transcript rows, shared with workers on main
+    if (
+        isinstance(value, FunctionType)
+        and value.__closure__ is None
+        and "<" not in value.__qualname__
+    ):
+        return  # a plain module-level function: no bound state, closure, or lambda
+    params = getattr(type(value), "__dataclass_params__", None)
+    if params is not None and params.frozen:
+        for field in fields(value):  # type: ignore[arg-type]
+            _check_frozen(getattr(value, field.name), name)
+        return
+    raise TypeError(
+        f"/{name} prepare returned unsupported/live state {type(value).__name__}; "
+        "copy immutable inputs instead"
+    )
+
+
+def _standard_prepare(_session: SlashSession, args: str) -> str:
+    return args
+
+
+def _standard_publish(_session: SlashSession, output: object) -> SlashResult:
+    if not isinstance(output, (str, ModelInputEnvelope, SlashPromptError)):
+        raise TypeError("slash worker returned an unsupported result")
+    return output
+
+
+@dataclass(frozen=True, slots=True)
+class _Worker:
+    prepare: Callable[[SlashSession, str], object]
+    run: Callable[[Any], object]
+    publish: Callable[[SlashSession, Any], SlashResult]
+
+
+@dataclass(frozen=True, slots=True)
+class _LoopSafe:
+    handler: SlashHandler
+    reason: str
+
+
 @dataclass(frozen=True, slots=True)
 class SlashCommand:
-    """One named command in the input-time registry."""
+    """One named command: worker (prepare, run, publish) or reviewed loop-safe."""
 
     name: str
-    handler: SlashHandler
+    policy: _Worker | _LoopSafe
     description: str = ""
     serve: ServeSlash | None = None
 
-    def run(self, session: SlashSession, args: str) -> SlashResult:
-        return self.handler(session, args)
+    def __post_init__(self) -> None:
+        if not isinstance(self.policy, (_Worker, _LoopSafe)):
+            raise TypeError("use SlashCommand.worker or SlashCommand.loop_safe")
+
+    @classmethod
+    def worker(
+        cls,
+        name: str,
+        prepare: Callable[[SlashSession, str], object] | None,
+        run: Callable[[Any], object],
+        publish: Callable[[SlashSession, Any], SlashResult] | None,
+        description: str = "",
+        *,
+        serve: ServeSlash | None = None,
+    ) -> SlashCommand:
+        """Run ``prepare`` on the loop, ``run`` on a thread, ``publish`` on the loop."""
+
+        for step in (prepare, run, publish):
+            if inspect.iscoroutinefunction(step):
+                raise TypeError(f"/{name} worker steps must be synchronous")
+        policy = _Worker(
+            prepare or _standard_prepare, run, publish or _standard_publish
+        )
+        return cls(name, policy, description, serve)
+
+    @classmethod
+    def loop_safe(
+        cls,
+        name: str,
+        handler: SlashHandler,
+        description: str = "",
+        *,
+        serve: ServeSlash | None = None,
+        reason: str,
+    ) -> SlashCommand:
+        """Run ``handler`` on the event loop; ``reason`` records the review."""
+
+        if not reason.strip():
+            raise ValueError(f"/{name} loop_safe needs a reason")
+        return cls(name, _LoopSafe(handler, reason), description, serve)
+
+    async def run(
+        self, session: SlashSession, args: str, lock: SlashLock
+    ) -> str | ModelInputEnvelope | SlashPromptError:
+        policy = self.policy
+        if isinstance(policy, _LoopSafe):
+            result = policy.handler(session, args)
+            if inspect.isawaitable(result):
+                if not inspect.iscoroutinefunction(policy.handler):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise TypeError(
+                        f"/{self.name} returned an awaitable from a synchronous "
+                        "handler; make it async def"
+                    )
+                return await result
+            return result
+        inputs = policy.prepare(session, args)
+        _check_frozen(inputs, self.name)
+        worker = asyncio.ensure_future(asyncio.to_thread(policy.run, inputs))
+        cancelled = False
+        while True:
+            try:
+                output = await asyncio.shield(worker)
+                break
+            except asyncio.CancelledError:
+                if worker.done() and worker.cancelled():
+                    raise
+                if not cancelled:
+                    cancelled = True
+                    lock.defer_cancellation()
+        result = policy.publish(session, output)
+        if cancelled:
+            lock.late_output(result)
+            raise asyncio.CancelledError
+        return result
 
 
 class SlashCommandRegistry:
@@ -208,84 +418,91 @@ class SlashCommandRegistry:
             self._notices.append(notice)
             self._warning_notices.add(notice)
 
-    def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
-        """Run a known command or expand registered dollar-skill mentions."""
+    def _route(self, session: SlashSession, value: str) -> _Route | None:
+        """Resolve one input to its lock label and its deferred execution."""
 
         first_line = value.split("\n", 1)[0]
         if not first_line.startswith("/") or first_line.startswith("//"):
             mentions = dollar_skill_mentions(value, self._skills)
             if not mentions:
                 return None
-            prompts = [load_skill_prompt(self._skills[item.name]) for item in mentions]
-            if mentions[0].start == 0 and len(mentions) == 1:
-                request = value[mentions[0].end :]
-                return skill_model_input(prompts[0], request, value)
-            request = f"User request:\n{value}"
-            return ModelInputEnvelope(
-                "\n\n".join((*prompts, request)),
-                display_text=value,
-                origin=MessageOrigin.SKILL_EXPANSION,
-            )
+
+            def expand() -> ModelInputEnvelope:
+                prompts = [
+                    load_skill_prompt(self._skills[item.name]) for item in mentions
+                ]
+                if mentions[0].start == 0 and len(mentions) == 1:
+                    request = value[mentions[0].end :]
+                    return skill_model_input(prompts[0], request, value)
+                return ModelInputEnvelope(
+                    "\n\n".join((*prompts, f"User request:\n{value}")),
+                    display_text=value,
+                    origin=MessageOrigin.SKILL_EXPANSION,
+                )
+
+            return f"${mentions[0].name}", lambda _lock: _resolved(expand())
         parts = first_line[1:].split(maxsplit=1)
         if not parts:
             return None
         name = parts[0]
         if not is_slash_safe_name(name):
             return None
+        args = parts[1] if len(parts) == 2 else ""
+        label = f"/{name}"
         command = self._commands.get(name)
         if command is not None and self.available(command):
-            result = command.run(session, parts[1] if len(parts) == 2 else "")
-            if isinstance(result, ModelInputEnvelope):
-                return replace(result, display_text=value)
-            return result
-        custom = self._custom_commands.get(name)
+            return label, lambda lock: command.run(session, args, lock)
         skill = self._skills.get(name)
         if skill is not None:
             request = value[1 + len(name) :]
-            return skill_model_input(load_skill_prompt(skill), request, value)
+            return label, lambda _lock: _resolved(
+                skill_model_input(load_skill_prompt(skill), request, value)
+            )
         prompt = self._mcp_prompts.get(name)
         if prompt is not None:
-            return dispatch_prompt(
-                session,
-                name,
-                prompt[1],
-                parts[1] if len(parts) == 2 else "",
-                display_text=value,
+            return label, lambda _lock: dispatch_prompt(
+                session, name, prompt[1], args, display_text=value
             )
+        custom = self._custom_commands.get(name)
         if custom is not None:
             if custom.kind != "exec":
                 return None
-            return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
-        return unknown_slash_command(
-            value, name, parts[1] if len(parts) == 2 else "",
-            (entry[0] for entry in self.completion_entries),
+            return label, lambda _lock: session.slash_exec_macro(custom, args)
+        return None, lambda _lock: unknown_slash_command(
+            value, name, args, (entry[0] for entry in self.completion_entries)
         )
 
-    def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
-        """Run a known command, returning an awaitable for async commands."""
+    def routes(self, session: SlashSession, value: str) -> bool:
+        """Return whether ``dispatch_async`` handles this input as a command."""
 
-        result = self._dispatch(session, value)
-        if result is not None and inspect.isawaitable(result):
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                return asyncio.run(result)
-        return result
+        return self._route(session, value) is not None
+
+    def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
+        """Run ``dispatch_async`` to completion when no event loop is running."""
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.dispatch_async(session, value))
+        return self.dispatch_async(session, value)
 
     async def dispatch_async(
         self, session: SlashSession, value: str
     ) -> str | ModelInputEnvelope | SlashPromptError | None:
-        """Run a known command, awaiting it when the command is asynchronous."""
+        """Run one command while holding the session's slash lock."""
 
-        result = self._dispatch(session, value)
-        if result is None:
+        route = self._route(session, value)
+        if route is None:
             return None
-        if isinstance(result, (str, ModelInputEnvelope, SlashPromptError)):
-            return result
-        resolved = await result
-        if isinstance(resolved, ModelInputEnvelope):
-            return replace(resolved, display_text=value)
-        return resolved
+        label, execute = route
+        lock = session.slash_lock
+        if label is None:
+            return await execute(lock)
+        async with lock.hold(label):
+            result = await execute(lock)
+        if isinstance(result, ModelInputEnvelope):
+            return replace(result, display_text=value)
+        return result
 
     def input_for_model(self, value: str) -> ModelInputEnvelope:
         """Expand a custom command or turn an escape into a literal slash."""

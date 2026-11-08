@@ -21,6 +21,7 @@ from rich.console import Console
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
     INIT_PROMPT,
@@ -304,6 +305,8 @@ async def test_mcp_prompt_completion_and_resolution() -> None:
     )
 
     class Session:
+        slash_lock = SlashLock()
+
         async def slash_mcp_prompt(
             self, name: str, arguments: dict[str, str]
         ) -> str:
@@ -346,6 +349,8 @@ async def test_mcp_prompt_missing_required_argument_does_not_call_session() -> N
     )
 
     class Session:
+        slash_lock = SlashLock()
+
         async def slash_mcp_prompt(
             self, name: str, arguments: dict[str, str]
         ) -> str:

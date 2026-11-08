@@ -151,7 +151,7 @@ def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
         )
         app._active_task = asyncio.create_task(asyncio.sleep(1))
         try:
-            output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+            output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
                 app, "/new"
             )
         finally:

@@ -978,6 +978,9 @@ def _active_status_parts(
         ),
         "store": runtime.opened.store,
     }
+    slash_command = client.server.control.slash_lock.status()
+    if slash_command is not None:
+        suffix["slash_command"] = slash_command
     return status, suffix
 
 

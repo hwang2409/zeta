@@ -19,6 +19,7 @@ from ..core.approval import (
     revoke_session_grants,
     session_grant_change,
 )
+from ..core.commands.slash_registry import SlashLock
 from ..core.store import ConversationStore
 from ..protocol.types import (
     ErrorInfo,
@@ -120,6 +121,9 @@ class ServeControl:
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
+        # Serve reads requests serially per connection and has one controller,
+        # so this lock never contends today; status projects its holder.
+        self.slash_lock = SlashLock()
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
         self._host_binding_required = False

@@ -100,8 +100,8 @@ async def test_blocked_scanner_status_renders_blocked_text_through_tui_and_serve
         ),
     )
     try:
-        tui = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
-        serve = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        tui = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
+        serve = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
             ServerSlashSession(runtime), "/status"
         )
         assert tui is not None and serve is not None

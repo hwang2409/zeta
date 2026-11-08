@@ -24,6 +24,7 @@ from tests.test_agent import (
 )
 from tests.test_server import _connect, _frames_until_event, _request
 from tests.test_steering import SteerToolBackend
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.mcp import MCPPrompt, MCPPromptArgument
@@ -237,6 +238,8 @@ async def test_mcp_prompt_preserves_exact_typed_input_as_nested_user_evidence() 
     )
 
     class Session:
+        slash_lock = SlashLock()
+
         async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
             return f"resolved {name} {arguments['topic']}"
 

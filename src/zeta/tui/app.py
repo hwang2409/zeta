@@ -690,14 +690,13 @@ class TUIApp(
     def status_card_active(self) -> bool:
         return self._status_card_open and self._full_screen_active()
 
-    def open_status_card(self) -> None:
+    def open_status_card(self, status: SlashStatus) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
         self._status_restore_text = buffer.text
         self._status_restore_cursor = buffer.cursor_position
-        status = self.slash_status()
         self._status_card.set_lines(
             _status_card_lines(status),
             line_factory=lambda width: _status_card_lines(status, width),

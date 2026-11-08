@@ -19,13 +19,14 @@ from typing import Protocol
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
-from ..core.commands.slash_registry import SlashSurface
+from ..core.commands.slash_registry import SlashLock, SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     SlashCommandRegistry,
     SlashStatus,
-    _format_status,
+    SlashStatusSnapshot,
+    build_slash_status,
     create_slash_registry,
 )
 from ..core.transcript_recovery.runtime import (
@@ -38,11 +39,7 @@ from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from ..project_registry import ProjectRegistryError
-from ..runtime.status import (
-    SlashStatusSnapshot,
-    build_slash_status,
-    capture_slash_status,
-)
+from ..runtime.status import capture_slash_status
 from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
 from .protocol import (
@@ -107,11 +104,11 @@ class ServerSlashSession:
         self,
         runtime: ServerRuntime,
         approval_control: _ApprovalProjection | None = None,
-        run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
+        slash_lock: SlashLock | None = None,
     ) -> None:
         self._runtime = runtime
         self._approval_control = approval_control
-        self._run_blocking = run_blocking
+        self.slash_lock = SlashLock() if slash_lock is None else slash_lock
 
     # --- runnable server-side ---
 
@@ -199,19 +196,9 @@ class ServerSlashSession:
     async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
         return await run_implement_command(self, args)
 
-    def slash_status_command(self, args: str) -> str | Awaitable[str]:
+    def slash_status_input(self, args: str) -> tuple[bool, SlashStatusSnapshot]:
         del args
-        if self._run_blocking is None:
-            return _format_status(self.slash_status())
-        snapshot = self.status_snapshot()
-
-        async def build() -> str:
-            status = await self._run_blocking(lambda: build_slash_status(snapshot))
-            if not isinstance(status, SlashStatus):
-                raise TypeError("status worker returned an invalid projection")
-            return _format_status(status)
-
-        return build()
+        return False, self.status_snapshot()
 
     def status_snapshot(self) -> SlashStatusSnapshot:
         runtime = self._runtime
@@ -547,7 +534,7 @@ async def run_command(
     *,
     register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
     approval_control: _ApprovalProjection | None = None,
-    run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
+    slash_lock: SlashLock | None = None,
     busy: bool = False,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
@@ -590,7 +577,7 @@ async def run_command(
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(runtime, approval_control, run_blocking=run_blocking)
+    session = ServerSlashSession(runtime, approval_control, slash_lock=slash_lock)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}
