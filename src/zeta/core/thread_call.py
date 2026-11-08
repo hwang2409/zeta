@@ -16,6 +16,22 @@ def _close_abandoned_result[T](
     close_on_cancel(result)
 
 
+async def run_must_complete_thread_call[T](function: Callable[[], T]) -> T:
+    """Run blocking work to completion before propagating caller cancellation."""
+
+    worker = asyncio.get_running_loop().run_in_executor(None, function)
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = worker.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 async def run_owned_thread_call[T](
     function: Callable[[], T],
     close_on_cancel: Callable[[T], None] | None = None,

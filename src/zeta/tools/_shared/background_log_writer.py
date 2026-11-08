@@ -7,7 +7,10 @@ import queue
 import threading
 from typing import IO
 
-from ...core.thread_call import run_owned_thread_call
+from ...core.thread_call import (
+    run_must_complete_thread_call,
+    run_owned_thread_call,
+)
 
 
 class _OrderedLogWriter:
@@ -64,9 +67,9 @@ class _OrderedLogWriter:
         completion: concurrent.futures.Future[None] = concurrent.futures.Future()
         self._queue.put((None, completion))
         try:
-            await _await_worker(completion)
+            await run_must_complete_thread_call(completion.result)
         finally:
-            await run_owned_thread_call(self._thread.join)
+            await run_must_complete_thread_call(self._thread.join)
 
 
 async def _await_worker(completion: concurrent.futures.Future[None]) -> None:

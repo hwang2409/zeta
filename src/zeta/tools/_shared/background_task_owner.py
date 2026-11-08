@@ -10,7 +10,7 @@ from dataclasses import replace
 from enum import Enum, auto
 from typing import IO, TYPE_CHECKING, Literal
 
-from ...core.thread_call import run_owned_thread_call
+from ...core.thread_call import run_must_complete_thread_call
 from . import process_output
 from .background_log_writer import _OrderedLogWriter
 from .background_spawn import _group_exists, _signal_group
@@ -179,7 +179,7 @@ class _BackgroundTaskOwner:
             if self.registry._archive is None or self.log_fd is None:
                 raise RuntimeError("background output storage is unavailable")
             try:
-                await run_owned_thread_call(
+                await run_must_complete_thread_call(
                     lambda: self.registry._archive.append(
                         self.record.task_id, self.log_fd, self.record.total_bytes
                     )
