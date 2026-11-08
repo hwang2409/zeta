@@ -301,6 +301,8 @@ async def test_active_resume_rejects_a_session_whose_cwd_was_removed(
         created = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]
         session_id = created["session"]["session_id"]
         assert server.runtime.session_id == session_id
+        assert server.runtime.loop is not None
+        await server.runtime.loop.ensure_mcp_servers()
         shutil.rmtree(original)
 
         resumed = await _request(
