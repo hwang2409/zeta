@@ -147,6 +147,7 @@ async def test_prepared_context_is_consumed_once(tmp_path: Path, monkeypatch: py
         calls += 1
         return real_prepare(*args, **kwargs)
 
+    # test-contract: seam instrumentation verifies one preparation per head.
     monkeypatch.setattr(assembler, "_prepare_assembly", observed_prepare)
     assert await assembler.prepare_context() is False
     first = await assembler.assemble_context()
@@ -169,6 +170,7 @@ async def test_prepared_context_retries_after_append(tmp_path: Path, monkeypatch
         calls += 1
         return real_prepare(*args, **kwargs)
 
+    # test-contract: seam instrumentation verifies stale-head retry.
     monkeypatch.setattr(assembler, "_prepare_assembly", observed_prepare)
     await assembler.prepare_context()
     store.append_message(text(MessageRole.USER, "after"))

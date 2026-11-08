@@ -428,6 +428,36 @@ class ParallelChildFailureBackend(CompletionBackend):
 
 
 @pytest.mark.asyncio
+async def test_runtime_prepares_context_once_without_sync_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    calls = 0
+    preflight_calls = 0
+    real_prepare = loop.context_assembler._prepare_assembly
+
+    def observed_prepare(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_prepare(*args, **kwargs)
+
+    def unexpected_preflight(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return False
+
+    monkeypatch.setattr(loop.context_assembler, "_prepare_assembly", observed_prepare)
+    monkeypatch.setattr(loop.context_assembler, "needs_compaction", unexpected_preflight)
+
+    await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
+
+    assert calls == 1
+    assert preflight_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_single_turn_without_tools(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     store = ConversationStore(tmp_path)

@@ -450,28 +450,21 @@ class ContextAssembler(ContextMarkerMixin):
         """
 
         assembly_budget = self._assembly_budget(reserved_estimator_tokens)
-        key = self._preparation_key(
-            self.store.active_branch_head_id(),
-            force=force,
-            assembly_budget=assembly_budget,
-            system_append=system_append,
-        )
-        prepared = self._prepared_assembly
-        if prepared is not None and prepared[0] == key:
-            _, branch, preparation = prepared
-            branch_id = self._branch_id(branch)
-            if self.store.active_branch_head_id() != branch_id:
+        while True:
+            key = self._preparation_key(
+                self.store.active_branch_head_id(),
+                force=force,
+                assembly_budget=assembly_budget,
+                system_append=system_append,
+            )
+            prepared = self._prepared_assembly
+            if prepared is not None and prepared[0] == key:
+                _, branch, preparation = prepared
+                branch_id = self._branch_id(branch)
                 self._prepared_assembly = None
-                return await self.assemble_context(
-                    backend=backend,
-                    force=force,
-                    bypass_eviction_hysteresis=bypass_eviction_hysteresis,
-                    emergency=emergency,
-                    reserved_estimator_tokens=reserved_estimator_tokens,
-                    system_append=system_append,
-                )
-            self._prepared_assembly = None
-        else:
+                if self.store.active_branch_head_id() == branch_id:
+                    break
+                continue
             self._prepared_assembly = None
             branch = self.store.active_branch_snapshot()
             branch_id = self._branch_id(branch)
@@ -484,15 +477,8 @@ class ContextAssembler(ContextMarkerMixin):
                 system_append=system_append,
             )
             await asyncio.sleep(0)
-            if self.store.active_branch_head_id() != branch_id:
-                return await self.assemble_context(
-                    backend=backend,
-                    force=force,
-                    bypass_eviction_hysteresis=bypass_eviction_hysteresis,
-                    emergency=emergency,
-                    reserved_estimator_tokens=reserved_estimator_tokens,
-                    system_append=system_append,
-                )
+            if self.store.active_branch_head_id() == branch_id:
+                break
         items = preparation.items
         result_seqs = preparation.result_seqs
         boundary = preparation.boundary
