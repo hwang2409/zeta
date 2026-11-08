@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,27 @@ class SettlementResult:
     def should_retry(self) -> bool:
         """True when a cancelled settlement never committed a durable decision."""
         return self.cancelled and self.resolution is None
+
+
+async def finish_despite_cancellation[T](
+    operation: Callable[[], Awaitable[T]],
+) -> T:
+    """Keep one settlement owner alive through cancellation."""
+    while True:
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            continue
+
+
+async def settlement_outcome[T](
+    admitted: asyncio.Future[T], settlement: asyncio.Task[T]
+) -> T:
+    """Return admission, unless the settlement owner reports a real failure first."""
+    done, _ = await asyncio.wait(
+        (admitted, settlement), return_when=asyncio.FIRST_COMPLETED
+    )
+    return (admitted if admitted in done else settlement).result()
 
 
 async def persist_durably(

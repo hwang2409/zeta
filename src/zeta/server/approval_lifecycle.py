@@ -13,8 +13,7 @@ from uuid import uuid4
 from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
-from . import event_contract
-from .approval_settlement import persist_durably
+from . import approval_settlement, event_contract
 from .approval_settlement.approval_grants import (
     ApprovalRecord,
     GrantPublication,
@@ -696,12 +695,8 @@ class ApprovalLifecycle:
         )
         settlement = asyncio.create_task(self._settle_record(record, decision))
         self._change(record, settlement=settlement)
-        done, _ = await asyncio.wait(
-            (record.admitted, settlement), return_when=asyncio.FIRST_COMPLETED
-        )
-        outcome = record.admitted if record.admitted in done else settlement
         try:
-            resolution = outcome.result()
+            resolution = await approval_settlement.settlement_outcome(record.admitted, settlement)
         except OSError as exc:
             raise ProtocolError(
                 ErrorDescriptor.INTERNAL_ERROR, f"approval persistence failed: {exc}"
@@ -767,16 +762,11 @@ class ApprovalLifecycle:
         token = record.token
         generation = record.generation
         target = record.target
-
-        while True:
-            try:
-                result = await persist_durably(
-                    target.store, target.store_request_id, decision, reason
-                )
-                break
-            except asyncio.CancelledError:
-                # The settlement owner owns recovery from cancellation.
-                continue
+        result = await approval_settlement.finish_despite_cancellation(
+            lambda: approval_settlement.persist_durably(
+                target.store, target.store_request_id, decision, reason
+            )
+        )
         if result.should_retry:
             self._reset_for_retry(target.key, token, generation)
             raise asyncio.CancelledError
@@ -796,9 +786,9 @@ class ApprovalLifecycle:
                 }
                 finish = asyncio.create_task(self._finish_record(record, synthetic))
                 try:
-                    await asyncio.shield(finish)
-                except asyncio.CancelledError:
-                    await asyncio.shield(finish)
+                    await approval_settlement.finish_despite_cancellation(
+                        lambda: asyncio.shield(finish)
+                    )
                 except BaseException as exc:
                     self._release_gate(record, error=exc)
                     raise
@@ -816,15 +806,13 @@ class ApprovalLifecycle:
         if not owns_record:
             self._release_gate(record, resolution=resolution)
             return resolution
-        while True:
-            try:
-                await self._finish_record(record, resolution)
-                break
-            except asyncio.CancelledError:
-                continue
-            except BaseException as exc:
-                self._release_gate(record, error=exc)
-                raise
+        try:
+            await approval_settlement.finish_despite_cancellation(
+                lambda: self._finish_record(record, resolution)
+            )
+        except BaseException as exc:
+            self._release_gate(record, error=exc)
+            raise
         return resolution
 
     def request_approval_abort(
