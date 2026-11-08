@@ -13,7 +13,11 @@ import zeta.agent.runner as agent_runner_module
 from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent import pending_delivery as pending_delivery_module
-from zeta.agent.background import BackgroundAgentOwner, finish_background_child
+from zeta.agent.background import (
+    BackgroundAgentOwner,
+    finish_background_child,
+    recover_agent_children,
+)
 from zeta.agent.receipt import build_agent_receipt, has_agent_receipt_suffix
 from zeta.agent.turn_limit import (
     ChildTurnControl,
@@ -67,9 +71,7 @@ async def _run_limited_child(
                     else [TextContent(f"child completion {number}")]
                 ),
                 tool_calls=(
-                    [ToolCall(f"noop-{number}", "noop", {})]
-                    if number < turns
-                    else []
+                    [ToolCall(f"noop-{number}", "noop", {})] if number < turns else []
                 ),
             )
             for number in range(1, turns + 1)
@@ -138,20 +140,23 @@ async def test_turn_limit_foreground_result_projects_status_and_handoff(
         assert structured["status"] == "turn_limit"
         assert structured["turns_used"] == 2
         handoff = Path(structured["handoff_path"])
-        assert handoff == Path(structured["child_session_path"]) / "turn-limit-handoff.md"
+        assert (
+            handoff == Path(structured["child_session_path"]) / "turn-limit-handoff.md"
+        )
         assert handoff.exists()
         rows = [
             load_session_json(line)
-            for line in (
-                Path(structured["child_session_path"]) / "conversation.jsonl"
-            ).read_bytes().splitlines()
+            for line in (Path(structured["child_session_path"]) / "conversation.jsonl")
+            .read_bytes()
+            .splitlines()
         ]
         notices = [
             row
             for row in rows
-            if row.get("data", {}).get("message", {}).get("metadata", {}).get(
-                "zeta_event"
-            )
+            if row.get("data", {})
+            .get("message", {})
+            .get("metadata", {})
+            .get("zeta_event")
             == "child_turn_limit"
         ]
         assert len(notices) == 1
@@ -204,6 +209,140 @@ async def test_profile_max_turns_applies_when_spawn_omits_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await test_spawn_max_turns_precedence(tmp_path, 2, None, 2, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_nested_children_keep_independent_limits_after_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_call = ToolCall(
+        "child-call",
+        "agent",
+        {
+            "prompt": "child work",
+            "description": "limited child",
+            "agent_type": "child",
+            "background": False,
+        },
+    )
+    grandchild_call = ToolCall(
+        "grandchild-call",
+        "agent",
+        {
+            "prompt": "grandchild work",
+            "description": "limited grandchild",
+            "agent_type": "grandchild",
+            "background": True,
+        },
+    )
+    child_backend = FakeBackend([ScriptedTurn(tool_calls=[grandchild_call])])
+    grandchild_started = asyncio.Event()
+    release_grandchild = asyncio.Event()
+
+    class PausedGrandchildBackend(FakeBackend):
+        async def complete(self, messages, tool_schemas):
+            if not self.calls:
+                grandchild_started.set()
+                await asyncio.wait_for(release_grandchild.wait(), timeout=10)
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+
+    grandchild_backend = PausedGrandchildBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("noop-call", "noop", {})]),
+            ScriptedTurn([TextContent("grandchild finished")]),
+        ]
+    )
+    monkeypatch.setattr(
+        agent_runner_module,
+        "resolve_child_backend",
+        lambda parent_loop, _model: (
+            child_backend if parent_loop.agent_depth == 0 else grandchild_backend,
+            None,
+        ),
+    )
+    agents = tmp_path / "home" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "child.md").write_text(
+        "---\nname: child\ndescription: child\nmax_turns: 1\n---\nchild prompt\n",
+        encoding="utf-8",
+    )
+    (agents / "grandchild.md").write_text(
+        "---\nname: grandchild\ndescription: grandchild\n"
+        "max_turns: 2\n---\ngrandchild prompt\n",
+        encoding="utf-8",
+    )
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(
+        store.cwd,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=discover_session_agents(home=tmp_path / "home"),
+    )
+
+    async def noop(_arguments: dict[str, object]) -> str:
+        return "done"
+
+    registry.register("noop", noop)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[child_call])]),
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        events = [
+            event async for event in loop.run_turn("start", origin=MessageOrigin.USER)
+        ]
+        child_terminal = next(
+            event
+            for event in events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.id == "child-call"
+        )
+        assert child_terminal.tool_result is not None
+        assert grandchild_started.is_set()
+        assert child_terminal.tool_result.structured_content is not None
+        assert child_terminal.tool_result.structured_content["status"] == "turn_limit"
+        assert len(child_backend.calls) == 1
+        grandchild_id = f"{store.session_id}:1:1"
+        assert loop._background_owner._parent_ids[grandchild_id] is None
+
+        release_grandchild.set()
+        await asyncio.wait_for(wait_background_owner(loop), timeout=10)
+        assert len(grandchild_backend.calls) == 2
+        notifications = store.agent_notifications(pending_only=False)
+        grandchild_notification = next(
+            item
+            for item in notifications
+            if item.data["child_instance_id"] == grandchild_id
+        )
+        from zeta.agent.turn_limit import project_notification_data
+
+        assert (
+            project_notification_data(grandchild_notification.data)["status"]
+            == "turn_limit"
+        )
+        grandchild_store = ConversationStore(
+            store.session_dir / "agents" / "1" / "agents", session_id="1"
+        )
+        try:
+            lifecycle = grandchild_store.agent_lifecycle()
+            assert lifecycle is not None
+            assert lifecycle["turns_used"] == 2
+            assert (
+                parse_turn_limit_result(
+                    lifecycle["final_result"], grandchild_store.session_dir
+                )
+                is not None
+            )
+        finally:
+            grandchild_store.close()
+    finally:
+        release_grandchild.set()
+        await loop.close()
 
 
 @pytest.mark.asyncio
@@ -269,9 +408,10 @@ async def test_profile_turn_limit_allows_final_tool_batch_then_stops(
         assert durable_effect.read_text(encoding="utf-8") == "finished"
         second_completion_started = len(backend.calls) > 1
         assert second_completion_started is False
-        assert sum(
-            event.type is StreamEventType.TOOL_EXECUTION_START for event in events
-        ) == 1
+        assert (
+            sum(event.type is StreamEventType.TOOL_EXECUTION_START for event in events)
+            == 1
+        )
     finally:
         release_tool.set()
         if not turn.done():
@@ -402,8 +542,7 @@ async def test_top_level_pending_followup_still_runs_after_soft_max_turns(
             event.message is not None
             and event.message.role.value == "assistant"
             and any(
-                isinstance(block, TextContent)
-                and block.text == "final visible answer"
+                isinstance(block, TextContent) and block.text == "final visible answer"
                 for block in event.message.content
             )
             for event in events
@@ -524,15 +663,30 @@ async def test_tui_replay_renders_turn_limit_and_handoff(
         Console(file=output, width=1000, color_system=None).print(render_event(event))
         rendered = output.getvalue()
         assert "turn_limit" in rendered
-        assert str(Path(notification["child_session_path"]) / "turn-limit-handoff.md") in rendered
+        assert (
+            str(Path(notification["child_session_path"]) / "turn-limit-handoff.md")
+            in rendered
+        )
     finally:
         await loop.close()
         store.close()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel_phase",
+    [
+        "handoff_write",
+        "descendant_register",
+        "descendant_finish",
+        "lifecycle_commit",
+        "publication",
+    ],
+)
 async def test_turn_limit_finalization_defers_cancel_at_each_await(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_phase: str,
 ) -> None:
     parent_store = ConversationStore(tmp_path / "parent")
     child_store = ConversationStore(tmp_path / "child")
@@ -551,6 +705,15 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
         agent_type="worker",
         description="limited",
     )
+    grandchild_call = ToolCall(
+        "grandchild-call", "agent", {"description": "grandchild"}
+    )
+    child_store.register_agent_child(
+        grandchild_call,
+        child_session_path=str(tmp_path / "grandchild"),
+        description="grandchild",
+        child_instance_id="child-1:1",
+    )
     owner = BackgroundAgentOwner(parent_store)
     owner.conversation_channel.register_delivery_flow(
         None, pending_delivery_module.StepDeliveryFlow(parent_store)
@@ -567,28 +730,51 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
             background_tasks=SimpleNamespace(snapshot=lambda: ())
         ),
     )
-    publish_started = asyncio.Event()
-    release_publish = asyncio.Event()
+    phase_started = asyncio.Event()
+    release_phase = asyncio.Event()
     handoff_exists_at_publish = False
+    original_child_write = child_store._to_thread_agent_state
+    original_parent_write = parent_store._to_thread_agent_state
     original_publish = owner.conversation_channel.publish_completion
+
+    async def gate(phase: str) -> None:
+        if phase != cancel_phase:
+            return
+        phase_started.set()
+        await asyncio.wait_for(release_phase.wait(), timeout=10)
+
+    async def child_write(operation, *args, **kwargs):
+        phases = {
+            "ensure_turn_limit_handoff": "handoff_write",
+            "finish_agent_child": "descendant_finish",
+            "finish_agent_lifecycle": "lifecycle_commit",
+        }
+        await gate(phases.get(operation.__name__, ""))
+        return await original_child_write(operation, *args, **kwargs)
+
+    async def parent_write(operation, *args, **kwargs):
+        if operation.__name__ == "register_agent_child":
+            await gate("descendant_register")
+        return await original_parent_write(operation, *args, **kwargs)
 
     async def pause_publish(**kwargs):
         nonlocal handoff_exists_at_publish
         handoff_exists_at_publish = (
             child_store.session_dir / "turn-limit-handoff.md"
         ).exists()
-        publish_started.set()
-        await asyncio.wait_for(release_publish.wait(), timeout=10)
+        await gate("publication")
         return await original_publish(**kwargs)
 
+    # test-contract: seam force cancellation at each durable write await.
+    monkeypatch.setattr(child_store, "_to_thread_agent_state", child_write)
+    # test-contract: seam force cancellation at the descendant registration await.
+    monkeypatch.setattr(parent_store, "_to_thread_agent_state", parent_write)
     monkeypatch.setattr(owner.conversation_channel, "publish_completion", pause_publish)
 
     async def close_child(_cause: str) -> tuple[()]:
         return ()
 
-    def terminal_result(
-        text: str, error: bool, status: str, stats=None, **kwargs
-    ):
+    def terminal_result(text: str, error: bool, status: str, stats=None, **kwargs):
         state = status if status in {"completed", "failed", "canceled"} else "completed"
         return build_agent_receipt(
             state,
@@ -633,27 +819,46 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
             finish_gate_state=SimpleNamespace(terminal_admitted=True),
         )
     )
+    grandchild_watcher = asyncio.create_task(asyncio.sleep(3600))
+    owner.register(
+        "child-1:1",
+        grandchild_watcher.cancel,
+        grandchild_watcher,
+        child_store,
+        parent_instance_id="child-1",
+    )
     owner.register("child-1", watcher.cancel, watcher, parent_store)
     try:
-        await asyncio.wait_for(publish_started.wait(), timeout=10)
+        await asyncio.wait_for(phase_started.wait(), timeout=10)
         watcher.cancel()
-        release_publish.set()
+        release_phase.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(watcher, timeout=10)
         assert handoff_exists_at_publish is True
         lifecycle = child_store.agent_lifecycle()
         assert lifecycle is not None and lifecycle["state"] == "completed"
-        assert parse_turn_limit_result(
-            lifecycle["final_result"], str(child_store.session_dir)
-        ) is not None
+        assert (
+            parse_turn_limit_result(
+                lifecycle["final_result"], str(child_store.session_dir)
+            )
+            is not None
+        )
         assert len(parent_store.agent_notifications(pending_only=False)) == 1
+        assert "child-1:1" in parent_store.agent_children()
+        assert "child-1:1" not in child_store.agent_children()
+        assert owner._parent_ids["child-1:1"] is None
     finally:
-        release_publish.set()
+        release_phase.set()
         if not watcher.done():
             watcher.cancel()
             await asyncio.wait_for(
                 asyncio.gather(watcher, return_exceptions=True), timeout=10
             )
+        owner.unregister("child-1:1")
+        grandchild_watcher.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(grandchild_watcher, return_exceptions=True), timeout=10
+        )
         child_store.close()
         parent_store.close()
 
@@ -668,7 +873,9 @@ def test_profile_max_turns_validation_and_snapshot(tmp_path: Path) -> None:
     )
     catalog = discover_session_agents(home=home)
     assert catalog.find("limited").max_turns == 7
-    assert AgentCatalog.from_snapshot(catalog.to_snapshot()).find("limited").max_turns == 7
+    assert (
+        AgentCatalog.from_snapshot(catalog.to_snapshot()).find("limited").max_turns == 7
+    )
 
     for value in (True, 0, -1, 1.5, "1"):
         (agents / "limited.md").write_text(
@@ -697,7 +904,9 @@ def test_model_text_cannot_forge_turn_limit_marker(tmp_path: Path) -> None:
         assert parse_turn_limit_result(receipt, tmp_path) is None
 
 
-def test_turn_limit_marker_round_trip_uses_post_receipt_position(tmp_path: Path) -> None:
+def test_turn_limit_marker_round_trip_uses_post_receipt_position(
+    tmp_path: Path,
+) -> None:
     receipt = _completed_receipt()
     marked = build_turn_limit_result(receipt, tmp_path)
     readable, marker = marked.rsplit("\n", 1)
@@ -766,6 +975,125 @@ def test_old_validators_accept_turn_limit_as_completed_text(tmp_path: Path) -> N
     assert "turn_limit" not in notification
 
 
+@pytest.mark.asyncio
+async def test_turn_limit_recovery_after_lifecycle_commit_publishes_once(
+    tmp_path: Path,
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    call = ToolCall("child-call", "agent", {"description": "limited"})
+    parent.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="limited",
+        background=True,
+        child_instance_id="root:1",
+    )
+    child.mark_agent_parent(call.id)
+    child.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="limited",
+    )
+    handoff_bytes = b"child-authored recovery handoff\n"
+    child.ensure_turn_limit_handoff(handoff_bytes)
+    child.finish_agent_lifecycle(
+        "completed",
+        final_result=build_turn_limit_result(_completed_receipt(), child.session_dir),
+        turns_used=1,
+        canonical_receipt=True,
+    )
+    child.close()
+
+    owner = BackgroundAgentOwner(parent)
+    flow = pending_delivery_module.StepDeliveryFlow(parent)
+    owner.conversation_channel.register_delivery_flow(None, flow)
+    loop = SimpleNamespace(store=parent, _background_owner=owner)
+    try:
+        for item in await asyncio.to_thread(recover_agent_children, loop):
+            await flow.produce(item)
+        notifications = parent.agent_notifications(pending_only=False)
+        assert len(notifications) == 1
+        from zeta.agent.turn_limit import project_notification_data
+
+        projected = project_notification_data(notifications[0].data)
+        assert projected["status"] == "turn_limit"
+        assert projected["handoff_path"] == str(
+            child.session_dir / "turn-limit-handoff.md"
+        )
+        assert not parent.agent_children()
+        assert (
+            child.session_dir / "turn-limit-handoff.md"
+        ).read_bytes() == handoff_bytes
+
+        for item in await asyncio.to_thread(recover_agent_children, loop):
+            await flow.produce(item)
+        assert len(parent.agent_notifications(pending_only=False)) == 1
+        assert (
+            child.session_dir / "turn-limit-handoff.md"
+        ).read_bytes() == handoff_bytes
+    finally:
+        parent.close()
+
+
+def test_nested_turn_limit_recovery_matches_existing_mid_publication_behavior(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "root")
+    parent = ConversationStore(root.session_dir / "agents", session_id="1")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    call = ToolCall("grandchild-call", "agent", {"description": "limited"})
+    parent.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="limited",
+        background=True,
+        child_instance_id="root:1:1",
+    )
+    child.mark_agent_parent(call.id)
+    child.start_agent_lifecycle(
+        handle="root:1:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=2,
+        agent_type="worker",
+        description="limited",
+    )
+    handoff_bytes = b"nested crash handoff\n"
+    child.ensure_turn_limit_handoff(handoff_bytes)
+    marked = build_turn_limit_result(_completed_receipt(), child.session_dir)
+    child.finish_agent_lifecycle(
+        "completed",
+        final_result=marked,
+        turns_used=1,
+        canonical_receipt=True,
+    )
+    root.append_agent_notification(
+        "root:1:1",
+        child_session_path=str(child.session_dir),
+        description="limited",
+        status="completed",
+        text=marked,
+        display_only=True,
+    )
+    child.close()
+
+    owner = BackgroundAgentOwner(root)
+    loop = SimpleNamespace(store=parent, _background_owner=owner)
+    try:
+        assert recover_agent_children(loop) == ()
+        assert len(root.agent_notifications(pending_only=False)) == 1
+        assert parent.agent_notifications(pending_only=False) == []
+        assert not parent.agent_children()
+        assert (
+            child.session_dir / "turn-limit-handoff.md"
+        ).read_bytes() == handoff_bytes
+    finally:
+        parent.close()
+        root.close()
+
+
 def test_existing_child_handoff_is_not_overwritten(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "session")
     child_authored_bytes = b"child authored handoff\n"
@@ -778,7 +1106,9 @@ def test_existing_child_handoff_is_not_overwritten(tmp_path: Path) -> None:
         store.close()
 
 
-def test_child_turn_control_warns_once_and_reserves_final_completion(tmp_path: Path) -> None:
+def test_child_turn_control_warns_once_and_reserves_final_completion(
+    tmp_path: Path,
+) -> None:
     control = ChildTurnControl(2, str(tmp_path))
     assert control.begin_completion() is None
     assert control.finish_completion() is False

@@ -538,6 +538,12 @@ def _background_terminal(
         if report is not None
         else build_agent_receipt(state, text, stats)
     )
+    if (
+        report is None
+        and lifecycle is not None
+        and lifecycle.get("final_result_is_receipt") is True
+    ):
+        payload["content"][0]["text"] = text
     return _BackgroundTerminal(
         status=status,
         text=payload["content"][0]["text"],
