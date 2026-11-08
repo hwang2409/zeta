@@ -542,7 +542,7 @@ def test_stuck_decisions_scan_does_not_block_asyncio_run_shutdown(
 
     def hung_open(*_args, **_kwargs):
         entered.set()
-        release.wait()
+        assert release.wait(timeout=10), "test did not release held decision scan"
         return ()
 
     async def run_tui_lifecycle() -> None:
