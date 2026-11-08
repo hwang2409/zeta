@@ -77,8 +77,12 @@ def test_attention_kind_epoch_is_independent_of_writer_epoch(
     opened = _session(tmp_path)
     try:
         store = AttentionStore(opened.store.session_dir, writer_epoch=5)
-        record = _record(store, kind="answer", session_id=opened.store.session_id)
-        assert record.kind == "answer"
+        try:
+            record = _record(store, kind="answer", session_id=opened.store.session_id)
+            refusal = None
+        except ValueError as exc:
+            record, refusal = None, str(exc)
+        assert refusal is None and record is not None and record.kind == "answer"
     finally:
         opened.store.close()
 
