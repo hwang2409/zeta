@@ -12,6 +12,8 @@ from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+from ..storage_format import drain_releases
+
 
 class SessionError(ValueError):
     """Raised when a session cannot be accessed safely."""
@@ -57,6 +59,8 @@ def session_directory(root: Path, session_id: str, *, exclusive: bool = False):
             _component(session_id)
             root_fd = cleanup.enter_context(session_root(root))
             session_fd = cleanup.enter_context(child_directory(root_fd, session_id))
+            if exclusive:
+                drain_releases()  # a store this process dropped must not refuse deletion
             try:
                 fcntl.flock(
                     session_fd,
