@@ -4213,6 +4213,20 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             for state, _configured_timeout in deadlines.started
             if deadlines._wakes[id(state)][1] == child_handle
         )
+        # let the 4th edge's result land and be held by the causal budget first,
+        # so no background commit can fall between the repeated calls below.
+        flow = owner.conversation_channel._delivery_targets[child_handle].flow
+        edge_held = asyncio.Event()
+        original_suppress = flow.suppress_pending
+
+        def observe_suppression(staged_ids: tuple[str, ...]) -> None:
+            original_suppress(staged_ids)
+            if staged_ids:
+                edge_held.set()
+
+        monkeypatch.setattr(flow, "suppress_pending", observe_suppression)
+        await await_or_fail(edge_held.wait(), what="causal budget holds the 4th edge")
+
         def expire_turn() -> bool:
             if timeouts == "every_fresh_call" or backend.fresh_calls == 1:
                 deadlines._expire_active(state)
@@ -4250,9 +4264,6 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
                 f"identical provider calls with nothing committed: {backend.fresh_calls}"
             )
         assert terminal in done
-        flow = loop._background_owner.conversation_channel._delivery_targets[
-            child_handle
-        ].flow
         child_store = flow.store
         stopped = [
             message.metadata[FAILED_TURN_ERROR]["code"]
