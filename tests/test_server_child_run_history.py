@@ -508,6 +508,88 @@ async def test_child_history_rejects_replacement_during_continuation(
 
 
 @pytest.mark.asyncio
+async def test_child_history_writer_after_idle_probe_does_not_offer_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    params = {"session_id": session_id, "run_id": f"{session_id}:1"}
+    probe_complete = threading.Event()
+    prefix_written = threading.Event()
+    release_append = threading.Event()
+    append_errors: list[BaseException] = []
+    original_probe = ConversationStore._observer_append_active
+    original_write_bytes = ConversationStore._write_bytes
+
+    def probe_then_start_writer(target: ConversationStore) -> bool:
+        active = original_probe(target)
+        if not active and not probe_complete.is_set():
+            probe_complete.set()
+            assert prefix_written.wait(10)
+        return active
+
+    def split_write(target: ConversationStore, data: bytes) -> None:
+        if target is not child or prefix_written.is_set():
+            original_write_bytes(target, data)
+            return
+        original_write_bytes(target, data[:-1])
+        prefix_written.set()
+        assert release_append.wait(10)
+        original_write_bytes(target, data[-1:])
+
+    def append_message() -> None:
+        try:
+            assert probe_complete.wait(10)
+            child.append_message(Message(MessageRole.ASSISTANT, [TextContent("partial")]))
+        except BaseException as exc:  # noqa: BLE001 - transfer thread failure
+            append_errors.append(exc)
+
+    try:
+        first = (await request(reader, writer, 3, "child_run_history", params))[-1]
+        assert "result" in first, first
+        transcript = child.session_dir / "conversation.jsonl"
+        with transcript.open("ab") as stream:
+            stream.write(b'{"type":"message"')
+        # test-contract: seam starts the real writer in the old post-probe gap
+        monkeypatch.setattr(
+            ConversationStore, "_observer_append_active", probe_then_start_writer
+        )
+        # test-contract: seam pauses production append after its strict row prefix
+        monkeypatch.setattr(ConversationStore, "_write_bytes", split_write)
+        append_thread = threading.Thread(target=append_message)
+        append_thread.start()
+        try:
+            during = (await request(reader, writer, 4, "child_run_history", params))[-1]
+            assert during.get("error", {}).get("data") == {
+                "code": "stale_history_snapshot"
+            }, during
+        finally:
+            release_append.set()
+            await await_or_fail(
+                asyncio.to_thread(append_thread.join, 10),
+                what="post-probe production child append completion",
+            )
+        assert not append_thread.is_alive()
+        assert not append_errors, append_errors
+    finally:
+        release_append.set()
+        child.close()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_child_history_unix_ignores_production_partial_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

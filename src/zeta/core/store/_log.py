@@ -780,13 +780,30 @@ class ConversationLogMixin:
             validator.finish(install=False)
         except ConversationIntegrityError as exc:
             validation_error = exc
+        has_suffix = complete_end < g0.st_size
+        full_validator: _FullLoadValidator | None = None
+        full_validation_error: ConversationIntegrityError | None = None
+        if has_suffix:
+            full_validator = _FullLoadValidator(self, raw, g0)
+            try:
+                for physical_row in self._iter_physical_rows(
+                    raw, g0, full_validator.validated_prefix
+                ):
+                    full_validator.accept(physical_row)
+                full_validator.finish(install=False)
+            except ConversationIntegrityError as exc:
+                full_validation_error = exc
+        append_active = has_suffix and self._observer_append_active()
         if self._check_observer_source(g0, retry_source_change):
             return
         if validation_error is not None:
             raise validation_error
-        if complete_end < g0.st_size and not self._observer_append_active():
-            self._load_full()
-            return
+        if has_suffix and not append_active:
+            if full_validation_error is not None:
+                raise full_validation_error
+            assert full_validator is not None
+            validator = full_validator
+            candidate = raw
         for attribute in _FullLoadValidator._STATE_ATTRIBUTES:
             setattr(self, attribute, getattr(validator.state, attribute))
         delta = (
