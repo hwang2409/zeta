@@ -1338,7 +1338,7 @@ async def test_code_literal_does_not_span_lines(tmp_path: Path) -> None:
     result, prompts = await _run(
         registry,
         project_id,
-        _transcript(_row(1, "Keep `alpha\nbeta` apart; use `run_background`.")),
+        _transcript(_row(1, "Note `alpha\nbeta` here.\nUse `run_background` too.")),
         [_proposal(_add("decisions", "Use `run_background` for builds."))],
         key="code-literal-multiline",
     )
