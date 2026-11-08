@@ -153,13 +153,21 @@ def test_finish_gate_message_caps_details_and_reports_omissions() -> None:
     assert text == finish_gate_message(children, tasks).content[0].text
 
 
-def test_finish_gate_message_has_bounded_detail_bytes() -> None:
-    children = tuple((f"root:{i}", "child") for i in range(1_000))
-    tasks = tuple((f"task-{i}", "task") for i in range(1_000))
+@pytest.mark.parametrize(
+    "detail", ["x" * 100_000, "漢字🙂" * 25_000], ids=["ascii", "multibyte"]
+)
+def test_finish_gate_message_bounds_long_details_by_utf8_bytes(detail: str) -> None:
+    children = tuple((f"root:{i}", detail) for i in range(1_000))
+    tasks = tuple((f"task-{i}", detail) for i in range(1_000))
 
     text = finish_gate_message(children, tasks).content[0].text
 
+    expected = detail.encode()[:64].decode("utf-8", "ignore")
     assert len(text.encode()) < 5_000
+    assert "root:19: " + expected in text
+    assert "task-19: " + expected in text
+    assert "root:20: " not in text
+    assert "task-20: " not in text
 
 
 def _harness_notice_conversation() -> list[Message]:

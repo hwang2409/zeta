@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 FinishGateOutcome = Literal["completed", "handed_off", "task_safety_expired"]
 POST_CAP_CAUSAL_TURNS = 3
 _FINISH_GATE_DETAIL_CAP = 20
+_FINISH_GATE_DETAIL_BYTES = 64
 ConsumeEvents = Callable[
     [AsyncIterator[StreamEvent], "FinishGateControl | None"], Awaitable[None]
 ]
@@ -31,7 +32,7 @@ def finish_gate_message(
     running: list[str] = []
     if children:
         child_list = ", ".join(
-            f"{handle}: {description}"
+            f"{handle}: {_truncate_finish_gate_detail(description)}"
             for handle, description in children[:_FINISH_GATE_DETAIL_CAP]
         )
         omitted = len(children) - _FINISH_GATE_DETAIL_CAP
@@ -45,7 +46,7 @@ def finish_gate_message(
         )
     if tasks:
         task_list = ", ".join(
-            f"{task_id}: {headline}"
+            f"{task_id}: {_truncate_finish_gate_detail(headline)}"
             for task_id, headline in tasks[:_FINISH_GATE_DETAIL_CAP]
         )
         omitted = len(tasks) - _FINISH_GATE_DETAIL_CAP
@@ -72,6 +73,14 @@ def finish_gate_message(
         "A finish-gate safety bound applies if a task never exits."
     )
     return harness_notice("finish gate", text, event="agent_finish_gate")
+
+
+def _truncate_finish_gate_detail(value: str) -> str:
+    return (
+        value[:_FINISH_GATE_DETAIL_BYTES]
+        .encode("utf-8")[:_FINISH_GATE_DETAIL_BYTES]
+        .decode("utf-8", errors="ignore")
+    )
 
 
 @dataclass(eq=False, slots=True)
