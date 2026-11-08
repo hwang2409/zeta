@@ -35,4 +35,26 @@ runs:
     # Report slow tests so future bottlenecks are visible in the CI logs.
     - name: Run the suite
       shell: bash
-      run: uv run ${{ inputs.python-version != '' && format('--python "{0}" ', inputs.python-version) || '' }}--frozen pytest -q -n 4 --dist worksteal --durations=25
+      env:
+        ZETA_TEST_EXIT_WATCHDOG_SECONDS: "90"
+      run: |
+        # DIAG ONLY: after 11 min, dump every process tree and every python stack.
+        pip install --quiet py-spy || true
+        (
+          sleep 660
+          for round in 1 2; do
+            echo "=== DIAG round $round $(date -u +%T) ==="
+            ps -eo pid,ppid,pgid,sid,stat,wchan:32,etime,args --forest | grep -v ' ps -eo'
+            for pid in $(pgrep -f python); do
+              echo "--- DIAG pid $pid stat=$(cut -d' ' -f3 /proc/$pid/stat 2>/dev/null) ---"
+              tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null; echo
+              sudo cat /proc/$pid/stack 2>/dev/null | head -20
+              for t in /proc/$pid/task/*; do echo "task ${t##*/} $(cat $t/comm) wchan=$(cat $t/wchan 2>/dev/null) state=$(cut -d' ' -f3 $t/stat)"; done
+              sudo env "PATH=$PATH" py-spy dump --native --pid $pid 2>&1 | head -200
+            done
+            sleep 60
+          done
+          echo "=== DIAG killing pytest ==="
+          pkill -f 'pytest -q -n 4' || true
+        ) &
+        uv run ${{ inputs.python-version != '' && format('--python "{0}" ', inputs.python-version) || '' }}--frozen pytest -q -n 4 --dist worksteal --durations=25

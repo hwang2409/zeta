@@ -29,11 +29,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos')) && '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"}]' || '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"}]') }}
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"os":"ubuntu-latest","python-version":"3.14","rep":1},{"os":"ubuntu-latest","python-version":"3.14","rep":2},{"os":"ubuntu-latest","python-version":"3.14","rep":3}]' || (github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'macos')) && '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"}]' || '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"}]') }}
     # Main keeps one running macOS job and only the newest pending commit.
     # Other matrix jobs use a unique group and cannot replace it.
     concurrency:
-      group: ${{ (github.event_name == 'push' && matrix.os == 'macos-latest') && 'ci-macos-main' || format('ci-{0}-{1}-{2}-{3}', github.workflow, github.sha, matrix.os, matrix.python-version) }}
+      group: ${{ (github.event_name == 'push' && matrix.os == 'macos-latest') && 'ci-macos-main' || format('ci-{0}-{1}-{2}-{3}-{4}', github.workflow, github.sha, matrix.os, matrix.python-version, matrix.rep) }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +47,7 @@ jobs:
         if: matrix.os == 'macos-latest'
 
   lint:
+    if: github.event_name != 'workflow_dispatch'
     name: ruff
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -82,6 +83,7 @@ jobs:
           git diff --unified=0 "$base" HEAD -- ':(glob)**/*.py' | python scripts/lint_test_quality.py -
 
   browser:
+    if: github.event_name != 'workflow_dispatch'
     name: browser
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -98,6 +100,7 @@ jobs:
         run: uv run --frozen pytest -q tests/test_server_gamma.py
 
   fresh-old-home:
+    if: github.event_name != 'workflow_dispatch'
     name: fresh zeta on old home (${{ matrix.os }})
     strategy:
       fail-fast: false
