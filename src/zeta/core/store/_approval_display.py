@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 
 from ...protocol.types import Message, ToolCall, ToolUseContent
+from ...storage_format import reject_unknown_keys
 
 _STRING_FIELDS = frozenset(
     {
@@ -26,9 +27,7 @@ def validated_approval_facts(facts: Mapping[str, object]) -> dict[str, object]:
 
     if not isinstance(facts, Mapping):
         raise TypeError("approval facts must be an object")
-    unknown = set(facts) - _APPROVAL_FACT_FIELDS
-    if unknown:
-        raise ValueError(f"unknown approval fact fields: {sorted(unknown)}")
+    reject_unknown_keys(facts, "approval_fact")
     action = facts.get("action")
     if action is not None and (type(action) is not str or not action):
         raise ValueError("approval fact action must be a nonempty string or null")
@@ -40,9 +39,7 @@ def validated_approval_display(display: Mapping[str, object]) -> dict[str, objec
 
     if not isinstance(display, Mapping):
         raise TypeError("approval display must be an object")
-    unknown = set(display) - _FIELDS
-    if unknown:
-        raise ValueError(f"unknown approval display fields: {sorted(unknown)}")
+    reject_unknown_keys(display, "approval_display")
     copied: dict[str, object] = {}
     for name, value in display.items():
         if name in _STRING_FIELDS:

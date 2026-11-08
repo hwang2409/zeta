@@ -110,9 +110,7 @@ def _project_message(message: Mapping[str, Any]) -> dict[str, Any] | None:
             if not isinstance(block, Mapping):
                 continue
             if block.get("type") == "text" and isinstance(block.get("text"), str):
-                content.append(
-                    {"type": "text", "text": redact_secrets(block["text"])}
-                )
+                content.append({"type": "text", "text": redact_secrets(block["text"])})
             elif block.get("type") == "tool_use":
                 call = block.get("tool_call")
                 if isinstance(call, Mapping):
@@ -280,13 +278,19 @@ def _receipts_extend_cursor(
             receipt.before_mtime_ns,
             receipt.before_ctime_ns,
         )
-        if receipt.start_offset != expected_offset or before_identity != expected_identity:
+        if (
+            receipt.start_offset != expected_offset
+            or before_identity != expected_identity
+        ):
             return False
         length = receipt.end_offset - receipt.start_offset
         if length <= 0:
             return False
         appended = os.pread(fd, length, receipt.start_offset)
-        if len(appended) != length or hashlib.sha256(appended).hexdigest() != receipt.digest:
+        if (
+            len(appended) != length
+            or hashlib.sha256(appended).hexdigest() != receipt.digest
+        ):
             return False
         expected_offset = receipt.end_offset
         expected_identity = (

@@ -7,6 +7,7 @@ cap. ``TUIApp`` mixes these in, so they run against its attributes.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any
 
@@ -30,6 +31,7 @@ from ...core.session import (
     persist_metadata_change,
 )
 from ...core.slash import SlashStatus, _format_status
+from ...core.transcript_recovery.runtime import repair_transcript_for_runtime
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
@@ -779,13 +781,35 @@ class SlashHandlerMixin:
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             run_memory_command,
             registry,
             project_id,
             args,
             getattr(self.loop, "memory_reconciler", None),
             MemoryMutationAuthorization.direct_slash(),
+        )
+        return await result if inspect.isawaitable(result) else result
+
+    async def slash_repair_transcript(self, args: str) -> str:
+        """Repair one corrupt root transcript after explicit confirmation."""
+        parts = args.split()
+        if len(parts) not in {2, 3} or parts[-1] != "confirm":
+            return "usage: /repair-transcript <session-id> [<child-run-id>] confirm"
+        child_run_id = parts[1] if len(parts) == 3 else None
+        result = await repair_transcript_for_runtime(
+            self.loop.manager,
+            parts[0],
+            child_run_id,
+            parent_store=self.loop.store,
+            memory_reconciler=getattr(self.loop, "memory_reconciler", None),
+        )
+        return (
+            f"repaired transcript {parts[0]}"
+            + (f" child {child_run_id}" if child_run_id is not None else "")
+            + "; quarantine "
+            f"{result.quarantine_id}; retained through sequence "
+            f"{result.retained_last_sequence}"
         )
 
     async def slash_inbox(self, args: str) -> str:
