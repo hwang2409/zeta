@@ -31,7 +31,7 @@ class NamedItem(Protocol):
 def is_slash_safe_name(name: str) -> bool:
     """Return whether a name can be addressed by slash input."""
 
-    return bool(name) and not name.startswith("/") and not any(
+    return bool(name) and "/" not in name and not any(
         character.isspace() for character in name
     )
 

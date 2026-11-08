@@ -10,11 +10,32 @@ from typing import TYPE_CHECKING
 
 from ..store import ConversationStore
 from ..store._child_runs import child_run_segments
-from . import RepairResult, RepairTarget
+from . import TRANSCRIPT_REPAIR_EPOCH, RepairResult, RepairTarget
 
 if TYPE_CHECKING:
     from ...memory.auto import AutoMemoryReconciler
     from ..session import SessionManager
+
+
+class TranscriptRepairRequiresUpgrade(ValueError):
+    """The observed home predates explicit transcript repair."""
+
+    def __init__(self, home_epoch: int) -> None:
+        self.home_epoch = home_epoch
+        self.required_epoch = TRANSCRIPT_REPAIR_EPOCH
+        super().__init__(
+            "transcript repair needs the stored-format upgrade "
+            f"(home epoch {home_epoch}, needs {TRANSCRIPT_REPAIR_EPOCH})"
+        )
+
+
+def transcript_repair_available(manager: SessionManager) -> bool:
+    return manager.observed_storage_epoch >= TRANSCRIPT_REPAIR_EPOCH
+
+
+def require_transcript_repair(manager: SessionManager) -> None:
+    if not transcript_repair_available(manager):
+        raise TranscriptRepairRequiresUpgrade(manager.observed_storage_epoch)
 
 
 def repair_command_for_child_path(path: Path) -> str:
@@ -105,6 +126,7 @@ async def repair_transcript_for_runtime(
     memory_reconciler: AutoMemoryReconciler | None = None,
 ) -> RepairResult:
     """Commit one repair through its resident owner, then publish success."""
+    require_transcript_repair(manager)
     resident_memory_commit = _resident_memory_commit(
         memory_reconciler, session_id, child_run_id
     )
