@@ -3975,6 +3975,13 @@ async def test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget(
 
 
 
+_CAUSAL_HELD_TEXT = (
+    "the budget of 3 automatic turns after the finish gate is used up. "
+    "Input not delivered: it is held for the next message to this agent "
+    "and is lost if the agent ends first."
+)
+
+
 def _durable_not_delivered_texts(store: ConversationStore) -> list[str]:
     return [
         entry.data["text"]
@@ -4042,13 +4049,7 @@ async def test_causal_budget_stop_shows_held_input_as_not_delivered(
         await await_or_fail(backend.fresh_prompt_seen.wait(), what="fresh prompt call")
 
         notices = _not_delivered_texts(root_events)
-        assert notices == [
-            (
-                "the budget of 3 automatic turns after the finish gate is used up. "
-                "Input not delivered: it is held for the next message to this agent "
-                "and is lost if the agent ends first."
-            )
-        ]
+        assert notices == [_CAUSAL_HELD_TEXT]
         assert _durable_not_delivered_texts(store) == notices
         # the notice woke nothing: no automatic call after the stop.
         assert backend.gate_calls == 4
@@ -4391,8 +4392,10 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             assert held not in flow.pending_ids()
             # the user sees what was held, on the root transcript, durably.
             stop_text = text.split(" · ")[0].removeprefix("agent error: ")
-            assert _not_delivered_texts(root_events) == [stop_text]
-            assert _durable_not_delivered_texts(store) == [stop_text]
+            # the 4th edge result held by the causal budget is shown too.
+            shown = [_CAUSAL_HELD_TEXT, stop_text]
+            assert _not_delivered_texts(root_events) == shown
+            assert _durable_not_delivered_texts(store) == shown
             # this child has no explicit finish, so its run ends here and the
             # text must not promise a next message.
             assert stop_text.endswith("is lost if the agent ends first.")
