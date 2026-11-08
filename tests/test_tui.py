@@ -1538,6 +1538,7 @@ def terminal_plain(renderable: object) -> str:
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
 
+
 def test_task_safety_kill_renders_cause() -> None:
     cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     event = StreamEvent(
@@ -5100,6 +5101,30 @@ def test_child_message_delivered_background_event_renders_parent_receipt(
     )
 
     assert "delivered to worker: check the retry" in output.getvalue()
+
+
+def test_nested_stalled_idle_background_event_renders_last_message(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "child_instance_id": "root:1:1",
+                "description": "nested verifier",
+                "status": "child_idle",
+                "text": "nested verifier is waiting for review",
+            },
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "nested verifier" in rendered
+    assert "nested verifier is waiting for review" in rendered
 
 
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
@@ -8930,6 +8955,27 @@ def test_rebuild_renders_closed_turn_end_reasons(
     assert "turn ended with an error" in rendered
     assert "turn ended when the controller disconnected" in rendered
     assert "completed" not in rendered
+
+
+def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions)
+    with store.path.open("ab") as stream:
+        stream.write(b'{"torn"')
+    with pytest.warns(RuntimeWarning, match="torn"):
+        recovered = ConversationStore(sessions, session_id=store.session_id)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), recovered, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "transcript recovered; preserved corrupt bytes in quarantine" in rendered
+    assert recovered.entries[-1].data["quarantine_id"] in rendered
 
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:

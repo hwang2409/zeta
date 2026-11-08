@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..core.session_execution import SessionOwnedError
-from ..core.store import ConversationStore
+from ..core.store import ConversationStore, TranscriptLoadError
 from ..protocol.types import ToolResult
 
 
@@ -81,6 +81,8 @@ def acquire_recovery_subtree(
     try:
         child_store = open_child_store(parent_store, child_path)
     except SessionOwnedError:
+        return False
+    except TranscriptLoadError:
         return False
     if child_store is None:
         return True

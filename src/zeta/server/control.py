@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from .server import ZetaServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
+CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
 
 NotificationSender = Callable[..., Awaitable[bool]]
 
@@ -115,6 +116,7 @@ class ServeControl:
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
+        self._controller_release_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
@@ -122,7 +124,7 @@ class ServeControl:
         self._active_host_commands: SessionHostCommands | None = None
         self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
-            publish=lambda *args, **kwargs: self._notify(*args, **kwargs),
+            admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
             policy=lambda: self.server.runtime.policy,
             session_id=lambda: (
@@ -256,16 +258,49 @@ class ServeControl:
     async def wait_for_approval_settlement(self) -> None:
         await self._approvals.wait_for_approval_settlement()
 
+    def begin_controller_release(
+        self, *, reconnect: bool = False
+    ) -> asyncio.Task[None]:
+        previous = self._controller_release_task
+        # Establish approval grace before the physical controller slot is released.
+        operation = (
+            None
+            if previous is not None and not previous.done()
+            else self._controller_release(reconnect)
+        )
+
+        async def release() -> None:
+            if previous is not None:
+                await asyncio.shield(previous)
+            if operation is None:
+                await self.controller_released(reconnect=reconnect)
+            else:
+                await operation
+
+        task = asyncio.create_task(release())
+        self._controller_release_task = task
+        return task
+
     async def controller_claimed(
         self, *, reconnect: bool = False, require_host_binding: bool = False
-    ) -> None:
+    ) -> bool:
+        release = self._controller_release_task
+        if release is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(release), CONTROLLER_HANDOFF_DEADLINE_SECONDS
+                )
+            except TimeoutError:
+                return False
+            if self._controller_release_task is release:
+                self._controller_release_task = None
         self._host_binding_required |= require_host_binding
         task = self._grace_task
         if task is None:
-            return
+            return True
         if self._grace_expiring:
             await asyncio.shield(task)
-            return
+            return True
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         self._grace_task = None
@@ -274,6 +309,7 @@ class ServeControl:
         else:
             await self._approvals.transition(Expire())
             await self._disconnect_turn()
+        return True
 
     async def controller_ready(self, *, reconnect: bool = False) -> None:
         if reconnect:
@@ -281,18 +317,33 @@ class ServeControl:
         await self._attach_pending_notifications()
 
     async def controller_released(self, *, reconnect: bool = False) -> None:
+        await self._controller_release(reconnect)
+
+    def _controller_release(self, reconnect: bool) -> Awaitable[None]:
         self._active_host_commands = None
         if reconnect and self._grace_task is not None:
-            await asyncio.shield(self._grace_task)
-            return
+
+            async def wait_for_grace() -> None:
+                assert self._grace_task is not None
+                await asyncio.shield(self._grace_task)
+
+            return wait_for_grace()
         if reconnect and self._approvals.has_pending_approvals():
-            await self._approvals.transition(BeginGrace())
+            self._approvals.transition(BeginGrace())
             self._grace_task = asyncio.create_task(self._expire_grace())
-            if self.server.approval_reconnect_grace == 0:
-                await self._grace_task
-            return
-        await self._terminate_pending_approvals(suppress_write_errors=True)
-        await self._disconnect_turn()
+
+            async def start_grace() -> None:
+                if self.server.approval_reconnect_grace == 0:
+                    assert self._grace_task is not None
+                    await self._grace_task
+
+            return start_grace()
+
+        async def disconnect() -> None:
+            await self._terminate_pending_approvals(suppress_write_errors=True)
+            await self._disconnect_turn()
+
+        return disconnect()
 
     async def _expire_grace(self) -> None:
         try:
@@ -428,7 +479,22 @@ class ServeControl:
         reason: str = "turn_canceled",
     ) -> Awaitable[object]:
         return asyncio.create_task(
-            self._approvals.transition(Cancel(request_id, child_instance_id, reason))
+            self._approvals.transition(
+                Cancel(request_id, child_instance_id, reason)
+            )
+        )
+
+    def request_approval_abort_gate(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
+    ) -> Awaitable[object]:
+        return self._approvals.request_approval_abort(
+            request_id,
+            child_instance_id=child_instance_id,
+            reason=reason,
         )
 
     async def abort(
@@ -741,7 +807,7 @@ class ServeControl:
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
         }:
-            await self._end_stale_approvals(session_id)
+            self._end_stale_approvals(session_id)
         if kind is StreamEventType.MESSAGE_UPDATE:
             delta = event.delta
             stream_kind = "assistant"
@@ -812,11 +878,15 @@ class ServeControl:
         if kind is StreamEventType.TOOL_EXECUTION_END:
             if foreground:
                 state.tool_finished()
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_end(event, fidelity=fidelity),
-            )
+            fields = event_contract.tool_end(event, fidelity=fidelity)
+            if not foreground and self._approvals.release_or_hold_terminal(
+                _approval_key(event), session_id, fields
+            ):
+                await self._notify(
+                    wire_event, session_id, _admitted=True, **fields
+                )
+                return
+            await self._notify(wire_event, session_id, **fields)
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
             await self._end_approval(
@@ -913,9 +983,21 @@ class ServeControl:
                 )
             )
 
+    def _admit_controller(
+        self, event: EventDescriptor, session_id: str | None = None, **fields: object
+    ) -> object:
+        connections = getattr(self.server, "connections", None)
+        if connections is None:
+            from .connections import Admission
+
+            return Admission("no_controller")
+        return connections.try_admit_controller(event, session_id, **fields)
+
     async def _notify(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> bool:
+        if fields.pop("_admitted", False):
+            return True
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
         connections = self.server.connections
@@ -935,8 +1017,8 @@ class ServeControl:
             ExternalEnd(key, session_id, data, suppress_write_errors)
         )
 
-    async def _end_stale_approvals(self, session_id: str | None) -> None:
-        await self._approvals._end_stale_approvals(session_id)
+    def _end_stale_approvals(self, session_id: str | None) -> None:
+        self._approvals._end_stale_approvals(session_id)
 
     async def _terminate_pending_approvals(
         self,

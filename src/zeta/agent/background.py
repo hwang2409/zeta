@@ -344,15 +344,12 @@ class BackgroundAgentOwner:
         default_store: ConversationStore,
         default_instance_id: str | None = None,
     ) -> tuple[ConversationStore, str | None]:
-        """Read the child's current owner edge before it is unregistered."""
         return (
             self._parent_stores.get(instance_id, default_store),
             self._parent_ids.get(instance_id, default_instance_id),
         )
 
-    def parent_store(
-        self, instance_id: str, default: ConversationStore
-    ) -> ConversationStore:
+    def parent_store(self, instance_id: str, default: ConversationStore) -> ConversationStore:
         return self.parent_edge(instance_id, default)[0]
 
     def cancel_all(self) -> None:
@@ -373,9 +370,11 @@ class BackgroundAgentOwner:
     def active_descriptions(self) -> tuple[str, ...]:
         return tuple(self._descriptions.values())
 
-    def owned_running(self, parent_instance_id: str) -> tuple[tuple[str, str], ...]:
-        """Return running children directly owned by one agent."""
+    @property
+    def active_instance_ids(self) -> frozenset[str]:
+        return frozenset(self._cancellers)
 
+    def owned_running(self, parent_instance_id: str) -> tuple[tuple[str, str], ...]:
         return tuple(
             (instance_id, self._descriptions.get(instance_id, "background task"))
             for instance_id in self._cancellers
