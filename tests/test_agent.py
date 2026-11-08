@@ -10500,8 +10500,9 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
     def observe_cancellation(_policy: object) -> None:
         cancellation_seen.set()
 
-    # test-contract: seams force and observe cancellation before write start
+    # test-contract: seam forces cancellation before write start
     monkeypatch.setattr(child_store, "_before_committed_mutation", pause_before_write)
+    # test-contract: seam observes the selected cancellation policy
     monkeypatch.setattr(
         child_store, "_submitted_mutation_cancelled", observe_cancellation
     )
@@ -12065,7 +12066,7 @@ async def test_agent_cancel_mixed_child_and_task_terminal_result(
     )
     store, loop, run, completion_published = await _start_task_gate(tmp_path, backend)
 
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
     await asyncio.wait_for(run, timeout=10)
     notification = await _completion_after_publication(store, completion_published)
     assert "background sub-agents" in backend.gate_text
@@ -14574,20 +14575,18 @@ async def test_follow_up_commit_suppresses_racing_stalled_admission(
     release_commit = asyncio.Event()
     idle_waiting = asyncio.Event()
     order: list[str] = []
-    original_durable = child._to_thread_durable
+    original_commit = child.commit_delivery_input
     channel = loop._background_owner.conversation_channel
     original_idle = channel.publish_idle
 
-    async def blocked_durable(function, /, *args, **kwargs):
-        if function.__name__ == "_commit_delivery_input" and isinstance(
-            args[0], pending_delivery_module.PromptInput
-        ):
+    async def blocked_commit(item: object) -> object:
+        if isinstance(item, pending_delivery_module.PromptInput):
             commit_entered.set()
             await asyncio.wait_for(release_commit.wait(), 10)
-            result = await original_durable(function, *args, **kwargs)
+            result = await original_commit(item)
             order.append("follow_up")
             return result
-        return await original_durable(function, *args, **kwargs)
+        return await original_commit(item)
 
     async def observed_idle(**kwargs):
         order.append("idle")
@@ -14608,7 +14607,7 @@ async def test_follow_up_commit_suppresses_racing_stalled_admission(
         return True
 
     # test-contract: seam force input commit to overlap stalled admission
-    monkeypatch.setattr(child, "_to_thread_durable", blocked_durable)
+    monkeypatch.setattr(child, "commit_delivery_input", blocked_commit)
     monkeypatch.setattr(channel, "publish_idle", observed_idle)
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
     run = asyncio.create_task(

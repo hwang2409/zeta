@@ -1705,8 +1705,9 @@ async def test_off_loop_refresh_cancellation_finalizes_submitted_work(
     def observe_cancellation(_policy: object) -> None:
         cancellation_seen.set()
 
-    # test-contract: seam exercises the shared mutation cancellation boundary
+    # test-contract: seam blocks the worker before write ownership
     monkeypatch.setattr(ConversationStore, "_before_committed_mutation", blocked_load)
+    # test-contract: seam observes the selected cancellation policy
     monkeypatch.setattr(
         store, "_submitted_mutation_cancelled", observe_cancellation
     )
