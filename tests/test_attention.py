@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import multiprocessing
+import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -13,16 +17,21 @@ from pathlib import Path
 import pytest
 
 import zeta
+from zeta import attention_records
 from zeta.attention_forks import (
     ATTENTION_FORK_POLICY,
+    attention_decision_message_id,
     create_discussion_fork,
+    deliver_attention_decision,
     read_attention_fork,
+    release_discussion_fork,
     validate_attention_fork,
 )
 from zeta.attention_records import AttentionStore
 from zeta.config.tool_policy import ToolPolicy
 from zeta.core.project_context import ProjectContext, load_project_context
 from zeta.core.session import SessionManager
+from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     Message,
@@ -709,3 +718,239 @@ def test_p06_8_discussion_fork_allocation_process_progress(
         for result in (fork_result, mutation_result):
             result.close()
             result.join_thread()
+
+
+def _open_project_attention(home: Path, project_id: str) -> tuple[str, str]:
+    opened = _session(home, project_id=project_id)
+    try:
+        anchor = opened.store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("Choose")])
+        )
+        record = AttentionStore(opened.store.session_dir).request(
+            session_id=opened.store.session_id,
+            project_id=project_id,
+            entry_id=anchor.id,
+            entry_seq=anchor.seq,
+            title="Question",
+            why="Need a choice.",
+        )
+        return opened.store.session_id, record.id
+    finally:
+        opened.store.close()
+
+
+def _inbox_ids(manager: SessionManager, project_id: str) -> set[str]:
+    state = ProjectInbox(
+        manager.project_registry, sessions_root=manager.sessions_dir
+    ).read(project_id)
+    return {item["id"] for status in ("new", "claimed", "done") for item in state[status]}
+
+
+@pytest.mark.parametrize("opponent", ["competing_resolver", "fork_release"])
+def test_p06_6_attention_resolution_commits_message_and_record_or_neither(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opponent: str
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    session_id, attention_id = _open_project_attention(tmp_path, project.project_id)
+    fork_id = create_discussion_fork(tmp_path, session_id, attention_id)
+    store = AttentionStore(manager.sessions_dir / session_id)
+    record = store.get(attention_id)
+    original_lock = AttentionStore._resolution_lock
+
+    if opponent == "competing_resolver":
+        # test-contract: seam the public resolver commits right after the
+        # deliverer's first `.resolution.lock` hold ends.
+        competed: list[bool] = []
+
+        @contextmanager
+        def lock_then_compete(self: AttentionStore):
+            with original_lock(self) as held:
+                yield held
+            if not competed:
+                competed.append(True)
+                self.resolve(attention_id, session_id=session_id, decision="chat answer")
+
+        monkeypatch.setattr(AttentionStore, "_resolution_lock", lock_then_compete)
+        result = deliver_attention_decision(
+            tmp_path, record, "popup answer", from_session=fork_id
+        )
+        assert competed == [True]
+    else:
+        # test-contract: seam stop the public fork release just before it writes
+        # the record; the deliverer then either finishes or waits on the lock.
+        release_writing = threading.Event()
+        release_go = threading.Event()
+        deliver_progress = threading.Event()
+        original_write = attention_records.write_session_file
+
+        def gated_write(directory_fd: int, name: str, data: bytes) -> None:
+            if threading.current_thread().name.startswith("fork-release"):
+                release_writing.set()
+                assert release_go.wait(10)
+            original_write(directory_fd, name, data)
+
+        def probing_lock(self: AttentionStore):
+            if threading.current_thread().name.startswith("deliver"):
+                fd = os.open(
+                    self.directory / ".resolution.lock", os.O_RDWR | os.O_CREAT, 0o600
+                )
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    deliver_progress.set()
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+            return original_lock(self)
+
+        monkeypatch.setattr(attention_records, "write_session_file", gated_write)
+        monkeypatch.setattr(AttentionStore, "_resolution_lock", probing_lock)
+        with (
+            ThreadPoolExecutor(1, thread_name_prefix="fork-release") as releaser,
+            ThreadPoolExecutor(1, thread_name_prefix="deliver") as deliverer,
+        ):
+            try:
+                released = releaser.submit(release_discussion_fork, tmp_path, fork_id)
+                assert release_writing.wait(10), "fork release did not reach its write"
+                delivered = deliverer.submit(
+                    deliver_attention_decision,
+                    tmp_path,
+                    record,
+                    "popup answer",
+                    from_session=fork_id,
+                )
+                delivered.add_done_callback(lambda _future: deliver_progress.set())
+                assert deliver_progress.wait(10), (
+                    "deliverer neither finished nor waited on .resolution.lock"
+                )
+            finally:
+                release_go.set()
+            assert released.result(10) == session_id
+            result = delivered.result(10)
+
+    final = store.get(attention_id)
+    delivered_message = attention_decision_message_id(attention_id) in _inbox_ids(
+        manager, project.project_id
+    )
+    assert delivered_message == (
+        final.status == "resolved" and final.decision == "popup answer"
+    ), "attention resolution committed only one of message and record"
+    assert result[2] is (not delivered_message)
+
+
+def _deliver_attention_in_process(
+    home: str,
+    session_id: str,
+    attention_id: str,
+    decision: str,
+    send_started: object | None,
+    send_release: object | None,
+    result: object,
+) -> None:
+    try:
+        if send_started is not None:
+            original_send = ProjectInbox.send
+
+            def gated_send(self, *args, **kwargs):
+                send_started.set()  # type: ignore[attr-defined]
+                if not send_release.wait(10):  # type: ignore[attr-defined]
+                    raise TimeoutError("holder was not released")
+                return original_send(self, *args, **kwargs)
+
+            ProjectInbox.send = gated_send  # type: ignore[method-assign]
+        record = AttentionStore(Path(home) / "sessions" / session_id).get(attention_id)
+        _message_id, resolved, already = deliver_attention_decision(
+            Path(home), record, decision, from_session=session_id
+        )
+    except BaseException as exc:  # noqa: BLE001 - reported to parent process
+        result.put(("refused", type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
+    else:
+        result.put(("delivered", already, resolved.decision))  # type: ignore[attr-defined]
+
+
+def test_p06_8_attention_resolution_process_progress(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    held_session, held_attention = _open_project_attention(tmp_path, project.project_id)
+    other_session, other_attention = _open_project_attention(
+        tmp_path, project.project_id
+    )
+    other_message = attention_decision_message_id(other_attention)
+
+    context = multiprocessing.get_context("spawn")
+    send_started = context.Event()
+    send_release = context.Event()
+    holder_result = context.Queue()
+    opponent_result = context.Queue()
+    holder = context.Process(
+        target=_deliver_attention_in_process,
+        args=(
+            str(tmp_path),
+            held_session,
+            held_attention,
+            "holder answer",
+            send_started,
+            send_release,
+            holder_result,
+        ),
+    )
+    opponent = context.Process(
+        target=_deliver_attention_in_process,
+        args=(
+            str(tmp_path),
+            other_session,
+            other_attention,
+            "opponent answer",
+            None,
+            None,
+            opponent_result,
+        ),
+    )
+    holder.start()
+    try:
+        assert send_started.wait(10), "holder did not reach its inbox publication"
+        opponent.start()
+        outcome = opponent_result.get(timeout=10)
+        assert not send_release.is_set()
+        assert outcome[0] in {"refused", "delivered"}, (
+            "opposing attention resolution made no progress while the holder held"
+        )
+        if outcome[0] == "refused":
+            assert outcome[1] in {"InboxError", "ProjectRegistryBusyError"}, outcome
+            assert AttentionStore(manager.sessions_dir / other_session).get(
+                other_attention
+            ).status == "open"
+        send_release.set()
+        assert holder_result.get(timeout=10) == ("delivered", False, "holder answer")
+        assert (other_message in _inbox_ids(manager, project.project_id)) is (
+            outcome[0] == "delivered"
+        ), "a refused attention resolution left its message behind"
+        holder.join(10)
+        opponent.join(10)
+        assert holder.exitcode == 0
+        assert opponent.exitcode == 0
+
+        record = AttentionStore(manager.sessions_dir / other_session).get(
+            other_attention
+        )
+        retried = deliver_attention_decision(
+            tmp_path, record, "opponent answer", from_session=other_session
+        )
+        assert retried[2] is (outcome[0] == "delivered")
+        assert other_message in _inbox_ids(manager, project.project_id)
+        assert AttentionStore(manager.sessions_dir / other_session).get(
+            other_attention
+        ).decision == "opponent answer"
+    finally:
+        send_release.set()
+        for process in (holder, opponent):
+            if process.pid is not None and process.is_alive():
+                process.kill()
+            if process.pid is not None:
+                process.join(10)
+                process.close()
+        for queue in (holder_result, opponent_result):
+            queue.close()
+            queue.join_thread()
