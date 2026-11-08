@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..core.store import ConversationStore
 
+from ..core.checkpoints import _now
 from ..protocol.types import Message, harness_notice
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
 
@@ -297,6 +299,47 @@ def finish_foreground_turn_limit(
         canonical_receipt=True,
     )
     return payload
+
+
+def make_publish_child_lifecycle(
+    *,
+    account_context: Any,
+    selected_accounts: dict[str, object],
+    child_store: Any,
+    child_instance_id: str,
+    child_depth: int,
+    agent_type: str,
+    description: str,
+    child_cwd: str,
+) -> Callable[[], None]:
+    def publish_child_lifecycle() -> None:
+        account_store = getattr(account_context, "store", None)
+        protected_accounts = {
+            provider: account
+            for provider, account in selected_accounts.items()
+            if account_store is not None and account_store.contains(account)
+        }
+        guard = (
+            account_store.pin_guard(protected_accounts)
+            if protected_accounts
+            else nullcontext()
+        )
+        with guard:
+            child_store.start_agent_lifecycle(
+                handle=child_instance_id,
+                started_at=_now(),
+                depth=child_depth,
+                agent_type=agent_type,
+                description=description,
+                cwd=child_cwd,
+                selected_accounts={
+                    provider: str(account)
+                    for provider, account in selected_accounts.items()
+                }
+                or None,
+            )
+
+    return publish_child_lifecycle
 
 
 def make_child_progress_callbacks(

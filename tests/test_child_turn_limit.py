@@ -647,6 +647,50 @@ async def test_agent_status_reloads_turn_limit_projection(
         store.close()
 
 
+def test_agent_status_projects_nested_turn_limit_child_path(tmp_path: Path) -> None:
+    child_store = ConversationStore(tmp_path / "child")
+    grandchild_store = ConversationStore(
+        child_store.session_dir / "agents", session_id="1"
+    )
+    try:
+        grandchild_call = ToolCall(
+            "grandchild-call", "agent", {"description": "grandchild"}
+        )
+        child_store.register_agent_child(
+            grandchild_call,
+            child_session_path=str(grandchild_store.session_dir),
+            description="grandchild",
+            child_instance_id="root:1:1",
+        )
+        grandchild_store.mark_agent_parent(grandchild_call.id)
+        grandchild_store.start_agent_lifecycle(
+            handle="root:1:1",
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=2,
+            agent_type="grandchild",
+            description="grandchild",
+            cwd=str(tmp_path),
+        )
+        grandchild_store.finish_agent_lifecycle(
+            "completed",
+            final_result=build_turn_limit_result(
+                _completed_receipt(), grandchild_store.session_dir
+            ),
+            turns_used=1,
+            canonical_receipt=True,
+        )
+
+        status = _read_agent_status(child_store, requested_handle="root:1:1")[0]
+
+        assert status["state"] == "turn_limit"
+        assert status["handoff_path"] == str(
+            grandchild_store.session_dir / "turn-limit-handoff.md"
+        )
+    finally:
+        grandchild_store.close()
+        child_store.close()
+
+
 @pytest.mark.asyncio
 async def test_tui_replay_renders_child_turn_limit_notice_once(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "session")

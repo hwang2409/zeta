@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -67,6 +67,7 @@ from .turn_limit import (
     finalize_exhausted_child,
     make_child_progress_callbacks,
     make_finish_limited_child_turn,
+    make_publish_child_lifecycle,
 )
 
 logger = logging.getLogger(__name__)
@@ -764,32 +765,16 @@ async def run_agent_tool(
         child_account_pins.snapshot() if child_account_pins is not None else {}
     )
 
-    def publish_child_lifecycle() -> None:
-        account_store = getattr(account_context, "store", None)
-        protected_accounts = {
-            provider: account
-            for provider, account in selected_accounts.items()
-            if account_store is not None and account_store.contains(account)
-        }
-        guard = (
-            account_store.pin_guard(protected_accounts)
-            if protected_accounts
-            else nullcontext()
-        )
-        with guard:
-            child_store.start_agent_lifecycle(
-                handle=child_instance_id,
-                started_at=_now(),
-                depth=child_depth,
-                agent_type=preset.name,
-                description=description,
-                cwd=child_cwd,
-                selected_accounts={
-                    provider: str(account)
-                    for provider, account in selected_accounts.items()
-                }
-                or None,
-            )
+    publish_child_lifecycle = make_publish_child_lifecycle(
+        account_context=account_context,
+        selected_accounts=selected_accounts,
+        child_store=child_store,
+        child_instance_id=child_instance_id,
+        child_depth=child_depth,
+        agent_type=preset.name,
+        description=description,
+        child_cwd=child_cwd,
+    )
 
     try:
         await asyncio.to_thread(publish_child_lifecycle)
