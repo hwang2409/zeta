@@ -23,6 +23,8 @@ class ProjectInboxNotificationMixin:
     """Notice top-level sessions without a daemon or persistent ownership."""
 
     _inbox_scanner: ProjectInboxScanner | None = None
+    _project_inbox_publication_event: asyncio.Event | None = None
+    _project_inbox_owner_loop: asyncio.AbstractEventLoop | None = None
     tool_registry: Any
     store: Any
     agent_depth: int
@@ -32,6 +34,8 @@ class ProjectInboxNotificationMixin:
         if "inbox" not in self.tool_registry.registered_names or self.agent_depth > 0:
             return
         self._inbox_scanner = self._new_project_inbox_scanner()
+        self._project_inbox_owner_loop = asyncio.get_running_loop()
+        self._project_inbox_publication_event = asyncio.Event()
         await self._check_project_inbox()
         watcher = asyncio.create_task(self._watch_project_inbox())
         self._tracked_tasks.add(watcher)
@@ -59,10 +63,28 @@ class ProjectInboxNotificationMixin:
             tracker=tracker,
         )
 
+    def notify_project_inbox_publication(self) -> None:
+        loop = self._project_inbox_owner_loop
+        event = self._project_inbox_publication_event
+        if loop is None or event is None:
+            return
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass
+
     async def _watch_project_inbox(self) -> None:
+        event = self._project_inbox_publication_event
+        if event is None:
+            return
         while True:
-            await asyncio.sleep(2)
-            await self._check_project_inbox(periodic=True)
+            try:
+                await asyncio.wait_for(event.wait(), timeout=2)
+            except TimeoutError:
+                await self._check_project_inbox(periodic=True)
+            else:
+                event.clear()
+                await self._check_project_inbox()
 
     async def _record_sent_statuses(self, messages: tuple[dict[str, Any], ...]) -> None:
         pending: dict[tuple[str, str], dict[str, Any]] = getattr(
