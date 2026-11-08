@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ..protocol.types import ErrorInfo
-from ..providers.retry_policy import retryable_provider_error
+from ..providers.completion import retryable_provider_error
 
 RetryKind = Literal["wake", "history"]
 

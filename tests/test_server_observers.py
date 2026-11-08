@@ -238,7 +238,6 @@ async def test_observer_hello_has_no_controller_side_effects(
         "set_background_event_sink",
         "set_memory_notice_sink",
         "set_background_wake_sink",
-        "set_post_stream_provider_retry",
     ):
         original = getattr(server.runtime, name)
         monkeypatch.setattr(
