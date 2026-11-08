@@ -8200,7 +8200,7 @@ async def test_serve_plan_prompt_returns_opaque_input_id(tmp_path: Path) -> None
         assert result["input_id"]
         assert "text" not in result
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
