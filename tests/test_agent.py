@@ -1671,6 +1671,7 @@ class CancelIdleTreeBackend(CompletionBackend):
             )
         )
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -14522,6 +14523,7 @@ class _ParentTaskExplicitFinishBackend(CompletionBackend):
     def __init__(self, command: str) -> None:
         self.command = command
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
