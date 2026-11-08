@@ -293,7 +293,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         if not isinstance(covers, DeferredFrame):
             self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers
+                event, session_id, required_feature, fields, covers, replay_row
             )
         outcome, frame, output = self._controller_preflight(
             self._controller,
@@ -308,7 +308,7 @@ class ConnectionRegistry(ReplayOutput):
         if self._replay_holds_copy(self._controller, covers):
             return outcome
         if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            self._controller, event, session_id, dict(fields), covers
+            self._controller, event, session_id, dict(fields), covers, replay_row
         ):
             return outcome
         if not self._admit(self._controller, frame):
@@ -343,7 +343,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         if not isinstance(covers, DeferredFrame):
             self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers
+                event, session_id, required_feature, fields, covers, replay_row
             )
         outcome, frame, output = self._controller_preflight(
             self._controller,
@@ -359,7 +359,7 @@ class ConnectionRegistry(ReplayOutput):
         if self._replay_holds_copy(state, covers):
             return True
         if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            state, event, session_id, fields, covers
+            state, event, session_id, fields, covers, replay_row
         ):
             return True
         if not self._admit(state, frame):
@@ -854,6 +854,7 @@ class ConnectionRegistry(ReplayOutput):
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
+                child_runs="child_run_events" in features,
             ),
             session_id=target[0],
         )
@@ -882,6 +883,7 @@ class ConnectionRegistry(ReplayOutput):
                 params,
                 registry=self,
                 fidelity="session_history_fidelity" in features,
+                child_runs="child_run_events" in features,
             ),
             session_id=runtime.session_id,
         )
@@ -1093,14 +1095,32 @@ def perform_child_history_read(
     *,
     registry: ConnectionRegistry,
     fidelity: bool,
+    child_runs: bool,
 ) -> object:
+    runtime = child_reader_runtime(target, params["run_id"], registry)
+    history_params = {key: value for key, value in params.items() if key != "run_id"}
+    if "before" not in history_params:
+        history_params["before"] = None
+    return ergonomics.history(
+        runtime,
+        history_params,
+        backward_enabled=True,
+        fidelity=fidelity,
+        child_runs=child_runs,
+    )
+
+
+def child_reader_runtime(
+    target: tuple[str | None, object], run_id: str, registry: ConnectionRegistry
+) -> Any:
+    """The selected child's pinned reader store, shaped as a history runtime."""
     root_store = target[1]
     try:
-        parse_child_run_id(root_store.session_id, params["run_id"])
+        parse_child_run_id(root_store.session_id, run_id)
     except ValueError as exc:
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid child run id") from exc
     try:
-        reader = registry._child_reader_for(root_store, params["run_id"])
+        reader = registry._child_reader_for(root_store, run_id)
     except ObserverSnapshotChanged as exc:
         raise ProtocolError(
             ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
@@ -1112,20 +1132,11 @@ def perform_child_history_read(
         raise ProtocolError(
             ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found"
         ) from exc
-    runtime = type(
+    return type(
         "ObserverRuntime",
         (),
         {"session_id": target[0], "opened": type("Opened", (), {"store": reader})()},
     )()
-    history_params = {key: value for key, value in params.items() if key != "run_id"}
-    if "before" not in history_params:
-        history_params["before"] = None
-    return ergonomics.history(
-        runtime,
-        history_params,
-        backward_enabled=True,
-        fidelity=fidelity,
-    )
 
 
 def _active_status_parts(
@@ -1262,6 +1273,7 @@ def perform_read(
     fidelity: bool = False,
     content_read: bool = False,
     served_turn_end: bool = False,
+    child_runs: bool = False,
 ) -> object:
     if method == "status":
         return project_status(target[1], served_turn_end=served_turn_end)
@@ -1283,6 +1295,7 @@ def perform_read(
             fidelity=fidelity,
             content_read=content_read,
             served_turn_end=served_turn_end,
+            child_runs=child_runs,
         )
     if method == "content_read":
         return content.read(

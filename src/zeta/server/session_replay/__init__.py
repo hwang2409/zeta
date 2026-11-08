@@ -50,7 +50,7 @@ class Frontier:
     reset generation when the join began (a reset renumbers rows)."""
 
     seq: int
-    reset_generation: int
+    reset_generation: int | None
 
 
 @dataclass(slots=True)
@@ -84,7 +84,7 @@ class PendingReplayJoin:
     connection: Any
     scope: ReplayScopeId
     stream_id: str
-    reset_generation: int
+    reset_generation: int | None
     frames: list[HeldFrame] = field(default_factory=list)
     frontier: Frontier | None = None
     stale: bool = False
@@ -263,7 +263,7 @@ class SessionReplay:
         return True
 
     def begin_join(
-        self, connection: Any, scope: ReplayScopeId, reset_generation: int
+        self, connection: Any, scope: ReplayScopeId, reset_generation: int | None
     ) -> PendingReplayJoin:
         self.connection_closed(connection)
         pending = PendingReplayJoin(

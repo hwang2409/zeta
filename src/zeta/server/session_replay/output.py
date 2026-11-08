@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from ...core.agent_progress import live_child_store
 from .. import ergonomics
 from ..protocol import EventDescriptor, FrameCodec, _Frame
 from . import (
@@ -21,6 +22,14 @@ from . import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _agent_id(fields: dict[str, object]) -> str | None:
+    """The run that owns an event: its data's or its own agent_instance_id."""
+    data = fields.get("data")
+    agent = data.get("agent_instance_id") if isinstance(data, dict) else None
+    agent = agent or fields.get("agent_instance_id")
+    return agent if type(agent) is str else None
 
 
 @dataclass
@@ -42,11 +51,12 @@ class ReplayOutput:
         required_feature: str | None,
         fields: dict[str, object],
         covers: rows.Covers,
+        facts: rows.RowFacts | None = None,
     ) -> None:
         """Send a controller event to observers that joined its replay scope."""
         for observer in tuple(self._observers):
             if not self._feature_rejected(observer, event, required_feature, fields):
-                self._publish_replay(observer, event, session_id, fields, covers)
+                self._publish_replay(observer, event, session_id, fields, covers, facts)
 
     def _replay_covers(
         self,
@@ -173,15 +183,29 @@ class ReplayOutput:
         """The scope's store while a replay stream or join needs it, else None."""
         for connection in self._connections:
             if self.replay.scope_for(connection) == scope:
-                runtime = connection.server.runtime
-                if runtime.opened is not None and runtime.session_id == scope.value:
-                    return runtime.opened.store
+                return self._scope_store(scope, connection.server.runtime)
+        return None
+
+    @staticmethod
+    def _scope_store(scope: ReplayScopeId, runtime: Any) -> Any:
+        """The top session's store, or a child run's store while this process runs it."""
+        if scope.kind == "child":
+            store = live_child_store(scope.value)
+            return None if store is None or store._closed else store
+        if runtime.opened is not None and runtime.session_id == scope.value:
+            return runtime.opened.store
         return None
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         self.invalidate_replay_connection(connection, reason="rejoined")
-        store = ergonomics.active(connection.server.runtime, {"session_id": scope.value})
-        self.replay.begin_join(connection, scope, store.reset_generation())
+        if scope.kind == "top":
+            store = ergonomics.active(connection.server.runtime, {"session_id": scope.value})
+        else:
+            store = self._scope_store(scope, connection.server.runtime)
+        # a child this process does not run has no live rows to renumber
+        self.replay.begin_join(
+            connection, scope, None if store is None else store.reset_generation()
+        )
 
     def finish_replay_join(
         self, connection: Any, history: dict[str, object], frontier_seq: int
@@ -287,12 +311,24 @@ class ReplayOutput:
         session_id: str | None,
         fields: dict[str, object],
         covers: rows.Covers,
+        facts: rows.RowFacts | None = None,
+        scope: ReplayScopeId | None = None,
     ) -> bool:
-        """Admit one frame to a replay stream; False when the caller sends it plainly."""
+        """Admit one frame to a replay stream; False when the caller sends it plainly.
+
+        Without ``scope`` the frame goes to the connection's stream when it is a member:
+        every event of the top session, or a child stream's own run and descendants,
+        whose covers come from that run's store.
+        """
         if "session_replay_seq" not in state.features or session_id is None:
             return False
-        scope = ReplayScopeId.top(session_id)
         connection = state.connection
+        if scope is None:
+            scope = self._member_scope(connection, session_id, fields)
+            if scope is None:
+                return False
+            if scope.kind == "child":
+                covers = self._child_covers(scope, event, fields, facts)
         if covers is not None and not self._frontier_holds(connection, scope):
             self.invalidate_replay_scope(scope, "session_replaced")
             return False
@@ -343,6 +379,66 @@ class ReplayOutput:
             ),
         )
         return True
+
+    def _member_scope(
+        self, connection: Any, session_id: str, fields: dict[str, object]
+    ) -> ReplayScopeId | None:
+        scope = self.replay.scope_for(connection)
+        if scope is None:
+            return None
+        if scope.kind == "top":
+            return scope if scope.value == session_id else None
+        agent = _agent_id(fields)
+        if agent is not None and (agent == scope.value or agent.startswith(scope.value + ":")):
+            return scope
+        return None
+
+    def _child_covers(
+        self,
+        scope: ReplayScopeId,
+        event: EventDescriptor,
+        fields: dict[str, object],
+        facts: rows.RowFacts | None,
+    ) -> rows.Covers:
+        """The child scope's covers: the run's own store and owner (rows.py scope rule)."""
+        facts = facts or rows.RowFacts()
+        try:
+            source = rows.route(event, fields, facts, owner=scope.value)
+        except rows.UnroutedEvent as exc:
+            logger.error("replay event has no route table entry: %s", exc)
+            self.invalidate_replay_scope(scope, "evicted")
+            return None
+        store = live_child_store(scope.value)
+        if store is None:
+            return None
+        return rows.covers(event, source, store, fields, facts)
+
+    def publish_child_lifecycle(
+        self,
+        event: EventDescriptor,
+        scope: ReplayScopeId,
+        session_id: str,
+        fields: dict[str, object],
+        covers: rows.Covers,
+    ) -> None:
+        """Send one lifecycle event only to streams of its immediate parent's scope.
+
+        ``child_progress`` for a pending join is suppressed: no frame, charge, or seq;
+        the join's admission baseline carries the run's latest row instead.
+        """
+        for state in (self._controller, *self._observers):
+            if (
+                state is None
+                or "child_run_events" not in state.features
+                or (state is self._controller and self._controller_output_paused)
+                or self.replay.scope_for(state.connection) != scope
+            ):
+                continue
+            if event is EventDescriptor.CHILD_PROGRESS and self.replay.is_pending(
+                state.connection
+            ):
+                continue
+            self._publish_replay(state, event, session_id, fields, covers, scope=scope)
 
     async def admit_join_response(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)

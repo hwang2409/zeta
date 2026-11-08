@@ -20,7 +20,7 @@ from ..protocol.types import (
     is_passive_harness_message,
     is_visible_harness_notice,
 )
-from . import event_contract
+from . import child_history, event_contract
 from .protocol import (
     MAX_FRAME_BYTES,
     MAX_REQUEST_ID_BYTES,
@@ -186,6 +186,7 @@ _HISTORY_ROW_FEATURES = (
     "fidelity",
     "content_read",
     "served_turn_end",
+    "child_runs",
 )
 
 
@@ -195,6 +196,7 @@ def _history_feature_key(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool,
 ) -> tuple[bool, ...]:
     values = locals()
     return tuple(values[name] for name in _HISTORY_ROW_FEATURES)
@@ -214,6 +216,7 @@ def _cache(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool,
 ) -> _CachedProjection | None:
     cache = getattr(store, "_serve_history_projections", {})
     return cache.get(
@@ -222,6 +225,7 @@ def _cache(
             fidelity=fidelity,
             content_read=content_read,
             served_turn_end=served_turn_end,
+            child_runs=child_runs,
         )
     )
 
@@ -233,6 +237,7 @@ def _publish_cache(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool,
     cached: _CachedProjection,
 ) -> None:
     cache = getattr(store, "_serve_history_projections", None)
@@ -245,6 +250,7 @@ def _publish_cache(
             fidelity=fidelity,
             content_read=content_read,
             served_turn_end=served_turn_end,
+            child_runs=child_runs,
         )
     ] = cached
 
@@ -343,6 +349,7 @@ def history_projection(
     fidelity: bool = False,
     content_read: bool = False,
     served_turn_end: bool = False,
+    child_runs: bool = False,
 ) -> HistoryProjection:
     """Return one immutable wire projection for the store's generation."""
     cached = _cache(
@@ -351,6 +358,7 @@ def history_projection(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )
     generation = _generation(store)
     if cached is not None and cached.generation == generation:
@@ -367,7 +375,12 @@ def history_projection(
     approval_calls: dict[str, object] = {}
     accepted_messages: dict[str, dict[str, object]] = {}
     entries: list[list[Any]] = [[]]
+    runs: dict[str, str] = {}
     for entry in branch:
+        if entry.type == "child_run_started":
+            if child_runs:
+                entries[-1].append(child_history.started_entry(store, entry, runs))
+            continue
         if entry.type == "client_delivery" and isinstance(
             entry.data.get("accepted_message"), dict
         ):
@@ -400,6 +413,10 @@ def history_projection(
             entry.type == "warning" and entry.data.get("kind") == "transcript_recovery"
         ):
             entries[-1].append(entry)
+            if child_runs and (
+                ended := child_history.ended_entry(store, entry, runs)
+            ) is not None:
+                entries[-1].append(ended)
             entries.append([])
         elif entry.type in {
             "client_delivery",
@@ -424,6 +441,7 @@ def history_projection(
             fidelity=fidelity,
             content_read=content_read,
             served_turn_end=served_turn_end,
+            child_runs=child_runs,
         )
         if cached is None or cached.generation != generation:
             _publish_cache(
@@ -432,6 +450,7 @@ def history_projection(
                 fidelity=fidelity,
                 content_read=content_read,
                 served_turn_end=served_turn_end,
+                child_runs=child_runs,
                 cached=_CachedProjection(generation, built),
             )
             return built
@@ -496,6 +515,8 @@ def _history_entry_rows(
     """Project one durable entry to one atomic group of history rows."""
 
     entry_type = entry.type
+    if entry_type in {"child_run_started", "child_ended"}:
+        return child_history.history_rows(entry)
     if entry_type == "client_delivery":
         if not fidelity:
             return []
@@ -961,6 +982,7 @@ def _publish_history_page(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool,
 ) -> dict:
     with _cache_creation_lock:
         cached = _cache(
@@ -969,6 +991,7 @@ def _publish_history_page(
             fidelity=fidelity,
             content_read=content_read,
             served_turn_end=served_turn_end,
+            child_runs=child_runs,
         )
         if (
             cached is not None
@@ -981,6 +1004,7 @@ def _publish_history_page(
                 fidelity=fidelity,
                 content_read=content_read,
                 served_turn_end=served_turn_end,
+                child_runs=child_runs,
                 cached=_CachedProjection(generation, expanded),
             )
     return result
@@ -994,6 +1018,7 @@ def _backward_history_request(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool,
 ) -> dict:
     return _backward_history_page(
         runtime,
@@ -1002,6 +1027,7 @@ def _backward_history_request(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )[0]
 
 
@@ -1012,6 +1038,7 @@ def replay_history(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool,
 ) -> tuple[dict, int]:
     """Return the newest backward page and the seq of the newest row it covers."""
     return _backward_history_page(
@@ -1021,6 +1048,7 @@ def replay_history(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )
 
 
@@ -1032,6 +1060,7 @@ def _backward_history_page(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool,
 ) -> tuple[dict, int]:
     before = params["before"]
     validator = params.get("history_validator")
@@ -1045,6 +1074,7 @@ def _backward_history_page(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )
     end = len(projection.entry_groups) - 1
     if before is None:
@@ -1071,6 +1101,7 @@ def _backward_history_page(
         fidelity,
         content_read,
         served_turn_end,
+        child_runs,
     ), projection.frontier
 
 
@@ -1082,6 +1113,7 @@ def _forward_history_request(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool,
 ) -> dict:
     store = runtime.opened.store
     generation = _generation(store)
@@ -1091,6 +1123,7 @@ def _forward_history_request(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )
     result, expanded = page_history(
         projection,
@@ -1108,6 +1141,7 @@ def _forward_history_request(
         fidelity,
         content_read,
         served_turn_end,
+        child_runs,
     )
 
 
@@ -1153,6 +1187,7 @@ def history(
     fidelity: bool = False,
     content_read: bool = False,
     served_turn_end: bool = False,
+    child_runs: bool = False,
 ) -> dict:
     backward_keys = {"before", "history_validator"}
     if backward_keys.intersection(params) and not backward_enabled:
@@ -1169,6 +1204,7 @@ def history(
             fidelity=fidelity,
             content_read=content_read,
             served_turn_end=served_turn_end,
+            child_runs=child_runs,
         )
     if backward_keys.intersection(params):
         raise ProtocolError(
@@ -1186,6 +1222,7 @@ def history(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )
 
 
