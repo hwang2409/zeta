@@ -1027,6 +1027,7 @@ Error descriptors are:
 | `controller_output_overflow` | `-32011` | none | controller output overflow |
 | `observer_output_overflow` | `-32011` | none | observer output overflow |
 | `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `transcript_repair_requires_upgrade` | `-32013` | `transcript_repair_requires_upgrade` | transcript repair requires the stored-format upgrade |
 | `corrupt_transcript` | `-32000` | `corrupt_transcript` | transcript is corrupt or uses an unsupported format |
 | `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
 | `account_lock_timeout` | `-32008` | `account_lock_timeout` | another process holds the selected account lock |
@@ -1485,8 +1486,10 @@ implementation for the frontend client. Two RPCs cover the surface.
     its authorship stay server-side.
   - `client_only`: the command exists but must run in the client (name is
     echoed back for the client's dispatch table).
-  - `unknown`: no command matched the leading token.
-  - `error`: the shared dispatcher reported a bounded failure `text`.
+  - `unknown`: the shared dispatcher did not handle the input as a command, so the client may use it as model input; this includes multiline or non-slash-safe input, existing root-absolute paths, and argument-bearing input without a close command match. Path detection uses the host filesystem, so `/tmp` passes through only where that path exists.
+  - `error`: the shared dispatcher reported a bounded failure `text`, such as
+    an unknown slash-safe command. The text tells users to type `//` to send
+    the command as model input and may include a close-match suggestion.
 
 Structured slash error codes are:
 
@@ -1524,7 +1527,7 @@ The shared slash registry has this order and surface availability:
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
 | `tasks` | no | inspect background processes |
-| `decisions` | no | answer or discuss open decisions |
+| `decisions` | yes | read, reply to, or dismiss attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |
 | `approve` | no | `/approve [key]` |

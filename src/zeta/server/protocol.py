@@ -69,6 +69,11 @@ class ErrorDescriptor(Enum):
     CONTROLLER_OUTPUT_OVERFLOW = (-32011, None, "controller output overflow")
     OBSERVER_OUTPUT_OVERFLOW = (-32011, None, "observer output overflow")
     CONTENT_NOT_FOUND = (-32012, "content_not_found", "content handle was not found")
+    TRANSCRIPT_REPAIR_REQUIRES_UPGRADE = (
+        -32013,
+        "transcript_repair_requires_upgrade",
+        "transcript repair requires the stored-format upgrade",
+    )
     CORRUPT_TRANSCRIPT = (
         -32000,
         "corrupt_transcript",

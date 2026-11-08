@@ -86,7 +86,7 @@ def test_render_failure_exits_without_input_and_restores_session(
         nonlocal startup_canceled, startup_canceled_before_close, startup_started
         startup_started = True
         try:
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=10)
         finally:
             startup_canceled = True
             startup_canceled_before_close = not app._closed
@@ -96,7 +96,8 @@ def test_render_failure_exits_without_input_and_restores_session(
     async def bounded_run(app, args) -> None:
         await asyncio.wait_for(original_run(app, args), timeout=5)
 
-    monkeypatch.setattr(cli, "create_app", lambda args: app)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
+    monkeypatch.setattr(cli, "_create_tui_app", lambda *_args: app)
     monkeypatch.setattr(cli, "_run_tui", bounded_run)
     monkeypatch.setattr(app._status_card, "preferred_width", broken_width)
     monkeypatch.setattr(Application, "_handle_exception", unexpected_exception_prompt)

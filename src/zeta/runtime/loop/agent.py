@@ -231,9 +231,9 @@ class AgentLoop(
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
         self._children_recovered = False
-        self._pending_child_recovery: tuple[NotificationInput, ...] = ()
         self._closed = False
         self._turn_active = False
+        self._abort_admitted = False
         self._delivery_wake_pending = False
         self.explicit_finish = False
         self._explicit_finish_report: dict[str, object] | None = None
@@ -370,13 +370,16 @@ class AgentLoop(
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
 
+    def admit_abort(self) -> None:
+        self._abort_admitted = True
+
     def abort(
         self,
         *,
         foreground_only: bool = False,
         steering_drop_reason: Literal["abort", "disconnect"] | None = "abort",
     ) -> None:
-        """Signal active tools; optionally preserve background work and steering."""
+        self.admit_abort()
         self.tool_registry.abort()
         if not foreground_only:
             self._background_owner.cancel_all()
@@ -802,6 +805,8 @@ class AgentLoop(
             or recovering_tool_limit
         ):
             if not retrying_context and not retrying_provider:
+                if self._abort_admitted:
+                    return
                 provider_retry_budget = None
                 self._turn_provider_retry_records = []
                 iteration_consuming_notifications = consuming_notifications
@@ -913,6 +918,8 @@ class AgentLoop(
                 self._turn_provider_retry_records = provider_retry_budget.records
                 admitted_request = prepared_delivery.admitted_request
                 assert admitted_request is not None
+                if self._abort_admitted:
+                    return
                 completion = apply_retry_budget(
                     self.context_assembler.dispatch_admitted_request(
                         self.backend, admitted_request
