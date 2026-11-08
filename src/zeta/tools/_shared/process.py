@@ -13,7 +13,10 @@ import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ...core.store import ConversationStore
 
 from ...core.checkpoints import load_session_json
 from ...core.process_env import subprocess_env as tool_subprocess_env
@@ -57,6 +60,23 @@ BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
 BACKGROUND_OUTPUT_DRAIN_TIMEOUT = 0.25
 class BackgroundTaskRegistry:
     """Own detached process groups and their bounded session output."""
+
+    @classmethod
+    def for_session_store(
+        cls,
+        store: ConversationStore | None,
+        *,
+        command_niceness: int,
+    ) -> BackgroundTaskRegistry:
+        if store is None:
+            return cls(command_niceness=command_niceness)
+        return cls(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            command_niceness=command_niceness,
+            storage_lease=store._storage_lease,
+            notification_exists=store.has_task_exit_notification,
+        )
 
     def __init__(
         self,
@@ -169,8 +189,9 @@ class BackgroundTaskRegistry:
     ) -> None:
         self._notice_sink = sink
 
-    def set_notification_exists(self, lookup: Callable[[str], bool]) -> None:
-        self._notification_exists = lookup
+    def bind_session_store(self, store: ConversationStore) -> None:
+        self._notification_exists = store.has_task_exit_notification
+        self.bind_session_dir(store.session_dir, store.directory_fd, store._storage_lease)
 
     def set_notification_sink(
         self,
