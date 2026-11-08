@@ -15306,35 +15306,27 @@ async def test_history_finder_does_not_cross_session_boundaries(
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "content", "structured_content", "expected"),
+    ("tool_name", "content", "structured_content"),
     [
         (
             "finish",
-            "finish accepted; no more work or prose is needed",
+            "finish accepted",
             {
                 "status": "done",
-                "summary": "summary-" + "x" * 180,
+                "summary": "summary paragraph. " * 200,
                 "verdict": "pass",
                 "head_sha": "abcdef1234567",
             },
-            ("summary-" + "x" * 180, "verdict: pass"),
         ),
         (
             "agent_handoff",
-            "background child agents handed off; reason: "
-            + "reason-"
-            + "y" * 180
-            + "; outputs: output details",
+            "background child agents handed off; reason: " + "reason paragraph. " * 200,
             None,
-            ("reason-" + "y" * 180, "outputs:"),
         ),
     ],
 )
-def test_finish_and_handoff_cards_wrap_complete_detail(
-    tool_name: str,
-    content: str,
-    structured_content: dict[str, str] | None,
-    expected: tuple[str, str],
+def test_finish_and_handoff_cards_cap_long_detail(
+    tool_name: str, content: str, structured_content: dict[str, str] | None
 ) -> None:
     call = ToolCall(f"{tool_name}-detail", tool_name, {})
     rendered = render_event(
@@ -15342,9 +15334,7 @@ def test_finish_and_handoff_cards_wrap_complete_detail(
             StreamEventType.TOOL_EXECUTION_END,
             tool_call=call,
             tool_result=ToolResult(
-                call.id,
-                content,
-                structured_content=structured_content,
+                call.id, content, structured_content=structured_content
             ),
         )
     )
@@ -15353,7 +15343,27 @@ def test_finish_and_handoff_cards_wrap_complete_detail(
     output = StringIO()
     _test_console(output, width=100).print(rendered)
     snapshot = Text.from_ansi(output.getvalue()).plain.rstrip()
-    plain = renderable_plain(rendered)
-    assert expected[0] in plain
-    assert expected[1] in plain
-    assert "…" not in snapshot
+    assert "… +" in snapshot
+    assert snapshot.count("… +") == 1
+    assert "summary paragraph." in snapshot or "reason paragraph." in snapshot
+
+
+def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
+    for tool_name, content, structured in (
+        ("finish", "finish accepted", {"summary": "short summary"}),
+        ("agent_handoff", "short reason", None),
+    ):
+        call = ToolCall(f"{tool_name}-short", tool_name, {})
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(
+                    call.id, content, structured_content=structured
+                ),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        _test_console(output, width=100).print(rendered)
+        assert "… +" not in Text.from_ansi(output.getvalue()).plain
