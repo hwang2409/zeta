@@ -29,7 +29,7 @@ class _ControlledSignal:
     async def wait(self) -> None:
         self.wait_entered.set()
         try:
-            await self.released.wait()
+            await asyncio.wait_for(self.released.wait(), 10)
         finally:
             self.wait_finished.set()
 
@@ -46,10 +46,10 @@ class _SlowCancelSignal(_ControlledSignal):
     async def wait(self) -> None:
         self.wait_entered.set()
         try:
-            await self.released.wait()
+            await asyncio.wait_for(self.released.wait(), 10)
         except asyncio.CancelledError:
             self.drain_entered.set()
-            await self.release_drain.wait()
+            await asyncio.wait_for(self.release_drain.wait(), 10)
             raise
         finally:
             self.wait_finished.set()
@@ -64,7 +64,7 @@ class _ControlledTick:
     async def __call__(self, _delay: float) -> None:
         self.entered.set()
         try:
-            await self.released.wait()
+            await asyncio.wait_for(self.released.wait(), 10)
         finally:
             self.finished.set()
 
@@ -92,7 +92,7 @@ class _AdmissionControl:
         self.aborts.append((request_id, child_instance_id, reason))
         self.entered.set()
         try:
-            await self.released.wait()
+            await asyncio.wait_for(self.released.wait(), 10)
             return {"decision": "abort", "reason": reason}
         finally:
             self.finished.set()
@@ -221,6 +221,7 @@ async def test_authorize_polling_interleavings(
             monkeypatch.setattr(
                 harness.store, "append_message_with_approval_requests", persist_winner
             )
+            # test-contract: seam prove current-state read precedes abort arbitration
             monkeypatch.setattr(harness.policy, "_resolve_abort_or_winner", reject_abort)
             signal.abort()
             assert await harness.authorize(signal) is ApprovalDecision.ALLOW
@@ -290,7 +291,7 @@ async def test_authorize_polling_interleavings(
         elif case == "cancel_wait":
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await await_or_fail(task, what="canceled approval wait")
             await await_or_fail(signal.wait_finished.wait(), what="canceled abort waiter")
             await await_or_fail(tick.finished.wait(), what="canceled poll tick")
             assert harness.decision() is None
@@ -301,7 +302,7 @@ async def test_authorize_polling_interleavings(
             task.cancel()
             signal.release_drain.set()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await await_or_fail(task, what="canceled approval drain")
             await await_or_fail(signal.wait_finished.wait(), what="drained abort waiter")
             await await_or_fail(tick.finished.wait(), what="completed poll tick")
             assert harness.decision() is None
@@ -312,7 +313,7 @@ async def test_authorize_polling_interleavings(
             await await_or_fail(control.entered.wait(), what="serve abort admission")
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await await_or_fail(task, what="canceled serve admission")
             control.released.set()
             await await_or_fail(control.finished.wait(), what="owned serve settlement")
             expected_child = "innermost" if kind == "nested" else None
@@ -338,7 +339,9 @@ async def test_authorize_polling_interleavings(
         signal.abort()
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), 10
+            )
         harness.close()
 
 
