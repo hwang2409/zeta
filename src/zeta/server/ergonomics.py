@@ -1161,7 +1161,10 @@ def catalog(runtime: ServerRuntime) -> dict:
         "models": known_model_names(),
         "providers": {
             model: provider
-            for provider, models in PROVIDER_MODELS.items()
-            for model in models
+            for model, provider in sorted(
+                (model, provider)
+                for provider, models in PROVIDER_MODELS.items()
+                for model in models
+            )
         },
     }
