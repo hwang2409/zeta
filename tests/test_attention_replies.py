@@ -90,6 +90,40 @@ def _fixture(home: Path, count: int = 3) -> ReplyFixture:
     )
 
 
+def test_invalid_attention_name_is_listed_without_reading_bytes(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, count=1)
+    path = fixture.attention_dir / "junk.json"
+    path.write_bytes(b"must not be read")
+    long_path = fixture.attention_dir / ("x" * 200 + ".json")
+    long_path.write_bytes(b"also must not be read")
+
+    listed = AttentionStore(tmp_path / "sessions" / fixture.session_id).list()
+
+    broken = next(item for item in listed if isinstance(item, Broken))
+    assert broken.id == "junk.json"
+    assert broken.path == "attention/junk.json"
+    assert broken.reason == "invalid_name"
+    assert broken.bytes == b""
+    long_broken = next(
+        item
+        for item in listed
+        if isinstance(item, Broken)
+        and item.path
+        == long_path.relative_to(
+            fixture.home / "sessions" / fixture.session_id
+        ).as_posix()
+    )
+    assert isinstance(long_broken, Broken)
+    assert len(long_broken.id) == 160
+    assert long_broken.id.endswith("...")
+    assert path.read_bytes() == b"must not be read"
+    assert long_path.read_bytes() == b"also must not be read"
+    assert any(
+        isinstance(item, AttentionRecord) and item.id == fixture.records[0].id
+        for item in listed
+    )
+
+
 def test_broken_attention_is_listed_and_cannot_be_replied_or_deleted(
     tmp_path: Path,
 ) -> None:

@@ -1455,8 +1455,10 @@ The shared slash registry has this order and surface availability:
 
 The `/decisions` list includes broken attention records instead of hiding them. A
 broken item is additive: it has `id`, `path`, and `reason` fields in attention
-payloads, and contains no request body. Reply, dismiss, stage, and batch-reply
-operations refuse broken ids without changing their bytes.
+payloads, and contains no request body. `reason` is one of `unreadable`,
+`invalid_name`, `invalid_json`, `invalid_schema`, `id_mismatch`, or `too_large`.
+Reply, dismiss, stage, and batch-reply operations refuse broken ids without
+changing their bytes.
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |
 | `approve` | no | `/approve [key]` |

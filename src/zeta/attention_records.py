@@ -14,6 +14,14 @@ from typing import Any, Literal
 from .storage_format import WRITER_EPOCH, require_closed_variant
 
 AttentionKind = Literal["decision", "answer", "decided", "deferred"]
+AttentionReason = Literal[
+    "unreadable",
+    "invalid_name",
+    "invalid_json",
+    "invalid_schema",
+    "id_mismatch",
+    "too_large",
+]
 
 from .core.session_files import (
     child_directory,
@@ -23,6 +31,16 @@ from .core.session_files import (
 )
 
 _MAX_RECORD_BYTES = 256 * 1024
+_MAX_BROKEN_ID_CHARS = 160
+
+
+def _safe_broken_id(filename: str) -> str:
+    rendered = "".join(
+        character if character.isprintable() else "�" for character in filename
+    )
+    if len(rendered) <= _MAX_BROKEN_ID_CHARS:
+        return rendered
+    return rendered[: _MAX_BROKEN_ID_CHARS - 3] + "..."
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +57,7 @@ class Loaded:
 class Broken:
     id: str
     path: str
-    reason: str
+    reason: AttentionReason
     recoverability: str
     bytes: bytes
 
@@ -199,9 +217,16 @@ class AttentionStore:
         self.replace(record, create_directory=True)
         return record
 
-    def _broken(self, path: Path, reason: str, raw: bytes = b"") -> Broken:
+    def _broken(
+        self,
+        path: Path,
+        reason: AttentionReason,
+        raw: bytes = b"",
+        *,
+        record_id: str | None = None,
+    ) -> Broken:
         return Broken(
-            path.stem,
+            path.stem if record_id is None else record_id,
             self._relative_path(path),
             reason,
             "manual repair",
@@ -268,6 +293,17 @@ class AttentionStore:
         records: list[AttentionRecord | Broken] = []
         for path in paths:
             if path.suffix != ".json":
+                continue
+            if len(path.stem) != 32 or any(
+                character not in "0123456789abcdef" for character in path.stem
+            ):
+                records.append(
+                    self._broken(
+                        path,
+                        "invalid_name",
+                        record_id=_safe_broken_id(path.name),
+                    )
+                )
                 continue
             state = self.record_state(path.stem)
             if isinstance(state, Loaded):
