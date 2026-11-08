@@ -20,6 +20,7 @@ from tests.test_server import (
     TIMEOUT,
     _connect,
     _event,
+    _frames_until_eof,
     _frames_until_event,
     _read,
     _request,
@@ -1475,10 +1476,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
             if cancel:
                 original_frames = list(_buffer(reader))
                 _buffer(reader).clear()
-                while line := await await_or_fail(
-                    reader.readline(), what="original controller close"
-                ):
-                    original_frames.append(json.loads(line))
+                original_frames.extend(await _frames_until_eof(reader))
                 (
                     replacement_reader,
                     replacement_writer,
