@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
@@ -24,6 +25,7 @@ ToolStream = Literal["stdout", "stderr"]
 ToolHandlerResult = str | StructuredToolResult | ToolResult
 ToolStreamSink = Callable[[StreamEvent], None]
 ToolLifecycleSink = Callable[..., None]
+logger = logging.getLogger(__name__)
 
 
 class ToolStreamPublisher(Protocol):
@@ -199,6 +201,12 @@ def bind_execution_context(
     return partial(handler, execution_context=context)
 
 
+# How long the owner waits for a canceled handler to finish its cleanup.
+# Read at call time, so tests lower it through the same code path.
+HANDLER_CANCEL_DRAIN_SECONDS = 30.0
+_detached_handlers: set[asyncio.Task[ToolHandlerResult]] = set()
+
+
 async def run_handler_with_abort(
     handler: ToolHandler,
     arguments: dict[str, Any],
@@ -206,63 +214,91 @@ async def run_handler_with_abort(
     stream_publisher: ToolStreamPublisher | None,
     tool_call_id: str,
 ) -> ToolHandlerResult:
-    current = asyncio.current_task()
+    """Run one handler in a task that only this function cancels, at most once.
 
-    async def cancel_on_abort() -> None:
-        await execution_signal.wait()
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        if (
-            current is not None
-            and not current.done()
-            and not current.cancelling()
-        ):
-            current.cancel()
-
-    abort_wait = asyncio.create_task(cancel_on_abort())
-    result: ToolHandlerResult | None = None
-    result_produced = False
+    The abort signal and every cancel of the caller's task are requests. The
+    handler task gets one cancel for all of them, then has
+    HANDLER_CANCEL_DRAIN_SECONDS to finish before it is detached.
+    """
+    handler_task = asyncio.create_task(
+        invoke_handler(handler, arguments, execution_signal, stream_publisher)
+    )
+    signal_wait = asyncio.create_task(execution_signal.wait())
+    clock = asyncio.get_running_loop()
+    outer_canceled = False
+    cancel_sent = False
+    deadline = 0.0
     try:
-        try:
-            result = await invoke_handler(
-                handler,
-                arguments,
-                execution_signal,
-                stream_publisher,
-            )
-            result_produced = True
-        except _ToolCanceled:
-            result = canceled_result(tool_call_id)
-            result_produced = True
-        except asyncio.CancelledError:
-            if execution_signal.is_set():
-                result = canceled_result(tool_call_id)
-                result_produced = True
-            else:
-                raise
-        except Exception as exc:  # noqa: BLE001 - tool handlers fail closed
-            result = ToolResult(tool_call_id, str(exc), True)
-            result_produced = True
+        while not handler_task.done():
+            if cancel_sent and clock.time() >= deadline:
+                _detach(handler_task, tool_call_id)
+                break
+            try:
+                await asyncio.wait(
+                    {handler_task} if cancel_sent else {handler_task, signal_wait},
+                    timeout=deadline - clock.time() if cancel_sent else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                outer_canceled = True
+            if cancel_sent or handler_task.done():
+                continue
+            if signal_wait.done():
+                # Let a cooperative handler (bash, agent) see the signal first.
+                for _ in range(2):
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError:
+                        outer_canceled = True
+            if outer_canceled or signal_wait.done():
+                handler_task.cancel()
+                cancel_sent = True
+                deadline = clock.time() + HANDLER_CANCEL_DRAIN_SECONDS
     finally:
         if stream_publisher is not None:
             stream_publisher.close()
-        if not abort_wait.done():
-            abort_wait.cancel()
-            async def cleanup_abort_wait() -> None:
-                await asyncio.gather(abort_wait, return_exceptions=True)
+        signal_wait.cancel()
+        while not signal_wait.done():
+            try:
+                await asyncio.wait({signal_wait})
+            except asyncio.CancelledError:
+                pass
+    return _handler_result(handler_task, execution_signal, tool_call_id)
 
-            cleanup = asyncio.create_task(cleanup_abort_wait())
-            cleanup_canceled = False
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    cleanup_canceled = True
-            if cleanup_canceled and not result_produced:
-                raise asyncio.CancelledError
-    if not result_produced:
-        raise RuntimeError("tool handler did not produce a result")
-    return result
+
+def _handler_result(
+    handler_task: asyncio.Task[ToolHandlerResult],
+    execution_signal: AbortSignal,
+    tool_call_id: str,
+) -> ToolHandlerResult:
+    if handler_task.done() and not handler_task.cancelled():
+        error = handler_task.exception()
+        if error is None:
+            return handler_task.result()
+        if isinstance(error, _ToolCanceled):
+            return canceled_result(tool_call_id)
+        if isinstance(error, Exception):
+            return ToolResult(tool_call_id, str(error), True)
+        raise error
+    if execution_signal.is_set():
+        return canceled_result(tool_call_id)
+    raise asyncio.CancelledError
+
+
+def _detach(task: asyncio.Task[ToolHandlerResult], tool_call_id: str) -> None:
+    _detached_handlers.add(task)
+    task.add_done_callback(_reap_detached)
+    logger.warning(
+        "tool %s: cleanup still running %.0f s after its cancel; detached",
+        tool_call_id,
+        HANDLER_CANCEL_DRAIN_SECONDS,
+    )
+
+
+def _reap_detached(task: asyncio.Task[ToolHandlerResult]) -> None:
+    _detached_handlers.discard(task)
+    if not task.cancelled():
+        task.exception()
 
 
 def build_execution_arguments(
