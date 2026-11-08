@@ -30,7 +30,7 @@ async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
     metadata, pins = _pin()
     assert pins
     assert PIN.read_text().splitlines()[0] == (
-        '{"fixture":"serve_wire_pin","base_sha":"e8e77882"}'
+        '{"fixture":"serve_wire_pin","base_sha":"cfa06e43"}'
     )
     assert {pin.get("kind") for pin in pins} >= {
         "mutation_observer",

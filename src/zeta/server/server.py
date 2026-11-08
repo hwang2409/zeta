@@ -51,6 +51,26 @@ from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
+LOADED_SESSION_MUTATIONS = frozenset(
+    {
+        "abort",
+        "approve",
+        "clear_steering",
+        "deny",
+        "fork_message",
+        "rename_session",
+        "revoke_session_grants",
+        "send",
+        "send_images",
+        "set_compaction",
+        "set_settings",
+        "set_turn_context",
+        "slash_run",
+        "steer",
+        "switch_branch",
+    }
+)
+
 
 def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
     async def handle(
@@ -316,7 +336,7 @@ class ZetaServer:
     async def close(self) -> None:
         try:
             if self._client is not None:
-                await self._client.close()
+                await self._client.close(graceful=True)
         finally:
             self._client = None
             self._client_active = False
@@ -387,6 +407,7 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
@@ -394,10 +415,12 @@ class _Client:
         )
 
     async def run(self) -> None:
+        graceful = True
         try:
             while True:
                 line = await self._read_frame()
                 if not line:
+                    graceful = False
                     break
                 await self.connections.wait_until_settled(self)
                 try:
@@ -480,7 +503,7 @@ class _Client:
                 if not self.handshaken:
                     break
         finally:
-            await self.close()
+            await self.close(graceful=graceful and not self._transport_failed)
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -520,7 +543,7 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
-    async def close(self) -> None:
+    async def close(self, *, graceful: bool = False) -> None:
         async with self._close_lock:
             if self._closed:
                 return
@@ -530,6 +553,8 @@ class _Client:
                 )
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
+            if graceful:
+                await self.connections.flush(self)
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
@@ -947,16 +972,23 @@ class _Client:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self
             )
-        await self.server.control.require_idle()
         if descriptor is MethodDescriptor.SLASH_RUN:
+            text = _required_string(params, "text")
+            if (
+                self.server.control.turn_busy()
+                and not await slash_commands.can_run_while_busy(runtime, text)
+            ):
+                await self.server.control.require_idle()
             register = self.server.control.model_input_registrar(self.features)
             return await slash_commands.run_command(
                 runtime,
-                _required_string(params, "text"),
+                text,
                 register_model_input=register,
                 approval_control=self.server.control,
                 run_blocking=self.server.control._run_blocking,
+                busy=self.server.control.turn_busy(),
             )
+        await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if descriptor is MethodDescriptor.SET_SETTINGS:
             model = _required_string(params, "model")
@@ -1137,7 +1169,10 @@ class _Client:
         }, page_ids
 
     async def _write(self, payload: _Frame) -> bool:
-        return await self.connections.send(self, payload)
+        written = await self.connections.send(self, payload)
+        if not written:
+            self._transport_failed = True
+        return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
         async with self._write_lock:

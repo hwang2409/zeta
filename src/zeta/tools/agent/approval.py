@@ -421,14 +421,14 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         execution_token: str | None,
         capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
-        settlement = self._request_serve_abort(request_id)
-        if settlement is None:
+        admitted = self._request_serve_abort(request_id)
+        if admitted is None:
             return self.abort_or_winner(
                 request_id,
                 execution_token=execution_token,
                 capability=capability,
             )
-        resolution = await settlement
+        resolution = await asyncio.shield(admitted)
         state = self.child_store.approval_states().get(request_id)
         decision = _approval_decision(
             resolution["decision"] if resolution is not None else None

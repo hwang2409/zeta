@@ -1,4 +1,4 @@
-{"fixture":"serve_wire_pin","base_sha":"e8e77882"}
+{"fixture":"serve_wire_pin","base_sha":"cfa06e43"}
 {"kind":"method_sets","loaded":["abort","approve","clear_steering","deny","fork_message","rename_session","revoke_session_grants","send","send_images","set_compaction","set_settings","set_turn_context","slash_run","steer","switch_branch"],"delivery":["send","send_images","steer"],"observer":["content_read","delivery_status","list_sessions","model_catalog","ping","session_grants","session_history","session_settings","session_tree","status"]}
 {"case":"controller hello 1.0 []","response":"{\"jsonrpc\":\"2.0\",\"id\":\"c-hello\",\"result\":{\"protocol_version\":\"1.0\",\"server\":\"zeta\",\"capabilities\":{\"requests\":[\"list_sessions\",\"new_session\",\"resume\",\"send\",\"steer\",\"approve\",\"deny\",\"abort\",\"status\"],\"notifications\":[\"event\"]}}}\n"}
 {"case":"observer hello 1.0 []","response":"{\"jsonrpc\":\"2.0\",\"id\":\"o-hello\",\"error\":{\"code\":-32602,\"message\":\"observer requires protocol 1.1 and serve_observers\"}}\n"}

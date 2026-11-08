@@ -159,6 +159,32 @@ async def test_real_method_conformance_matrix(transport: str, tmp_path: Path) ->
             await contract.close()
 
 
+def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
+    registry = create_slash_registry(skill_catalog=SkillCatalog(()), surface="serve")
+    safe = {
+        command.name
+        for command in registry.builtin_commands
+        if command.serve is not None and command.serve.can_run_while_busy("")
+    }
+    assert safe == {
+        "accounts",
+        "help",
+        "inbox",
+        "memory",
+        "model",
+        "project",
+        "status",
+        "vim",
+    }
+    assert all(
+        command.serve is not None and command.serve.mutates is not None
+        for command in registry.builtin_commands
+        if command.name in safe
+    )
+    assert registry.command_for("memory").serve.can_run_while_busy("")
+    assert not registry.command_for("memory").serve.can_run_while_busy("undo")
+
+
 def test_protocol_registry_matches_documented_errors_and_events() -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     documented_errors = _documented_errors(document)

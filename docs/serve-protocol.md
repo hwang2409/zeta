@@ -938,7 +938,16 @@ synchronously reserves one parent notification turn in the `scheduled` state,
 then streams it to that client. The optional wake delay occurs inside this
 reservation. While the turn is `scheduled` or `running`, idle-only requests such
 as `send` and `resume` return the existing `-32004` busy error; they cannot take
-the reserved turn.
+the reserved turn. `slash_run` follows the same rule for commands that mutate or
+produce model input. It still returns client-only results for commands unavailable
+on serve, and it runs read-only slash commands such as `/status` and `/help`
+while the turn is busy. `/mcp` remains blocked while busy because even its
+status form can initialize and reconcile the live MCP mount on the event loop.
+For commands with argument-sensitive mutation, such as `/vim` and `/project`,
+the registry applies an exact read-only-form predicate and the mutation
+predicate to the arguments before allowing the command to run. The
+shared slash registry declares this per-command policy; commands without a
+busy-safe declaration remain blocked.
 
 The wake claims one notification batch without consuming it. Receipt events
 are streamed from that claim. Each receipt includes a stable
