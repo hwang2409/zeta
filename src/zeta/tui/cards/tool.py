@@ -493,9 +493,9 @@ def finish_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     if not isinstance(structured, dict):
         return tool_card(event)
     fields = [
-        (key, str(structured[key]))
+        (key, value)
         for key in ("status", "summary", "verdict", "head_sha")
-        if key in structured
+        if isinstance(value := structured.get(key), str)
     ]
     if not fields:
         return tool_card(event)

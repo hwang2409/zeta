@@ -15347,6 +15347,7 @@ def test_finish_and_handoff_cards_cap_long_detail(
     snapshot = Text.from_ansi(output.getvalue()).plain.rstrip()
     body = [line[2:-2] for line in snapshot.splitlines()[2:-1]]
     if tool_name == "finish":
+        assert any(line.startswith("summary: ") for line in body)
         start = next(index for index, line in enumerate(body) if line.startswith("summary: "))
         end = next(
             (index for index in range(start + 1, len(body)) if body[index].strip().startswith(("verdict:", "head_sha:"))),
@@ -15362,11 +15363,11 @@ def test_finish_and_handoff_cards_cap_long_detail(
 
 def test_finish_and_handoff_cards_handle_fallback_detail() -> None:
     cases = (
-        ("finish", "finish fallback", None, True),
-        ("finish", "finish malformed", {"summary": object()}, False),
-        ("agent_handoff", "handoff fallback", {"unexpected": "field"}, True),
+        ("finish", "finish fallback", None),
+        ("finish", "finish malformed", {"summary": object()}),
+        ("agent_handoff", "handoff fallback", {"unexpected": "field"}),
     )
-    for tool_name, content, structured, content_visible in cases:
+    for tool_name, content, structured in cases:
         call = ToolCall(f"{tool_name}-fallback", tool_name, {})
         rendered = render_event(
             StreamEvent(
@@ -15378,8 +15379,9 @@ def test_finish_and_handoff_cards_handle_fallback_detail() -> None:
         assert rendered is not None
         output = StringIO()
         _test_console(output, width=38).print(rendered)
-        if content_visible:
-            assert content in Text.from_ansi(output.getvalue()).plain
+        snapshot = Text.from_ansi(output.getvalue()).plain
+        assert content in snapshot
+        assert "object at 0x" not in snapshot
 
 
 def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
