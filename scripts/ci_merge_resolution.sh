@@ -8,8 +8,9 @@ trap cleanup EXIT
 if [ "$EVENT_NAME" = pull_request ]; then
   body_file=$(mktemp)
   gh pr view "$PR_NUMBER" --json body -q .body > "$body_file"
-  git fetch origin main --no-tags
-  commits=$(git rev-list --merges --first-parent origin/main.."$HEAD_SHA")
+  base_ref=${BASE_REF:-main}
+  git fetch origin "$base_ref" --no-tags
+  commits=$(git rev-list --merges --first-parent "origin/$base_ref..$HEAD_SHA")
   if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
     commits="$commits $(git rev-parse HEAD)"
   fi
