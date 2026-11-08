@@ -524,11 +524,7 @@ class AccountStore:
         value = value or self._read_registry(home_fd)
         self._check_reference_available(value, account, account.name)
         key = str(account)
-        # a new registry that omits existing account dirs makes the next sweep delete them
-        state, _ = self._load_registry(home_fd)
-        if state is _Registry.MISSING and self._has_unregistered_account_directories(
-            home_fd, {key}
-        ):
+        if self._registering_would_orphan(home_fd, account):
             raise AccountError(
                 "accounts.json is missing but other account directories exist; "
                 "restore accounts.json before adding an account"
@@ -565,9 +561,10 @@ class AccountStore:
                         state is _Registry.BROKEN
                         or self._has_unregistered_account_directories(home_fd, set())
                     ):
-                        warning = _UNSAFE_REGISTRY_WARNINGS[state]
-                        logger.warning("%s", warning)
-                        return (warning,)
+                        warnings.append(_UNSAFE_REGISTRY_WARNINGS[state])
+                        logger.warning("%s", warnings[-1])
+                    if state is _Registry.BROKEN:
+                        return tuple(warnings)
                 for provider in ("anthropic", "codex"):
                     self._migrate_provider(home_fd, provider)
         return tuple(warnings)
@@ -608,6 +605,14 @@ class AccountStore:
             except FileNotFoundError:
                 continue
         return orphans
+
+    def _registering_would_orphan(self, home_fd: int, account: AccountId) -> bool:
+        """A registry created without existing account dirs would sweep them next."""
+
+        state, _ = self._load_registry(home_fd)
+        if state is not _Registry.MISSING:
+            return False
+        return self._has_unregistered_account_directories(home_fd, {str(account)})
 
     def _has_unregistered_account_directories(
         self, home_fd: int, registered: set[str]
@@ -683,6 +688,8 @@ class AccountStore:
             self._lifecycle_guard(home_fd, account),
             credential_file_lock(legacy_path),
         ):
+            if self._registering_would_orphan(home_fd, account):
+                return
             value = self._read_registry(home_fd)
             registered = str(account) in value["accounts"]
             legacy_exists = _exists_regular(home_fd, legacy_name)
