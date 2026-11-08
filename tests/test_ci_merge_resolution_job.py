@@ -158,6 +158,20 @@ def test_pull_request_checks_only_first_parent_merges(tmp_path: Path) -> None:
     assert f"checking merge resolution: {inner_sha}" not in result.stdout
 
 
+def test_pytest_workflows_fetch_full_history() -> None:
+    workflows_dir = ROOT / ".github/workflows"
+    for workflow in workflows_dir.glob("*.y*ml"):
+        text = workflow.read_text()
+        if "pytest" not in text:
+            continue
+        checkout_before_pytest = re.search(
+            r"(?ms)^      - uses: actions/checkout@v4\n(.*?)(?=^      - uses:|\Z).*?(?:^      - uses: ./\.github/workflows/pytest$|^        run: .*pytest)",
+            text,
+        )
+        assert checkout_before_pytest is not None, workflow
+        assert "fetch-depth: 0" in checkout_before_pytest.group(1), workflow
+
+
 def test_title_only_edited_pull_request_still_runs_merge_resolution() -> None:
     workflow = WORKFLOW.read_text()
     job = workflow.split("  merge-resolution:\n", 1)[1]
