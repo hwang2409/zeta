@@ -14,7 +14,7 @@ from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
 from .. import memory_migration_plan, project_schema
-from ..storage_format import ACCEPTED_KEY_SETS
+from ..storage_format import ACCEPTED_KEY_SETS, P06_FEATURE_EPOCH, WRITER_EPOCH
 from . import (
     RemoteSyncError,
     _append_resume_hint,
@@ -34,30 +34,136 @@ _HOST = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 DEFAULT_MAX_ARCHIVE_BYTES = 1 << 30
 DEFAULT_MAX_ARCHIVE_MEMBERS = 200_000
 
-_FETCH_SCRIPT = r'''
-import fcntl, io, json, os, pathlib, sys, tarfile
+_SESSION_FETCH_SCRIPT = r'''
+import fcntl, pathlib, sys, tarfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
-kind, ident = sys.argv[2], sys.argv[3]
-if kind not in {"sessions", "projects"} or pathlib.Path(ident).parts != (ident,): sys.exit(45)
-parent = home / kind
+ident = sys.argv[2]
+if pathlib.Path(ident).parts != (ident,): sys.exit(45)
+parent = home / "sessions"
 if not parent.is_dir(): sys.exit(44)
 root = parent / ident
+if not root.is_dir() or root.is_symlink(): sys.exit(44)
 locks = []
 try:
-    if kind == "projects":
-        manifest = json.loads((home / "storage-format.json").read_text())
-        epoch = manifest.get("epoch")
-        if type(epoch) is not int or epoch < 1 or epoch > 6: sys.exit(53)
-        lock_path = parent / ".lock" if epoch < 6 else root / ".memory.lock"
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        os.fchmod(fd, 0o600); handle = os.fdopen(fd, "r+b")
-        try: fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError: sys.exit(52)
-        locks.append(handle)
-    if not root.is_dir() or root.is_symlink(): sys.exit(44)
     for path in [root / ".lock", *sorted(root.rglob(".lock"))]:
         if path.is_file() and not path.is_symlink():
             handle = path.open("rb"); fcntl.flock(handle.fileno(), fcntl.LOCK_EX); locks.append(handle)
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as archive:
+        for path in [root, *sorted(root.rglob("*"))]:
+            relative = path.relative_to(root)
+            if path.is_symlink(): sys.exit(46)
+            if path.name in {".lock", ".spill.lock", "runtime.lease"}: continue
+            if path.is_dir() or path.is_file():
+                archive.add(path, arcname=str(pathlib.Path("payload") / relative), recursive=False)
+            else: sys.exit(46)
+finally:
+    for handle in reversed(locks): handle.close()
+'''
+
+
+_PROJECT_AUTHORITY = rf'''
+import contextlib, fcntl, json, os, pathlib, stat, sys
+_P06_FEATURE_EPOCH = {P06_FEATURE_EPOCH}
+_WRITER_EPOCH = {WRITER_EPOCH}
+
+def _writer_epoch(home):
+    try: manifest = json.loads((home / "storage-format.json").read_text())
+    except (OSError, ValueError): sys.exit(53)
+    epoch = manifest.get("writer_epoch")
+    if type(epoch) is not int or epoch < 1 or epoch > _WRITER_EPOCH: sys.exit(53)
+    return epoch
+
+def _lock_file(directory_fd, name, operation):
+    try:
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
+    except OSError:
+        sys.exit(46)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        sys.exit(46)
+    os.fchmod(fd, 0o600)
+    try:
+        fcntl.flock(fd, operation)
+    except BlockingIOError:
+        os.close(fd)
+        sys.exit(52)
+    return fd
+
+def _validate_project(project_fd, ident):
+    try:
+        record_fd = os.open("project.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=project_fd)
+        with os.fdopen(record_fd) as stream:
+            record = json.load(stream)
+    except (OSError, ValueError):
+        sys.exit(44)
+    if record.get("project_id") != ident:
+        sys.exit(46)
+
+def _project_fd(projects_fd, ident):
+    try:
+        fd = os.open(ident, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=projects_fd)
+    except OSError:
+        sys.exit(44)
+    _validate_project(fd, ident)
+    return fd
+
+@contextlib.contextmanager
+def _project_authority(home, ident, *, identity, exclusive, nonblocking=False):
+    try:
+        projects_fd = os.open(home / "projects", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        sys.exit(44)
+    project_fd = None
+    lock_fd = None
+    try:
+        epoch = _writer_epoch(home)
+        legacy = epoch < _P06_FEATURE_EPOCH
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if nonblocking:
+            operation |= fcntl.LOCK_NB
+        if legacy or identity:
+            lock_fd = _lock_file(projects_fd, ".lock", operation)
+            if not identity:
+                project_fd = _project_fd(projects_fd, ident)
+        else:
+            project_fd = _project_fd(projects_fd, ident)
+            lock_fd = _lock_file(project_fd, ".memory.lock", operation)
+            _validate_project(project_fd, ident)
+        yield projects_fd if identity else project_fd
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if project_fd is not None:
+            os.close(project_fd)
+        os.close(projects_fd)
+
+class ProjectRegistry:
+    def __init__(self, projects):
+        self.projects = pathlib.Path(projects)
+    def _identity_write(self):
+        return _project_authority(
+            self.projects.parent, "", identity=True, exclusive=True
+        )
+    def _project_lock(self, project_id, domain, *, exclusive):
+        if domain != "memory":
+            raise ValueError("generated publisher supports memory only")
+        return _project_authority(
+            self.projects.parent,
+            project_id,
+            identity=False,
+            exclusive=exclusive,
+        )
+'''
+
+
+_PROJECT_FETCH_SCRIPT = _PROJECT_AUTHORITY + r'''
+import tarfile
+home = pathlib.Path(sys.argv[1]).expanduser().resolve()
+ident = sys.argv[2]
+if pathlib.Path(ident).parts != (ident,): sys.exit(45)
+root = home / "projects" / ident
+with _project_authority(home, ident, identity=False, exclusive=False, nonblocking=True):
     with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as archive:
         for path in [root, *sorted(root.rglob("*"))]:
             relative = path.relative_to(root)
@@ -66,8 +172,6 @@ try:
             if path.is_dir() or path.is_file():
                 archive.add(path, arcname=str(pathlib.Path("payload") / relative), recursive=False)
             else: sys.exit(46)
-finally:
-    for handle in reversed(locks): handle.close()
 '''
 
 _IDENTITY_SCRIPT = r'''
@@ -104,25 +208,16 @@ with lock_path.open("a+") as lock:
 print(value, end="")
 '''
 
-_INSTALL_SCRIPT = r'''
+_SESSION_INSTALL_SCRIPT = r'''
 import fcntl, hashlib, json, os, pathlib, shutil, sys, tarfile, tempfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
-kind, ident, expected = sys.argv[2], sys.argv[3], sys.argv[4]
-max_members, max_bytes = int(sys.argv[5]), int(sys.argv[6])
-if kind not in {"sessions", "projects"} or pathlib.Path(ident).parts != (ident,): sys.exit(45)
-parent = home / kind; parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+ident, expected = sys.argv[2], sys.argv[3]
+max_members, max_bytes = int(sys.argv[4]), int(sys.argv[5])
+if pathlib.Path(ident).parts != (ident,): sys.exit(45)
+parent = home / "sessions"; parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 destination = parent / ident
-registry_lease = None
-if kind == "projects":
-    manifest = json.loads((home / "storage-format.json").read_text())
-    epoch = manifest.get("epoch")
-    if type(epoch) is not int or epoch < 1 or epoch > 6: sys.exit(53)
-    lock_path = parent / ".lock" if epoch < 6 or expected == "missing" else destination / ".memory.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    os.fchmod(fd, 0o600); registry_lease = os.fdopen(fd, "r+b")
-    fcntl.flock(registry_lease.fileno(), fcntl.LOCK_EX)
 lease = None
-if destination.exists() and kind == "sessions":
+if destination.exists():
     lease = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
     try: fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError: sys.exit(48)
@@ -151,7 +246,7 @@ try:
             parts = pathlib.PurePosixPath(member.name).parts
             if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): sys.exit(46)
             target = staging.joinpath(*parts[1:])
-            if kind == "sessions" and target.name == "runtime.lease": sys.exit(46)
+            if target.name == "runtime.lease": sys.exit(46)
             if member.isdir(): target.mkdir(parents=True, exist_ok=True, mode=0o700)
             elif member.isfile():
                 target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -168,12 +263,11 @@ try:
                     if source.read(1): sys.exit(50)
                 target.chmod(0o600)
             else: sys.exit(46)
-    if kind == "sessions":
-        manifest = json.loads((staging / "transfer.json").read_text())
-        resume_cwd = pathlib.Path(manifest.get("resume_cwd", ""))
-        expected_cwd = home / "remote-workspaces" / ident
-        if resume_cwd != expected_cwd: sys.exit(46)
-        expected_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
+    manifest = json.loads((staging / "transfer.json").read_text())
+    resume_cwd = pathlib.Path(manifest.get("resume_cwd", ""))
+    expected_cwd = home / "remote-workspaces" / ident
+    if resume_cwd != expected_cwd: sys.exit(46)
+    expected_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
     backup = parent / f".{ident}.replaced-{os.getpid()}"
     if backup.exists(): shutil.rmtree(backup)
     if destination.exists(): destination.rename(backup)
@@ -245,7 +339,9 @@ def _project_install_script() -> str:
     publisher_filename = project_publish.__file__
     if None in {schema_filename, migration_filename, publisher_filename}:
         raise RemoteSyncError("project publication module source is unavailable")
-    schema_source = Path(schema_filename).read_text(encoding="utf-8")
+    schema_source = Path(schema_filename).read_text(encoding="utf-8").replace(
+        "from __future__ import annotations\n\n", "", 1
+    )
     accepted = {
         "entry_memory_snapshot_reference": sorted(
             ACCEPTED_KEY_SETS["entry_memory_snapshot_reference"]
@@ -268,6 +364,7 @@ def _project_install_script() -> str:
     publisher_source = Path(publisher_filename).read_text(encoding="utf-8")
     dependencies = (
         "from .. import project_schema\n",
+        "from ..project_registry import ProjectRegistry\n",
         (
             "from ..memory_migration_plan import (\n"
             "    LEGACY_MEMORY_FILES,\n"
@@ -286,8 +383,10 @@ def _project_install_script() -> str:
     for dependency in dependencies:
         publisher_source = publisher_source.replace(dependency, "", 1)
     return (
-        schema_source
-        + "\nimport sys\nproject_schema = sys.modules[__name__]\n"
+        "from __future__ import annotations\n\n"
+        + _PROJECT_AUTHORITY
+        + schema_source
+        + "\nproject_schema = sys.modules[__name__]\n"
         + migration_source
         + publisher_source
         + "\n"
@@ -349,19 +448,19 @@ class SshTransport:
                 outgoing / "transfer.json",
                 _make_manifest(outgoing, str(remote_cwd), previous=previous),
             )
-            expected = self._existing_state("sessions", session_id, outgoing, force)
-            self._install("sessions", session_id, outgoing, expected)
+            expected = self._existing_session_state(session_id, outgoing, force)
+            self._install_session(session_id, outgoing, expected)
             shutil.copyfile(outgoing / "transfer.json", snapshot / "transfer.json")
         return snapshot
 
     def fetch_session(self, session_id: str, destination: Path) -> Path:
-        self._fetch("sessions", _safe_component(session_id, "session id"), destination)
+        self._fetch_session(_safe_component(session_id, "session id"), destination)
         return destination
 
     def fetch_project(self, project_id: str, destination: Path) -> str:
         project_id = _safe_component(project_id, "project id")
         try:
-            self._fetch("projects", project_id, destination)
+            self._fetch_project(project_id, destination)
         except RemoteSyncError as exc:
             if "was not found" in str(exc):
                 return "missing"
@@ -375,19 +474,19 @@ class SshTransport:
         prepared = prepare_project_transfer(snapshot)
         self._install_project(project_id, prepared, expected_digest)
 
-    def _existing_state(
-        self, kind: str, ident: str, source: Path, force: bool
+    def _existing_session_state(
+        self, ident: str, source: Path, force: bool
     ) -> str:
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-existing-") as temporary:
             current = Path(temporary) / ident
             try:
-                self._fetch(kind, ident, current)
+                self._fetch_session(ident, current)
             except RemoteSyncError as exc:
                 if "was not found" in str(exc):
                     return "missing"
                 raise
             expected = _directory_digest(current)
-            if kind == "sessions" and not force:
+            if not force:
                 source_state = _tree_state(source)
                 current_state = _tree_state(current)
                 if current_state != source_state:
@@ -409,16 +508,28 @@ class SshTransport:
                 raise RemoteSyncError("remote ZETA_HOME did not resolve absolutely")
         return self._resolved_home
 
-    def _fetch(self, kind: str, ident: str, destination: Path) -> None:
+    def _fetch_session(self, ident: str, destination: Path) -> None:
+        self._fetch_archive(
+            _SESSION_FETCH_SCRIPT, "session", ident, destination
+        )
+
+    def _fetch_project(self, ident: str, destination: Path) -> None:
+        self._fetch_archive(
+            _PROJECT_FETCH_SCRIPT, "project", ident, destination
+        )
+
+    def _fetch_archive(
+        self, script: str, kind: str, ident: str, destination: Path
+    ) -> None:
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-fetch-") as temporary:
             archive = Path(temporary) / "snapshot.tar.gz"
             result = self._run_to_file(
-                _FETCH_SCRIPT,
-                [self._home(), kind, ident],
+                script,
+                [self._home(), ident],
                 archive,
             )
             if result.returncode == 44:
-                raise RemoteSyncError(f"remote {kind[:-1]} {ident} was not found")
+                raise RemoteSyncError(f"remote {kind} {ident} was not found")
             if result.returncode == 52:
                 raise RemoteSyncError(f"project registry busy on {self.name}; retry")
             if result.returncode:
@@ -454,16 +565,15 @@ class SshTransport:
             )
         self._raise_install_error(result, project=True)
 
-    def _install(self, kind: str, ident: str, source: Path, expected: str) -> None:
+    def _install_session(self, ident: str, source: Path, expected: str) -> None:
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
             archive = Path(temporary) / "snapshot.tar.gz"
             _pack(source, archive)
             with archive.open("rb") as incoming:
                 result = self._run(
-                    _INSTALL_SCRIPT,
+                    _SESSION_INSTALL_SCRIPT,
                     [
                         self._home(),
-                        kind,
                         ident,
                         expected,
                         str(self.max_archive_members),
