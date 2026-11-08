@@ -17,7 +17,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
 from zeta.attention_replies import AttentionReplies
@@ -531,58 +531,56 @@ async def test_tui_marks_staged_rows_and_counts_them_until_flush(
         what="create attention records",
     )
     app = await _make_app(tmp_path, owner, owner.store.session_id)
-    restarted = None
     replies = AttentionReplies(tmp_path, owner.store.session_id)
     try:
-        await app._decisions_tick()
-        assert "● 3 attention items" in _rendered_text(app)
-        _press(app, "1")
-        await await_or_fail(
-            asyncio.to_thread(_wait_for_staged, replies, 1), what="stage first"
-        )
-        _press(app, "j")
-        _press(app, "1")
-        await await_or_fail(
-            asyncio.to_thread(_wait_for_staged, replies, 2), what="stage second"
-        )
-        await app._decisions_tick()
-        text = _rendered_text(app)
-        rows = {
-            r.title: line
-            for r in records
-            for line in text.splitlines()
-            if f"{r.title}  decision" in line
-        }
-        assert "staged: yes" in rows["Pick 0"], text
-        assert "staged: yes" in rows["Pick 1"], text
-        assert "staged:" not in rows["Pick 2"], text
-        assert "● 1 open, 2 staged" in text, text
+        async with owned_app(app):
+            await app._decisions_tick()
+            assert "● 3 attention items" in _rendered_text(app)
+            _press(app, "1")
+            await await_or_fail(
+                asyncio.to_thread(_wait_for_staged, replies, 1), what="stage first"
+            )
+            _press(app, "j")
+            _press(app, "1")
+            await await_or_fail(
+                asyncio.to_thread(_wait_for_staged, replies, 2), what="stage second"
+            )
+            await app._decisions_tick()
+            text = _rendered_text(app)
+            rows = {
+                r.title: line
+                for r in records
+                for line in text.splitlines()
+                if f"{r.title}  decision" in line
+            }
+            assert "staged: yes" in rows["Pick 0"], text
+            assert "staged: yes" in rows["Pick 1"], text
+            assert "staged:" not in rows["Pick 2"], text
+            assert "● 1 open, 2 staged" in text, text
 
-        # A new TUI on the same session reads the staged replies from disk.
-        restarted = await _make_app(tmp_path, owner, owner.store.session_id)
-        await restarted._decisions_tick()
-        assert "● 1 open, 2 staged" in _rendered_text(restarted)
-        restarted.close_decisions_panel()
+            # A new TUI on the same session reads the staged replies from disk.
+            restarted = await _make_app(tmp_path, owner, owner.store.session_id)
+            async with owned_app(restarted):
+                await restarted._decisions_tick()
+                assert "● 1 open, 2 staged" in _rendered_text(restarted)
+                restarted.close_decisions_panel()
 
-        _press(app, "escape")
-        await asyncio.wait_for(
-            asyncio.to_thread(
-                _wait_for_records,
-                tmp_path,
-                owner.store.session_id,
-                {r.id for r in records[:2]},
-            ),
-            10,
-        )
-        await app._decisions_tick()
-        text = _rendered_text(app)
-        assert "staged:" not in text and "open," not in text, text
-        assert "● 1 attention item" in text, text
+            _press(app, "escape")
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    _wait_for_records,
+                    tmp_path,
+                    owner.store.session_id,
+                    {r.id for r in records[:2]},
+                ),
+                10,
+            )
+            await app._decisions_tick()
+            text = _rendered_text(app)
+            assert "staged:" not in text and "open," not in text, text
+            assert "● 1 attention item" in text, text
     finally:
         owner.store.close()
-        if restarted is not None:
-            await restarted.loop.close()
-        await app.loop.close()
 
 
 @pytest.mark.asyncio
@@ -601,31 +599,31 @@ async def test_tui_broken_record_with_staged_reply_is_not_counted_as_staged(
     app = await _make_app(tmp_path, owner, owner.store.session_id)
     replies = AttentionReplies(tmp_path, owner.store.session_id)
     try:
-        await app._decisions_tick()
-        _press(app, "1")
-        await await_or_fail(
-            asyncio.to_thread(_wait_for_staged, replies, 1), what="stage first"
-        )
-        _press(app, "j")
-        _press(app, "1")
-        await await_or_fail(
-            asyncio.to_thread(_wait_for_staged, replies, 2), what="stage second"
-        )
-        # The first record goes bad after its reply was staged.
-        broken = (
-            tmp_path
-            / "sessions"
-            / owner.store.session_id
-            / "attention"
-            / f"{records[0].id}.json"
-        )
-        broken.write_bytes(b'{"why":"cut off"')
-        await app._decisions_tick()
-        text = _rendered_text(app)
-        assert "● 2 open, 1 staged" in text, text
-        broken_rows = [line for line in text.splitlines() if records[0].id in line]
-        assert broken_rows, text
-        assert all("staged:" not in line for line in broken_rows), text
+        async with owned_app(app):
+            await app._decisions_tick()
+            _press(app, "1")
+            await await_or_fail(
+                asyncio.to_thread(_wait_for_staged, replies, 1), what="stage first"
+            )
+            _press(app, "j")
+            _press(app, "1")
+            await await_or_fail(
+                asyncio.to_thread(_wait_for_staged, replies, 2), what="stage second"
+            )
+            # The first record goes bad after its reply was staged.
+            broken = (
+                tmp_path
+                / "sessions"
+                / owner.store.session_id
+                / "attention"
+                / f"{records[0].id}.json"
+            )
+            broken.write_bytes(b'{"why":"cut off"')
+            await app._decisions_tick()
+            text = _rendered_text(app)
+            assert "● 2 open, 1 staged" in text, text
+            broken_rows = [line for line in text.splitlines() if records[0].id in line]
+            assert broken_rows, text
+            assert all("staged:" not in line for line in broken_rows), text
     finally:
         owner.store.close()
-        await app.loop.close()
