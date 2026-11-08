@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.server_client import (
+    _buffer,
     assert_event_order,
     event_owner,
     frames_for_call,
@@ -172,22 +173,11 @@ async def test_read_until_timeout_lists_skipped_frames() -> None:
 
 
 @pytest.mark.asyncio
-async def test_buffered_read_regression_rejects_old_direct_read() -> None:
-    reader = _Reader(
-        {"params": {"event": "tool_end"}},
-        {"params": {"event": "approval_end"}},
-        {"id": 1, "result": {}},
-    )
-    await request(reader, _Writer(), 1, "deny")
+async def test_request_consumes_buffered_frames_before_socket_reads() -> None:
+    reader = _Reader({"id": 2, "result": {}})
+    _buffer(reader).append({"id": 1, "result": {}})
 
-    with pytest.raises(AssertionError, match="server closed"):
-        while True:
-            line = await reader.readline()
-            assert line, "server closed the socket"
-            if json.loads(line).get("params", {}).get("event") == "tool_end":
-                break
-
-    assert (await buffered_read(reader))["params"]["event"] == "tool_end"
+    assert await request(reader, _Writer(), 1, "deny") == [{"id": 1, "result": {}}]
 
 
 # The shape of the pre-#647 mistake in test_server.py: a raw readline on the
