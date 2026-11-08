@@ -206,6 +206,7 @@ class AgentTodoSource:
                 session_id=self.path.name,
                 cwd=self._cwd,
                 _read_only=True,
+                _observer_snapshot=True,
                 _must_exist=True,
             )
             after = self._state_signature(self.path)
@@ -484,6 +485,7 @@ class AgentTranscriptSource:
                     path.parent,
                     session_id=path.name,
                     _read_only=True,
+                    _observer_snapshot=True,
                     _must_exist=True,
                 )
                 self._stores[path] = store
@@ -629,6 +631,7 @@ def _read_active_message_tail(path: Path, limit: int) -> tuple[ConversationEntry
         path.parent,
         session_id=path.name,
         _read_only=True,
+        _observer_snapshot=True,
         _must_exist=True,
     )
     try:

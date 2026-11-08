@@ -132,6 +132,7 @@ class ConversationStore(
         bash_cwd: str | Path | None = None,
         _lock_deadline: float | None = None,
         _read_only: bool = False,
+        _observer_snapshot: bool = False,
         _must_exist: bool = False,
         _collect_persisted_appends: bool = False,
         _validated_log_state: _DetachedLogState | None = None,
@@ -170,7 +171,10 @@ class ConversationStore(
             self.on_persisted_activity: Callable[[int], None] | None = None
             self._initialize_entries_installed()
             self.session_dir = self.root_dir / self.session_id
+            if _observer_snapshot and not _read_only:
+                raise ValueError("observer snapshots must be read-only")
             self._read_only = _read_only
+            self._observer_snapshot = _observer_snapshot
             self._must_exist = _must_exist
             self._mutation_target = _mutation_target
             self._repair_explicit = _repair_explicit
@@ -231,7 +235,10 @@ class ConversationStore(
                     session_directory(self.root_dir, self.session_id)
                 )
                 if _read_only:
-                    self._load()
+                    if _observer_snapshot:
+                        self._sync_observer_snapshot()
+                    else:
+                        self._load()
                     self._load_session_state()
                 else:
                     self._runtime_lease = self._open_execution_lease(

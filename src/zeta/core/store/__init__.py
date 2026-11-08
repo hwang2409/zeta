@@ -13,7 +13,13 @@ from ..checkpoints.mutation import (
     ConversationTargetOwned,
     commit_conversation_async,
 )
-from ._log import SCHEMA, InstalledEntriesDelta, PersistedAppend, TranscriptLoadError
+from ._log import (
+    SCHEMA,
+    InstalledEntriesDelta,
+    ObserverSnapshotChanged,
+    PersistedAppend,
+    TranscriptLoadError,
+)
 from ._row_history import (
     RECENT_ROW_WINDOW,
     ApprovalHistory,
@@ -106,6 +112,7 @@ __all__ = [
     "Mapping",
     "Message",
     "MessageRole",
+    "ObserverSnapshotChanged",
     "Path",
     "PendingPromptCommitTimeoutError",
     "PendingPromptQueue",

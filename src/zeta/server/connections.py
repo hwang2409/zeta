@@ -5,9 +5,17 @@ import contextlib
 import threading
 from collections import deque
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from ..core.session_files import descend_directory
+from ..core.store import ConversationStore, ObserverSnapshotChanged
+from ..core.store._child_runs import (
+    child_run_segments,
+    parse_child_run_id,
+    verify_child_run_directory,
+)
 from . import content, ergonomics
 from .protocol import (
     ErrorDescriptor,
@@ -42,6 +50,7 @@ OBSERVER_REQUESTS = frozenset(
         "ping",
         "delivery_status",
         "session_grants",
+        "child_run_history",
     }
 )
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
@@ -119,6 +128,8 @@ class ConnectionRegistry(ReplayOutput):
         self._read_condition = threading.Condition()
         self._read_jobs: deque[tuple[Callable[[], Any], asyncio.Future[Any]]] = deque()
         self._read_stopping = False
+        self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
+        self._child_reader_lock = threading.Lock()
         self._read_threads = [
             threading.Thread(
                 target=self._read_worker, daemon=True, name=f"zeta-read-{i}"
@@ -847,6 +858,84 @@ class ConnectionRegistry(ReplayOutput):
             session_id=target[0],
         )
 
+    async def read_child_run_history(
+        self, connection: Any, params: dict[str, Any]
+    ) -> object:
+        if (
+            set(params) - {"session_id", "run_id", "before", "history_validator"}
+            or type(params.get("session_id")) is not str
+            or type(params.get("run_id")) is not str
+        ):
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "session_id and run_id are required child history parameters",
+            )
+        runtime = connection.server.runtime
+        if runtime.opened is None or params["session_id"] != runtime.session_id:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        features = self._connections[connection].features
+        target = (runtime.session_id, runtime.opened.store)
+        return await self.run_read(
+            connection,
+            lambda: perform_child_history_read(
+                target,
+                params,
+                registry=self,
+                fidelity="session_history_fidelity" in features,
+            ),
+            session_id=runtime.session_id,
+        )
+
+    def _child_reader_for(
+        self, root_store: ConversationStore, run_id: str
+    ) -> ConversationStore:
+        parse_child_run_id(root_store.session_id, run_id)
+        segments = child_run_segments(root_store.session_id, run_id)
+        key = (root_store.session_id, run_id)
+        with self._child_reader_lock:
+            if self._child_reader is not None and self._child_reader[0] == key:
+                reader = self._child_reader[1]
+                reader.refresh()
+                return reader
+            if self._child_reader is not None:
+                self._child_reader[1].close()
+            with ExitStack() as cleanup:
+                directory_fd = root_store.directory_fd
+                components = tuple(
+                    component
+                    for segment in segments
+                    for component in ("agents", str(segment))
+                )
+                directory_fd = cleanup.enter_context(
+                    descend_directory(directory_fd, components)
+                )
+                try:
+                    verify_child_run_directory(directory_fd, run_id)
+                except (FileNotFoundError, OSError, ValueError) as exc:
+                    raise ProtocolError(
+                        ErrorDescriptor.CHILD_RUN_NOT_FOUND,
+                        "child run was not found",
+                    ) from exc
+            parent = root_store.session_dir
+            for segment in segments[:-1]:
+                parent = parent / "agents" / str(segment)
+            reader = ConversationStore(
+                parent / "agents",
+                session_id=str(segments[-1]),
+                _read_only=True,
+                _observer_snapshot=True,
+                _must_exist=True,
+                _storage_lease=root_store._storage_lease,
+            )
+            self._child_reader = (key, reader)
+            return reader
+
+    def close_child_reader(self) -> None:
+        with self._child_reader_lock:
+            if self._child_reader is not None:
+                self._child_reader[1].close()
+                self._child_reader = None
+
     async def read_status(
         self, connection: Any, status: dict[str, Any], session_id: str | None
     ) -> object:
@@ -927,10 +1016,18 @@ class ConnectionRegistry(ReplayOutput):
             "model_catalog",
             "session_settings",
             "content_read",
+            "child_run_history",
         }:
             return False, None
         if method in {"session_tree", "session_history"}:
             return True, await self.read_session(connection, method, params)
+        if method == "child_run_history":
+            if "child_run_history" not in state.features:
+                raise ProtocolError(
+                    ErrorDescriptor.METHOD_NOT_FOUND,
+                    "child_run_history requires the negotiated child_run_history feature",
+                )
+            return True, await self.read_child_run_history(connection, params)
         if method == "content_read":
             if "content_read" not in state.features:
                 raise ProtocolError(
@@ -975,6 +1072,7 @@ class ConnectionRegistry(ReplayOutput):
     async def aclose(self) -> None:
         self._closed = True
         states = tuple(self._connections.values())
+        await self.run_blocking(self.close_child_reader)
         with self._read_condition:
             self._read_stopping = True
             self._read_condition.notify_all()
@@ -987,6 +1085,47 @@ class ConnectionRegistry(ReplayOutput):
         self._connections.clear()
         self._observers.clear()
         self._controller = None
+
+
+def perform_child_history_read(
+    target: tuple[str | None, object],
+    params: dict[str, Any],
+    *,
+    registry: ConnectionRegistry,
+    fidelity: bool,
+) -> object:
+    root_store = target[1]
+    try:
+        parse_child_run_id(root_store.session_id, params["run_id"])
+    except ValueError as exc:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid child run id") from exc
+    try:
+        reader = registry._child_reader_for(root_store, params["run_id"])
+    except ObserverSnapshotChanged as exc:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "child history source changed during read",
+        ) from exc
+    except ProtocolError:
+        raise
+    except (FileNotFoundError, OSError) as exc:
+        raise ProtocolError(
+            ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found"
+        ) from exc
+    runtime = type(
+        "ObserverRuntime",
+        (),
+        {"session_id": target[0], "opened": type("Opened", (), {"store": reader})()},
+    )()
+    history_params = {key: value for key, value in params.items() if key != "run_id"}
+    if "before" not in history_params:
+        history_params["before"] = None
+    return ergonomics.history(
+        runtime,
+        history_params,
+        backward_enabled=True,
+        fidelity=fidelity,
+    )
 
 
 def _active_status_parts(

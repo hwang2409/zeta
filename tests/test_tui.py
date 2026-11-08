@@ -15357,3 +15357,51 @@ async def test_history_finder_does_not_cross_session_boundaries(
     assert len(batches) == 1
     assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()
+
+
+def test_agent_transcript_source_keeps_snapshot_during_active_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="tui-observer")
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    source = agent_sync.AgentTranscriptSource(store.session_dir)
+    try:
+        assert source.refresh().transcript(store.session_dir).messages[0][1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "complete"}],
+        }
+        original_write_bytes = ConversationStore._write_bytes
+        prefix_written = threading.Event()
+        release_writer = threading.Event()
+
+        def split_target_write(target: ConversationStore, data: bytes) -> None:
+            if target is not store or prefix_written.is_set():
+                original_write_bytes(target, data)
+                return
+            original_write_bytes(target, data[:-1])
+            prefix_written.set()
+            assert release_writer.wait(10)
+            original_write_bytes(target, data[-1:])
+
+        # test-contract: seam pauses one production append after its strict row prefix
+        monkeypatch.setattr(ConversationStore, "_write_bytes", split_target_write)
+        writer = threading.Thread(
+            target=lambda: store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("next")])
+            )
+        )
+        writer.start()
+        assert prefix_written.wait(10)
+        snapshot = source.refresh()
+        assert snapshot.transcript(store.session_dir).messages[-1][1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "complete"}],
+        }
+        release_writer.set()
+        writer.join(10)
+        assert not writer.is_alive()
+        assert source.refresh().transcript(store.session_dir).messages[-1][1]["content"][0]["text"] == "next"
+    finally:
+        source.close()
+        store.close()
