@@ -156,7 +156,7 @@ def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
             )
         finally:
             app._active_task.cancel()
-            await asyncio.gather(app._active_task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(app._active_task, return_exceptions=True), 10)
         assert output == (
             "new unchanged: cannot start a new session while a turn or "
             "approval is active"

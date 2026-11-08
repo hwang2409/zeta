@@ -256,7 +256,7 @@ async def test_permissions_tracks_always_scope_and_session_lifetime(
     finally:
         if pending is not None:
             pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 10)
         await app.close()
 
 
