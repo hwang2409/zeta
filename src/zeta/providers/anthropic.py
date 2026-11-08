@@ -991,8 +991,7 @@ def _translate_event(
                 )
             partial = _required_string(delta, "partial_json")
             block.input_json += partial
-            arguments = _parse_partial_object(block.input_json)
-            call = ToolCall(block.call_id, block.name, arguments)
+            call = ToolCall(block.call_id, block.name, {})
             return StreamEvent(
                 StreamEventType.MESSAGE_UPDATE,
                 tool_call=call,
@@ -1163,14 +1162,6 @@ def _required_string(value: Mapping[str, Any], key: str) -> str:
     if type(result) is not str:
         raise AnthropicStreamError(f"Anthropic delta field {key} is invalid")
     return result
-
-
-def _parse_partial_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
 
 
 def _is_complete_object(value: str) -> bool:
