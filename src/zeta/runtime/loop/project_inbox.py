@@ -31,18 +31,24 @@ class ProjectInboxNotificationMixin:
     async def _activate_project_inbox(self) -> None:
         if "inbox" not in self.tool_registry.registered_names or self.agent_depth > 0:
             return
-        self._inbox_scanner = self._new_project_inbox_scanner()
+        self._inbox_scanner = await asyncio.to_thread(
+            self._new_project_inbox_scanner
+        )
         await self._check_project_inbox()
         tracker = self._inbox_scanner.tracker
-        if tracker is not None and tracker.health()["state"] == "broken":
-            await self._append_turn_message(
-                harness_notice(
-                    "inbox sent history",
-                    tracker.health_text(),
-                    event=SENT_STATUS_EVENT,
-                    metadata={"sent_ledger_health": tracker.health()},
-                )
+        if tracker is not None:
+            health, text = await asyncio.to_thread(
+                lambda: (tracker.health(), tracker.health_text())
             )
+            if health["state"] == "broken":
+                await self._append_turn_message(
+                    harness_notice(
+                        "inbox sent history",
+                        text,
+                        event=SENT_STATUS_EVENT,
+                        metadata={"sent_ledger_health": health},
+                    )
+                )
         watcher = asyncio.create_task(self._watch_project_inbox())
         self._tracked_tasks.add(watcher)
         watcher.add_done_callback(self._tracked_tasks.discard)

@@ -1451,3 +1451,69 @@ def test_broken_sent_ledger_projects_authoritative_delivery_without_writing(
     assert result["state"] == "broken"
     assert [item["id"] for item in result["messages"]] == [message_id]
     assert result["messages"][0]["reported"] == []
+
+
+def test_broken_projection_keeps_identity_when_spilled_body_is_undecodable(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    inbox = ProjectInbox(
+        registry,
+        sessions_root=home / "sessions",
+        sent_tracker=tracker,
+        receipts=(("0" * 32, "done"),),
+    )
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="bug_report",
+        title="body unavailable",
+        body="x" * 70_000,
+        message_id="1" * 32,
+    )
+    ledger = home / "sessions" / session_id / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    body = registry.root / project_b.project_id / "inbox" / "bodies" / f"{message_id}.txt"
+    body.write_bytes(b"\\xff")
+
+    result = inbox.sent(project_a.project_id, session_id=session_id)
+
+    assert [row["id"] for row in result["messages"]] == [message_id]
+    assert result["messages"][0]["reported"] == []
+    assert result["history_complete"] is False
+
+
+def test_broken_sent_ledger_transitions_to_loaded_and_missing(tmp_path: Path) -> None:
+    home, _registry, project_a, _project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    ledger = home / "sessions" / session_id / "project-inbox-sent.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_bytes(b"{")
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    assert "unless the repaired ledger includes their IDs" in tracker.health_text()
+    retained = "2" * 32
+    ledger.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "id": retained,
+                        "target_project": project_a.project_id,
+                        "created_at": "2026-01-01T00:00:00.000000Z",
+                        "reported": [],
+                    }
+                ],
+            }
+        )
+    )
+
+    assert tracker.health()["state"] == "healthy"
+    assert tracker.records()[0]["id"] == retained
+
+    ledger.unlink()
+    assert tracker.health()["state"] == "healthy"
+    assert tracker.records() == ()

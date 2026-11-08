@@ -84,9 +84,10 @@ class SentMessageTracker:
         return (
             f"sent history is incomplete ({health['reason']}) at {health['ledger']}; messages sent or replied "
             "to while this ledger is broken are delivered, but they are not added to "
-            "the ledger and will disappear from sent history after the ledger is "
-            "repaired or removed; later claimed/done updates for those message IDs "
-            "will not be discovered. The file was not changed."
+            "the ledger. Removing it loses those messages from sent history; repairing "
+            "it loses them unless the repaired ledger includes their IDs. Later "
+            "claimed/done updates for a lost ID will not be discovered. The file was "
+            "not changed."
         )
 
     def _refresh(self) -> None:
@@ -304,5 +305,6 @@ class SentMessageTracker:
             self._state = self._load_state()
             self._records = []
             self._pending = set()
+            self._deleted_ids.clear()
         except (OSError, SessionError) as exc:
             raise InboxError("sent-message tracking is unsafe or unavailable") from exc

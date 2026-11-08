@@ -377,49 +377,94 @@ class ProjectInbox:
         source_session: str,
         receipts: Iterable[tuple[str, str]],
     ) -> list[dict[str, Any]]:
-        receipt_map: dict[str, set[str]] = {}
-        for message_id, status in receipts:
-            receipt_map.setdefault(message_id, set()).add(status)
+        receipt_map = self._receipt_map(receipts)
         rows: list[dict[str, Any]] = []
         for target in sorted(self.registry.list_projects(), key=lambda p: p.project_id):
-            state = self.read(target.project_id)
-            for status in ("new", "claimed", "done"):
-                for record in state[status]:
-                    sender = record.get("from")
-                    if sender != {"project": source_project, "session": source_session}:
-                        continue
-                    try:
-                        target_name = self.registry.show_project(target.project_id).name
-                    except ProjectNotFoundError:
-                        target_name = target.project_id
-                    row = {
-                        "id": record["id"],
-                        "status": status,
-                        "to_project": target.project_id,
-                        "to_project_name": target_name[:200],
-                        "from_session": source_session,
-                        "kind": record["kind"],
-                        "title": record["title"][:200],
-                        "created_at": record["created_at"][:64],
-                        "reported": [
-                            name
-                            for name in ("claimed", "done")
-                            if name in receipt_map.get(record["id"], set())
-                        ],
-                    }
-                    if status in {"claimed", "done"}:
-                        row["claimed_at"] = str(record.get("claimed_at") or "")[:64]
-                        row["claimer_session"] = record.get("claimer_session")
-                    if status == "done":
-                        row["done_at"] = str(record.get("done_at") or "")[:64]
-                        row["outcome"] = str(record.get("outcome") or "")[:500]
-                        row["reply_id"] = record.get("reply_id")
-                    rows.append(row)
+            rows.extend(
+                self._broken_project_rows(
+                    target.project_id, source_project, source_session, receipt_map
+                )
+            )
         rows.sort(key=lambda item: (item["created_at"], item["id"]))
         while len(rows) > SENT_HISTORY_LIMIT:
             done = next((row for row in rows if row["reported"] == ["done"]), None)
             rows.remove(done or rows[0])
         return list(reversed(rows))
+
+    @staticmethod
+    def _receipt_map(receipts: Iterable[tuple[str, str]]) -> dict[str, set[str]]:
+        result: dict[str, set[str]] = {}
+        for message_id, status in receipts:
+            result.setdefault(message_id, set()).add(status)
+        return result
+
+    def _broken_project_rows(
+        self,
+        project_id: str,
+        source_project: str,
+        source_session: str,
+        receipt_map: dict[str, set[str]],
+    ) -> list[dict[str, Any]]:
+        invalid: list[dict[str, str]] = []
+        rows: list[dict[str, Any]] = []
+        def read(root_fd: int) -> None:
+            try:
+                with self._directory_handles(
+                    root_fd, project_id, create=False, lock=False
+                ) as dirs:
+                    for status, directory_fd in zip(("new", "claimed", "done"), dirs[:3]):
+                        for record in self._read_directory(
+                            directory_fd,
+                            dirs[3],
+                            status=status,
+                            invalid=invalid,
+                            resolve_body=False,
+                        ):
+                            if record.get("from") == {
+                                "project": source_project,
+                                "session": source_session,
+                            }:
+                                rows.append(self._broken_row(record, status, project_id, source_session, receipt_map))
+            except _InboxNotFound:
+                return
+        self.registry._read(read)
+        return rows
+
+    def _broken_row(
+        self,
+        record: dict[str, Any],
+        status: str,
+        project_id: str,
+        source_session: str,
+        receipt_map: dict[str, set[str]],
+    ) -> dict[str, Any]:
+        try:
+            project_name = self.registry.show_project(project_id).name
+        except ProjectNotFoundError:
+            project_name = project_id
+        row = {
+            "id": record["id"],
+            "status": status,
+            "to_project": project_id,
+            "to_project_name": project_name[:200],
+            "from_session": source_session,
+            "kind": record["kind"],
+            "title": record["title"][:200],
+            "created_at": record["created_at"][:64],
+            "reported": [
+                name for name in ("claimed", "done") if name in receipt_map.get(record["id"], set())
+            ],
+        }
+        if status in {"claimed", "done"}:
+            row["claimed_at"] = str(record.get("claimed_at") or "")[:64]
+            row["claimer_session"] = record.get("claimer_session")
+        if status == "done":
+            row.update(
+                done_at=str(record.get("done_at") or "")[:64],
+                outcome=str(record.get("outcome") or "")[:500],
+                reply_id=record.get("reply_id"),
+            )
+        return row
 
     def _resolve_tracked_sent(
         self,
