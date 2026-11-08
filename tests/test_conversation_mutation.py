@@ -719,7 +719,7 @@ async def test_address_concurrent_resident_commits_are_serialized(
     ]
     try:
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 10), 11)
-        await asyncio.wait_for(queued.wait(), 10)
+        await await_or_fail(queued.wait(), what="resident lock queue admission")
         assert store._address_commit_waiters == 8
         release.set()
         results = await await_or_fail(
@@ -792,7 +792,7 @@ async def test_address_transient_waiter_retries_after_owner_release(
     )
     try:
         assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
-        await asyncio.wait_for(waiting.wait(), 10)
+        await await_or_fail(waiting.wait(), what="transient reservation admission")
         assert not waiter.done()
         release.set()
         outcomes = await await_or_fail(
@@ -862,7 +862,7 @@ async def test_transient_waiter_cancellation_does_not_release_owner(
                 address, AppendConversationRows((_warning("cancelled"),))
             )
         )
-        await asyncio.wait_for(waiting.wait(), 10)
+        await await_or_fail(waiting.wait(), what="transient reservation admission")
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(waiter, 10)
@@ -872,7 +872,7 @@ async def test_transient_waiter_cancellation_does_not_release_owner(
                 address, AppendConversationRows((_warning("third"),))
             )
         )
-        await asyncio.wait_for(waiting.wait(), 10)
+        await await_or_fail(waiting.wait(), what="transient reservation admission")
         assert not third.done()
         release.set()
         await asyncio.wait_for(asyncio.gather(owner, third), 20)
@@ -941,7 +941,7 @@ async def test_transient_owner_failure_wakes_waiter(
             )
         )
         tasks.append(waiter)
-        await asyncio.wait_for(waiting.wait(), 10)
+        await await_or_fail(waiting.wait(), what="transient reservation admission")
         assert not waiter.done()
         release.set()
         with pytest.raises(ConversationIntegrityError, match="forced owner failure"):
@@ -1003,7 +1003,7 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
                 address, AppendConversationRows((_warning("waiter"),))
             )
         )
-        await asyncio.wait_for(waiting.wait(), 10)
+        await await_or_fail(waiting.wait(), what="transient reservation admission")
         owner.cancel()
         assert not owner.done()
         assert waiter is not None and not waiter.done()
