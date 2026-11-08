@@ -39,6 +39,7 @@ from .completion import (
     is_completion_sentinel,
     report_provider_record,
 )
+from .codex_arguments import _parse_complete_object, _parse_partial_object
 from .codex_payload import (
     _cache_affinity_json,
     build_responses_payload,
@@ -1238,20 +1239,3 @@ def _complete_item(item: _ItemState) -> list[ContentBlock]:
     arguments = _parse_complete_object(item.arguments)
     return [ToolUseContent(ToolCall(item.call_id, item.name, arguments))]
 
-
-def _parse_partial_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _parse_complete_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value or "{}")
-    except json.JSONDecodeError as exc:
-        raise CodexStreamError("Codex tool arguments are invalid JSON") from exc
-    if not isinstance(parsed, dict):
-        raise CodexStreamError("Codex tool arguments are not an object")
-    return parsed
