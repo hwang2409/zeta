@@ -130,6 +130,7 @@ class SessionState:
     opened: OpenedSession
     loop: AgentLoop
     policy: ApprovalPolicy
+    project_dir: Path
     usage: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker = field(init=False)
     status: str = "idle"
@@ -145,6 +146,7 @@ class SessionState:
             opened=composition.opened,
             loop=composition.loop,
             policy=composition.policy,
+            project_dir=composition.project_dir,
         )
 
     @property
@@ -299,6 +301,12 @@ class ServerRuntime:
     def session_id(self) -> str:
         return self.metadata.session_id
 
+    @property
+    def project_dir(self) -> Path:
+        if self._state is None:
+            raise RuntimeError("server has no active session")
+        return self._state.project_dir
+
     async def initialize_project_registry(self) -> None:
         """Probe registry availability once outside the event loop."""
 
@@ -381,7 +389,7 @@ class ServerRuntime:
 
     def _prepare_new_session(
         self, session_cwd: Path, provider: str | None, model: str | None
-    ) -> tuple[object, object, object, object, object]:
+    ) -> tuple[object, object, object, object, object, object]:
         discovery = discover_project(session_cwd, user_home=self.home.parent)
         repo_root = discovery.primary_root or discovery.cwd
         config = self._config(provider, model, project_root=repo_root)
@@ -412,11 +420,18 @@ class ServerRuntime:
             registry=registry,
             project_projection=projection,
         )
-        return config, skill_catalog, agent_catalog, context, session_project
+        return (
+            config,
+            skill_catalog,
+            agent_catalog,
+            context,
+            session_project,
+            discovery,
+        )
 
     def _prepare_resumed_session(
         self, opened: OpenedSession, session_cwd: Path
-    ) -> tuple[object, object]:
+    ) -> tuple[object, object, object]:
         discovery = discover_project(session_cwd, user_home=self.home.parent)
         repo_root = discovery.primary_root or discovery.cwd
         config = self._config(
@@ -449,7 +464,7 @@ class ServerRuntime:
             registry=registry,
             project_projection=projection,
         )
-        return config, resumed_prompt
+        return config, resumed_prompt, discovery
 
     async def resume_session(
         self, session_id: str, *, force: bool = False
@@ -491,7 +506,7 @@ class ServerRuntime:
                     prepared = await asyncio.to_thread(
                         self._prepare_resumed_session, opened, session_cwd
                     )
-                    config, resumed_prompt = prepared
+                    config, resumed_prompt, discovery = prepared
                     kwargs = {
                         "config": config,
                         "provider": opened.metadata.provider,
@@ -501,14 +516,20 @@ class ServerRuntime:
                         "agent_catalog": resumed_prompt.agent_catalog,
                         "opened": opened,
                         "project_id": opened.metadata.project_id,
+                        "project_discovery": discovery,
                     }
                 else:
                     prepared = await asyncio.to_thread(
                         self._prepare_new_session, session_cwd, provider, model
                     )
-                    config, skill_catalog, agent_catalog, context, session_project = (
-                        prepared
-                    )
+                    (
+                        config,
+                        skill_catalog,
+                        agent_catalog,
+                        context,
+                        session_project,
+                        discovery,
+                    ) = prepared
                     kwargs = {
                         "config": config,
                         "provider": config.provider,
@@ -521,6 +542,7 @@ class ServerRuntime:
                             if session_project is not None
                             else None
                         ),
+                        "project_discovery": discovery,
                     }
                 return await asyncio.to_thread(
                     self._compose,

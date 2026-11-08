@@ -8,6 +8,7 @@ import io
 import json
 import re
 import shutil
+import subprocess
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -32,7 +33,7 @@ from zeta.mcp.management import MCPManagementService
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
-from zeta.server import ZetaServer, image_delivery
+from zeta.server import ZetaServer, image_delivery, slash_commands
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -379,6 +380,118 @@ async def test_new_session_cwd_selects_the_tool_directory(tmp_path: Path) -> Non
         await _request(reader, writer, 4, "approve", {"request_id": "pwd-call"})
         end = await _event(reader, "tool_end")
         assert _tool_stdout(end) == str(project.resolve())
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_requests_reuse_session_repo_root_and_build_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repos = []
+    for name in ("first", "second"):
+        repo = tmp_path / name
+        nested = repo / "nested"
+        commands = repo / ".zeta" / "commands"
+        nested.mkdir(parents=True)
+        commands.mkdir(parents=True)
+        (commands / "location.md").write_text(
+            f"---\ndescription: identify the repository\n---\nrepository {name}\n"
+        )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["git", "init", "--quiet", str(repo)],
+            check=True,
+            capture_output=True,
+        )
+        repos.append((repo, nested))
+
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["session_cwd"])
+        first = (
+            await _request(
+                reader,
+                writer,
+                "first-session",
+                "new_session",
+                {"cwd": str(repos[0][1])},
+            )
+        )[-1]["result"]["session"]["session_id"]
+
+        registry_builds = 0
+        repo_root_commands = 0
+        original_build_registry = slash_commands.build_registry
+        original_subprocess_run = subprocess.run
+
+        def tracked_build_registry(runtime):
+            nonlocal registry_builds
+            registry_builds += 1
+            return original_build_registry(runtime)
+
+        def tracked_subprocess_run(*args, **kwargs):
+            nonlocal repo_root_commands
+            command = list(args[0])
+            if command[-2:] == ["rev-parse", "--show-toplevel"]:
+                repo_root_commands += 1
+            return original_subprocess_run(*args, **kwargs)
+
+        monkeypatch.setattr(slash_commands, "build_registry", tracked_build_registry)
+        monkeypatch.setattr(subprocess, "run", tracked_subprocess_run)
+        original_turn_busy = server.control.turn_busy
+        monkeypatch.setattr(server.control, "turn_busy", lambda: True)
+        for request_id in range(3):
+            result = (
+                await _request(
+                    reader,
+                    writer,
+                    f"busy-{request_id}",
+                    "slash_run",
+                    {"session_id": first, "text": "/status"},
+                )
+            )[-1]["result"]
+            assert result["kind"] == "output"
+        busy_registry_builds = registry_builds
+        busy_repo_root_commands = repo_root_commands
+        monkeypatch.setattr(server.control, "turn_busy", original_turn_busy)
+
+        second = (
+            await _request(
+                reader,
+                writer,
+                "second-session",
+                "new_session",
+                {"cwd": str(repos[1][1])},
+            )
+        )[-1]["result"]["session"]["session_id"]
+        repo_root_commands = 0
+        result = (
+            await _request(
+                reader,
+                writer,
+                "second-location",
+                "slash_run",
+                {"session_id": second, "text": "/location"},
+            )
+        )[-1]["result"]
+        assert result["kind"] == "model_input"
+        assert "repository second" in result["text"]
+        listed = (
+            await _request(
+                reader,
+                writer,
+                "second-list",
+                "slash_list",
+                {"session_id": second},
+            )
+        )[-1]["result"]
+        assert any(command["name"] == "location" for command in listed["commands"])
+        assert busy_registry_builds == 3, "busy slash_run rebuilt its registry"
+        assert registry_builds == 5, "slash requests did not build exactly once"
+        assert (
+            busy_repo_root_commands == repo_root_commands == 0
+        ), "slash_run repeated Git repo-root discovery"
     finally:
         await close_serve(server, writer)
 

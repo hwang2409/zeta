@@ -69,6 +69,7 @@ class RuntimeComposition:
     loop: AgentLoop
     policy: ApprovalPolicy
     model: str
+    project_dir: Path
     external_tools: ExternalToolDiscovery
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
@@ -448,6 +449,7 @@ def compose_runtime(
             loop=loop,
             policy=policy,
             model=selected_model,
+            project_dir=repo_root,
             external_tools=external_tools,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,
