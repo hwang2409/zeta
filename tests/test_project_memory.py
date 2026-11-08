@@ -7,6 +7,7 @@ import random
 import stat
 import threading
 import time
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from zeta.core.session import SessionManager
 from zeta.project_registry import (
     MAX_MEMORY_FILE_SIZE,
     MAX_SESSION_REFERENCE_SIZE,
+    MAX_SESSION_REFERENCES,
     ProjectRegistry,
     ProjectRegistryError,
 )
@@ -104,6 +106,289 @@ def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -
     assert session.metadata.session_id in references
     assert str(home / "sessions" / session.metadata.session_id) in references
     session.store.close()
+
+
+def _linked_session_fixture(tmp_path: Path):
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    project = ProjectRegistry(home / "projects").create_project(
+        "demo", "scope", repository
+    )
+    opened = SessionManager(home).create(provider="codex", model="fake", cwd=repository)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    links_path = home / "projects" / project.project_id / "sessions.jsonl"
+    return home, project, session_id, links_path
+
+
+def _seed_pending_link(home: Path, session_id: str) -> Path:
+    pending = home / "sessions" / session_id / "project_link_pending.json"
+    pending.write_text("{}", encoding="utf-8")
+    return pending
+
+
+_SESSION_DUPLICATE_CASES = (
+    "valid duplicate",
+    "no match",
+    "invalid target then valid duplicate",
+    "valid duplicate then invalid target",
+    "malformed unrelated row with duplicate",
+    "over-limit row count with duplicate",
+    "over-long unrelated line with duplicate",
+    "torn final line with duplicate",
+    "id only in parent_session_id",
+    "id only in transcript_path",
+    "prefix id",
+    "unicode escaped id",
+    "crlf line ending",
+    "target in torn final line only",
+)
+
+
+@pytest.mark.parametrize("case", _SESSION_DUPLICATE_CASES)
+def test_record_session_fast_duplicate_matches_full_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    # test-contract: seam fix append bytes while comparing public outcomes
+    monkeypatch.setattr(registry_module, "_now", lambda: "2026-01-02T03:04:05.000000Z")
+    home, project, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = json.loads(links_path.read_text(encoding="utf-8"))
+    requested_id = session_id
+
+    def line(record: object, *, ending: bytes = b"\n") -> bytes:
+        return json.dumps(record, sort_keys=True).encode() + ending
+
+    valid = line(target)
+    decoy = {**target, "session_id": "decoy", "transcript_path": "/decoy"}
+    invalid = {**target, "role": "invalid"}
+    if case == "valid duplicate":
+        original = valid
+    elif case == "no match":
+        original = line(decoy)
+    elif case == "invalid target then valid duplicate":
+        original = line(invalid) + valid
+    elif case == "valid duplicate then invalid target":
+        original = valid + line(invalid)
+    elif case == "malformed unrelated row with duplicate":
+        original = b"{not valid json}\n" + valid
+    elif case == "over-limit row count with duplicate":
+        original = valid + line(decoy) * MAX_SESSION_REFERENCES
+    elif case == "over-long unrelated line with duplicate":
+        original = valid + b"x" * (MAX_SESSION_REFERENCE_SIZE + 1) + b"\n"
+    elif case == "torn final line with duplicate":
+        original = valid + b'{"incomplete"'
+    elif case == "id only in parent_session_id":
+        original = line({**decoy, "parent_session_id": session_id})
+    elif case == "id only in transcript_path":
+        original = line({**decoy, "transcript_path": f"/sessions/{session_id}"})
+    elif case == "prefix id":
+        requested_id = "abc"
+        original = line({**target, "session_id": "abcd"})
+    elif case == "unicode escaped id":
+        requested_id = "snowman-☃"
+        original = line({**target, "session_id": requested_id})
+    elif case == "crlf line ending":
+        original = line(target, ending=b"\r\n")
+    else:
+        original = line(target, ending=b"")
+
+    use_open = case == "invalid target then valid duplicate"
+    pending = _seed_pending_link(home, session_id) if use_open else None
+
+    def run() -> tuple[tuple[str, ...], bytes, bool | None]:
+        try:
+            if use_open:
+                reopened = SessionManager(home).open(session_id)
+                reopened.store.close()
+            else:
+                ProjectRegistry(home / "projects").record_session(
+                    project.project_id,
+                    session_id=requested_id,
+                    transcript_path=str(home / "sessions" / requested_id),
+                )
+        except ProjectRegistryError as exc:
+            outcome = ("raised", type(exc).__name__, str(exc))
+        else:
+            outcome = ("returned",)
+        return outcome, links_path.read_bytes(), pending.exists() if pending else None
+
+    links_path.write_bytes(original)
+    with monkeypatch.context() as full_reader:
+        # test-contract: seam force the old full reader behind record_session
+        full_reader.setattr(
+            ProjectRegistry,
+            "_session_record_exists",
+            classmethod(lambda cls, fd, target_id: False),
+        )
+        expected = run()
+
+    links_path.write_bytes(original)
+    if pending is not None:
+        pending.write_text("{}", encoding="utf-8")
+    actual = run()
+
+    if case == "malformed unrelated row with duplicate":
+        # The caller at core/session.py:_reconcile_project_link swallows this error.
+        assert expected[0] == (
+            "raised",
+            "ProjectRegistryError",
+            "malformed project session reference",
+        )
+        assert actual[0] == ("returned",)
+        assert actual[1:] == expected[1:]
+    else:
+        assert actual == expected
+
+
+def test_linked_session_reopen_decodes_only_matching_registry_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = json.loads(links_path.read_text(encoding="utf-8"))
+    records = [
+        {
+            **target,
+            "session_id": f"decoy-{index}",
+            "transcript_path": f"/decoy/{index}",
+        }
+        for index in range(6_281)
+    ]
+    records.append(target)
+    links_path.write_text(
+        "".join(f"{json.dumps(record, sort_keys=True)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    decoded = 0
+    real_decode = ProjectRegistry._decode_session_link
+
+    def count_decode(value: object) -> dict[str, object]:
+        nonlocal decoded
+        decoded += 1
+        return real_decode(value)
+
+    # test-contract: seam count decoding behind the production session-open interface
+    monkeypatch.setattr(
+        ProjectRegistry, "_decode_session_link", staticmethod(count_decode)
+    )
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+
+    assert decoded == 1
+
+
+def test_linked_session_reopen_preserves_pending_link_above_record_limit(
+    tmp_path: Path,
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = links_path.read_bytes()
+    decoy = target.replace(session_id.encode(), b"0" * len(session_id))
+    original = target + decoy * MAX_SESSION_REFERENCES
+    links_path.write_bytes(original)
+    pending = _seed_pending_link(home, session_id)
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+
+    assert pending.exists()
+    assert links_path.read_bytes() == original
+
+
+def test_linked_session_reopen_preserves_pending_link_for_oversize_unrelated_row(
+    tmp_path: Path,
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = links_path.read_bytes()
+    original = target + b"x" * (MAX_SESSION_REFERENCE_SIZE + 1) + b"\n"
+    links_path.write_bytes(original)
+    pending = _seed_pending_link(home, session_id)
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+
+    assert pending.exists()
+    assert links_path.read_bytes() == original
+
+
+def test_duplicate_session_scan_keeps_memory_below_registry_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, project, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = json.loads(links_path.read_text(encoding="utf-8"))
+    records = [target]
+    records.extend(
+        {
+            **target,
+            "session_id": f"decoy-{index}",
+            "transcript_path": f"/decoy/{index}/" + "x" * 256,
+        }
+        for index in range(9_000)
+    )
+    original = "".join(
+        f"{json.dumps(record, sort_keys=True)}\n" for record in records
+    ).encode()
+    links_path.write_bytes(original)
+    max_read = 0
+    real_read = os.read
+
+    def bounded_read(fd: int, size: int) -> bytes:
+        nonlocal max_read
+        max_read = max(max_read, size)
+        return real_read(fd, size)
+
+    # test-contract: seam observe read sizes through production record_session
+    monkeypatch.setattr(registry_module.os, "read", bounded_read)
+    tracemalloc.start()
+    try:
+        ProjectRegistry(home / "projects").record_session(
+            project.project_id,
+            session_id=session_id,
+            transcript_path=str(home / "sessions" / session_id),
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert max_read <= 64 * 1024
+    assert peak < len(original) // 2
+
+
+def test_linked_session_reopen_ignores_unrelated_malformed_registry_row(
+    tmp_path: Path,
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    original = links_path.read_bytes()
+    malformed = b"{not valid json}\n" + original
+    links_path.write_bytes(malformed)
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+
+    assert links_path.read_bytes() == malformed
+
+
+def test_new_session_link_preserves_registry_validation_and_append(
+    tmp_path: Path,
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    malformed = b"{not valid json}\n"
+    links_path.write_bytes(malformed)
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+    assert links_path.read_bytes() == malformed
+
+    links_path.write_bytes(b"")
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+    first_append = links_path.read_bytes()
+    records = [json.loads(line) for line in first_append.splitlines()]
+    assert [record["session_id"] for record in records] == [session_id]
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+    assert links_path.read_bytes() == first_append
 
 
 def test_resume_replaces_only_current_project_memory(tmp_path: Path) -> None:

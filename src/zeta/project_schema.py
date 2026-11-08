@@ -13,7 +13,10 @@ import os
 import re
 from pathlib import Path
 
-from .storage_format import reject_unknown_keys
+try:
+    from .storage_format import reject_unknown_keys
+except ImportError:  # the SSH installer defines this helper after the source
+    pass
 
 # Memory kind keys (entry_store) and their mirror temporaries (project_publish)
 # share this grammar; it lives here because this module ships to remote peers.

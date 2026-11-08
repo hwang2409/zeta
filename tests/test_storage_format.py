@@ -256,7 +256,9 @@ def test_advanced_home_refuses_predecessor_before_transcript_parsing(
         if path.is_file()
     }
 
-    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH, "candidate advanced the home"
+    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH, (
+        "candidate advanced the home"
+    )
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
         open_writer(tmp_path, capability=2)
 

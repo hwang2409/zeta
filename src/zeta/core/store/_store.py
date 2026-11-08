@@ -35,7 +35,7 @@ from ...protocol.types import (
     ToolUseContent,
     require_new_message_origin,
 )
-from ...storage_format import WriterLease, open_writer
+from ...storage_format import WriterLease, open_writer, reject_unknown_keys
 from .. import session_execution
 from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
@@ -53,6 +53,11 @@ from ..session_files import (
     session_root,
 )
 from ..todo import TodoItem, parse_todo_items
+from ..transcript_recovery import (
+    RepairResult,
+    RepairTarget,
+    repair_target_for_session_dir,
+)
 from ._approval_display import (
     ApprovalAuditRequest,
     normalize_approval_requests,
@@ -60,7 +65,10 @@ from ._approval_display import (
 )
 from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_history_data
 from ._async_writes import AsyncDurableWritesMixin
-from ._child_runs import ChildRunStoreMixin, validate_child_run_started_data
+from ._child_runs import (
+    ChildRunStoreMixin,
+    validate_child_run_started_data,
+)
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._execution_owner import ExecutionOwnerStoreMixin
 from ._incremental_validation import (
@@ -127,6 +135,8 @@ class ConversationStore(
         _execution_lease: session_execution.SessionExecutionLease | None = None,
         _owner_surface: session_execution.OwnerSurface = "tui",
         _recovery_owner: bool = False,
+        _repair_explicit: bool = False,
+        _repair_target: RepairTarget | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -157,6 +167,11 @@ class ConversationStore(
             self.session_dir = self.root_dir / self.session_id
             self._read_only = _read_only
             self._must_exist = _must_exist
+            self._repair_explicit = _repair_explicit
+            self._repair_target = _repair_target or repair_target_for_session_dir(
+                self.session_dir, self.session_id
+            )
+            self._last_repair_result: RepairResult | None = None
             self._runtime_lease: session_execution.SessionExecutionLease | None = None
             self._closed = False
             self._closing = False
@@ -235,6 +250,10 @@ class ConversationStore(
                     self._storage_lease,
                 )
             storage_ownership.pop_all()
+
+    @property
+    def last_repair_result(self) -> RepairResult | None:
+        return self._last_repair_result
 
     def bind_owner_thread(self) -> None:
         self._owner_thread_id = threading.get_ident()
@@ -571,8 +590,7 @@ class ConversationStore(
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:
                     raise ValueError("notification id must be a nonempty string")
-                if set(entry.data) != {"notification_id"}:
-                    raise ValueError("notification marker has unexpected fields")
+                reject_unknown_keys(entry.data, "notification_marker")
             elif entry.type == "pending_prompt":
                 text = entry.data.get("text")
                 if type(text) is not str or not text:
@@ -584,8 +602,7 @@ class ConversationStore(
                 if type(prompt_id) is not str or not prompt_id:
                     raise ValueError("pending prompt id must be a nonempty string")
             elif entry.type == "pending_queue_closed":
-                if entry.data != {}:
-                    raise ValueError("pending queue closed marker takes no fields")
+                reject_unknown_keys(entry.data, "pending_queue_closed")
             elif entry.type == "terminal_transition":
                 validate_terminal_transition_data(entry.data)
             else:

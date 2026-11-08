@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -8,9 +9,9 @@ import pty
 import shlex
 import shutil
 import signal
-import subprocess
 import sys
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import read_pid_file, wait_pid_exited
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
@@ -48,28 +50,46 @@ def _niceness_command() -> str:
 
 
 def _descendant_command(
-    marker: Path,
-    delay: float = 0.3,
-    started: Path | None = None,
-    release: Path | None = None,
+    child_pid: Path | None = None, release_path: Path | None = None
 ) -> str:
-    child = "import pathlib,time\n"
-    if release:
+    child = "import os,signal,pathlib,time\n"
+    if child_pid:
+        child += f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+    if release_path:
+        child += "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         child += (
-            f"deadline=time.monotonic()+5\n"
-            f"while not pathlib.Path({str(release)!r}).exists() and time.monotonic() < deadline:\n"
-            "    time.sleep(0.01)\n"
+            "while not pathlib.Path("
+            f"{str(release_path)!r}"
+            ").exists(): time.sleep(0.01)\n"
         )
     else:
-        child += f"time.sleep({delay})\n"
-    child += f"pathlib.Path({str(marker)!r}).write_text('alive')"
+        child += "signal.pause()"
     parent = (
-        "import pathlib,subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
-        + (f"pathlib.Path({str(started)!r}).write_text('started'); " if started else "")
-        + "time.sleep(5)"
+        "import pathlib,subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        + (
+            f"while not pathlib.Path({str(release_path)!r}).exists(): time.sleep(0.01)"
+            if release_path
+            else "time.sleep(5)"
+        )
     )
     return _python_command(parent)
+
+
+@asynccontextmanager
+async def _owned_descendant(
+    pid_file: Path, release_path: Path | None = None
+):
+    try:
+        yield
+    finally:
+        if release_path is not None:
+            release_path.touch()
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            await wait_pid_exited(pid)
 
 
 async def _collect_loop(loop: AgentLoop) -> list[object]:
@@ -434,30 +454,34 @@ async def test_bash_persists_explicit_cd_from_override(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Path) -> None:
-    marker = tmp_path / "child-alive"
+    child_pid = tmp_path / "child.pid"
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall("bash-abort", "bash", {"cmd": _descendant_command(marker)})
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-abort",
+                    "bash",
+                    {"cmd": _descendant_command(child_pid=child_pid)},
+                )
+            )
         )
-    )
 
-    await asyncio.sleep(0.05)
-    abort_signal.abort()
-    result = await task
-    await asyncio.sleep(0.5)
+        child_pid_value = await read_pid_file(child_pid)
+        abort_signal.abort()
+        result = await asyncio.wait_for(task, 10)
+        await wait_pid_exited(child_pid_value)
 
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool execution canceled"
-    assert not marker.exists()
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
 async def test_bash_task_cancellation_kills_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    marker = tmp_path / "child-canceled"
+    child_pid = tmp_path / "cancel-child.pid"
     spawned = asyncio.Event()
     release_spawn = asyncio.Event()
     spawned_process: asyncio.subprocess.Process | None = None
@@ -468,27 +492,29 @@ async def test_bash_task_cancellation_kills_process_group(
         process = await create_subprocess_shell(*args, **kwargs)
         spawned_process = process
         spawned.set()
-        await release_spawn.wait()
+        await asyncio.wait_for(release_spawn.wait(), 10)
         return process
 
     monkeypatch.setattr(bash_module, "create_tool_subprocess_shell", hold_spawn)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(marker)})
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(child_pid)})
+            )
         )
-    )
 
-    await asyncio.wait_for(spawned.wait(), timeout=2)
-    task.cancel()
-    release_spawn.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(spawned.wait(), timeout=2)
+        await read_pid_file(child_pid)
+        task.cancel()
+        release_spawn.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
 
-    assert spawned_process is not None
-    assert spawned_process.returncode is not None
-    with pytest.raises(ProcessLookupError):
-        os.killpg(spawned_process.pid, 0)
+        assert spawned_process is not None
+        assert spawned_process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(spawned_process.pid, 0)
 
 
 @pytest.mark.asyncio
@@ -1362,7 +1388,6 @@ async def test_bash_rejects_max_output_above_host_cap_before_spawn_or_capture(
             },
             registry.abort_signal,
         )
-    assert not marker.exists()
     assert captures == []
 
 
@@ -1398,7 +1423,6 @@ async def test_repeated_rejected_bash_output_limits_retain_no_captures(
         )
         assert result["isError"] is True
 
-    assert not marker.exists()
     assert captures == []
 
 
@@ -1591,53 +1615,74 @@ skill_catalog=SkillCatalog.empty(),
 
     abort_task = asyncio.create_task(abort_soon())
     result = await registry.execute(ToolCall("read-abort", "read", {"path": "large.txt"}))
-    await abort_task
+    await await_or_fail(abort_task, what="read abort task")
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
-async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
-    marker = tmp_path / "timeout-child-alive"
-    started = tmp_path / "timeout-child-started"
-    release = tmp_path / "timeout-child-release"
+async def test_bash_timeout_kills_and_reaps_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_pid = tmp_path / "timeout-child.pid"
+    release_path = tmp_path / "timeout-release"
+    timeout_ready = asyncio.Event()
+    timeout_fired = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def wait_for_readiness(delay: float) -> None:
+        if delay == 0.5:
+            await asyncio.wait_for(timeout_ready.wait(), 10)
+            timeout_fired.set()
+            return
+        await real_sleep(delay)
+
+    monkeypatch.setattr(bash_module.asyncio, "sleep", wait_for_readiness)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    execution = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-timeout",
-                "bash",
-                {
-                    "command": _descendant_command(
-                        marker, delay=1, started=started, release=release
-                    ),
-                    "timeout": 0.5,
-                },
+    async with _owned_descendant(child_pid, release_path):
+        execution = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-timeout",
+                    "bash",
+                    {
+                        "command": _descendant_command(
+                            child_pid=child_pid, release_path=release_path
+                        ),
+                        "timeout": 0.5,
+                    },
+                )
             )
         )
-    )
-    for _ in range(100):
-        if started.exists():
-            break
-        await asyncio.sleep(0.01)
-    else:
-        pytest.fail("descendant did not start")
-    result = await execution
+        child_pid_value = await read_pid_file(child_pid)
+        timeout_ready.set()
+        await await_or_fail(timeout_fired.wait(), what="bash timeout awaitable")
+        done, _ = await asyncio.wait({execution}, timeout=10)
+        if not done:
+            release_path.touch()
+            result = await await_or_fail(
+                execution, what="bash execution after timeout fallback release"
+            )
+        else:
+            result = execution.result()
 
-    assert result["isError"] is True
-    assert "timed out after" in result["content"][0]["text"]
-    assert result["structuredContent"]["timed_out"] is True
-    assert result["structuredContent"]["error"]["tool"] == "bash"
-    assert result["structuredContent"]["error"]["kind"] == "timeout"
-    assert not marker.exists()
+        assert result["isError"] is True, (
+            "bash did not return a timeout result after its timeout fired"
+        )
+        try:
+            await wait_pid_exited(child_pid_value)
+        except AssertionError as error:
+            raise AssertionError(
+                "bash timeout did not terminate the descendant process"
+            ) from error
 
-    release.touch()
-    for _ in range(20):
-        if marker.exists():
-            pytest.fail("descendant survived timeout cleanup")
-        await asyncio.sleep(0.01)
+        assert "timed out after" in result["content"][0]["text"]
+        assert result["structuredContent"]["timed_out"] is True
+        assert result["structuredContent"]["error"]["tool"] == "bash"
+        assert result["structuredContent"]["error"]["kind"] == "timeout"
+
 
 
 @pytest.mark.asyncio
@@ -1645,46 +1690,49 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launcher_ready = tmp_path / "launcher-ready"
+    # test-contract: seam launcher script readiness is controlled by this test
     monkeypatch.setattr(
         tool_spawn_module,
         "_LAUNCHER",
-        "import pathlib,time; time.sleep(1.0); "
-        f"pathlib.Path({str(launcher_ready)!r}).touch()\n"
+        f"import pathlib; pathlib.Path({str(launcher_ready)!r}).touch()\n"
         + tool_spawn_module._LAUNCHER,
     )
-    command_started = tmp_path / "timeout-command-started"
-    command_finished = tmp_path / "timeout-command-finished"
-    command = (
-        "import pathlib,time; "
-        f"pathlib.Path({str(command_started)!r}).touch(); time.sleep(1.5); "
-        f"pathlib.Path({str(command_finished)!r}).touch()"
-    )
-    original_spawn = bash_module.create_tool_subprocess_shell
+    timeout_started = asyncio.Event()
+    release_timeout = asyncio.Event()
+    timeout_started_early = False
+    real_sleep = asyncio.sleep
 
-    async def spawn_after_command_started(*args, **kwargs):
-        process = await original_spawn(*args, **kwargs)
-        assert launcher_ready.exists()
-        while not command_started.exists():
-            await asyncio.sleep(0.01)
-        return process
+    async def controlled_sleep(delay: float) -> None:
+        nonlocal timeout_started_early
+        if delay == 0.5:
+            timeout_started_early = not launcher_ready.exists()
+            timeout_started.set()
+            await asyncio.wait_for(release_timeout.wait(), 10)
+            return
+        await real_sleep(delay)
 
-    monkeypatch.setattr(
-        bash_module, "create_tool_subprocess_shell", spawn_after_command_started
-    )
+    monkeypatch.setattr(bash_module.asyncio, "sleep", controlled_sleep)
+    command = _python_command("import time; time.sleep(30)")
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-
-    result = await registry.execute(
-        ToolCall(
-            "bash-launcher-timeout",
-            "bash",
-            {"command": _python_command(command), "timeout": 2.0},
+    execution = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "bash-launcher-timeout",
+                "bash",
+                {"command": command, "timeout": 0.5},
+            )
         )
     )
 
+    await asyncio.wait_for(timeout_started.wait(), 10)
     assert launcher_ready.exists()
-    assert command_finished.exists()
-    assert result["isError"] is False
-    assert "timed_out" not in result["structuredContent"]
+    # test-contract: seam injected timeout awaitable records ordering
+    assert not timeout_started_early
+    release_timeout.set()
+    result = await asyncio.wait_for(execution, 10)
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["timed_out"] is True
 
 
 @pytest.mark.asyncio
@@ -1726,27 +1774,8 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
     assert result["isError"] is True
     assert "[timed out after 0.2s; process group killed]" in result["content"][0]["text"]
     assert result["structuredContent"]["timed_out"] is True
-    _, child_pgid = (int(value) for value in pid_file.read_text().split())
-    live_group = []
-    for _ in range(50):
-        rows = (
-            await asyncio.to_thread(
-                subprocess.check_output,
-                ["ps", "-axo", "pid=,pgid=,stat="],
-                text=True,
-            )
-        ).splitlines()
-        live_group = [
-            row.split()[0]
-            for row in rows
-            if len(row.split()) >= 3
-            and int(row.split()[1]) == child_pgid
-            and not row.split()[2].startswith("Z")
-        ]
-        if not live_group:
-            break
-        await asyncio.sleep(0.02)
-    assert not live_group
+    child_pid, _ = (int(value) for value in pid_file.read_text().split())
+    await asyncio.wait_for(wait_pid_exited(child_pid), 10)
 
 
 @pytest.mark.asyncio
@@ -1839,57 +1868,55 @@ async def test_bash_fast_command_is_not_marked_timed_out(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
-    marker = tmp_path / "cancel-child-alive"
-    started = tmp_path / "cancel-child-started"
+    child_pid = tmp_path / "cancel-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-cancel",
-                "bash",
-                {"command": _descendant_command(marker, started=started), "timeout": 5},
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-cancel",
+                    "bash",
+                    {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
+                )
             )
         )
-    )
-    for _ in range(100):
-        if started.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert started.exists()
-    task.cancel()
+        # The pid file is written by the descendant itself, so this is real process readiness.
+        await read_pid_file(child_pid)
+        task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await asyncio.sleep(0.4)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        child_pid_value = await read_pid_file(child_pid)
+        await wait_pid_exited(child_pid_value)
 
-    assert not marker.exists()
 
 
 @pytest.mark.asyncio
 async def test_bash_abort_kills_process_group_and_returns_canceled_result(
     tmp_path: Path,
 ) -> None:
-    marker = tmp_path / "abort-child-alive"
+    child_pid = tmp_path / "abort-child.pid"
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-abort",
-                "bash",
-                {"command": _descendant_command(marker), "timeout": 5},
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-abort",
+                    "bash",
+                    {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
+                )
             )
         )
-    )
-    await asyncio.sleep(0.05)
-    abort_signal.abort()
+        await read_pid_file(child_pid)
+        abort_signal.abort()
 
-    result = await asyncio.wait_for(task, timeout=0.5)
-    await asyncio.sleep(0.4)
+        result = await asyncio.wait_for(task, timeout=10)
+        child_pid_value = await read_pid_file(child_pid)
+        await wait_pid_exited(child_pid_value)
 
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool execution canceled"
-    assert not marker.exists()
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio

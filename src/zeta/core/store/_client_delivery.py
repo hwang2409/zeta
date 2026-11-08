@@ -80,18 +80,6 @@ def validate_client_delivery_data(
 ) -> None:
     """Validate one acceptance or terminal transition record."""
 
-    shape = (
-        "client_delivery_queued_steer_acceptance_message"
-        if "accepted_message" in data
-        else "client_delivery_send_acceptance"
-        if data.get("method") == "send" and "outcome" in data
-        else "client_delivery_steer_acceptance"
-        if "outcome" in data
-        else "client_delivery_delivered_transition"
-        if data.get("status") == "delivered"
-        else "client_delivery_dropped_transition"
-    )
-    reject_unknown_keys(data, shape)
     delivery_id = data.get("delivery_id")
     method = data.get("method")
     status = data.get("status")
@@ -100,44 +88,37 @@ def validate_client_delivery_data(
 
     if "outcome" in data:
         outcome = data.get("outcome")
-        valid_acceptance = (
-            method == "send"
-            and status == "delivered"
-            and outcome == {"accepted": True, "session_id": session_id}
-        ) or (
-            method == "steer"
-            and status == "queued"
-            and outcome == {"accepted": True}
-        )
-        allowed = {"delivery_id", "method", "status", "outcome"}
+        if method == "send":
+            reject_unknown_keys(data, "client_delivery_send_acceptance")
+            if isinstance(outcome, Mapping):
+                reject_unknown_keys(outcome, "client_delivery_accepted_outcome")
+            valid_acceptance = status == "delivered" and outcome == {"accepted": True, "session_id": session_id}
+        else:
+            if "accepted_message" in data:
+                reject_unknown_keys(data, "client_delivery_queued_steer_acceptance_message")
+            else:
+                reject_unknown_keys(data, "client_delivery_steer_acceptance")
+            if isinstance(outcome, Mapping):
+                reject_unknown_keys(outcome, "client_delivery_steer_accepted_outcome")
+            valid_acceptance = status == "queued" and outcome == {"accepted": True}
         if "accepted_message" in data:
             accepted_message = data["accepted_message"]
-            if (
-                method != "steer"
-                or status != "queued"
-                or not isinstance(accepted_message, dict)
-            ):
+            if method != "steer" or status != "queued" or not isinstance(accepted_message, dict):
                 raise ValueError("invalid accepted steering message")
             message = require_new_message_origin(Message.from_dict(accepted_message))
             if message.role is not MessageRole.USER:
                 raise ValueError("invalid accepted steering message")
-            allowed.add("accepted_message")
-        if set(data) - allowed or not valid_acceptance:
+        if not valid_acceptance:
             raise ValueError("invalid client delivery")
         return
 
     reason = data.get("reason")
-    valid_transition = (
-        method == "steer"
-        and (
-            (status == "delivered" and reason is None and set(data) == {"delivery_id", "method", "status"})
-            or (
-                status == "dropped"
-                and reason in {"restart", "abort", "clear", "disconnect", "turn_end", "failed"}
-                and set(data) == {"delivery_id", "method", "status", "reason"}
-            )
-        )
-    )
+    if status == "delivered":
+        reject_unknown_keys(data, "client_delivery_delivered_transition")
+        valid_transition = method == "steer" and reason is None
+    else:
+        reject_unknown_keys(data, "client_delivery_dropped_transition")
+        valid_transition = method == "steer" and status == "dropped" and reason in {"restart", "abort", "clear", "disconnect", "turn_end", "failed"}
     if not valid_transition:
         raise ValueError("invalid client delivery")
 

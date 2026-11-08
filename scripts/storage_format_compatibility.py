@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ ROUNDTRIP = Path(__file__).resolve().parents[1] / "tests/compatibility/storage_r
 CLASSIFIER_PREFIXES = ("src/zeta/", "tests/compatibility/", ".github/workflows/", "scripts/")
 CLASSIFIER_FILES = {"pyproject.toml", "uv.lock"}
 
-def _git(*args: str, check: bool = True) -> str:
+def _git(*args: str) -> str:
     return subprocess.check_output(("git", *args), text=True, stderr=subprocess.STDOUT).strip()
 
 def qualifying(commit: str) -> bool:
@@ -59,6 +60,26 @@ def _assert_mutation_delta(before: dict[str, str], after: dict[str, str], allowe
         raise RuntimeError(f"old-writer mutation changed undeclared paths: {sorted(unexpected)!r}")
 
 
+def _assert_roundtrip_delta(before: dict[str, str], after: dict[str, str]) -> None:
+    changed = {path for path in set(before) | set(after) if before.get(path) != after.get(path)}
+    allowed_prefix = "sessions/format-roundtrip/"
+    unexpected = {
+        path for path in changed if path != "meta.json" and not path.startswith(allowed_prefix)
+    }
+    if unexpected:
+        raise RuntimeError(f"old-writer mutation changed undeclared paths: {sorted(unexpected)!r}")
+    recovery_files = {
+        Path(path).name
+        for path in changed
+        if path.startswith(allowed_prefix)
+        and (".recovery." in path or ".quarantine." in path)
+    }
+    if not any(name.startswith("conversation.recovery.") for name in recovery_files):
+        raise RuntimeError("old writer did not publish a transcript recovery record")
+    if not any(name.endswith(".jsonl") and name.startswith("conversation.quarantine.") for name in recovery_files):
+        raise RuntimeError("old writer did not publish transcript quarantine payload")
+
+
 def _run_roundtrips(source: Path, predecessor_epoch: int) -> None:
     with tempfile.TemporaryDirectory(prefix="storage-format-roundtrip-") as temporary, tempfile.TemporaryDirectory(prefix="storage-format-uv-cache-") as cache:
         home = Path(temporary)
@@ -87,7 +108,7 @@ def _run_roundtrips(source: Path, predecessor_epoch: int) -> None:
         )
         if result.returncode:
             raise RuntimeError(f"old-writer round trip failed: {result.stderr or result.stdout}")
-        _assert_mutation_delta(before, _digest_tree(home), ("meta.json",))
+        _assert_roundtrip_delta(before, _digest_tree(home))
         candidate = subprocess.run(
             ("uv", "run", "--frozen", "python", str(ROUNDTRIP), "--home", str(home), "--mode", "reopen"),
             cwd=ROUNDTRIP.parents[1],
@@ -98,6 +119,20 @@ def _run_roundtrips(source: Path, predecessor_epoch: int) -> None:
         if candidate.returncode:
             raise RuntimeError(f"candidate could not reopen old-writer data: {candidate.stderr or candidate.stdout}")
     print("::notice::selected predecessor old-writer round trips passed")
+
+
+def _writer_epoch(source: Path) -> int:
+    tree = ast.parse((source / "src/zeta/storage_format.py").read_text())
+    for node in tree.body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "WRITER_EPOCH"
+            and isinstance(node.value, ast.Constant)
+            and type(node.value.value) is int
+        ):
+            return node.value.value
+    raise RuntimeError("predecessor WRITER_EPOCH is not a literal integer")
 
 
 def _probe_source(source: Path, output: Path) -> None:
@@ -137,18 +172,21 @@ def main() -> int:
         candidate.write_text(json.dumps(json.loads(result.stdout), sort_keys=True, separators=(",", ":")) + "\n")
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"candidate probe emitted malformed json: {exc}") from exc
-    if not has_probe(predecessor):
-        if any(has_probe(commit) for commit in earlier[1:] if qualifying(commit)):
-            raise RuntimeError(f"selected predecessor {predecessor} is missing the compatibility probe")
-        print(f"::notice::bootstrap predecessor {predecessor}: skipped registry comparison and old-writer round trips")
-        return 0
+    bootstrap = not has_probe(predecessor)
+    if bootstrap and any(has_probe(commit) for commit in earlier[1:] if qualifying(commit)):
+        raise RuntimeError(f"selected predecessor {predecessor} is missing the compatibility probe")
     with tempfile.TemporaryDirectory(prefix="storage-format-predecessor-") as temporary:
         source = Path(temporary)
         subprocess.run(("tar", "xf", str(output / "predecessor.tar"), "-C", str(source)), check=True)
-        _probe_source(source, output / "storage-format-predecessor.json")
-    predecessor_registry = json.loads((output / "storage-format-predecessor.json").read_text())
-    compare_registry_dumps(predecessor_registry, json.loads(candidate.read_text()))
-    _run_roundtrips(source, predecessor_registry["writer_epoch"])
+        if bootstrap:
+            predecessor_epoch = _writer_epoch(source)
+            print(f"::notice::bootstrap predecessor {predecessor}: registry comparison starts with this predecessor")
+        else:
+            _probe_source(source, output / "storage-format-predecessor.json")
+            predecessor_registry = json.loads((output / "storage-format-predecessor.json").read_text())
+            compare_registry_dumps(predecessor_registry, json.loads(candidate.read_text()))
+            predecessor_epoch = predecessor_registry["writer_epoch"]
+        _run_roundtrips(source, predecessor_epoch)
     return 0
 
 if __name__ == "__main__":

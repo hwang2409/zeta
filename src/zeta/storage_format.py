@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 3
+WRITER_EPOCH: Final = 4
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -40,64 +40,15 @@ GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
 ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "hook_config": frozenset({"hook"}),
     "hook_record": frozenset({"event", "command", "timeout_seconds", "tools", "on_error"}),
-    "todo_item": frozenset({"content", "status"}),
     "notification_marker": frozenset({"notification_id"}),
     "turn_history": frozenset({"turn_id", "reason"}),
     "prompt_component": frozenset({"offset", "length", "digest"}),
     "approval_fact": frozenset({"action"}),
     "approval_display": frozenset({"effective_cwd", "resolved_path", "utf8_bytes"}),
     "child_run": frozenset({"run_id", "parent_run_id", "name", "task", "started_at"}),
-    "response_action": frozenset({"action"}),
-    "response_action_report": frozenset({"action", "report"}),
-    "response_report": frozenset({"status", "summary", "head_sha", "verdict"}),
-    "child_idle_notification": frozenset(
-        {"origin", "kind", "child_instance_id", "child_session_path", "description", "status", "text", "ask_parent_question_id", "display_only"}
-    ),
-    "project_registry_update": frozenset({"description", "repo", "repo_agents"}),
-    "project_registry_record": frozenset({"schema_version", "project_id", "name", "scope", "created_at", "updated_at", "canonical_integration_root", "lanes", "repo_agents"}),
-    "memory_sync_digest": frozenset({"kind", "digests"}),
-    "memory_sync_entry": frozenset({"kind", "entry_ids", "digests"}),
-    "memory_reconciliation": frozenset({"changes"}),
-    "memory_reconciliation_change": frozenset({"path", "content", "action"}),
-    "memory_reconciliation_source": frozenset({"project_id", "session_id", "entry_id"}),
-    "memory_operations": frozenset({"operations"}),
-    "account_credential": frozenset({"provider", "name", "sha256"}),
-    "account_publication_marker": frozenset({"provider", "name", "sha256"}),
-    "project_session_reference": frozenset({"session_id", "transcript_path", "role", "parent_session_id", "recorded_at"}),
-    "memory_state_root": frozenset({"format", "project_id", "generation", "schema", "entries", "compacted_through_version"}),
-    "memory_schema": frozenset({"version", "profile", "kinds"}),
-    "memory_kind": frozenset({"key", "name", "description", "prompt_mode", "prompt_priority", "prompt_max_entries", "default_expiry_days"}),
-    "memory_entry": frozenset({"id", "project_id", "kind", "text", "representation", "status", "created_at", "updated_at", "seen_at", "expires_at", "expiry_is_default", "valid_from", "valid_until", "supersedes", "superseded_by", "sources", "automatic", "accepted_at", "accepted_by", "last_operation_id", "section", "migration_order", "migration_source"}),
-    "memory_missing_entry": frozenset({"id", "missing"}),
-    "memory_source": frozenset({"session_id", "seq_start", "seq_end", "origins", "observed_at", "evidence_rank"}),
-    "memory_migration_source": frozenset({"source_digest", "source_version"}),
-    "memory_operation_receipt": frozenset({"operation_id", "type", "target_ids", "result_ids", "reason", "reconciliation_key", "automatic"}),
-    "remote_memory_sync_state": frozenset({"schema", "project_id", "files", "conflicts"}),
-    "remote_memory_sync_conflict": frozenset({"id", "local", "remote"}),
-    "entry_sync_state": frozenset({"version", "entries", "conflicts", "transitions"}),
-    "entry_sync_schema": frozenset({"version", "kind", "fields"}),
-    "entry_sync_conflict": frozenset({"id", "local", "remote", "resolution"}),
-    "entry_sync_transition": frozenset({"id", "from", "to", "at"}),
-    "entry_sync_resolution_candidate": frozenset({"id", "value", "source"}),
-    "background_output_journal_commit": frozenset({"task_id", "offset", "length"}),
-    "client_delivery_send_acceptance": frozenset(
-        {"delivery_id", "method", "status", "outcome"}
-    ),
-    "client_delivery_steer_acceptance": frozenset(
-        {"delivery_id", "method", "status", "outcome"}
-    ),
-    "client_delivery_queued_steer_acceptance_message": frozenset(
-        {"delivery_id", "method", "status", "outcome", "accepted_message"}
-    ),
-    "client_delivery_delivered_transition": frozenset(
-        {"delivery_id", "method", "status"}
-    ),
-    "client_delivery_dropped_transition": frozenset(
-        {"delivery_id", "method", "status", "reason"}
-    ),
+    "pending_queue_closed": frozenset(),
     "client_delivery_accepted_outcome": frozenset({"accepted", "session_id"}),
     "client_delivery_steer_accepted_outcome": frozenset({"accepted"}),
-    "pending_queue_closed": frozenset(),
     "fact_floor_root": frozenset({"version", "oldest", "newest"}),
     "fact_floor_aggregate": frozenset({"fact", "first_seq", "last_seq", "value_rank"}),
     "fact_pr": frozenset({"type", "pr"}),
@@ -105,14 +56,81 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "fact_pr_head": frozenset({"type", "pr", "sha"}),
     "fact_child_status": frozenset({"type", "handle", "status"}),
     "fact_child_head": frozenset({"type", "handle", "sha"}),
-    "tool_result_text": frozenset({"type", "text", "truncated", "full_size", "full_size_chars", "next_offset", "spill_path", "annotations"}),
-    "tool_result_image": frozenset({"type", "data", "mimeType", "annotations", "caption", "width", "height", "path", "size"}),
-    "tool_result_resource": frozenset({"type", "resource", "annotations"}),
-    "tool_result_resource_contents": frozenset({"uri", "mimeType", "text", "blob"}),
-    "tool_result_annotations": frozenset({"audience", "priority", "lastModified"}),
-    "attention_record": frozenset({"id", "created_at", "session_id", "project_id", "entry_id", "entry_seq", "lane", "title", "why", "options", "recommendation", "status", "resolved_at", "fork_session_id", "decision"}),
-    "attention_fork_meta": frozenset({"forked_from_session", "forked_at_entry", "attention_id"}),
     "storage_manifest": frozenset({"writer_epoch"}),
+    "project_session_reference": frozenset({"session_id", "transcript_path", "role", "parent_session_id", "recorded_at"}),
+    "remote_memory_sync_state": frozenset({"schema", "project_id", "files", "conflicts"}),
+    "remote_memory_sync_conflict": frozenset({"digests"}),
+    "entry_sync_state": frozenset({"schema", "project_id", "format", "entries", "schema_digest", "conflicts", "transition"}),
+    "entry_sync_schema_conflict": frozenset({"kind", "digests"}),
+    "entry_sync_entry_conflict": frozenset({"kind", "entry_ids", "digests"}),
+    "entry_sync_transition": frozenset({"id", "previous_state", "resolutions", "candidates"}),
+    "entry_sync_schema_resolution_candidate": frozenset({"kind", "local", "remote", "prepared"}),
+    "entry_sync_entry_resolution_candidate": frozenset({"kind", "entry_ids", "local", "remote", "prepared"}),
+    "account_publication_marker": frozenset({"provider", "name", "sha256"}),
+    "memory_history_provenance": frozenset({"session_id", "seq_start", "seq_end", "fragment_start", "fragment_end", "model", "usage"}),
+    "entry_memory_snapshot_reference": frozenset({"state"}),
+    "legacy_memory_snapshot": frozenset(
+        {"brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"}
+    ),
+    "eviction_reasoning_receipt_metadata": frozenset({"context_evicted", "source_seq"}),
+    'todo_item': frozenset({'content', 'status'}),
+    'response_action': frozenset({'action'}),
+    'response_action_report': frozenset({'action', 'report'}),
+    'response_report': frozenset({'head_sha', 'status', 'summary', 'verdict'}),
+    'child_idle_notification': frozenset({'ask_parent_question_id', 'child_instance_id', 'child_session_path', 'description', 'display_only', 'kind', 'origin', 'status', 'text'}),
+    'project_registry_record': frozenset({'canonical_integration_root', 'created_at', 'lanes', 'name', 'project_id', 'repo_agents', 'schema_version', 'scope', 'updated_at'}),
+    'memory_state_root': frozenset({'compacted_through_version', 'entries', 'format', 'generation', 'project_id', 'schema'}),
+    'memory_schema': frozenset({'kinds', 'profile', 'version'}),
+    'memory_kind': frozenset({'default_expiry_days', 'description', 'key', 'name', 'prompt_max_entries', 'prompt_mode', 'prompt_priority'}),
+    'memory_entry': frozenset({'accepted_at', 'accepted_by', 'automatic', 'created_at', 'expires_at', 'expiry_is_default', 'id', 'kind', 'last_operation_id', 'migration_order', 'migration_source', 'project_id', 'representation', 'section', 'seen_at', 'sources', 'status', 'superseded_by', 'supersedes', 'text', 'updated_at', 'valid_from', 'valid_until'}),
+    'memory_missing_entry': frozenset({'id', 'missing'}),
+    'memory_source': frozenset({'evidence_rank', 'observed_at', 'origins', 'seq_end', 'seq_start', 'session_id'}),
+    'memory_migration_source': frozenset({'source_digest', 'source_version'}),
+    'memory_operation_receipt': frozenset({'automatic', 'operation_id', 'reason', 'reconciliation_key', 'result_ids', 'target_ids', 'type'}),
+    'background_output_journal_commit': frozenset({'length', 'offset', 'task_id'}),
+    'client_delivery_send_acceptance': frozenset({'delivery_id', 'method', 'outcome', 'status'}),
+    'client_delivery_steer_acceptance': frozenset({'delivery_id', 'method', 'outcome', 'status'}),
+    'client_delivery_queued_steer_acceptance_message': frozenset({'accepted_message', 'delivery_id', 'method', 'outcome', 'status'}),
+    'client_delivery_delivered_transition': frozenset({'delivery_id', 'method', 'status'}),
+    'client_delivery_dropped_transition': frozenset({'delivery_id', 'method', 'reason', 'status'}),
+    'tool_result_text': frozenset({'annotations', 'full_size', 'full_size_chars', 'next_offset', 'spill_path', 'text', 'truncated', 'type'}),
+    'tool_result_image': frozenset({'annotations', 'caption', 'data', 'height', 'mimeType', 'path', 'size', 'type', 'width'}),
+    'tool_result_resource': frozenset({'annotations', 'resource', 'type'}),
+    'tool_result_resource_contents': frozenset({'blob', 'mimeType', 'text', 'uri'}),
+    'tool_result_annotations': frozenset({'audience', 'lastModified', 'priority'}),
+    'attention_record': frozenset({'created_at', 'decision', 'entry_id', 'entry_seq', 'fork_session_id', 'id', 'lane', 'options', 'project_id', 'recommendation', 'resolved_at', 'session_id', 'status', 'title', 'why'}),
+    'attention_fork_meta': frozenset({'attention_id', 'forked_at_entry', 'forked_from_session'}),
+    "transcript_recovery.evidence": frozenset(
+        {
+            "schema",
+            "quarantine_id",
+            "target",
+            "source_digest",
+            "source_size",
+            "first_bad_row",
+            "first_bad_offset",
+            "valid_prefix_end",
+            "retained_last_sequence",
+            "repaired_digest",
+            "diagnosed_at",
+            "payload_digest",
+            "payload_size",
+        }
+    ),
+    "transcript_recovery.state": frozenset(
+        {
+            "schema",
+            "quarantine_id",
+            "target",
+            "state",
+            "expected_source_digest",
+            "repaired_digest",
+            "cutoff_sequence",
+            "diagnosis_timestamp",
+            "memory_step",
+        }
+    ),
+    "transcript_recovery.target": frozenset({"root_session_id", "child_run_id"}),
 }
 
 
@@ -155,7 +173,25 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "project.session_role": frozenset({"session", "orchestrator", "worker"}),
     "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
     "sent_message_ledger.schema_version": frozenset({1}),
+    "transcript_recovery.evidence_schema": frozenset({"zeta.transcript-quarantine.v1"}),
+    "transcript_recovery.state_schema": frozenset({"zeta.transcript-recovery.v1"}),
+    "transcript_recovery.state": frozenset({"pending", "committed", "abandoned"}),
+    "transcript_recovery.memory_step": frozenset(
+        {"not_required", "review_pending", "resumed"}
+    ),
+    "warning.transcript_recovery.kind": frozenset({"transcript_recovery"}),
 }
+
+RECOVERY_STATE_MEMORY_PAIRS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {
+        ("pending", "not_required"),
+        ("pending", "review_pending"),
+        ("committed", "not_required"),
+        ("committed", "review_pending"),
+        ("committed", "resumed"),
+        ("abandoned", "not_required"),
+    }
+)
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
@@ -373,12 +409,9 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
         decoder = json.JSONDecoder()
         text = raw.decode()
         value, end = decoder.raw_decode(text)
-        if (
-            text[end:].strip()
-            or type(value) is not dict
-            or set(value) != {"writer_epoch"}
-        ):
+        if text[end:].strip() or type(value) is not dict:
             raise ValueError
+        reject_unknown_keys(value, "storage_manifest")
         epoch = value["writer_epoch"]
         if type(epoch) is not int or epoch < 0:
             raise ValueError
@@ -673,6 +706,13 @@ class WriterLease:
         self.home = home
         self._entry = entry
         self._closed = False
+
+    @property
+    def observed_epoch(self) -> int:
+        """Return the home epoch observed when this lease was acquired."""
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        return self._entry.epoch
 
     def retain(self) -> WriterLease:
         if self._closed:
