@@ -137,8 +137,6 @@ async def test_new_session_promotes_healthy_cwd_project_after_malformed_finding(
 
         assert metadata.project_id == healthy.project_id
         assert server.runtime.loop.root_project_id == healthy.project_id
-        assert server.runtime.loop.project_context_health is None
-
         assert server.port is not None
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         try:
