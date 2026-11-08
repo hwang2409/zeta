@@ -358,8 +358,9 @@ def test_completion_stats_match_scrollback_and_agent_card(elapsed: float, expect
     )
 
     assert scrollback is not None
-    assert f"{expected_elapsed} · 1 turn" in scrollback.plain
-    assert f"{expected_elapsed} · 1 turn" in card
+    expected_text = f"{expected_elapsed} · 1 turn"
+    assert scrollback.plain.count(expected_text) == 1
+    assert card.count(expected_text) == 1
     assert "1 turns" not in scrollback.plain + card
 
 
