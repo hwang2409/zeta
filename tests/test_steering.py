@@ -18,6 +18,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.providers.completion as completion_module
 from tests.support.fake_backend import FakeBackend
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import BudgetExceeded, ContextAssembler
@@ -697,18 +698,14 @@ async def test_transient_notification_failure_is_retried(
     monkeypatch: pytest.MonkeyPatch,
     failure: ErrorInfo | BaseException,
 ) -> None:
-    backend: CompletionBackend
     if isinstance(failure, ErrorInfo):
-        backend = _NotificationBackend(errors={0: failure})
-    else:
-        backend = _NotificationBackend()
-    app = _notification_app(tmp_path, backend)
-    if isinstance(failure, BaseException):
-        monkeypatch.setattr(
-            app.loop,
-            "run_notification_turn",
-            lambda **kwargs: _raise_notification_failure(failure, **kwargs),
+        backend = _NotificationBackend(
+            failures=set(range(10)), errors=dict.fromkeys(range(10), failure)
         )
+    else:
+        backend = _NotificationBackend(exceptions=dict.fromkeys(range(10), failure))
+    app = _notification_app(tmp_path, backend)
+    monkeypatch.setattr(completion_module, "retry_wait_seconds", lambda *_args: 0.0)
     timers, captured = _capture_notification_timers(monkeypatch)
 
     # test-contract: seam notification wake has no public completion future
