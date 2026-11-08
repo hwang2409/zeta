@@ -232,7 +232,10 @@ class AgentNotificationMixin:
             async for event in stream:
                 yield event
         finally:
-            await stream.aclose()
+            try:
+                await stream.aclose()
+            except BaseException:  # noqa: BLE001 - preserve turn cleanup
+                pass
             self._turn_active = False
             self._delivering_prompt_id = None
             flow = self.step_delivery
