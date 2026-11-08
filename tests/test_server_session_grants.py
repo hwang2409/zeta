@@ -530,6 +530,7 @@ async def test_session_grant_flow_over_authenticated_websocket(
         )
         return await original_run_setup(*args, **kwargs)
 
+    # test-contract: seam no public setup gate exposes request/setup ordering
     monkeypatch.setattr(server.runtime, "_run_setup", gated_run_setup)
     create_task: asyncio.Task[list[dict[str, Any]]] | None = None
     try:
@@ -550,7 +551,9 @@ async def test_session_grant_flow_over_authenticated_websocket(
         await await_or_fail(setup_started.wait(), what="new_session setup to start")
         assert not create_task.done(), "new_session responded before setup completed"
         release_setup.set()
-        created = await create_task
+        created = await await_or_fail(
+            create_task, what="new_session WebSocket response after setup release"
+        )
         assert any(
             frame.get("params", {}).get("data", {}).get("change") == "reset"
             for frame in created
@@ -590,7 +593,10 @@ async def test_session_grant_flow_over_authenticated_websocket(
         release_setup.set()
         if create_task is not None and not create_task.done():
             create_task.cancel()
-            await asyncio.gather(create_task, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(create_task, return_exceptions=True),
+                what="canceled new_session request cleanup",
+            )
         await websocket.close()
         await close_serve(server)
 
