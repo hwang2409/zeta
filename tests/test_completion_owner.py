@@ -377,6 +377,43 @@ async def test_account_lock_retry_does_not_consume_transient_attempt_budget() ->
 
 
 @pytest.mark.asyncio
+async def test_lock_waits_do_not_grant_a_sixth_provider_attempt_to_a_later_request() -> None:
+    clock = _ManualClock()
+
+    async def wait(delay: float) -> None:
+        clock.current += delay
+
+    done = _SequenceAttempt(
+        AttemptSignal(
+            TransportActivity.MODEL_PROGRESS,
+            StreamEvent(StreamEventType.MESSAGE_END),
+        )
+    )
+    attempts = [
+        _SequenceAttempt(AccountCredentialLockTimeoutError()),
+        *[_SequenceAttempt(_RetryableError("busy")) for _ in range(4)],
+        done,
+        _SequenceAttempt(_RetryableError("must not start")),
+    ]
+    backend = _AttemptBackend(attempts, clock, wait=wait)
+    budget = CompletionRetryBudget()
+    first = backend.complete([], [], control=_control(budget=budget))
+    try:
+        await _collect(first)
+    finally:
+        await _within(first.aclose())
+    assert backend.created == 6
+
+    later = backend.complete([], [], control=_control(budget=budget))
+    try:
+        with pytest.raises(RuntimeError, match="budget exhausted"):
+            await _collect(later)
+    finally:
+        await _within(later.aclose())
+    assert backend.created == 6
+
+
+@pytest.mark.asyncio
 async def test_account_lock_exhaustion_stops_after_five_attempts() -> None:
     clock = _ManualClock()
 
