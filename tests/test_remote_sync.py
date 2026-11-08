@@ -62,6 +62,7 @@ from zeta.remote_sync.project_publish import (
 )
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
 from zeta.tools import ToolRegistry
 from zeta.tools import session_push as session_push_tool
 from zeta.tools.session_push import register as register_session_push
@@ -1377,6 +1378,48 @@ def _format_two_project_snapshot(
                 manifest[field] = new_digest
         manifest_path.write_text(json.dumps(manifest, sort_keys=True))
     return snapshot, project.project_id
+
+
+def test_p06_3_generated_project_programs_match_fresh_home_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_home = tmp_path / "local-home"
+    lease = open_writer(local_home)
+    try:
+        expected_epoch = lease.observed_epoch
+    finally:
+        lease.close()
+
+    fetch_home = tmp_path / "fetch-home"
+    fetch = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            ssh_module._PROJECT_FETCH_SCRIPT,
+            str(fetch_home),
+            "missing-project",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert fetch.returncode == 44
+    assert json.loads((fetch_home / "storage-format.json").read_text()) == {
+        "writer_epoch": expected_epoch
+    }
+
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    install_home = tmp_path / "install-home"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    SshTransport("fake", str(install_home), name="cloud").publish_project(
+        project_id, snapshot, expected_digest="missing"
+    )
+
+    assert json.loads((install_home / "storage-format.json").read_text()) == {
+        "writer_epoch": expected_epoch
+    }
+    assert project_digest(install_home / "projects" / project_id) == project_digest(
+        snapshot
+    )
 
 
 def test_p06_3_generated_project_fetch_uses_one_memory_authority(

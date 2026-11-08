@@ -797,6 +797,7 @@ def test_root_link_pending_intent_dir_fsync_precedes_record_session(
         events.append("update_sessions")
         return real_update(*args, **kwargs)
 
+    # test-contract: durability observe registry publication after intent fsync
     monkeypatch.setattr(manager.project_registry, "_update_sessions_locked", spy_update)
 
     session = manager.create(provider="codex", model="fake", cwd=repository)
@@ -1502,6 +1503,33 @@ async def test_real_child_spawns_repeat_after_generation_changes(
     )
     first_batch_ready = threading.Event()
     release_first_batch = threading.Event()
+    all_admissions_ready = threading.Event()
+    admission_lock = threading.Lock()
+    real_persist = session_links.persist_pending_child_link
+    admission_count = 0
+
+    def count_admission(*args: object, **kwargs: object) -> None:
+        nonlocal admission_count
+        real_persist(*args, **kwargs)
+        with admission_lock:
+            admission_count += 1
+            if admission_count == 257:
+                all_admissions_ready.set()
+
+    # test-contract: count real admissions before the second bounded pass
+    monkeypatch.setattr(session_links, "persist_pending_child_link", count_admission)
+    real_reconcile = session_links._reconcile_child_links_pass
+    reconcile_calls = 0
+
+    def gate_second_pass(*args: object, **kwargs: object):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        if reconcile_calls == 2:
+            assert all_admissions_ready.wait(120), "all admissions were not durable"
+        return real_reconcile(*args, **kwargs)
+
+    # test-contract: seam hold the second pass until all admissions are durable
+    monkeypatch.setattr(session_links, "_reconcile_child_links_pass", gate_second_pass)
     real_record_sessions = registry._record_child_lineage_batch
     record_calls = 0
 
@@ -1580,9 +1608,7 @@ async def test_real_child_spawns_repeat_after_generation_changes(
         repr(result) for result in results if not isinstance(result, RuntimeError)
     ]
 
-    # The semantic lock can split concurrent admissions into more than two
-    # passes, but every bounded pass reads and rewrites the project only once.
-    assert record_calls >= 2
+    assert record_calls == 2, "child lineage publication was not bounded"
     assert registry_reads == record_calls
     records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=10_000)
     child_ids = [
@@ -1599,6 +1625,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.agent import runner as agent_runner
+    from zeta.core import session_links
 
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
@@ -1668,6 +1695,35 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             )
 
         first_batch_ready = threading.Event()
+        all_admissions_ready = threading.Event()
+        admission_lock = threading.Lock()
+        real_persist = session_links.persist_pending_child_link
+        admission_count = 0
+
+        def count_admission(*args: object, **kwargs: object) -> None:
+            nonlocal admission_count
+            real_persist(*args, **kwargs)
+            with admission_lock:
+                admission_count += 1
+                if admission_count == 4:
+                    all_admissions_ready.set()
+
+        # test-contract: count real admissions before the second bounded pass
+        monkeypatch.setattr(session_links, "persist_pending_child_link", count_admission)
+        real_reconcile = session_links._reconcile_child_links_pass
+        reconcile_calls = 0
+
+        def gate_second_pass(*args: object, **kwargs: object):
+            nonlocal reconcile_calls
+            reconcile_calls += 1
+            if reconcile_calls == 2:
+                assert all_admissions_ready.wait(10), "all admissions were not durable"
+            return real_reconcile(*args, **kwargs)
+
+        # test-contract: seam hold the second pass until all admissions are durable
+        monkeypatch.setattr(
+            session_links, "_reconcile_child_links_pass", gate_second_pass
+        )
         second_owner_entered = asyncio.Event()
         event_loop = asyncio.get_running_loop()
         record_lock = threading.Lock()
@@ -1768,7 +1824,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         repr(result) for result in results if not isinstance(result, RuntimeError)
     ]
     assert max_active_records == 1
-    assert record_calls >= 2
+    assert record_calls == 2, "nested lineage publication was not bounded"
     assert registry_reads == record_calls
     records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=100)
     grandchild_ids = [

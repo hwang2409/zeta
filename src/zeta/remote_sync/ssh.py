@@ -62,13 +62,54 @@ finally:
 
 
 _PROJECT_AUTHORITY = rf'''
-import contextlib, fcntl, json, os, pathlib, stat, sys
+import contextlib, fcntl, json, os, pathlib, secrets, stat, sys
 _P06_FEATURE_EPOCH = {P06_FEATURE_EPOCH}
 _WRITER_EPOCH = {WRITER_EPOCH}
 
+def _has_gated_state(home):
+    projects = home / "projects"
+    sessions = home / "sessions"
+    if projects.exists() or any((home / name).exists() for name in (
+        "accounts.json", "accounts", "anthropic-oauth.json", "codex-oauth.json", "mcp-tokens"
+    )):
+        return True
+    try: return sessions.exists() and next(sessions.iterdir(), None) is not None
+    except OSError: return True
+
 def _writer_epoch(home):
-    try: manifest = json.loads((home / "storage-format.json").read_text())
-    except (OSError, ValueError): sys.exit(53)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    manifest_path = home / "storage-format.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except FileNotFoundError:
+        lock_path = home / ".storage-format.lock"
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            try: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: sys.exit(53)
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except FileNotFoundError:
+                if _has_gated_state(home): sys.exit(53)
+                temporary = home / f".storage-format.json.{{secrets.token_hex(16)}}.tmp"
+                try:
+                    with temporary.open("x") as stream:
+                        stream.write(json.dumps({{"writer_epoch": _WRITER_EPOCH}}, separators=(",", ":")) + "\n")
+                        stream.flush(); os.fsync(stream.fileno())
+                    os.replace(temporary, manifest_path)
+                    directory_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+                    try: os.fsync(directory_fd)
+                    finally: os.close(directory_fd)
+                finally:
+                    try: temporary.unlink()
+                    except FileNotFoundError: pass
+                manifest = {{"writer_epoch": _WRITER_EPOCH}}
+            except (OSError, ValueError): sys.exit(53)
+        finally:
+            os.close(lock_fd)
+    except (OSError, ValueError):
+        sys.exit(53)
+    if type(manifest) is not dict or set(manifest) != {{"writer_epoch"}}: sys.exit(53)
     epoch = manifest.get("writer_epoch")
     if type(epoch) is not int or epoch < 1 or epoch > _WRITER_EPOCH: sys.exit(53)
     return epoch
@@ -110,6 +151,7 @@ def _project_fd(projects_fd, ident):
 
 @contextlib.contextmanager
 def _project_authority(home, ident, *, identity, exclusive, nonblocking=False):
+    epoch = _writer_epoch(home)
     try:
         projects_fd = os.open(home / "projects", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
@@ -117,7 +159,6 @@ def _project_authority(home, ident, *, identity, exclusive, nonblocking=False):
     project_fd = None
     lock_fd = None
     try:
-        epoch = _writer_epoch(home)
         legacy = epoch < _P06_FEATURE_EPOCH
         operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         if nonblocking:
@@ -288,6 +329,7 @@ ident, expected, transfer = sys.argv[2], sys.argv[3], sys.argv[4]
 max_members, max_bytes = int(sys.argv[5]), int(sys.argv[6])
 if Path(ident).parts != (ident,): sys.exit(45)
 home.mkdir(parents=True, exist_ok=True, mode=0o700)
+_writer_epoch(home)
 with tempfile.TemporaryDirectory(prefix=f".{ident}.upload-", dir=home) as temporary:
     staging = Path(temporary) / ident
     staging.mkdir(mode=0o700)

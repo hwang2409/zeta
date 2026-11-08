@@ -330,6 +330,7 @@ def test_p06_5_root_reconciliation_revalidates_replaced_intent(
             with original(*args, **kwargs) as value:
                 yield value
 
+        # test-contract: seam replace the root intent during authority acquisition
         monkeypatch.setattr(registry, "_project_locks", gated)
     else:
         original_record = registry.record_session  # type: ignore[attr-defined]
@@ -411,6 +412,7 @@ def test_p06_5_root_reconciliation_recovers_each_crash_boundary(
                 raise OSError(f"crash {boundary}")
             original_update(*args, **kwargs)
 
+        # test-contract: durability inject each session-publication crash boundary
         monkeypatch.setattr(registry, "_update_sessions_locked", crash_update)
     elif original_update is not None:
         import zeta.core.session as session_module
@@ -425,6 +427,7 @@ def test_p06_5_root_reconciliation_recovers_each_crash_boundary(
                 raise OSError("crash after upsert")
             original_unlink(path, *args, **kwargs)
 
+        # test-contract: durability fail after upsert and before intent cleanup
         monkeypatch.setattr(session_module.os, "unlink", crash_cleanup)
 
     manager.associate_project(opened.metadata, new.project_id)
@@ -496,6 +499,7 @@ def test_p06_5_child_reconciliation_revalidates_replaced_batch(
             with original(*args, **kwargs) as value:
                 yield value
 
+        # test-contract: seam replace the child intent during authority acquisition
         monkeypatch.setattr(registry, "_project_locks", gated)
     else:
         import zeta.core.session_links as session_links_module
@@ -507,6 +511,7 @@ def test_p06_5_child_reconciliation_revalidates_replaced_batch(
             assert release_publication.wait(10), "replacement gate was not released"
             original_batch(*args, **kwargs)
 
+        # test-contract: seam replace the child intent during batch publication
         monkeypatch.setattr(
             session_links_module, "_record_child_lineage_batch", gated_batch
         )
