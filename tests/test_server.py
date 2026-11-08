@@ -82,6 +82,7 @@ from zeta.protocol.types import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
     with_message_origin,
 )
@@ -99,6 +100,7 @@ from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
+    tool_end,
 )
 from zeta.server.protocol import (
     MAX_FRAME_BYTES,
@@ -551,6 +553,34 @@ def test_serve_maps_account_state_unknown() -> None:
         STREAM_EVENT_WIRE_EVENTS[StreamEventType.ACCOUNT_STATE_UNKNOWN]
         == "account_state_unknown"
     )
+
+
+def test_agent_status_lost_reason_survives_serve_tool_mapping() -> None:
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=ToolCall("status-1", "agent_status", {"handle": "root:1"}),
+        tool_result=ToolResult(
+            tool_call_id="status-1",
+            content="child root:1: state: failed; reason: lost: owner process exited",
+            structured_content={
+                "children": [
+                    {
+                        "handle": "root:1",
+                        "state": "failed",
+                        "reason": "lost: owner process exited",
+                    }
+                ]
+            },
+        ),
+    )
+
+    mapped = tool_end(event, fidelity=True)
+
+    assert mapped["tool_result"]["structured_content"]["children"][0] == {
+        "handle": "root:1",
+        "state": "failed",
+        "reason": "lost: owner process exited",
+    }
 
 
 def test_server_sends_only_wire_map_event_names() -> None:
