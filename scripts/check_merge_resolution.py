@@ -1209,11 +1209,9 @@ def _filter_findings(findings: list[Item], text: str) -> list[Item]:
     ]
 
 
-def _borrow_skip_reason(pull: dict, pr: int, author: str) -> str | None:
+def _borrow_skip_reason(pull: dict, author: str) -> str | None:
     head_repo = (pull.get("head") or {}).get("repo") or {}
     base = pull.get("base") or {}
-    if pull.get("number") == pr:
-        return "this PR"
     if head_repo.get("full_name") != (base.get("repo") or {}).get("full_name"):
         return "fork head"
     if base.get("ref") != "main":
@@ -1228,8 +1226,9 @@ def _candidate_lines(
 ) -> tuple[dict[int, list[str]], list[str]]:
     found: dict[int, list[str]] = {}
     skipped = []
-    for pull in data["pulls"]:
-        skip = _borrow_skip_reason(pull, data["pr"], data["author"])
+    # The PR being checked always contains its own merges; its body is already applied.
+    for pull in (pull for pull in data["pulls"] if pull.get("number") != data["pr"]):
+        skip = _borrow_skip_reason(pull, data["author"])
         lines = sorted(
             {
                 line
