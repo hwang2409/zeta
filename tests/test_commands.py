@@ -19,8 +19,8 @@ from rich.console import Console
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.commands.custom_commands import COMMAND_FILE_SIZE_LIMIT
 from zeta.core.slash import (
-    COMMAND_FILE_SIZE_LIMIT,
     INIT_PROMPT,
     CustomCommand,
     create_slash_registry,
