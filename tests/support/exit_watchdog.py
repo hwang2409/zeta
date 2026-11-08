@@ -26,6 +26,9 @@ import pytest
 # durations of any CI job), so this only fires on a real hang.
 EXIT_WATCHDOG_SECONDS = 120
 
+# Disarmed, the dump thread only wakes on arm(); this bounds each idle wait.
+_IDLE_RECHECK_SECONDS = 3600.0
+
 _stderr_fd: int | None = None
 _seconds = float(EXIT_WATCHDOG_SECONDS)
 
@@ -91,7 +94,8 @@ class _TaskDumper:
                         _write(f"\nzeta test watchdog: broken: {error!r}\n")
 
     def _wait_and_dump(self) -> None:
-        self._changed.wait()
+        if not self._changed.wait(_IDLE_RECHECK_SECONDS):
+            return
         with self._lock:
             self._changed.clear()
             generation, seconds = self._generation, self._seconds
