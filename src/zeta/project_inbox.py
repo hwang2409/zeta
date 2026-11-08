@@ -23,10 +23,9 @@ from .core.session_files import (
     atomic_publish_file,
     child_directory,
     open_session_file,
-    read_session_file,  # noqa: F401 - compatibility seam for scanner tests
-    session_root,  # noqa: F401 - compatibility seam for scanner tests
 )
 from .project_errors import ProjectNotFoundError
+from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 from .session_liveness import session_is_live
 from .storage_format import (
@@ -39,7 +38,6 @@ from .storage_format import (
 SCHEMA_VERSION = 1
 BODY_SPILL_BYTES = 64 * 1024
 DONE_HISTORY_LIMIT = 100
-SENT_HISTORY_LIMIT = 512
 SENT_PAGE_LIMIT = 100
 _SENT_TRACKING_FILE = "project-inbox-sent.json"
 SENT_STATUS_EVENT = "project_inbox_sent_status"
@@ -141,6 +139,7 @@ class ProjectInboxScanner:
             if session_id is not None
             else None
         )
+        self._activation_sent_outcome: SentLedgerOutcome[None] | None = None
         self._fingerprint: tuple[tuple[int, int, int, int] | None, ...] | None = None
 
     def scan(self) -> tuple[str, ...] | None:
@@ -162,10 +161,14 @@ class ProjectInboxScanner:
         if not self.tracker.broken_cached and not self.tracker._pending:
             return ()
         source = self.inbox._resolve_project(self.project_id)
-        sent, _health = self.tracker.sent_view(
+        outcome = self.tracker.sent_view(
             self.inbox, source.project_id, self.tracker._receipts
         )
-        return tuple(item for item in sent if "done" not in item.get("reported", []))
+        return tuple(
+            item
+            for item in outcome.result
+            if "done" not in item.get("reported", [])
+        )
 
     def mark_reported(self, statuses: Iterator[tuple[str, str]]) -> None:
         if self.tracker is not None:
@@ -221,6 +224,32 @@ class ProjectInbox:
         message_id: str | None = None,
         to_session: str | None = None,
     ) -> str:
+        message_id, _outcome = self.send_with_outcome(
+            from_project=from_project,
+            from_session=from_session,
+            to_project=to_project,
+            kind=kind,
+            title=title,
+            body=body,
+            in_reply_to=in_reply_to,
+            message_id=message_id,
+            to_session=to_session,
+        )
+        return message_id
+
+    def send_with_outcome(
+        self,
+        *,
+        from_project: str,
+        from_session: str,
+        to_project: str,
+        kind: str,
+        title: str,
+        body: str,
+        in_reply_to: str | None = None,
+        message_id: str | None = None,
+        to_session: str | None = None,
+    ) -> tuple[str, SentLedgerOutcome[None]]:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
         session = _id(from_session, "session id")
@@ -298,8 +327,8 @@ class ProjectInbox:
             if self.sent_tracker is not None and self.sent_tracker.session_id == session
             else SentMessageTracker(self.sessions_root, session)
         )
-        tracker.record(message_id, target.project_id)
-        return message_id
+        outcome = tracker.record(message_id, target.project_id)
+        return message_id, outcome
 
     def list(
         self, project: str, *, session_id: str | None = None
@@ -353,9 +382,10 @@ class ProjectInbox:
             and self.sent_tracker.session_id == session_id
             else SentMessageTracker(self.sessions_root, session_id)
         )
-        sent, health = tracker.sent_view(
+        outcome = tracker.sent_view(
             self, source.project_id, self._receipts_for_session(session_id)
         )
+        sent = outcome.result
         page = sent[offset : offset + limit]
         next_offset = offset + len(page)
         return {
@@ -365,38 +395,11 @@ class ProjectInbox:
             "next_offset": next_offset if next_offset < len(sent) else None,
             "total": len(sent),
             "truncated": False,
-            **health,
+            **outcome.health.as_dict(),
         }
 
     def _receipts_for_session(self, session_id: str) -> tuple[tuple[str, str], ...]:
         return self.receipts
-
-    def _projected_broken_sent(
-        self,
-        source_project: str,
-        source_session: str,
-        receipts: Iterable[tuple[str, str]],
-    ) -> list[dict[str, Any]]:
-        receipt_map = self._receipt_map(receipts)
-        rows: list[dict[str, Any]] = []
-        for target in sorted(self.registry.list_projects(), key=lambda p: p.project_id):
-            rows.extend(
-                self._broken_project_rows(
-                    target.project_id, source_project, source_session, receipt_map
-                )
-            )
-        rows.sort(key=lambda item: (item["created_at"], item["id"]))
-        while len(rows) > SENT_HISTORY_LIMIT:
-            done = next((row for row in rows if row["reported"] == ["done"]), None)
-            rows.remove(done or rows[0])
-        return list(reversed(rows))
-
-    @staticmethod
-    def _receipt_map(receipts: Iterable[tuple[str, str]]) -> dict[str, set[str]]:
-        result: dict[str, set[str]] = {}
-        for message_id, status in receipts:
-            result.setdefault(message_id, set()).add(status)
-        return result
 
     def _broken_project_rows(
         self,
@@ -668,6 +671,20 @@ class ProjectInbox:
         *,
         reply: str | None = None,
     ) -> dict[str, Any]:
+        message, _sent_outcome = self.done_with_outcome(
+            project, message_id, session_id, outcome, reply=reply
+        )
+        return message
+
+    def done_with_outcome(
+        self,
+        project: str,
+        message_id: str,
+        session_id: str,
+        outcome: str,
+        *,
+        reply: str | None = None,
+    ) -> tuple[dict[str, Any], SentLedgerOutcome[None] | None]:
         target = self._resolve_project(project)
         message_id = _id(message_id)
         session_id = _id(session_id, "session id")
@@ -714,10 +731,11 @@ class ProjectInbox:
                 os.fsync(claimed_fd)
                 self._prune_done(done_fd, bodies_fd)
             completed = self._read_record(done_fd, name, bodies_fd)
+        sent_outcome = None
         if reply is not None:
             sender = record["from"]
             assert isinstance(sender, dict)
-            self.send(
+            _reply_id_value, sent_outcome = self.send_with_outcome(
                 from_project=target.project_id,
                 from_session=session_id,
                 to_project=str(sender["project"]),
@@ -727,7 +745,7 @@ class ProjectInbox:
                 in_reply_to=message_id,
                 message_id=reply_id,
             )
-        return completed
+        return completed, sent_outcome
 
     def notice(self, project: str) -> str | None:
         count = len(self.new_ids(project))
@@ -1107,6 +1125,3 @@ class ProjectInbox:
             if not stat.S_ISREG(body_info.st_mode) or body_info.st_nlink != 1:
                 raise InboxError("unsafe done history body")
             os.unlink(body_name, dir_fd=bodies_fd)
-
-
-from .project_inbox_sent import SentMessageTracker

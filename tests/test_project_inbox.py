@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import multiprocessing
+import multiprocessing.resource_tracker
 import os
 import sys
 import threading
@@ -20,6 +21,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import (
+    SENT_PAGE_LIMIT,
     InboxError,
     ProjectInbox,
     ProjectInboxScanner,
@@ -63,7 +65,7 @@ def _stale_tracker_writer(
     except Exception as exc:  # noqa: BLE001 - process result is asserted by parent
         connection.send(f"{type(exc).__name__}: {exc}")
     else:
-        connection.send(tracker.health()["state"])
+        connection.send(tracker.health().health.state)
     finally:
         connection.close()
 
@@ -300,7 +302,7 @@ def test_done_reply_failure_is_retryable_and_idempotent(
     )
     session_id = "c" * 32
     assert inbox.claim(project_b.project_id, message_id, session_id) is not None
-    real_send = inbox.send
+    real_send = inbox.send_with_outcome
     attempts = 0
 
     def flaky_send(**kwargs):
@@ -310,7 +312,7 @@ def test_done_reply_failure_is_retryable_and_idempotent(
             raise OSError("injected reply publication failure")
         return real_send(**kwargs)
 
-    monkeypatch.setattr(inbox, "send", flaky_send)
+    monkeypatch.setattr(inbox, "send_with_outcome", flaky_send)
     with pytest.raises(OSError, match="injected reply"):
         inbox.done(
             project_b.project_id,
@@ -1211,8 +1213,9 @@ def test_idle_tracker_does_no_filesystem_io(
         raise AssertionError("idle sent tracker accessed the filesystem")
 
     monkeypatch.setattr(project_inbox_module.os, "listdir", unexpected_filesystem_call)
+    tracker_module = sys.modules[SentMessageTracker.__module__]
     monkeypatch.setattr(
-        project_inbox_module, "read_session_file", unexpected_filesystem_call
+        tracker_module, "read_session_file", unexpected_filesystem_call
     )
 
     assert scanner.scan_sent() == ()
@@ -1277,8 +1280,9 @@ def test_newest_record_with_lowest_id_survives_pruning(
             "2026-01-01T00:00:00.000004Z",
         )
     )
-    monkeypatch.setattr(project_inbox_module, "SENT_HISTORY_LIMIT", 2)
-    monkeypatch.setattr(project_inbox_module, "_now", lambda: next(timestamps))
+    tracker_module = sys.modules[SentMessageTracker.__module__]
+    monkeypatch.setattr(tracker_module, "SENT_HISTORY_LIMIT", 2)
+    monkeypatch.setattr(tracker_module, "_now", lambda: next(timestamps))
     tracker = SentMessageTracker(home / "sessions", "a" * 32)
 
     tracker.record("f" * 32, project_b.project_id)
@@ -1509,6 +1513,81 @@ def test_broken_projection_keeps_identity_when_spilled_body_is_undecodable(
     assert result["history_complete"] is False
 
 
+def test_broken_sent_projection_prunes_completed_row_with_both_receipts(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    session_dir = home / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    ledger = session_dir / "project-inbox-sent.json"
+    completed_id = f"{0:032x}"
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    inbox = ProjectInbox(
+        registry,
+        sessions_root=home / "sessions",
+        sent_tracker=tracker,
+    )
+    expected_ids = []
+    send_error = None
+    for index in range(513):
+        message_id = f"{index:032x}"
+        try:
+            inbox.send(
+                from_project=project_a.project_id,
+                from_session=session_id,
+                to_project=project_b.project_id,
+                kind="info",
+                title=f"message {index}",
+                body="body",
+                message_id=message_id,
+            )
+        except InboxError as exc:
+            send_error = exc
+            break
+        if message_id == completed_id:
+            tracker.mark_reported(
+                ((completed_id, "claimed"), (completed_id, "done"))
+            )
+        else:
+            expected_ids.append(message_id)
+
+    assert send_error is None
+    ledger.write_bytes(b"{")
+    projection_error = None
+    try:
+        broken_tracker = SentMessageTracker(home / "sessions", session_id)
+        broken_tracker.mark_reported(
+            ((completed_id, "claimed"), (completed_id, "done"))
+        )
+        inbox = ProjectInbox(
+            registry,
+            sessions_root=home / "sessions",
+            sent_tracker=broken_tracker,
+        )
+    except InboxError as exc:
+        projection_error = exc
+    assert projection_error is None
+    actual_ids = []
+    offset = 0
+    while True:
+        page = inbox.sent(
+            project_a.project_id,
+            session_id=session_id,
+            offset=offset,
+            limit=SENT_PAGE_LIMIT,
+        )
+        actual_ids.extend(item["id"] for item in page["messages"])
+        if page["next_offset"] is None:
+            break
+        offset = page["next_offset"]
+
+    assert page["total"] == 512
+    assert set(actual_ids) == set(expected_ids)
+    assert completed_id not in actual_ids
+    assert ledger.read_bytes() == b"{"
+
+
 def test_broken_sent_ledger_transitions_to_loaded_and_missing(tmp_path: Path) -> None:
     home, _registry, project_a, _project_b = _projects(tmp_path)
     session_id = "a" * 32
@@ -1516,7 +1595,7 @@ def test_broken_sent_ledger_transitions_to_loaded_and_missing(tmp_path: Path) ->
     ledger.parent.mkdir(parents=True)
     ledger.write_bytes(b"{")
     tracker = SentMessageTracker(home / "sessions", session_id)
-    assert "unless the repaired ledger includes their IDs" in tracker.health_text()
+    assert "unless the repaired ledger includes their IDs" in tracker.health().warning
     retained = "2" * 32
     ledger.write_text(
         json.dumps(
@@ -1534,11 +1613,11 @@ def test_broken_sent_ledger_transitions_to_loaded_and_missing(tmp_path: Path) ->
         )
     )
 
-    assert tracker.health()["state"] == "healthy"
+    assert tracker.health().health.state == "healthy"
     assert tracker.records()[0]["id"] == retained
 
     ledger.unlink()
-    assert tracker.health()["state"] == "healthy"
+    assert tracker.health().health.state == "healthy"
     assert tracker.records() == ()
 
 
@@ -1590,6 +1669,7 @@ def test_stale_loaded_process_adopts_broken_ledger_without_republishing(
             process.join(10)
         parent.close()
         process.close()
+        multiprocessing.resource_tracker._resource_tracker._stop()
 
 
 @pytest.mark.asyncio
@@ -1620,39 +1700,30 @@ async def test_inbox_activation_reads_broken_ledger_off_owner_loop(
     real_read = tracker_module.read_session_file
     read_entered = threading.Event()
     release_read = threading.Event()
-    owner_progress = threading.Event()
-    progress_before_release: list[bool] = []
+    owner_thread = threading.get_ident()
 
     def gated_read(*args, **kwargs):
+        assert threading.get_ident() != owner_thread
         read_entered.set()
         assert release_read.wait(timeout=10)
         return real_read(*args, **kwargs)
 
     monkeypatch.setattr(tracker_module, "read_session_file", gated_read)
 
-    def release_after_owner_progress() -> None:
-        assert read_entered.wait(timeout=10)
-        progressed = owner_progress.wait(timeout=5)
-        progress_before_release.append(progressed)
-        release_read.set()
-
-    releaser = threading.Thread(target=release_after_owner_progress)
-    releaser.start()
     activation = asyncio.create_task(loop.activate())
     try:
-        await asyncio.sleep(0)
-        owner_progress.set()
-        activation_error = None
-        try:
-            await asyncio.wait_for(activation, 10)
-        except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
-            activation_error = exc
-        await asyncio.to_thread(releaser.join, 10)
-        assert activation_error is None
-        assert not releaser.is_alive()
-        assert progress_before_release == [True]
+        assert await asyncio.wait_for(asyncio.to_thread(read_entered.wait), 10)
+        assert not release_read.is_set()
+        owner_progress = asyncio.Event()
+        asyncio.get_running_loop().call_soon(owner_progress.set)
+        await asyncio.wait_for(owner_progress.wait(), 10)
+        assert owner_progress.is_set()
+        assert not release_read.is_set()
+        release_read.set()
+        await asyncio.wait_for(activation, 10)
         assert loop._inbox_scanner is not None
-        assert loop._inbox_scanner.tracker.health()["state"] == "broken"
+        health = await asyncio.to_thread(loop._inbox_scanner.tracker.health)
+        assert health.health.state == "broken"
     finally:
         release_read.set()
         if not activation.done():

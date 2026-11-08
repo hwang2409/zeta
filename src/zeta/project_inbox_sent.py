@@ -1,23 +1,78 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
+import re
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .. import project_inbox as _owner
-from ..core.session_files import (
+from .core.session_files import (
     SessionError,
     atomic_publish_file,
     child_directory,
     read_session_file,
     session_root,
 )
-from ..project_inbox import InboxError, ProjectInbox
-from ..storage_format import open_writer, require_closed_variant
+from .storage_format import open_writer, require_closed_variant
+
+if TYPE_CHECKING:
+    from .project_inbox import ProjectInbox
+
+
+_ID = re.compile(r"[0-9a-f]{32}\Z")
+_SENT_TRACKING_FILE = "project-inbox-sent.json"
+_MAX_FILE_BYTES = 10 * 1024 * 1024
+SENT_HISTORY_LIMIT = 512
+
+
+def _id(value: object, field: str = "message id") -> str:
+    if not isinstance(value, str) or _ID.fullmatch(value) is None:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError(f"{field} must be a valid string")
+    return value
+
+
+def _now() -> str:
+    return (
+        dt.datetime.now(dt.UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+@dataclass(frozen=True)
+class SentLedgerHealth:
+    state: str
+    history_complete: bool
+    reason: str | None = None
+    ledger: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "state": self.state,
+            "history_complete": self.history_complete,
+        }
+        if self.reason is not None:
+            result["reason"] = self.reason
+        if self.ledger is not None:
+            result["ledger"] = self.ledger
+        return result
+
+
+@dataclass(frozen=True)
+class SentLedgerOutcome[T]:
+    result: T
+    health: SentLedgerHealth
+    warning: str
 
 
 @dataclass(frozen=True)
@@ -42,8 +97,8 @@ class SentMessageTracker:
 
     def __init__(self, sessions_root: Path, session_id: str) -> None:
         self.sessions_root = Path(sessions_root)
-        self.session_id = _owner._id(session_id, "session id")
-        self.path = self.sessions_root / self.session_id / _owner._SENT_TRACKING_FILE
+        self.session_id = _id(session_id, "session id")
+        self.path = self.sessions_root / self.session_id / _SENT_TRACKING_FILE
         self._lock = threading.RLock()
         self._deleted_ids: set[str] = set()
         self._receipts: tuple[tuple[str, str], ...] = ()
@@ -61,34 +116,31 @@ class SentMessageTracker:
 
     @property
     def broken(self) -> bool:
+        return self.health().health.state == "broken"
+
+    def health(self) -> SentLedgerOutcome[None]:
         with self._lock:
             self._refresh()
-            return isinstance(self._state, _Broken)
+            return self._outcome(None)
 
-    def health(self) -> dict[str, Any]:
-        with self._lock:
-            self._refresh()
-            if not isinstance(self._state, _Broken):
-                return {"state": "healthy", "history_complete": True}
-            return {
-                "state": "broken",
-                "reason": self._state.reason,
-                "ledger": str(self._state.path.relative_to(self.sessions_root.parent)),
-                "history_complete": False,
-            }
-
-    def health_text(self) -> str:
-        health = self.health()
-        if health["state"] != "broken":
-            return ""
-        return (
-            f"sent history is incomplete ({health['reason']}) at {health['ledger']}; messages sent or replied "
+    def _outcome[T](self, result: T) -> SentLedgerOutcome[T]:
+        if not isinstance(self._state, _Broken):
+            return SentLedgerOutcome(result, SentLedgerHealth("healthy", True), "")
+        health = SentLedgerHealth(
+            "broken",
+            False,
+            self._state.reason,
+            str(self._state.path.relative_to(self.sessions_root.parent)),
+        )
+        warning = (
+            f"sent history is incomplete ({health.reason}) at {health.ledger}; messages sent or replied "
             "to while this ledger is broken are delivered, but they are not added to "
             "the ledger. Removing it loses those messages from sent history; repairing "
             "it loses them unless the repaired ledger includes their IDs. Later "
             "claimed/done updates for a lost ID will not be discovered. The file was "
             "not changed."
         )
+        return SentLedgerOutcome(result, health, warning)
 
     def _refresh(self) -> None:
         state = self._load_state()
@@ -113,22 +165,22 @@ class SentMessageTracker:
         ):
             yield session_fd
 
-    def record(self, message_id: str, project_id: str) -> None:
-        message_id = _owner._id(message_id)
-        project_id = _owner._text(project_id, "target project")
+    def record(self, message_id: str, project_id: str) -> SentLedgerOutcome[None]:
+        message_id = _id(message_id)
+        project_id = _text(project_id, "target project")
         with self._lock:
             self._refresh()
             if isinstance(self._state, _Broken):
-                return
+                return self._outcome(None)
             existing = next((r for r in self._records if r["id"] == message_id), None)
             if existing is not None:
                 if existing["target_project"] != project_id:
-                    raise InboxError("sent-message tracking record conflicts")
-                return
+                    raise ValueError("sent-message tracking record conflicts")
+                return self._outcome(None)
             record = {
                 "id": message_id,
                 "target_project": project_id,
-                "created_at": _owner._now(),
+                "created_at": _now(),
                 "reported": [],
             }
             self._records.append(record)
@@ -136,6 +188,7 @@ class SentMessageTracker:
             self._pending.add(message_id)
             self._prune()
             self._persist((record,), self._deleted_ids)
+            return self._outcome(None)
 
     def records(self) -> tuple[dict[str, Any], ...]:
         with self._lock:
@@ -152,33 +205,58 @@ class SentMessageTracker:
         inbox: ProjectInbox,
         source_project: str,
         receipts: Iterable[tuple[str, str]],
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ) -> SentLedgerOutcome[list[dict[str, Any]]]:
         with self._lock:
             self._receipts = tuple(receipts)
             self._refresh()
-            state = self._state
             tracked = tuple(dict(r) for r in reversed(self._records))
-        if isinstance(state, _Broken):
-            return inbox._projected_broken_sent(
-                source_project, self.session_id, self._receipts
-            ), self.health()
-        return inbox._resolve_tracked_sent(
-            source_project, self.session_id, tracked
-        ), self.health()
+            if isinstance(self._state, _Broken):
+                result = self._projected_broken_sent(inbox, source_project)
+            else:
+                result = inbox._resolve_tracked_sent(
+                    source_project, self.session_id, tracked
+                )
+            return self._outcome(result)
 
-    def mark_reported(self, statuses: Iterable[tuple[str, str]]) -> None:
+    def _projected_broken_sent(
+        self, inbox: ProjectInbox, source_project: str
+    ) -> list[dict[str, Any]]:
+        receipt_map: dict[str, set[str]] = {}
+        for message_id, status in self._receipts:
+            receipt_map.setdefault(message_id, set()).add(status)
+        rows: list[dict[str, Any]] = []
+        for target in sorted(
+            inbox.registry.list_projects(), key=lambda project: project.project_id
+        ):
+            rows.extend(
+                inbox._broken_project_rows(
+                    target.project_id,
+                    source_project,
+                    self.session_id,
+                    receipt_map,
+                )
+            )
+        rows.sort(key=lambda item: (item["created_at"], item["id"]))
+        while len(rows) > SENT_HISTORY_LIMIT:
+            terminal = next(
+                (row for row in rows if "done" in row["reported"]), None
+            )
+            rows.remove(terminal or rows[0])
+        return list(reversed(rows))
+
+    def mark_reported(
+        self, statuses: Iterable[tuple[str, str]]
+    ) -> SentLedgerOutcome[None]:
         updates = {
-            (_owner._id(mid), status)
+            (_id(mid), status)
             for mid, status in statuses
             if status in {"claimed", "done"}
         }
-        if not updates:
-            return
         with self._lock:
             self._receipts = tuple(set(self._receipts).union(updates))
             self._refresh()
-            if isinstance(self._state, _Broken):
-                return
+            if isinstance(self._state, _Broken) or not updates:
+                return self._outcome(None)
             by_id = {r["id"]: r for r in self._records}
             changed = []
             for mid, status in updates:
@@ -190,17 +268,20 @@ class SentMessageTracker:
                         self._pending.discard(mid)
             if changed:
                 self._persist(tuple(changed), ())
+            return self._outcome(None)
 
-    def reconcile(self, receipts: Iterable[tuple[str, str]]) -> None:
+    def reconcile(
+        self, receipts: Iterable[tuple[str, str]]
+    ) -> SentLedgerOutcome[None]:
         self._receipts = tuple(receipts)
-        self.mark_reported(self._receipts)
+        return self.mark_reported(self._receipts)
 
     @staticmethod
     def _chronology(record: dict[str, Any]) -> tuple[str, str]:
         return record["created_at"], record["id"]
 
     def _prune(self) -> None:
-        while len(self._records) > _owner.SENT_HISTORY_LIMIT:
+        while len(self._records) > SENT_HISTORY_LIMIT:
             terminal = next((r for r in self._records if "done" in r["reported"]), None)
             removed = terminal or self._records[0]
             self._records.remove(removed)
@@ -211,12 +292,12 @@ class SentMessageTracker:
         path = self.path
         try:
             with self._session_directory(create=False) as session_fd:
-                payload = read_session_file(session_fd, _owner._SENT_TRACKING_FILE)
+                payload = read_session_file(session_fd, _SENT_TRACKING_FILE)
         except FileNotFoundError:
             return _Missing(path)
         except (OSError, SessionError, ValueError):
             return _Broken(path, "unsafe_or_unavailable")
-        if len(payload) > _owner._MAX_FILE_BYTES:
+        if len(payload) > _MAX_FILE_BYTES:
             return _Broken(path, "too_large")
         try:
             value = json.loads(payload)
@@ -230,11 +311,11 @@ class SentMessageTracker:
         try:
             records = value.get("records")
             if not isinstance(records, list):
-                raise InboxError("invalid")
+                raise TypeError("invalid")
             validated = [self._validate_record(r) for r in records]
             if len({r["id"] for r in validated}) != len(validated):
-                raise InboxError("duplicate")
-        except (InboxError, AttributeError, TypeError):
+                raise ValueError("duplicate")
+        except (ValueError, AttributeError, TypeError):
             return _Broken(path, "invalid_records")
         validated.sort(key=self._chronology)
         return _Loaded(path, tuple(validated))
@@ -242,13 +323,13 @@ class SentMessageTracker:
     @staticmethod
     def _validate_record(value: object) -> dict[str, Any]:
         if not isinstance(value, dict):
-            raise InboxError("invalid sent-message tracking record")
+            raise TypeError("invalid sent-message tracking record")
         mid, target, created, reported = (
             value.get(k) for k in ("id", "target_project", "created_at", "reported")
         )
         if (
             not isinstance(mid, str)
-            or _owner._ID.fullmatch(mid) is None
+            or _ID.fullmatch(mid) is None
             or not isinstance(target, str)
             or not target
             or not isinstance(created, str)
@@ -256,12 +337,12 @@ class SentMessageTracker:
             or any(not isinstance(x, str) for x in reported)
             or len(set(reported)) != len(reported)
         ):
-            raise InboxError("invalid sent-message tracking record")
+            raise ValueError("invalid sent-message tracking record")
         try:
             for status in reported:
                 require_closed_variant("sent_message_ledger.reported_status", status)
         except ValueError as exc:
-            raise InboxError("invalid sent-message tracking record") from exc
+            raise ValueError("invalid sent-message tracking record") from exc
         return {
             "id": mid,
             "target_project": target,
@@ -289,7 +370,7 @@ class SentMessageTracker:
             ):
                 lease.publish_records(
                     session_fd,
-                    _owner._SENT_TRACKING_FILE,
+                    _SENT_TRACKING_FILE,
                     upserts,
                     identity="id",
                     delete_ids=delete_ids,
@@ -307,4 +388,4 @@ class SentMessageTracker:
             self._pending = set()
             self._deleted_ids.clear()
         except (OSError, SessionError) as exc:
-            raise InboxError("sent-message tracking is unsafe or unavailable") from exc
+            raise ValueError("sent-message tracking is unsafe or unavailable") from exc
