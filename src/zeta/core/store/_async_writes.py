@@ -993,6 +993,7 @@ class AsyncDurableWritesMixin:
         cancelled = False
         while True:
             try:
+                # test-contract: durability submitted store work must finish
                 return await asyncio.shield(worker), cancelled
             except asyncio.CancelledError:
                 cancelled = True
