@@ -69,7 +69,6 @@ async def test_path_complete_uses_tui_projection_over_real_unix_transport(
     reader, writer = await _connect(server)
     try:
         hello = await _hello(reader, writer, features=["path_completion"])
-        assert "path_completion" in hello["result"]["capabilities"]["features"]
         created = (await _request(reader, writer, "new", "new_session"))[-1]
         session_id = created["result"]["session"]["session_id"]
         before_cursor = "😀 before @😀f"
@@ -85,8 +84,10 @@ async def test_path_complete_uses_tui_projection_over_real_unix_transport(
                 },
             )
         )[-1]
+        assert response.get("result") is not None, response
         entries = response["result"]["entries"]
 
+        assert "path_completion" in hello["result"]["capabilities"]["features"]
         assert response["result"]["truncated"] is False
         assert entries == [
             {
@@ -189,25 +190,31 @@ async def test_path_complete_uses_tui_projection_over_real_unix_transport(
 async def test_path_complete_negotiation_validation_and_observer_access(
     tmp_path: Path,
 ) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    server = _server(tmp_path, workspace)
+    negotiated_root = tmp_path / "negotiated"
+    workspace = negotiated_root / "workspace"
+    workspace.mkdir(parents=True)
+    server = _server(negotiated_root, workspace)
     reader, writer = await _connect(server)
     observer_reader = observer_writer = None
     try:
-        await _hello(reader, writer, features=["serve_observers"])
+        hello = await _hello(
+            reader,
+            writer,
+            features=["serve_observers", "path_completion"],
+        )
         created = (await _request(reader, writer, "new", "new_session"))[-1]
         session_id = created["result"]["session"]["session_id"]
-        unnegotiated = (
+        completed = (
             await _request(
                 reader,
                 writer,
-                "missing-feature",
+                "complete",
                 "path_complete",
-                {"session_id": session_id, "text_before_cursor": "@"},
+                {"session_id": session_id, "text_before_cursor": "plain text"},
             )
         )[-1]
-        assert unnegotiated["error"]["code"] == -32601
+        assert completed.get("result") == {"entries": [], "truncated": False}, completed
+        assert "path_completion" in hello["result"]["capabilities"]["features"]
 
         observer_reader, observer_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
@@ -235,6 +242,28 @@ async def test_path_complete_negotiation_validation_and_observer_access(
             await await_or_fail(
                 observer_writer.wait_closed(), what="observer writer close"
             )
+        await close_serve(server, writer)
+
+    unnegotiated_root = tmp_path / "unnegotiated"
+    unnegotiated_workspace = unnegotiated_root / "workspace"
+    unnegotiated_workspace.mkdir(parents=True)
+    server = _server(unnegotiated_root, unnegotiated_workspace)
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer)
+        created = (await _request(reader, writer, "new", "new_session"))[-1]
+        session_id = created["result"]["session"]["session_id"]
+        unnegotiated = (
+            await _request(
+                reader,
+                writer,
+                "missing-feature",
+                "path_complete",
+                {"session_id": session_id, "text_before_cursor": "@"},
+            )
+        )[-1]
+        assert unnegotiated["error"]["code"] == -32601
+    finally:
         await close_serve(server, writer)
 
 
@@ -269,13 +298,23 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
             writer,
             features=["path_completion", "serve_observers"],
         )
+        created = (await _request(reader, writer, "new", "new_session"))[-1]
+        session_id = created["result"]["session"]["session_id"]
+        probe = (
+            await _request(
+                reader,
+                writer,
+                "probe-path",
+                "path_complete",
+                {"session_id": session_id, "text_before_cursor": "plain text"},
+            )
+        )[-1]
+        assert probe.get("result") == {"entries": [], "truncated": False}, probe
         assert "path_completion" in hello["result"]["capabilities"]["features"]
         path_module = importlib.import_module("zeta.core.path_completion")
         original_scandir = path_module.os.scandir
         # test-contract: seam blocks the actual synchronous path scanner thread.
         monkeypatch.setattr(path_module.os, "scandir", gated_scandir)
-        created = (await _request(reader, writer, "new", "new_session"))[-1]
-        session_id = created["result"]["session"]["session_id"]
         observer_reader, observer_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
         )
