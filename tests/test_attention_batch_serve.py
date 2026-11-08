@@ -65,7 +65,7 @@ async def test_serve_decisions_lists_broken_record_without_body(tmp_path: Path) 
         assert "invalid_json" in response
         assert "secret request body" not in response
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
