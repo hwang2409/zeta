@@ -811,7 +811,7 @@ class ConversationLogMixin:
             if self.on_entries_installed is not None
             else ()
         )
-        self._set_observer_log_stat(g0, complete_end, raw)
+        self._set_observer_log_stat(g0, len(candidate), raw)
         self._publish_entries_installed(delta)
 
     def _check_observer_source(
