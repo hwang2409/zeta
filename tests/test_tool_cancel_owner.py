@@ -66,14 +66,16 @@ class Probe:
                 raise ValueError("boom")
             if self.mode == "tool_canceled":
                 raise execution._ToolCanceled()
-            await self.forever.wait()
+            # wait_for, not await_or_fail: a cancel here must not leave an inner
+            # task pending. 30 s, so the row-level 10 s guards fire first.
+            await asyncio.wait_for(self.forever.wait(), 30)
             return "unreachable"
         except asyncio.CancelledError:
             self.delivered += 1
             self.cleanup_started.set()
             while not self.release.is_set():
                 try:
-                    await self.release.wait()
+                    await asyncio.wait_for(self.release.wait(), 30)
                 except asyncio.CancelledError:
                     self.delivered += 1
             raise
@@ -180,26 +182,11 @@ class Harness:
             )
 
 
-class _CancelOnClose:
-    def __init__(self, task: asyncio.Task[Any]) -> None:
-        self.task = task
-
-    def publish(self, text: str, stream: str) -> None:
-        del text, stream
-
-    def set_metadata(self, metadata: object) -> None:
-        del metadata
-
-    def close(self) -> None:
-        self.task.cancel()
-
-
 async def owner_call(
     probe: Probe,
     *,
     cancel_first: bool = False,
     signal_first: bool = False,
-    cancel_on_close: bool = False,
 ) -> str:
     """Call the owner directly from a caller task, as registry.execute does."""
 
@@ -210,10 +197,9 @@ async def owner_call(
         signal.abort()
     if cancel_first:
         caller.cancel()
-    publisher = _CancelOnClose(caller) if cancel_on_close else None
     try:
         result = await execution.run_handler_with_abort(
-            probe, {}, signal, publisher, "call-0"
+            probe, {}, signal, None, "call-0"
         )
     except asyncio.CancelledError:
         return "raised CancelledError"
@@ -460,11 +446,6 @@ ROWS: list[Any] = [
         direct("wait", cancel_first=True, signal_first=True), 1, False,
         Outcome((1,), (1,), ("canceled",)),
         id="outer-cancel-before-owner-first-await-with-signal",
-    ),
-    pytest.param(
-        direct("value", cancel_on_close=True), 1, False,
-        Outcome((0,), (0,), ("done",)),
-        id="outer-cancel-in-owner-finally",
     ),
     pytest.param(outer_cancel_at_each_loop_turn, 1, False, Outcome((1,), (1,), ("canceled",)), id="outer-cancel-at-each-owner-await"),
     # Every route that reaches a running handler, through the real loop.

@@ -221,7 +221,7 @@ async def run_handler_with_abort(
     HANDLER_CANCEL_DRAIN_SECONDS to finish before it is detached.
     """
     handler_task = asyncio.create_task(
-        invoke_handler(handler, arguments, execution_signal, stream_publisher)
+        _invoke_then_close(handler, arguments, execution_signal, stream_publisher)
     )
     signal_wait = asyncio.create_task(execution_signal.wait())
     clock = asyncio.get_running_loop()
@@ -255,15 +255,27 @@ async def run_handler_with_abort(
                 cancel_sent = True
                 deadline = clock.time() + HANDLER_CANCEL_DRAIN_SECONDS
     finally:
+        # Also closes after a detach; the handler task closes on its own end.
         if stream_publisher is not None:
             stream_publisher.close()
         signal_wait.cancel()
-        while not signal_wait.done():
-            try:
-                await asyncio.wait({signal_wait})
-            except asyncio.CancelledError:
-                pass
     return _handler_result(handler_task, execution_signal, tool_call_id)
+
+
+async def _invoke_then_close(
+    handler: ToolHandler,
+    arguments: dict[str, Any],
+    execution_signal: AbortSignal,
+    stream_publisher: ToolStreamPublisher | None,
+) -> ToolHandlerResult:
+    # Output stops when the handler returns, not one loop turn later in the owner.
+    try:
+        return await invoke_handler(
+            handler, arguments, execution_signal, stream_publisher
+        )
+    finally:
+        if stream_publisher is not None:
+            stream_publisher.close()
 
 
 def _handler_result(
