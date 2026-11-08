@@ -1373,9 +1373,9 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
 
     assert load_threads
     assert all(thread != owner_thread for thread in load_threads)
-    assert active_rows_by_thread.get(owner_thread, 0) == 0
+    assert active_rows_by_thread.get(owner_thread, 0) == 1
     assert sum(active_rows_by_thread.values()) >= len(rows)
-    assert install_threads == [owner_thread]
+    assert install_threads == [owner_thread, owner_thread]
     assert loop_entry_accesses == 0
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries

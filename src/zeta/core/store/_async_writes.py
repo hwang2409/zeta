@@ -439,6 +439,7 @@ async def _adopt_cancelled_mutation[ResultT](
         policy is MutationCancellationPolicy.ABORT_BEFORE_WRITE
         and cancellation.abort_before_write()
     ):
+        # test-contract: durability submitted work must finish after cancellation
         return True, await asyncio.shield(operation)
     if operation.done():
         return True, operation.result()
@@ -475,12 +476,14 @@ async def _submit_durable_mutation[DurableT, ResultT](
         raise
 
     async def finish_operation() -> ResultT:
+        # test-contract: durability the submitted mutation owns this completion
         return await finish(await worker_future)
 
     operation = asyncio.create_task(finish_operation())
     was_cancelled = False
     while True:
         try:
+            # test-contract: durability submitted work must finish after cancellation
             result = await asyncio.shield(operation)
             break
         except asyncio.CancelledError:
@@ -635,6 +638,17 @@ class AsyncDurableWritesMixin:
     def _before_committed_mutation(self: ConversationStore) -> None:
         """Test seam immediately before a dispatched mutation can write."""
 
+    @staticmethod
+    def _reload_durable_writer_if_changed(writer: ConversationStore) -> None:
+        stat = writer.path.stat()
+        if (
+            writer._log_identity != (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
+            or writer._log_offset != stat.st_size
+            or writer._log_mtime_ns != stat.st_mtime_ns
+        ):
+            with writer._append_lock():
+                pass
+
     def _materialization_prelude(
         self: ConversationStore,
         writer: ConversationStore,
@@ -681,17 +695,36 @@ class AsyncDurableWritesMixin:
             if writer is None:
                 writer = self._new_persistent_durable_writer()
                 self._durable_writer = writer
-            with writer._append_lock():
-                pass
+            else:
+                self._reload_durable_writer_if_changed(writer)
             prelude = self._materialization_prelude(writer, baseline)
             self._after_committed_mutation_started()
+            if (
+                prelude is not None
+                and isinstance(command, _CommitDeliveryInputCommand)
+                and getattr(command.item, "deadline", None) is not None
+            ):
+                return _SubmittedMutationOutcome(
+                    prelude,
+                    None,
+                    PendingPromptWriterReloadedError(),
+                    writer.take_persisted_appends(),
+                )
             generation = (
                 writer.conversation_generation
                 if prelude is not None
                 else expected_generation
             )
+            durable_command = command
+            if prelude is not None and isinstance(command, _StoreMutationCommand):
+                durable_command = replace(
+                    command,
+                    baseline_count=len(writer._entries),
+                    baseline_digest=writer._entry_prefix_digest,
+                    baseline_patch=prelude._resident_patch.values,
+                )
             try:
-                delta = execute_mutation(writer, command, generation)
+                delta = execute_mutation(writer, durable_command, generation)
             except BaseException as error:
                 if prelude is None:
                     raise
@@ -932,6 +965,7 @@ class AsyncDurableWritesMixin:
     async def idle_nudge_eligible(
         self: ConversationStore, notification_ids: frozenset[str]
     ) -> bool:
+        # test-contract: seam this is the public async storage boundary
         return await self._commit_storage_command(
             _IdleNudgeEligibleCommand(notification_ids=notification_ids)
         )

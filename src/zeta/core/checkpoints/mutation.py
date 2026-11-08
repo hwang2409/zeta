@@ -236,6 +236,7 @@ async def _acquire_transient_target(path: Path) -> object:
             waiter: asyncio.Future[None] = loop.create_future()
             reservation.waiters.append((loop, waiter))
         _reservation_waiting(path)
+        # test-contract: durability the caller owns the reservation wait deadline
         await asyncio.shield(waiter)
 
 

@@ -173,8 +173,9 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
             self, command, expected_generation, cancelled_before_write
         )
         message = (
-            result[0].result.notification_message
+            result.delta.result.notification_message
             if type(command).__name__ == "_StageDeliveryRequestCommand"
+            and result.delta is not None
             else None
         )
         if (
@@ -264,8 +265,9 @@ async def test_persisted_notification_retry_attaches_new_context_once(
             self, command, expected_generation, cancelled_before_write
         )
         message = (
-            result[0].result.notification_message
+            result.delta.result.notification_message
             if type(command).__name__ == "_StageDeliveryRequestCommand"
+            and result.delta is not None
             else None
         )
         if (
