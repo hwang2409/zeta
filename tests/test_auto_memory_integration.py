@@ -31,6 +31,7 @@ from zeta.protocol.types import (
     ToolSchema,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.providers.factory import build_backend
 from zeta.runtime.composition import RuntimeComposition, compose_runtime
 from zeta.server.control import ServeControl
@@ -44,6 +45,7 @@ class _MemoryScriptBackend(CompletionBackend):
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
@@ -86,6 +88,7 @@ class _LoginRequiredBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls = 0
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
@@ -96,6 +99,7 @@ class _LoginRequiredBackend(CompletionBackend):
 
 
 class _UnusedBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
