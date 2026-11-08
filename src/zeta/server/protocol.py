@@ -64,6 +64,7 @@ class ErrorDescriptor(Enum):
     CONTROLLER_OUTPUT_OVERFLOW = (-32011, None, "controller output overflow")
     OBSERVER_OUTPUT_OVERFLOW = (-32011, None, "observer output overflow")
     CONTENT_NOT_FOUND = (-32012, "content_not_found", "content handle was not found")
+    CHILD_RUN_NOT_FOUND = (-32012, "child_run_not_found", "child run was not found")
     TRANSCRIPT_REPAIR_REQUIRES_UPGRADE = (
         -32013,
         "transcript_repair_requires_upgrade",
@@ -232,6 +233,7 @@ FEATURES = (
     "session_history_backward",
     "session_host_commands",
     "session_history_fidelity",
+    "child_run_history",
     "served_turn_end",
     "content_read",
     "session_grants",
@@ -263,6 +265,7 @@ class MethodDescriptor(Enum):
     REPAIR_TRANSCRIPT = ("repair_transcript", "1.1", None, Access.SESSION_MUTATION)
     SESSION_TREE = ("session_tree", "1.1", None, Access.READ)
     SESSION_HISTORY = ("session_history", "1.1", None, Access.READ)
+    CHILD_RUN_HISTORY = ("child_run_history", "1.1", "child_run_history", Access.READ)
     CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)
     SWITCH_BRANCH = ("switch_branch", "1.1", None, Access.SESSION_MUTATION)
     FORK_MESSAGE = ("fork_message", "1.1", None, Access.SESSION_MUTATION)

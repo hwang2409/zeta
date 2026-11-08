@@ -155,6 +155,7 @@ feature. Observer connections receive only methods with `read` access.
 | `repair_transcript` | `1.1` | `none` | `session_mutation` |
 | `session_tree` | `1.1` | `none` | `read` |
 | `session_history` | `1.1` | `none` | `read` |
+| `child_run_history` | `1.1` | `child_run_history` | `read` |
 | `content_read` | `1.1` | `content_read` | `read` |
 | `switch_branch` | `1.1` | `none` | `session_mutation` |
 | `fork_message` | `1.1` | `none` | `session_mutation` |
@@ -1025,6 +1026,7 @@ Error descriptors are:
 | `controller_output_overflow` | `-32011` | none | controller output overflow |
 | `observer_output_overflow` | `-32011` | none | observer output overflow |
 | `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `child_run_not_found` | `-32012` | `child_run_not_found` | child run was not found |
 | `transcript_repair_requires_upgrade` | `-32013` | `transcript_repair_requires_upgrade` | transcript repair requires the stored-format upgrade |
 | `corrupt_transcript` | `-32000` | `corrupt_transcript` | transcript is corrupt or uses an unsupported format |
 | `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
@@ -1305,6 +1307,7 @@ error code and message. Provider status and origin remain internal.
 - `switch_branch`: takes `head_id`, an existing leaf. Calls `switch_to_branch`
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
+- `child_run_history`: takes `session_id` for the active top-level session and a durable child `run_id`. It returns the same backward history projection as `session_history`: `messages`, `next_before`, and `history_validator`. Omit `before` or set it to null for the newest page; continuations supply `before` and the returned validator. The method requires the negotiated `child_run_history` feature, is available to observers, and returns `-32012` with `child_run_not_found` for a valid but absent child, `-32602` for malformed ids or parameters, and `-32009` with `stale_history_snapshot` for a changed snapshot.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns
@@ -1584,6 +1587,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
+| `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 

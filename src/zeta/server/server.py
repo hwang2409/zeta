@@ -644,6 +644,9 @@ class _Client:
             return await self.logins.request(method, params)
         if descriptor in _ERGONOMICS_METHODS:
             return await self._ergonomics(descriptor, params)
+        if descriptor is MethodDescriptor.CHILD_RUN_HISTORY:
+            assert self.server.connections is not None
+            return await self.server.connections.read_child_run_history(self, params)
         if descriptor is MethodDescriptor.PING:
             if "ping" not in self.features:
                 raise ProtocolError(
