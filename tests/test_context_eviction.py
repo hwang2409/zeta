@@ -3418,9 +3418,6 @@ async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path)
     assert [message.to_dict() for message in replayed.messages] == [
         message.to_dict() for message in assembled[0].messages
     ]
-    assert [message.to_dict() for message in replayed.messages] == [
-        message.to_dict() for message in assembled[0].messages
-    ]
     assert len([entry for entry in reopened.replay() if entry.type == "compaction"]) == 1
 
 
