@@ -1034,6 +1034,7 @@ async def run_agent_tool(
             return False
         if terminal_fence is not None and not await terminal_fence.cancel():
             return False
+        child_store.mark_agent_canceled(tool_call.id)
         child_canceled = True
         return True
 
@@ -1050,7 +1051,6 @@ async def run_agent_tool(
             child_task.cancel()
         await loop._background_owner.wait_for_descendant_watchers(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
-        child_store.mark_agent_canceled(tool_call.id)
 
     def request_child_cancel() -> CancellationRequest:
         """Start durable cancellation and tree-owned cleanup."""

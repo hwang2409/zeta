@@ -1580,6 +1580,107 @@ class IdleParentRoutingBackend(CompletionBackend):
         )
 
 
+class CancelIdleTreeBackend(CompletionBackend):
+    def __init__(self, *, with_grandchild: bool) -> None:
+        self.with_grandchild = with_grandchild
+        self.calls = {"root": 0, "child": 0, "grandchild": 0}
+        self.child_idle = asyncio.Event()
+        self.question_seen = asyncio.Event()
+        self.follow_up_seen = asyncio.Event()
+
+    @staticmethod
+    def _actor(messages: Sequence[Message]) -> str:
+        prompts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        if "grandchild prompt" in prompts:
+            return "grandchild"
+        if "child prompt" in prompts:
+            return "child"
+        return "root"
+
+    @staticmethod
+    def _start_agent(call_id: str, prompt: str, description: str) -> ToolUseContent:
+        return ToolUseContent(
+            ToolCall(
+                call_id,
+                "agent",
+                {
+                    "prompt": prompt,
+                    "description": description,
+                    "agent_type": "run",
+                    "background": True,
+                },
+            )
+        )
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        actor = self._actor(messages)
+        self.calls[actor] += 1
+        call = self.calls[actor]
+        blocks: list[TextContent | ToolUseContent]
+        if actor == "root":
+            blocks = (
+                [self._start_agent("start-child", "child prompt", "child")]
+                if call == 1
+                else []
+            )
+        elif actor == "child":
+            if self.with_grandchild and call == 1:
+                blocks = [
+                    self._start_agent(
+                        "start-grandchild", "grandchild prompt", "grandchild"
+                    )
+                ]
+            else:
+                if any(
+                    isinstance(block, TextContent) and block.text == "wake child"
+                    for message in messages
+                    if message.role is MessageRole.USER
+                    for block in message.content
+                ):
+                    self.follow_up_seen.set()
+                if any(
+                    message.metadata.get("zeta_event") == "agent_notifications"
+                    and any(
+                        isinstance(block, TextContent)
+                        and "grandchild needs parent" in block.text
+                        for block in message.content
+                    )
+                    for message in messages
+                ):
+                    self.question_seen.set()
+                blocks = [TextContent("WAIT")]
+        elif call == 1:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "ask-child",
+                        "ask_parent",
+                        {"question": "grandchild needs parent"},
+                    )
+                )
+            ]
+        else:
+            blocks = [TextContent("WAIT")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class ForegroundNestedBackgroundBackend(CompletionBackend):
     def __init__(self, *, background_child: bool = False) -> None:
         self.background_child = background_child
@@ -17587,6 +17688,116 @@ def test_child_idle_then_terminal_receipt_is_appended_and_delivered_once(
         "child_idle",
         "agent_completion",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("with_grandchild", "wake_before_cancel"),
+    [(False, False), (True, False), (True, True)],
+    ids=["no-grandchild", "live-grandchild", "after-agent-send"],
+)
+async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_grandchild: bool,
+    wake_before_cancel: bool,
+) -> None:
+    backend = CancelIdleTreeBackend(with_grandchild=with_grandchild)
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    transition_idle = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        transition_idle(child_store)
+        lifecycle = child_store.agent_lifecycle() or {}
+        handle = lifecycle.get("handle")
+        if isinstance(handle, str) and handle.count(":") == 1:
+            backend.child_idle.set()
+
+    # test-contract: seam observes the exact idle transition without a sleep
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        max_agent_depth=3,
+    )
+    loop.explicit_finish = True
+    child_store: ConversationStore | None = None
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_idle.wait(), 10)
+        child_handle = _run_handle_from_receipt(store)
+        child_path = Path(store.agent_children()[child_handle]["child_session_path"])
+        grandchild_handle: str | None = None
+        grandchild_path: Path | None = None
+        if with_grandchild:
+            await asyncio.wait_for(backend.question_seen.wait(), 10)
+            child_store = ConversationStore(
+                child_path.parent, session_id=child_path.name, _read_only=True
+            )
+            grandchild_handle = next(iter(child_store.agent_children()))
+            assert grandchild_handle.startswith(f"{child_handle}:")
+            grandchild_path = Path(
+                child_store.agent_children()[grandchild_handle]["child_session_path"]
+            )
+            assert any(
+                entry.type == "notification"
+                and entry.data.get("kind") == "child_question"
+                and entry.data.get("status") == "pending"
+                for entry in child_store.replay()
+            )
+        if child_store is not None:
+            child_store.close()
+            child_store = None
+
+        if wake_before_cancel:
+            backend.child_idle.clear()
+            sent = await loop.tool_registry.execute(
+                ToolCall(
+                    "wake-before-cancel",
+                    "agent_send",
+                    {"child_instance_id": child_handle, "message": "wake child"},
+                )
+            )
+            assert sent["isError"] is False
+            await asyncio.wait_for(backend.follow_up_seen.wait(), 10)
+            await asyncio.wait_for(backend.child_idle.wait(), 10)
+
+        canceled = await loop.tool_registry.execute(
+            ToolCall("cancel-idle-child", "agent_cancel", {"handle": child_handle})
+        )
+        assert canceled["structuredContent"]["status"] == "cancellation_confirmed"
+        status = await loop.tool_registry.execute(
+            ToolCall("canceled-idle-status", "agent_status", {"handle": child_handle})
+        )
+        child_status = status["structuredContent"]["children"][0]
+        assert child_status["state"] == "canceled"
+        assert child_status["finished_at"] is not None
+
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        if grandchild_path is not None:
+            grandchild_store = ConversationStore(
+                grandchild_path.parent,
+                session_id=grandchild_path.name,
+                _read_only=True,
+            )
+            try:
+                descendant = grandchild_store.agent_lifecycle() or {}
+                assert descendant["state"] == "canceled"
+                assert descendant["finished_at"] is not None
+            finally:
+                grandchild_store.close()
+    finally:
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        if child_store is not None:
+            child_store.close()
+        store.close()
 
 
 @pytest.mark.asyncio
