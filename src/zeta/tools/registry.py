@@ -72,6 +72,7 @@ from ._action_metadata import (
 from ._action_metadata import (
     resolve_approval_rule as resolve_registered_approval_rule,
 )
+from ._live_config import _LiveConfigRegistryMixin
 from ._results import (
     _apply_error_governance,
     _BoundedText,  # noqa: F401 - preserve the registry import
@@ -208,7 +209,7 @@ def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
 
 
-class ToolRegistry:
+class ToolRegistry(_LiveConfigRegistryMixin):
     """One provider-neutral registry for built-in and custom tools."""
 
     def __init__(
@@ -353,17 +354,6 @@ class ToolRegistry:
         if register_builtin:
             _register_discovered_tools(self)
 
-    def set_live_config_refresher(
-        self, refresher: Callable[[bool], Awaitable[None]]
-    ) -> None:
-        """Let tools request one live catalog refresh."""
-
-        self._live_config_refresher = refresher
-
-    async def refresh_live_config(self, *, force: bool = False) -> None:
-        if self._live_config_refresher is not None:
-            await self._live_config_refresher(force)
-
     @property
     def tool_allow(self) -> tuple[str, ...] | None:
         return self.tool_policy.allow
@@ -452,16 +442,6 @@ class ToolRegistry:
             else:
                 allowed.append(copy.deepcopy(schema))
         return allowed
-
-    def definition_reference(self, name: str) -> ToolDefinition | None:
-        return self._tools.get(name)
-
-    def commit_prepared_definition(
-        self, base: ToolDefinition | None, replacement: ToolDefinition
-    ) -> None:
-        if self._tools.get(replacement.name) is not base:
-            raise RuntimeError(f"stale prepared tool definition: {replacement.name}")
-        self._tools[replacement.name] = replacement
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
