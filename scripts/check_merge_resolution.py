@@ -6,6 +6,7 @@ import argparse
 import ast
 import difflib
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -1208,6 +1209,71 @@ def _filter_findings(findings: list[Item], text: str) -> list[Item]:
     ]
 
 
+def _borrow_skip_reason(pull: dict, author: str) -> str | None:
+    head_repo = (pull.get("head") or {}).get("repo") or {}
+    base = pull.get("base") or {}
+    if head_repo.get("full_name") != (base.get("repo") or {}).get("full_name"):
+        return "fork head"
+    if base.get("ref") != "main":
+        return f"base {base.get('ref')}"
+    if (pull.get("user") or {}).get("login") != author:
+        return "other author"
+    # An abandoned PR's body is no longer a reviewed statement.
+    if pull.get("state") == "closed" and not pull.get("merged_at"):
+        return "closed without merge"
+    return None
+
+
+def _matching_lines(body: str, findings: list[Item], remaining: list[Item]) -> list[str]:
+    return sorted(
+        {line for line in body.splitlines() if any(marker(line, item, findings) for item in remaining)}
+    )
+
+
+def _candidate_lines(
+    data: dict, findings: list[Item], remaining: list[Item]
+) -> tuple[dict[int, list[str]], list[str]]:
+    found: dict[int, list[str]] = {}
+    skipped = []
+    # The PR being checked always contains its own merges; its body is already applied.
+    for pull in (pull for pull in data["pulls"] if pull.get("number") != data["pr"]):
+        skip = _borrow_skip_reason(pull, data["author"])
+        if skip:
+            skipped.append(f"#{pull.get('number')} ({skip})")
+            continue
+        lines = _matching_lines(pull.get("body") or "", findings, remaining)
+        if lines:
+            found[pull["number"]] = lines
+    return found, skipped
+
+
+def borrowed_overrides(
+    lookup: str, commit: str, findings: list[Item], remaining: list[Item]
+) -> tuple[str, str]:
+    """Return override lines borrowed from the PR that introduced this merge, and why.
+
+    A stacked PR contains its base PR's merge commits; the base PR body already
+    explains them. Any doubt returns no text, so the check is never weaker.
+    """
+    try:
+        data = json.loads(lookup)
+        if data.get("commit") != commit:
+            return "", f"lookup is for commit {data.get('commit')}, not {commit}"
+        pulls = data.get("pulls")
+        if data.get("error") or not isinstance(pulls, list):
+            message = pulls.get("message") if isinstance(pulls, dict) else pulls
+            return "", f"PR lookup failed: {data.get('error')}: {message}"
+        found, skipped = _candidate_lines(data, findings, remaining)
+    except (ValueError, AttributeError, KeyError, TypeError) as exc:
+        return "", f"PR lookup is unreadable: {exc!r}"
+    numbers = ", ".join(f"#{number}" for number in sorted(found))
+    if len({tuple(lines) for lines in found.values()}) > 1:
+        return "", f"conflicting override lines in {numbers}"
+    if not found:
+        return "", "no PR with a matching override line; skipped: " + (", ".join(skipped) or "none")
+    return "\n".join(next(iter(found.values()))), f"override lines from {numbers}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("commit", nargs="?", default="HEAD")
@@ -1217,6 +1283,11 @@ def main() -> int:
     )
     parser.add_argument("--allow", type=argparse.FileType("r"))
     parser.add_argument("--pr-body-file", type=argparse.FileType("r"))
+    parser.add_argument(
+        "--borrow-file",
+        type=argparse.FileType("r"),
+        help="JSON {commit, pr, author, pulls: <GET commits/<sha>/pulls>} for stacked PRs",
+    )
     parser.add_argument(
         "--final", help="revision whose final tree contains later fixes and moves"
     )
@@ -1270,7 +1341,13 @@ def main() -> int:
     if final_revision and findings:
         final_items, final_sources, final_error_path, final_lines = _final_index(final_revision)
         findings = _report_final_moves(findings, final_items, final_lines)
-    findings = _filter_findings(findings, text)
+    all_findings = findings
+    findings = _filter_findings(all_findings, text)
+    if findings and args.borrow_file:
+        full = git("rev-parse", f"{commit}^{{commit}}").strip()
+        extra, reason = borrowed_overrides(args.borrow_file.read(), full, all_findings, findings)
+        print(f"{'borrowed' if extra else 'did not borrow'} overrides: {reason}")
+        findings = _filter_findings(all_findings, f"{text}\n{extra}")
     if findings:
         for finding in findings:
             _render_finding(finding, main_items, branch_items, merge_items)
