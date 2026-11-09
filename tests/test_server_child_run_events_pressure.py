@@ -494,3 +494,76 @@ async def test_64_maximal_lifecycle_frames_fit_the_scope_byte_cap(
         row = events[0]["child"]
         assert len(json.dumps(row["description"], ensure_ascii=False).encode()) == 4_000
         assert len(json.dumps(row["current_step"], ensure_ascii=False).encode()) == 4_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize(
+    ("charges", "victim"),
+    (
+        pytest.param(((500, 500), (500, 500)), 0, id="equal-earliest-created"),
+        pytest.param(((1000,), (500, 500)), 1, id="equal-bytes-more-records"),
+        pytest.param(((500, 500), (1001,)), 1, id="more-bytes-fewer-records"),
+    ),
+)
+async def test_global_pressure_evicts_by_bytes_then_records_then_creation_order(
+    tmp_path: Path,
+    transport: Transport,
+    monkeypatch: pytest.MonkeyPatch,
+    charges: tuple[tuple[int, ...], tuple[int, ...]],
+    victim: int,
+) -> None:
+    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
+        assert server.connections is not None
+        replay = server.connections.replay
+        runs = [f"{session_id}:1", f"{session_id}:2"]
+        for run_id in runs:
+            _start_child(server, stores, run_id)
+        await _lifecycle_applied(server)
+        joined = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})
+        stream_id = joined["result"]["replay"]["stream_id"]
+        arrivals = [asyncio.Event() for _ in runs]
+        release = asyncio.Event()
+        original = server.connections.run_read
+
+        async def gated(connection: Any, read: Any, *, session_id: str | None = None) -> Any:
+            next(event for event in arrivals if not event.is_set()).set()
+            await await_or_fail(release.wait(), what="release child join reads")
+            return await original(connection, read, session_id=session_id)
+
+        # test-contract: seam hold both real child join reads while pressure is applied
+        monkeypatch.setattr(server.connections, "run_read", gated)
+        observers = [await connect_replay(server, transport) for _ in runs]
+        try:
+            for observer, run_id in zip(observers, runs, strict=True):
+                await negotiate(
+                    observer,
+                    observer=True,
+                    extra=("child_run_history", "child_run_events"),
+                    protocol_version="1.2",
+                )
+                await observer.send(3, "child_run_events", {"session_id": session_id, "run_id": run_id})
+                await await_or_fail(
+                    arrivals[runs.index(run_id)].wait(), what="child join read held"
+                )
+            # creation order is first charge order: run 1's scope, then run 2's
+            for run_id, sizes in zip(runs, charges, strict=True):
+                for size in sizes:
+                    assert replay.reserve(ReplayScopeId.child(run_id), size) is None
+            monkeypatch.setattr(
+                "zeta.server.session_replay.REPLAY_MAX_RECORDS", sum(map(len, charges))
+            )
+            await _publish_turns(server, session_id, 1)
+            release.set()
+            replies = [await observer.response(3) for observer in observers]
+            codes = [reply.get("error", {}).get("data", {}).get("code") for reply in replies]
+            expected = [None, None]
+            expected[victim] = "stale_event_sequence"
+            assert codes == expected, f"wrong global victim: {codes}"
+            event = await await_or_fail(client.event("turn_start"), what="candidate frame")
+            assert (event["stream_id"], event["seq"]) == (stream_id, 1)
+        finally:
+            release.set()
+            for observer in observers:
+                await observer.close()
+
