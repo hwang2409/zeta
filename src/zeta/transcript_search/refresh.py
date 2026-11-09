@@ -11,10 +11,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS, PersistedAppend
+from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.transcript_search.index import (
     TranscriptIndex,
     TranscriptIndexError,
     TranscriptSource,
+    open_project_index,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +151,9 @@ def _refresh_sources(
     project_id: str,
     sources: Sequence[TranscriptSource],
 ) -> None:
-    index = TranscriptIndex(projects_root / project_id, project_id)
+    try:
+        index = open_project_index(ProjectRegistry(projects_root), project_id)
+    except ProjectRegistryError:
+        index = TranscriptIndex(projects_root / project_id, project_id)
     for source in sources:
         index.append(source)
