@@ -102,11 +102,10 @@ def _validated_approval_requests(
 def _message_approval_requests(
     parsed_message: Message, approval_requests: object
 ) -> None:
-    anchored = {
-        block.tool_call.id: block.tool_call
-        for block in parsed_message.content
-        if isinstance(block, ToolUseContent)
-    }
+    anchored: dict[str, ToolCall] = {}
+    for block in parsed_message.content:
+        if isinstance(block, ToolUseContent):
+            anchored.setdefault(block.tool_call.id, block.tool_call)
     for tool_call in _validated_approval_requests(approval_requests):
         if anchored.get(tool_call.id) != tool_call:
             raise ValueError("approval request must match an anchored tool call")
