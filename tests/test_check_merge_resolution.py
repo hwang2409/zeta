@@ -967,17 +967,43 @@ def test_pr_side_line_table(tmp_path: Path, case: str) -> None:
 
 
 
-def test_large_repeated_diff_uses_bounded_matching(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[bool] = []
+def test_diff_blocks_matches_exact_matcher_on_generated_inputs() -> None:
+    import random
+
+    randomizer = random.Random(7)
+    cases = [
+        ([randomizer.choice("abc") for _ in range(size)], [randomizer.choice("abc") for _ in range(size)])
+        for size in range(1, 40)
+    ]
+    cases += [
+        (["same"] * size + ["left"] + ["same"] * size, ["same"] * size + ["right"] + ["same"] * size)
+        for size in range(1, 40)
+    ]
+    for base, side in cases:
+        expected = [
+            (old_start, old_end, new_start, new_end)
+            for tag, old_start, old_end, new_start, new_end in merge_resolution.difflib.SequenceMatcher(
+                None, base, side, autojunk=False
+            ).get_opcodes()
+            if tag != "equal"
+        ]
+        assert merge_resolution._diff_blocks(base, side) == expected
+
+
+def test_large_repeated_diff_trims_before_exact_matching(monkeypatch: pytest.MonkeyPatch) -> None:
+    sizes: list[tuple[int, int]] = []
     original = merge_resolution.difflib.SequenceMatcher
 
     def matcher(*args, **kwargs):
-        calls.append(kwargs["autojunk"])
+        sizes.append((len(args[1]), len(args[2])))
         return original(*args, **kwargs)
 
     monkeypatch.setattr(merge_resolution.difflib, "SequenceMatcher", matcher)
-    merge_resolution._diff_blocks(["same"] * 600, ["same"] * 600 + ["new"])
-    assert calls == [True]
+    merge_resolution._diff_blocks(
+        ["same"] * 6_000 + ["left"] + ["same"] * 6_000,
+        ["same"] * 6_000 + ["right"] + ["same"] * 6_000,
+    )
+    assert sizes == [(1, 1)]
 
 
 def test_pr_line_count_subtracts_base_and_main_copies(tmp_path: Path) -> None:

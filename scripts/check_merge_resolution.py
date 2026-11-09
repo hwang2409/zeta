@@ -286,12 +286,21 @@ def _owners_by_line(tree: ast.Module, count: int) -> list[str]:
 
 
 def _diff_blocks(base: list[str], side: list[str]) -> list[tuple[int, int, int, int]]:
-    # Repeated source lines make the exact matcher superlinear on large files.
-    matcher = difflib.SequenceMatcher(
-        None, base, side, autojunk=len(base) + len(side) > 1000
-    )
+    prefix = suffix = 0
+    if len(base) + len(side) > 1_000:
+        while prefix < len(base) and prefix < len(side) and base[prefix] == side[prefix]:
+            prefix += 1
+        while (
+            suffix < len(base) - prefix
+            and suffix < len(side) - prefix
+            and base[-suffix - 1] == side[-suffix - 1]
+        ):
+            suffix += 1
+    middle_base = base[prefix : len(base) - suffix if suffix else None]
+    middle_side = side[prefix : len(side) - suffix if suffix else None]
+    matcher = difflib.SequenceMatcher(None, middle_base, middle_side, autojunk=False)
     return [
-        (old_start, old_end, new_start, new_end)
+        (old_start + prefix, old_end + prefix, new_start + prefix, new_end + prefix)
         for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes()
         if tag != "equal"
     ]
