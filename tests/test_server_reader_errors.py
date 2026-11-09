@@ -45,8 +45,11 @@ async def test_failed_write_to_closed_reader_ends_connection_without_unhandled_e
     unhandled: list[dict[str, Any]] = []
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
-    server = ZetaServer(
-        home=tmp_path, socket_path=short_socket_path(tmp_path), provider="codex"
+    server = await asyncio.to_thread(
+        ZetaServer,
+        home=tmp_path,
+        socket_path=short_socket_path(tmp_path),
+        provider="codex",
     )
     accepted: asyncio.Future[asyncio.Task[Any]] = loop.create_future()
     accept = server._accept
