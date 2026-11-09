@@ -19,6 +19,7 @@ from .storage_format import (
     require_closed_variant,
 )
 
+# merge-resolution: src/zeta/attention_records.py constant ATTENTION_KIND_EPOCH -> moved to FEATURE_EPOCHS[StorageFeature.ATTENTION_KINDS]
 AttentionKind = Literal["decision", "answer", "decided", "deferred"]
 AttentionReason = Literal[
     "unreadable",
