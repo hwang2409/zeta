@@ -17,19 +17,110 @@ _TURN_EVENTS = {"turn_start", "turn_end"}
 _buffers: weakref.WeakKeyDictionary[asyncio.StreamReader, deque[dict[str, Any]]] = (
     weakref.WeakKeyDictionary()
 )
+# Request ids sent with send() whose response no read helper has returned yet.
+_unanswered: weakref.WeakKeyDictionary[asyncio.StreamReader, set[str | int]] = (
+    weakref.WeakKeyDictionary()
+)
+# The reader that receives the responses to send() requests on each writer.
+_reader_of: weakref.WeakKeyDictionary[asyncio.StreamWriter, asyncio.StreamReader] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+class RawFrame(dict[str, Any]):
+    """A decoded frame that keeps its exact wire bytes."""
+
+    raw: bytes
 
 
 def _buffer(reader: asyncio.StreamReader) -> deque[dict[str, Any]]:
     return _buffers.setdefault(reader, deque())
 
 
+def _pending(reader: asyncio.StreamReader) -> set[str | int]:
+    return _unanswered.setdefault(reader, set())
+
+
 async def read(reader: asyncio.StreamReader) -> dict[str, Any]:
     buffered = _buffer(reader)
     if buffered:
-        return buffered.popleft()
+        # request() buffers frames without clearing their ids; clear them here.
+        frame = buffered.popleft()
+        _pending(reader).discard(frame.get("id"))
+        return frame
     line = await asyncio.wait_for(reader.readline(), TIMEOUT)
     assert line, "server closed the socket"
-    return json.loads(line)
+    frame = RawFrame(json.loads(line))
+    frame.raw = line
+    _pending(reader).discard(frame.get("id"))
+    return frame
+
+
+async def read_raw(reader: asyncio.StreamReader) -> bytes:
+    """Return the next frame exactly as the server wrote it."""
+    frame = await read(reader)
+    assert isinstance(frame, RawFrame), f"buffered frame has no wire bytes: {frame!r}"
+    return frame.raw
+
+
+async def send(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request_id: str | int,
+    method: str,
+    params: dict[str, object] | None = None,
+) -> None:
+    """Write a request; later read helpers and close_serve read its response."""
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params or {},
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+    _pending(reader).add(request_id)
+    _reader_of[writer] = reader
+    await asyncio.wait_for(writer.drain(), TIMEOUT)
+
+
+def expect_no_response(reader: asyncio.StreamReader, request_id: str | int) -> None:
+    """Declare that the server never answers this sent request (it closes first)."""
+    _pending(reader).remove(request_id)
+
+
+async def read_sent_responses(writer: asyncio.StreamWriter) -> None:
+    """Teardown check: read until each request sent on this writer has its response."""
+    reader = _reader_of.get(writer)
+    if reader is None or not _pending(reader):
+        return
+    frames: list[dict[str, Any]] = []
+    try:
+        async with asyncio.timeout(10):
+            await _read_sent_responses(reader, frames)
+    except TimeoutError:
+        raise AssertionError(_no_response(_pending(reader), frames)) from None
+
+
+async def _read_sent_responses(
+    reader: asyncio.StreamReader, frames: list[dict[str, Any]]
+) -> None:
+    """Keep reading until every request sent with send() has its response."""
+    while pending := _pending(reader):
+        try:
+            frames.append(await read(reader))
+        except (AssertionError, TimeoutError):
+            raise AssertionError(_no_response(pending, frames)) from None
+
+
+def _no_response(pending: set[str | int], frames: list[dict[str, Any]]) -> str:
+    missing = min(pending, key=str)
+    return f"request id {missing} has no response; frames read: {frames!r}"
 
 
 async def request(
@@ -169,12 +260,17 @@ async def frames_until_event(
         frame = await read(reader)
         frames.append(frame)
         if frame.get("params", {}).get("event") == name:
+            await _read_sent_responses(reader, frames)
             return frames
 
 
 async def event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
     frames = await frames_until_event(reader, name)
-    return frames[-1]["params"]
+    return next(
+        frame["params"]
+        for frame in frames
+        if frame.get("params", {}).get("event") == name
+    )
 
 
 def event_owner(frame: dict[str, Any]) -> EventOwner | None:
@@ -212,16 +308,23 @@ async def read_until(
     timeout: float = 10,
     what: str,
 ) -> list[dict[str, Any]]:
-    """Read through a matching frame and return every skipped frame with it."""
+    """Read through a matching frame and every response still owed to send().
+
+    Returns all frames read, in wire order.
+    """
     frames: list[dict[str, Any]] = []
+    matched = False
     try:
         async with asyncio.timeout(timeout):
-            while True:
+            while not matched:
                 frame = await read(reader)
                 frames.append(frame)
-                if predicate(frame):
-                    return frames
+                matched = predicate(frame)
+            await _read_sent_responses(reader, frames)
+            return frames
     except TimeoutError:
+        if matched:
+            raise AssertionError(_no_response(_pending(reader), frames)) from None
         raise AssertionError(
             f"timed out waiting for {what}; skipped frames: {frames!r}"
         ) from None

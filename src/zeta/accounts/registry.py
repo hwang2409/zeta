@@ -38,11 +38,14 @@ class _Registry(Enum):
     BROKEN = "broken"
 
 
+_BROKEN_REGISTRY = (
+    "accounts.json is unreadable; kept it and every account directory; "
+    "repair or restore accounts.json, then restart zeta"
+)
 _UNSAFE_REGISTRY_WARNINGS = {
     _Registry.MISSING: "accounts.json is missing; kept every account directory and "
     "skipped account cleanup; restore accounts.json, then restart zeta",
-    _Registry.BROKEN: "accounts.json is invalid; kept it and every account directory "
-    "and skipped account cleanup; fix or restore accounts.json, then restart zeta",
+    _Registry.BROKEN: _BROKEN_REGISTRY,
 }
 
 
@@ -99,6 +102,13 @@ class AccountRegistryMissingError(AccountError):
             "accounts.json is missing but other account directories exist; "
             "restore accounts.json before adding an account"
         )
+
+
+class AccountRegistryBrokenError(AccountError):
+    """accounts.json exists but is unreadable, so nothing may read or write it."""
+
+    def __init__(self) -> None:
+        super().__init__(_BROKEN_REGISTRY)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +198,14 @@ class _AccountRegistry:
         return orphans
 
     def _refuse_orphaning_registration(self, home_fd: int, account: AccountId) -> None:
-        if self._registering_would_orphan(home_fd, account):
+        """Only a LOADED registry, or a fresh home, may take a new account."""
+
+        state, _ = self._load_registry(home_fd)
+        if state is _Registry.BROKEN:
+            raise AccountRegistryBrokenError
+        if state is _Registry.MISSING and self._has_unregistered_account_directories(
+            home_fd, {str(account)}
+        ):
             raise AccountRegistryMissingError
 
     def _registering_would_orphan(self, home_fd: int, account: AccountId) -> bool:
@@ -267,7 +284,7 @@ class _AccountRegistry:
     def _read_registry(self, home_fd: int) -> dict[str, Any]:
         state, value = self._load_registry(home_fd)
         if state is _Registry.BROKEN:
-            raise AccountError("accounts.json is invalid; use /accounts")
+            raise AccountRegistryBrokenError
         return value
 
     def _load_registry(self, home_fd: int) -> tuple[_Registry, dict[str, Any]]:

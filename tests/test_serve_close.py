@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from tests.support.serve_close import close_serve
+from tests.support.server_client import expect_no_response, send
+from tests.support.server_client import read as client_read
 
 
 def _run_owner_test(pytester: pytest.Pytester, source: str):
@@ -500,3 +503,66 @@ async def test_close_serve_drains_server_when_cancelled(phase: str) -> None:
         if not close_task.done():
             close_task.cancel()
         await asyncio.wait_for(asyncio.gather(close_task, return_exceptions=True), 10)
+
+
+class _ClientWriter(_Writer):
+    def write(self, data: bytes) -> None:
+        del data
+
+    async def drain(self) -> None:
+        return None
+
+
+def _stream(*frames: dict[str, object]) -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    for frame in frames:
+        reader.feed_data(json.dumps(frame).encode() + b"\n")
+    reader.feed_eof()
+    return reader
+
+
+_TURN_END = {"method": "event", "params": {"event": "turn_end"}}
+
+
+@pytest.mark.asyncio
+async def test_close_serve_fails_when_a_read_loop_stopped_before_a_response() -> None:
+    server = _Server()
+    writer = _ClientWriter(server)
+    reader = _stream(_TURN_END)
+    await send(reader, writer, 4, "deny")
+    # A plain read loop that stops at an event, before the id-4 response.
+    while (await client_read(reader))["params"]["event"] != "turn_end":
+        pass
+
+    with pytest.raises(
+        AssertionError, match=r"^request id 4 has no response; frames read: \[\]$"
+    ):
+        await close_serve(server, writer)
+    assert server.closed and writer.closed
+
+
+@pytest.mark.asyncio
+async def test_close_serve_reads_a_response_written_after_the_event() -> None:
+    server = _Server()
+    writer = _ClientWriter(server)
+    reader = _stream(_TURN_END, {"id": 4, "result": {}})
+    await send(reader, writer, 4, "deny")
+    assert (await client_read(reader))["params"]["event"] == "turn_end"
+
+    await close_serve(server, writer)
+
+    assert reader.at_eof(), "close_serve must read the id-4 response"
+    assert server.closed and writer.closed
+
+
+@pytest.mark.asyncio
+async def test_close_serve_accepts_a_declared_unanswered_request() -> None:
+    server = _Server()
+    writer = _ClientWriter(server)
+    reader = _stream()
+    await send(reader, writer, 4, "shutdown")
+    expect_no_response(reader, 4)
+
+    await close_serve(server, writer)
+
+    assert server.closed and writer.closed

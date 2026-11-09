@@ -2,8 +2,28 @@
 set -eu
 
 body_file=""
-cleanup() { [ -z "$body_file" ] || rm -f "$body_file"; }
+borrow_file=$(mktemp)
+cleanup() { rm -f "$borrow_file"; [ -z "$body_file" ] || rm -f "$body_file"; }
 trap cleanup EXIT
+
+# Writes the PRs that contain a merge commit; the checker decides which may lend overrides.
+write_borrow_file() {
+  set +e
+  pulls=$(gh api "repos/${GITHUB_REPOSITORY:-}/commits/$1/pulls" 2>/dev/null)
+  api_status=$?
+  set -e
+  printf '{"commit":"%s","pr":%s,"author":"%s","error":%s,"pulls":%s}\n' \
+    "$1" "$PR_NUMBER" "${PR_AUTHOR:-}" \
+    "$([ "$api_status" -eq 0 ] && echo null || echo "\"gh api exit $api_status\"")" \
+    "${pulls:-null}" > "$borrow_file"
+}
+
+run_check() {
+  set +e
+  output=$(python "${CHECK_MERGE_RESOLUTION_SCRIPT:-scripts/check_merge_resolution.py}" "$@" 2>&1)
+  status=$?
+  set -e
+}
 
 if [ "$EVENT_NAME" = pull_request ]; then
   body_file=$(mktemp)
@@ -35,10 +55,12 @@ for commit in $commits; do
   [ -z "$body_file" ] || args+=(--pr-body-file "$body_file")
   # train/<lane>-<n> is built from origin/main with git merge --no-ff of each PR head.
   case "${HEAD_REF:-}" in train/*) args+=(--train-head "$HEAD_SHA") ;; esac
-  set +e
-  output=$(python "${CHECK_MERGE_RESOLUTION_SCRIPT:-scripts/check_merge_resolution.py}" "${args[@]}" 2>&1)
-  status=$?
-  set -e
+  run_check "${args[@]}"
+  # Only ask GitHub when the PR's own explanations leave findings.
+  if [ "$status" -eq 1 ] && [ "$EVENT_NAME" = pull_request ]; then
+    write_borrow_file "$commit"
+    run_check "${args[@]}" --borrow-file "$borrow_file"
+  fi
   printf '%s\n' "$output"
   if [ "$status" -eq 0 ]; then
     continue
