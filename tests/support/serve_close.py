@@ -3,14 +3,27 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from tests.support.server_client import read_sent_responses
+
 _CLOSE_TIMEOUT = 10
 
 
 async def close_serve(server: Any, *writers: Any) -> None:
-    """Close a serve server before waiting for any client peers to close."""
-    server_task = asyncio.create_task(server.close())
+    """Close a serve server before waiting for any client peers to close.
+
+    First read every response still owed to a request the shared client sent, so a
+    test cannot pass while it stopped reading before another actor's frame arrived.
+    """
     first_error: BaseException | None = None
     cancellation: asyncio.CancelledError | None = None
+    try:
+        for writer in writers:
+            await read_sent_responses(writer)
+    except asyncio.CancelledError as error:
+        cancellation = error
+    except BaseException as error:  # noqa: BLE001
+        first_error = error
+    server_task = asyncio.create_task(server.close())
     try:
         await asyncio.sleep(0)
         for writer in writers:

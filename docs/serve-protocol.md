@@ -1515,7 +1515,7 @@ The shared slash registry has this order and surface availability:
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
 | `tasks` | no | inspect background processes |
-| `decisions` | yes | read, reply to, or dismiss attention items |
+| `decisions` | yes | read, reply, dismiss, or batch-reply to attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |
 | `approve` | no | `/approve [key]` |
@@ -1524,6 +1524,13 @@ The shared slash registry has this order and surface availability:
 | `accounts` | yes | list, switch, or label accounts |
 | `restart` | no | restart this session from the local checkout (reinstall after `pyproject` changes) |
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
+
+The `/decisions` list includes broken attention records instead of hiding them. A
+broken item is additive: it has `id`, `path`, and `reason` fields in attention
+payloads, and contains no request body. `reason` is one of `unreadable`,
+`invalid_name`, `invalid_json`, `invalid_schema`, `id_mismatch`, or `too_large`.
+Reply, dismiss, stage, and batch-reply operations refuse broken ids without
+changing their bytes.
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
 `/implement`, `/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/plan`,
