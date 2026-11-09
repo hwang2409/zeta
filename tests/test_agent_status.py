@@ -605,7 +605,7 @@ async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
     read_threads: list[int] = []
     original = agent_tools._read_child_lifecycle
 
-    def tracked_read(*args: object, **kwargs: object) -> bytes:
+    def tracked_read(*args: object, **kwargs: object) -> tuple[object, str | None]:
         read_threads.append(threading.get_ident())
         return original(*args, **kwargs)
 
@@ -618,7 +618,7 @@ async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
 
     assert len(status["structuredContent"]["children"]) == 8
     assert len(read_threads) == 8
-    assert loop_thread not in read_threads
+    assert all(thread != loop_thread for thread in read_threads)
     await loop.close()
 
 

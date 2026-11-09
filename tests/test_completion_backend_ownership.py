@@ -10,6 +10,7 @@ import pytest
 
 from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountId, SessionAccountContext
+from zeta.agent import child_context
 from zeta.agent import runner as agent_runner
 from zeta.agent.presets import GENERAL_PRESET
 from zeta.core.session import SessionManager
@@ -307,14 +308,14 @@ async def test_child_registry_clone_gets_its_own_backend_owner(
         skill_catalog=SkillCatalog.empty(),
     )
     monkeypatch.setattr(
-        agent_runner,
+        child_context,
         "build_backend",
         lambda *_args, **_kwargs: (child, child.model),
     )
     child_store = ConversationStore(tmp_path / "child")
     child_loop = None
     try:
-        resolved, error = agent_runner.resolve_child_backend(parent_loop, None)
+        resolved, error = child_context.resolve_child_backend(parent_loop, None)
         assert error is None
         child_loop, policy = await _within(
             agent_runner._build_child_loop(
