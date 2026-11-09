@@ -634,33 +634,27 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def search_query(self) -> str:
         return self._search_query
 
-    def begin_search(self) -> None:
-        self._search_active = True
-        self._search_query = ""
-        self._search_index = 0
-        self._search_anchor_key = None
-        self._render_cache.clear()
-        self._highlight_cache = None
-
-    def update_search(self, query: str, *, anchor_key: int | None = None) -> None:
-        self._search_active = True
+    def _transition_search(
+        self, *, active: bool, query: str, anchor_key: int | None
+    ) -> None:
+        self._search_active = active
         self._search_query = query
         self._search_index = 0
         self._search_anchor_key = anchor_key
+        self._render_cache.clear()
         self._parsed_cache.clear()
         self._search_cache.clear()
         self._highlight_cache = None
+
+    def begin_search(self) -> None:
+        self._transition_search(active=True, query="", anchor_key=None)
+
+    def update_search(self, query: str, *, anchor_key: int | None = None) -> None:
+        self._transition_search(active=True, query=query, anchor_key=anchor_key)
         self._focus_search_match()
 
-
     def end_search(self) -> None:
-        self._search_active = False
-        self._search_query = ""
-        self._search_index = 0
-        self._search_anchor_key = None
-        self._render_cache.clear()
-        self._parsed_cache.clear()
-        self._highlight_cache = None
+        self._transition_search(active=False, query="", anchor_key=None)
         if self._uses_virtual_history():
             return
         line_count = len(self._parsed_lines(self._content_width))
