@@ -64,6 +64,7 @@ def login_named_account(
             account = store.resolve_reference(provider, label)
         except AccountError:
             account = AccountId(provider, label)
+            store.refuse_orphaning_registration(account)
         else:
             if not replace_existing:
                 raise AccountError(
