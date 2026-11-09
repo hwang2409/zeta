@@ -129,7 +129,7 @@ class RateLimitedChildBackend(PerActorFakeBackend):
 
     async def _wait(self, _delay: float) -> None:
         self.held.set()
-        await self.release.wait()
+        await asyncio.wait_for(self.release.wait(), 10)
 
     @owned_completion
     async def complete(self, messages, tool_schemas):
@@ -163,14 +163,15 @@ async def test_held_child_reports_rate_limited_until_and_stays_running(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
-    held = asyncio.ensure_future(backend.held.wait())
+    held = asyncio.ensure_future(asyncio.wait_for(backend.held.wait(), 10))
     child_ended: asyncio.Future[object] | None = None
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-        child_ended = asyncio.ensure_future(loop._background_owner.wait())
-        await await_or_fail(
-            asyncio.wait({held, child_ended}, return_when=asyncio.FIRST_COMPLETED),
-            what="child hold or child end",
+        child_ended = asyncio.ensure_future(
+            asyncio.wait_for(loop._background_owner.wait(), 10)
+        )
+        await asyncio.wait(
+            {held, child_ended}, timeout=10, return_when=asyncio.FIRST_COMPLETED
         )
         assert held.done() and not child_ended.done(), "the child must hold, not fail"
 
