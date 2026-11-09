@@ -145,13 +145,18 @@ async def request(
     )
     await asyncio.wait_for(writer.drain(), TIMEOUT)
     buffered = _buffer(reader)
-    while True:
-        line = await asyncio.wait_for(reader.readline(), TIMEOUT)
-        assert line, "server closed the socket"
-        frame = json.loads(line)
-        if frame.get("id") == request_id:
-            return [frame]
-        buffered.append(frame)
+    deferred: list[dict[str, Any]] = []
+    try:
+        while True:
+            if buffered:
+                frame = buffered.popleft()
+            else:
+                frame = await read(reader)
+            if frame.get("id") == request_id:
+                return [frame]
+            deferred.append(frame)
+    finally:
+        buffered.extendleft(reversed(deferred))
 
 
 async def approve_and_collect_grant(

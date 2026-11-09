@@ -26,7 +26,12 @@ from .agent_progress import (
     remove_live_agent_lifecycle,
 )
 from .checkpoints import ConversationIntegrityError, _now, load_session_json
-from .session_files import child_directory, read_session_file, write_session_file
+from .session_files import (
+    child_directory,
+    read_session_file,
+    write_session_file,
+    write_session_file_if_absent,
+)
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
 _TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
@@ -495,7 +500,7 @@ class AgentStateMixin:
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def mark_agent_canceled(self, parent_tool_call_id: str) -> None:
-        """Persist a child cancellation after its task has stopped."""
+        """Persist a child cancellation and its terminal lifecycle."""
 
         if not parent_tool_call_id:
             raise ValueError("parent tool call id must be nonempty")
@@ -772,6 +777,14 @@ class AgentStateMixin:
                     killed_task_ids_truncated
                 )
             self._write_agent_lifecycle()
+
+    def ensure_turn_limit_handoff(self, content: bytes) -> bool:
+        """Durably create the deterministic turn-limit handoff once."""
+        if type(content) is not bytes or not content:
+            raise ValueError("turn-limit handoff must be nonempty bytes")
+        return write_session_file_if_absent(
+            self.directory_fd, "turn-limit-handoff.md", content
+        )
 
     async def finalize_background_agent(
         self,

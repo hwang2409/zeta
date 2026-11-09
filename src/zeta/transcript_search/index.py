@@ -528,7 +528,16 @@ class TranscriptIndex:
         with self._write_guard():
             if self.path.exists():
                 status = self._status()
-                if not (status.ready and status.session_count == 0 and sources):
+                # generation 0 is the legacy #1123 empty file; any completed
+                # _rebuild_locked bumps it >= 1, so a project whose only linked
+                # sources are all unbound (they publish 0 cursors) backfills once
+                # instead of rebuilding on every open_project_index.
+                if not (
+                    status.ready
+                    and status.session_count == 0
+                    and status.generation == 0
+                    and sources
+                ):
                     return
             elif not sources:
                 with self._temporary_database() as temporary_path:
@@ -1131,7 +1140,7 @@ def open_project_index(
         return index
     if index.path.exists():
         status = index.status()
-        if not (status.ready and status.session_count == 0):
+        if not (status.ready and status.session_count == 0 and status.generation == 0):
             return index
     try:
         sources = linked_transcript_sources(registry, project_id)

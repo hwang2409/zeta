@@ -311,7 +311,6 @@ async def test_commit_async_cancelled_before_write_changes_nothing(
         "submitted",
         "during_write",
         "committed",
-        "publish",
         "publish_failure",
         "final_callback_failure",
         "duplicate",
@@ -404,7 +403,7 @@ async def test_mutation_cancellation_policy_table(
         monkeypatch.setattr(
             store, "_after_committed_mutation_started", pause_during_write
         )
-    elif phase in {"committed", "publish"}:
+    elif phase == "committed":
 
         async def pause_owner_phase() -> None:
             reached.set()
@@ -413,13 +412,8 @@ async def test_mutation_cancellation_policy_table(
                 what=f"{phase} cancellation release",
             )
 
-        seam = (
-            "_before_committed_install"
-            if phase == "committed"
-            else "_before_committed_publish"
-        )
         # test-contract: seam pauses at the owner-side durable/install boundary
-        monkeypatch.setattr(store, seam, pause_owner_phase)
+        monkeypatch.setattr(store, "_before_committed_install", pause_owner_phase)
 
     try:
         if phase in {
@@ -442,7 +436,7 @@ async def test_mutation_cancellation_policy_table(
                 await submit()
         else:
             task = asyncio.create_task(submit())
-            if phase in {"queued", "committed", "publish"}:
+            if phase in {"queued", "committed"}:
                 await await_or_fail(
                     reached.wait(), what=f"{policy} {phase} cancellation point"
                 )
@@ -490,6 +484,67 @@ async def test_mutation_cancellation_policy_table(
         assert tuple(entry.to_dict() for entry in reopened.entries) == resident
     finally:
         await asyncio.to_thread(reopened.close)
+
+
+@pytest.mark.asyncio
+async def test_install_and_publish_run_in_one_loop_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A task scheduled at resident install must not observe an unpublished row.
+
+    Install (resident rows visible), publication, and the command's
+    after_persisted callback must complete in one event-loop step with no
+    suspension point between them. We schedule a loop callback at the moment of
+    install; it can only run after the finish coroutine yields. If install and
+    publication share one loop step, the callback observes both publication and
+    after_persisted already done. A suspension between them lets the callback
+    run first and see the installed-but-unpublished row.
+    """
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    store = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (store.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    store.bind_owner_thread()
+
+    publications: list[object] = []
+    store.on_entries_installed = publications.append
+    persisted: list[bool] = []
+
+    observed: dict[str, object] = {}
+    observed_ran = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def record_at_install_callback() -> None:
+        observed["publications"] = len(publications)
+        observed["persisted"] = len(persisted)
+        observed_ran.set()
+
+    original_install = store._install_committed_delta
+
+    def install_and_schedule(delta: object) -> object:
+        result = original_install(delta)
+        # Schedule from inside the synchronous resident-install section. The
+        # callback runs on the next loop turn after the finish coroutine yields.
+        loop.call_soon(record_at_install_callback)
+        return result
+
+    # test-contract: seam observes the real resident-install section
+    monkeypatch.setattr(store, "_install_committed_delta", install_and_schedule)
+
+    try:
+        await store.append_message_async(
+            Message(MessageRole.ASSISTANT, [TextContent("one-step")]),
+            on_persisted=lambda: persisted.append(True),
+        )
+        await await_or_fail(observed_ran.wait(), what="install-scheduled observer")
+        assert observed["publications"] == 1
+        assert observed["persisted"] == 1
+    finally:
+        await asyncio.to_thread(store.close)
 
 
 @pytest.mark.parametrize("target_kind", ["resident", "transient"])

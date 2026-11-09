@@ -33,7 +33,9 @@ class _Store:
         await asyncio.to_thread(self._warm_step_delivery_writer)
         self.installed = True
 
-    async def commit_delivery_input(self, item: object) -> ProducerResult:
+    async def commit_delivery_input(
+        self, item: object, **_kwargs: object
+    ) -> ProducerResult:
         result = await asyncio.to_thread(self._commit_delivery_input, item)
         self.installed = True
         return result

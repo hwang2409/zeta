@@ -681,8 +681,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app._on_session_close = flush_recency
     app._active_session = app._draft_session = app._session = object()
     app._history = None
-    app.stop_decisions_poll = lambda: cleaned.append("poll")
-    app._stop_decisions_refresh = lambda: cleaned.append("refresh")
+    app.stop_decisions_poll = lambda: async_cleanup("poll")
     app._close_finder_workers = fail_finder
     app._close_approval_labels = lambda: async_cleanup("approval labels")
     async def close_navigation() -> None:
