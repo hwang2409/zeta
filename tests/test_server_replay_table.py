@@ -26,10 +26,40 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer, ergonomics
 from zeta.server import connections as connection_module
-from zeta.server.protocol import EventDescriptor
+from zeta.server.protocol import FEATURES, EventDescriptor
 from zeta.server.server import _Client
 
 pytest_plugins = ("tests.support.socket_fixtures",)
+
+
+def test_event_feature_table_names_every_published_event_exactly_once() -> None:
+    """Admission indexes EVENT_FEATURES[event] with no default, so a published
+    event with no entry would raise at runtime. The server can publish exactly
+    the EventDescriptor members, so the table keys must equal that set."""
+    published = set(EventDescriptor)
+    table = set(connection_module.EVENT_FEATURES)
+    missing = sorted(e.value for e in published - table)
+    unknown = sorted(e.value for e in table - published)
+    assert table == published, (
+        f"EVENT_FEATURES must name every published event; missing={missing}, "
+        f"unknown={unknown}"
+    )
+
+
+def test_feature_tables_only_name_negotiable_features() -> None:
+    """Every feature a gate requires must be a real negotiable feature; a typo
+    would gate an event behind a feature no client can ever hold."""
+    valid = set(FEATURES)
+    for event, required in connection_module.EVENT_FEATURES.items():
+        unknown = sorted(required - valid)
+        assert not unknown, f"{event.value} requires unknown features {unknown}"
+    for (event, field), required in connection_module.OPTIONAL_FIELD_FEATURES.items():
+        assert isinstance(event, EventDescriptor), f"{event!r}.{field} is not an event"
+        assert required, f"{event.value}.{field} must name at least one gating feature"
+        unknown = sorted(required - valid)
+        assert not unknown, f"{event.value}.{field} requires unknown features {unknown}"
+
+
 
 TRANSPORTS: tuple[Transport, ...] = ("unix", "websocket")
 ROWS = (

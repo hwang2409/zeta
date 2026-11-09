@@ -50,12 +50,43 @@ OUTPUT_MAX_FRAMES = 256
 OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
 
 # one owner for feature gates and optional wire fields on every output path
+NO_FEATURE = frozenset()
 EVENT_FEATURES = {
-    EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
-    EventDescriptor.MEMORY_UPDATED: frozenset({"memory_updated"}),
-    EventDescriptor.USER_MESSAGE: frozenset({"user_message_event"}),
+    EventDescriptor.AGENT_START: NO_FEATURE,
+    EventDescriptor.TURN_START: NO_FEATURE,
+    EventDescriptor.COMPACTION_START: NO_FEATURE,
+    EventDescriptor.COMPACTION_END: NO_FEATURE,
+    EventDescriptor.MESSAGE_START: NO_FEATURE,
+    EventDescriptor.ASSISTANT_DELTA: NO_FEATURE,
+    EventDescriptor.ASSISTANT_MESSAGE: NO_FEATURE,
+    EventDescriptor.RETRY: NO_FEATURE,
+    EventDescriptor.ASSISTANT_RESET: NO_FEATURE,
+    EventDescriptor.APPROVAL_REQUEST: NO_FEATURE,
+    EventDescriptor.APPROVAL_END: NO_FEATURE,
+    EventDescriptor.TOOL_START: NO_FEATURE,
+    EventDescriptor.TOOL_OUTPUT: NO_FEATURE,
+    EventDescriptor.TOOL_END: NO_FEATURE,
+    EventDescriptor.SUB_AGENT_RECEIPT: NO_FEATURE,
+    EventDescriptor.CHILD_IDLE: NO_FEATURE,
+    EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
+    EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
+    EventDescriptor.CHILD_QUESTION: NO_FEATURE,
+    EventDescriptor.CHILD_QUESTION_WITHDRAWN: NO_FEATURE,
+    EventDescriptor.CHILD_MESSAGE_DELIVERED: NO_FEATURE,
+    EventDescriptor.ACCOUNT_LIMIT: NO_FEATURE,
+    EventDescriptor.ACCOUNT_STATE_UNKNOWN: NO_FEATURE,
+    EventDescriptor.TURN_END: NO_FEATURE,
+    EventDescriptor.SERVED_TURN_END: NO_FEATURE,
+    EventDescriptor.AGENT_END: NO_FEATURE,
+    EventDescriptor.ERROR: NO_FEATURE,
     EventDescriptor.DELIVERY_STATUS: frozenset({"session_history_fidelity"}),
+    EventDescriptor.MEMORY_UPDATED: frozenset({"memory_updated"}),
+    EventDescriptor.TURN_ABORTED: NO_FEATURE,
+    EventDescriptor.USAGE: NO_FEATURE,
+    EventDescriptor.USER_MESSAGE: frozenset({"user_message_event"}),
     EventDescriptor.SESSION_GRANTS_CHANGED: frozenset({"session_grants"}),
+    EventDescriptor.REPLAY_STREAM_ENDED: NO_FEATURE,
+    EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
 }
 OPTIONAL_FIELD_FEATURES = {
     (EventDescriptor.USER_MESSAGE, "delivery_id"): frozenset(
@@ -271,7 +302,7 @@ class ConnectionRegistry(ReplayOutput):
         required_feature: str | None,
         fields: dict[str, object],
     ) -> bool:
-        required = EVENT_FEATURES.get(event, frozenset())
+        required = EVENT_FEATURES[event]
         if required_feature is not None:
             required |= frozenset({required_feature})
         if not required <= history_features(state.features):
