@@ -362,9 +362,9 @@ def _split_utf8(value: str, max_bytes: int) -> list[str]:
     return chunks or [""]
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SANITIZER_VERSION = 2
-INDEX_FILENAME = "transcript-index.sqlite3"
+INDEX_FILENAME = f"transcript-index-v{SCHEMA_VERSION}.sqlite3"
 MAX_ACTIVE_TAIL_BYTES = 1024 * 1024
 _TOKEN = re.compile(r"[\w.-]+", re.UNICODE)
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
@@ -447,7 +447,7 @@ class TranscriptIndex:
         self.project_dir = Path(project_dir)
         self.project_id = project_id
         self.path = self.project_dir / INDEX_FILENAME
-        self.lock_path = self.project_dir / ".transcript-index.lock"
+        self.lock_path = self.path.with_name(f".{self.path.name}.lock")
         try:
             self.project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             with self._write_guard():
@@ -498,8 +498,9 @@ class TranscriptIndex:
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
                         source_inode, source_mtime_ns, source_ctime_ns,
-                        source_size, incremental_ready, last_entry_id, active_tail_json
-                    ) VALUES (?, 0, ?, 0, 0, 0, 0, 0, 1, NULL, '[]')
+                        source_size, incremental_ready, last_entry_id, active_tail_json,
+                        prefix_digest
+                    ) VALUES (?, 0, ?, 0, 0, 0, 0, 0, 1, NULL, '[]', NULL)
                     ON CONFLICT(session_id) DO UPDATE SET last_seq=excluded.last_seq""",
                     (session_id, cursor),
                 )
@@ -703,8 +704,9 @@ class TranscriptIndex:
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
                         source_inode, source_mtime_ns, source_ctime_ns,
-                        source_size, incremental_ready, last_entry_id, active_tail_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_size, incremental_ready, last_entry_id, active_tail_json,
+                        prefix_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         byte_offset=excluded.byte_offset,
                         last_seq=excluded.last_seq,
@@ -715,7 +717,8 @@ class TranscriptIndex:
                         source_size=excluded.source_size,
                         incremental_ready=excluded.incremental_ready,
                         last_entry_id=excluded.last_entry_id,
-                        active_tail_json=excluded.active_tail_json""",
+                        active_tail_json=excluded.active_tail_json,
+                        prefix_digest=excluded.prefix_digest""",
                     (
                         source.session_id,
                         read.byte_offset,
@@ -728,6 +731,7 @@ class TranscriptIndex:
                         incremental_ready,
                         read.last_entry_id,
                         tail_json,
+                        read.prefix_digest,
                     ),
                 )
                 connection.commit()
@@ -767,7 +771,7 @@ class TranscriptIndex:
         row = connection.execute(
             """SELECT byte_offset, last_seq, source_device, source_inode,
                 source_mtime_ns, source_ctime_ns, source_size, incremental_ready,
-                last_entry_id, active_tail_json
+                last_entry_id, active_tail_json, prefix_digest
             FROM session_cursors WHERE session_id = ?""",
             (session_id,),
         ).fetchone()
@@ -778,6 +782,7 @@ class TranscriptIndex:
             bool(row[7]),
             str(row[8]) if row[8] is not None else None,
             tuple(json.loads(row[9])),
+            str(row[10]) if row[10] is not None else None,
         )
 
     @staticmethod
@@ -1068,7 +1073,8 @@ CREATE TABLE session_cursors (
     source_size INTEGER NOT NULL CHECK(source_size >= 0),
     incremental_ready INTEGER NOT NULL CHECK(incremental_ready IN (0, 1)),
     last_entry_id TEXT,
-    active_tail_json TEXT NOT NULL
+    active_tail_json TEXT NOT NULL,
+    prefix_digest TEXT
 ) WITHOUT ROWID;
 CREATE TABLE units (
     id INTEGER PRIMARY KEY,
