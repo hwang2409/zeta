@@ -203,8 +203,30 @@ def _history_rows_for(
     raise AssertionError(f"no history-row matcher for {event.value}")
 
 
-async def _wait_event(client: ReplayClient, name: str, **match: Any) -> dict[str, Any]:
-    return await client.event(name, match=match)
+async def _wait_event(
+    client: ReplayClient,
+    name: str,
+    *,
+    diagnostic: Callable[[], str] | None = None,
+    **match: Any,
+) -> dict[str, Any]:
+    return await client.event(name, match=match, diagnostic=diagnostic)
+
+
+def _background_diagnostic(serve: Serve, backend: PerActorFakeBackend, parent_started: bool) -> str:
+    active = tuple(serve.server.control._approvals.active_keys())
+    published = [event.value for event, _fields, _facts, _covers in serve.published]
+    buffered = [frame.get("params", {}).get("event") for frame in serve.observer.buffered]
+    milestones = {
+        "parent_agent_tool_started": parent_started,
+        "child_model_turn_started": backend.child_started["child-work"].is_set(),
+        "approval_created": bool(active),
+        "admitted_for_controller": "approval_request" in published,
+        "admitted_for_observer": any(event == "approval_request" for event in buffered),
+        # frames in buffered arrived from the real unix/websocket reader.
+        "bytes_read_by_observer": any(event == "approval_request" for event in buffered),
+    }
+    return "milestones=" + repr(milestones) + f"; active_approvals={active!r}; buffered={buffered!r}"
 
 
 # --- scenarios: each drives one real serve flow with the observer already joined ---
@@ -361,9 +383,16 @@ def _background_backend(
     )
 
 
-async def _background(serve: Serve, *, wait_for_parent_idle: bool = False) -> None:
+async def _background(
+    serve: Serve, backend: PerActorFakeBackend, *, wait_for_parent_idle: bool = False
+) -> None:
     await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
-    request = await _wait_event(serve.observer, "approval_request", delegated=True)
+    request = await _wait_event(
+        serve.observer,
+        "approval_request",
+        delegated=True,
+        diagnostic=lambda: _background_diagnostic(serve, backend, bool(backend.parent.calls)),
+    )
     if wait_for_parent_idle:
         # The parent is idle before approval, so its completion cannot be folded into its turn.
         await _wait_event(serve.observer, "agent_end")
@@ -465,9 +494,9 @@ SCENARIOS = {
         "assistant_failed", lambda tmp: TruncatedBackend(), lambda s, b: _assistant_failed(s)
     ),
     "foreground_tool": Scenario("foreground_tool", _foreground_tool_backend, lambda s, b: _foreground_tool(s)),
-    "background_child": Scenario("background_child", _background_backend, lambda s, b: _background(s)),
+    "background_child": Scenario("background_child", _background_backend, _background),
     "background_child_idle": Scenario(
-        "background_child_idle", _background_backend, lambda s, b: _background(s, wait_for_parent_idle=True)
+        "background_child_idle", _background_backend, lambda s, b: _background(s, b, wait_for_parent_idle=True)
     ),
     "dropped_steer": Scenario("dropped_steer", lambda tmp: BlockingBackend(), _dropped_steer),
     "synthetic_abort": Scenario("synthetic_abort", lambda tmp: FakeBackend([]), lambda s, b: _synthetic_abort(s)),

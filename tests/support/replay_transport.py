@@ -9,6 +9,7 @@ import hashlib
 import json
 import secrets
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -64,9 +65,13 @@ class ReplayClient:
         *,
         what: str = "replay frame",
         received: list[dict[str, Any]] | None = None,
+        diagnostic: Callable[[], str] | None = None,
     ) -> dict[str, Any] | None:
         received = list(self.buffered) if received is None else received
-        describe = lambda: f"{what}; received={received!r}"
+        describe = lambda: (
+            f"{what}; received={received!r}"
+            + (f"; {diagnostic()}" if diagnostic is not None else "")
+        )
         # a write to a connection the server closed surfaces on the next read
         try:
             if not self.websocket:
@@ -126,7 +131,10 @@ class ReplayClient:
         return await self.response(request_id)
 
     async def event(
-        self, name: str | None = None, match: dict[str, Any] | None = None
+        self,
+        name: str | None = None,
+        match: dict[str, Any] | None = None,
+        diagnostic: Callable[[], str] | None = None,
     ) -> dict[str, Any]:
         """The first matching event in arrival order; other frames stay buffered in order."""
         def matches(frame: dict[str, Any]) -> bool:
@@ -145,7 +153,9 @@ class ReplayClient:
         try:
             while not matches(
                 frame := await self._read_or_eof(
-                    what=f"event {name or '<any>'}", received=received
+                    what=f"event {name or '<any>'}",
+                    received=received,
+                    diagnostic=diagnostic,
                 )
             ):
                 skipped.append(frame)
