@@ -280,6 +280,9 @@ class DecisionsMixin:
             self._advance_decisions_generation() if generation is None else generation
         )
         while True:
+            current_generation = getattr(self, "_decisions_scan_generation", 0)
+            if requested_generation != current_generation:
+                requested_generation = current_generation
             work = getattr(self, "_decisions_scan_work", None)
             if work is None or work.done():
                 if work is not None and work.done() and not work.cancelled():
@@ -287,6 +290,7 @@ class DecisionsMixin:
                 loop = asyncio.get_running_loop()
                 work = loop.create_future()
                 self._decisions_scan_work = work
+                self._decisions_scan_work_generation = requested_generation
                 threading.Thread(
                     target=_scan_decisions,
                     args=(
@@ -304,7 +308,11 @@ class DecisionsMixin:
             finally:
                 if work.done() and self._decisions_scan_work is work:
                     self._decisions_scan_work = None
-            if requested_generation == getattr(self, "_decisions_scan_generation", 0):
+            if (
+                requested_generation == getattr(self, "_decisions_scan_generation", 0)
+                and requested_generation
+                == getattr(self, "_decisions_scan_work_generation", requested_generation)
+            ):
                 return result
 
     async def _decisions_tick(self) -> None:
