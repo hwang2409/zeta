@@ -9,6 +9,7 @@ from typing import ClassVar
 import httpx
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.mcp.config import MCPServerConfig
 from zeta.mcp.http import StreamableHTTPMCPClient
 
@@ -84,7 +85,7 @@ class _ResumableNotificationHandler(BaseHTTPRequestHandler):
             self.wfile.write(self._event("event-1", "notifications/first"))
             self.wfile.flush()
             type(self).second_stream_open.set()
-            type(self).close_second_stream.wait()
+            type(self).close_second_stream.wait(timeout=10)
             return
         self._stream_or_stop(
             self._event("event-2", "notifications/second") if get_number == 3 else None
@@ -150,7 +151,7 @@ def resumable_notification_server(monkeypatch: pytest.MonkeyPatch):
         _ResumableNotificationHandler.close_second_stream.set()
         server.shutdown()
         server.server_close()
-        thread.join()
+        thread.join(timeout=10)
 
 
 async def _notification_methods(url: str, expected: int) -> list[str]:
@@ -208,7 +209,7 @@ async def test_http_notification_resume_preserves_non_ascii_event_id(
         assert await asyncio.to_thread(
             _ResumableNotificationHandler.second_stream_open.wait, 2
         )
-        await asyncio.wait_for(complete.wait(), 2)
+        await await_or_fail(complete.wait(), what="second notification")
     finally:
         await client.close()
 
