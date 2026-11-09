@@ -11554,8 +11554,6 @@ async def test_agent_send_cancellation_reports_durable_outcome(
     child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
     registry: ToolRegistry | None = None
     owner: BackgroundAgentOwner | None = None
-    from zeta.core.store import _async_writes as async_writes_module
-
     try:
         call = _run_agent_call()
         child_store.mark_agent_parent(call.id, agent_type="run")
@@ -11614,7 +11612,6 @@ async def test_agent_send_cancellation_reports_durable_outcome(
         monkeypatch.setattr(
             child_store, "_submitted_mutation_cancelled", observe_cancellation
         )
-        lock_held = False
         task = asyncio.create_task(
             registry.execute(
                 ToolCall(
