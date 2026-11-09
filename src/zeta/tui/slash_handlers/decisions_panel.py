@@ -224,10 +224,14 @@ class DecisionsMixin:
         ):
             self.request_decisions_refresh()
 
+    def _advance_decisions_generation(self) -> int:
+        self._decisions_scan_generation += 1
+        return self._decisions_scan_generation
+
     def request_decisions_refresh(self) -> None:
         if self._decisions_stopping:
             return
-        self._decisions_scan_generation += 1
+        self._advance_decisions_generation()
         self._decisions_scan_requested.set()
         if self._decisions_scan_task is None or self._decisions_scan_task.done():
             self._decisions_scan_task = asyncio.create_task(
@@ -269,9 +273,13 @@ class DecisionsMixin:
         self._decisions_error = reason[:80]
         self._invalidate_prompt()
 
-    async def _read_decisions(self, timeout: float | None) -> tuple:
+    async def _read_decisions(
+        self, timeout: float | None, generation: int | None = None
+    ) -> tuple:
+        requested_generation = (
+            self._advance_decisions_generation() if generation is None else generation
+        )
         while True:
-            requested_generation = getattr(self, "_decisions_scan_generation", 0)
             work = getattr(self, "_decisions_scan_work", None)
             if work is None or work.done():
                 if work is not None and work.done() and not work.cancelled():
@@ -300,11 +308,12 @@ class DecisionsMixin:
                 return result
 
     async def _decisions_tick(self) -> None:
+        generation = self._advance_decisions_generation()
         try:
-            items = await self._read_decisions(_SCAN_TIMEOUT)
+            items = await self._read_decisions(_SCAN_TIMEOUT, generation)
         except TimeoutError as exc:
             self._set_decisions_error(exc)
-            items = await self._read_decisions(timeout=None)
+            items = await self._read_decisions(timeout=None, generation=generation)
         replies = self._attention_replies(self._decisions_session_id)
         from ...attention_records import Broken
 
