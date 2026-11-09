@@ -7,21 +7,18 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import nullcontext, suppress
+from contextlib import suppress
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
-from ..core.project_context import ProjectContext
 from ..core.session import env_home
-from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
-from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
-from ..project_context.projection import ProjectContextProjection
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
@@ -36,7 +33,6 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
-from ..providers.factory import build_backend, credential_store
 from ..providers.rate_limit_hold import rate_limit_hold_text
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
@@ -50,8 +46,11 @@ from . import child_context as _child_context
 from .background import CancellationRequest, finish_background_child
 from .child_context import (
     _child_base_system_prompt,
+    _child_model_and_budget,
     _compose_child_project_context,
-    _load_child_project_context,
+    _prepare_child_project_context,
+    consume_run,
+    resolve_child_backend,
 )
 from .conversation_channel import NO_HOLD_WAKE, HoldWake, has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
@@ -62,10 +61,23 @@ from .presets import (
     RUN_PRESET,
     AgentPreset,
     resolve_child_profile_tools,
+    valid_max_turns,
 )
-from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
-from .run_consumer import consume_run as consume_follow_up_run
-from .terminal_fence import TerminalTransitionFence
+from .receipt import (
+    MAX_AGENT_RESULT_BYTES,
+    TerminalState,
+    child_cleanup_details,
+    recoverable_error_result,
+)
+from .terminal_fence import TerminalTransitionFence, persist_confirmed_cancel
+from .turn_limit import (
+    ChildTurnControl,
+    finalize_exhausted_child,
+    make_child_progress_callbacks,
+    make_finish_limited_child_turn,
+    make_publish_child_lifecycle,
+    turn_control_for,
+)
 
 _compose_child_system_prompt = _child_context._compose_child_system_prompt
 
@@ -96,10 +108,14 @@ async def consume_child(
     finish_gate_state: FinishGateState | None = None,
     delivering_prompt_id: str | None = None,
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
+    child_store: ConversationStore | None = None,
+    background: bool = False,
+    finish_turn_limit: Callable[[str], dict[str, object]] | None = None,
     hold_wake: HoldWake = NO_HOLD_WAKE,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
+    last_message: Message | None = None
     failure_message: str | None = None
     failure_error: tuple[str, str] | None = None
     explicit_report: dict[str, object] | None = None
@@ -124,7 +140,7 @@ async def consume_child(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
     ) -> None:
-        nonlocal failure_error, failure_message, final_message, explicit_report
+        nonlocal failure_error, failure_message, final_message, last_message, explicit_report
         final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
@@ -182,6 +198,7 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TURN_END:
+                last_message = event.message
                 turns = child_turns() + 1
                 update_turns(turns)
                 if event.data.get("tool_calls") == 0 and event.message is not None:
@@ -220,6 +237,21 @@ async def consume_child(
             await consume_events(events)
         finally:
             await events.aclose()
+        limited_result = await finalize_exhausted_child(
+            control=getattr(child_loop, "child_turn_control", None),
+            text=assistant_text(last_message) if last_message is not None else "",
+            child_session_path=child_path,
+            child_instance_id=child_loop.agent_instance_id or "unknown",
+            child_store=child_store,
+            background=background,
+            owned_children=owned_children,
+            owned_tasks=owned_tasks,
+            terminal_result=terminal_result,
+            finish_turn_limit=finish_turn_limit,
+            record_report=record_report,
+        )
+        if limited_result is not None:
+            return limited_result
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]
@@ -290,94 +322,28 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
-        if failure_error is not None and failure_error[0] in {"account_lock_timeout", "no_progress_loop"}:
-            result = terminal_result(
-                state="idle",
-                text=f"agent error: {failure_message}",
-                error=False,
-                status="running",
-            )
-            structured = result.get("structuredContent")
-            if isinstance(structured, dict):
-                structured["recoverable_error"] = {
-                    "code": failure_error[0],
-                    "message": failure_error[1],
-                }
-            return result
+        if failure_error is not None and failure_error[0] in {
+            "account_lock_timeout",
+            "no_progress_loop",
+        }:
+            return recoverable_error_result(terminal_result, failure_message, *failure_error)
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
         return terminal_result(state="failed", text=text)
+    from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE, has_visible_output
     final_text = assistant_text(final_message)
-    if not final_text.strip():
+    if not has_visible_output(final_message):  # empty or only eviction receipts
         if final_message.metadata.get("stop_reason") == "max_tokens":
-            from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE
-
             return terminal_result(state="completed", text=OUTPUT_LIMIT_ERROR_MESSAGE)
-        text = "agent error: child returned an empty final assistant message"
-        return terminal_result(state="failed", text=text)
+        if child_loop.explicit_finish:  # wrote nothing: idle, not failed
+            return terminal_result(state="idle", text="", status="running")
+        return terminal_result(state="failed", text="agent error: child returned an empty final assistant message")
     if record_report is not None:
         record_report(final_text)
     if child_loop.explicit_finish:
         return terminal_result(state="idle", text=final_text, status="running")
     return terminal_result(state="completed", text=final_text)
-
-
-async def consume_run(
-    child_loop: AgentLoop,
-    prompt: str,
-    *,
-    child_store: ConversationStore,
-    tool_call_id: str = "",
-    max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
-    receipt_components: dict[str, str] | None = None,
-    **kwargs: Any,
-) -> dict[str, object]:
-    """Consume one child run through its follow-up and idle lifecycle."""
-    return await consume_follow_up_run(
-        consume_child,
-        child_loop,
-        prompt,
-        child_store=child_store,
-        tool_call_id=tool_call_id,
-        max_receipt_bytes=max_receipt_bytes,
-        receipt_components=receipt_components,
-        **kwargs,
-    )
-
-
-def resolve_child_backend(
-    loop: AgentLoop, model: object
-) -> tuple[CompletionBackend | None, str | None]:
-    """Give composed child loops a distinct backend owner."""
-    if model is None:
-        if not is_owned_completion_backend(loop.backend):
-            return loop.backend, None
-        model = loop.backend.model
-    if type(model) is not str or not model.strip():
-        return None, "agent error: model must be a nonempty string"
-    try:
-        provider = provider_for_model(model)
-    except ValueError as exc:
-        return None, f"agent error: {exc}"
-    context = getattr(loop, "account_context", None)
-    account_kwargs = context.backend_kwargs(provider) if context is not None else {}
-    store = credential_store(provider, **account_kwargs)
-    if store is not None:
-        tokens = store.read() or store.bootstrap()
-        if tokens is None:
-            message = f"agent error: not logged in to {provider}; "
-            return None, message + f"run zeta login --provider {provider}"
-    try:
-        child_budget = effective_budget_for_model(
-            provider, model, loop.context_assembler.token_budget
-        )
-        backend, _ = build_backend(
-            provider, model, token_budget=child_budget, **account_kwargs
-        )
-    except (OSError, RuntimeError, ValueError) as exc:
-        return None, f"agent error: could not start {provider} backend: {exc}"
-    return backend, None
 
 
 async def _build_child_loop(
@@ -393,6 +359,7 @@ async def _build_child_loop(
     follow_up_loop: bool,
     description: str,
     child_account_context: Any,
+    child_turn_control: ChildTurnControl | None = None,
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
@@ -462,17 +429,9 @@ async def _build_child_loop(
             child_registry.set_approval_policy(child_policy)
         from ..runtime.loop import AgentLoop
 
-        child_model = getattr(child_backend, "model", None)
-        if type(child_model) is not str or not child_model:
-            child_model = model if type(model) is str and model else "unknown"
-        backend_budget = getattr(child_backend, "token_budget", None)
-        child_budget = loop.context_assembler.token_budget
-        if type(backend_budget) is int and backend_budget > 0:
-            child_budget = backend_budget
-        elif isinstance(child_provider, str):
-            child_budget = effective_budget_for_model(
-                child_provider, child_model, child_budget
-            )
+        child_model, child_budget = _child_model_and_budget(
+            loop, child_backend, child_provider, model
+        )
 
         def record_child_usage(usage: Mapping[str, Any]) -> None:
             loop.context_assembler.record_descendant_usage(
@@ -518,27 +477,13 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            child_turn_control=child_turn_control,
             live_config_home=child_home,
             live_config_project_dir=child_project_dir,
             freeze_live_config=child_scope is None,
         )
 
         await child_loop.refresh_live_config(publish=False)
-
-        def prepare_child_project_context(
-            projection: ProjectContextProjection,
-        ) -> ProjectContext:
-            context = _load_child_project_context(
-                loop,
-                cwd_override,
-                child_registry,
-                projection=projection,
-            )
-            return _compose_child_project_context(
-                context,
-                preset,
-                explicit_finish=explicit_finish,
-            )
 
         inherited_prompt = cwd_override is None or same_physical_path(
             cwd_override, loop.store.cwd
@@ -547,7 +492,10 @@ async def _build_child_loop(
             registry=loop.project_registry,
             project_id=loop.root_project_id,
             health=child_context.health,
-            prepare=prepare_child_project_context,
+            prepare=partial(
+                _prepare_child_project_context,
+                loop, cwd_override, child_registry, preset, explicit_finish,
+            ),
             replace_component=("project_memory" if inherited_prompt else None),
         )
         child_loop.explicit_finish = explicit_finish
@@ -643,6 +591,13 @@ async def run_agent_tool(
             "use agent_type 'explore' or 'plan'",
             state="failed",
         )
+    requested_max_turns = arguments.get("max_turns", preset.max_turns)
+    if requested_max_turns is not None and not valid_max_turns(requested_max_turns):
+        return loop._child_result_payload(
+            tool_call.id,
+            "agent error: max_turns must be a positive integer",
+            state="failed",
+        )
     effective_model = model if model is not None else preset.model
     if getattr(loop, "account_context", None) is None:
         child_backend, backend_error = resolve_child_backend(loop, effective_model)
@@ -727,15 +682,26 @@ async def run_agent_tool(
     parent_identity = loop.agent_instance_id or loop.store.session_id
     child_instance_id = f"{parent_identity}:{child_number}"
     agents_root = loop.store.session_dir / "agents"
-    child_store = await loop.store._to_thread_store(
-        lambda: ConversationStore(
+    opened: list[ConversationStore] = []
+
+    def open_child_store() -> ConversationStore:
+        store = ConversationStore(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
             _storage_lease=loop.store._storage_lease,
             _owner_surface="child",
         )
-    )
+        opened.append(store)
+        return store
+
+    try:
+        child_store = await loop.store._to_thread_store(open_child_store)
+    except asyncio.CancelledError:
+        # _to_thread_store finishes the worker before it raises, so close its store.
+        for store in opened:
+            await store._to_thread_store(store.close)
+        raise
     try:
         await child_store._to_thread_store(child_store.activate_runtime_lease)
     except BaseException:
@@ -798,32 +764,18 @@ async def run_agent_tool(
         child_account_pins.snapshot() if child_account_pins is not None else {}
     )
 
-    def publish_child_lifecycle() -> None:
-        account_store = getattr(account_context, "store", None)
-        protected_accounts = {
-            provider: account
-            for provider, account in selected_accounts.items()
-            if account_store is not None and account_store.contains(account)
-        }
-        guard = (
-            account_store.pin_guard(protected_accounts)
-            if protected_accounts
-            else nullcontext()
-        )
-        with guard:
-            child_store.start_agent_lifecycle(
-                handle=child_instance_id,
-                started_at=_now(),
-                depth=child_depth,
-                agent_type=preset.name,
-                description=description,
-                cwd=child_cwd,
-                selected_accounts={
-                    provider: str(account)
-                    for provider, account in selected_accounts.items()
-                }
-                or None,
-            )
+    child_turn_control = turn_control_for(requested_max_turns, child_path)
+
+    publish_child_lifecycle = make_publish_child_lifecycle(
+        account_context=account_context,
+        selected_accounts=selected_accounts,
+        child_store=child_store,
+        child_instance_id=child_instance_id,
+        child_depth=child_depth,
+        preset=preset,
+        description=description,
+        child_cwd=child_cwd,
+    )
 
     try:
         await asyncio.to_thread(publish_child_lifecycle)
@@ -855,6 +807,7 @@ async def run_agent_tool(
             follow_up_loop=follow_up_loop,
             description=description,
             child_account_context=child_account_pins,
+            child_turn_control=child_turn_control,
         )
         loop._background_owner.project_context_loops[child_store.session_id] = (
             child_loop
@@ -941,6 +894,7 @@ async def run_agent_tool(
         notice: str | None = None,
         notice_items: Sequence[str] | None = None,
         max_bytes: int | None = None,
+        persist_receipt: bool = True,
     ) -> dict[str, object]:
         payload = loop._child_result_payload(
             tool_call.id,
@@ -959,7 +913,7 @@ async def run_agent_tool(
             notice_items=notice_items,
             max_bytes=max_bytes,
         )
-        if not background and state is not None:
+        if not background and state is not None and persist_receipt:
             content = payload.get("content")
             if (
                 isinstance(content, list)
@@ -971,6 +925,14 @@ async def run_agent_tool(
                     content[0]["text"], canonical_receipt=True
                 )
         return payload
+
+    finish_turn_limit = make_finish_limited_child_turn(
+        store=child_store,
+        child_session_path=child_path,
+        turns_used=child_turns,
+        stats=lambda turns: agent_stats(child_store.agent_lifecycle(), turns_used=turns),
+        build_result=child_result,
+    )
 
     def publish_lifecycle(
         kind: str,
@@ -1003,13 +965,12 @@ async def run_agent_tool(
         elif lifecycle_sink is not None:
             lifecycle_sink(kind, call, data, tool_result)
 
-    def update_turns(turns: int) -> None:
-        loop._agent_child_turns[tool_call.id] = turns
-        child_store.update_agent_lifecycle(turns_used=turns)
-        loop.store.update_agent_child_turns(child_marker_key, turns)
-
-    def record_tool_call() -> None:
-        child_store.update_agent_lifecycle(tool_calls=1)
+    update_turns, record_tool_call = make_child_progress_callbacks(
+        loop=loop,
+        child_store=child_store,
+        child_marker_key=child_marker_key,
+        child_tool_call_id=tool_call.id,
+    )
 
     consume = consume_run if follow_up_loop else consume_child
     loop._background_owner.causal_episodes.associate_new_member(
@@ -1026,6 +987,7 @@ async def run_agent_tool(
             ),
             "receipt_components": receipt_components,
             "finish_gate_state": finish_gate_state,
+            "finish_turn_limit": finish_turn_limit,
             "explicit_finish_metadata": {
                 "child_instance_id": child_instance_id,
                 "description": description,
@@ -1040,6 +1002,8 @@ async def run_agent_tool(
                 "report", report
             ),
             "finish_gate_state": finish_gate_state,
+            "child_store": child_store,
+            "finish_turn_limit": finish_turn_limit,
         }
     )
     child_task = loop._create_task(
@@ -1072,15 +1036,25 @@ async def run_agent_tool(
         nonlocal child_canceled
         if child_canceled:
             return False
-        if terminal_fence is not None and not await terminal_fence.cancel():
-            return False
+        # Claim before any await: concurrent requests (owner cleanup and the
+        # child's own abort path) must not both write; a failed write releases it.
         child_canceled = True
-        return True
+        try:
+            return await persist_confirmed_cancel(
+                terminal_fence, child_store, tool_call.id
+            )
+        except BaseException:
+            child_canceled = False
+            raise
 
     async def cleanup_canceled_child(
         confirmation: asyncio.Task[bool],
     ) -> None:
-        if not await confirmation:
+        try:
+            confirmed = await confirmation
+        except Exception:  # noqa: BLE001 - the caller reports confirmation failures
+            return
+        if not confirmed:
             return
         child_loop.admit_abort()
         child_loop.tool_registry.abort()
@@ -1090,7 +1064,6 @@ async def run_agent_tool(
             child_task.cancel()
         await loop._background_owner.wait_for_descendant_watchers(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
-        child_store.mark_agent_canceled(tool_call.id)
 
     def request_child_cancel() -> CancellationRequest:
         """Start durable cancellation and tree-owned cleanup."""
@@ -1136,11 +1109,10 @@ async def run_agent_tool(
             loop._background_owner.project_context_loops.pop(
                 child_store.session_id, None
             )
+            loop._background_owner.finish_store(child_instance_id, child_store)
             loop._background_owner.unregister(child_instance_id)
             if child_policy is not None:
                 await child_policy.cleanup()
-            loop._background_owner.mark_store_finished(child_store)
-            loop._background_owner.release_unused_stores()
 
         async def close_background_child(cause: str) -> tuple[str, ...]:
             return tuple(
@@ -1267,9 +1239,21 @@ async def run_agent_tool(
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
-        await child_loop.close(
-            cancel_background=False,
-            background_task_cause=child_cleanup_details(
-                "foreground", child_task.cancelled()
-            )[0],
+        close_task = asyncio.create_task(
+            child_loop.close(
+                cancel_background=False,
+                background_task_cause=child_cleanup_details(
+                    "foreground", child_task.cancelled()
+                )[0],
+            )
         )
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            while not close_task.done():
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    continue
+            close_task.result()
+            raise

@@ -218,6 +218,7 @@ class _WarmStepDeliveryCommand(_StoreMutationCommand):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _CommitDeliveryInputCommand(_StoreMutationCommand):
     item: Any
+    return_committed_on_cancel: bool = False
 
     def apply(self, store: Any) -> Any:
         return store._commit_delivery_input(self.item)
@@ -278,6 +279,12 @@ class _CancelExplicitChildCommand(_StoreMutationCommand):
 class _ExplicitFinishReportCommand(_StoreMutationCommand):
     def apply(self, store: Any) -> Any:
         return store._explicit_finish_report()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _TerminalTransitionCommand(_StoreMutationCommand):
+    def apply(self, store: Any) -> str | None:
+        return store._terminal_transition()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -344,6 +351,14 @@ class _FinishAgentChildCommand(_StoreMutationCommand):
 class _FinishAgentParentCommand(_StoreMutationCommand):
     def apply(self, store: Any) -> None:
         store.finish_agent_parent()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _EnsureTurnLimitHandoffCommand(_StoreMutationCommand):
+    content: bytes
+
+    def apply(self, store: Any) -> bool:
+        return store.ensure_turn_limit_handoff(self.content)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -462,6 +477,7 @@ async def _submit_durable_mutation[DurableT, ResultT](
     worker_context: object | None = None,
     submission_failed: Callable[[], None] | None = None,
     cancelled: Callable[[MutationCancellationPolicy], None] | None = None,
+    return_committed_on_cancel: bool = False,
 ) -> ResultT:
     """Submit one durable mutation and enforce its cancellation policy."""
     cancellation = _MutationCancellation(worker_context)
@@ -501,6 +517,9 @@ async def _submit_durable_mutation[DurableT, ResultT](
                 result = adopted
                 break
     task = asyncio.current_task()
+    if return_committed_on_cancel:
+        # The caller reports a committed outcome instead of a lost cancellation.
+        return result
     if was_cancelled or (task is not None and task.cancelling() > 0):
         raise asyncio.CancelledError
     return result
@@ -859,6 +878,8 @@ class AsyncDurableWritesMixin:
             worker_context=baseline,
             submission_failed=self._mutation_submission_failed,
             cancelled=self._submitted_mutation_cancelled,
+            return_committed_on_cancel=isinstance(command, _CommitDeliveryInputCommand)
+            and command.return_committed_on_cancel,
         )
 
     def _address_commit_queued(self: ConversationStore) -> None:
@@ -916,9 +937,13 @@ class AsyncDurableWritesMixin:
     async def warm_step_delivery_writer(self: ConversationStore) -> None:
         await self._commit_storage_command(_WarmStepDeliveryCommand())
 
-    async def commit_delivery_input(self: ConversationStore, item: Any) -> Any:
+    async def commit_delivery_input(
+        self: ConversationStore, item: Any, *, return_committed_on_cancel: bool = False
+    ) -> Any:
         return await self._commit_storage_command(
-            _CommitDeliveryInputCommand(item=item)
+            _CommitDeliveryInputCommand(
+                item=item, return_committed_on_cancel=return_committed_on_cancel
+            )
         )
 
     async def stage_delivery_request(
@@ -972,6 +997,16 @@ class AsyncDurableWritesMixin:
 
     async def explicit_finish_report(self: ConversationStore) -> Any:
         return await self._commit_storage_command(_ExplicitFinishReportCommand())
+
+    async def terminal_transition(self: ConversationStore) -> str | None:
+        return await self._commit_storage_command(_TerminalTransitionCommand())
+
+    async def mark_agent_canceled_async(
+        self: ConversationStore, parent_tool_call_id: str
+    ) -> None:
+        await self._commit_storage_command(
+            _MarkAgentCanceledCommand(tool_call_id=parent_tool_call_id)
+        )
 
     async def idle_nudge_eligible(
         self: ConversationStore, notification_ids: frozenset[str]
