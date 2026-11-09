@@ -75,6 +75,7 @@ from ...providers.completion import (
     CompletionControl,
     CompletionRetryBudget,
     CompletionRun,
+    ProviderAccountSwitched,
     ResetPolicy,
 )
 from ...runtime.tool_setup import select_tool_registry
@@ -88,6 +89,7 @@ from ..prompt import RuntimePrompt
 from ._completion import (
     _error_info,
     _sanitize_account_message,
+    account_generation,
     can_retry_context,
     ensure_context_reduced,
     observed_completion,
@@ -98,7 +100,9 @@ from ._completion import (
 from ._store_writes import StoreWriteMixin
 from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
+    NO_PROGRESS_LOOP_CODE,
     OUTPUT_LIMIT_ERROR_MESSAGE,
+    DispatchProgress,
     EmptyTurnRecoveryState,
     build_nudge_message,
     build_tool_limit_recovery_message,
@@ -108,11 +112,11 @@ from .empty_turn import (
     read_turn_metadata,
     should_nudge_empty_turn,
 )
+from .live_config import LiveConfigMixin
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_context_recovery import ProjectContextRecoveryMixin
 from .project_inbox import ProjectInboxNotificationMixin
-from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
@@ -133,7 +137,7 @@ class AgentLoop(
     TurnPersistenceMixin,
     ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
-    SkillRefreshMixin,
+    LiveConfigMixin,
     StoreWriteMixin,
     AgentNotificationMixin,
     ProjectInboxNotificationMixin,
@@ -171,9 +175,9 @@ class AgentLoop(
         child_lineage_publisher: ChildLineagePublisher | None = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
-        skill_home: Path | None = None,
-        skill_project_dir: Path | None = None,
-        freeze_skill_catalog: bool = False,
+        live_config_home: Path | None = None,
+        live_config_project_dir: Path | None = None,
+        freeze_live_config: bool = False,
     ) -> None:
         if type(max_agent_depth) is not int or not (
             0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
@@ -279,10 +283,11 @@ class AgentLoop(
             self.tool_registry.set_approval_policy(approval_policy)
         if self.tool_registry.approval_policy is not None:
             self.tool_registry.bind_approval_store(store)
-        self.tool_schemas = list(
+        self.tool_schemas = tuple(
             tool_schemas if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
+        self._dispatch_progress = DispatchProgress()
         if system_prompt is None:
             system_prompt = load_identity(catalog=self.tool_registry.skill_catalog)
         self.context_assembler = context_assembler or ContextAssembler(
@@ -295,11 +300,12 @@ class AgentLoop(
             usage_sink=usage_sink,
         )
         self._initialize_step_delivery(store)
-        self._configure_skill_refresh(
-            catalog=self.tool_registry.skill_catalog,
-            home=skill_home,
-            project_dir=skill_project_dir,
-            frozen=freeze_skill_catalog,
+        self._configure_live_config(
+            skill_catalog=self.tool_registry.skill_catalog,
+            agent_catalog=self.tool_registry.agent_catalog,
+            home=live_config_home,
+            project_dir=live_config_project_dir,
+            frozen=freeze_live_config,
             runtime_prompt=runtime_prompt,
         )
         self.on_completion_success = on_completion_success
@@ -358,7 +364,6 @@ class AgentLoop(
             self.step_delivery.capacity_changed()
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
-
     def admit_abort(self) -> None:
         self._abort_admitted = True
 
@@ -730,7 +735,7 @@ class AgentLoop(
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         self._advance_project_context_recovery()
-        await self.refresh_skills()
+        await self.refresh_live_config()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
         await self._check_project_inbox()
@@ -749,7 +754,7 @@ class AgentLoop(
             raise ValueError("cannot reuse a user message that is not persisted")
         if system_message is None and persist_user_message:
             await self._append_turn_message(user_message)
-        await self._flush_skill_refresh_notices()
+        await self._flush_live_config_notices()
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()
@@ -899,6 +904,8 @@ class AgentLoop(
                     notification_turn=notification_turn,
                     notice_sink=self._mcp_notice_sink,
                 )
+                if disposition == "dispatch":
+                    disposition = self._dispatch_progress.admit(self.store, prepared_delivery, step_delivery, retrying_context, waits_for_input=self.agent_instance_id is None or self.explicit_finish)
                 if disposition == "deferred":
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
@@ -906,6 +913,8 @@ class AgentLoop(
                     self._persist_partial_with_cancelled_tools(
                         [], None, failure=disposition
                     )
+                    if disposition.code == NO_PROGRESS_LOOP_CODE and self.agent_instance_id is not None:
+                        await self._background_owner.conversation_channel.publish_not_delivered(self, disposition.message)
                     yield StreamEvent(StreamEventType.ERROR, error=disposition)
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
@@ -932,6 +941,8 @@ class AgentLoop(
                         ),
                         budget=provider_retry_budget,
                         task_deadline=task_deadline,
+                        account_generation=account_generation(self),
+                        account_limit=getattr(getattr(self, "account_context", None), "subscription_limit_event", None),
                     ),
                 )
                 has_active_delivery = prepared_delivery.has_active_delivery
@@ -1010,6 +1021,10 @@ class AgentLoop(
                     await completion.aclose()
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
+            except ProviderAccountSwitched:  # redispatch through the new account's backend
+                await completion.aclose()  # type: ignore[union-attr]
+                self._dispatch_progress.reset()
+                continue
             except Exception as exc:
                 if completion is not None:
                     await completion.aclose()
@@ -1077,6 +1092,7 @@ class AgentLoop(
                             original,
                             provider_error=getattr(original, "provider_error", True),
                         )
+                self._dispatch_progress.reset()
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )

@@ -26,6 +26,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.context import ContextAssembler
 from zeta.core.project_context import project_instructions_editor_command
 from zeta.core.session import (
@@ -660,7 +661,7 @@ async def test_project_instructions_serve_does_not_start_editor(
         return func()
 
     monkeypatch.setattr(tui_app, "run_in_terminal", run_in_terminal)
-    result = await registry.dispatch_async(SimpleNamespace(), "/project-instructions")
+    result = await registry.dispatch_async(SimpleNamespace(slash_lock=SlashLock()), "/project-instructions")
 
     assert result == f"project instructions: {private}"
     assert private.is_file()

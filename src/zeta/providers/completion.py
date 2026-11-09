@@ -24,6 +24,21 @@ from ..protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from .must_complete_close import (
+    DeadlineClock,
+    MonotonicDeadlineClock,
+    MustCompleteClose,
+    task_is_cancelling,
+)
+from .rate_limit_hold import (
+    RATE_LIMIT_CREDENTIAL_POLL_SECONDS,
+    RATE_LIMIT_PROBE_SECONDS,
+    credential_fingerprint,
+    is_rate_limit_hold,
+    rate_limit_hold_text,
+    retry_after_seconds,
+    subscription_limit_wait,
+)
 
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
@@ -32,7 +47,6 @@ MAX_ACCOUNT_LOCK_ATTEMPTS = 5
 MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
 MODEL_PROGRESS_IDLE_SECONDS = 15 * 60.0
-
 _RETRYABLE_STATUS_CODES = {
     408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529
 }
@@ -60,26 +74,6 @@ class AttemptSignal:
     activity: TransportActivity
     event: StreamEvent | None = None
 
-
-class DeadlineClock(Protocol):
-    def now(self) -> float: ...
-
-    async def wait_until(self, deadline: float) -> None: ...
-
-
-class MonotonicDeadlineClock:
-    def now(self) -> float:
-        return time.monotonic()
-
-    async def wait_until(self, deadline: float) -> None:
-        loop = asyncio.get_running_loop()
-        ready = loop.create_future()
-        timer = loop.call_at(deadline, ready.set_result, None)
-        try:
-            # test-contract: seam this future is the injected deadline clock
-            await ready
-        finally:
-            timer.cancel()
 
 
 def is_control_exception(value: BaseException) -> bool:
@@ -149,6 +143,9 @@ class RetryPlan:
     delay: float
     is_stall: bool = False
     is_account_lock: bool = False
+    is_rate_limit_hold: bool = False
+    retry_after: float | None = None
+    subscription_limit: Any = None
 
 
 @dataclass(slots=True)
@@ -173,8 +170,21 @@ class CompletionRetryBudget:
     attempt_started_at: float | None = None
     committed: bool = False
 
-    def start_attempt(self, owner: str, now: float, *, is_stall: bool = False) -> bool:
+    def start_attempt(
+        self,
+        owner: str,
+        now: float,
+        *,
+        is_stall: bool = False,
+        is_rate_limit_hold: bool = False,
+    ) -> bool:
         del is_stall
+        if is_rate_limit_hold:
+            self.attempt_started_at = now
+            self.attempt_records.append(
+                {"attempt": self.attempts, "owner": owner, "probe": True}
+            )
+            return True
         # lock waits have their own bound in _plan_account_lock; they do not use provider attempts
         if self.attempts - self.account_lock_attempts >= self.max_attempts:
             self.exhausted = True
@@ -195,6 +205,17 @@ class CompletionRetryBudget:
         first_failure = self.original_error is None
         if first_failure:
             self.original_error = source
+        limit = getattr(source, "subscription_limit", None)
+        if limit is not None and not self.exhausted:
+            wait = subscription_limit_wait(limit.resets_at.timestamp(), time.time())
+            return RetryPlan(
+                attempt=self.attempts,
+                reason="subscription_limit",
+                delay=wait,
+                is_rate_limit_hold=True,
+                retry_after=wait,
+                subscription_limit=limit,
+            )
         if self.exhausted or not retryable_provider_error(source, event_data):
             return None
         is_account_lock = getattr(source, "code", None) == "account_lock_timeout"
@@ -211,11 +232,11 @@ class CompletionRetryBudget:
             )
             self.account_lock_exclusion_started_at = None
         generic_attempts = self.attempts - self.account_lock_attempts
+        explicit_retry_after = retry_after_seconds(source, event_data)
         if generic_attempts >= self.max_attempts:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return None
-        explicit_retry_after = retry_after_seconds(source, event_data)
         delay = retry_wait_seconds(source, generic_attempts, event_data)
         is_stall = bool(getattr(source, "is_stall", False))
         stall_seconds = getattr(source, "stall_seconds", 0.0)
@@ -235,12 +256,22 @@ class CompletionRetryBudget:
             - self.excluded_stall_seconds
             - self.excluded_account_lock_seconds
         )
+        if (
+            is_rate_limit_hold(source, explicit_retry_after)
+            and elapsed + delay > MAX_PROVIDER_RETRY_SECONDS
+        ):
+            return RetryPlan(
+                attempt=self.attempts,
+                reason=retry_reason(source),
+                delay=min(delay, RATE_LIMIT_PROBE_SECONDS),
+                is_rate_limit_hold=True,
+                retry_after=explicit_retry_after,
+            )
         if (not is_stall or has_stall_duration) and elapsed + delay > MAX_PROVIDER_RETRY_SECONDS:
             self.exhausted = True
             record: dict[str, object] = {"decision": "budget-exhausted"}
             if explicit_retry_after is not None:
                 record["retry_after"] = explicit_retry_after
-                explain_unhonored_retry_after(source, explicit_retry_after)
             self.records.append(record)
             return None
         return RetryPlan(
@@ -295,6 +326,10 @@ class CompletionControl:
     reset: ResetPolicy
     budget: CompletionRetryBudget
     task_deadline: float | None
+    # the session's account identity; a change ends a rate-limit hold at once
+    account_generation: Callable[[], object] | None = None
+    # records a subscription limit and returns the user's recovery suggestion, if any
+    account_limit: Callable[[object], Awaitable[dict[str, object] | None]] | None = None
 
 
 class ProviderAttempt(Protocol):
@@ -344,12 +379,18 @@ def is_completion_sentinel(event: StreamEvent) -> bool:
 _ATTEMPT_END = object()
 
 
+# how long an attempt close may run before its owner stops it; below the
+# lease drain bound, so a stuck close releases its borrow before the lease
+# close names it.
+ATTEMPT_CLOSE_BOUND = 20.0
+
+
 class IteratorProviderAttempt:
     """Expose decoder activity and output through one owned attempt handle."""
 
     def __init__(self, source: AsyncIterator[StreamEvent]) -> None:
         self._source = source
-        self._closed = False
+        self._close = MustCompleteClose("provider attempt", ATTEMPT_CLOSE_BOUND)
         self._producer: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[AttemptSignal | BaseException | object] = (
             asyncio.Queue()
@@ -402,40 +443,67 @@ class IteratorProviderAttempt:
         return item
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._producer is not None and not self._producer.done():
-            self._producer.cancel()
-            # test-contract: seam producer cancellation must drain fully
-            await asyncio.gather(self._producer, return_exceptions=True)
-            # this close cancelled the producer; a bare cancellation is not a
-            # source outcome (a chained one still carries the source error).
-            if (
-                isinstance(self._producer_error, asyncio.CancelledError)
-                and self._producer_error.__cause__ is None
-            ):
-                self._producer_error = None
-        elif self._producer is not None:
-            # test-contract: seam producer completion must drain fully
-            await asyncio.gather(self._producer, return_exceptions=True)
+        # the close runs as one owned task: a cancelled caller (task deadline,
+        # client disconnect, server close) cannot stop it before the source
+        # closes and releases what it holds (an HTTP lease borrow); it only
+        # tells the close not to wait on slow transport closes.
+        self._close.start(self._close_source)
+        if task_is_cancelling():
+            self._close.abort()
+        try:
+            await self._close.wait()
+        except asyncio.CancelledError:
+            self._close.abort()
+            raise
+
+    async def _close_source(self) -> None:
+        producer = self._producer
+        if producer is not None:
+            if producer.cancel():
+                await _drain_cancelled(producer)
+                # this close cancelled the producer; a bare cancellation is not
+                # a source outcome (a chained one still carries the source error).
+                if (
+                    isinstance(self._producer_error, asyncio.CancelledError)
+                    and self._producer_error.__cause__ is None
+                ):
+                    self._producer_error = None
+            else:
+                # test-contract: seam producer completion must drain fully
+                await asyncio.gather(producer, return_exceptions=True)
         close = getattr(self._source, "aclose", None)
         if close is not None:
             try:
+                # test-contract: seam the owner abort or bound ends this source close
                 await close()
             except asyncio.CancelledError as error:
                 if self._producer_error is not None:
                     raise error from self._producer_error
                 raise
-        if (
-            self._producer_error is not None
-            and not self._error_delivered
-            and (
-                not isinstance(self._producer_error, asyncio.CancelledError)
-                or self._producer_error.__cause__ is not None
-            )
-        ):
-            raise self._producer_error
+        if self._undelivered_error is not None:
+            raise self._undelivered_error
+
+    @property
+    def _undelivered_error(self) -> BaseException | None:
+        error = self._producer_error
+        if error is None or self._error_delivered:
+            return None
+        if isinstance(error, asyncio.CancelledError) and error.__cause__ is None:
+            return None
+        return error
+
+
+async def _drain_cancelled(producer: asyncio.Task[None]) -> None:
+    """Wait for a cancelled producer to unwind; an owner abort does not skip it."""
+    try:
+        # test-contract: seam producer cancellation must drain fully
+        await asyncio.gather(producer, return_exceptions=True)
+    except asyncio.CancelledError:
+        # abort: the gather passed the cancellation on to the producer, and the
+        # close keeps waiting for it to release what it holds. this wait is not
+        # bounded here: the owner's terminal bound cancels it and stops waiting.
+        # test-contract: seam the owner bound ends this drain
+        await asyncio.gather(producer, return_exceptions=True)
 
 
 class AuthIteratorProviderAttempt(IteratorProviderAttempt):
@@ -525,6 +593,10 @@ class CompletionCleanupError(RuntimeError):
     """Closing a successful provider attempt failed."""
 
 
+class ProviderAccountSwitched(Exception):
+    """The session switched accounts during a hold; redispatch through the new backend."""
+
+
 class TaskDeadlineExceeded(TimeoutError):
     """The enclosing finish-gate task deadline expired."""
 
@@ -580,6 +652,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._last_model_progress: float | None = None
         self._maximum_progress_gap = 0.0
         self._retry_usage: dict[str, Any] | None = None
+        self._rate_limit_hold = False
+        self._rate_limit_state: object | None = None
 
     def __aiter__(self) -> CompletionRun:
         return self
@@ -676,9 +750,14 @@ class CompletionRun(AsyncIterator[StreamEvent]):
 
     async def _open_attempt(self) -> None:
         now = self._clock.now()
-        if not self._control.budget.start_attempt(self._adapter.provider, now):
+        if not self._control.budget.start_attempt(
+            self._adapter.provider,
+            now,
+            is_rate_limit_hold=self._rate_limit_hold,
+        ):
             self._closed = True
             raise RuntimeError("provider retry budget exhausted")
+        self._rate_limit_hold = False
         self._attempt_salvaged = False
         self._attempt = self._adapter.create_attempt(
             self._messages, self._tool_schemas, self._token
@@ -813,10 +892,49 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         if self._emitted:
             self._pending.append(StreamEvent(StreamEventType.ASSISTANT_RESET))
             self._emitted = False
+        if plan.subscription_limit is not None and self._control.account_limit is not None:
+            # a suggestion only: the runtime never switches accounts by itself
+            suggestion = await self._control.account_limit(error)
+            if suggestion is not None:
+                self._pending.append(StreamEvent(StreamEventType.ACCOUNT_LIMIT, data=suggestion))
         self._pending_retry = plan
+        self._rate_limit_hold = plan.is_rate_limit_hold
+        if plan.is_rate_limit_hold:
+            self._rate_limit_state = self._hold_generation()
         return True
 
+    def _hold_generation(self) -> tuple[object, object]:
+        account = self._control.account_generation
+        return (
+            credential_fingerprint(getattr(self._adapter, "token_store", None)),
+            account() if account is not None else None,
+        )
+
     async def _wait_for_retry(self, delay: float) -> None:
+        if self._rate_limit_hold:
+            await self._wait_for_rate_limit_hold(delay)
+            return
+        await self._wait_step(delay)
+
+    async def _wait_for_rate_limit_hold(self, delay: float) -> None:
+        """Wait out a hold; a re-login wakes it, an account switch ends this run."""
+
+        initial = self._rate_limit_state
+        assert isinstance(initial, tuple)
+        remaining = delay
+        while remaining > 0:
+            step = min(remaining, RATE_LIMIT_CREDENTIAL_POLL_SECONDS)
+            await self._wait_step(step)
+            credential, account = self._hold_generation()
+            if account != initial[1]:
+                # this adapter belongs to the old account; the caller redispatches
+                self._closed = True
+                raise ProviderAccountSwitched("session account changed during rate-limit hold")
+            if credential != initial[0]:
+                return
+            remaining -= step
+
+    async def _wait_step(self, delay: float) -> None:
         await self._await_step(
             self._wait(delay),
             deadline=self._control.task_deadline,
@@ -881,6 +999,29 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         )
 
     def _retry_notice(self, plan: RetryPlan, error: object) -> StreamEvent:
+        if plan.is_rate_limit_hold:
+            assert plan.retry_after is not None
+            limit = plan.subscription_limit
+            data: dict[str, Any] = {
+                "kind": "provider_rate_limit_hold",
+                "limit": "rate" if limit is None else "subscription",
+                "delay": plan.delay,
+                "retry_after": plan.retry_after,
+                "until": time.time() + plan.retry_after,
+                "provider": self._adapter.provider,
+                "attempt": plan.attempt,
+                "reason": plan.reason,
+            }
+            if limit is not None:
+                data["until"] = limit.resets_at.timestamp()
+                data["account"] = str(limit.account)
+                data["text"] = f"{limit.account} {rate_limit_hold_text(data)}"
+                return StreamEvent(StreamEventType.RETRY, data=data)
+            data["text"] = (
+                f"{self._adapter.provider} {rate_limit_hold_text(data)} "
+                "(log in again or switch account to resume sooner)"
+            )
+            return StreamEvent(StreamEventType.RETRY, data=data)
         if plan.is_account_lock:
             return StreamEvent(
                 StreamEventType.RETRY,
@@ -1089,17 +1230,6 @@ def retryable_provider_error(
         and event_data.get("retryable") is True
     )
 
-
-def retry_after_seconds(
-    error: BaseException | object,
-    event_data: Mapping[str, Any] | None = None,
-) -> float | None:
-    value = getattr(error, "retry_after", None)
-    if value is None and event_data is not None:
-        value = event_data.get("retry_after")
-    return max(0.0, float(value)) if type(value) in {int, float} else None
-
-
 def retry_wait_seconds(
     error: BaseException | object,
     retry_number: int,
@@ -1110,17 +1240,6 @@ def retry_wait_seconds(
         return explicit_retry_after
     base = min(MAX_PROVIDER_RETRY_DELAY_SECONDS, float(2 ** (retry_number - 1)))
     return min(MAX_PROVIDER_RETRY_DELAY_SECONDS, random.uniform(base * 0.5, base * 1.5))
-
-
-def explain_unhonored_retry_after(source: BaseException | object, delay: float) -> None:
-    if isinstance(source, BaseException):
-        source.args = (
-            (
-                f"{source}; provider requested Retry-After of {delay:g}s, longer than "
-                f"the remaining turn retry budget (maximum "
-                f"{MAX_PROVIDER_RETRY_SECONDS:g}s); not retrying early"
-            ),
-        )
 
 
 def retry_reason(error: BaseException | object) -> str:

@@ -60,6 +60,12 @@ def image_stub(block: Mapping[str, object]) -> dict[str, object]:
     return stub
 
 
+def config_changed_wire_fields(event: StreamEvent) -> dict[str, object]:
+    """Return the prepared live-config payload without rebuilding it."""
+
+    return {"data": event.data}
+
+
 def project_tool_value(value: object) -> tuple[object, bool]:
     """Bound string leaves in tool wire data."""
     if isinstance(value, str):
@@ -88,6 +94,7 @@ LEGACY_NOTIFICATION_WIRE_EVENT = EventDescriptor.SUB_AGENT_RECEIPT
 NOTIFICATION_WIRE_EVENTS = {
     "agent_completion": LEGACY_NOTIFICATION_WIRE_EVENT,
     "child_idle": EventDescriptor.CHILD_IDLE,
+    "child_hold": EventDescriptor.CHILD_HOLD,
     "task_exited": EventDescriptor.TASK_EXIT_NOTIFICATION,
     "project_inbox": EventDescriptor.PROJECT_INBOX_NOTIFICATION,
     "child_question": EventDescriptor.CHILD_QUESTION,
@@ -236,6 +243,7 @@ STREAM_EVENT_WIRE_EVENTS = {
     StreamEventType.TOOL_EXECUTION_UPDATE: EventDescriptor.TOOL_OUTPUT,
     StreamEventType.TOOL_EXECUTION_END: EventDescriptor.TOOL_END,
     StreamEventType.AGENT_NOTIFICATION: EventDescriptor.SUB_AGENT_RECEIPT,
+    StreamEventType.CONFIG_CHANGED: EventDescriptor.CONFIG_CHANGED,
     StreamEventType.CHILD_MESSAGE_DELIVERED: EventDescriptor.CHILD_MESSAGE_DELIVERED,
     StreamEventType.ACCOUNT_LIMIT: EventDescriptor.ACCOUNT_LIMIT,
     StreamEventType.ACCOUNT_STATE_UNKNOWN: EventDescriptor.ACCOUNT_STATE_UNKNOWN,

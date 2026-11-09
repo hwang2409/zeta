@@ -14,7 +14,10 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.layout.controls import UIContent
+from rich.ansi import re_ansi
 from rich.console import Console
+from rich.padding import Padding
+from rich.segment import Segment
 from rich.text import Text
 from rich.theme import Theme
 
@@ -29,6 +32,7 @@ from .transcript_search import (
 
 _LAZY_TAIL_MIN_UNITS = 128
 _VIRTUAL_MARGIN_SCREENS = 1
+_ANSI_SENTINEL = "\ue000"
 
 
 class _HeightIndex:
@@ -85,6 +89,32 @@ class TranscriptVirtualMixin:
     """Bound synchronous transcript work to units in or entering the viewport."""
 
     @staticmethod
+    def _plain_search_segments(
+        segments: list[Segment], console: Console
+    ) -> str | None:
+        if any(
+            _ANSI_SENTINEL in segment.text
+            or "\x1b(" in segment.text
+            or ("\x1b" in segment.text and not segment.control)
+            for segment in segments
+        ):
+            return None
+
+        output: list[str] = []
+        for text, style, _control in segments:
+            if style:
+                text = style.render(
+                    text,
+                    color_system=console.color_system,
+                    legacy_windows=console.legacy_windows,
+                )
+            output.append(re_ansi.sub(_ANSI_SENTINEL, text))
+        rendered = "".join(output)
+        rendered = "\n".join(line.rstrip(" ") for line in rendered.splitlines())
+        decoded = "\n".join(line.rsplit("\r", 1)[-1] for line in rendered.split("\n"))
+        return decoded.replace(_ANSI_SENTINEL, "")
+
+    @staticmethod
     def _render_search_snapshot(
         renderable: Any, width: int, rich_theme: Theme
     ) -> str:
@@ -99,6 +129,21 @@ class TranscriptVirtualMixin:
             width=max(1, width),
             theme=rich_theme,
         )
+        if not isinstance(renderable, Padding) or not isinstance(
+            renderable.renderable, Text
+        ):
+            console.print(renderable)
+            rendered = "\n".join(
+                line.rstrip(" ") for line in output.getvalue().splitlines()
+            )
+            return Text.from_ansi(rendered).plain
+
+        plain = TranscriptVirtualMixin._plain_search_segments(
+            list(console.render(renderable, console.options)), console
+        )
+        if plain is not None:
+            return plain
+
         console.print(renderable)
         rendered = "\n".join(
             line.rstrip(" ") for line in output.getvalue().splitlines()

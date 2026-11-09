@@ -668,6 +668,109 @@ async def test_persistent_503_bounded_total_requests(
 
 
 @pytest.mark.asyncio
+async def test_long_rate_limit_enters_hold_and_reprobes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    waits: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "524749"},
+                json={"error": {"message": "busy"}},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    async def fake_wait(delay: float) -> None:
+        waits.append(delay)
+
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    backend = AnthropicBackend(client=client, token_store=store)
+    backend._completion_wait = fake_wait
+    events: list[StreamEvent] = []
+    outcome = "completed"
+    try:
+        async for event in backend.complete([], [], control=completion_control()):
+            events.append(event)
+    except AnthropicHTTPError as exc:
+        outcome = f"failed: {exc}"
+    finally:
+        await client.aclose()
+    text = "".join(
+        event.delta or ""
+        for event in events
+        if event.type is StreamEventType.MESSAGE_UPDATE
+    )
+
+    assert (outcome, text) == ("completed", "hello"), "the turn must survive a long Retry-After"
+    assert len(requests) == 2
+    hold = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert hold.data["kind"] == "provider_rate_limit_hold"
+    assert hold.data["delay"] == 300
+    assert hold.data["retry_after"] == 524749
+    # the credential file is checked every 5 s; nothing changed, so the full 300 s passed
+    assert sum(waits) == 300 and max(waits) == 5
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_hold_wakes_on_relogin(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    waits: list[float] = []
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "524749"},
+                json={"error": {"message": "busy"}},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    async def relogin_during_wait(delay: float) -> None:
+        waits.append(delay)
+        if len(waits) == 1:
+            store.save(OAuthTokens("access-after-relogin", "refresh-new", 4_000_000_000))
+
+    client = client_for(handler)
+    backend = AnthropicBackend(client=client, token_store=store)
+    backend._completion_wait = relogin_during_wait
+    events: list[StreamEvent] = []
+    outcome = "completed"
+    try:
+        async for event in backend.complete([], [], control=completion_control()):
+            events.append(event)
+    except AnthropicHTTPError as exc:
+        outcome = f"failed: {exc}"
+    finally:
+        await client.aclose()
+
+    assert outcome == "completed"
+    assert waits == [5], "a re-login must end the hold at the next 5 s check"
+    assert requests[-1].headers["authorization"] == "Bearer access-after-relogin"
+    assert any(event.delta == "hello" for event in events)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504, 529])
 async def test_each_retryable_status_retries_before_stream(
     tmp_path: Path,

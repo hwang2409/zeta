@@ -15,6 +15,7 @@ import pytest
 
 import zeta.mcp.server_actor as server_actor_module
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from tests.support.serve_contract import ServeClient
 from tests.support.tui_render import render_full_screen
 from zeta.config.settings import load_settings
@@ -29,7 +30,7 @@ from zeta.mcp.server_actor import MCPServerActor
 from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.skills import SkillCatalog
-from zeta.tools._spill import SpillStore
+from zeta.tools._spill import SpillByteBudget, SpillStore
 from zeta.tools.registry import ToolRegistry
 from zeta.tui.app import TUIApp
 
@@ -532,6 +533,157 @@ async def test_spill_reservation_rejects_before_cap_and_releases() -> None:
     with pytest.raises(ValueError, match="exceeds its reservation"):
         release(1)
     spill.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_spill_reservation_is_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget = SpillByteBudget(max_bytes=100)
+    spill = SpillStore(byte_budget=budget)
+    spill.configure_transient_limit(100)
+    reserved = threading.Event()
+    release = threading.Event()
+    released = threading.Event()
+    real_reserve = spill.reserve_transient
+    real_release = spill.release_transient
+
+    def gated_reserve(byte_count: int) -> None:
+        real_reserve(byte_count)
+        reserved.set()
+        if not release.wait(timeout=10):
+            raise AssertionError("reservation gate timed out")
+
+    def observed_release(byte_count: int) -> None:
+        real_release(byte_count)
+        released.set()
+
+    monkeypatch.setattr(spill, "reserve_transient", gated_reserve)
+    monkeypatch.setattr(spill, "release_transient", observed_release)
+    envelope = MCPCallEnvelope(_limits(spill_after=1), spill)
+    append = asyncio.create_task(envelope.append(b"x" * 100))
+    try:
+        assert await asyncio.to_thread(reserved.wait, 10)
+        append.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(append, what="cancelled append")
+        release.set()
+        assert await asyncio.to_thread(released.wait, 10)
+        await envelope.close()
+
+        assert spill._transient_bytes == 0
+        assert budget._used_bytes == 0
+        real_reserve(100)
+        real_release(100)
+    finally:
+        release.set()
+        await envelope.close()
+        if not append.done():
+            append.cancel()
+        await await_or_fail(asyncio.gather(append, return_exceptions=True), what="drain append")
+        spill.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_failed_spill_reservation_leaks_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget = SpillByteBudget(max_bytes=100)
+    spill = SpillStore(byte_budget=budget)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def failing_reserve(_byte_count: int) -> None:
+        started.set()
+        try:
+            if not release.wait(timeout=10):
+                raise AssertionError("reservation gate timed out")
+            raise RuntimeError("spill budget is full")
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(spill, "reserve_transient", failing_reserve)
+    envelope = MCPCallEnvelope(_limits(spill_after=1), spill)
+    append = asyncio.create_task(envelope.append(b"x" * 100))
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        append.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(append, what="failed-reservation append")
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 10)
+        await envelope.close()
+        assert spill._transient_bytes == 0
+        assert budget._used_bytes == 0
+    finally:
+        release.set()
+        await envelope.close()
+        if not append.done():
+            append.cancel()
+        await await_or_fail(asyncio.gather(append, return_exceptions=True), what="drain append")
+        spill.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_temporary_open_closes_late_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget = SpillByteBudget(max_bytes=100)
+    spill = SpillStore(byte_budget=budget)
+    spill.configure_transient_limit(100)
+    opened = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    real_temporary_file = spill.temporary_file
+
+    class GatedTemporary:
+        def __init__(self) -> None:
+            self.context = real_temporary_file()
+            self.handle = None
+            self.exits = 0
+
+        def __enter__(self):
+            self.handle = self.context.__enter__()
+            opened.set()
+            if not release.wait(timeout=10):
+                self.context.__exit__(None, None, None)
+                raise AssertionError("temporary-file gate timed out")
+            return self.handle
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.exits += 1
+            try:
+                return self.context.__exit__(exc_type, exc, traceback)
+            finally:
+                exited.set()
+
+    temporary = GatedTemporary()
+    monkeypatch.setattr(spill, "temporary_file", lambda: temporary)
+    envelope = MCPCallEnvelope(_limits(spill_after=1), spill)
+    append = asyncio.create_task(envelope.append(b"{}"))
+    try:
+        assert await asyncio.to_thread(opened.wait, 10)
+        append.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(append, what="cancelled temporary-open append")
+        await envelope.close()
+        assert spill._transient_bytes == 0
+        assert budget._used_bytes == 0
+
+        release.set()
+        assert await asyncio.to_thread(exited.wait, 10)
+        assert temporary.handle is not None and temporary.handle.closed
+        assert temporary.exits == 1
+        await envelope.close()
+        assert temporary.exits == 1
+    finally:
+        release.set()
+        await envelope.close()
+        if not append.done():
+            append.cancel()
+        await await_or_fail(asyncio.gather(append, return_exceptions=True), what="drain append")
+        spill.close()
 
 
 @pytest.mark.asyncio

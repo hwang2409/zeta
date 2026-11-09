@@ -597,28 +597,30 @@ def test_hanging_git_registered_project_one_warning_one_deadline(
         asyncio.run(app.close())
 
 
-@pytest.mark.parametrize("failed_call", [2, 3])
+@pytest.mark.parametrize("line_count", [1, 2])
 def test_incomplete_git_discovery_is_ineligible_and_warns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    failed_call: int,
+    line_count: int,
 ) -> None:
     from zeta.core import project_context
 
     root = repo(tmp_path)
     m = manager(tmp_path)
     real_run = subprocess.run
-    call_count = 0
 
-    def timeout_one(command: list[str], *args: object, **kwargs: object):
-        nonlocal call_count
-        call_count += 1
-        if call_count == failed_call:
-            raise subprocess.TimeoutExpired(command, 2)
-        return real_run(command, *args, **kwargs)
+    def truncate_geometry(command: list[str], *args: object, **kwargs: object):
+        result = real_run(command, *args, **kwargs)
+        lines = result.stdout.splitlines()
+        return subprocess.CompletedProcess(
+            result.args,
+            result.returncode,
+            stdout="\n".join(lines[:line_count]) + "\n",
+            stderr=result.stderr,
+        )
 
-    monkeypatch.setattr(project_context.subprocess, "run", timeout_one)
+    monkeypatch.setattr(project_context.subprocess, "run", truncate_geometry)
     with caplog.at_level(logging.WARNING):
         opened = m.create(provider="codex", model="test", cwd=root)
     try:

@@ -90,6 +90,165 @@ def test_method_registry_matches_documented_table() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_observer_access_uses_shared_dispatch_table(transport: str, tmp_path: Path) -> None:
+    contract = await ServeContract.start(tmp_path / transport, transport)  # type: ignore[arg-type]
+    controller = observer = None
+    try:
+        controller = await contract.connect("controller")
+        hello = await controller.request("controller-hello", "hello", {"protocol_version": "1.2"})
+        assert "new_session" in hello["result"]["capabilities"]["requests"]
+        controller_reply = await controller.request(
+            "controller-new-session", "new_session", {"provider": "codex"}
+        )
+        assert "result" in controller_reply
+        observer = await contract.connect("observer")
+        await observer.request(
+            "observer-hello",
+            "hello",
+            {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]},
+        )
+        reply = await observer.request("observer-new-session", "new_session")
+        assert reply["error"] == {
+            "code": -32008,
+            "message": "method is unavailable to read-only observers",
+            "data": {"code": "observer_read_only", "method": "new_session"},
+        }
+    finally:
+        await contract.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_every_observer_request_has_transport_parity(
+    transport: str, tmp_path: Path
+) -> None:
+    contract = await ServeContract.start(tmp_path / transport, transport)  # type: ignore[arg-type]
+    features = [
+        "serve_observers",
+        "content_read",
+        "ping",
+        "delivery_id",
+        "session_grants",
+    ]
+    try:
+        controller = await contract.connect("controller")
+        await controller.request(
+            "controller-hello",
+            "hello",
+            {"protocol_version": "1.2", "features": features},
+        )
+        observer = await contract.connect("observer")
+        await observer.request(
+            "observer-hello",
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": features,
+            },
+        )
+        idle_status = await observer.request("observer-idle-status", "status")
+        assert idle_status["result"] == {
+            "session": None,
+            "state": "idle",
+            "explicit_finish": False,
+            "max_agent_depth": 3,
+            "pending_approvals": [],
+            "usage": {},
+            "compaction_markers": 0,
+        }
+        created = await controller.request(
+            "controller-new-session", "new_session", {"provider": "codex"}
+        )
+        session_id = created["result"]["session"]["session_id"]
+
+        listing = await observer.request("observer-list", "list_sessions")
+        controller_listing = await controller.request(
+            "controller-list", "list_sessions"
+        )
+        assert listing["result"] == controller_listing["result"]
+
+        status = await observer.request(
+            "observer-status",
+            "status",
+            {"include_connection_setup_counts": True},
+        )
+        assert set(status["result"]) == {
+            "compaction_markers",
+            "explicit_finish",
+            "max_agent_depth",
+            "pending_approvals",
+            "project_context_health",
+            "session",
+            "state",
+            "usage",
+        }
+        assert status["result"]["session"]["session_id"] == session_id
+
+        tree = await observer.request(
+            "observer-tree", "session_tree", {"session_id": session_id}
+        )
+        assert tree["result"] == {"branches": []}
+        history = await observer.request(
+            "observer-history", "session_history", {"session_id": session_id}
+        )
+        assert history["result"] == {"messages": [], "next_offset": None}
+        content = await observer.request(
+            "observer-content", "content_read", {"handle": "missing"}
+        )
+        assert content["error"] == {
+            "code": -32012,
+            "message": "content not found",
+            "data": {"code": "content_not_found"},
+        }
+
+        catalog = await observer.request("observer-catalog", "model_catalog")
+        controller_catalog = await controller.request(
+            "controller-catalog", "model_catalog"
+        )
+        assert catalog["result"] == controller_catalog["result"]
+        settings = await observer.request("observer-settings", "session_settings")
+        assert settings["result"] == {
+            "model": "gpt-5.6-luna",
+            "approval_mode": "ask",
+        }
+        ping = await observer.request("observer-ping", "ping")
+        assert ping["result"] == {"pong": True}
+        delivery = await observer.request(
+            "observer-delivery",
+            "delivery_status",
+            {"delivery_id": "missing"},
+        )
+        assert delivery["result"] == {
+            "delivery_id": "missing",
+            "status": "unknown",
+        }
+        grants = await observer.request("observer-grants", "session_grants")
+        assert grants["result"] == {
+            "session_id": session_id,
+            "default": "ask",
+            "precedence": ["deny", "ask", "allow", "default"],
+            "rules": {"deny": [], "ask": [], "allow": []},
+            "session_grants": [],
+        }
+        denied = await observer.request(
+            "observer-new-session", "new_session", {"provider": "codex"}
+        )
+        assert denied == {
+            "jsonrpc": "2.0",
+            "id": "observer-new-session",
+            "error": {
+                "code": -32008,
+                "message": "method is unavailable to read-only observers",
+                "data": {"code": "observer_read_only", "method": "new_session"},
+            },
+        }
+    finally:
+        await contract.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
 async def test_real_method_conformance_matrix(transport: str, tmp_path: Path) -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     section = _section(document, "## method table", "## common JSON-RPC shapes")
@@ -606,6 +765,205 @@ def test_static_gate_rejects_raw_method_dispatch_mutations(source: str) -> None:
     assert _source_bypasses(source)
 
 
+def _is_wire_literal(node: ast.AST | None, wires: set[str]) -> bool:
+    return isinstance(node, ast.Constant) and node.value in wires
+
+
+def _is_descriptor_value(node: ast.AST | None) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "MethodDescriptor"
+    )
+
+
+def _dispatch_aliases(tree: ast.AST) -> set[str]:
+    aliases = {"method", "wire", "descriptor"}
+    assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
+    while additions := {
+        target.id
+        for node in assignments
+        if isinstance(node.value, ast.Name) and node.value.id in aliases
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id not in aliases
+    }:
+        aliases.update(additions)
+    return aliases
+
+
+class _DispatchMappingVisitor(ast.NodeVisitor):
+    def __init__(
+        self,
+        path: Path,
+        wires: set[str],
+        function_names: set[str],
+        allowed_table: ast.AST | None,
+        aliases: set[str],
+    ) -> None:
+        self.path = path
+        self.wires = wires
+        self.function_names = function_names
+        self.allowed_table = allowed_table
+        self.aliases = aliases
+        self.violations: list[str] = []
+
+    def report(self, node: ast.AST, message: str) -> None:
+        self.violations.append(
+            f"{self.path.relative_to(ROOT)}:{node.lineno}: {message}"
+        )
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        values = (node.left, *node.comparators)
+        routes = any(
+            isinstance(value, ast.Name) and value.id in self.aliases for value in values
+        )
+        if routes and any(_is_wire_literal(value, self.wires) for value in values):
+            self.report(node, "method strings belong in handlers/registry.py")
+        if routes and any(_is_descriptor_value(value) for value in values):
+            self.report(node, "descriptor branches may not select implementations")
+        self.generic_visit(node)
+
+    def visit_Match(self, node: ast.Match) -> None:
+        values = (
+            pattern.value
+            for case in node.cases
+            for pattern in ast.walk(case.pattern)
+            if isinstance(pattern, ast.MatchValue)
+        )
+        if (
+            isinstance(node.subject, ast.Name)
+            and node.subject.id in self.aliases
+            and any(
+                _is_wire_literal(value, self.wires) or _is_descriptor_value(value)
+                for value in values
+            )
+        ):
+            self.report(node, "serve methods may not be selected with match")
+        self.generic_visit(node)
+
+    def visit_Dict(self, node: ast.Dict) -> None:
+        callable_values = any(
+            isinstance(value, ast.Lambda)
+            or isinstance(value, ast.Name) and value.id in self.function_names
+            for value in node.values
+        )
+        if callable_values and any(
+            _is_wire_literal(key, self.wires) for key in node.keys
+        ):
+            self.report(node, "method strings may not map to callables")
+        if (
+            callable_values
+            and node is not self.allowed_table
+            and any(_is_descriptor_value(key) for key in node.keys)
+        ):
+            self.report(node, "HANDLERS is the only descriptor-to-callable map")
+        self.generic_visit(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        if any(
+            isinstance(item, ast.Name) and item.id == "MethodDescriptor"
+            for generator in node.generators
+            for item in ast.walk(generator.iter)
+        ):
+            self.report(node, "generated descriptor handler maps are forbidden")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Name)
+            and node.args[1].id in self.aliases
+        ):
+            self.report(node, "getattr may not dispatch serve methods")
+        self.generic_visit(node)
+
+
+def _dispatch_mapping_bypasses(sources: dict[Path, str]) -> list[str]:
+    wires = {item.wire for item in MethodDescriptor}
+    violations: list[str] = []
+    for path, source in sources.items():
+        tree = ast.parse(source)
+        function_names = {
+            item.name
+            for item in tree.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        allowed_table = next(
+            (
+                item.value
+                for item in tree.body
+                if path == ROOT / "src/zeta/server/handlers/registry.py"
+                and isinstance(item, ast.AnnAssign)
+                and isinstance(item.target, ast.Name)
+                and item.target.id == "HANDLERS"
+            ),
+            None,
+        )
+        visitor = _DispatchMappingVisitor(
+            path, wires, function_names, allowed_table, _dispatch_aliases(tree)
+        )
+        visitor.visit(tree)
+        violations.extend(visitor.violations)
+    return violations
+
+
+def _server_sources() -> dict[Path, str]:
+    root = ROOT / "src/zeta/server"
+    return {path: path.read_text() for path in root.rglob("*.py")}
+
+
+def test_one_table_is_the_only_serve_method_dispatch_authority() -> None:
+    registry = ROOT / "src/zeta/server/handlers/registry.py"
+    tree = ast.parse(registry.read_text())
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            child.parent = parent
+    handlers = next(
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "HANDLERS"
+    )
+    assert isinstance(handlers, ast.Dict)
+    assert len(handlers.keys) == len(MethodDescriptor)
+    assert all(isinstance(value, ast.Name) for value in handlers.values)
+    assert len({value.id for value in handlers.values}) == len(MethodDescriptor)
+    assert not (
+        violations := _dispatch_mapping_bypasses(_server_sources())
+    ), "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "mutation"),
+    (
+        ("accounts.py", 'if method == "account_list": pass'),
+        ("accounts.py", 'SECOND = {"ping": refresh}'),
+        (
+            "handlers/registry.py",
+            "SECOND = {MethodDescriptor.PING: ping}",
+        ),
+        (
+            "handlers/registry.py",
+            "def bypass(descriptor): return ping if descriptor is MethodDescriptor.PING else status",
+        ),
+        (
+            "accounts.py",
+            'def bypass(method):\n    route = method\n    if route == "ping":\n        return True',
+        ),
+    ),
+)
+def test_dispatch_guard_rejects_production_mutations(
+    relative_path: str, mutation: str
+) -> None:
+    sources = _server_sources()
+    path = ROOT / "src/zeta/server" / relative_path
+    sources[path] += f"\n{mutation}\n"
+    assert _dispatch_mapping_bypasses(sources)
+
+
 def test_no_code_bypasses_the_typed_frame_codec() -> None:
     assert not (violations := _raw_frame_bypasses()), (
         "error and notification wire frames have one typed chokepoint in "
@@ -725,6 +1083,12 @@ STRUCTURED_ERROR_FIXTURES = (
         "session grant not found",
         {"grant": "bash"},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session grant not found","data":{"code":"session_grant_not_found","grant":"bash"}}}\n',
+    ),
+    (
+        ErrorDescriptor.SESSION_MISMATCH,
+        "session is not active",
+        {"attached_session_id": "s1", "session_id": "s2"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32003,"message":"session is not active","data":{"code":"session_mismatch","attached_session_id":"s1","session_id":"s2"}}}\n',
     ),
     (
         ErrorDescriptor.SESSION_NOT_FOUND,

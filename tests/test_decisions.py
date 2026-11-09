@@ -54,7 +54,7 @@ def _session(home: Path, project_id: str):
 
 
 def _request(opened, project_id, title, why, **kw):
-    return AttentionStore(opened.store.session_dir).request(
+    return AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
         project_id=project_id,
         entry_id=kw.get("entry_id"),
@@ -177,7 +177,7 @@ def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) ->
     second = _session(tmp_path, project.project_id)
     _request(first, project.project_id, "Pick DB", "Choose one.", options=["SQLite"])
     resolved = _request(second, project.project_id, "Old", "Historical.")
-    AttentionStore(second.store.session_dir).replace(
+    AttentionStore(second.store.session_dir, writer_epoch=5).replace(
         replace(resolved, status="resolved", resolved_at=resolved.created_at)
     )
     _request(second, project.project_id, "Pick region", "Where to deploy.")
@@ -344,7 +344,7 @@ def test_quick_answer_delivers_to_asking_session_and_closes(tmp_path: Path) -> N
         project.project_id, outcome.message_id, asker.store.session_id
     )
     assert "Use SQLite." in message["body"]
-    assert AttentionStore(asker.store.session_dir).get(record.id).status == "resolved"
+    assert AttentionStore(asker.store.session_dir, writer_epoch=5).get(record.id).status == "resolved"
 
     # A repeat is idempotent and reports the prior delivery.
     again = AttentionReplies(tmp_path, asker.store.session_id).reply(
@@ -420,7 +420,7 @@ def test_return_without_decision_unbinds_so_item_can_be_rediscussed(
     )
     fork_id = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
     assert (
-        AttentionStore(asker.store.session_dir).get(record.id).fork_session_id
+        AttentionStore(asker.store.session_dir, writer_epoch=5).get(record.id).fork_session_id
         == fork_id
     )
 
@@ -428,7 +428,7 @@ def test_return_without_decision_unbinds_so_item_can_be_rediscussed(
     assert source == asker.store.session_id
     # Open item: the binding is cleared so a fresh fork starts next time.
     assert (
-        AttentionStore(asker.store.session_dir).get(record.id).fork_session_id is None
+        AttentionStore(asker.store.session_dir, writer_epoch=5).get(record.id).fork_session_id is None
     )
     new_fork = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
     assert new_fork != fork_id
@@ -456,7 +456,7 @@ def test_return_after_decision_keeps_resolved_binding(tmp_path: Path) -> None:
     )
     source = release_discussion_fork(tmp_path, fork_id)
     assert source == asker.store.session_id
-    resolved = AttentionStore(asker.store.session_dir).get(record.id)
+    resolved = AttentionStore(asker.store.session_dir, writer_epoch=5).get(record.id)
     assert resolved.status == "resolved"
     assert resolved.fork_session_id == fork_id  # binding kept for a closed item
     asker.store.close()

@@ -975,6 +975,7 @@ async def test_resolve_attention_does_not_open_registry(
             session_dir=session_dir,
             session_id=session_dir.name,
             directory_fd=-1,
+            observed_storage_epoch=5,
         ),
         project_registry=state.registry,
         project_registry_state=state,

@@ -506,8 +506,9 @@ async def test_oauth_credential_lock_wait_is_bounded(
 ) -> None:
     store = _codex_store(tmp_path / "codex.json")
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(account_store, "ACCOUNT_LOCK_TURN_WAIT_SECONDS", 0.05)
     async with _mock_client(lambda _request: httpx.Response(500)) as client:
-        async with store._async_guard(registry=False):
+        async with store._async_guard(registry=False, timeout=30):
             with pytest.raises(
                 account_store.AccountCredentialLockTimeoutError,
                 match=(

@@ -196,6 +196,8 @@ def render_error_card(event: StreamEvent) -> Panel:
     retryable = is_retryable_error(error)
     if code == "account_lock_timeout":
         title = "account busy"
+    elif code == "no_progress_loop":
+        title = "model loop stopped"
     elif code == "project_registry_busy":
         title = "project registry busy"
     elif code == "auth_error":
@@ -504,12 +506,14 @@ def _compact_notification_text(value: str, limit: int) -> str:
 # by design. Keep this exhaustive when adding a StreamEventType member.
 BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = frozenset({
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CONFIG_CHANGED,
     StreamEventType.CHILD_MESSAGE_DELIVERED,
 })
 STREAM_EVENTS_RENDERED = frozenset({
     StreamEventType.MESSAGE_END,
     StreamEventType.RETRY,
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CONFIG_CHANGED,
     StreamEventType.CHILD_MESSAGE_DELIVERED,
     StreamEventType.ACCOUNT_LIMIT,
     StreamEventType.ACCOUNT_STATE_UNKNOWN,
@@ -574,7 +578,10 @@ def render_agent_notification(
             or isinstance(event.data.get("verdict"), str)
         )
     )
-    if kind in {"child_question", "child_idle", "child_question_withdrawn"} or readable_completion:
+    if (
+        kind in {"child_question", "child_idle", "child_hold", "child_question_withdrawn"}
+        or readable_completion
+    ):
         rendered = render_agent_notification_message(event, identity_index)
         if rendered is not None:
             return rendered
@@ -647,6 +654,16 @@ def render_event(
         return Text(text if type(text) is str else "retrying", style=theme.DIM)
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         return render_agent_notification(event, identity_index)
+    if event.type is StreamEventType.CONFIG_CHANGED:
+        message = event.data.get("message")
+        if not isinstance(message, str) or not message:
+            return Text("live config changed", style=theme.NOTICE)
+        return Text(
+            message,
+            style=theme.NOTICE,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
     if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
         preview = event.data.get("preview", "")
         if not isinstance(preview, str):

@@ -386,12 +386,7 @@ class MCPMount:
         except BaseException:
             async with self._config_lock:
                 if self._actors.get(name) is actor:
-                    self._actors.pop(name, None)
-                    self.configs.pop(name, None)
-                    self.statuses.pop(name, None)
-                    self.sources.pop(name, None)
-                    self._clients.pop(name, None)
-                    self._refresh_schemas()
+                    self._discard_server(name)
             await actor.close()
             raise
 
@@ -401,14 +396,9 @@ class MCPMount:
         async with self._config_lock:
             if name not in self.configs:
                 raise ValueError(f"unknown MCP server: {name}")
-            actor = self._actors.pop(name, None)
-            self.configs.pop(name, None)
-            self.statuses.pop(name, None)
-            self.sources.pop(name, None)
-            self._clients.pop(name, None)
+            actor = self._discard_server(name)
             if actor is not None:
                 self._removed_actors.add(actor)
-            self._refresh_schemas()
         if actor is None:
             return
         removal_task = asyncio.create_task(self._remove_server_locked(actor))
@@ -473,6 +463,16 @@ class MCPMount:
             auto_base_delay=AUTO_RECONNECT_BASE_DELAY_SECONDS,
             auto_max_delay=AUTO_RECONNECT_MAX_DELAY_SECONDS,
         )
+
+    def _discard_server(self, name: str) -> MCPServerActor | None:
+        actor = self._actors.pop(name, None)
+        self.configs.pop(name, None)
+        self.statuses.pop(name, None)
+        self.sources.pop(name, None)
+        self._clients.pop(name, None)
+        self._rebuild_catalog()
+        self._refresh_schemas()
+        return actor
 
     def _publish(
         self,

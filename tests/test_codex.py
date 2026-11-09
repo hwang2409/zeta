@@ -3449,12 +3449,12 @@ def _refresh_lock_probe_process(
     async def run() -> None:
         store = codex_credentials(path)
         if hold:
-            async with store._async_guard(registry=False):
+            async with store._async_guard(registry=False, timeout=30):
                 results.put("holding")
                 await asyncio.to_thread(release.wait)
             return
         await asyncio.to_thread(start.wait)
-        lock = store._async_guard(registry=False)
+        lock = store._async_guard(registry=False, timeout=30)
         try:
             await asyncio.wait_for(lock.__aenter__(), timeout=2)
         except TimeoutError:
@@ -3463,7 +3463,7 @@ def _refresh_lock_probe_process(
             results.put("unexpectedly acquired")
             await lock.__aexit__(None, None, None)
         await asyncio.to_thread(release.wait)
-        async with store._async_guard(registry=False):
+        async with store._async_guard(registry=False, timeout=30):
             results.put("acquired")
 
     asyncio.run(run())

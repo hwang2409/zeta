@@ -72,6 +72,7 @@ from ._action_metadata import (
 from ._action_metadata import (
     resolve_approval_rule as resolve_registered_approval_rule,
 )
+from ._live_config import _LiveConfigRegistryMixin
 from ._results import (
     _apply_error_governance,
     _BoundedText,  # noqa: F401 - preserve the registry import
@@ -88,7 +89,7 @@ from ._shared.cwd_state import (
 )
 from ._shared.process import BackgroundTaskRegistry
 from ._shared.sandbox import SandboxPolicy
-from ._spill import SpillStore
+from ._spill import SpillByteBudget, SpillStore
 from ._validation import (
     MAX_STRUCTURED_CONTENT_DEPTH,  # noqa: F401 - preserve the registry import
     _coerce_arguments,
@@ -213,7 +214,7 @@ def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
 
 
-class ToolRegistry:
+class ToolRegistry(_LiveConfigRegistryMixin):
     """One provider-neutral registry for built-in and custom tools."""
 
     def __init__(
@@ -304,6 +305,7 @@ class ToolRegistry:
         self._agent_output_cache: OrderedDict[Path, tuple[tuple[int, int, int], str]] = OrderedDict()
         self._agent_output_cache_chars = 0
         self._execution_guard: Callable[[str], str | None] | None = None
+        self._spill_byte_budget = SpillByteBudget()
         self.spills = SpillStore(
             session_dir=session_store.session_dir
             if session_store is not None
@@ -311,6 +313,7 @@ class ToolRegistry:
             directory_fd=session_store.directory_fd
             if session_store is not None
             else None,
+            byte_budget=self._spill_byte_budget,
         )
         if mcp_limits is not None:
             self.spills.configure_transient_limit(mcp_limits.max_wire_bytes)
@@ -349,7 +352,7 @@ class ToolRegistry:
         self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
-        self._skill_refresher: Callable[[bool], Awaitable[None]] | None = None
+        self._live_config_refresher: Callable[[bool], Awaitable[None]] | None = None
         if agent_catalog is None:
             from ..skills.agent_catalog import discover_packaged_agents
 
@@ -358,17 +361,6 @@ class ToolRegistry:
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
-
-    def set_skill_refresher(
-        self, refresher: Callable[[bool], Awaitable[None]]
-    ) -> None:
-        """Let tools request one live catalog refresh."""
-
-        self._skill_refresher = refresher
-
-    async def refresh_skills(self, *, force: bool = False) -> None:
-        if self._skill_refresher is not None:
-            await self._skill_refresher(force)
 
     @property
     def tool_allow(self) -> tuple[str, ...] | None:
@@ -763,6 +755,7 @@ class ToolRegistry:
         clone.spills = SpillStore(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
+            byte_budget=clone._spill_byte_budget,
         )
         clone.policy = SandboxPolicy(
             clone.cwd,
@@ -829,6 +822,7 @@ class ToolRegistry:
         self.spills = SpillStore(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
+            byte_budget=self._spill_byte_budget,
         )
         self.policy = SandboxPolicy(
             self.cwd,

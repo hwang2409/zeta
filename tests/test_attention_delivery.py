@@ -37,7 +37,7 @@ def test_resolve_attention_targets_only_original_and_resolves_record(
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
     )
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -90,12 +90,14 @@ def test_resolve_attention_targets_only_original_and_resolves_record(
         == 1
     )
     assert inbox.new_ids(project.project_id, session_id=other.store.session_id) == ()
-    message = inbox.list(project.project_id)["new"][0]
-    assert message["origin"] == "agent"
-    assert message["authority"] == "information"
+    message_id = inbox.new_ids(
+        project.project_id, session_id=original.store.session_id
+    )[0]
+    assert inbox.claim(project.project_id, message_id, other.store.session_id) is None
+    message = inbox.claim(project.project_id, message_id, original.store.session_id)
+    assert message is not None
     assert "Decision: Use SQLite." in message["body"]
-    assert message.get("origin") == "agent"
-    resolved = AttentionStore(original.store.session_dir).get(record.id)
+    resolved = AttentionStore(original.store.session_dir, writer_epoch=5).get(record.id)
     assert resolved.status == "resolved"
     assert resolved.fork_session_id == fork_id
     assert resolved.decision == "Use SQLite."
@@ -114,7 +116,7 @@ def test_forged_fork_cannot_resolve_unbound_attention(tmp_path: Path) -> None:
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
     )
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -149,7 +151,7 @@ def test_forged_fork_cannot_resolve_unbound_attention(tmp_path: Path) -> None:
             )
         )
 
-    assert AttentionStore(original.store.session_dir).get(record.id).status == "open"
+    assert AttentionStore(original.store.session_dir, writer_epoch=5).get(record.id).status == "open"
     inbox = ProjectInbox(manager.project_registry, sessions_root=tmp_path / "sessions")
     assert inbox.new_ids(project.project_id, session_id=original.store.session_id) == ()
     asyncio.run(registry.close())
@@ -161,7 +163,7 @@ def test_orchestrator_can_resolve_own_attention_without_inbox(tmp_path: Path) ->
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "Alpha")
     original = _project_session(tmp_path, project.project_id)
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=None,
@@ -184,7 +186,7 @@ def test_orchestrator_can_resolve_own_attention_without_inbox(tmp_path: Path) ->
     repeated = asyncio.run(
         definition.handler({"attention_id": record.id, "decision": "Use SQLite."})
     )
-    resolved = AttentionStore(original.store.session_dir).get(record.id)
+    resolved = AttentionStore(original.store.session_dir, writer_epoch=5).get(record.id)
     assert result["structuredContent"]["already_resolved"] is False
     assert repeated["structuredContent"]["already_resolved"] is True
     assert resolved.status == "resolved"
@@ -203,7 +205,7 @@ def test_orchestrator_resolve_attention_rejects_unknown_and_foreign_items(
     project = manager.project_registry.create_project("alpha", "Alpha")
     original = _project_session(tmp_path, project.project_id)
     other = _project_session(tmp_path, project.project_id)
-    record = AttentionStore(other.store.session_dir).request(
+    record = AttentionStore(other.store.session_dir, writer_epoch=5).request(
         session_id=other.store.session_id,
         project_id=project.project_id,
         entry_id=None,
@@ -218,7 +220,7 @@ def test_orchestrator_resolve_attention_rejects_unknown_and_foreign_items(
         project_id=project.project_id,
         project_registry=manager.project_registry,
     )
-    own_record = AttentionStore(original.store.session_dir).request(
+    own_record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=None,
@@ -247,7 +249,7 @@ def test_popup_and_orchestrator_resolution_conflict_without_overwrite(tmp_path: 
     project = manager.project_registry.create_project("alpha", "Alpha")
     original = _project_session(tmp_path, project.project_id)
     answerer = _project_session(tmp_path, project.project_id)
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id, project_id=project.project_id,
         entry_id=None, entry_seq=None, title="Pick one", why="Only the user can choose.",
     )
@@ -261,7 +263,7 @@ def test_popup_and_orchestrator_resolution_conflict_without_overwrite(tmp_path: 
         asyncio.run(registry.definitions_by_name["resolve_attention"].handler(
             {"attention_id": record.id, "decision": "chat answer"}))
     replies.flush(answerer.store.session_id)
-    resolved = AttentionStore(original.store.session_dir).get(record.id)
+    resolved = AttentionStore(original.store.session_dir, writer_epoch=5).get(record.id)
     inbox = ProjectInbox(manager.project_registry, sessions_root=tmp_path / "sessions")
     message_id = inbox.new_ids(project.project_id, session_id=original.store.session_id)[0]
     assert resolved.decision == "popup answer"

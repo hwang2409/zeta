@@ -8,6 +8,7 @@ import io
 import json
 import re
 import shutil
+import subprocess
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -34,7 +35,8 @@ from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.completion import owned_completion
-from zeta.server import ZetaServer, image_delivery
+from zeta.server import ZetaServer, slash_commands
+from zeta.server.handlers import send_images, settings
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -101,13 +103,25 @@ def _tool_stdout(end: dict) -> str:
 @pytest.mark.asyncio
 async def test_controller_model_catalog_works_before_session_attachment(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class ReverseSet(set[str]):
+        def __iter__(self):
+            return iter(sorted(super().__iter__(), reverse=True))
+
+    monkeypatch.setattr(
+        settings,
+        "PROVIDER_MODELS",
+        {"test": ReverseSet({"model-a", "model-b"})},
+    )
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer)
-        result = (await _request(reader, writer, 2, "model_catalog"))[-1]
-        assert result["result"]["models"]
+        result = (await _request(reader, writer, 2, "model_catalog"))[-1]["result"]
+        assert result["models"]
+        assert list(result["providers"]) == ["model-a", "model-b"]
+        assert result["providers"] == {"model-a": "test", "model-b": "test"}
     finally:
         await close_serve(server, writer)
 
@@ -290,6 +304,40 @@ async def test_resume_rejects_a_session_whose_cwd_was_removed(
         await close_serve(server, writer)
 
 
+@pytest.mark.asyncio
+async def test_active_resume_rejects_a_session_whose_cwd_was_removed(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original"
+    original.mkdir()
+    server = _server(tmp_path, None, original)
+    reader, writer = await _connect(server)
+    try:
+        await _legacy_hello(reader, writer)
+        created = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]
+        session_id = created["session"]["session_id"]
+        assert server.runtime.session_id == session_id
+        assert server.runtime.loop is not None
+        await server.runtime.loop.ensure_mcp_servers()
+        shutil.rmtree(original)
+
+        resumed = await _request(
+            reader, writer, 3, "resume", {"session_id": session_id}
+        )
+
+        assert resumed[-1]["error"] == {
+            "code": -32602,
+            "message": (
+                "session working directory no longer exists: "
+                f"{original.resolve()}"
+            ),
+        }
+        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+        assert status["session"]["session_id"] == session_id
+    finally:
+        await close_serve(server, writer)
+
+
 # Feature negotiation for the gamma extensions.
 
 
@@ -381,6 +429,130 @@ async def test_new_session_cwd_selects_the_tool_directory(tmp_path: Path) -> Non
         await _request(reader, writer, 4, "approve", {"request_id": "pwd-call"})
         end = await _event(reader, "tool_end")
         assert _tool_stdout(end) == str(project.resolve())
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_requests_reuse_session_repo_root_and_build_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repos = []
+    for name in ("first", "second"):
+        repo = tmp_path / name
+        nested = repo / "nested"
+        commands = repo / ".zeta" / "commands"
+        nested.mkdir(parents=True)
+        commands.mkdir(parents=True)
+        (commands / "location.md").write_text(
+            f"---\ndescription: identify the repository\n---\nrepository {name}\n"
+        )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["git", "init", "--quiet", str(repo)],
+            check=True,
+            capture_output=True,
+        )
+        repos.append(nested)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    registry_builds = 0
+    discovery_commands = 0
+    original_build_registry = slash_commands.build_registry
+    original_subprocess_run = subprocess.run
+
+    def tracked_build_registry(runtime):
+        nonlocal registry_builds
+        registry_builds += 1
+        return original_build_registry(runtime)
+
+    def tracked_subprocess_run(*args, **kwargs):
+        nonlocal discovery_commands
+        command = list(args[0])
+        if command[:3] == ["git", "-c", "core.fsmonitor=false"]:
+            discovery_commands += 1
+        return original_subprocess_run(*args, **kwargs)
+
+    monkeypatch.setattr(slash_commands, "build_registry", tracked_build_registry)
+    monkeypatch.setattr(subprocess, "run", tracked_subprocess_run)
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["session_cwd"])
+        observed = []
+        for index, (cwd, expected) in enumerate(
+            [(repos[0], "repository first"), (repos[1], "repository second")]
+        ):
+            session_id = (
+                await _request(
+                    reader,
+                    writer,
+                    f"session-{index}",
+                    "new_session",
+                    {"cwd": str(cwd)},
+                )
+            )[-1]["result"]["session"]["session_id"]
+            if index == 0:
+                original_turn_busy = server.control.turn_busy
+                monkeypatch.setattr(server.control, "turn_busy", lambda: True)
+                for request_id in range(3):
+                    result = (
+                        await _request(
+                            reader,
+                            writer,
+                            f"busy-{request_id}",
+                            "slash_run",
+                            {"session_id": session_id, "text": "/status"},
+                        )
+                    )[-1]["result"]
+                    assert result["kind"] == "output"
+                busy_registry_builds = registry_builds
+                monkeypatch.setattr(server.control, "turn_busy", original_turn_busy)
+            result = (
+                await _request(
+                    reader,
+                    writer,
+                    f"location-{index}",
+                    "slash_run",
+                    {"session_id": session_id, "text": "/location"},
+                )
+            )[-1]["result"]
+            observed.append((result["kind"], expected in result["text"]))
+
+        plain_session = (
+            await _request(
+                reader,
+                writer,
+                "plain-session",
+                "new_session",
+                {"cwd": str(plain)},
+            )
+        )[-1]["result"]["session"]["session_id"]
+        listed = (
+            await _request(
+                reader,
+                writer,
+                "plain-list",
+                "slash_list",
+                {"session_id": plain_session},
+            )
+        )[-1]["result"]
+        observed.append(
+            (
+                "non-repository",
+                all(command["name"] != "location" for command in listed["commands"]),
+            )
+        )
+
+        assert observed == [
+            ("model_input", True),
+            ("model_input", True),
+            ("non-repository", True),
+        ]
+        assert busy_registry_builds == 3, "busy slash_run rebuilt its registry"
+        assert discovery_commands == 3, "session setup repeated Git discovery"
+        assert registry_builds == 6, "slash requests did not build exactly once"
     finally:
         await close_serve(server, writer)
 
@@ -586,6 +758,7 @@ async def test_queued_steer_keeps_its_delivery_id_when_another_request_is_pendin
         echo = await _event(reader, "user_message")
         assert echo["delivery_id"] == "steer-queued"
 
+        # test-contract: transport hold the approval reply while queued events arrive
         writer.write(
             json.dumps(
                 {
@@ -752,7 +925,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
     heartbeat = asyncio.Event()
     heartbeat_reached_thread = threading.Event()
     decoded_after_heartbeat: list[bool] = []
-    original_decode = image_delivery.base64.b64decode
+    original_decode = send_images.base64.b64decode
 
     def record_decode(*args, **kwargs):
         if threading.get_ident() != threading.main_thread().ident:
@@ -760,7 +933,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
         decoded_after_heartbeat.append(heartbeat.is_set())
         return original_decode(*args, **kwargs)
 
-    monkeypatch.setattr(image_delivery.base64, "b64decode", record_decode)
+    monkeypatch.setattr(send_images.base64, "b64decode", record_decode)
     output = io.BytesIO()
     Image.new("RGB", (3000, 180), "white").save(output, format="PNG")
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
@@ -806,7 +979,7 @@ async def test_cancelled_send_images_publishes_nothing(
     worker_started = threading.Event()
     release_worker = threading.Event()
     worker_finished = threading.Event()
-    original_normalize = image_delivery.normalize_image_bytes
+    original_normalize = send_images.normalize_image_bytes
 
     async def gated_normalize(*args, **kwargs):
         worker_started.set()
@@ -816,7 +989,7 @@ async def test_cancelled_send_images_publishes_nothing(
         finally:
             worker_finished.set()
 
-    monkeypatch.setattr(image_delivery, "normalize_image_bytes", gated_normalize)
+    monkeypatch.setattr(send_images, "normalize_image_bytes", gated_normalize)
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -859,7 +1032,7 @@ async def test_send_images_publication_is_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publication_threads: list[int] = []
-    original_publish = image_delivery.write_session_file
+    original_publish = send_images.write_session_file
     output = io.BytesIO()
     Image.new("RGB", (3318, 180), "white").save(output, format="PNG")
     oversized = output.getvalue()
@@ -868,7 +1041,7 @@ async def test_send_images_publication_is_off_event_loop(
         publication_threads.append(threading.get_ident())
         original_publish(*args, **kwargs)
 
-    monkeypatch.setattr(image_delivery, "write_session_file", record_publish)
+    monkeypatch.setattr(send_images, "write_session_file", record_publish)
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
     server = _server(
         tmp_path, backend, _launch(tmp_path), provider="anthropic"

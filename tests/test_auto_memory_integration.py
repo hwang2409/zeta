@@ -15,6 +15,7 @@ from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.codex import CodexLoginRequiredError
 from zeta.config.settings import load_settings, resolve
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
 from zeta.core.slash import create_slash_registry
@@ -133,8 +134,8 @@ async def _login_required_composition(
     )
     config = _resolve(home)
     manager = SessionManager(home)
-    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
-    await asyncio.to_thread(manager.project_registry.initialize_memory, project.project_id)
+    project = manager.project_registry.create_project("demo", "scope", workspace)
+    manager.project_registry.initialize_memory(project.project_id)
     memory_backend = _LoginRequiredBackend()
 
     def backend_builder(provider: str, model: str | None, **kwargs: object):
@@ -189,7 +190,8 @@ idle_minutes = 2
 def test_memory_slash_command_dispatches_log_and_undo() -> None:
     calls: list[str] = []
     session = SimpleNamespace(
-        slash_memory=lambda args: calls.append(args) or f"memory:{args}"
+        slash_memory=lambda args: calls.append(args) or f"memory:{args}",
+        slash_lock=SlashLock(),
     )
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
@@ -214,8 +216,8 @@ async def test_memory_reconciliation_builds_backend_off_event_loop(
     )
     config = _resolve(home)
     manager = SessionManager(home)
-    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
-    await asyncio.to_thread(manager.project_registry.initialize_memory, project.project_id)
+    project = manager.project_registry.create_project("demo", "scope", workspace)
+    manager.project_registry.initialize_memory(project.project_id)
 
     async def no_network(*_args: object, **_kwargs: object) -> ReconciliationResponse:
         return ReconciliationResponse('{"changes": []}', {})
@@ -259,8 +261,8 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
     )
     config = _resolve(home)
     manager = SessionManager(home)
-    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
-    await asyncio.to_thread(manager.project_registry.initialize_memory, project.project_id)
+    project = manager.project_registry.create_project("demo", "scope", workspace)
+    manager.project_registry.initialize_memory(project.project_id)
     memory_backend = _MemoryScriptBackend()
     notices: list[str] = []
 
@@ -303,11 +305,11 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
 
         project_id = composition.opened.metadata.project_id
         assert project_id is not None
-        snapshot = await asyncio.to_thread(manager.project_registry.memory_snapshot, project_id)
+        snapshot = manager.project_registry.memory_snapshot(project_id)
         assert snapshot.contents["decisions.md"].endswith(
             f"composed range {second.seq}-{second.seq}\n"
         )
-        records = await asyncio.to_thread(manager.project_registry.memory_log, project_id)
+        records = manager.project_registry.memory_log(project_id)
         assert [record["provenance"]["seq_end"] for record in records] == [
             first.seq,
             second.seq,
@@ -443,8 +445,8 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     workspace.mkdir()
     config = _resolve(home)
     manager = SessionManager(home)
-    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
-    await asyncio.to_thread(manager.project_registry.initialize_memory, project.project_id)
+    project = manager.project_registry.create_project("demo", "scope", workspace)
+    manager.project_registry.initialize_memory(project.project_id)
     original = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="fake",
@@ -457,7 +459,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -528,7 +530,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
     workspace.mkdir()
     config = _resolve(home)
     manager = SessionManager(home)
-    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
+    project = manager.project_registry.create_project("demo", "scope", workspace)
     original = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="fake",
@@ -541,7 +543,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -580,7 +582,9 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
             "normalindexcanary", origin=MessageOrigin.USER
         ):
             pass
-        await asyncio.wait_for(asyncio.gather(*tuple(normal.loop._tracked_tasks)), 10)
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(normal.loop._tracked_tasks)), 10
+        )
     finally:
         await normal.loop.close()
 

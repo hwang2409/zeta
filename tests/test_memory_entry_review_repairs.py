@@ -21,7 +21,7 @@ from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import _MEMORY_MIRROR_HEADER
 from zeta.project_registry import ProjectRegistry
-from zeta.server.project_requests import ProjectRequests
+from zeta.server.handlers.projects import ProjectRequests
 from zeta.server.protocol import FrameCodec
 
 
@@ -361,11 +361,10 @@ def test_large_version_detail_is_bounded_and_reports_paging(tmp_path: Path) -> N
         registry=registry,
     )
 
-    result = requests.dispatch(
+    result = requests.memory_log(
         1,
-        "project_memory_log",
         {"project_id": project_id, "version_id": large.version},
-        features=frozenset({"projects-memory-v2"}),
+        entry_response=True,
     )
 
     assert requests.codec.response_fits(1, result)

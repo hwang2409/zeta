@@ -54,7 +54,10 @@ async def _resolve_attention(
         store.session_id,
     )
     record = await asyncio.to_thread(
-        AttentionStore(home / "sessions" / validated.record.session_id).get,
+        AttentionStore(
+            home / "sessions" / validated.record.session_id,
+            writer_epoch=store.observed_storage_epoch,
+        ).get,
         validated.record.id,
     )
     if outcome.already_resolved:
@@ -91,7 +94,10 @@ async def _close_attention(
         arguments["decision"],
     )
     record = await asyncio.to_thread(
-        AttentionStore(store.session_dir).get, arguments["attention_id"]
+        AttentionStore(
+            store.session_dir, writer_epoch=store.observed_storage_epoch
+        ).get,
+        arguments["attention_id"],
     )
     if outcome.already_resolved:
         return _success_result(

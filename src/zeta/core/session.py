@@ -31,6 +31,7 @@ from .transcript_recovery import (
     recovery_status,
     set_memory_review_required,
 )
+from .transcript_recovery.runtime import format_repair_transcript_command
 from .store._child_runs import child_run_segments
 from .session_execution import (
     OwnerHint,
@@ -939,6 +940,24 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         row = load_session_json(line)
                         lines.append(json.dumps(row, separators=(",", ":")))
         except (ConversationIntegrityError, OSError) as exc:
+            try:
+                ConversationStore(
+                    self.sessions_dir,
+                    session_id=full_id,
+                    _read_only=True,
+                    _must_exist=True,
+                ).close()
+            except TranscriptLoadError as diagnosis:
+                repair_hint = (
+                    f"; run {format_repair_transcript_command(full_id)}"
+                    if diagnosis.repair_available
+                    else ""
+                )
+                raise SessionError(
+                    f"session {full_id} could not be exported: {diagnosis}{repair_hint}"
+                ) from exc
+            except (ConversationIntegrityError, OSError):
+                pass
             raise SessionError(f"session {full_id} could not be exported") from exc
         return "\n".join(lines) + "\n"
 

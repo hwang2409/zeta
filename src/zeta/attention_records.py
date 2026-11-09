@@ -14,8 +14,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .storage_format import WRITER_EPOCH, require_closed_variant
+from .storage_format import (
+    FEATURE_EPOCHS,
+    StorageFeature,
+    feature_enabled,
+    require_closed_variant,
+)
 
+# merge-resolution: src/zeta/attention_records.py constant ATTENTION_KIND_EPOCH -> owned by FEATURE_EPOCHS[StorageFeature.ATTENTION_KINDS]
 AttentionKind = Literal["decision", "answer", "decided", "deferred"]
 AttentionReason = Literal[
     "unreadable",
@@ -32,10 +38,14 @@ from .core.session_files import (
     session_directory,
     write_session_file,
 )
-from .storage_format import reject_unknown_keys
+from .storage_format import reject_unknown_keys, verify
 
 _MAX_RECORD_BYTES = 256 * 1024
 _MAX_BROKEN_ID_CHARS = 160
+
+
+def observed_epoch_for_session(session_dir: Path) -> int:
+    return verify(Path(session_dir).parent.parent).writer_epoch
 
 
 def _safe_broken_id(filename: str) -> str:
@@ -74,9 +84,6 @@ def broken_record_refusal(record: Broken) -> str:
         f"attention record {record.id} is broken ({record.reason}); "
         f"repair {record.path} before replying"
     )
-
-
-ATTENTION_KIND_EPOCH = 5
 
 
 def _now() -> str:
@@ -155,7 +162,7 @@ class AttentionRecord:
 class AttentionStore:
     """Own attention records behind one small session-local interface."""
 
-    def __init__(self, session_dir: Path, *, writer_epoch: int = WRITER_EPOCH):
+    def __init__(self, session_dir: Path, *, writer_epoch: int):
         self.session_dir = Path(session_dir)
         self.writer_epoch = writer_epoch
         self.directory = self.session_dir / "attention"
@@ -175,11 +182,14 @@ class AttentionStore:
         kind: AttentionKind = "decision",
     ) -> AttentionRecord:
         require_closed_variant("attention.kind", kind)
-        if kind != "decision" and self.writer_epoch < ATTENTION_KIND_EPOCH:
+        if kind != "decision" and not feature_enabled(
+            self.writer_epoch, StorageFeature.ATTENTION_KINDS
+        ):
+            required_epoch = FEATURE_EPOCHS[StorageFeature.ATTENTION_KINDS]
             raise ValueError(
                 "non-decision attention kinds require the one-way shared cutover: "
                 f"zeta storage-format advance --expected-epoch {self.writer_epoch} "
-                f"--target-epoch {ATTENTION_KIND_EPOCH}"
+                f"--target-epoch {required_epoch}"
             )
         if kind != "decision" and (options or recommendation is not None):
             raise ValueError(
