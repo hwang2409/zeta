@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owner_counts import dropped_for_gc
 from tests.test_session_execution_owner import (
     _cleanup_process,
     _created_session,
@@ -93,7 +94,9 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
         server = ZetaServer(home=home, port=0, provider="codex")
         await server.start()
         try:
-            store = manager.open(session_id).store
+            store = dropped_for_gc(
+                manager.open(session_id).store, "the collector must finalize it"
+            )
             store._cycle = store  # only the collector can free it now
             del store
             # a failed release ahead of the store's must not stop the drain
@@ -120,7 +123,9 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
             assert result[0] == "opened", result
 
             # a drain that raises is logged and the next tick retries
-            again = manager.open(session_id).store
+            again = dropped_for_gc(
+                manager.open(session_id).store, "the collector must finalize it"
+            )
             again._cycle = again
             del again
             probe.fail_next = True

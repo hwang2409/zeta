@@ -17,7 +17,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, close_owned_app
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
 from zeta.attention_replies import AttentionReplies
@@ -144,7 +144,7 @@ async def test_tui_renders_broken_attention_without_request_body(
         assert "secret request body" not in rendered
     finally:
         owner.store.close()
-        await app.loop.close()
+        await await_or_fail(close_owned_app(app), what="TUIApp.close")
 
 
 @pytest.mark.asyncio
@@ -182,7 +182,7 @@ async def test_tui_broken_row_refuses_actions(tmp_path: Path) -> None:
         assert broken_path.read_bytes() == broken_bytes
     finally:
         owner.store.close()
-        await app.loop.close()
+        await await_or_fail(close_owned_app(app), what="TUIApp.close")
 
 
 @pytest.mark.asyncio
@@ -218,7 +218,7 @@ async def test_tui_broken_row_does_not_block_good_batch(tmp_path: Path) -> None:
         )
     finally:
         owner.store.close()
-        await app.loop.close()
+        await await_or_fail(close_owned_app(app), what="TUIApp.close")
 
 
 @pytest.mark.asyncio
@@ -275,7 +275,7 @@ async def test_tui_popup_waits_for_recovery_before_input(
     finally:
         gate.set()
         owner.store.close()
-        await app.loop.close()
+        await await_or_fail(close_owned_app(app), what="TUIApp.close")
 
 
 @pytest.mark.asyncio
@@ -347,7 +347,7 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(
     finally:
         owner.store.close()
         answerer.store.close()
-        await app.loop.close()
+        await await_or_fail(close_owned_app(app), what="TUIApp.close")
 
 
 @pytest.mark.asyncio
@@ -420,7 +420,7 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
     finally:
         owner.store.close()
         answerer.store.close()
-        await app.loop.close()
+        await await_or_fail(close_owned_app(app), what="TUIApp.close")
 
 
 @pytest.mark.asyncio
@@ -487,4 +487,4 @@ async def test_cancelled_tui_adapter_still_checks_late_publication(
     finally:
         release.set()
         owner.store.close()
-        await app.loop.close()
+        await await_or_fail(close_owned_app(app), what="TUIApp.close")
