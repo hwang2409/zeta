@@ -5,10 +5,12 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..checkpoints import ConversationIntegrityError
 from ..session_files import open_session_file
+from ..transcript_recovery.stream import TranscriptStream
 from ._log import (
     PREFIX_FINGERPRINT_BYTES,
     ObserverSnapshotChanged,
@@ -17,6 +19,28 @@ from ._log import (
 
 if TYPE_CHECKING:
     from ._store import ConversationStore
+
+
+def _resize_stat(stat: os.stat_result, size: int) -> os.stat_result:
+    """Return ``stat`` with ``st_size`` set to ``size``, identity fields intact."""
+    values = list(stat)
+    values[6] = size
+    return os.stat_result(
+        values,
+        {
+            "st_atime_ns": stat.st_atime_ns,
+            "st_mtime_ns": stat.st_mtime_ns,
+            "st_ctime_ns": stat.st_ctime_ns,
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ObserverValidation:
+    """One validated transcript range: accepted state plus any integrity error."""
+
+    state: ConversationStore
+    error: ConversationIntegrityError | None
 
 
 class ObserverSnapshotMixin:
@@ -28,62 +52,75 @@ class ObserverSnapshotMixin:
         try:
             g0 = os.fstat(fd)
             raw = self._read_fd(fd, g0.st_size)
+            complete_end = raw.rfind(b"\n") + 1
+            if (
+                complete_end == g0.st_size
+                and complete_end == getattr(self, "_log_offset", 0)
+                and complete_end
+                and self._known_prefix_matches_bytes(raw, complete_end)
+            ):
+                self._check_observer_source(g0, retry_source_change)
+                return
+            candidate = raw[:complete_end]
+            baseline = (len(self._entries), self._entry_prefix_digest)
+            validation = self._validate_observer_range(fd, g0, candidate)
+            has_suffix = complete_end < g0.st_size
+            full_validation: _ObserverValidation | None = None
+            if has_suffix:
+                full_validation = self._validate_observer_range(fd, g0, raw)
+            append_active = has_suffix and self._observer_append_active()
+            if self._check_observer_source(g0, retry_source_change):
+                return
+            if validation.error is not None:
+                raise validation.error
+            if has_suffix and not append_active:
+                assert full_validation is not None
+                if full_validation.error is not None:
+                    raise full_validation.error
+                validation = full_validation
+                candidate = raw
+            for attribute in _FullLoadValidator._STATE_ATTRIBUTES:
+                setattr(self, attribute, getattr(validation.state, attribute))
+            delta = (
+                self._installed_delta_from_baseline(self._entries, baseline)
+                if self.on_entries_installed is not None
+                else ()
+            )
+            self._set_observer_log_stat(g0, len(candidate), raw)
+            self._publish_entries_installed(delta)
         finally:
             os.close(fd)
-        complete_end = raw.rfind(b"\n") + 1
-        if (
-            complete_end == g0.st_size
-            and complete_end == getattr(self, "_log_offset", 0)
-            and complete_end
-            and self._known_prefix_matches_bytes(raw, complete_end)
-        ):
-            self._check_observer_source(g0, retry_source_change)
-            return
-        candidate = raw[:complete_end]
-        baseline = (len(self._entries), self._entry_prefix_digest)
-        validator = _FullLoadValidator(self, candidate, g0)
-        validation_error: ConversationIntegrityError | None = None
+
+    def _validate_observer_range(
+        self: ConversationStore, fd: int, g0: os.stat_result, data: bytes
+    ) -> _ObserverValidation:
+        """Validate one in-memory byte range through the shared streaming validator.
+
+        The authoritative bytes are read once (``data``); feeding them to
+        ``TranscriptStream`` reuses the loader's validator and physical-row
+        iteration without a second parse. ``finish_digest`` re-stats ``fd`` only
+        on the error path, so a resized stat keeps the digest bound to ``data``.
+        """
+        stat = g0 if len(data) == g0.st_size else _resize_stat(g0, len(data))
+        cursor = 0
+
+        def read(_fd: int, size: int) -> bytes:
+            nonlocal cursor
+            chunk = data[cursor : cursor + size]
+            cursor += len(chunk)
+            return chunk
+
+        source = TranscriptStream(fd, stat, read=read)
+        validator = _FullLoadValidator(self, source)
         try:
             for physical_row in self._iter_physical_rows(
-                candidate, g0, validator.validated_prefix
+                source, validator.validated_prefix
             ):
                 validator.accept(physical_row)
             validator.finish(install=False)
         except ConversationIntegrityError as exc:
-            validation_error = exc
-        has_suffix = complete_end < g0.st_size
-        full_validator: _FullLoadValidator | None = None
-        full_validation_error: ConversationIntegrityError | None = None
-        if has_suffix:
-            full_validator = _FullLoadValidator(self, raw, g0)
-            try:
-                for physical_row in self._iter_physical_rows(
-                    raw, g0, full_validator.validated_prefix
-                ):
-                    full_validator.accept(physical_row)
-                full_validator.finish(install=False)
-            except ConversationIntegrityError as exc:
-                full_validation_error = exc
-        append_active = has_suffix and self._observer_append_active()
-        if self._check_observer_source(g0, retry_source_change):
-            return
-        if validation_error is not None:
-            raise validation_error
-        if has_suffix and not append_active:
-            if full_validation_error is not None:
-                raise full_validation_error
-            assert full_validator is not None
-            validator = full_validator
-            candidate = raw
-        for attribute in _FullLoadValidator._STATE_ATTRIBUTES:
-            setattr(self, attribute, getattr(validator.state, attribute))
-        delta = (
-            self._installed_delta_from_baseline(self._entries, baseline)
-            if self.on_entries_installed is not None
-            else ()
-        )
-        self._set_observer_log_stat(g0, len(candidate), raw)
-        self._publish_entries_installed(delta)
+            return _ObserverValidation(validator.state, exc)
+        return _ObserverValidation(validator.state, None)
 
     def _check_observer_source(
         self: ConversationStore,
