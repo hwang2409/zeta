@@ -680,7 +680,11 @@ class ServerRuntime:
                     return
                 task = next((item for item in registry.snapshot() if item.task_id == notice.task_id), None)
                 if task is not None:
-                    run_work_sink(session_id, EventDescriptor.BACKGROUND_TASK_UPDATED, {"task": background_task_row(task)})
+                    run_work_sink(
+                        session_id,
+                        EventDescriptor.BACKGROUND_TASK_UPDATED,
+                        {"task": background_task_row(task, phase=notice.phase)},
+                    )
             registry.set_notice_sink(task_changed)
             state.opened.store.set_todo_change_sink(
                 lambda todo: run_work_sink(session_id, EventDescriptor.TODO_UPDATED, {"todo": [dict(item) for item in todo]})

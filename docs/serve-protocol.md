@@ -807,6 +807,8 @@ work. The result contains `cleared`, the number of removed messages.
 Both methods require the negotiated `run_work` feature and an active session.
 `run_work_list` takes `session_id` and returns `tasks` and `todo` snapshots. Each task has `id`, `status`, `command`, `elapsed_seconds`, and `cancelable`; a known terminal code adds `exit_code`. Todo rows contain only `content` and `status`.
 
+Task status is one of `starting`, `running`, `stopping`, `exited`, `failed`, or `killed`. `starting` and `stopping` are lifecycle events; `exited` is a clean natural exit, `failed` is a known nonzero natural exit, and `killed` is a killed or terminated task. `cancelable` is true only for `starting`, `running`, and `stopping`.
+
 `background_task_cancel` takes `session_id` and `task_id`. It asks the task registry to stop the task and returns the committed terminal task row as `{"task": row}`. Task lifecycle commits emit `background_task_updated`; todo store commits emit `todo_updated`. Events use the same projections and go only to a controller that negotiated `run_work`.
 
 ### `status`

@@ -12,11 +12,17 @@ from .process import BackgroundTaskRegistry
 MAX_WIRE_COMMAND_BYTES = 8_000
 
 
-def task_status(task: BackgroundTaskInfo) -> str:
+def task_status(task: BackgroundTaskInfo, phase: str | None = None) -> str:
+    if phase == "started":
+        return "starting"
+    if phase == "stopping":
+        return "stopping"
     if task.running:
         return "running"
     if task.terminal_phase in {"task_kill", "session_shutdown"}:
         return "killed"
+    if task.exit_code not in {None, 0}:
+        return "failed"
     return "exited"
 
 
@@ -35,12 +41,12 @@ def _bounded_command(command: str) -> str:
 
 
 def background_task_row(
-    task: BackgroundTaskInfo, now: float | None = None
+    task: BackgroundTaskInfo, now: float | None = None, phase: str | None = None
 ) -> dict[str, object]:
     current = time.monotonic() if now is None else now
     row: dict[str, object] = {
         "id": task.task_id,
-        "status": task_status(task),
+        "status": task_status(task, phase),
         "command": _bounded_command(task.command),
         "elapsed_seconds": task_elapsed_seconds(task, current),
         "cancelable": task.running,
@@ -57,7 +63,7 @@ def run_work_snapshot(
 ) -> dict[str, object]:
     current = time.monotonic() if now is None else now
     return {
-        "background_tasks": [
+        "tasks": [
             background_task_row(task, current) for task in registry.snapshot()
         ],
         "todo": [dict(item) for item in todo],
