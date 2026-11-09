@@ -41,28 +41,57 @@ async def _open(tmp_path: Path, features: list[str]):
 
 
 @pytest.mark.asyncio
-async def test_child_history_is_advertised_to_negotiated_observer(tmp_path: Path) -> None:
-    server = ZetaServer(
-        provider="codex",
-        home=tmp_path,
-        socket_path=short_socket_path(tmp_path),
-        approval_reconnect_grace=0,
+async def test_child_history_is_available_to_negotiated_observer(tmp_path: Path) -> None:
+    server, controller_reader, controller_writer, session_id = await _open(
+        tmp_path, ["child_run_history"]
     )
-    await server.start()
-    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("message")]))
+    child.close()
+    observer_reader, observer_writer = await asyncio.open_unix_connection(
+        str(server.socket_path)
+    )
     try:
         hello = (
             await request(
-                reader,
-                writer,
-                1,
+                observer_reader,
+                observer_writer,
+                3,
                 "hello",
-                {"protocol_version": "1.2", "features": ["child_run_history"]},
+                {
+                    "protocol_version": "1.2",
+                    "role": "observer",
+                    "features": ["serve_observers", "child_run_history"],
+                },
             )
         )[-1]
         assert "child_run_history" in hello["result"]["capabilities"]["features"]
+        reply = (
+            await request(
+                observer_reader,
+                observer_writer,
+                4,
+                "child_run_history",
+                {"session_id": session_id, "run_id": f"{session_id}:1"},
+            )
+        )[-1]
+        assert "result" in reply, reply
+        assert reply["result"]["messages"][0]["content"][0]["text"] == "message"
+        assert reply["result"]["next_before"] is None
+        assert "history_validator" in reply["result"]
     finally:
-        await close_serve(server, writer)
+        await close_serve(server, observer_writer, controller_writer)
 
 
 @pytest.mark.asyncio
