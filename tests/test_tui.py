@@ -8985,6 +8985,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         recover_agent_children(loop, should_stop=observed_stop)
         recovery_steps += children_before - len(loop.store.agent_children())
 
+    # test-contract: seam recovery must stop while the TUI is shutting down.
     monkeypatch.setattr(background_lifecycle, "_recover_agent_children", gated_recovery)
     app = TUIApp(
         AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty()),
