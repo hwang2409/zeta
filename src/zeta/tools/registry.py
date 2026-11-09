@@ -86,7 +86,10 @@ from ._shared.cwd_state import (
     open_session_cwd,
     open_verified_directory,
 )
-from ._shared.process import BackgroundTaskRegistry
+from ._shared.process import (
+    background_tasks_for_session,
+    bind_background_tasks_to_session,
+)
 from ._shared.sandbox import SandboxPolicy
 from ._spill import SpillStore
 from ._validation import (
@@ -322,17 +325,8 @@ class ToolRegistry:
         # Set by AgentLoop; copied into child session clones.  Kept optional so
         # registries used by standalone tool tests remain valid.
         self._agent_owner: Any = None
-        self.background_tasks = BackgroundTaskRegistry(
-            session_dir=session_store.session_dir
-            if session_store is not None
-            else None,
-            directory_fd=session_store.directory_fd
-            if session_store is not None
-            else None,
-            command_niceness=command_niceness,
-            storage_lease=(
-                session_store._storage_lease if session_store is not None else None
-            ),
+        self.background_tasks = background_tasks_for_session(
+            session_store, command_niceness=command_niceness
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -771,11 +765,8 @@ class ToolRegistry:
             clone.cwd,
             allow_outside=not clone.tool_policy.restricted,
         )
-        clone.background_tasks = BackgroundTaskRegistry(
-            session_dir=store.session_dir,
-            directory_fd=store.directory_fd,
-            command_niceness=clone.command_niceness,
-            storage_lease=store._storage_lease,
+        clone.background_tasks = background_tasks_for_session(
+            store, command_niceness=clone.command_niceness
         )
         clone.bash_cwd = store.bash_cwd
         clone.abort_signal = clone._abort_registry.new_generation()
@@ -837,9 +828,7 @@ class ToolRegistry:
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
         )
-        self.background_tasks.bind_session_dir(
-            store.session_dir, store.directory_fd, store._storage_lease
-        )
+        bind_background_tasks_to_session(self.background_tasks, store)
         self.bash_cwd = store.bash_cwd
 
     @property
