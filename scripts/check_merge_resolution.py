@@ -14,6 +14,18 @@ import tempfile
 from collections import Counter
 from dataclasses import dataclass
 
+_AST_CACHE: dict[str, ast.Module] = {}
+_PARSE_ITEMS_CACHE: dict[tuple[int, str, tuple[tuple[str, str], ...]], tuple[list[Item], set[tuple[str, str]]]] = {}
+
+
+def _parse_tree(text: str, path: str) -> ast.Module:
+    key = hashlib.sha256(text.encode()).hexdigest()
+    tree = _AST_CACHE.get(key)
+    if tree is None:
+        tree = ast.parse(text, filename=path)
+        _AST_CACHE[key] = tree
+    return tree
+
 ROOTS = ("src/", "scripts/", "tests/")
 
 
@@ -116,6 +128,14 @@ def _collection_elements(value: ast.expr) -> list[ast.expr] | None:
 def parse_items(
     path: str, tree: ast.Module, collection_lookup: dict[str, list[ast.expr]]
 ) -> tuple[list[Item], set[tuple[str, str]]]:
+    cache_key = (
+        id(tree),
+        path,
+        tuple(sorted((name, ast.dump(elements, include_attributes=False)) for name, elements in collection_lookup.items())),
+    )
+    cached = _PARSE_ITEMS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     result: list[Item] = []
     unresolved: set[tuple[str, str]] = set()
 
@@ -246,6 +266,7 @@ def parse_items(
             add_dispatch_comparisons(node, scope)
 
     visit_body(tree.body)
+    _PARSE_ITEMS_CACHE[cache_key] = (result, unresolved)
     return result, unresolved
 
 
@@ -330,7 +351,7 @@ def _owner_translation(source: dict, target: dict) -> dict[str, str]:
 
 def _line_items(path: str, text: str, owners: dict[str, str]) -> list[Item]:
     try:
-        tree = ast.parse(text, filename=path)
+        tree = _parse_tree(text, path)
     except SyntaxError:
         return []
     lines = text.splitlines()
@@ -371,15 +392,13 @@ def _pr_line_candidates(
     path: str, base: list[str], branch: list[str], owners: dict[str, str]
 ) -> list[tuple[Item, tuple[int, int]]]:
     branch_items = _line_items(path, "\n".join(branch), owners)
-    items_by_line: dict[int, list[Item]] = {}
-    for item in branch_items:
-        items_by_line.setdefault(item.line, []).append(item)
     candidates = []
     for old_start, old_end, new_start, new_end in _diff_blocks(base, branch):
         for line in range(new_start + 1, new_end + 1):
             candidates.extend(
                 (item, (old_start, old_end))
-                for item in items_by_line.get(line, ())
+                for item in branch_items
+                if item.line == line
             )
     return candidates
 
@@ -404,16 +423,14 @@ def _pr_line_items(
               (base_items, branch_items, main_items, merge_items)]
     additions = Counter(item_key(item) for item, _interval in candidates)
     result = []
-    result_counts: Counter[tuple[str, str, str, str, str]] = Counter()
     for item, (start, end) in candidates:
         if _main_overlaps(start, end, main_blocks):
             continue
         key = item_key(item)
         required = max(0, counts[1][key] + counts[2][key] - counts[0][key])
         lost = min(additions[key], max(0, required - counts[3][key]))
-        if lost and result_counts[key] < lost:
+        if lost and sum(item_key(candidate) == key for candidate in result) < lost:
             result.append(item)
-            result_counts[key] += 1
     return result
 
 
@@ -649,7 +666,7 @@ def _revision_index(
         text = sources[(revision, path)]
         if text is None:
             continue
-        tree = ast.parse(text, filename=path)
+        tree = _parse_tree(text, path)
         trees[path] = tree
         _index_collections(tree, _module_name(path), collections)
     return trees, collections
