@@ -438,20 +438,6 @@ class IndexStatus:
     detail: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class EvalResult:
-    query_count: int
-    recall_at: dict[int, float]
-    mrr: float
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "query_count": self.query_count,
-            "recall_at": {str(key): value for key, value in self.recall_at.items()},
-            "mrr": self.mrr,
-        }
-
-
 class TranscriptIndex:
     """Own one project's complete derived index behind a small interface."""
 
@@ -1012,54 +998,6 @@ class _ProjectFileGuard:
         finally:
             self.thread_lock.release()
 
-
-def evaluate_manifest(manifest_path: Path, units_path: Path) -> EvalResult:
-    """Evaluate the frozen corpus through the production FTS5 search path."""
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    units = [
-        TranscriptUnit.from_dict(json.loads(line))
-        for line in units_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    project_ids = {unit.project_id for unit in units}
-    if len(project_ids) != 1:
-        raise ValueError("evaluation units must belong to one project")
-    project_id = project_ids.pop()
-    rankings: list[list[str]] = []
-    targets: list[set[str]] = []
-    with tempfile.TemporaryDirectory() as directory:
-        index = TranscriptIndex(Path(directory) / project_id, project_id)
-        by_session: dict[str, list[TranscriptUnit]] = {}
-        for unit in units:
-            by_session.setdefault(unit.session_id, []).append(unit)
-        for session_id, session_units in by_session.items():
-            index.append_units(
-                session_id,
-                session_units,
-                cursor=max(unit.seq_end for unit in session_units),
-            )
-        for case in manifest["queries"]:
-            rankings.append(
-                [hit.unit_id for hit in index.search(case["query"], limit=10)]
-            )
-            targets.append(set(case["target_unit_ids"]))
-    recall = {
-        k: sum(
-            bool(set(ranking[:k]) & target)
-            for ranking, target in zip(rankings, targets, strict=True)
-        )
-        / len(targets)
-        for k in (1, 5, 10)
-    }
-    reciprocal = []
-    for ranking, target in zip(rankings, targets, strict=True):
-        rank = next(
-            (index for index, unit_id in enumerate(ranking, 1) if unit_id in target),
-            None,
-        )
-        reciprocal.append(1.0 / rank if rank else 0.0)
-    return EvalResult(len(targets), recall, sum(reciprocal) / len(reciprocal))
 
 
 def delete_indexed_session(

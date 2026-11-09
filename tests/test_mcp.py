@@ -3279,6 +3279,40 @@ def _write_json(path: Path, servers: dict[str, dict[str, object]]) -> None:
     path.write_text(json.dumps({"servers": servers}))
 
 
+@pytest.mark.asyncio
+async def test_malformed_mcp_trust_reports_offline_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    project = tmp_path / "project"
+    _write_json(
+        project_config_path(project),
+        {"local": {"transport": "stdio", "command": "local-server"}},
+    )
+    trust_path = home / "mcp-trust.json"
+    original = b"not json\n"
+    trust_path.parent.mkdir(parents=True)
+    trust_path.write_bytes(original)
+
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    loop.set_mcp_scope(home=home, project_dir=project)
+    try:
+        output = await loop.slash_mcp("")
+        assert output == (
+            f"mcp error: mcp-trust.json is not valid: {trust_path.resolve()}; "
+            "move it aside to a backup, then re-approve the servers or restore it "
+            "from a backup"
+        )
+        assert loop._mcp_mount is not None
+        assert loop._mcp_mount.configs == {}
+        assert trust_path.read_bytes() == original
+    finally:
+        await loop.close()
+        store.close()
+
+
 def test_overlay_project_shadows_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

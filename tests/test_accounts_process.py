@@ -282,7 +282,13 @@ def test_start_without_a_loaded_registry_keeps_every_account_file(
     result = _headless_start(tmp_path)
 
     assert _account_files(tmp_path) == before, result.stderr
-    assert warning in result.stderr
+    expected_warning = (
+        warning
+        if registry is None
+        else f"accounts.json is unreadable: {tmp_path / 'accounts.json'}; "
+        "kept it and every account directory"
+    )
+    assert expected_warning in result.stderr
     assert result.stderr.count("accounts.json is") == 1, result.stderr
     if registry is None:
         assert not (tmp_path / "accounts.json").exists()
