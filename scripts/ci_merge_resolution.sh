@@ -33,6 +33,8 @@ for commit in $commits; do
   echo "checking merge resolution: $commit"
   args=("$commit" --final "$FINAL_SHA")
   [ -z "$body_file" ] || args+=(--pr-body-file "$body_file")
+  # train/<lane>-<n> is built from origin/main with git merge --no-ff of each PR head.
+  case "${HEAD_REF:-}" in train/*) args+=(--train-head "$HEAD_SHA") ;; esac
   set +e
   output=$(python "${CHECK_MERGE_RESOLUTION_SCRIPT:-scripts/check_merge_resolution.py}" "${args[@]}" 2>&1)
   status=$?
