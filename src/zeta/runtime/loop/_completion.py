@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import errno
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from ...core.abort import AbortSignal
 from ...protocol.types import (
     ContentBlock,
     ErrorInfo,
@@ -25,14 +24,7 @@ from ...protocol.types import (
     StreamEvent,
     StreamEventType,
     ThinkingContent,
-    ToolUseContent,
 )
-from ...providers.retry_policy import (
-    MAX_PROVIDER_ATTEMPTS,
-    ProviderRetryBudget,
-    RetryPlan,
-)
-from ...providers.stream_diagnostics import StreamDiagnostics
 
 if TYPE_CHECKING:
     from ...core.store import ConversationStore
@@ -43,47 +35,13 @@ MAX_ERROR_MESSAGE = 400
 
 async def provider_events(
     completion: AsyncIterator[StreamEvent],
-    on_started: Callable[[], Awaitable[None]] | None = None,
+    on_started: Callable[[], Awaitable[None]],
 ) -> AsyncIterator[StreamEvent]:
-    """Preserve stream ordering while exposing the provider-start seam."""
+    """Run ``on_started`` when provider consumption starts."""
 
-    finished = object()
-    events: asyncio.Queue[StreamEvent | object] = asyncio.Queue(maxsize=1)
-    consumed = asyncio.Event()
-    started = asyncio.Event()
-
-    async def produce() -> None:
-        started.set()
-        try:
-            async for event in completion:
-                await events.put(event)
-                await consumed.wait()
-                consumed.clear()
-        finally:
-            task = asyncio.current_task()
-            if task is None or not task.cancelling():
-                await events.put(finished)
-
-    producer = asyncio.create_task(produce())
-    try:
-        await started.wait()
-        if producer.done() and not producer.cancelled():
-            error = producer.exception()
-            if error is not None:
-                raise error
-        if on_started is not None:
-            await on_started()
-        while (event := await events.get()) is not finished:
-            assert isinstance(event, StreamEvent)
-            try:
-                yield event
-            finally:
-                consumed.set()
-        await producer
-    finally:
-        if not producer.done():
-            producer.cancel()
-            await asyncio.gather(producer, return_exceptions=True)
+    await on_started()
+    async for event in completion:
+        yield event
 
 
 def observed_completion(
@@ -91,14 +49,13 @@ def observed_completion(
     store: ConversationStore,
     steering: ClientSteeringBatch | None,
 ) -> AsyncIterator[StreamEvent]:
-    """Publish steering when the provider starts without changing event order."""
+    """Publish steering when provider consumption starts, keeping event order."""
 
     if steering is None:
         return completion
-    on_started = (
-        partial(store.deliver_client_steering, steering) if steering is not None else None
+    return provider_events(
+        completion, partial(store.deliver_client_steering, steering)
     )
-    return provider_events(completion, on_started)
 
 
 def _is_permission_error(error: BaseException) -> bool:
@@ -196,19 +153,6 @@ async def subscription_limit_failure(
     return error, StreamEvent(StreamEventType.ACCOUNT_LIMIT, data=limit_data)
 
 
-async def close_completion(
-    completion: AsyncIterator[StreamEvent] | None,
-) -> BaseException | None:
-    if completion is None:
-        return None
-    close = getattr(completion, "aclose", None)
-    if close is None:
-        return None
-    try:
-        await close()
-    except BaseException as exc:  # noqa: BLE001 - preserve close errors
-        return exc
-    return None
 
 
 def task_is_cancelling() -> bool:
@@ -239,164 +183,3 @@ def can_retry_context(
         and not partial
         and message is None
     )
-
-
-@dataclass(slots=True)
-class ProviderAttemptState:
-    """Exposure and persistence state for one streamed provider attempt."""
-
-    started: bool = False
-    tool_call_completed: bool = False
-    persisted: bool = False
-
-    def observe(self, event: StreamEvent) -> None:
-        if (
-            event.type
-            in {
-                StreamEventType.MESSAGE_START,
-                StreamEventType.MESSAGE_UPDATE,
-                StreamEventType.MESSAGE_END,
-            }
-            or event.message is not None
-            or event.content is not None
-            or event.delta is not None
-            or event.tool_call is not None
-        ):
-            self.started = True
-        if event.data.get("tool_call_completed") is True:
-            self.tool_call_completed = True
-        elif event.tool_call is not None and "tool_call_delta" not in event.data:
-            # Providers such as Ollama emit only complete tool calls.
-            self.tool_call_completed = True
-        if isinstance(event.content, ToolUseContent):
-            self.tool_call_completed = True
-        if event.message is not None and any(
-            isinstance(block, ToolUseContent) for block in event.message.content
-        ):
-            self.tool_call_completed = True
-
-    @property
-    def can_retry(self) -> bool:
-        return self.started and not self.persisted and not self.tool_call_completed
-
-    def _retry_block_reason(
-        self, *, reset_supported: bool, turn_aborted: bool
-    ) -> str | None:
-        if self.persisted:
-            return "assistant_persisted"
-        if self.tool_call_completed:
-            return "tool_call_completed"
-        if not reset_supported:
-            return "assistant_reset_not_supported"
-        if turn_aborted:
-            return "turn_aborted"
-        return None
-
-    def retry_plan(
-        self,
-        budget: ProviderRetryBudget | None,
-        source: BaseException | object,
-        *,
-        reset_supported: bool,
-        turn_aborted: bool,
-        event_data: Mapping[str, Any],
-    ) -> RetryPlan | None:
-        if budget is None:
-            StreamDiagnostics.record_failure_decision(
-                source, provider="codex", will_retry=False
-            )
-            return None
-        reason = self._retry_block_reason(
-            reset_supported=reset_supported,
-            turn_aborted=turn_aborted,
-        )
-        if self.started and reason is not None:
-            budget.records.append(
-                {"decision": "skipped-after-output", "reason": reason}
-            )
-            StreamDiagnostics.record_failure_decision(
-                source, provider="codex", will_retry=False
-            )
-            return None
-        if not self.can_retry:
-            StreamDiagnostics.record_failure_decision(
-                source, provider="codex", will_retry=False
-            )
-            return None
-        plan = budget.plan(source, owner="loop", event_data=event_data)
-        if plan is None:
-            StreamDiagnostics.record_failure_decision(
-                source, provider="codex", will_retry=False
-            )
-        return plan
-
-
-def start_provider_attempt(
-    budget: ProviderRetryBudget | None,
-) -> ProviderRetryBudget:
-    budget = budget or ProviderRetryBudget()
-    if not budget.start_attempt("loop"):
-        raise RuntimeError("provider retry budget exhausted")
-    return budget
-
-
-def provider_retry_notice(plan: RetryPlan) -> StreamEvent:
-    """Tell consumers that a retry is scheduled, without clearing output yet."""
-
-    label = "provider stalled" if plan.is_stall else f"provider error ({plan.reason})"
-    data: dict[str, object] = {
-        "kind": "provider_retry",
-        "text": (
-            f"{label}, retry scheduled in {plan.delay:g}s "
-            f"(attempt {plan.attempt}/{MAX_PROVIDER_ATTEMPTS})"
-        ),
-        "retry": plan.attempt - 1,
-        "attempt": plan.attempt,
-        "reason": plan.reason,
-        "delay": plan.delay,
-    }
-    if plan.is_stall:
-        data["is_stall"] = True
-    return StreamEvent(type=StreamEventType.RETRY, data=data)
-
-
-def assistant_reset_event() -> StreamEvent:
-    """Tell output adapters to drop the unfinished assistant response."""
-
-    return StreamEvent(StreamEventType.ASSISTANT_RESET)
-
-
-async def wait_for_provider_retry(
-    delay: float,
-    abort_signal: AbortSignal | None,
-    source: BaseException | object,
-) -> bool:
-    """Wait for backoff, returning false immediately when the user aborts."""
-
-    if abort_signal is None:
-        await asyncio.sleep(delay)
-        StreamDiagnostics.record_failure_decision(
-            source, provider="codex", will_retry=True
-        )
-        return True
-    if abort_signal.is_set():
-        StreamDiagnostics.record_failure_decision(
-            source, provider="codex", will_retry=False
-        )
-        return False
-    sleep_task = asyncio.create_task(asyncio.sleep(delay))
-    abort_task = asyncio.create_task(abort_signal.wait())
-    try:
-        done, _pending = await asyncio.wait(
-            {sleep_task, abort_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        will_retry = sleep_task in done and not abort_signal.is_set()
-        StreamDiagnostics.record_failure_decision(
-            source, provider="codex", will_retry=will_retry
-        )
-        return will_retry
-    finally:
-        for task in (sleep_task, abort_task):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(sleep_task, abort_task, return_exceptions=True)

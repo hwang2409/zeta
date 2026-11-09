@@ -1521,6 +1521,7 @@ async def test_typed_mutation_snapshots_one_nested_resident_field(
     await store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
 
     assert resident_deepcopies == 1
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -1570,6 +1571,7 @@ async def test_durable_publish_preserves_nested_owner_change(
     await await_or_fail(write, what="nested owner change publication")
 
     assert store.agent_children()[call.id]["turns_used"] == 7
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -1625,6 +1627,8 @@ async def test_durable_publish_preserves_newer_owner_state(
     assert store.agent_canceled() == fresh.agent_canceled()
     assert store._agent_parent == fresh._agent_parent
     assert store.agent_lifecycle() == fresh.agent_lifecycle()
+    fresh.close()
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -1678,6 +1682,8 @@ async def test_off_loop_refresh_preserves_newer_owner_state(
     assert store.agent_canceled() == fresh.agent_canceled()
     assert store._agent_parent == fresh._agent_parent
     assert store.agent_lifecycle() == fresh.agent_lifecycle()
+    fresh.close()
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -1711,6 +1717,7 @@ async def test_off_loop_refresh_is_bounded_under_owner_writes(
 
     assert loads == 1
     assert store.bash_cwd == "/owner-1"
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -1804,6 +1811,7 @@ async def test_off_loop_refresh_cancellation_finalizes_submitted_work(
         await await_or_fail(
             asyncio.gather(refresh, return_exceptions=True), what="refresh cleanup"
         )
+        store.close()
 
 
 @pytest.mark.asyncio
