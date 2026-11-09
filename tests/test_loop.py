@@ -26,7 +26,7 @@ from zeta.agent.finish_gate import finish_gate_message
 from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
-from zeta.core.context import ContextAssembler
+from zeta.core.context import AssembledContext, ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
 from zeta.protocol.types import (
@@ -59,6 +59,14 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
+
+
+def _update_prompt(assembler: ContextAssembler, prompt: Message) -> None:
+    update = getattr(assembler, "update_system_prompt", None)
+    if update is None:
+        assembler.system_prompt = prompt
+    else:
+        update(prompt)
 
 
 @pytest.mark.asyncio
@@ -530,6 +538,107 @@ class ParallelChildFailureBackend(CompletionBackend):
             [TextContent("delegating"), *(ToolUseContent(call) for call in calls)],
         )
         yield StreamEvent(StreamEventType.MESSAGE_END, message=message)
+
+
+@pytest.mark.asyncio
+async def test_runtime_prepares_context_once_without_sync_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
+    store = ConversationStore(tmp_path)
+    calls = 0
+    preflight_calls = 0
+    real_prepare = ContextAssembler._prepare_assembly
+
+    def observed_prepare(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_prepare(self, *args, **kwargs)
+
+    def unexpected_preflight(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return False
+
+    # test-contract: seam instrumentation verifies one runtime preparation.
+    monkeypatch.setattr(ContextAssembler, "_prepare_assembly", observed_prepare)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    monkeypatch.setattr(loop.context_assembler, "needs_compaction", unexpected_preflight)
+
+    await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
+
+    assert calls == 1
+    assert preflight_calls == 0
+    assert loop.context_assembler.last_context is not None
+    assert backend.calls[0][0] == loop.context_assembler.last_context.messages
+    await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_compaction_start_precedes_durable_assembly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    order: list[str] = []
+    starts = 0
+    assembler = loop.context_assembler
+    message = Message(MessageRole.USER, [TextContent("prepared")])
+
+    async def prepare_context(**kwargs):  # type: ignore[no-untyped-def]
+        order.append("prepare")
+        return True
+
+    async def assemble(**kwargs):  # type: ignore[no-untyped-def]
+        order.append("durable-compaction")
+        assembler.last_context = AssembledContext([message], 1, compacted=True)
+        return [message]
+
+    monkeypatch.setattr(assembler, "prepare_context", prepare_context)
+    monkeypatch.setattr(assembler, "assemble", assemble)
+    events = await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
+    starts = sum(event.type is StreamEventType.COMPACTION_START for event in events)
+
+    assert starts == 1
+    assert order == ["prepare", "durable-compaction"]
+    await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancellation_after_compaction_start_discards_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    assembler = loop.context_assembler
+    sentinel = object()
+
+    async def prepare_context(**kwargs):  # type: ignore[no-untyped-def]
+        assembler._preparation_owner._prepared = sentinel  # type: ignore[assignment]
+        return True
+
+    async def assemble(**kwargs):  # type: ignore[no-untyped-def]
+        pytest.fail("durable assembly must not run after cancellation")
+
+    monkeypatch.setattr(assembler, "prepare_context", prepare_context)
+    monkeypatch.setattr(assembler, "assemble", assemble)
+    run = loop.run_turn("hi", origin=MessageOrigin.USER)
+    while True:
+        event = await asyncio.wait_for(anext(run), 10)
+        if event.type is StreamEventType.COMPACTION_START:
+            break
+
+    try:
+        assert assembler._preparation_owner._prepared is sentinel
+        await asyncio.wait_for(run.aclose(), 10)
+        assert assembler._preparation_owner._prepared is None
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -3286,3 +3395,36 @@ def test_run_turn_requires_explicit_origin(tmp_path: Path) -> None:
 
     with pytest.raises(TypeError):
         loop.run_turn("plain string without origin")  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_change_at_compaction_start_is_used(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        system_prompt="old prompt",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    assembler = loop.context_assembler
+    real_prepare = assembler.prepare_context
+
+    async def prepare_then_expose_compaction_window(**kwargs):
+        await real_prepare(**kwargs)
+        return True
+
+    assembler.prepare_context = prepare_then_expose_compaction_window
+    run = loop.run_turn("hello", origin=MessageOrigin.USER)
+    try:
+        while True:
+            event = await asyncio.wait_for(anext(run), 10)
+            if event.type is StreamEventType.COMPACTION_START:
+                break
+        _update_prompt(assembler, Message(MessageRole.SYSTEM, [TextContent("new prompt")]))
+        async for _ in run:
+            pass
+        assert backend.calls[0][0][0].content[0].text == "new prompt"
+    finally:
+        await loop.close()
+        store.close()
