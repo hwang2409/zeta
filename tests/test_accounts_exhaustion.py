@@ -1007,8 +1007,7 @@ async def test_account_switch_never_replays_transcript(
     async def idle() -> None:
         return None
 
-    response = await server_accounts.request(
-        "account_switch",
+    response = await server_accounts.switch(
         SimpleNamespace(loop=loop, metadata=context.metadata),
         idle,
         {"account": str(first)},
