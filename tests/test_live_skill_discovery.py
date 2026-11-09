@@ -126,6 +126,14 @@ def _install_live_skill(
     )
 
 
+def _write_skill(path: Path, name: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: live prompt\n---\nlive body\n",
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.asyncio
 async def test_live_live_config_ignores_user_skill_marker_and_replaces_owned_index(
     tmp_path: Path,
@@ -790,7 +798,7 @@ async def test_live_reload_between_turns_updates_next_provider_prompt(tmp_path: 
     project.mkdir()
     store = ConversationStore(tmp_path / "session", cwd=project)
     old_skill = home / "skills" / "old-live-prompt.md"
-    _install_live_skill(home, "old-live-prompt", "live prompt")
+    _write_skill(old_skill, "old-live-prompt")
     backend = FakeBackend(
         [ScriptedTurn([TextContent("first")]), ScriptedTurn([TextContent("second")])]
     )
@@ -806,7 +814,7 @@ async def test_live_reload_between_turns_updates_next_provider_prompt(tmp_path: 
         async for _ in loop.run_turn("first", origin=MessageOrigin.USER):
             pass
         old_skill.unlink()
-        _install_live_skill(home, "new-live-prompt", "new-live-prompt")
+        _write_skill(home / "skills" / "new-live-prompt.md", "new-live-prompt")
         await loop.refresh_live_config()
         async for _ in loop.run_turn("second", origin=MessageOrigin.USER):
             pass
