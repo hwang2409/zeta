@@ -1,10 +1,8 @@
 """Tool registration and MCP-compatible execution results.
-
 Text blocks always include ``truncated`` and ``full_size``. ``full_size`` is
 the original UTF-8 byte length before a character cap is applied. Fetch pages
 also include ``full_size_chars`` for their readable-text character length.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -101,12 +99,10 @@ from ._validation import (
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
     from ..skills.agent_catalog import AgentCatalog
-
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
 HandlerBinding = Literal["loop", "shared"]
-
 
 def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
     return partial(handler, registry)
