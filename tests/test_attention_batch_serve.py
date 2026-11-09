@@ -303,6 +303,62 @@ def _leave_sealed_reply(
 
 
 @pytest.mark.asyncio
+async def test_serve_batch_sends_good_items_and_refuses_broken_one(
+    tmp_path: Path,
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        opened = server.runtime.opened
+        assert opened is not None
+        registry = server.runtime.manager.project_registry
+        assert registry is not None
+        project_id = (
+            await asyncio.to_thread(registry.create_project, "serve attention", "test")
+        ).project_id
+        store = AttentionStore(opened.store.session_dir)
+        good, bad = [
+            await asyncio.to_thread(
+                store.request,
+                session_id=session_id,
+                project_id=project_id,
+                entry_id=None,
+                entry_seq=None,
+                title=f"pick {index}",
+                why="choose",
+                options=("yes",),
+            )
+            for index in range(2)
+        ]
+        bad_path = opened.store.session_dir / "attention" / f"{bad.id}.json"
+        bad_path.write_bytes(b"{")
+        payload = json.dumps(
+            [{"id": good.id, "reply": "yes"}, {"id": bad.id, "reply": "yes"}]
+        )
+        response = (
+            await _request(
+                reader,
+                writer,
+                "mixed",
+                "slash_run",
+                {"session_id": session_id, "text": f"/decisions batch {payload}"},
+            )
+        )[-1]["result"]
+        assert response["text"] == (
+            "replied to 1 attention item(s)\n"
+            f"attention record {bad.id} is broken (invalid_json); "
+            f"repair attention/{bad.id}.json before replying"
+        )
+        assert store.get(good.id).status == "resolved"
+        assert bad_path.read_bytes() == b"{"
+        inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
+        assert len(inbox.new_ids(project_id, session_id=session_id)) == 1
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

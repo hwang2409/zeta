@@ -15,7 +15,12 @@ from typing import Any, ClassVar, TypeVar
 
 import httpx
 
-from .completion import is_control_exception, merge_exception, report_transport_activity
+from .completion import (
+    MustCompleteClose,
+    is_control_exception,
+    merge_exception,
+    report_transport_activity,
+)
 from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
@@ -269,7 +274,7 @@ class HTTPClientLease:
     __slots__ = (
         "_background_reporter_registered",
         "_borrowers",
-        "_close_task",
+        "_close",
         "_drained",
         "_retired",
         "client",
@@ -285,7 +290,7 @@ class HTTPClientLease:
         self.connection_setup_count = int(self.owned)
         self._borrowers: Counter[str] = Counter()
         self._background_reporter_registered = False
-        self._close_task: asyncio.Task[None] | None = None
+        self._close = MustCompleteClose()
         self._drained = asyncio.Event()
         self._drained.set()
         self._retired = False
@@ -329,21 +334,19 @@ class HTTPClientLease:
 
     def start_close(self) -> None:
         self.retire()
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_owned())
+        self._close.start(self._close_owned)
 
     async def aclose(
         self, report_failure: CloseFailureReporter | None = None
     ) -> None:
         self.start_close()
-        assert self._close_task is not None
-        task = self._close_task
+        assert self._close.task is not None
         try:
-            await asyncio.shield(task)
+            await self._close.wait()
         except asyncio.CancelledError:
             if report_failure is not None and not self._background_reporter_registered:
                 self._background_reporter_registered = True
-                _retain_background_closes((task,), report_failure)
+                _retain_background_closes((self._close.task,), report_failure)
             raise
 
     async def refresh(

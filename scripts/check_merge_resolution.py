@@ -6,6 +6,7 @@ import argparse
 import ast
 import difflib
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -477,22 +478,43 @@ def _direct_main_parent(
 
 
 def _train_chain_parent(
-    parents: list[str], first_parent_chain: set[str], origin_main: str
-) -> tuple[int | None, str]:
+    parents: list[str],
+    first_parent_chain: set[str],
+    origin_main: str,
+    train_head: str | None,
+) -> tuple[int | None, str, str]:
+    """Pick the train side of a merge on a train branch.
+
+    Without train evidence, only an all-merge chain qualifies. With
+    --train-head (CI passes it for train/* PRs, built per AGENTS.md as
+    train/<lane>-<n> from origin/main with a git merge --no-ff of each PR
+    head), the train side is the parent on the train head's own first-parent
+    chain, so plain fix commits between the train's merges are allowed.
+    """
     if not origin_main:
-        return None, ""
+        return None, "", "neither parent qualifies"
     matches = [
         index
         for index, parent in enumerate(parents)
         if _train_parent_qualifies(parent, first_parent_chain)
     ]
     if len(matches) == 1:
-        return matches[0], "the selected parent is the train merge chain"
-    return None, ""
+        return matches[0], "the selected parent is the train merge chain", ""
+    if len(matches) > 1:
+        return None, "", "both parents qualify"
+    if not train_head:
+        return None, "", "neither parent qualifies"
+    train_chain = set(
+        git("rev-list", "--first-parent", train_head, "^" + origin_main).splitlines()
+    )
+    matches = [index for index, parent in enumerate(parents) if parent in train_chain]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is on the --train-head first-parent chain", ""
+    return None, "", "neither parent qualifies"
 
 
 def _identify_main_parent(
-    parents: list[str],
+    parents: list[str], train_head: str | None
 ) -> tuple[int | None, str, str, str]:
     """Identify the main parent, or return evidence for an explicit refusal."""
     try:
@@ -510,17 +532,11 @@ def _identify_main_parent(
             origin_main,
             "exactly one parent is on origin/main ancestry",
         )
-    index, reason = _train_chain_parent(parents, first_parent_chain, origin_main)
+    index, reason, details = _train_chain_parent(
+        parents, first_parent_chain, origin_main, train_head
+    )
     if index is not None:
         return index, reason, origin_main, "exactly one parent is the train merge chain"
-    train_matches = [
-        parent
-        for parent in parents
-        if origin_main and _train_parent_qualifies(parent, first_parent_chain)
-    ]
-    details = (
-        "both parents qualify" if len(train_matches) > 1 else "neither parent qualifies"
-    )
     return None, "", origin_main, details
 
 
@@ -581,11 +597,11 @@ def _validate_override(
 
 
 def resolve_parent(
-    commit: str, parents: list[str], main_sha: str | None
+    commit: str, parents: list[str], main_sha: str | None, train_head: str | None
 ) -> tuple[str, str, str] | None:
     p1, p2 = parents
     print(f"parents: 1={p1} 2={p2}")
-    index, reason, origin_main, details = _identify_main_parent(parents)
+    index, reason, origin_main, details = _identify_main_parent(parents, train_head)
     if main_sha is not None:
         index = _validate_override(
             commit, parents, main_sha, index, origin_main, details
@@ -1208,6 +1224,71 @@ def _filter_findings(findings: list[Item], text: str) -> list[Item]:
     ]
 
 
+def _borrow_skip_reason(pull: dict, author: str) -> str | None:
+    head_repo = (pull.get("head") or {}).get("repo") or {}
+    base = pull.get("base") or {}
+    if head_repo.get("full_name") != (base.get("repo") or {}).get("full_name"):
+        return "fork head"
+    if base.get("ref") != "main":
+        return f"base {base.get('ref')}"
+    if (pull.get("user") or {}).get("login") != author:
+        return "other author"
+    # An abandoned PR's body is no longer a reviewed statement.
+    if pull.get("state") == "closed" and not pull.get("merged_at"):
+        return "closed without merge"
+    return None
+
+
+def _matching_lines(body: str, findings: list[Item], remaining: list[Item]) -> list[str]:
+    return sorted(
+        {line for line in body.splitlines() if any(marker(line, item, findings) for item in remaining)}
+    )
+
+
+def _candidate_lines(
+    data: dict, findings: list[Item], remaining: list[Item]
+) -> tuple[dict[int, list[str]], list[str]]:
+    found: dict[int, list[str]] = {}
+    skipped = []
+    # The PR being checked always contains its own merges; its body is already applied.
+    for pull in (pull for pull in data["pulls"] if pull.get("number") != data["pr"]):
+        skip = _borrow_skip_reason(pull, data["author"])
+        if skip:
+            skipped.append(f"#{pull.get('number')} ({skip})")
+            continue
+        lines = _matching_lines(pull.get("body") or "", findings, remaining)
+        if lines:
+            found[pull["number"]] = lines
+    return found, skipped
+
+
+def borrowed_overrides(
+    lookup: str, commit: str, findings: list[Item], remaining: list[Item]
+) -> tuple[str, str]:
+    """Return override lines borrowed from the PR that introduced this merge, and why.
+
+    A stacked PR contains its base PR's merge commits; the base PR body already
+    explains them. Any doubt returns no text, so the check is never weaker.
+    """
+    try:
+        data = json.loads(lookup)
+        if data.get("commit") != commit:
+            return "", f"lookup is for commit {data.get('commit')}, not {commit}"
+        pulls = data.get("pulls")
+        if data.get("error") or not isinstance(pulls, list):
+            message = pulls.get("message") if isinstance(pulls, dict) else pulls
+            return "", f"PR lookup failed: {data.get('error')}: {message}"
+        found, skipped = _candidate_lines(data, findings, remaining)
+    except (ValueError, AttributeError, KeyError, TypeError) as exc:
+        return "", f"PR lookup is unreadable: {exc!r}"
+    numbers = ", ".join(f"#{number}" for number in sorted(found))
+    if len({tuple(lines) for lines in found.values()}) > 1:
+        return "", f"conflicting override lines in {numbers}"
+    if not found:
+        return "", "no PR with a matching override line; skipped: " + (", ".join(skipped) or "none")
+    return "\n".join(next(iter(found.values()))), f"override lines from {numbers}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("commit", nargs="?", default="HEAD")
@@ -1215,8 +1296,17 @@ def main() -> int:
         "--main-sha",
         help="exact object name of the merge parent that carries main",
     )
+    parser.add_argument(
+        "--train-head",
+        help="head of the train/* branch; its first-parent chain is the main side",
+    )
     parser.add_argument("--allow", type=argparse.FileType("r"))
     parser.add_argument("--pr-body-file", type=argparse.FileType("r"))
+    parser.add_argument(
+        "--borrow-file",
+        type=argparse.FileType("r"),
+        help="JSON {commit, pr, author, pulls: <GET commits/<sha>/pulls>} for stacked PRs",
+    )
     parser.add_argument(
         "--final", help="revision whose final tree contains later fixes and moves"
     )
@@ -1226,7 +1316,7 @@ def main() -> int:
     if len(parents) != 2:
         print(f"{commit} is not a two-parent merge; nothing to check")
         return 0
-    resolved = resolve_parent(commit, parents, args.main_sha)
+    resolved = resolve_parent(commit, parents, args.main_sha, args.train_head)
     if resolved is None:
         return 2
     main, branch, _reason = resolved
@@ -1270,7 +1360,13 @@ def main() -> int:
     if final_revision and findings:
         final_items, final_sources, final_error_path, final_lines = _final_index(final_revision)
         findings = _report_final_moves(findings, final_items, final_lines)
-    findings = _filter_findings(findings, text)
+    all_findings = findings
+    findings = _filter_findings(all_findings, text)
+    if findings and args.borrow_file:
+        full = git("rev-parse", f"{commit}^{{commit}}").strip()
+        extra, reason = borrowed_overrides(args.borrow_file.read(), full, all_findings, findings)
+        print(f"{'borrowed' if extra else 'did not borrow'} overrides: {reason}")
+        findings = _filter_findings(all_findings, f"{text}\n{extra}")
     if findings:
         for finding in findings:
             _render_finding(finding, main_items, branch_items, merge_items)

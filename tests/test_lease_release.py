@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owner_counts import dropped_for_gc
 from zeta.core import session_execution
 from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
 from zeta.core.session import SessionManager
@@ -113,7 +114,7 @@ def test_gc_finalized_store_under_assert_owned_releases_without_deadlock(
     survivor = manager.open(created[1].metadata.session_id).store
     gc.disable()
     try:
-        dropped = created[0].store
+        dropped = dropped_for_gc(created[0].store, "the collector must finalize it")
         dropped_epoch = dropped.execution_lease.epoch
         dropped._cycle = dropped  # only the collector can free it now
         dropped_ref = weakref.ref(dropped)
@@ -167,7 +168,7 @@ def test_gc_finalized_writer_owner_during_open_writer_keeps_home_locked(
     open_writer(home).close()  # bootstrap the manifest
     gc.disable()
     try:
-        owner = make_owner(home)
+        owner = dropped_for_gc(make_owner(home), "the collector must finalize it")
         owner._cycle = owner  # type: ignore[attr-defined]
         owner_ref = weakref.ref(owner)
         del owner
@@ -209,7 +210,7 @@ def test_gc_finalizer_on_another_thread_queues_while_a_registry_lock_is_held(
     holder = threading.Thread(target=hold_registry_until_finalizer_returns, daemon=True)
     gc.disable()
     try:
-        dropped = opened.store
+        dropped = dropped_for_gc(opened.store, "the collector must finalize it")
         dropped._cycle = dropped  # only the collector can free it now
         dropped_ref = weakref.ref(dropped)
         del opened, dropped
@@ -343,7 +344,7 @@ def test_next_lease_acquire_runs_releases_queued_with_no_lock_held(
     session_id = opened.metadata.session_id
     gc.disable()
     try:
-        dropped = opened.store
+        dropped = dropped_for_gc(opened.store, "the collector must finalize it")
         dropped_epoch = dropped.execution_lease.epoch
         dropped._cycle = dropped
         del opened, dropped

@@ -344,15 +344,30 @@ def is_completion_sentinel(event: StreamEvent) -> bool:
 _ATTEMPT_END = object()
 
 
-# attempt closes still running after their caller was cancelled
-_CLOSING_ATTEMPTS: set[asyncio.Task[None]] = set()
+# Must-complete cleanup tasks stay owned after their caller is cancelled.
+_CLOSING_TASKS: set[asyncio.Task[None]] = set()
 
 
-def _release_close(task: asyncio.Task[None]) -> None:
-    _CLOSING_ATTEMPTS.discard(task)
-    # the first caller reads the outcome; a cancelled caller abandons it
-    if not task.cancelled():
-        task.exception()
+class MustCompleteClose:
+    """Run one async cleanup task and let every caller wait for it."""
+
+    def __init__(self) -> None:
+        self.task: asyncio.Task[None] | None = None
+
+    def start(self, close: Callable[[], Awaitable[None]]) -> None:
+        if self.task is None:
+            self.task = asyncio.create_task(close())
+            _CLOSING_TASKS.add(self.task)
+            self.task.add_done_callback(self._release)
+
+    def _release(self, task: asyncio.Task[None]) -> None:
+        _CLOSING_TASKS.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def wait(self) -> None:
+        assert self.task is not None
+        await asyncio.shield(self.task)
 
 
 class IteratorProviderAttempt:
@@ -360,7 +375,7 @@ class IteratorProviderAttempt:
 
     def __init__(self, source: AsyncIterator[StreamEvent]) -> None:
         self._source = source
-        self._close_task: asyncio.Task[None] | None = None
+        self._close = MustCompleteClose()
         self._producer: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[AttemptSignal | BaseException | object] = (
             asyncio.Queue()
@@ -416,17 +431,11 @@ class IteratorProviderAttempt:
         # the close runs as one task, so cancelling a caller (twice in serve:
         # client disconnect, then server close) cannot stop it before the
         # source closes and releases what it holds (an HTTP lease borrow).
-        if self._close_task is not None:
-            # test-contract: seam a later close waits for the first close
-            await asyncio.wait((self._close_task,))
-            return
-        self._close_task = asyncio.create_task(self._close())
-        _CLOSING_ATTEMPTS.add(self._close_task)
-        self._close_task.add_done_callback(_release_close)
+        self._close.start(self._close_source)
         # test-contract: seam cancellation cannot interrupt the source close
-        await asyncio.shield(self._close_task)
+        await self._close.wait()
 
-    async def _close(self) -> None:
+    async def _close_source(self) -> None:
         if self._producer is not None and not self._producer.done():
             self._producer.cancel()
             # test-contract: seam producer cancellation must drain fully

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -11,7 +12,8 @@ import pytest
 
 from tests.support.account_homes import build_account_home
 from tests.support.server_client import request
-from zeta.accounts import AccountId
+from zeta.accounts import AccountId, AccountStore
+from zeta.oauth import OAuthTokens
 
 _PROCESS_TIMEOUT = 30
 
@@ -259,7 +261,7 @@ def _headless_start(home: Path) -> subprocess.CompletedProcess[str]:
     ("registry", "warning"),
     [
         (None, "accounts.json is missing; kept every account directory"),
-        (b"{not json\n", "accounts.json is invalid; kept it and every account"),
+        (b"{not json\n", "accounts.json is unreadable; kept it and every account"),
     ],
     ids=("missing", "broken"),
 )
@@ -281,6 +283,7 @@ def test_start_without_a_loaded_registry_keeps_every_account_file(
 
     assert _account_files(tmp_path) == before, result.stderr
     assert warning in result.stderr
+    assert result.stderr.count("accounts.json is") == 1, result.stderr
     if registry is None:
         assert not (tmp_path / "accounts.json").exists()
     else:
@@ -302,3 +305,73 @@ def test_start_with_a_loaded_registry_still_sweeps_an_orphan_directory(
 
     assert not orphan.exists(), result.stderr
     assert _account_files(tmp_path) == kept
+
+
+_OLD = {"access_token": "old-access", "refresh_token": "old-refresh"}
+_NEW = {"access_token": "new-access", "refresh_token": "new-refresh"}
+# expiries stay in the future, so no start tries a network token refresh
+_TOKEN_CHOICES = {
+    # name: (legacy file, account file or None, which file migration keeps)
+    "account-missing": (_NEW | {"expires_at": 9.5e9}, None, "legacy"),
+    "legacy-expires-later": (_NEW | {"expires_at": 9.5e9}, _OLD | {"expires_at": 9e9}, "legacy"),
+    "account-expires-later": (_OLD | {"expires_at": 9e9}, _NEW | {"expires_at": 9.5e9}, "account"),
+    "tie": (_NEW | {"expires_at": 9.5e9}, _OLD | {"expires_at": 9.5e9}, "both"),
+    "legacy-expiry-unreadable": (_NEW | {"expires_at": "later"}, _OLD | {"expires_at": 9e9}, "both"),
+    # a missing expires_at reads as 0; on the legacy side, so no start refreshes it
+    "legacy-expiry-missing": (_NEW, _OLD | {"expires_at": 9e9}, "both"),
+    "account-unparseable": (_NEW | {"expires_at": 9.5e9}, "{not json", "both"),
+    "both-unparseable": ("{also not json", "{not json", "both"),
+    "same-tokens": (_NEW | {"expires_at": 9.5e9}, _NEW | {"expires_at": 9.5e9}, "account"),
+}
+
+
+@pytest.mark.parametrize("registry", [False, True], ids=("registry-missing", "registry-loaded"))
+@pytest.mark.parametrize("legacy_mtime_newer", [False, True], ids=("account-mtime-newer", "legacy-mtime-newer"))
+@pytest.mark.parametrize("choice", list(_TOKEN_CHOICES))
+def test_start_keeps_the_login_that_expires_later_and_never_trusts_mtime(
+    tmp_path: Path, choice: str, legacy_mtime_newer: bool, registry: bool
+) -> None:
+    legacy_value, account_value, kept = _TOKEN_CHOICES[choice]
+    account = AccountId("codex", "default")
+    store = build_account_home(
+        tmp_path, (account,), available=(account,) if account_value else (), defaults=(account,)
+    )
+    registry_bytes = store.registry.read_bytes()
+    if not registry:
+        store.registry.unlink()
+    destination = store.credential_path(account)
+    legacy = tmp_path / "codex-oauth.json"
+    legacy.write_text(legacy_value if isinstance(legacy_value, str) else json.dumps(legacy_value))
+    if isinstance(account_value, dict):
+        destination.write_text(json.dumps(account_value))
+    elif account_value is not None:
+        destination.write_text(account_value)
+    base = 1_700_000_000_000_000_000
+    newer, older = base + 10**9, base
+    os.utime(legacy, ns=(newer, newer) if legacy_mtime_newer else (older, older))
+    if account_value is not None:
+        os.utime(destination, ns=(older, older) if legacy_mtime_newer else (newer, newer))
+    account_bytes = destination.read_bytes() if account_value is not None else None
+    legacy_bytes = legacy.read_bytes()
+
+    result = _headless_start(tmp_path)
+
+    warning = (
+        f"kept {destination} and {legacy}: could not tell which login is newer; "
+        "delete the one you do not want, then restart zeta"
+    )
+    if kept == "legacy":
+        imported = OAuthTokens.from_mapping(legacy_value, error_type=RuntimeError)
+        assert json.loads(destination.read_text()) == imported.to_dict(), result.stderr
+    else:
+        assert destination.read_bytes() == account_bytes, result.stderr
+    assert legacy.exists() is (kept == "both"), result.stderr
+    assert result.stderr.count(warning) == (kept == "both"), result.stderr
+    if kept == "both":
+        assert legacy.read_bytes() == legacy_bytes
+        if registry:
+            assert store.registry.read_bytes() == registry_bytes
+        else:
+            assert not store.registry.exists()
+    else:
+        assert AccountStore(tmp_path).default("codex") == account

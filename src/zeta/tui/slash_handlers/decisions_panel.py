@@ -53,6 +53,7 @@ class DecisionsMixin:
         self._decisions_panel_control = OverlayControl()
         self._decisions_panel_open = False
         self._decisions_count = 0
+        self._decisions_staged_count = 0
         self._decisions_poll_task: asyncio.Task[None] | None = None
         self._decisions_refresh_task: asyncio.Task[None] | None = None
         self._decisions_restore_text = ""
@@ -68,6 +69,10 @@ class DecisionsMixin:
     @property
     def decisions_count(self) -> int:
         return self._decisions_count
+
+    @property
+    def decisions_staged_count(self) -> int:
+        return self._decisions_staged_count
 
     @property
     def _decisions_session_id(self) -> str:
@@ -152,20 +157,39 @@ class DecisionsMixin:
 
     async def _decisions_tick(self) -> None:
         from ...attention_decisions import open_decisions
+        from ...attention_records import Broken
+
+        session_id = self._decisions_session_id
+        registry_state = _registry_state(self)
+        replies = self._attention_replies(session_id)
+
+        def read():
+            items = open_decisions(self._home, session_id, registry_state)
+            # A broken record cannot take a reply, so it never shows as staged.
+            open_ids = {
+                item.record.id
+                for item in items
+                if not isinstance(item.record, Broken)
+            }
+            staged = {
+                item_id: reply
+                for item_id, reply in (replies.staged() if items else ())
+                if item_id in open_ids
+            }
+            return items, staged
 
         try:
-            items = await asyncio.to_thread(
-                open_decisions,
-                self._home,
-                self._decisions_session_id,
-                _registry_state(self),
-            )
+            items, staged = await asyncio.to_thread(read)
         except OSError:
             return
-        changed = len(items) != self._decisions_count
+        changed = (len(items), len(staged)) != (
+            self._decisions_count,
+            self._decisions_staged_count,
+        )
         self._decisions_count = len(items)
+        self._decisions_staged_count = len(staged)
         if self._decisions_panel_open:
-            self._decisions_panel.set_items(items)
+            self._decisions_panel.set_items(items, staged)
             self._decisions_panel_control.set_lines(
                 self._decisions_panel.render_lines(),
                 keep_offset=True,
@@ -240,12 +264,18 @@ class DecisionsMixin:
     async def _flush_staged_decisions(self) -> None:
         try:
             for session_id in self._decisions_session_ids():
-                await self._run_attention_operation(
+                outcome = await self._run_attention_operation(
                     self._attention_replies(session_id).flush,
                     self.loop.store.session_id,
                 )
+                self._print_broken_outcomes(outcome)
         except (OSError, ValueError) as exc:
             self._print_system(f"decisions not delivered: {exc}")
+
+    def _print_broken_outcomes(self, outcome) -> None:
+        for item in outcome.items:
+            if item.status == "broken":
+                self._print_system(f"decision not delivered: {item.detail}")
 
     def _decisions_session_ids(self) -> tuple[str, ...]:
         return tuple({item.session_id for item in self._decisions_panel.items})
@@ -357,13 +387,14 @@ class DecisionsMixin:
             }
             try:
                 replies = self._attention_replies(record.session_id)
-                await self._run_attention_operation(
+                outcome = await self._run_attention_operation(
                     replies.stage,
                     record.id,
                     decision,
                     flush_ids=item_ids,
                     from_session=self.loop.store.session_id,
                 )
+                self._print_broken_outcomes(outcome)
             except (OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
             await self._decisions_tick()

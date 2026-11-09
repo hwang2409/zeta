@@ -10,6 +10,7 @@ import httpx
 from ..accounts import (
     AccountCredentialLockTimeoutError,
     AccountId,
+    AccountRegistryBrokenError,
     AccountRegistryMissingError,
     AccountStore,
 )
@@ -145,7 +146,11 @@ class Logins:
                 "login_lock_timeout",
                 "Sign-in could not save credentials because the account is busy. Please try again.",
             )
-        except (LoginPublicationError, AccountRegistryMissingError) as exc:
+        except (
+            LoginPublicationError,
+            AccountRegistryBrokenError,
+            AccountRegistryMissingError,
+        ) as exc:
             return failure("login_save_failed", str(exc))
         except LoginPortInUseError as exc:
             provider_label = exc.provider.capitalize()
