@@ -245,11 +245,11 @@ async def test_nested_children_keep_independent_limits_after_adoption(
     release_grandchild = asyncio.Event()
 
     class PausedGrandchildBackend(FakeBackend):
-        async def complete(self, messages, tool_schemas):
+        async def complete(self, messages, tool_schemas, **kwargs):
             if not self.calls:
                 grandchild_started.set()
                 await asyncio.wait_for(release_grandchild.wait(), timeout=10)
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, **kwargs):
                 yield event
 
     grandchild_backend = PausedGrandchildBackend(
@@ -288,7 +288,7 @@ async def test_nested_children_keep_independent_limits_after_adoption(
     async def noop(_arguments: dict[str, object]) -> str:
         return "done"
 
-    registry.register("noop", noop)
+    registry.register("noop", noop, requires_approval=False)
     loop = AgentLoop(
         FakeBackend([ScriptedTurn(tool_calls=[child_call])]),
         store,
