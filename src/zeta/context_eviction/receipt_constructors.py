@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping
 
 from ..protocol.types import (
     ContentBlock,
     Message,
     MessageRole,
+    RedactedThinkingContent,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -21,6 +24,105 @@ DIGEST_LIMIT = 440
 WORKFLOW_MESSAGE_LIMIT = 4
 RECEIPT_KIND_METADATA = "eviction_receipt"
 RECEIPT_FIELDS_METADATA = "eviction_receipt_fields"
+
+# The one grammar of free-text receipts: constructors format these, and
+# receipt_tokens parses them, so the two cannot drift apart.
+ASSISTANT_RECEIPT = "[{kind} evicted · seq {seq}]"
+REASONING_KIND = "assistant reasoning"
+COLLAPSED_RECEIPT = "[{label} collapsed into seq {seq}]"
+RANGE_RECEIPT_PREFIX = "[evicted range] seq {start}-{end}: "
+RANGE_RECEIPT_SUFFIX = (
+    "; recall_history seq_start={start}, seq_end={end} for exact content"
+)
+RANGE_RECEIPT_LIMIT = 440
+
+
+def reasoning_marker(seq: int) -> str:
+    """Text appended to a message whose reasoning was evicted."""
+    return ASSISTANT_RECEIPT.format(kind=REASONING_KIND, seq=seq)
+
+
+def _token_pattern(template: str, **groups: str) -> re.Pattern[str]:
+    pattern = re.escape(template)
+    for name, group in groups.items():
+        pattern = pattern.replace(re.escape(f"{{{name}}}"), f"(?P<{name}>{group})")
+    return re.compile(pattern)
+
+
+_FIXED_TOKENS = (
+    (
+        ASSISTANT_RECEIPT,
+        _token_pattern(
+            ASSISTANT_RECEIPT, kind="assistant text|assistant reasoning", seq=r"\d+"
+        ),
+    ),
+    (
+        COLLAPSED_RECEIPT,
+        _token_pattern(
+            COLLAPSED_RECEIPT,
+            label="older duplicate read|duplicate result",
+            seq=r"\d+",
+        ),
+    ),
+)
+_RANGE_PREFIX = _token_pattern(RANGE_RECEIPT_PREFIX, start=r"\d+", end=r"\d+")
+
+
+def _receipt_token(text: str, start: int) -> str | None:
+    for template, pattern in _FIXED_TOKENS:
+        match = pattern.match(text, start)
+        if match is not None:
+            fields = {
+                key: int(value) if key == "seq" else value
+                for key, value in match.groupdict().items()
+            }
+            token = match.group(0)
+            return token if template.format(**fields) == token else None
+    match = _RANGE_PREFIX.match(text, start)
+    if match is None:
+        return None
+    first, last = int(match["start"]), int(match["end"])
+    if RANGE_RECEIPT_PREFIX.format(start=first, end=last) != match.group(0):
+        return None
+    suffix = RANGE_RECEIPT_SUFFIX.format(start=first, end=last)
+    end = text.find(suffix, match.end())
+    if end < 0:
+        return None
+    token = text[start : end + len(suffix)]
+    return token if len(token) <= RANGE_RECEIPT_LIMIT and "\n" not in token else None
+
+
+def receipt_tokens(text: str) -> tuple[str, ...] | None:
+    """Return the receipt tokens that make up all of ``text``, else ``None``."""
+    tokens: list[str] = []
+    rest = text.strip()
+    index = 0
+    while index < len(rest):
+        token = _receipt_token(rest, index)
+        if token is None:
+            return None
+        tokens.append(token)
+        index += len(token)
+        while index < len(rest) and rest[index].isspace():
+            index += 1
+    return tuple(tokens) or None
+
+
+def is_receipt_echo(message: Message) -> bool:
+    """True for a model reply that only repeats eviction receipt text."""
+    if (
+        message.role is not MessageRole.ASSISTANT
+        or message.tool_result is not None
+        or message.metadata.get("context_evicted")
+    ):
+        return False
+    texts: list[str] = []
+    for block in message.content:
+        if isinstance(block, TextContent):
+            texts.append(block.text)
+        elif not isinstance(block, (ThinkingContent, RedactedThinkingContent)):
+            return False
+    return receipt_tokens("".join(texts)) is not None
 
 
 def _valid_persisted_reasoning_receipt_metadata(value: Mapping[str, object]) -> bool:
@@ -47,9 +149,8 @@ def _persisted_reasoning_receipt(
         or not message.content
     ):
         return None
-    marker = f"[assistant reasoning evicted · seq {seq}]"
     last = message.content[-1]
-    if not isinstance(last, TextContent) or last.text != marker:
+    if not isinstance(last, TextContent) or last.text != reasoning_marker(seq):
         return None
     body = message.content[:-1]
     tool_content = [block for block in body if isinstance(block, ToolUseContent)]
@@ -115,7 +216,7 @@ def _assistant_receipt(
 ) -> Message:
     return Message(
         role,
-        [TextContent(f"[{kind} evicted · seq {seq}]")],
+        [TextContent(ASSISTANT_RECEIPT.format(kind=kind, seq=seq))],
         metadata={
             **(metadata or {}),
             "context_evicted": True,
@@ -132,7 +233,7 @@ def _collapsed_assistant_receipt(
     label = "older duplicate read" if older_read else "duplicate result"
     return Message(
         MessageRole.ASSISTANT,
-        [TextContent(f"[{label} collapsed into seq {collapsed_into_seq}]")],
+        [TextContent(COLLAPSED_RECEIPT.format(label=label, seq=collapsed_into_seq))],
         metadata={
             "context_evicted": True,
             RECEIPT_KIND_METADATA: "assistant",

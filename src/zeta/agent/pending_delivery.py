@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from ..core.context import ContextAssembler
     from ..core.context_parts.admission import AdmittedSessionRequest
     from ..core.store._client_delivery import ClientSteeringBatch
+    from .background import BackgroundAgentOwner
 
 AGENT_SEND_COMMIT_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_DELIVERY_TIMEOUT_SECONDS = 1.0
@@ -190,14 +191,22 @@ class StepDeliveryFlow:
                 if isinstance(item, PromptInput) and item.deadline is not None
                 else None
             )
+            return_committed_on_cancel = (
+                isinstance(item, PromptInput)
+                and item.origin is MessageOrigin.AGENT_SEND
+            )
             try:
-                result = await self.store.commit_delivery_input(item)
+                result = await self.store.commit_delivery_input(
+                    item, return_committed_on_cancel=return_committed_on_cancel
+                )
             except PendingPromptWriterReloadedError:
                 if not isinstance(item, PromptInput) or item.deadline is None:
                     raise
                 assert commit_window is not None
                 retry = replace(item, deadline=time.monotonic() + commit_window)
-                result = await self.store.commit_delivery_input(retry)
+                result = await self.store.commit_delivery_input(
+                    retry, return_committed_on_cancel=return_committed_on_cancel
+                )
             if result.changed and not (
                 isinstance(item, NotificationInput)
                 and (
@@ -765,6 +774,7 @@ async def send_to_run(
     child_instance_id: object,
     message: object,
     *,
+    owner: BackgroundAgentOwner,
     channel: ConversationChannel,
     origin: MessageOrigin = MessageOrigin.AGENT_SEND,
 ) -> str | None:
@@ -778,6 +788,8 @@ async def send_to_run(
         f"no live run/child {child_instance_id!r}; it was canceled, finished, "
         "or never started"
     )
+    if not owner.controls_child(parent_store, child_instance_id):
+        return no_live_run
     marker = parent_store.agent_children().get(child_instance_id)
     if marker is None:
         return no_live_run
