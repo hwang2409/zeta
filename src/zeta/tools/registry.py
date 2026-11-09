@@ -925,11 +925,11 @@ class ToolRegistry:
         definition = self._tools.get(tool_call.name)
         if definition is None:
             return tool_call
+        if definition.call_preparer is None:
+            return tool_call
         prepare_rules = getattr(self.approval_policy, "prepare_rules", None)
         if prepare_rules is not None:
             await prepare_rules(self._prepare_approval_rule)
-        if definition.call_preparer is None:
-            return tool_call
         return await definition.call_preparer(tool_call)
 
     async def _prepare_approval_rule(self, rule: ApprovalRule) -> ApprovalRule:
