@@ -1487,7 +1487,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
 
 
 @pytest.mark.asyncio
-async def test_slash_and_ergonomics_read_serve_control_not_store(
+async def test_slash_and_named_settings_read_serve_control_not_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
