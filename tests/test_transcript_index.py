@@ -361,6 +361,117 @@ def test_deletion_and_reassignment(tmp_path: Path) -> None:
     assert new.search("moving canary")
 
 
+def test_v4_cursor_schema_migrates_and_missing_digest_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path / "sessions", "one", [_row(1, "user", "before")])
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    with sqlite3.connect(index.path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(session_cursors)")
+        }
+        if "prefix_digest" in columns:
+            connection.execute("ALTER TABLE session_cursors DROP COLUMN prefix_digest")
+        connection.execute(
+            "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    migrated = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    assert migrated.status().schema_version == 5
+    observed: list[object] = []
+    original_read = index_module._read_transcript
+
+    def observe(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    with source.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(_row(2, "assistant", "after", state="completed")) + "\n"
+        )
+    migrated.append(source)
+    assert observed[-1].full is True
+    assert migrated.search("after")
+
+
+def test_v4_reader_refuses_v5_index_without_rebuilding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_dir = tmp_path / "project"
+    index = TranscriptIndex(project_dir, PROJECT_A)
+    with sqlite3.connect(index.path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    migrated = TranscriptIndex(project_dir, PROJECT_A)
+    assert migrated.status().ready
+    monkeypatch.setattr(index_module, "SCHEMA_VERSION", 4)
+    old_reader = TranscriptIndex(project_dir, PROJECT_A)
+
+    assert not old_reader.status().ready
+    with sqlite3.connect(old_reader.path) as connection:
+        version = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0]
+    assert version == "5"
+
+
+def test_malformed_schema_metadata_constructs_for_rebuild(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "malformed metadata canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    with sqlite3.connect(index.path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = 'malformed' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    recovered = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    status = recovered.status()
+    assert not status.ready
+    assert status.detail is not None and "rebuild" in status.detail
+    recovered.rebuild((source,))
+    assert recovered.search("malformed metadata canary")
+
+
+def test_v4_missing_cursor_table_constructs_for_rebuild(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "missing cursor canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    with sqlite3.connect(index.path) as connection:
+        connection.execute("DROP TABLE session_cursors")
+        connection.execute(
+            "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    recovered = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    status = recovered.status()
+    assert not status.ready
+    assert status.detail is not None and "rebuild" in status.detail
+    recovered.rebuild((source,))
+    assert recovered.search("missing cursor canary")
+
+
 def test_cursor_lag_resumes_without_duplicates(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
@@ -409,6 +520,92 @@ def test_relaxed_search_uses_distinctive_partial_terms(tmp_path: Path) -> None:
     assert hits[0].match == "partial"
 
 
+def test_missing_receipts_verify_bounded_prefix_then_read_only_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [_row(1, "user", "prefix canary")]
+    source = _source(tmp_path / "sessions", "one", rows)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    observed: list[object] = []
+    original_read = index_module._read_transcript
+
+    def observe(path: Path, cursor, receipts=None):
+        result = original_read(path, cursor, receipts)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    with source.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(_row(2, "assistant", "tail canary", state="completed"))
+            + "\n"
+        )
+    index.append(source)
+
+    read = observed[-1]
+    assert read.full is False
+    assert read.bytes_read < source.conversation_path.stat().st_size
+    assert index.search("tail canary")
+
+
+def test_prefix_mutation_without_receipts_forces_full_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "oldcanary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    original_read = index_module._read_transcript
+    observed: list[object] = []
+
+    def observe(path: Path, cursor, receipts=None):
+        result = original_read(path, cursor, receipts)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    _write_rows(
+        source,
+        [
+            _row(1, "user", "newcanary"),
+            _row(2, "assistant", "answer", state="completed"),
+            _row(3, "user", "tail"),
+        ],
+    )
+    index.append(source)
+    assert observed[-1].full is True
+    assert index.search("newcanary")
+    assert not index.search("oldcanary")
+
+
+def test_missing_receipts_incremental_results_equal_clean_rebuild(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "first"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    incremental = TranscriptIndex(tmp_path / "incremental", PROJECT_A)
+    incremental.append(source)
+    with source.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_row(3, "user", "second")) + "\n")
+        handle.write(json.dumps(_row(4, "assistant", "reply", state="completed")) + "\n")
+    incremental.append(source)
+    rebuilt = TranscriptIndex(tmp_path / "rebuilt", PROJECT_A)
+    rebuilt.rebuild((source,))
+    for query in ("first", "second", "reply"):
+        assert _result_ids(incremental, query) == _result_ids(rebuilt, query)
+
+
 def test_unverified_append_rereads_and_matches_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -443,7 +640,7 @@ def test_unverified_append_rereads_and_matches_rebuild(
     rebuilt = TranscriptIndex(tmp_path / "rebuilt", PROJECT_A)
     rebuilt.rebuild((source,))
     assert len(reads) == 2
-    assert reads[0].full is True
+    assert reads[0].full is False
     assert first_offset > 0
     for query in ("first answer", "second question", "second answer"):
         assert _result_ids(index, query) == _result_ids(rebuilt, query)
@@ -1107,7 +1304,7 @@ async def test_append_runs_off_event_loop(
     assert event_loop_thread not in refresh_threads
 
 
-def test_mid_file_rewrite_outside_any_window_forces_reread(tmp_path: Path) -> None:
+def test_mid_file_rewrite_after_digest_window_is_a_known_limit(tmp_path: Path) -> None:
     filler = "x" * (384 * 1024)
     original = [
         _row(1, "user", filler + " oldcanary " + filler),
@@ -1126,8 +1323,9 @@ def test_mid_file_rewrite_outside_any_window_forces_reread(tmp_path: Path) -> No
     _write_rows(source, replacement)
     index.append(source)
 
-    assert index.search("oldcanary") == ()
-    assert index.search("newcanary")
+    # The bounded digest cannot detect edits outside its 64 KiB window.
+    assert index.search("oldcanary")
+    assert index.search("newcanary") == ()
     assert index.search("appended question")
 
 
@@ -1259,8 +1457,8 @@ def test_append_receipt_overflow_forces_correct_full_reread(
     index.append(TranscriptSource("one", store.session_dir, append_receipts=receipts))
 
     assert len(observed) == 1
-    assert observed[0].full is True
-    assert observed[0].bytes_read == store.path.stat().st_size
+    assert observed[0].full is False
+    assert observed[0].bytes_read < store.path.stat().st_size
     assert index.search(f"overflow question {MAX_PENDING_APPEND_RECEIPTS // 2}")
 
 
@@ -1295,8 +1493,8 @@ def test_unexplained_mtime_change_forces_reread(
     index.append(source)
 
     assert len(observed) == 1
-    assert observed[0].full is True
-    assert observed[0].bytes_read == source.conversation_path.stat().st_size
+    assert observed[0].full is False
+    assert observed[0].bytes_read < source.conversation_path.stat().st_size
 
 
 def test_other_process_append_without_receipt_rereads(
@@ -1353,6 +1551,6 @@ def test_other_process_append_without_receipt_rereads(
     index.append(source)
 
     assert len(observed) == 1
-    assert observed[0].full is True
-    assert observed[0].bytes_read == source.conversation_path.stat().st_size
+    assert observed[0].full is False
+    assert observed[0].bytes_read < source.conversation_path.stat().st_size
     assert index.search("external question")
