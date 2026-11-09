@@ -222,6 +222,55 @@ async def test_tui_broken_row_does_not_block_good_batch(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tui_escape_sends_good_staged_reply_and_reports_broken_one(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(
+        manager.project_registry.create_project, "alpha", "git"
+    )
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    good = await asyncio.to_thread(_request, owner, project.project_id, "good")
+    bad = await asyncio.to_thread(_request, owner, project.project_id, "bad")
+    replies = AttentionReplies(tmp_path, owner.store.session_id)
+    await asyncio.to_thread(replies.stage, good.id, "yes")
+    await asyncio.to_thread(replies.stage, bad.id, "yes")
+    bad_path = owner.store.session_dir / "attention" / f"{bad.id}.json"
+    bad_path.write_bytes(b"{")
+    app = await _make_app(tmp_path, owner, owner.store.session_id)
+    printed: list[str] = []
+    reported = asyncio.Event()
+
+    def capture(text: str, *args: object, **kwargs: object) -> None:
+        printed.append(text)
+        reported.set()
+
+    app._print_system = capture
+    async with owned_app(app) as owned:
+        owned.release_with(owner.store.close)
+        _press(app, "escape")
+        await await_or_fail(reported.wait(), what="broken outcome report")
+        assert AttentionStore(owner.store.session_dir).get(good.id).status == (
+            "resolved"
+        ), f"broken staged record blocked the batch: {printed}"
+        assert printed == [
+            (
+                f"decision not delivered: attention record {bad.id} is broken "
+                f"(invalid_json); repair attention/{bad.id}.json before replying"
+            )
+        ]
+        assert bad_path.read_bytes() == b"{"
+        assert (owner.store.session_dir / "attention" / "staged" / bad.id).exists()
+        inbox = ProjectInbox(
+            manager.project_registry, sessions_root=tmp_path / "sessions"
+        )
+        assert (
+            len(inbox.new_ids(project.project_id, session_id=owner.store.session_id))
+            == 1
+        )
+
+
+@pytest.mark.asyncio
 async def test_tui_popup_waits_for_recovery_before_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
