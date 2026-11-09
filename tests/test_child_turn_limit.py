@@ -13,7 +13,7 @@ from rich.text import Text
 import zeta.agent.runner as agent_runner_module
 from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from zeta.agent import pending_delivery as pending_delivery_module
 from zeta.agent.background import (
     BackgroundAgentOwner,
@@ -133,7 +133,7 @@ async def _run_limited_child(
 async def test_turn_limit_foreground_result_projects_status_and_handoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    backend, result, _store, loop = await _run_limited_child(
+    backend, result, store, loop = await _run_limited_child(
         tmp_path, profile_limit=2, monkeypatch=monkeypatch
     )
     try:
@@ -165,6 +165,7 @@ async def test_turn_limit_foreground_result_projects_status_and_handoff(
         assert len(notices) == 1
     finally:
         await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -179,7 +180,7 @@ async def test_spawn_max_turns_precedence(
     expected: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend, result, _store, loop = await _run_limited_child(
+    backend, result, store, loop = await _run_limited_child(
         tmp_path,
         profile_limit=profile_limit,
         spawn_limit=spawn_limit,
@@ -191,6 +192,7 @@ async def test_spawn_max_turns_precedence(
         assert result.structured_content["status"] == "turn_limit"
     finally:
         await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -306,7 +308,10 @@ async def test_nested_children_keep_independent_limits_after_adoption(
             and event.tool_call.id == "child-call"
         )
         assert child_terminal.tool_result is not None
-        assert grandchild_started.is_set()
+        await await_or_fail(
+            grandchild_started.wait(),
+            what="grandchild backend start",
+        )
         assert child_terminal.tool_result.structured_content is not None
         assert child_terminal.tool_result.structured_content["status"] == "turn_limit"
         assert len(child_backend.calls) == 1
@@ -346,13 +351,14 @@ async def test_nested_children_keep_independent_limits_after_adoption(
     finally:
         release_grandchild.set()
         await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
 async def test_empty_final_child_completion_does_not_nudge_past_hard_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    backend, result, _store, loop = await _run_limited_child(
+    backend, result, store, loop = await _run_limited_child(
         tmp_path,
         profile_limit=1,
         turns=1,
@@ -366,6 +372,7 @@ async def test_empty_final_child_completion_does_not_nudge_past_hard_limit(
         assert result.structured_content["status"] == "turn_limit"
     finally:
         await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -505,7 +512,7 @@ async def test_finish_gate_with_one_lifetime_completion_left_uses_only_one(
         raise AssertionError("finish gate must not run after the hard limit")
 
     monkeypatch.setattr(agent_runner_module, "run_finish_gate", gate)
-    backend, result, _store, loop = await _run_limited_child(
+    backend, result, store, loop = await _run_limited_child(
         tmp_path,
         profile_limit=1,
         turns=1,
@@ -518,6 +525,7 @@ async def test_finish_gate_with_one_lifetime_completion_left_uses_only_one(
         assert result.structured_content["status"] == "turn_limit"
     finally:
         await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -708,14 +716,12 @@ async def test_tui_replay_renders_child_turn_limit_notice_once(tmp_path: Path) -
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
-    try:
+    async with owned_app(app):
         app._rebuild_transcript()
         rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
         assert rendered.count("child turn limit") == 1
         assert rendered.count("2 model completion(s) remain, including this one") == 1
-    finally:
-        await app.loop.close()
-        store.close()
+    store.close()
 
 
 @pytest.mark.asyncio
