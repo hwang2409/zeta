@@ -131,6 +131,11 @@ class ErrorDescriptor(Enum):
         "session_not_found",
         "the requested session does not exist",
     )
+    SESSION_ID_AMBIGUOUS = (
+        -32602,
+        "session_id_ambiguous",
+        "the session id prefix matches more than one session",
+    )
     SESSION_MISMATCH = (
         -32003,
         "session_mismatch",
@@ -243,6 +248,7 @@ FEATURES = (
     "served_turn_end",
     "content_read",
     "session_grants",
+    "child_runs",
     "delivery_session_guard",
 )
 
@@ -315,6 +321,8 @@ class MethodDescriptor(Enum):
         "session_grants",
         Access.SESSION_MUTATION,
     )
+    CHILD_RUN_LIST = ("child_run_list", None, "child_runs", Access.CONTROLLER_READ)
+    CHILD_RUN_SEND = ("child_run_send", None, "child_runs", Access.CONTROLLER_WRITE)
 
     def __init__(
         self, wire: str, since: str | None, feature: str | None, access: Access

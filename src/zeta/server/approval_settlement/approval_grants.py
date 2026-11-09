@@ -84,10 +84,12 @@ async def finish_grant(
     request: ApprovalRequest,
     committed: bool,
     event_published: bool,
+    *,
+    start_task: Callable[[Awaitable[object], str], asyncio.Task[object]],
 ) -> tuple[bool, bool, bool]:
     """Finish grant publication while deferring cancellation of the owner."""
-    operation = asyncio.create_task(
-        publication.finish(request, committed, event_published)
+    operation = start_task(
+        publication.finish(request, committed, event_published), "grant publication"
     )
     cancelled = False
     try:

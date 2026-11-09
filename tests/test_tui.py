@@ -11143,7 +11143,10 @@ async def test_app_surfaces_compacting_state_before_provider_output(
         return messages
 
     assembler.assemble = compacted_assemble  # type: ignore[method-assign]
-    assembler.needs_compaction = lambda: True  # type: ignore[method-assign]
+    async def prepare_context(**kwargs: object) -> bool:
+        return True
+
+    assembler.prepare_context = prepare_context  # type: ignore[method-assign]
     app._invalidate_prompt = lambda: states.append(app._loop_state)
 
     await app._consume_turn("prompt")
@@ -13608,6 +13611,42 @@ def test_tui_diagnostic_write_ignores_fd_exhaustion(
     tui_stalls_module.write_tui_diagnostic(
         tmp_path / "logs" / "tui-errors.jsonl", {"traceback": "failure"}
     )
+
+
+@pytest.mark.asyncio
+async def test_slow_successful_draft_flush_does_not_report_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[str] = []
+    write_started = threading.Event()
+    release_write = threading.Event()
+    persistence = DraftPersistence(
+        tmp_path / "draft",
+        delay=0,
+        notice_sink=notices.append,
+    )
+    original_write = persistence_module.write_json_file
+
+    def slow_write(*args: object, **kwargs: object) -> None:
+        write_started.set()
+        assert release_write.wait(10)
+        original_write(*args, **kwargs)
+
+    monkeypatch.setattr(persistence_module, "write_json_file", slow_write)
+    monkeypatch.setattr(persistence_module, "PERSISTENCE_FLUSH_TIMEOUT", 0.01)
+    persistence.schedule("slow draft")
+    flush = asyncio.create_task(persistence.flush_pending())
+    try:
+        assert await asyncio.to_thread(write_started.wait, 10)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(flush, 10)
+        assert notices == []
+    finally:
+        release_write.set()
+    await persistence._writer.flush(timeout=10)
+    await asyncio.sleep(0)
+    assert persistence.load() == "slow draft"
 
 
 @pytest.mark.asyncio
