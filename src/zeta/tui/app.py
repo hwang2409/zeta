@@ -264,6 +264,7 @@ class TUIApp(
         self._spinner_reset = asyncio.Event()
         self._stream_invalidation_handle: asyncio.TimerHandle | None = None
         self._stream_invalidation_pending = False
+        self._background_invalidation_handle: asyncio.TimerHandle | None = None
         self._abort_requested = False
         self._macro_receipts = deque()
         self._last_passthrough: str = ""
@@ -827,14 +828,17 @@ class TUIApp(
         """Render child progress while keeping completion notices at turn boundaries."""
         self._refresh_decisions_for_event(event)
         if event.type in render.BACKGROUND_EVENTS_RENDERED_IMMEDIATELY:
-            self._print_unit(self._presenter.render_event(event))
-            self._invalidate_stream_prompt()
+            rendered = self._presenter.render_event(event)
+            if rendered is not None:
+                self._print_unit(rendered)
+                self._invalidate_background_prompt()
             return
         if event.type in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
         }:
             self._handle_tool_event(event)
+            self._finish_background_invalidation()
             return
         if event.data.get("agent_instance_id") is not None:
             return
@@ -845,8 +849,12 @@ class TUIApp(
         }:
             if event.type is StreamEventType.TOOL_EXECUTION_START:
                 self._agent_navigation.request_refresh()
-            self._presenter.handle_tool_event(event, aborted=False)
-            self._invalidate_stream_prompt()
+            presentation = self._presenter.handle_tool_event(event, aborted=False)
+            if presentation is not None and presentation.visible_output:
+                if event.type is StreamEventType.TOOL_EXECUTION_END:
+                    self._finish_background_invalidation()
+                else:
+                    self._invalidate_background_prompt()
 
     def _schedule_background_wake(self) -> None:
         if self._closed:
