@@ -38,14 +38,14 @@ class _Registry(Enum):
     BROKEN = "broken"
 
 
-_BROKEN_REGISTRY = (
-    "accounts.json is unreadable; kept it and every account directory; "
-    "repair or restore accounts.json, then restart zeta"
+_BROKEN_REGISTRY = "accounts.json is unreadable"
+_BROKEN_REGISTRY_WARNING = (
+    "accounts.json is unreadable; kept it and every account directory"
 )
 _UNSAFE_REGISTRY_WARNINGS = {
     _Registry.MISSING: "accounts.json is missing; kept every account directory and "
     "skipped account cleanup; restore accounts.json, then restart zeta",
-    _Registry.BROKEN: _BROKEN_REGISTRY,
+    _Registry.BROKEN: _BROKEN_REGISTRY_WARNING,
 }
 
 
@@ -107,8 +107,12 @@ class AccountRegistryMissingError(AccountError):
 class AccountRegistryBrokenError(AccountError):
     """accounts.json exists but is unreadable, so nothing may read or write it."""
 
-    def __init__(self) -> None:
-        super().__init__(_BROKEN_REGISTRY)
+    def __init__(self, path: str) -> None:
+        super().__init__(
+            f"{_BROKEN_REGISTRY}: {path}; kept it and every account directory; "
+            "move it aside to a backup, then run login again or restore it from a "
+            "backup, then restart zeta"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +206,7 @@ class _AccountRegistry:
 
         state, _ = self._load_registry(home_fd)
         if state is _Registry.BROKEN:
-            raise AccountRegistryBrokenError
+            raise AccountRegistryBrokenError(str(self.registry.absolute()))
         if state is _Registry.MISSING and self._has_unregistered_account_directories(
             home_fd, {str(account)}
         ):
@@ -284,7 +288,7 @@ class _AccountRegistry:
     def _read_registry(self, home_fd: int) -> dict[str, Any]:
         state, value = self._load_registry(home_fd)
         if state is _Registry.BROKEN:
-            raise AccountRegistryBrokenError
+            raise AccountRegistryBrokenError(str(self.registry.absolute()))
         return value
 
     def _load_registry(self, home_fd: int) -> tuple[_Registry, dict[str, Any]]:

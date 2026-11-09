@@ -386,7 +386,7 @@ def test_append_rejects_non_boolean_display_only(tmp_path: Path, value: object) 
             description="child",
             status="completed",
             text="done",
-            display_only=value,  # type: ignore[arg-type]
+            display_only=value,
         )
 
 
@@ -611,7 +611,7 @@ def test_lifecycle_write_rejects_non_boolean_receipt_marker(tmp_path: Path) -> N
     store.finish_agent_lifecycle("completed", final_result="done")
 
     with pytest.raises(ValueError, match="receipt marker"):
-        store.update_agent_lifecycle_result("updated", canonical_receipt=1)  # type: ignore[arg-type]
+        store.update_agent_lifecycle_result("updated", canonical_receipt=1)
 
 
 @pytest.mark.parametrize("fields", INVALID_KILLED_TASK_FIELDS)
@@ -1234,9 +1234,9 @@ async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_c
     load_threads: list[int] = []
     original_load_full = ConversationStore._load_full
 
-    def observed_load_full(candidate: ConversationStore) -> None:
+    def observed_load_full(candidate: ConversationStore, *args: object, **kwargs: object) -> None:
         load_threads.append(threading.get_ident())
-        original_load_full(candidate)
+        original_load_full(candidate, *args, **kwargs)
 
     # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
@@ -1328,9 +1328,9 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
 
     original_load_full = ConversationStore._load_full
 
-    def observed_load_full(candidate: ConversationStore) -> None:
+    def observed_load_full(candidate: ConversationStore, *args: object, **kwargs: object) -> None:
         load_threads.append(threading.get_ident())
-        original_load_full(candidate)
+        original_load_full(candidate, *args, **kwargs)
 
     # test-contract: seam observe transcript loading across the async store boundary
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
