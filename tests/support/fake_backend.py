@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.protocol.types import (
     CompletionBackend,
     ContentBlock,

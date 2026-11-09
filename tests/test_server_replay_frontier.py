@@ -573,11 +573,11 @@ async def test_background_child_completion_can_arrive_during_parent_turn(
             )
         terminal = terminal_frames[-1]
         assert "notification_id" not in terminal_frames[0]["data"]
+        release_parent_second.set()
         receipt = await _wait_event(
             serve.observer, "sub_agent_receipt", **{"data.notification_id": terminal["data"]["notification_id"]}
         )
         assert receipt["data"]["notification_id"] == terminal["data"]["notification_id"]
-        release_parent_second.set()
         await _wait_event(serve.observer, "agent_end")
     finally:
         release_parent_second.set()
