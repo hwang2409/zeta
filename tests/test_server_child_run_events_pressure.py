@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -567,3 +568,110 @@ async def test_global_pressure_evicts_by_bytes_then_records_then_creation_order(
             for observer in observers:
                 await observer.close()
 
+
+
+def _push_older(store: ConversationStore) -> None:
+    """Append enough history after earlier rows to move them to an older page.
+
+    History bounds each assistant row near 8 KB, so 140 rows exceed one 1 MiB page.
+    """
+    for _ in range(140):
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("x" * 10_000)]))
+
+
+def _rows(messages: list[dict[str, Any]], event: str) -> list[str]:
+    return [row["run_id"] for row in messages if row.get("event") == event]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_snapshot_rows_come_only_from_newest_page_starts_without_scans(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
+        assert server.connections is not None
+        root = server.runtime.opened.store
+        older = [f"{session_id}:{n}" for n in (1, 2, 3)]
+        newer = [f"{session_id}:{n}" for n in (4, 5, 6)]
+        for run_id in older:
+            _start_child(server, stores, run_id)
+        _push_older(root)
+        children = {run_id: _start_child(server, stores, run_id) for run_id in newer}
+        parent = children[newer[0]]
+        nested_old = _start_child(server, stores, f"{newer[0]}:1", parent)
+        _push_older(parent)
+        nested_new = _start_child(server, stores, f"{newer[0]}:2", parent)
+        nested_old.update_agent_lifecycle(current_step="older start, still running")
+        await _lifecycle_applied(server)
+
+        # count the projection reads and directory walks of each admission
+        projection = server.connections.child_runs
+        counts = {"current": 0, "walks": 0}
+        admitting = False
+        original_current = projection.current
+        original_baseline = projection.with_baseline
+
+        def current(run_id: str) -> Any:
+            counts["current"] += admitting
+            return original_current(run_id)
+
+        def with_baseline(result: dict[str, Any]) -> dict[str, Any]:
+            nonlocal admitting
+            admitting = True
+            try:
+                return original_baseline(result)
+            finally:
+                admitting = False
+
+        def counted(original: Any) -> Any:
+            def walk(*args: Any, **kwargs: Any) -> Any:
+                counts["walks"] += admitting
+                return original(*args, **kwargs)
+
+            return walk
+
+        # test-contract: seam count the baseline builder's lifecycle reads and directory walks
+        monkeypatch.setattr(projection, "current", current)
+        monkeypatch.setattr(projection, "with_baseline", with_baseline)
+        monkeypatch.setattr(Path, "iterdir", counted(Path.iterdir))
+        monkeypatch.setattr(Path, "glob", counted(Path.glob))
+        monkeypatch.setattr(os, "scandir", counted(os.scandir))
+        monkeypatch.setattr(os, "listdir", counted(os.listdir))
+
+        # bullet 1 and 4: the top join snapshots only the newest page's starts
+        joined = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})
+        messages = joined["result"]["messages"]
+        assert joined["result"]["next_before"] is not None, "older starts were not paged out"
+        starts = _rows(messages, "child_started")
+        assert starts == newer
+        assert _rows(messages, "child_progress") == newer
+        assert counts == {"current": len(starts), "walks": 0}
+
+        # bullet 2: an older start is found by paging, its current row by a one-run join
+        counts.update(current=0, walks=0)
+        page = await client.request(
+            4, "child_run_events", {"session_id": session_id, "run_id": newer[0]}
+        )
+        assert _rows(page["result"]["messages"], "child_started") == [nested_new.agent_handle()]
+        assert _rows(page["result"]["messages"], "child_progress") == [nested_new.agent_handle()]
+        assert counts["walks"] == 0 and counts["current"] == 1
+        history = await client.request(
+            5,
+            "child_run_history",
+            {
+                "session_id": session_id,
+                "run_id": newer[0],
+                "before": page["result"]["next_before"],
+                "history_validator": page["result"]["history_validator"],
+            },
+        )
+        older_page = history["result"]["messages"]
+        assert _rows(older_page, "child_started") == [nested_old.agent_handle()]
+        assert _rows(older_page, "child_progress") == []
+        found = await client.request(
+            6, "child_run_events", {"session_id": session_id, "run_id": nested_old.agent_handle()}
+        )
+        assert "error" not in found, found
+        row, revision = original_current(nested_old.agent_handle())
+        assert (found["result"]["child"], found["result"]["revision"]) == (row, revision)
+        assert found["result"]["child"]["current_step"] == "older start, still running"
