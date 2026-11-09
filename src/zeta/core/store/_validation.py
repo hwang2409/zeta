@@ -14,6 +14,7 @@ from ...storage_format import reject_unknown_keys
 MAX_AGENT_NOTIFICATION_TEXT = 10_000
 AGENT_COMPLETION_NOTIFICATION_KIND = "agent_completion"
 CHILD_IDLE_NOTIFICATION_KIND = "child_idle"
+CHILD_HOLD_NOTIFICATION_KIND = "child_hold"
 TASK_EXITED_NOTIFICATION_KIND = "task_exited"
 PROJECT_INBOX_NOTIFICATION_KIND = "project_inbox"
 CHILD_QUESTION_NOTIFICATION_KIND = "child_question"
@@ -131,6 +132,32 @@ def validate_child_idle_notification_data(data: Mapping[str, Any]) -> None:
         raise ValueError("invalid child idle notification")
 
 
+def validate_child_hold_notification_data(data: Mapping[str, Any]) -> None:
+    """Check a child's long provider hold; the shape stays open like child_question."""
+
+    if (
+        data.get("origin") != "notification"
+        or data.get("kind") != CHILD_HOLD_NOTIFICATION_KIND
+        or data.get("status") != "held"
+        or data.get("reason") not in {"rate_limit", "subscription_limit"}
+        or any(
+            type(data.get(key)) is not str or not data[key]
+            for key in (
+                "child_instance_id",
+                "child_session_path",
+                "description",
+                "until",
+                "provider",
+                "text",
+            )
+        )
+        or len(data["text"]) > MAX_AGENT_NOTIFICATION_TEXT
+        or type(data.get("account")) not in {str, type(None)}
+        or type(data.get("retry_after")) not in {int, float}
+    ):
+        raise ValueError("invalid child hold notification")
+
+
 def validate_project_inbox_notification_data(data: Mapping[str, Any]) -> None:
     if (
         data.get("origin") != "notification"
@@ -213,6 +240,7 @@ def validate_agent_notification_data(data: Mapping[str, Any]) -> None:
 NOTIFICATION_VALIDATORS = {
     AGENT_COMPLETION_NOTIFICATION_KIND: validate_agent_notification_data,
     CHILD_IDLE_NOTIFICATION_KIND: validate_child_idle_notification_data,
+    CHILD_HOLD_NOTIFICATION_KIND: validate_child_hold_notification_data,
     TASK_EXITED_NOTIFICATION_KIND: validate_task_exited_notification_data,
     PROJECT_INBOX_NOTIFICATION_KIND: validate_project_inbox_notification_data,
     CHILD_QUESTION_NOTIFICATION_KIND: validate_child_question_notification_data,
