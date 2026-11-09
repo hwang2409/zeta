@@ -20,6 +20,7 @@ from .completion import (
     is_control_exception,
     merge_exception,
     report_transport_activity,
+    task_is_cancelling,
 )
 from .stream_diagnostics import StreamDiagnostics
 
@@ -290,7 +291,7 @@ class HTTPClientLease:
         self.connection_setup_count = int(self.owned)
         self._borrowers: Counter[str] = Counter()
         self._background_reporter_registered = False
-        self._close = MustCompleteClose()
+        self._close = MustCompleteClose("http client", LEASE_DRAIN_BOUND)
         self._drained = asyncio.Event()
         self._drained.set()
         self._retired = False
@@ -317,20 +318,19 @@ class HTTPClientLease:
         self._retired = True
 
     async def _close_owned(self) -> None:
-        leaked: RuntimeError | None = None
         try:
-            async with asyncio.timeout(LEASE_DRAIN_BOUND):
-                await self._drained.wait()
-        except TimeoutError:
-            # a borrow that never ends must not hang close forever: name it
-            leaked = RuntimeError(
-                "http client closed with borrows still open: "
-                + ", ".join(sorted(+self._borrowers))
-            )
-        if self.owned:
-            await self.client.aclose()
-        if leaked is not None:
-            raise leaked
+            # test-contract: seam the close owner bounds this drain
+            await self._drained.wait()
+        finally:
+            # the drain bound expired or the drain ended: close the client
+            # either way, and name any borrow that never ended.
+            if self.owned:
+                await self.client.aclose()
+            if self._borrowers:
+                raise RuntimeError(
+                    "http client closed with borrows still open: "
+                    + ", ".join(sorted(+self._borrowers))
+                )
 
     def start_close(self) -> None:
         self.retire()
@@ -435,11 +435,6 @@ async def sse_lines[E: RuntimeError](
 
 
 
-
-
-def task_is_cancelling() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
 
 
 def request_error[ErrorT: RuntimeError](

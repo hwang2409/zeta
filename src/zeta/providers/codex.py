@@ -38,6 +38,7 @@ from .completion import (
     complete as own_completion,
     is_completion_sentinel,
     report_provider_record,
+    task_is_cancelling,
 )
 from .codex_payload import (
     _cache_affinity_json,
@@ -59,7 +60,6 @@ from .transport import (
     request_error,
     retry_after_seconds,
     sse_lines,
-    task_is_cancelling,
 )
 from .usage import normalize_usage
 from ..protocol.types import (

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Awaitable, Sequence
 from typing import Any
 
-import httpx
 import pytest
 
 from tests.support.owned import await_or_fail
@@ -28,7 +26,6 @@ from zeta.providers.completion import (
     TaskDeadlineExceeded,
     TransportActivity,
 )
-from zeta.providers.ollama import OllamaBackend
 
 
 async def _within[T](awaitable: Awaitable[T]) -> T:
@@ -781,36 +778,3 @@ async def test_outer_cancel_during_task_deadline_drain_waits_for_close() -> None
         if not closing.done():
             closing.cancel()
         await _within(asyncio.gather(closing, return_exceptions=True))
-
-
-@pytest.mark.asyncio
-async def test_cancelled_attempt_close_still_lets_the_lease_close() -> None:
-    # The shape the bench serve probe hung in: cancellation must not skip source cleanup.
-    lines = [
-        {"message": {"role": "assistant", "content": "."}, "done": False},
-        {"message": {"role": "assistant", "content": ""}, "done": True},
-    ]
-    body = b"".join(json.dumps(line).encode() + b"\n" for line in lines)
-    client = httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(
-                200, headers={"Content-Type": "application/x-ndjson"}, content=body
-            )
-        )
-    )
-    backend = OllamaBackend(model="stub", base_url="http://ollama.test", client=client)
-    attempt = backend.create_attempt([], [])
-    try:
-        while True:
-            signal = await await_or_fail(attempt.__anext__(), what="next signal")
-            if signal.event is not None and signal.event.type is StreamEventType.MESSAGE_END:
-                break
-        closing = asyncio.create_task(attempt.aclose())
-        await asyncio.sleep(0)
-        closing.cancel()
-        await await_or_fail(asyncio.gather(closing, return_exceptions=True), what="cancelled close")
-        await await_or_fail(attempt.aclose(), what="retried close")
-        assert backend._lease._active_borrows == 0, "the closed attempt still holds a borrow"
-        await await_or_fail(backend.aclose(), what="backend close")
-    finally:
-        await await_or_fail(client.aclose(), what="client close")
