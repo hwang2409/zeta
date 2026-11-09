@@ -64,6 +64,10 @@ from ..session_files import (
     session_directory,
     session_root,
 )
+from ..store_history import (
+    ApprovalHistoryStoreMixin,
+    validate_approval_history_data,
+)
 from ..todo import TodoItem, parse_todo_items
 from ..transcript_recovery import (
     RepairResult,
@@ -74,11 +78,6 @@ from ._approval_display import (
     ApprovalAuditRequest,
     normalize_approval_requests,
     validated_approval_display,
-)
-from ._approval_history import (
-    ApprovalHistoryStoreMixin,
-    RecentRowsMixin,
-    validate_approval_history_data,
 )
 from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import (
@@ -102,6 +101,7 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._row_history import RecentRowsMixin
 from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
