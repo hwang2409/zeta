@@ -13292,7 +13292,9 @@ async def test_background_cleanup_keeps_store_close_visible_to_owner(
         await original_cleanup(policy)
 
     monkeypatch.setattr(agent_runner_module.ChildApprovalPolicy, "cleanup", pause_cleanup)
-    backend = _TaskFinishGateBackend(_python("print('done')"))
+    # The task must still run when the child ends its turn, or no finish gate opens.
+    release = tmp_path / "release"
+    backend = _TaskFinishGateBackend(f"{wait_for_path_command(release)} && echo done")
     store = ConversationStore(tmp_path / "session")
     owner = BackgroundAgentOwner(store)
     loop = AgentLoop(
@@ -13313,6 +13315,7 @@ async def test_background_cleanup_keeps_store_close_visible_to_owner(
     owner_wait: asyncio.Task[None] | None = None
     try:
         await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
+        release.touch()
         await asyncio.wait_for(run, timeout=10)
         await asyncio.wait_for(cleanup_entered.wait(), timeout=10)
         owner_wait = asyncio.create_task(
@@ -13324,6 +13327,7 @@ async def test_background_cleanup_keeps_store_close_visible_to_owner(
         release_cleanup.set()
         await asyncio.wait_for(owner_wait, timeout=10)
     finally:
+        release.touch()
         release_cleanup.set()
         if owner_wait is not None:
             await asyncio.wait_for(
