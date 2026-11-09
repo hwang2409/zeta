@@ -183,6 +183,8 @@ feature. Observer connections receive only methods with `read` access.
 | `delivery_status` | `1.0` | `delivery_id` | `read` |
 | `session_grants` | `1.1` | `session_grants` | `read` |
 | `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
+| `run_work_list` | `1.0` | `run_work` | `controller_read` |
+| `background_task_cancel` | `1.0` | `run_work` | `session_mutation` |
 
 ## common JSON-RPC shapes
 
@@ -800,6 +802,13 @@ work. The result contains `cleared`, the number of removed messages.
 {"jsonrpc":"2.0","id":9,"result":{"cleared":2}}
 ```
 
+### `run_work_list` and `background_task_cancel`
+
+Both methods require the negotiated `run_work` feature and an active session.
+`run_work_list` takes `session_id` and returns `tasks` and `todo` snapshots. Each task has `id`, `status`, `command`, `elapsed_seconds`, and `cancelable`; a known terminal code adds `exit_code`. Todo rows contain only `content` and `status`.
+
+`background_task_cancel` takes `session_id` and `task_id`. It asks the task registry to stop the task and returns the committed terminal task row as `{"task": row}`. Task lifecycle commits emit `background_task_updated`; todo store commits emit `todo_updated`. Events use the same projections and go only to a controller that negotiated `run_work`.
+
 ### `status`
 
 Params: optional `include_connection_setup_counts` (boolean). When it is `true`,
@@ -1218,6 +1227,8 @@ Event fields are:
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
+| `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
+| `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a

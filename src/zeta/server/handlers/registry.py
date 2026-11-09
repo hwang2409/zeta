@@ -16,6 +16,7 @@ from ..protocol import (
     protocol_error,
 )
 from . import lifecycle, session, settings, validation
+from .run_work import cancel_background_task, list_run_work
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
@@ -378,6 +379,8 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.DELIVERY_STATUS: delivery_status,
     MethodDescriptor.SESSION_GRANTS: session_grants_read,
     MethodDescriptor.REVOKE_SESSION_GRANTS: revoke_session_grants,
+    MethodDescriptor.RUN_WORK_LIST: list_run_work,
+    MethodDescriptor.BACKGROUND_TASK_CANCEL: cancel_background_task,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")

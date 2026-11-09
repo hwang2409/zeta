@@ -211,6 +211,8 @@ class EventDescriptor(StrEnum):
     USER_MESSAGE = "user_message"
     SESSION_GRANTS_CHANGED = "session_grants_changed"
     CONFIG_CHANGED = "config_changed"
+    BACKGROUND_TASK_UPDATED = "background_task_updated"
+    TODO_UPDATED = "todo_updated"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -244,6 +246,7 @@ FEATURES = (
     "content_read",
     "session_grants",
     "delivery_session_guard",
+    "run_work",
 )
 
 
@@ -313,6 +316,13 @@ class MethodDescriptor(Enum):
         "revoke_session_grants",
         "1.1",
         "session_grants",
+        Access.SESSION_MUTATION,
+    )
+    RUN_WORK_LIST = ("run_work_list", None, "run_work", Access.CONTROLLER_READ)
+    BACKGROUND_TASK_CANCEL = (
+        "background_task_cancel",
+        None,
+        "run_work",
         Access.SESSION_MUTATION,
     )
 
