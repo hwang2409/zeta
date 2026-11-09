@@ -41,7 +41,6 @@ MAX_ACCOUNT_LOCK_ATTEMPTS = 5
 MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
 MODEL_PROGRESS_IDLE_SECONDS = 15 * 60.0
-
 _RETRYABLE_STATUS_CODES = {
     408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529
 }
@@ -575,7 +574,7 @@ class CompletionCleanupError(RuntimeError):
 
 
 class ProviderAccountSwitched(Exception):
-    """The session switched accounts during a hold; redispatch through the new backend."""
+    pass
 
 
 class TaskDeadlineExceeded(TimeoutError):
@@ -894,8 +893,6 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         await self._wait_step(delay)
 
     async def _wait_for_rate_limit_hold(self, delay: float) -> None:
-        """Wait out a hold; a re-login wakes it, an account switch ends this run."""
-
         initial = self._rate_limit_state
         assert isinstance(initial, tuple)
         remaining = delay
@@ -904,7 +901,6 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             await self._wait_step(step)
             credential, account = self._hold_generation()
             if account != initial[1]:
-                # this adapter belongs to the old account; the caller redispatches
                 self._closed = True
                 raise ProviderAccountSwitched("session account changed during rate-limit hold")
             if credential != initial[0]:
@@ -1228,8 +1224,6 @@ def _rate_limit_hold(error: BaseException | object, retry_after: float | None) -
 
 
 def rate_limit_hold_text(data: Mapping[str, Any]) -> str:
-    """Describe a rate-limit hold event as local wall time plus the next probe."""
-
     until = datetime.fromtimestamp(data["until"]).astimezone()
     today = datetime.now().astimezone().date()
     stamp = until.strftime("%H:%M" if until.date() == today else "%b %d %H:%M")
@@ -1240,15 +1234,10 @@ def rate_limit_hold_text(data: Mapping[str, Any]) -> str:
 
 
 def format_duration(seconds: float) -> str:
-    total = max(0, int(seconds))
-    days, remainder = divmod(total, 86400)
+    days, remainder = divmod(max(0, int(seconds)), 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes, secs = divmod(remainder, 60)
-    parts = [
-        f"{value}{unit}"
-        for value, unit in ((days, "d"), (hours, "h"), (minutes, "m"))
-        if value
-    ]
+    parts = [f"{value}{unit}" for value, unit in ((days, "d"), (hours, "h"), (minutes, "m")) if value]
     if secs and not parts:
         parts.append(f"{secs}s")
     return " ".join(parts) or "0s"
