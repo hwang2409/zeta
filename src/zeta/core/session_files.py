@@ -9,7 +9,6 @@ import os
 import stat
 import uuid
 from collections.abc import Callable
-from functools import wraps
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
@@ -120,27 +119,6 @@ class SessionReferenceGate:
         finally:
             os.close(directory_fd)
         return value
-
-
-def reference_gate_transaction(function):
-    """Wrap a session publication method in the home reference authority."""
-    @wraps(function)
-    def wrapped(self, *args, **kwargs):
-        name = function.__name__
-        if name == "associate_project":
-            metadata = args[0] if args else kwargs["metadata"]
-            ids = (metadata.session_id, metadata.parent_session_id)
-        elif name == "open":
-            session_id = args[0] if args else kwargs["session_id"]
-            ids = (session_id,)
-        else:
-            ids = (kwargs.get("parent_session_id"),)
-        ids = tuple(item for item in ids if isinstance(item, str))
-        with SessionReferenceGate(self.home, self._storage_lease).shared(
-            referenced_ids=ids
-        ):
-            return function(self, *args, **kwargs)
-    return wrapped
 
 
 def require_off_loop_lock(

@@ -48,7 +48,6 @@ from .session_files import (
     SessionInUseError,
     SessionNotFoundError,
     open_session_file,
-    reference_gate_transaction,
     read_session_file,
     require_off_loop_lock,
     session_directory,
@@ -155,7 +154,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         """Return the home epoch held by this manager's writer lease."""
         return self._storage_lease.observed_epoch
 
-    @reference_gate_transaction
     def create(
         self,
         *,
@@ -298,7 +296,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 raise
         raise SessionError("could not allocate a unique session id")
 
-    @reference_gate_transaction
     def associate_project(
         self, metadata: SessionMetadata, project_id: str
     ) -> SessionMetadata:
@@ -343,7 +340,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             assert directory_fd is not None
             return self._read(session_id, directory_fd=directory_fd)
 
-    @reference_gate_transaction
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         metadata = self.read_metadata(session_id)
         try:
