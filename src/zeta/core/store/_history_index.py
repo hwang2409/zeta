@@ -8,11 +8,15 @@ import sqlite3
 import stat
 import threading
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ...protocol.types import is_passive_harness_message, is_visible_harness_notice
 from ..checkpoints import ConversationEntry
+
+if TYPE_CHECKING:
+    from ._store import ConversationStore
 
 
 class HistoryIndexError(RuntimeError):
@@ -425,3 +429,63 @@ class HistoryIndex:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+
+
+class HistoryPageStoreMixin:
+    def history_index_page(
+        self: ConversationStore, request: Mapping[str, object]
+    ) -> IndexedHistoryPage | None:
+        """Read one stable derived page, or defer when no sidecar exists."""
+        index = self._history_index
+        if self._closed:
+            return None
+        if index is None or (self._read_only and not index.available):
+            return None
+        for attempt in range(4):
+            if not index.available:
+                writer = self._new_persistent_durable_writer()
+                try:
+                    with writer._append_lock():
+                        self._sync_history_index(self.active_branch_snapshot())
+                finally:
+                    writer.close()
+            facts = self._history_index_facts()
+            try:
+                page = index.page(request, facts)
+            except StaleHistorySnapshot:
+                if "end" in request or attempt == 3:
+                    raise
+                index._mark_unavailable()
+                continue
+            except HistoryIndexUnavailableError as exc:
+                if self._history_index_facts() != facts:
+                    raise StaleHistorySnapshot from exc
+                if self._read_only or attempt == 3:
+                    raise
+                index._mark_unavailable()
+                continue
+            if self._history_index_facts() != facts:
+                if "end" in request or attempt == 3:
+                    raise StaleHistorySnapshot
+                continue
+
+            def resident_entry(entry: ConversationEntry) -> ConversationEntry:
+                if entry.seq > len(self._entries):
+                    return entry
+                resident = self._entries[entry.seq - 1]
+                if resident.id != entry.id:
+                    return entry
+                accepted = entry.data.get("_accepted_message")
+                if accepted is not None:
+                    return replace(
+                        resident,
+                        data={**resident.data, "_accepted_message": accepted},
+                    )
+                return resident
+
+            groups = tuple(
+                tuple(resident_entry(entry) for entry in group)
+                for group in page.groups
+            )
+            return replace(page, groups=groups)
+        raise HistoryIndexUnavailableError("history index is unavailable")
