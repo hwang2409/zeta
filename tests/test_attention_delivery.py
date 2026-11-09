@@ -94,6 +94,7 @@ def test_resolve_attention_targets_only_original_and_resolves_record(
     assert message["origin"] == "agent"
     assert message["authority"] == "information"
     assert "Decision: Use SQLite." in message["body"]
+    assert message.get("origin") == "agent"
     resolved = AttentionStore(original.store.session_dir).get(record.id)
     assert resolved.status == "resolved"
     assert resolved.fork_session_id == fork_id

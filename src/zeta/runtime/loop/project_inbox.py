@@ -187,8 +187,12 @@ class ProjectInboxNotificationMixin:
             scanner = self._new_project_inbox_scanner()
             self._inbox_scanner = scanner
         try:
-            message_ids, sent = await asyncio.to_thread(
-                lambda: (scanner.scan(), scanner.scan_sent())
+            message_ids, sent, messages = await asyncio.to_thread(
+                lambda: (
+                    scanner.scan(),
+                    scanner.scan_sent(),
+                    scanner.inbox.list(project_id)["new"],
+                )
             )
         except (InboxError, OSError, ProjectRegistryError):
             return
@@ -204,6 +208,7 @@ class ProjectInboxNotificationMixin:
                 {
                     "project_id": project_id,
                     "message_ids": list(message_ids),
+                    "messages": messages,
                     "description": "project inbox",
                     "status": "new",
                     "text": text,

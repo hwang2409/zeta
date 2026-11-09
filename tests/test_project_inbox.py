@@ -81,6 +81,7 @@ def _projects(tmp_path: Path):
 
 def test_exact_delegation_scopes_sender_and_kind(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
+    (home / "storage-format.json").write_text('{"writer_epoch":7}\n')
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox.set_delegation(project_b.project_id, project_a.project_id, "question", enabled=True)
     question_id = inbox.send(
@@ -119,6 +120,39 @@ def test_model_origin_defaults_to_information_and_cannot_claim(tmp_path: Path) -
     assert listed[0]["origin"] == "agent"
     assert listed[0]["author"] == "agent"
     assert listed[0]["authority"] == "information"
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is None
+
+
+def test_missing_origin_is_information(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="question",
+        title="legacy",
+        body="body",
+    )
+    path = home / "projects" / project_b.project_id / "inbox" / "new" / f"{message_id}.json"
+    value = json.loads(path.read_text())
+    value.pop("origin", None)
+    path.write_text(json.dumps(value))
+    listed = inbox.list(project_b.project_id)["new"][0]
+    assert listed.get("authority") == "information"
+
+
+def test_information_message_claim_is_refused(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="question",
+        title="question",
+        body="body",
+    )
     assert inbox.claim(project_b.project_id, message_id, "b" * 32) is None
 
 
@@ -440,6 +474,7 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
     assert replies[0]["kind"] == "reply"
     assert replies[0]["in_reply_to"] == message_id
     assert replies[0]["body"] == "The fix is ready."
+    assert replies[0].get("origin") == "agent"
 
 
 def _notice_loop(home, registry, project_id, session_id, wakes):
