@@ -36,7 +36,7 @@ from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer, slash_commands
-from zeta.server.handlers import send_images
+from zeta.server.handlers import send_images, settings
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -103,13 +103,25 @@ def _tool_stdout(end: dict) -> str:
 @pytest.mark.asyncio
 async def test_controller_model_catalog_works_before_session_attachment(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class ReverseSet(set[str]):
+        def __iter__(self):
+            return iter(sorted(super().__iter__(), reverse=True))
+
+    monkeypatch.setattr(
+        settings,
+        "PROVIDER_MODELS",
+        {"test": ReverseSet({"model-a", "model-b"})},
+    )
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer)
-        result = (await _request(reader, writer, 2, "model_catalog"))[-1]
-        assert result["result"]["models"]
+        result = (await _request(reader, writer, 2, "model_catalog"))[-1]["result"]
+        assert result["models"]
+        assert list(result["providers"]) == ["model-a", "model-b"]
+        assert result["providers"] == {"model-a": "test", "model-b": "test"}
     finally:
         await close_serve(server, writer)
 

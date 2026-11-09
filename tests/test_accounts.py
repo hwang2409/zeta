@@ -804,28 +804,68 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
     credential = named_account_credentials(tmp_path, "codex")
     await asyncio.to_thread(credential.save, tokens())
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
-    ticks = 0
-    stop = asyncio.Event()
+    lock_waiting = threading.Event()
+    original_bounded_guard = account_store._bounded_guard
 
-    async def ticker() -> None:
-        nonlocal ticks
-        async with asyncio.timeout(10):
-            while not stop.is_set():
-                ticks += 1
-                await asyncio.sleep(0)
+    observe_waiting = False
 
-    ticker_task = asyncio.create_task(ticker())
+    def observe_lock_wait(guard, timeout):
+        if observe_waiting:
+            lock_waiting.set()
+        return original_bounded_guard(guard, timeout)
+
+    # test-contract: seam observes the existing worker-thread lock boundary.
+    monkeypatch.setattr(account_store, "_bounded_guard", observe_lock_wait)
+
+    operation: asyncio.Task[object] | None = None
+    progress_future: asyncio.Future[None] | None = None
     try:
         async with credential._async_guard(registry=False, timeout=30):
+            observe_waiting = True
+            operation = asyncio.create_task(
+                asyncio.to_thread(credential_store, "codex", home=tmp_path)
+            )
+            assert await await_or_fail(
+                asyncio.to_thread(lock_waiting.wait, 10),
+                what="credential store lock-wait signal",
+            )
+
+            loop = asyncio.get_running_loop()
+            progress_future = loop.create_future()
+
+            def mark_progress() -> None:
+                if (
+                    operation is not None
+                    and not operation.done()
+                    and not progress_future.done()
+                ):
+                    progress_future.set_result(None)
+
+            loop.call_soon(mark_progress)
+            done, _ = await await_or_fail(
+                asyncio.wait(
+                    (progress_future, operation),
+                    timeout=10,
+                    return_when=asyncio.FIRST_COMPLETED,
+                ),
+                what="event-loop progress during credential store lock wait",
+            )
+            assert progress_future in done, (
+                "credential store lock wait completed without event-loop progress"
+            )
+            assert not operation.done()
             with pytest.raises(AccountError):
-                await asyncio.wait_for(
-                    asyncio.to_thread(credential_store, "codex", home=tmp_path),
-                    timeout=0.25,
-                )
-            assert ticks > 1
+                await await_or_fail(operation, what="credential store")
     finally:
-        stop.set()
-        await await_or_fail(ticker_task, what="event-loop ticker")
+        if progress_future is not None and not progress_future.done():
+            progress_future.cancel()
+        if operation is not None and not operation.done():
+            operation.cancel()
+        if operation is not None:
+            await await_or_fail(
+                asyncio.gather(operation, return_exceptions=True),
+                what="credential store operation",
+            )
 
 
 def test_resolve_account_does_not_migrate(
@@ -2552,13 +2592,15 @@ _MISSING_REGISTRY_REFUSAL = (
     "accounts.json is missing but other account directories exist; "
     "restore accounts.json before adding an account"
 )
-_BROKEN_REGISTRY_REFUSAL = (
-    "accounts.json is unreadable; kept it and every account directory; "
-    "repair or restore accounts.json, then restart zeta"
-)
+def _broken_registry_refusal(home: Path) -> str:
+    return (
+        f"accounts.json is unreadable: {home / 'accounts.json'}; kept it and every account directory; "
+        "move it aside to a backup, then run login again or restore it from a backup, "
+        "then restart zeta"
+    )
 _REGISTRY_REFUSALS = {
     "missing": _MISSING_REGISTRY_REFUSAL,
-    "broken": _BROKEN_REGISTRY_REFUSAL,
+    "broken": "accounts.json is unreadable",
 }
 
 
@@ -2608,7 +2650,12 @@ def test_refused_login_leaves_the_home_byte_for_byte_unchanged(
     assert files_after == files_before
     assert directories_after == directories_before
     assert flows == []
-    assert str(refusal.value) == _REGISTRY_REFUSALS[registry_state]
+    expected = (
+        _REGISTRY_REFUSALS[registry_state]
+        if registry_state == "missing"
+        else _broken_registry_refusal(tmp_path)
+    )
+    assert str(refusal.value) == expected
     (tmp_path / "accounts.json").write_bytes(registry)
     store.migrate()
     store.resolve_account(refused.provider)
@@ -2671,7 +2718,12 @@ async def test_tui_accounts_login_renders_the_registry_refusal(
         await asyncio.wait_for(login_rendered.wait(), 10)
 
         rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
-        assert f"login failed: {_REGISTRY_REFUSALS[registry_state]}" in rendered
+        expected = (
+            _REGISTRY_REFUSALS[registry_state]
+            if registry_state == "missing"
+            else _broken_registry_refusal(home)
+        )
+        assert f"login failed: {expected}" in rendered
         assert flows == []
         assert not (home / "accounts" / "anthropic").exists()
     finally:
@@ -2701,7 +2753,7 @@ def test_cli_login_with_unreadable_registry_is_refused_before_the_browser(
     assert cli_main.main(["login", "codex", "--account", "new"]) == 1
 
     assert flows == []
-    assert capsys.readouterr().err == f"login failed: {_BROKEN_REGISTRY_REFUSAL}\n"
+    assert capsys.readouterr().err == f"login failed: {_broken_registry_refusal(home)}\n"
     assert home_snapshot(home / "accounts") == accounts_before
     assert (home / "accounts.json").read_bytes() == b"{"
 

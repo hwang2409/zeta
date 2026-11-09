@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from ..session_execution import SessionOwnedError
 from ..session_files import read_session_file, session_directory
-from ..store._incremental_validation import TASK_EXITED_NOTIFICATION_KIND
 from . import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -364,6 +363,8 @@ def _build_append_entries(
 def _install_appended_entries(
     store: ConversationStore, entries: list[ConversationEntry]
 ) -> None:
+    from ..store._incremental_validation import TASK_EXITED_NOTIFICATION_KIND
+
     linear = not store._entries or entries[0].parent_id == store._entries[-1].id
     for entry in entries:
         store._entries.append(entry)
