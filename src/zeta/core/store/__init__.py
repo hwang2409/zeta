@@ -13,14 +13,7 @@ from ..checkpoints.mutation import (
     ConversationTargetOwned,
     commit_conversation_async,
 )
-from ._log import (
-    SCHEMA,
-    InstalledEntriesDelta,
-    ObserverSnapshotChanged,
-    PersistedAppend,
-    TranscriptLoadError,
-)
-from ._row_history import (
+from ._approval_history import (
     RECENT_ROW_WINDOW,
     ApprovalHistory,
     ApprovalRequest,
@@ -30,6 +23,13 @@ from ._row_history import (
     RecentRowKey,
     ToolResult,
     UserTurnMessageAfter,
+)
+from ._log import (
+    SCHEMA,
+    InstalledEntriesDelta,
+    ObserverSnapshotChanged,
+    PersistedAppend,
+    TranscriptLoadError,
 )
 from ._store import (
     AGENT_COMPLETION_NOTIFICATION_KIND,

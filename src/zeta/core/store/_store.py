@@ -75,7 +75,11 @@ from ._approval_display import (
     normalize_approval_requests,
     validated_approval_display,
 )
-from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_history_data
+from ._approval_history import (
+    ApprovalHistoryStoreMixin,
+    RecentRowsMixin,
+    validate_approval_history_data,
+)
 from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import (
     ChildRunStoreMixin,
@@ -98,7 +102,6 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
-from ._row_history import RecentRowsMixin
 from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
@@ -669,7 +672,6 @@ class ConversationStore(
         self, rows: Iterable[tuple[str, dict[str, Any]]]
     ) -> list[ConversationEntry]:
         """Durably append ordered rows with one flock acquisition and one fsync.
-
         Rows become visible together at the byte-write boundary and are ordered
         exactly as supplied. Each later row is parented to the preceding row.
         """
@@ -885,7 +887,6 @@ class ConversationStore(
         fact_floor: Mapping[str, Any] | None = None,
     ) -> None:
         """Commit an unshared marker without copying its large payload."""
-
         data = self._compaction_marker_data(
             summary,
             source_seq_start,
@@ -1096,7 +1097,6 @@ class ConversationStore(
 
         The state check and resolution append share one file lock.
         """
-
         if type(request_id) is not str or not request_id:
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
@@ -1213,12 +1213,10 @@ class ConversationStore(
 
     def active_branch_head_id(self) -> str | None:
         """Return the active leaf identity without materializing the branch."""
-
         return self._entries[-1].id if self._entries else None
 
     def active_branch_head_sequence(self) -> int:
         """Return the active leaf sequence without materializing the branch."""
-
         return self._entries[-1].seq if self._entries else 0
 
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
