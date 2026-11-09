@@ -17,6 +17,7 @@ from ...protocol.types import (
     is_passive_harness_message,
 )
 from ..session_files import read_session_file, session_directory
+from .entry_types import CONVERSATION_ENTRY_SPECS
 
 
 def _now() -> str:
@@ -28,28 +29,7 @@ class ConversationIntegrityError(ValueError):
 
 
 MAX_SESSION_JSON_DEPTH = 64
-# entry types accepted by ConversationStore._validate_entry_payload.
-CONVERSATION_ENTRY_TYPES = frozenset(
-    {
-        "message",
-        "child_run_started",
-        "compaction",
-        "client_delivery",
-        "warning",
-        "checkpoint",
-        "fork",
-        "approval_resolution",
-        "approval_history",
-        "turn_end",
-        "notification",
-        "notification_ack",
-        "notification_tui_presented",
-        "pending_prompt",
-        "pending_prompt_ack",
-        "pending_queue_closed",
-        "terminal_transition",
-    }
-)
+CONVERSATION_ENTRY_TYPES = frozenset(CONVERSATION_ENTRY_SPECS)
 
 
 def load_session_json(source: Path | bytes) -> Any:
@@ -58,7 +38,10 @@ def load_session_json(source: Path | bytes) -> Any:
     try:
         if isinstance(source, Path):
             path = source.absolute()
-            with session_directory(path.parent.parent, path.parent.name) as (_, directory_fd):
+            with session_directory(path.parent.parent, path.parent.name) as (
+                _,
+                directory_fd,
+            ):
                 source = read_session_file(directory_fd, path.name)
         value = json.loads(source)
         pending = [(value, 0)]
@@ -112,7 +95,9 @@ class ConversationEntry:
         if type(seq) is not int:
             raise ConversationIntegrityError("conversation seq must be an integer")
         if type(entry_id) is not str or not entry_id:
-            raise ConversationIntegrityError("conversation id must be a nonempty string")
+            raise ConversationIntegrityError(
+                "conversation id must be a nonempty string"
+            )
         if parent_id is not None and (type(parent_id) is not str or not parent_id):
             raise ConversationIntegrityError(
                 "conversation parent_id must be null or a nonempty string"
@@ -239,8 +224,7 @@ def list_branches_from_entries(
             1
             for candidate in chain
             if candidate.type == "message"
-            and Message.from_dict(candidate.data["message"]).role
-            is MessageRole.USER
+            and Message.from_dict(candidate.data["message"]).role is MessageRole.USER
         )
         branches.append(
             BranchInfo(
@@ -451,14 +435,10 @@ class CheckpointForkMixin:
                     f"user message is not on the active branch: {entry_id!r}"
                 )
             if source.type != "message":
-                raise ValueError(
-                    f"fork source is not a message: {entry_id!r}"
-                )
+                raise ValueError(f"fork source is not a message: {entry_id!r}")
             message = Message.from_dict(source.data["message"])
             if message.role is not MessageRole.USER:
-                raise ValueError(
-                    f"fork source is not a user message: {entry_id!r}"
-                )
+                raise ValueError(f"fork source is not a user message: {entry_id!r}")
             label = self._message_fork_label(source)
             entry = self._append_row_unlocked(
                 "fork",
@@ -498,9 +478,7 @@ class CheckpointForkMixin:
             by_id = {entry.id: entry for entry in self._entries}
             source = by_id.get(head_entry_id)
             if source is None:
-                raise ValueError(
-                    f"branch head not found: {head_entry_id!r}"
-                )
+                raise ValueError(f"branch head not found: {head_entry_id!r}")
             for entry in self._entries:
                 if entry.parent_id == source.id:
                     raise ValueError(
@@ -542,8 +520,7 @@ class CheckpointForkMixin:
             text = " ".join(
                 block.text.strip()
                 for block in message.content
-                if isinstance(block, TextContent)
-                and block.text.strip()
+                if isinstance(block, TextContent) and block.text.strip()
             )
             if text and not CheckpointForkMixin._is_numeric_selector(text):
                 return " ".join(text.split())[:48]

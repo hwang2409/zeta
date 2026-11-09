@@ -18,6 +18,7 @@ import pytest
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import (
@@ -153,9 +154,7 @@ def test_inbox_receipt_index_ignores_lookalikes(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(_sent_status_message("not-an-id"))
     store.append_message(_sent_status_message("b" * 32, "unknown"))
-    store.append_message(
-        _sent_status_message("c" * 32, origin=MessageOrigin.USER)
-    )
+    store.append_message(_sent_status_message("c" * 32, origin=MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.USER,
@@ -368,7 +367,11 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
         assert claimed is not None
         assert claimed["body"] == body
         claimed_path = (
-            registry.root / project_b.project_id / "inbox" / "claimed" / f"{message_id}.json"
+            registry.root
+            / project_b.project_id
+            / "inbox"
+            / "claimed"
+            / f"{message_id}.json"
         )
         assert json.loads(claimed_path.read_text())["body"] == {
             "file": f"bodies/{message_id}.txt"
@@ -386,7 +389,9 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
 
     assert completed["outcome"] == "fixed in PR #12"
     assert completed["body"] == body
-    done_path = registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    done_path = (
+        registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    )
     assert json.loads(done_path.read_text())["body"] == {
         "file": f"bodies/{message_id}.txt"
     }
@@ -425,7 +430,9 @@ def _notice_loop(home, registry, project_id, session_id, wakes):
 
 
 @pytest.mark.asyncio
-async def test_one_message_wakes_exactly_one_of_two_peer_sessions(tmp_path: Path) -> None:
+async def test_one_message_wakes_exactly_one_of_two_peer_sessions(
+    tmp_path: Path,
+) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox.send(
@@ -536,7 +543,9 @@ async def test_active_turn_skips_periodic_inbox_scan(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Path) -> None:
+async def test_session_notices_new_message_at_idle_or_tool_boundary(
+    tmp_path: Path,
+) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     message_id = inbox.send(
@@ -618,7 +627,9 @@ def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
         title="newer writer",
         body="body",
     )
-    new_path = registry.root / project_b.project_id / "inbox" / "new" / f"{message_id}.json"
+    new_path = (
+        registry.root / project_b.project_id / "inbox" / "new" / f"{message_id}.json"
+    )
     record = json.loads(new_path.read_text())
     record["future_optional"] = {"needed": True}
     record["from"]["future_sender_metadata"] = "preserve me"
@@ -638,7 +649,9 @@ def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
     completed = inbox.done(project_b.project_id, message_id, session_id, "complete")
     assert completed["future_optional"] == {"needed": True}
     assert completed["from"]["future_sender_metadata"] == "preserve me"
-    done_path = registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    done_path = (
+        registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    )
     stored = json.loads(done_path.read_text())
     assert stored["future_optional"] == {"needed": True}
     assert stored["from"]["future_sender_metadata"] == "preserve me"
@@ -787,15 +800,21 @@ def test_invalid_message_is_logged_once_across_readers(
     home, registry, _project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox.list(project_b.project_id)
-    invalid = registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    invalid = (
+        registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    )
     invalid.write_text("{not json")
 
     with caplog.at_level("WARNING", logger="zeta.project_inbox"):
         inbox.list(project_b.project_id)
-        ProjectInbox(registry, sessions_root=home / "sessions").list(project_b.project_id)
+        ProjectInbox(registry, sessions_root=home / "sessions").list(
+            project_b.project_id
+        )
 
     messages = [record.message for record in caplog.records]
-    assert sum("Skipping invalid project inbox message" in item for item in messages) == 1
+    assert (
+        sum("Skipping invalid project inbox message" in item for item in messages) == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -803,7 +822,9 @@ async def test_inbox_watcher_ignores_stable_invalid_message(tmp_path: Path) -> N
     home, registry, _project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox.list(project_b.project_id)
-    invalid = registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    invalid = (
+        registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    )
     invalid.write_text("{not json")
     wakes: list[str] = []
     loop = _notice_loop(home, registry, project_b.project_id, "b" * 32, wakes)
@@ -901,6 +922,7 @@ def test_invalid_log_dedup_evicts_before_logging_new_files(
         inbox.list(project_b.project_id)
     assert any(new_name in record.message for record in caplog.records)
 
+
 async def _collect_turn(loop: AgentLoop, text: str) -> None:
     async for _event in loop.run_turn(text, origin=MessageOrigin.USER):
         pass
@@ -976,7 +998,9 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
 
 
 @pytest.mark.asyncio
-async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path) -> None:
+async def test_claim_note_not_redelivered_after_fork_before_note(
+    tmp_path: Path,
+) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     session_id = "a" * 32
     loop, backend, store = _sender_loop(
@@ -1262,9 +1286,7 @@ def test_passive_scanner_io_is_bounded_by_sender_tracking(
     statuses = scanner.scan_sent()
 
     assert statuses is not None
-    assert [(item["id"], item["status"]) for item in statuses] == [
-        (message_id, "new")
-    ]
+    assert [(item["id"], item["status"]) for item in statuses] == [(message_id, "new")]
     assert reads == [(project_b.project_id, message_id)]
 
 
@@ -1317,13 +1339,19 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
     loop, backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id, turns=1
     )
-    original_durable_write = store._run_durable_write
+    original_durable_write = store._run_committed_mutation
     append_committed = threading.Event()
     release_append = threading.Event()
 
-    def pause_after_status_commit(method_name, args, kwargs):
-        result = original_durable_write(method_name, args, kwargs)
-        message = args[0] if method_name == "append_message" else None
+    def pause_after_status_commit(command, expected_generation, cancelled_before_write):
+        result = original_durable_write(
+            command, expected_generation, cancelled_before_write
+        )
+        message = (
+            command.message
+            if type(command).__name__ == "_AppendMessageCommand"
+            else None
+        )
         if (
             message is not None
             and message.metadata.get("zeta_event") == "project_inbox_sent_status"
@@ -1332,7 +1360,8 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
             assert release_append.wait(timeout=5)
         return result
 
-    monkeypatch.setattr(store, "_run_durable_write", pause_after_status_commit)
+    # test-contract: seam pauses after durable inbox status commit
+    monkeypatch.setattr(store, "_run_committed_mutation", pause_after_status_commit)
     try:
         await loop._check_project_inbox()
         first_turn = asyncio.create_task(_collect_turn(loop, "first"))
@@ -1340,9 +1369,9 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
         first_turn.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
-            await first_turn
-
-        monkeypatch.setattr(store, "_run_durable_write", original_durable_write)
+            await await_or_fail(first_turn, what="test await")
+        # test-contract: seam releases the next turn from the injected pause
+        monkeypatch.setattr(store, "_run_committed_mutation", original_durable_write)
         await _collect_turn(loop, "second")
 
         persisted = [
@@ -1386,12 +1415,15 @@ async def test_crash_between_note_append_and_receipt_does_not_duplicate(
     monkeypatch.setattr(loop._inbox_scanner, "mark_reported", crash_before_receipt)
     with pytest.raises(RuntimeError, match="simulated crash"):
         await _collect_turn(loop, "first")
-    assert sum(
-        message.metadata.get("zeta_event") == "project_inbox_sent_status"
-        for message in store.entries
-        if message.type == "message"
-        for message in [Message.from_dict(message.data["message"])]
-    ) == 1
+    assert (
+        sum(
+            message.metadata.get("zeta_event") == "project_inbox_sent_status"
+            for message in store.entries
+            if message.type == "message"
+            for message in [Message.from_dict(message.data["message"])]
+        )
+        == 1
+    )
     await loop.close()
     store.close()
 

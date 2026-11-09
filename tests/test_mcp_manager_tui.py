@@ -152,6 +152,7 @@ async def test_public_mcp_views_repair_a_committed_cancelled_add(
             loop=loop,
             home=tmp_path / "home",
             cwd=tmp_path / "repo",
+            repo_root=tmp_path / "repo",
             opened=SimpleNamespace(metadata=SimpleNamespace(cwd=str(tmp_path / "repo"))),
             manager=SimpleNamespace(
                 project_registry_state=available_project_registry(
