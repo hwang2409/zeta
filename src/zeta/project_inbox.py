@@ -445,7 +445,7 @@ class ProjectInbox:
                                 "session": source_session,
                             }:
                                 rows.append(self._broken_row(record, status, project_id, source_session, receipt_map))
-            except _InboxNotFound:
+            except (_InboxNotFound, FileNotFoundError):
                 return
         self.registry._identity_read(read)
         return rows
@@ -570,31 +570,32 @@ class ProjectInbox:
     ) -> tuple[str, dict[str, Any]] | None:
         name = f"{_id(message_id)}.json"
 
-        def read(root_fd: int) -> tuple[str, dict[str, Any]] | None:
+        def read() -> tuple[str, dict[str, Any]] | None:
             try:
-                with self._directory_handles(
-                    root_fd, target_project, create=False, lock=False
-                ) as dirs:
-                    for index, status in enumerate(("new", "claimed", "done")):
-                        try:
-                            record = self._read_record(
-                                dirs[index], name, dirs[3], resolve_body=False
-                            )
-                        except FileNotFoundError:
-                            continue
-                        sender = record.get("from")
-                        if not isinstance(sender, dict) or sender != {
-                            "project": source_project,
-                            "session": source_session,
-                        }:
-                            raise InboxError("tracked sent message has another sender")
-                        return status, record
-                    return None
+                with (
+                    self._lock(target_project, exclusive=False) as project_fd,
+                    self._project_directory_handles(project_fd, create=False) as dirs,
+                ):
+                        for index, status in enumerate(("new", "claimed", "done")):
+                            try:
+                                record = self._read_record(
+                                    dirs[index], name, dirs[3], resolve_body=False
+                                )
+                            except FileNotFoundError:
+                                continue
+                            sender = record.get("from")
+                            if not isinstance(sender, dict) or sender != {
+                                "project": source_project,
+                                "session": source_session,
+                            }:
+                                raise InboxError("tracked sent message has another sender")
+                            return status, record
+                        return None
             except _InboxNotFound:
                 return None
 
         try:
-            return self.registry._identity_read(read)
+            return read()
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -816,6 +817,11 @@ class ProjectInbox:
             if lock:
                 fcntl.flock(inbox_fd, fcntl.LOCK_EX)
                 stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
+            if not any(
+                name in os.listdir(inbox_fd)
+                for name in ("new", "claimed", "done", "bodies", "wake")
+            ):
+                raise _InboxNotFound
             fds = tuple(
                 stack.enter_context(child_directory(inbox_fd, name, create=create))
                 for name in ("new", "claimed", "done", "bodies", "wake")

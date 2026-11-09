@@ -38,8 +38,6 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     ("zeta.memory.migration", "migrate_format_one", "in-memory value"),
     ("zeta.memory.reconciler", "parse_proposal", "model output"),
     ("zeta.memory_migration_plan", "build_migration_plan", "in-memory value"),
-    # compares a directory listing with {".lock"}; no stored payload's keys
-    ("zeta.project_inbox", "_directory_handles", "in-memory value"),
     ("zeta.project_memory_history", "_validate_updates", "in-memory value"),
     ("zeta.project_memory_history", "_import_memory_locked", "in-memory value"),
     ("zeta.project_registry", "update_memory", "in-memory value"),
