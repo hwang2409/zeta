@@ -447,7 +447,7 @@ class ProjectInbox:
                                 rows.append(self._broken_row(record, status, project_id, source_session, receipt_map))
             except _InboxNotFound:
                 return
-        self.registry._read(read)
+        self.registry._identity_read(read)
         return rows
 
     def _broken_row(
@@ -557,7 +557,7 @@ class ProjectInbox:
             return result
 
         try:
-            return self.registry._read(read)
+            return self.registry._identity_read(read)
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -594,7 +594,7 @@ class ProjectInbox:
                 return None
 
         try:
-            return self.registry._read(read)
+            return self.registry._identity_read(read)
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 

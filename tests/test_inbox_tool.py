@@ -94,7 +94,14 @@ async def test_inbox_approval_subject_keeps_canonical_project_ids(
         project_id = registry.project_id
         assert project_id is not None
         capability = registry.resolve_call(
-            "inbox", {"action": "send", "project": project_id}
+            "inbox",
+            {
+                "action": "send",
+                "project": project_id,
+                "kind": "question",
+                "title": "title",
+                "body": "body",
+            },
         )
         assert capability.subject_value == project_id
         assert capability.arguments["project"] == project_id
