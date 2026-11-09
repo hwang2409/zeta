@@ -1810,7 +1810,7 @@ async def test_slow_context_assembly_does_not_exhaust_retry_budget(
 
     assembler.assemble = slow_assemble  # type: ignore[method-assign]
     with patch(
-        "zeta.providers.completion.time.monotonic", side_effect=lambda: now[0]
+        "zeta.providers.must_complete_close.time.monotonic", side_effect=lambda: now[0]
     ):
         events = await collect(
             AgentLoop(
@@ -2118,7 +2118,7 @@ async def test_stall_after_partial_tool_call_delta_is_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = 0.0
-    monkeypatch.setattr(completion_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
 
     class StallError(RetryableProviderFailure):
         is_stall = True
@@ -2177,7 +2177,7 @@ async def test_stall_after_text_delta_is_retried_with_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = 0.0
-    monkeypatch.setattr(completion_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
 
     class StallError(RetryableProviderFailure):
         is_stall = True
