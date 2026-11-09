@@ -63,7 +63,7 @@ class _CallPreparationMixin:
 
     async def approval_label(self, tool_call: ToolCall) -> str | None:
         """Name an inbox send's canonical target project, looked up off the loop."""
-        from ..project_registry import ProjectNotFoundError
+        from ..project_errors import ProjectRegistryError
         from ..project_schema import PROJECT_ID_PATTERN
         project = tool_call.arguments.get("project")
         if (
@@ -76,7 +76,8 @@ class _CallPreparationMixin:
             return None
         try:
             found = await asyncio.to_thread(self.project_registry.show_project, project_id=project)
-        except (ProjectNotFoundError, OSError):
+        except (ProjectRegistryError, OSError):
+            # the label is display-only: any registry read error yields no label.
             return None
         return f"{found.name} ({project})"
 

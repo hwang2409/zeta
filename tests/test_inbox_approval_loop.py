@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
+from zeta.project_errors import ProjectRegistryBusyError
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
@@ -25,9 +27,9 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.runtime.loop import AgentLoop
-from zeta.server.approval_lifecycle import ApprovalLifecycle, Close, Start
+from zeta.server.approval_lifecycle import ApprovalLifecycle, Close, Decide, Start
 from zeta.server.connections import Admission
-from zeta.server.protocol import EventDescriptor
+from zeta.server.protocol import ApprovalDecision, EventDescriptor
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
 from zeta.tools.registry import ToolRegistry
@@ -265,6 +267,116 @@ async def test_pending_inbox_approval_names_beta_in_tui_card_and_serve_event(
         await await_or_fail(lifecycle.transition(Close()), what="serve approval close")
         await loop.close()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_error_in_label_lookup_keeps_the_approval_usable(
+    tmp_path: Path,
+) -> None:
+    # The label is display-only: a busy or corrupt registry during the lookup must
+    # not fail the serve turn, wedge the decision, or leak a TUI task exception.
+    _home_dir, projects, alpha, beta, store = await asyncio.to_thread(_home, tmp_path)
+    policy = ApprovalPolicy(default="ask", store=store)
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_send("send-busy")]), ScriptedTurn(content=[TextContent("ok")])]
+    )
+    loop = _loop(tmp_path, projects, alpha, store, policy, backend)
+    admitted: list[dict[str, object]] = []
+
+    def admit(event: object, session_id: object, **fields: object) -> Admission:
+        admitted.append(fields)
+        return Admission("admitted")
+
+    async def offload(job):
+        return job()
+
+    lifecycle = ApprovalLifecycle(
+        admit=admit,
+        request_turn_failure=lambda: None,
+        policy=lambda: policy,
+        session_id=lambda: "session",
+        parent_store=lambda: None,
+        offload=offload,
+        is_closing=lambda: False,
+    )
+    app = TUIApp(loop, provider="codex", model="offline", approval_policy=policy)
+    cards: list[str] = []
+    outcomes: dict[str, object] = {}
+    original_show = projects.show_project
+
+    def busy(**_kwargs: object):
+        raise ProjectRegistryBusyError()
+
+    async def show(event: StreamEvent) -> None:
+        # Preparation already rewrote the project to its id; now break the label read.
+        projects.show_project = busy
+        try:
+            start_error: list[BaseException] = []
+            try:
+                await asyncio.wait_for(
+                    lifecycle.transition(
+                        Start(event, "session", EventDescriptor.APPROVAL_REQUEST)
+                    ),
+                    10,
+                )
+            except BaseException as exc:  # noqa: BLE001 - the test asserts on the escape
+                start_error.append(exc)
+            outcomes["start_error"] = start_error
+            outcomes["admitted_labels"] = [fields.get("label") for fields in admitted]
+
+            app._present_pending_approvals()
+            lookups = getattr(app, "_approval_label_tasks", ())
+            outcomes["label_task_results"] = await asyncio.wait_for(
+                asyncio.gather(*lookups, return_exceptions=True), 10
+            )
+            cards.append(Text.from_ansi(app._transcript.render(120)).plain)
+
+            request_id = admitted[-1]["request_id"] if admitted else event.tool_call.id
+            try:
+                decision, _key = await asyncio.wait_for(
+                    lifecycle.transition(Decide(ApprovalDecision.APPROVE, request_id)), 10
+                )
+                outcomes["decide"] = decision
+            except BaseException as exc:  # noqa: BLE001 - APPROVAL_UNAVAILABLE on the base
+                outcomes["decide"] = exc
+                loop.abort()  # the wedged record never resolves the turn; unblock it
+        finally:
+            projects.show_project = original_show  # the approved send uses the real registry
+
+    async def drive() -> None:
+        async for event in loop.run_turn("send it", origin=MessageOrigin.USER):
+            if event.type is StreamEventType.TOOL_APPROVAL_START and event.tool_call is not None:
+                await show(event)
+
+    try:
+        async with owned_app(app):
+            app._full_screen_active = lambda: True
+            await asyncio.wait_for(drive(), 30)
+            outcomes["call_state"] = _call_state(loop, policy, "send-busy")
+            # On the fixed code the accepted decision already drained the record, so
+            # the lifecycle holds nothing. On the base the wedged "starting" record is
+            # the bug itself and never drains, so do not await Close(): assert instead.
+            outcomes["records"] = len(lifecycle._state.records)
+    finally:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(loop.close(), 10)
+        store.close()
+
+    assert outcomes["start_error"] == [], (
+        f"serve start raised on a registry read error: {outcomes['start_error']!r}"
+    )
+    assert outcomes["admitted_labels"] == [None], outcomes["admitted_labels"]
+    assert not any(
+        isinstance(result, BaseException) for result in outcomes["label_task_results"]
+    ), outcomes["label_task_results"]
+    assert len(cards) == 1, cards
+    assert "allow inbox?" in cards[0], cards[0]
+    assert f"beta ({beta.project_id})" not in cards[0], cards[0]
+    decide = outcomes["decide"]
+    assert not isinstance(decide, BaseException), decide
+    assert decide["accepted"] is True, decide
+    assert outcomes["call_state"] == []
+    assert outcomes["records"] == 0, "the decided approval left a record behind"
 
 
 def test_only_the_inbox_definition_builds_an_inbox_approval_subject(tmp_path: Path) -> None:
