@@ -709,13 +709,24 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(account_store, "ACCOUNT_LOCK_TURN_WAIT_SECONDS", 0.05)
     lock_waiting = threading.Event()
+    progress_seen = threading.Event()
     original_bounded_guard = account_store._bounded_guard
 
     def observe_lock_wait(guard, timeout):
-        lock_waiting.set()
-        return original_bounded_guard(guard, timeout)
+        def first_attempt_waits_for_loop():
+            if not lock_waiting.is_set():
+                lock_waiting.set()
+                # park the worker thread inside the real bounded wait until the
+                # loop has run mark_progress, so the operation cannot finish
+                # before the loop has demonstrably progressed while the other
+                # process holds the registry lock. hang guard only.
+                progress_seen.wait(10)
+            return guard()
 
-    # test-contract: seam observes the worker-thread registry lock boundary.
+        return original_bounded_guard(first_attempt_waits_for_loop, timeout)
+
+    # test-contract: seam parks the worker-thread registry lock boundary until
+    # the loop runs, then lets the real bounded guard time out.
     monkeypatch.setattr(account_store, "_bounded_guard", observe_lock_wait)
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
@@ -728,7 +739,7 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
     operation: asyncio.Task[str] | None = None
     progress_future: asyncio.Future[None] | None = None
     try:
-        assert ready.wait(timeout=5)
+        assert await asyncio.to_thread(ready.wait, 5)
         async with httpx.AsyncClient() as client:
             operation = asyncio.create_task(credential.access_token(client))
             assert await await_or_fail(
@@ -745,6 +756,9 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
                     and not progress_future.done()
                 ):
                     progress_future.set_result(None)
+                # release the parked worker thread even if the operation has
+                # already finished, so no thread stays blocked.
+                progress_seen.set()
 
             loop.call_soon(mark_progress)
             done, _ = await await_or_fail(
@@ -762,6 +776,8 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
             with pytest.raises(AccountCredentialLockTimeoutError):
                 await await_or_fail(operation, what="access token")
     finally:
+        # unpark the worker thread before draining, so cancel/drain cannot hang.
+        progress_seen.set()
         if progress_future is not None and not progress_future.done():
             progress_future.cancel()
         if operation is not None and not operation.done():
