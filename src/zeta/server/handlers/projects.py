@@ -156,7 +156,7 @@ class ProjectRequests:
             else self._memory_log(request_id, project, params)
         )
 
-    def inbox(
+    def inbox_view(
         self, request_id: str | int, params: dict[str, Any]
     ) -> dict[str, object]:
         project = self.require_project(self._project_id(params))

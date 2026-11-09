@@ -304,7 +304,7 @@ async def project_memory_log(client, request_id, params):
 
 
 async def project_inbox(client, request_id, params):
-    return await _project(client, request_id, params, client.projects.inbox)
+    return await _project(client, request_id, params, client.projects.inbox_view)
 
 
 async def clear_steering(client, request_id, params):
