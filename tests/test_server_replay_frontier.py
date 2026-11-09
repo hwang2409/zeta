@@ -758,7 +758,7 @@ async def test_generation_overcount_keeps_row_backed_frame_on_stream(
         await serve.join(serve.observer)
         # This is the over-count from an async replace_entries install after an external append.
         serve.store._reset_generation += 1
-        await _publish_tool_end(serve, "covered-call")
+        await _publish_tool_end(serve, "frontier-call")
         frames = await serve.live(serve.observer)
         assert [frame["event"] for frame in frames] == ["tool_end"], frames
         assert not any(frame["event"] == "replay_stream_ended" for frame in frames)
