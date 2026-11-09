@@ -17,6 +17,10 @@ class TaskOwner:
     def __init__(self) -> None:
         self._tasks: dict[asyncio.Task[object], ApprovalKey] = {}
 
+    @property
+    def tasks(self) -> dict[asyncio.Task[object], ApprovalKey]:
+        return self._tasks
+
     def start(
         self, key: ApprovalKey, operation: Awaitable[object], kind: str
     ) -> asyncio.Task[object]:

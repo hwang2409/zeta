@@ -201,6 +201,10 @@ class ApprovalLifecycle:
         self._task_owner = TaskOwner()
 
     @property
+    def _settlement_tasks(self) -> dict[asyncio.Task[object], ApprovalKey]:
+        return self._task_owner.tasks
+
+    @property
     def state(self) -> ApprovalMachineState:
         return self._state
 
