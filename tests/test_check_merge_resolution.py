@@ -1005,8 +1005,10 @@ def test_pr_line_candidates_indexes_lines(monkeypatch: pytest.MonkeyPatch) -> No
             self.number = number
 
     items = [CountingItem(number) for number in range(1, 2_001)]
-    # test-contract: seam
+    # test-contract: seam private seam replacement for complexity measurement
     monkeypatch.setattr(merge_resolution, "_line_items", lambda *args: items)
+    # test-contract: seam
+    # test-contract: seam private seam replacement for complexity measurement
     monkeypatch.setattr(
         merge_resolution, "_diff_blocks", lambda base, side: [(0, 0, 0, 2_000)]
     )
