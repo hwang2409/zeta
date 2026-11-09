@@ -67,6 +67,7 @@ async def bind_shell_cwd_async(
     start_cwd, fd, recovery = await run_owned_thread_call(
         lambda: _bind_shell_cwd(registry, requested_cwd, approved_cwd),
         lambda result: os.close(result[1]),
+        close_is_thread_safe=True,
     )
     if recovery is not None:
         registry.commit_cwd_recovery(*recovery)

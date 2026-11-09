@@ -77,6 +77,7 @@ async def _temporary_file(spills: Any) -> AsyncIterator[BinaryIO]:
     handle = await run_owned_thread_call(
         manager.__enter__,
         lambda _handle: manager.__exit__(None, None, None),
+        close_is_thread_safe=True,
     )
     try:
         yield handle

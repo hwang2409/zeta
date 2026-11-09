@@ -72,6 +72,7 @@ from ._action_metadata import (
 from ._action_metadata import (
     resolve_approval_rule as resolve_registered_approval_rule,
 )
+from ._live_config import _LiveConfigRegistryMixin
 from ._results import (
     _apply_error_governance,
     _BoundedText,  # noqa: F401 - preserve the registry import
@@ -217,7 +218,7 @@ def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
 
 
-class ToolRegistry:
+class ToolRegistry(_LiveConfigRegistryMixin):
     """One provider-neutral registry for built-in and custom tools."""
 
     def __init__(
@@ -345,7 +346,7 @@ class ToolRegistry:
         self.web_clients = SessionWebClients()
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
-        self._skill_refresher: Callable[[bool], Awaitable[None]] | None = None
+        self._live_config_refresher: Callable[[bool], Awaitable[None]] | None = None
         if agent_catalog is None:
             from ..skills.agent_catalog import discover_packaged_agents
 
@@ -354,17 +355,6 @@ class ToolRegistry:
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
-
-    def set_skill_refresher(
-        self, refresher: Callable[[bool], Awaitable[None]]
-    ) -> None:
-        """Let tools request one live catalog refresh."""
-
-        self._skill_refresher = refresher
-
-    async def refresh_skills(self, *, force: bool = False) -> None:
-        if self._skill_refresher is not None:
-            await self._skill_refresher(force)
 
     @property
     def tool_allow(self) -> tuple[str, ...] | None:

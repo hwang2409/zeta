@@ -387,7 +387,6 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
 ) -> None:
     started = threading.Event()
     release = threading.Event()
-    entered = threading.Event()
     closed = threading.Event()
     descriptors: list[int] = []
     handles: list[io.FileIO] = []
@@ -403,7 +402,6 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
             handles.append(handle)
             started.set()
             assert release.wait(timeout=10)
-            entered.set()
             return handle
 
         def __exit__(
@@ -440,10 +438,10 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
         task.cancel()
         await next_loop_turn()
         release.set()
-        assert await asyncio.to_thread(entered.wait, 10)
+        # Block the loop thread: the abandoned file must close without the loop.
+        assert closed.wait(timeout=10), "abandoned temporary file was not closed"
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=10)
-        assert await asyncio.to_thread(closed.wait, 10)
 
         assert exit_calls == 1
         with pytest.raises(OSError) as error:

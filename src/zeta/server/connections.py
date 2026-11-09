@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from . import content, ergonomics
+from ..core.thread_call import ThreadCallWorkers
+from . import content
+from .handlers import history, lifecycle, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -112,17 +113,7 @@ class ConnectionRegistry:
         self._controller_output_paused = False
         self._observers: list[_Connection] = []
         self._closed = False
-        self._read_condition = threading.Condition()
-        self._read_jobs: deque[tuple[Callable[[], Any], asyncio.Future[Any]]] = deque()
-        self._read_stopping = False
-        self._read_threads = [
-            threading.Thread(
-                target=self._read_worker, daemon=True, name=f"zeta-read-{i}"
-            )
-            for i in range(2)
-        ]
-        for thread in self._read_threads:
-            thread.start()
+        self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
 
     def register(self, connection: Any) -> None:
         if self._closed:
@@ -735,13 +726,7 @@ class ConnectionRegistry:
 
     async def run_blocking(self, callable: Callable[[], Any]) -> Any:
         """Run one store or observer read away from the event loop."""
-        future = self.loop.create_future()
-        with self._read_condition:
-            if self._read_stopping:
-                raise RuntimeError("reads are closed")
-            self._read_jobs.append((callable, future))
-            self._read_condition.notify()
-        return await future
+        return await self._reads.run(callable)
 
     async def run_read(
         self,
@@ -799,39 +784,6 @@ class ConnectionRegistry:
             session_id=session_id,
         )
 
-    def _read_worker(self) -> None:
-        while True:
-            with self._read_condition:
-                while not self._read_jobs and not self._read_stopping:
-                    self._read_condition.wait()
-                if self._read_stopping and not self._read_jobs:
-                    return
-                job, future = self._read_jobs.popleft()
-            if future.cancelled():
-                continue
-            try:
-                result = job()
-            except Exception as exc:  # noqa: BLE001 - worker must return every job failure
-                result, error = None, exc
-            else:
-                error = None
-            try:
-                self.loop.call_soon_threadsafe(self._read_done, future, result, error)
-            except RuntimeError:
-                if not self.loop.is_closed():
-                    raise
-
-    @staticmethod
-    def _read_done(
-        future: asyncio.Future[Any], result: Any, error: BaseException | None
-    ) -> None:
-        if future.done():
-            return
-        if error is None:
-            future.set_result(result)
-        else:
-            future.set_exception(error)
-
     async def route_request(
         self,
         connection: Any,
@@ -877,7 +829,7 @@ class ConnectionRegistry:
             )
         if method == "list_sessions":
             result, _ = await self.run_read(
-                connection, lambda: connection._list_sessions(request_id, params)
+                connection, lambda: lifecycle.list_sessions(connection, request_id, params)
             )
             return True, result
         fallback_config = None
@@ -906,9 +858,7 @@ class ConnectionRegistry:
     async def aclose(self) -> None:
         self._closed = True
         states = tuple(self._connections.values())
-        with self._read_condition:
-            self._read_stopping = True
-            self._read_condition.notify_all()
+        self._reads.close()
         for state in states:
             if state.output is not None:
                 self._settle_output(state.output)
@@ -939,7 +889,7 @@ def _active_status_parts(
         else None
     )
     status = {
-        "session": client._session_snapshot(),
+        "session": lifecycle.session_snapshot(client),
         "state": (
             "idle"
             if client.server.control.unhealthy() or runtime.state is None
@@ -966,6 +916,9 @@ def _active_status_parts(
         ),
         "store": runtime.opened.store,
     }
+    slash_command = client.server.control.slash_lock.status()
+    if slash_command is not None:
+        suffix["slash_command"] = slash_command
     return status, suffix
 
 
@@ -1015,14 +968,14 @@ def capture_read(
             )
         return runtime.session_id, runtime.opened.store
     if method in {"session_tree", "session_history"}:
-        store = ergonomics.active(runtime, params)
+        store = validation.active(runtime, params)
         return runtime.session_id, store
     if method == "status":
         return _capture_status(client, fallback_config)
     if method == "model_catalog":
-        return None, ergonomics.catalog(runtime)
+        return None, settings.catalog(runtime)
     if method == "session_settings":
-        return runtime.session_id, ergonomics.settings(runtime)
+        return runtime.session_id, settings.settings(runtime)
     raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
 
 
@@ -1065,9 +1018,9 @@ def perform_read(
         "ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()}
     )()
     if method == "session_tree":
-        return ergonomics.tree(runtime)
+        return session.tree(runtime)
     if method == "session_history":
-        return ergonomics.history(
+        return history.history(
             runtime,
             params,
             include_delivery_id=include_delivery_id,
