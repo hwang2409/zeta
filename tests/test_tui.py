@@ -69,7 +69,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import (
@@ -15415,13 +15415,14 @@ async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
             activation_error = exc
         assert activation_error is None
         app = TUIApp(loop, provider="codex", model="offline")
-        app._full_screen_active = lambda: True
-        app._rebuild_transcript()
-        rendered = Text.from_ansi(app._transcript.render(120)).plain
-        assert "sent history is incomplete (invalid_json)" in rendered
-        assert "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project-inbox-sent.json" in rendered
-        assert "file was not changed" in rendered
-        assert "unless the repaired ledger includes their IDs" in rendered
+        async with owned_app(app):
+            app._full_screen_active = lambda: True
+            app._rebuild_transcript()
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "sent history is incomplete (invalid_json)" in rendered
+            assert "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project-inbox-sent.json" in rendered
+            assert "file was not changed" in rendered
+            assert "unless the repaired ledger includes their IDs" in rendered
     finally:
         await loop.close()
         store.close()
