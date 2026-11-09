@@ -20,6 +20,7 @@ from ...agent.explicit_finish import format_idle_resource_usage, idle_resource_u
 from ...agent.receipt import has_agent_receipt_suffix, terminal_state
 from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import ConversationIntegrityError
+from ...core.child_runs import NONTERMINAL_AGENT_STATES, child_run_rows
 from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType, ToolCall
 from ...tools.agent import send_to_run
 from .. import theme
@@ -979,27 +980,27 @@ class AgentRunCommandMixin:
                 return_exceptions=True,
             )
 
-    def slash_runs(self, args: str) -> str:
+    async def slash_runs(self, args: str) -> str:
         del args
-        children = self.loop.store.agent_children()
+        owner = self.loop._background_owner
+        rows = await asyncio.to_thread(
+            child_run_rows,
+            self.loop.store,
+            running_handles=owner.active_instance_ids,
+        )
         runs = [
-            (marker_key, marker)
-            for marker_key, marker in children.items()
-            if has_follow_up_loop(
-                accepts_follow_ups=marker.get("accepts_follow_ups") is True,
-                background=marker.get("background") is True,
-            )
+            row
+            for row in rows
+            if row["accepts_follow_ups"] is True
+            and row["status"] in NONTERMINAL_AGENT_STATES
         ]
         if not runs:
             return "no live runs"
-        lines = []
-        for marker_key, marker in sorted(runs):
-            turns = marker.get("turns_used", 0)
-            lines.append(
-                f"{marker_key}  {marker['description']}  "
-                f"[{marker.get('agent_type', 'general')}]  ({turns} turns)"
-            )
-        return "\n".join(lines)
+        return "\n".join(
+            f"{row['run_id']}  {row['description']}  "
+            f"[{row['agent_type']}]  ({row['turns_used']} turns)"
+            for row in runs
+        )
 
     async def slash_send(self, args: str) -> str:
         parts = args.strip().split(maxsplit=1)

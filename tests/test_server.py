@@ -953,6 +953,21 @@ def _controlled_terminal_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("COLORTERM", raising=False)
 
 
+def test_approval_wire_payload_includes_live_display_label(tmp_path: Path) -> None:
+    request = ApprovalRequest(
+        "approval",
+        ToolCall("approval", "inbox", {"action": "send", "project": "p_beta"}),
+        label="beta (p_beta)",
+    )
+    approvals = _bare_approval_lifecycle(tmp_path)
+
+    try:
+        payload = approvals.observe(request)
+        assert payload["label"] == "beta (p_beta)"
+    finally:
+        approvals._policy().store.close()
+
+
 def test_delegated_approval_payload_includes_execution_context() -> None:
     request = ApprovalRequest(
         "child-write",
@@ -5366,8 +5381,11 @@ async def test_inbox_reconcile_uses_receipt_index_not_entry_copy(
     home = tmp_path / "home"
     project_root = tmp_path / "project"
     project_root.mkdir()
-    ProjectRegistry(home / "projects").create_project(
-        "activation", "activation test", project_root
+    await asyncio.to_thread(
+        ProjectRegistry(home / "projects").create_project,
+        "activation",
+        "activation test",
+        project_root,
     )
     entries_reads = 0
     original_entries = ConversationStore.entries
@@ -8612,7 +8630,7 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         assert opened is not None
         registry = server.runtime.manager.project_registry
         assert registry is not None
-        project_record = registry.create_project("serve attention", "test")
+        project_record = await asyncio.to_thread(registry.create_project, "serve attention", "test")
         project_id = project_record.project_id
         store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         decision = store.request(
@@ -8665,9 +8683,11 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         assert dismissed["kind"] == "output"
         assert store.get(answer.id).status == "resolved"
         assert store.get(answer.id).decision is None
-        assert ProjectInbox(
-            registry, sessions_root=tmp_path / "home" / "sessions"
-        ).new_ids(project_id, session_id=session_id) == ()
+        inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
+        assert (
+            await asyncio.to_thread(inbox.new_ids, project_id, session_id=session_id)
+            == ()
+        )
 
         refused = (
             await _request(
@@ -8707,10 +8727,12 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         )[-1]["result"]
         assert replied["kind"] == "output"
         inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
-        message_ids = inbox.new_ids(project_id, session_id=session_id)
+        message_ids = await asyncio.to_thread(
+            inbox.new_ids, project_id, session_id=session_id
+        )
         assert len(message_ids) == 1
-        message = inbox.claim(
-            project_id, message_ids[0], session_id
+        message = await asyncio.to_thread(
+            inbox.claim, project_id, message_ids[0], session_id
         )
         assert message is not None
         assert "follow up" in message["body"]
@@ -9178,15 +9200,20 @@ async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
     registry = __import__(
         "zeta.project_registry", fromlist=["ProjectRegistry"]
     ).ProjectRegistry(home / "projects")
-    seeded = registry.create_project("demo", "scope", project)
-    registry.initialize_memory(seeded.project_id)
-    snapshot = registry.memory_snapshot(seeded.project_id)
-    registry.compare_and_swap_memory(
-        seeded.project_id,
-        expected_digest=snapshot.digest,
-        updates={"state.md": "automatic\n"},
-        provenance={"session_id": "s", "seq_start": 1, "seq_end": 1},
-    )
+
+    def seed():
+        seeded = registry.create_project("demo", "scope", project)
+        registry.initialize_memory(seeded.project_id)
+        snapshot = registry.memory_snapshot(seeded.project_id)
+        registry.compare_and_swap_memory(
+            seeded.project_id,
+            expected_digest=snapshot.digest,
+            updates={"state.md": "automatic\n"},
+            provenance={"session_id": "s", "seq_start": 1, "seq_end": 1},
+        )
+        return seeded
+
+    seeded = await asyncio.to_thread(seed)
     server = ZetaServer(home=home, cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -9200,9 +9227,8 @@ async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
             )
         )[-1]["result"]
         assert result == {"kind": "output", "text": "memory accepted: state.md"}
-        assert registry.memory_log(seeded.project_id)[-1]["provenance"] == {
-            "accepted_by": "user"
-        }
+        log = await asyncio.to_thread(registry.memory_log, seeded.project_id)
+        assert log[-1]["provenance"] == {"accepted_by": "user"}
     finally:
         await close_serve(server, writer)
 
@@ -10552,7 +10578,7 @@ async def test_serve_session_loads_private_instructions_from_linked_worktree(
     await run_git("add", "tracked")
     await run_git("commit", "-m", "initial")
     await run_git("worktree", "add", "-b", "feature", str(worktree))
-    project = ProjectRegistry(home / "projects").create_project("repo", "test", root)
+    project = await asyncio.to_thread(ProjectRegistry(home / "projects").create_project, "repo", "test", root)
     private = home / "projects" / project.project_id / "AGENTS.md"
     private.write_text("LINKED-SERVE-PRIVATE-MARKER", encoding="utf-8")
     runtime = ServerRuntime(home, cwd=worktree, provider="codex")
@@ -10589,7 +10615,7 @@ async def test_serve_linked_worktree_runs_one_git_discovery(
     await run_git("add", "tracked")
     await run_git("commit", "-m", "initial")
     await run_git("worktree", "add", "-b", "feature", str(worktree))
-    ProjectRegistry(home / "projects").create_project("repo", "test", root)
+    await asyncio.to_thread(ProjectRegistry(home / "projects").create_project, "repo", "test", root)
     real_run = subprocess.run
     commands: list[list[str]] = []
 
@@ -10614,7 +10640,7 @@ async def test_serve_session_loads_private_instructions(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
     cwd = tmp_path / "project"
     cwd.mkdir()
-    project = ProjectRegistry(home / "projects").create_project("project", "test", cwd)
+    project = await asyncio.to_thread(ProjectRegistry(home / "projects").create_project, "project", "test", cwd)
     private = home / "projects" / project.project_id / "AGENTS.md"
     private.write_text("SERVE-PRIVATE-MARKER", encoding="utf-8")
     runtime = ServerRuntime(home, cwd=cwd, provider="codex")
@@ -10643,7 +10669,7 @@ async def test_server_uses_only_existing_project_after_one_git_discovery(
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
     existing = (
-        manager.project_registry.find_or_create_for_directory(cwd)
+        await asyncio.to_thread(manager.project_registry.find_or_create_for_directory, cwd)
         if registered
         else None
     )
@@ -10664,7 +10690,7 @@ async def test_server_uses_only_existing_project_after_one_git_discovery(
         assert metadata.project_id == (
             existing.project_id if existing is not None else None
         )
-        assert len(manager.project_registry.list_projects()) == int(registered)
+        assert len(await asyncio.to_thread(manager.project_registry.list_projects)) == int(registered)
     finally:
         await runtime.close()
 
@@ -11457,16 +11483,19 @@ async def test_serve_current_session_repair_updates_live_memory_owner(
 
     workspace = tmp_path / "repo"
     workspace.mkdir()
+    for epoch in range(home_epoch):
+        await asyncio.to_thread(
+            storage_format.advance,
+            tmp_path,
+            expected_epoch=epoch,
+            target_epoch=epoch + 1,
+        )
+    for module in (storage_format, store_log, memory_auto, project_registry):
+        monkeypatch.setattr(module, "WRITER_EPOCH", writer_epoch, raising=False)
     registry = await asyncio.to_thread(ProjectRegistry, tmp_path / "projects")
     project = await asyncio.to_thread(
         registry.create_project, "recovery", "test", workspace
     )
-    (tmp_path / "storage-format.json").write_text(
-        json.dumps({"writer_epoch": home_epoch}) + "\n"
-    )
-    for module in (storage_format, store_log, memory_auto, project_registry):
-        monkeypatch.setattr(module, "WRITER_EPOCH", writer_epoch, raising=False)
-    bootstrap_lease = await asyncio.to_thread(storage_format.open_writer, tmp_path)
     server = ZetaServer(
         home=tmp_path,
         cwd=workspace,
@@ -11489,16 +11518,18 @@ async def test_serve_current_session_repair_updates_live_memory_owner(
     )
     memory_write_error: ProjectRegistryError | None = None
     try:
-        registry.compare_and_swap_memory(
-            project.project_id,
-            expected_digest=registry.memory_digest(project.project_id),
-            updates={"state.md": "automatic\n"},
-            provenance={
-                "session_id": session_id,
-                "seq_start": 1,
-                "seq_end": 2,
-                "model": "offline",
-            },
+        await asyncio.to_thread(
+            lambda: registry.compare_and_swap_memory(
+                project.project_id,
+                expected_digest=registry.memory_digest(project.project_id),
+                updates={"state.md": "automatic\n"},
+                provenance={
+                    "session_id": session_id,
+                    "seq_start": 1,
+                    "seq_end": 2,
+                    "model": "offline",
+                },
+            )
         )
     except ProjectRegistryError as exc:
         memory_write_error = exc
@@ -11555,7 +11586,6 @@ async def test_serve_current_session_repair_updates_live_memory_owner(
         assert memory_state["recovery_paused"] is True
     finally:
         await close_serve(server, writer)
-        bootstrap_lease.close()
 
 
 @pytest.mark.asyncio
@@ -13189,8 +13219,11 @@ async def test_session_history_returns_broken_sent_ledger_activation_notice(
 
     workspace = tmp_path / "project"
     workspace.mkdir()
-    ProjectRegistry(tmp_path / "projects").create_project(
-        "project", "test", workspace
+    await asyncio.to_thread(
+        ProjectRegistry(tmp_path / "projects").create_project,
+        "project",
+        "test",
+        workspace,
     )
     manager = SessionManager(tmp_path)
     opened = await asyncio.to_thread(

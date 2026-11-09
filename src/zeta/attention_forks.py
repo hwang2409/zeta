@@ -7,8 +7,9 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .attention_records import (
     AttentionRecord,
@@ -18,8 +19,9 @@ from .attention_records import (
 )
 from .config.tool_policy import ToolPolicy
 from .core.checkpoints import ConversationEntry
-from .core.session import OpenedSession, SessionManager
+from .core.session import SessionManager
 from .core.session_files import (
+    SessionNotFoundError,
     child_directory,
     open_session_file,
     session_directory,
@@ -137,15 +139,9 @@ def release_discussion_fork(
         raise ValueError("session is not a discussion fork")
     store = AttentionStore(manager.sessions_dir / fork.forked_from_session, writer_epoch=observed_epoch_for_session(manager.sessions_dir / fork.forked_from_session))
     try:
-        record = store.get(fork.attention_id)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        record = None
-    if (
-        record is not None
-        and record.status != "resolved"
-        and record.fork_session_id == fork_session_id
-    ):
-        store.replace(replace(record, fork_session_id=None))
+        store.release_fork(fork.attention_id, fork_session_id)
+    except (SessionNotFoundError, FileNotFoundError):
+        pass  # The source session or its attention records are gone.
     return fork.forked_from_session
 
 
@@ -164,12 +160,12 @@ def _fork_allocation_lock(attention_store: AttentionStore) -> Iterator[None]:
             )
         finally:
             fcntl.flock(attention_fd, fcntl.LOCK_UN)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def _fork_cut(branch: list[ConversationEntry], anchor: int) -> int:
@@ -236,12 +232,12 @@ def _attention_fork_note(record: AttentionRecord) -> str:
 def _create_fork_session(
     *,
     manager: SessionManager,
-    source: OpenedSession,
+    source_metadata: Any,
     record: AttentionRecord,
     branch: list[ConversationEntry],
     cut: int,
 ) -> str:
-    metadata = source.metadata
+    metadata = source_metadata
     fork = manager.create(
         provider=metadata.provider,
         model=metadata.model,
@@ -319,10 +315,13 @@ def create_discussion_fork(
     """Create or reuse the read-only discussion fork for one attention record."""
     state = registry_state or available_project_registry(Path(home) / "projects")
     manager = SessionManager(home, project_registry_state=state)
-    source = manager.open(source_session_id, _read_only=True)
-    try:
-        attention_store = AttentionStore(source.store.session_dir, writer_epoch=observed_epoch_for_session(source.store.session_dir))
-        with _fork_allocation_lock(attention_store):
+    attention_store = AttentionStore(
+        manager.sessions_dir / source_session_id,
+        writer_epoch=observed_epoch_for_session(manager.sessions_dir / source_session_id),
+    )
+    with _fork_allocation_lock(attention_store):
+        source = manager.open(source_session_id, _read_only=True)
+        try:
             record = attention_store.get(attention_id)
             if record.session_id != source_session_id:
                 raise ValueError(
@@ -334,6 +333,7 @@ def create_discussion_fork(
                 )
             if record.fork_session_id:
                 return record.fork_session_id
+            source_metadata = source.metadata
             branch = source.store.replay()
             anchor_index = next(
                 (
@@ -345,29 +345,43 @@ def create_discussion_fork(
             )
             if anchor_index is None:
                 raise ValueError("attention anchor is not on the active branch")
-            fork_id = _create_fork_session(
-                manager=manager,
-                source=source,
-                record=record,
-                branch=branch,
-                cut=_fork_cut(branch, anchor_index),
-            )
-            bound_record = AttentionRecord.from_dict(
-                {**record.to_dict(), "fork_session_id": fork_id}
-            )
+            cut = _fork_cut(branch, anchor_index)
+        finally:
+            source.store.close()
+
+        fork_id = _create_fork_session(
+            manager=manager,
+            source_metadata=source_metadata,
+            record=record,
+            branch=branch,
+            cut=cut,
+        )
+        bound_record = AttentionRecord.from_dict(
+            {**record.to_dict(), "fork_session_id": fork_id}
+        )
+        try:
+            reopened_source = manager.open(source_session_id, _read_only=True)
             try:
+                current = attention_store.get(attention_id)
+                if (
+                    reopened_source.metadata != source_metadata
+                    or reopened_source.store.replay() != branch
+                    or current != record
+                    or current.status == "resolved"
+                ):
+                    raise ValueError("source changed during fork allocation")
                 attention_store.replace(bound_record)
-            except BaseException:
-                try:
-                    publication_succeeded = (
-                        attention_store.get(attention_id).fork_session_id == fork_id
-                    )
-                except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                    publication_succeeded = False
-                if publication_succeeded:
-                    return fork_id
-                manager.delete(fork_id)
-                raise
-            return fork_id
-    finally:
-        source.store.close()
+            finally:
+                reopened_source.store.close()
+        except BaseException:
+            try:
+                publication_succeeded = (
+                    attention_store.get(attention_id).fork_session_id == fork_id
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                publication_succeeded = False
+            if publication_succeeded:
+                return fork_id
+            manager.delete(fork_id)
+            raise
+        return fork_id
