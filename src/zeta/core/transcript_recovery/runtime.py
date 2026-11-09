@@ -38,6 +38,14 @@ def require_transcript_repair(manager: SessionManager) -> None:
         raise TranscriptRepairRequiresUpgrade(manager.observed_storage_epoch)
 
 
+def format_repair_transcript_command(
+    session_id: str, child_run_id: str | None = None
+) -> str:
+    """Build the explicit repair command for a transcript target."""
+    target = f" {child_run_id}" if child_run_id is not None else ""
+    return f"/repair-transcript {session_id}{target} confirm"
+
+
 def repair_command_for_child_path(path: Path) -> str:
     """Build the explicit repair command for one child session path."""
     parts = path.parts
@@ -54,7 +62,7 @@ def repair_command_for_child_path(path: Path) -> str:
     ]
     if not root or not segments:
         return ""
-    return f"/repair-transcript {root} {root}:{':'.join(segments)}"
+    return format_repair_transcript_command(root, f"{root}:{':'.join(segments)}")
 
 
 def _resident_memory_commit(
