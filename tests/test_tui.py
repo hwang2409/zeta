@@ -13613,7 +13613,7 @@ async def test_slow_successful_draft_flush_does_not_report_failure(
     try:
         assert await asyncio.to_thread(write_started.wait, 10)
         with pytest.raises(TimeoutError):
-            await flush
+            await asyncio.wait_for(flush, 10)
         assert notices == []
     finally:
         release_write.set()
