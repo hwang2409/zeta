@@ -24,9 +24,10 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
-from zeta.core.agent_progress import publish_child_ended
+from zeta.core import agent_progress
+from zeta.core.agent_progress import publish_child_ended, remove_live_agent_lifecycle
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolResult
 from zeta.server import ZetaServer
 from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
@@ -675,3 +676,81 @@ async def test_snapshot_rows_come_only_from_newest_page_starts_without_scans(
         row, revision = original_current(nested_old.agent_handle())
         assert (found["result"]["child"], found["result"]["revision"]) == (row, revision)
         assert found["result"]["child"]["current_step"] == "older start, still running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_restart_registers_the_projection_before_children_and_reads_durable_lifecycle_rows(
+    tmp_path: Path, transport: Transport
+) -> None:
+    # before the restart: run 1 ends with a durable receipt, run 2 is running
+    async with _serve(tmp_path, transport) as (first, _client, session_id, stores):
+        assert first.connections is not None
+        first_sink = first.connections.child_runs.sink
+        root = first.runtime.opened.store
+        ended = _start_child(first, stores, f"{session_id}:1")
+        running = _start_child(first, stores, f"{session_id}:2")
+        running.update_agent_lifecycle(current_step="before restart")
+        ended.finish_agent_lifecycle("completed", final_result="done")
+        root.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent("done")],
+                tool_result=ToolResult(
+                    "call-1",
+                    "done",
+                    structured_content={"child_instance_id": f"{session_id}:1", "status": "completed"},
+                ),
+            )
+        )
+        await _lifecycle_applied(first)
+    # the process that ran run 2 is gone: its live lifecycle goes with it
+    remove_live_agent_lifecycle(running.agent_lifecycle_path)
+    assert first_sink not in agent_progress._sinks
+
+    second = replay_server(tmp_path, transport, _backend_factory)
+    await second.start()
+    restarted: list[ConversationStore] = []
+    try:
+        assert second.connections is not None
+        at_start = (
+            second.runtime.opened is None,
+            second.connections.child_runs.sink in agent_progress._sinks,
+        )
+        client = await connect_replay(second, transport)
+        try:
+            await negotiate(
+                client, extra=("child_run_history", "child_run_events"), protocol_version="1.2"
+            )
+            resumed = await client.request(2, "resume", {"session_id": session_id})
+            assert "error" not in resumed, resumed
+            fresh = _start_child(second, restarted, f"{session_id}:3")
+            fresh.update_agent_lifecycle(current_step="after restart")
+            await _lifecycle_applied(second)
+            joined = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})
+            messages = joined["result"]["messages"]
+            # start and end come from durable rows
+            assert _rows(messages, "child_started") == [f"{session_id}:{n}" for n in (1, 2, 3)]
+            ends = [row for row in messages if row.get("event") == "child_ended"]
+            assert [(row["run_id"], row["child"]["status"]) for row in ends] == [
+                (f"{session_id}:1", "completed")
+            ]
+            assert "finished_at" in ends[0]["child"]
+            # current progress comes only from this process's projection
+            progress = [row for row in messages if row.get("event") == "child_progress"]
+            assert [item["run_id"] for item in progress] == [f"{session_id}:3"], (
+                "the restarted server's projection missed a child started after restart"
+            )
+            row, revision = second.connections.child_runs.current(f"{session_id}:3")
+            assert [(item["run_id"], item["revision"], item["child"]) for item in progress] == [
+                (f"{session_id}:3", revision, row)
+            ]
+            assert row["current_step"] == "after restart"
+            # the sink was registered at start, before a session existed, so before any child
+            assert at_start == (True, True)
+        finally:
+            await client.close()
+    finally:
+        for store in restarted:
+            store.close()
+        await second.close()
