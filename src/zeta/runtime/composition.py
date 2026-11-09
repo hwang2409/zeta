@@ -70,6 +70,8 @@ class RuntimeComposition:
     loop: AgentLoop
     policy: ApprovalPolicy
     model: str
+    project_dir: Path
+    repo_root: Path
     external_tools: ExternalToolDiscovery
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
@@ -245,8 +247,8 @@ def compose_runtime(
             "retained_tail": metadata.retained_tail,
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
-            "skill_home": home,
-            "skill_project_dir": (
+            "live_config_home": home,
+            "live_config_project_dir": (
                 project_discovery.primary_root
                 if project_discovery is not None
                 and project_discovery.primary_root is not None
@@ -443,7 +445,7 @@ def compose_runtime(
             project_dir=repo_root / ".zeta",
             allow_external_tools=config.allow_external_tools,
         )
-        loop.tool_schemas = list(loop.tool_registry.schemas)
+        loop.tool_schemas = tuple(loop.tool_registry.schemas)
         if background_event_sink is not None:
             loop.set_background_event_sink(background_event_sink)
         composition = RuntimeComposition(
@@ -451,6 +453,12 @@ def compose_runtime(
             loop=loop,
             policy=policy,
             model=selected_model,
+            project_dir=repo_root,
+            repo_root=(
+                project_discovery.repo_root
+                if project_discovery is not None
+                else Path(metadata.cwd).resolve()
+            ),
             external_tools=external_tools,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,

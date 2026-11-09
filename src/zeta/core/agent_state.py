@@ -615,7 +615,7 @@ class AgentStateMixin:
         state: str | None = None,
         idle_since: str | None = None,
     ) -> None:
-        """Update a live child's process-local progress."""
+        """Update a live child's progress; ``tool_calls`` adds to its total."""
 
         if current_step is not None and not current_step:
             raise ValueError("agent lifecycle step must be nonempty")
@@ -634,7 +634,7 @@ class AgentStateMixin:
         if turns_used is not None:
             self._agent_lifecycle["turns_used"] = turns_used
         if tool_calls is not None:
-            self._agent_lifecycle["tool_calls"] = tool_calls
+            self._agent_lifecycle["tool_calls"] += tool_calls
         if state is not None:
             self._agent_lifecycle["state"] = state
         if idle_since is not None:

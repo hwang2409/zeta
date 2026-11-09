@@ -48,6 +48,8 @@ def utf8_char_chunk(data: bytes, limit: int) -> bytes:
     """Cap decoded UTF-8 characters without advancing past retained bytes."""
     if limit == 0:
         return b""
+    if data.isascii():
+        return data[:limit]
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     character_start = 0
     characters = 0

@@ -30,9 +30,9 @@ from zeta.tools import ToolRegistry
 
 
 def service(tmp_path, mount=None):
-    return MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "repo", mount=mount
-    )
+    project = tmp_path / "repo"
+    project.mkdir()
+    return MCPManagementService(home=tmp_path / "home", project_dir=project, mount=mount)
 
 
 async def _close_management_service(manager: MCPManagementService) -> None:
@@ -407,12 +407,12 @@ async def test_project_http_does_not_require_trust_but_stdio_does(tmp_path):
 
 @pytest.mark.asyncio
 async def test_clone_path_has_independent_trust_and_pending_stdio_is_filtered(tmp_path):
-    first = MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "clone-a"
-    )
-    second = MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "clone-b"
-    )
+    clone_a = tmp_path / "clone-a"
+    clone_b = tmp_path / "clone-b"
+    clone_a.mkdir()
+    clone_b.mkdir()
+    first = MCPManagementService(home=tmp_path / "home", project_dir=clone_a)
+    second = MCPManagementService(home=tmp_path / "home", project_dir=clone_b)
     await first.add("local", scope="project", command=sys.executable)
     second.path("project").parent.mkdir(parents=True)
     second.path("project").write_text(first.path("project").read_text())
@@ -1305,6 +1305,100 @@ async def test_contended_config_lock_fails_off_loop_with_nonblocking_flock(
     assert all(thread != loop_thread for thread, _operation in attempted)
     assert all(operation & fcntl.LOCK_NB for _thread, operation in attempted)
     await asyncio.wait_for(manager.view(), 10)
+
+
+@pytest.mark.asyncio
+async def test_missing_project_root_is_not_recreated_during_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    manager = MCPManagementService(home=tmp_path / "home", project_dir=project)
+    original_acquire = manager._acquire_locks
+    removed = False
+
+    def remove_project_before_lock(paths):
+        nonlocal removed
+        if not removed and any(path == project / ".zeta" / "mcp.json" for path in paths):
+            removed = True
+            project.rmdir()
+        return original_acquire(paths)
+
+    # test-contract: seam remove the project after paths resolve but before locking
+    monkeypatch.setattr(manager, "_acquire_locks", remove_project_before_lock)
+    try:
+        snapshot = await manager.refresh()
+        # test-contract: durability the project root must stay absent
+        assert not project.exists()
+        assert snapshot.entries == ()
+        with pytest.raises(MCPManagementError, match="project directory no longer exists"):
+            await manager.add("missing", scope="project", command=sys.executable)
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transaction_refuses_project_recreated_after_lock_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "repo"
+    manager = MCPManagementService(home=tmp_path / "first-home", project_dir=project)
+    writer = MCPManagementService(home=tmp_path / "second-home", project_dir=project)
+    original_acquire = manager._acquire_locks
+    lock_decided = threading.Event()
+    release = threading.Event()
+
+    def pause_after_lock_decision(paths):
+        result = original_acquire(paths)
+        lock_decided.set()
+        if not release.wait(10):
+            raise AssertionError("transaction was not released")
+        return result
+
+    # test-contract: seam recreate the root only after the first transaction skips its lock
+    monkeypatch.setattr(manager, "_acquire_locks", pause_after_lock_decision)
+    transaction = asyncio.create_task(
+        manager.add("unlocked", scope="project", command=sys.executable)
+    )
+    try:
+        assert await asyncio.to_thread(lock_decided.wait, 10)
+        project.mkdir()
+        await writer.add("concurrent", scope="project", command=sys.executable)
+        release.set()
+        with pytest.raises(MCPManagementError, match="project directory no longer exists"):
+            await asyncio.wait_for(transaction, 10)
+        assert (await writer.resolve("concurrent", scope="project")).name == "concurrent"
+        with pytest.raises(MCPManagementError, match="unknown MCP server"):
+            await writer.resolve("unlocked", scope="project")
+    finally:
+        release.set()
+        if not transaction.done():
+            transaction.cancel()
+        await asyncio.wait_for(asyncio.gather(transaction, return_exceptions=True), 10)
+        await manager.aclose()
+        await writer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_project_scope_returns_after_missing_root_is_recreated(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    manager = MCPManagementService(home=tmp_path / "home", project_dir=project)
+    try:
+        assert (await manager.refresh()).entries == ()
+        assert not project.exists()
+        project.mkdir()
+        # test-contract: durability a missing root must not stay unavailable
+        await manager.add("back", scope="project", command=sys.executable)
+        config = json.loads((project / ".zeta" / "mcp.json").read_text())
+        assert "back" in config["servers"]
+        snapshot = await manager.refresh()
+        assert [(item.name, item.scope) for item in snapshot.entries] == [
+            ("back", "project")
+        ]
+    finally:
+        await manager.aclose()
 
 
 @pytest.mark.asyncio

@@ -209,6 +209,7 @@ class EventDescriptor(StrEnum):
     USAGE = "usage"
     USER_MESSAGE = "user_message"
     SESSION_GRANTS_CHANGED = "session_grants_changed"
+    CONFIG_CHANGED = "config_changed"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -223,6 +224,7 @@ FEATURES = (
     "send_images_delivery_id",
     "list_sessions_paging",
     "memory_updated",
+    "live_config_changed",
     "ping",
     "assistant_reset",
     "model_input_ids",
@@ -418,7 +420,61 @@ class FrameWriteCancelled(asyncio.CancelledError):
 FRAME_CANCEL_GRACE = 1.0
 
 
-async def finish_frame_write(codec: FrameCodec, writer: Any, payload: _Frame) -> bool:
+class FrameWriteOwner:
+    def __init__(self) -> None:
+        self._active: set[asyncio.Task[Any]] = set()
+        self._orphaned: set[asyncio.Future[bool]] = set()
+
+    async def write(
+        self,
+        codec: FrameCodec,
+        writer: Any,
+        payload: _Frame,
+        lock: asyncio.Lock,
+    ) -> bool:
+        task = asyncio.current_task()
+        assert task is not None
+        self._active.add(task)
+        try:
+            async with lock:
+                return await finish_frame_write(codec, writer, payload, owner=self)
+        finally:
+            self._active.discard(task)
+
+    def register(self, task: asyncio.Future[bool]) -> None:
+        self._orphaned.add(task)
+        task.add_done_callback(self._forget)
+
+    def _forget(self, task: asyncio.Future[bool]) -> None:
+        self._orphaned.discard(task)
+        _observe_write(task)
+
+    async def aclose(self) -> None:
+        deadline = asyncio.get_running_loop().time() + 2 * FRAME_CANCEL_GRACE
+        while self._active or self._orphaned:
+            for write in tuple(self._active):
+                write.cancel()
+            # Let canceled writers reach their handler and register the inner
+            # write here, so this pass cancels it instead of the next one.
+            await asyncio.sleep(0)
+            pending = set(self._active) | self._orphaned
+            if not pending:
+                return
+            for write in pending:
+                write.cancel()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            await asyncio.wait(pending, timeout=min(remaining, FRAME_CANCEL_GRACE))
+
+
+async def finish_frame_write(
+    codec: FrameCodec,
+    writer: Any,
+    payload: _Frame,
+    *,
+    owner: FrameWriteOwner | None = None,
+) -> bool:
     """Write one frame; through cancellation, report whether it was written.
 
     Cancellation before this call writes nothing. Cancellation during the
@@ -431,10 +487,17 @@ async def finish_frame_write(codec: FrameCodec, writer: Any, payload: _Frame) ->
         return await asyncio.shield(task)
     except asyncio.CancelledError:
         pass
-    raise FrameWriteCancelled(await _settle_canceled_write(task, writer))
+    if owner is not None:
+        owner.register(task)
+    raise FrameWriteCancelled(await _settle_canceled_write(task, writer, owner=owner))
 
 
-async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> bool:
+async def _settle_canceled_write(
+    task: asyncio.Future[bool],
+    writer: Any,
+    *,
+    owner: FrameWriteOwner | None = None,
+) -> bool:
     """Wait for the deadline, abort the transport, then finish cleanup."""
 
     loop = asyncio.get_running_loop()
@@ -447,7 +510,8 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
                 # Supported transports settle after abort. Keep observing an
                 # abnormal transport without retaining it in process-global
                 # state or coupling it to another connection.
-                task.add_done_callback(_observe_write)
+                if owner is None:
+                    task.add_done_callback(_observe_write)
                 return False
             aborted = True
             deadline = loop.time() + FRAME_CANCEL_GRACE
