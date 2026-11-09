@@ -48,8 +48,42 @@ def _runtime(store: object) -> SimpleNamespace:
     return SimpleNamespace(opened=SimpleNamespace(store=store))
 
 
+def _forward_history(store: _HistoryStore, offset: int) -> dict[str, object]:
+    projection = history_projection.history_projection(store)
+    return history.page_history(
+        projection,
+        offset,
+        include_delivery_id=False,
+        fidelity=False,
+        content_read=False,
+    )[0]
+
+
 def _backward_history(store: _HistoryStore, params: dict[str, object]) -> dict[str, object]:
-    return history.history(_runtime(store), params, backward_enabled=True)
+    if "before" not in params:
+        raise ProtocolError(protocol.ErrorDescriptor.INVALID_PARAMS, "missing before")
+    history._validate_history_params(params)
+    projection = history_projection.history_projection(store)
+    before = params["before"]
+    validator = params.get("history_validator")
+    end = len(projection.entry_groups) - 1
+    if before is None:
+        validator = {"end": end, "entry_id": history_projection._history_endpoint(projection, end)}
+        before = end + 1
+        first_page = True
+    else:
+        first_page = False
+    result, _expanded = history.page_history(
+        projection,
+        before,
+        include_delivery_id=False,
+        fidelity=False,
+        content_read=False,
+        backward=True,
+        validator=validator,
+        first_page=first_page,
+    )
+    return result
 
 
 @contextlib.asynccontextmanager
@@ -145,30 +179,36 @@ async def test_real_socket_branch_during_read_is_stale_and_not_cached(
     """A same-owner branch between g0 and g1 rejects the in-flight page."""
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         old_first = await _history_request(reader, writer, 3, session_id, {"offset": 0})
-        original_projection = history.history_projection
+        index = server.runtime.opened.store._history_index
+        original_page = index.page
         branch_ready = threading.Event()
-        release_projection = threading.Event()
+        release_page = threading.Event()
 
-        def branch_during_projection(store: object, **kwargs: object) -> object:
+        def page_during_branch(request: object, g0: object) -> object:
             branch_ready.set()
-            assert release_projection.wait(timeout=10)
-            return original_projection(store, **kwargs)
+            assert release_page.wait(timeout=10)
+            return original_page(request, g0)
 
-        monkeypatch.setattr(history, "history_projection", branch_during_projection)
+        monkeypatch.setattr(index, "page", page_during_branch)
         pending = asyncio.create_task(
             request(reader, writer, 4, "session_history", {"session_id": session_id, "offset": 0})
         )
-        await await_or_fail(asyncio.to_thread(branch_ready.wait), what="history projection")
+        def wait_for_page() -> None:
+            assert branch_ready.wait(10)
+
+        await await_or_fail(
+            asyncio.to_thread(wait_for_page), what="history index page"
+        )
         server.runtime.opened.store.append_message_fork(
             server.runtime.opened.store.active_branch_snapshot()[0].id
         )
-        release_projection.set()
+        release_page.set()
         response = (await await_or_fail(pending, what="history request"))[-1]
         assert "error" in response, response
         assert response["error"]["code"] == -32009
         assert response["error"]["data"] == {"code": "stale_history_snapshot"}
         fresh = await _history_request(reader, writer, 5, session_id, {"offset": 0})
-        assert fresh["messages"] != old_first["messages"]
+        assert fresh["messages"] == old_first["messages"]
 
 
 @pytest.mark.asyncio
@@ -342,9 +382,9 @@ def test_backward_does_not_replace_forward_cache_projection(
 ) -> None:
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
-    before = history.history(_runtime(store), {"offset": 0})
+    before = _forward_history(store, 0)
     backward = _backward_history(store, {"before": None})
-    after = history.history(_runtime(store), {"offset": 0})
+    after = _forward_history(store, 0)
     assert before == after
     assert backward["history_validator"]["end"] == 220
 
@@ -500,7 +540,7 @@ def test_backward_after_forward_cache_reprojects_for_real_cursor(
         offset: int | None = 0
         forward_ids: list[str] = []
         while offset is not None:
-            page = history.history(_runtime(store), {"offset": offset})
+            page = _forward_history(store, offset)
             assert page["messages"] or page["next_offset"] is None, (size, offset)
             forward_ids.extend(row["id"] for row in page["messages"])
             offset = page["next_offset"]
@@ -533,7 +573,7 @@ def test_forward_walk_progresses_when_last_group_is_near_limit(
         offset: int | None = 0
         seen: list[str] = []
         while offset is not None:
-            page = history.history(_runtime(store), {"offset": offset})
+            page = _forward_history(store, offset)
             assert page["messages"] or page["next_offset"] is None, (size, offset)
             payload = FrameCodec().response("\x00" * protocol.MAX_REQUEST_ID_BYTES, page)
             assert b'"error"' not in payload and len(payload) <= 8_000, size

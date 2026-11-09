@@ -26,6 +26,7 @@ from zeta.core.store import (
     TranscriptLoadError,
     _async_writes,
 )
+from zeta.core.store._history_index import HistoryIndexUnavailableError
 from zeta.core.store._step_delivery import PromptInput
 from zeta.core.store._validation import (
     NOTIFICATION_KINDS,
@@ -61,10 +62,12 @@ def test_every_notification_kind_has_a_validator() -> None:
 def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="history-index")
     try:
-        store.append_many([("warning", {"message": str(index)}) for index in range(3)])
+        for value in range(3):
+            store.append_message(message(MessageRole.USER, str(value)))
         index = store._history_index
         assert index is not None
-        assert index.page({"after": 0, "limit": 128}, store._history_index_facts())[-1]["seq"] == 3
+        page = index.page({"offset": 0}, store._history_index_facts())
+        assert page.groups[2][-1].seq == 3
         writer = store._new_persistent_durable_writer()
         try:
             assert writer._history_index is index
@@ -74,12 +77,100 @@ def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
         store.close()
     reopened = ConversationStore(tmp_path, session_id="history-index")
     try:
-        rows = reopened._history_index.page(
-            {"after": 0, "limit": 128}, reopened._history_index_facts()
+        page = reopened._history_index.page(
+            {"offset": 0}, reopened._history_index_facts()
         )
-        assert [row["data"]["message"] for row in rows] == ["0", "1", "2"]
+        assert [
+            entry.data["message"]["content"][0]["text"]
+            for group in page.groups
+            for entry in group
+        ] == ["0", "1", "2"]
     finally:
         reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_loop_append_defers_sqlite_to_an_off_loop_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index-loop")
+    index = store._history_index
+    assert index is not None
+
+    called = False
+
+    def reject_loop_sqlite(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        called = True
+        raise AssertionError("sqlite ran on the event-loop thread")
+
+    monkeypatch.setattr(index, "apply_committed", reject_loop_sqlite)
+    index._available = True
+    try:
+        store.append_many([("warning", {"message": "committed"})])
+        assert not called
+        assert not index.available
+        await asyncio.to_thread(store._sync_history_index, store._entries)
+        assert index.available
+    finally:
+        store.close()
+
+
+def test_history_index_failure_never_turns_a_committed_append_into_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index-failure")
+    index = store._history_index
+    assert index is not None
+
+    def fail_after_transcript(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("forced derived index failure")
+
+    monkeypatch.setattr(index, "apply_committed", fail_after_transcript)
+    try:
+        committed = store.append_many([("warning", {"message": "committed"})])
+        assert len(committed) == 1
+    finally:
+        store.close()
+
+    reopened = ConversationStore(tmp_path, session_id="history-index-failure")
+    try:
+        assert [entry.data.get("message") for entry in reopened.entries].count("committed") == 1
+    finally:
+        reopened.close()
+
+
+def test_corrupt_history_index_never_blocks_a_valid_transcript_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index-corrupt")
+    store.append_many([("warning", {"message": "authority"})])
+    index_path = store.session_dir / "history-index.sqlite3"
+    store.close()
+    index_path.write_bytes(b"not sqlite")
+
+    reopened = ConversationStore(tmp_path, session_id="history-index-corrupt")
+    try:
+        assert reopened.entries[-1].data["message"] == "authority"
+        assert reopened._history_index.available
+    finally:
+        reopened.close()
+
+    index_path.write_bytes(b"not sqlite")
+    # test-contract: seam forces a derived rebuild failure through real store open
+    monkeypatch.setattr(
+        "zeta.core.store._history_index.HistoryIndex._rebuild",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("forced rebuild failure")),
+    )
+    unavailable = ConversationStore(tmp_path, session_id="history-index-corrupt")
+    try:
+        assert unavailable.entries[-1].data["message"] == "authority"
+        with pytest.raises(HistoryIndexUnavailableError):
+            unavailable._history_index.page(
+                {"offset": 0}, unavailable._history_index_facts()
+            )
+    finally:
+        unavailable.close()
 
 
 def test_history_index_rejects_a_repaired_transcript_snapshot(tmp_path: Path) -> None:

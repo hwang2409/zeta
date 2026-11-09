@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
@@ -75,7 +76,7 @@ from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
 from ._execution_owner import ExecutionOwnerStoreMixin
-from ._history_index import HistoryIndex
+from ._history_index import HistoryIndex, HistoryIndexError
 from ._incremental_validation import (
     IncrementalValidationMixin,
     validate_approval_reason,
@@ -205,11 +206,7 @@ class ConversationStore(
             self.path = self.session_dir / "conversation.jsonl"
             self.state_path = self.session_dir / "session_state.json"
             self._history_index = _history_index
-            self._history_index_owner = _history_index is None and not _read_only
-            if self._history_index is None and not _read_only:
-                self._history_index = HistoryIndex(self.session_dir)
-            elif self._history_index is None and _read_only:
-                self._history_index = HistoryIndex(self.session_dir, observer=True)
+            self._history_index_owner = _history_index is None
             self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"
             self.lock_path = self.session_dir / ".lock"
             self.cwd = str(cwd or Path.cwd())
@@ -240,6 +237,7 @@ class ConversationStore(
                 if _read_only:
                     self._load()
                     self._load_session_state()
+                    self._initialize_history_index(observer=True)
                 else:
                     self._runtime_lease = self._open_execution_lease(
                         self.directory_fd,
@@ -254,8 +252,7 @@ class ConversationStore(
                         self._strict_snapshot_sync = True
                     with self._append_lock(deadline=_lock_deadline):
                         self._load_session_state()
-                        if self._history_index_owner:
-                            self._sync_history_index(self._entries)
+                        self._initialize_history_index(observer=False)
                     self._strict_snapshot_sync = False
                 self._release_lease = weakref.finalize(
                     self,
@@ -269,8 +266,29 @@ class ConversationStore(
         if not _read_only and not _mutation_target:
             register_conversation_target(self)
 
+    def _initialize_history_index(self, *, observer: bool) -> None:
+        if self._history_index is None:
+            self._history_index = HistoryIndex(
+                self.session_dir, self.directory_fd, observer=observer
+            )
+        if not self._history_index_owner or observer:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._history_index._mark_unavailable()
+            return
+        try:
+            self._sync_history_index(self._entries)
+        except (OSError, HistoryIndexError):
+            self._history_index._mark_unavailable()
+
     def _history_index_facts(self) -> dict[str, object]:
-        stat = self.path.stat()
+        stat = os.stat(
+            "conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False
+        )
         last = self._entries[-1] if self._entries else None
         return {
             "st_dev": stat.st_dev,
@@ -280,12 +298,41 @@ class ConversationStore(
             "last_id": last.id if last else None,
             "last_parent": last.parent_id if last else None,
             "prefix_digest": self._entry_prefix_digest.hex(),
-            "reset_generation": self._transcript_generation,
         }
 
     def _sync_history_index(self, entries: Iterable[ConversationEntry]) -> None:
         if self._history_index is not None:
             self._history_index.sync_validated(self._history_index_facts(), entries)
+
+    def _apply_history_index_entries(
+        self, entries: tuple[ConversationEntry, ...]
+    ) -> None:
+        if self._history_index is None or not entries:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._history_index._mark_unavailable()
+            return
+        digest = self._entry_prefix_digest
+        for entry in entries:
+            digest = self._next_entry_prefix_digest(
+                digest, self._encoded_entry_line(entry)
+            )
+        facts = self._history_index_facts()
+        last = entries[-1]
+        facts.update(
+            last_seq=last.seq,
+            last_id=last.id,
+            last_parent=last.parent_id,
+            prefix_digest=digest.hex(),
+        )
+        try:
+            self._history_index.apply_committed(facts, entries)
+        except Exception:  # noqa: BLE001 -- derived state cannot fail authority
+            self._history_index._mark_unavailable()
 
     @property
     def last_repair_result(self) -> RepairResult | None:
@@ -642,6 +689,7 @@ class ConversationStore(
             del self._entries[-len(entries) :]
         encoded = b"".join(encode_json(entry.to_dict()) + b"\n" for entry in entries)
         self._write_bytes(encoded)
+        self._apply_history_index_entries(tuple(entries))
         for entry in entries:
             self._entries.append(entry)
             self._record_entry_prefix(entry)
