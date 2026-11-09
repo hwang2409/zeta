@@ -19,6 +19,7 @@ import pytest
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import (
@@ -1402,13 +1403,19 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
     loop, backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id, turns=1
     )
-    original_durable_write = store._run_durable_write
+    original_durable_write = store._run_committed_mutation
     append_committed = threading.Event()
     release_append = threading.Event()
 
-    def pause_after_status_commit(method_name, args, kwargs):
-        result = original_durable_write(method_name, args, kwargs)
-        message = args[0] if method_name == "append_message" else None
+    def pause_after_status_commit(command, expected_generation, cancelled_before_write):
+        result = original_durable_write(
+            command, expected_generation, cancelled_before_write
+        )
+        message = (
+            command.message
+            if type(command).__name__ == "_AppendMessageCommand"
+            else None
+        )
         if (
             message is not None
             and message.metadata.get("zeta_event") == "project_inbox_sent_status"
@@ -1417,7 +1424,8 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
             assert release_append.wait(timeout=5)
         return result
 
-    monkeypatch.setattr(store, "_run_durable_write", pause_after_status_commit)
+    # test-contract: seam pauses after durable inbox status commit
+    monkeypatch.setattr(store, "_run_committed_mutation", pause_after_status_commit)
     try:
         await loop._check_project_inbox()
         first_turn = asyncio.create_task(_collect_turn(loop, "first"))
@@ -1425,9 +1433,9 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
         first_turn.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(first_turn, 10)
-
-        monkeypatch.setattr(store, "_run_durable_write", original_durable_write)
+            await await_or_fail(first_turn, what="test await")
+        # test-contract: seam releases the next turn from the injected pause
+        monkeypatch.setattr(store, "_run_committed_mutation", original_durable_write)
         await _collect_turn(loop, "second")
 
         persisted = [
