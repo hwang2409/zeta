@@ -841,7 +841,7 @@ class _Client:
                 text,
                 register_model_input=register,
                 approval_control=self.server.control,
-                run_blocking=self.server.control._run_blocking,
+                slash_lock=self.server.control.slash_lock,
                 busy=self.server.control.turn_busy(),
                 registry=registry,
             )
