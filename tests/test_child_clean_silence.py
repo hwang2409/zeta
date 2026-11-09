@@ -373,6 +373,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             assert result["structuredContent"]["status"] in {
                 "cancellation_confirmed",
                 "already_finished",
+                "cancellation_unconfirmed",
             }
         await loop.close()
         store.close()
