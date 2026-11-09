@@ -422,7 +422,7 @@ class StreamableHTTPMCPClient(MCPClient):
         *,
         accept: str,
         content_type: str | None = None,
-        extra_headers: Mapping[str, str] = (),
+        extra_headers: Mapping[str, str | bytes] = (),
         json: object = None,
     ) -> AsyncIterator[httpx.Response]:
         headers = self._auth_headers(oauth_token)
@@ -524,7 +524,7 @@ class StreamableHTTPMCPClient(MCPClient):
         last_event_id = self._notification_event_id
         extra_headers = {"mcp-session-id": session_id}
         if last_event_id:
-            extra_headers["last-event-id"] = last_event_id.decode("latin-1")
+            extra_headers["last-event-id"] = last_event_id
         async with self._checked_stream(
             "GET",
             oauth_token,
