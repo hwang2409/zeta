@@ -30,10 +30,5 @@ class Remove:
 
 
 @dataclass(frozen=True, slots=True)
-class RemoveWhenIdle:
-    result: asyncio.Future[None]
-
-
-@dataclass(frozen=True, slots=True)
 class Close:
     result: asyncio.Future[None]
