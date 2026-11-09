@@ -12308,20 +12308,24 @@ async def test_config_changed_requires_live_config_changed_feature(
         server.runtime.loop.set_background_event_sink(prepared_events.append)
         await server.runtime.loop.refresh_live_config()
         assert len(prepared_events) == 1
-        notifications: list[str] = []
-        original_notify = server.control._notify
-
-        async def record_notify(event: str, *args: object, **kwargs: object) -> None:
-            notifications.append(event)
-            await original_notify(event, *args, **kwargs)
-
-        server.control._notify = record_notify
         await server.control._event(prepared_events[0], background=True)
-        await _request(reader, writer, 3, "status", {})
 
-        assert ("config_changed" in notifications) is negotiated
+        # Wire assertion: the one owner of the feature gate is the connection, so
+        # a controller that did not negotiate live_config_changed never receives
+        # the config_changed frame. Read every frame up to the status response and
+        # check the wire, not the internal _notify seam.
+        await _send(reader, writer, 3, "status", {})
+        frames = await read_until(
+            reader, lambda frame: frame.get("id") == 3, what="status response"
+        )
+        wire_events = [frame.get("params", {}).get("event") for frame in frames]
+        assert ("config_changed" in wire_events) is negotiated
         if negotiated:
-            config_event = await _event(reader, "config_changed")
+            config_event = next(
+                frame["params"]
+                for frame in frames
+                if frame.get("params", {}).get("event") == "config_changed"
+            )
             assert config_event["data"]["changes"]["agents"]["added"] == ["specialist"]
     finally:
         await close_serve(server, writer)

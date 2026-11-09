@@ -35,7 +35,9 @@ from zeta.protocol.types import (
 from zeta.providers.completion import owned_completion
 from zeta.providers.factory import build_backend
 from zeta.runtime.composition import RuntimeComposition, compose_runtime
+from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
+from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.transcript_search.index import TranscriptIndex
@@ -402,34 +404,62 @@ async def test_login_required_notice_is_delivered_to_serve_client(
 
 
 async def test_serve_memory_event_requires_negotiated_feature() -> None:
-    control = object.__new__(ServeControl)
-    control.closing = False
-    controller = SimpleNamespace(features=frozenset({"memory_updated"}))
-    control.server = SimpleNamespace(
-        connections=SimpleNamespace(controller_metadata=lambda: controller)
-    )
-    events: list[tuple[str, str | None, dict[str, object]]] = []
+    """The one owner of the feature gate is the connection: _publish_memory_notice
+    always routes through publish_controller, which drops memory_updated for a
+    controller that did not negotiate the feature. Assert that on the wire."""
 
-    async def notify(
-        event: str, session_id: str | None = None, **fields: object
-    ) -> None:
-        events.append((event, session_id, fields))
+    class _Controller:
+        def __init__(self) -> None:
+            self.codec = FrameCodec()
+            self.frames: list[bytes] = []
+            self._write_lock = asyncio.Lock()
+            self.server = SimpleNamespace(runtime=SimpleNamespace())
 
-    control._notify = notify
-    control._publish_memory_notice("session", "memory update failed: validation error")
-    await asyncio.sleep(0)
-    assert events == [
-        (
-            "memory_updated",
-            "session",
-            {"message": "memory update failed: validation error"},
+        async def _write_physical(self, frame: bytes) -> bool:
+            async with self._write_lock:
+                self.frames.append(frame)
+                return True
+
+        async def close(self) -> None:
+            pass
+
+    async def _memory_frames(features: frozenset[str]) -> list[dict[str, object]]:
+        registry = ConnectionRegistry(asyncio.get_running_loop())
+        connection = _Controller()
+        registry.register(connection)
+        registry.negotiate_role(connection, "controller", "1.2", features)
+        control = object.__new__(ServeControl)
+        control.closing = False
+        control.server = SimpleNamespace(connections=registry)
+        control._notify = lambda event, session_id=None, **fields: (
+            registry.publish_controller(event, session_id, **fields)
         )
-    ]
+        try:
+            control._publish_memory_notice(
+                "session", "memory update failed: validation error"
+            )
+            await asyncio.sleep(0)
+            # flush the claimed-buffering queue to the wire with one plain frame
+            hello = connection.codec.notification(
+                EventDescriptor.ASSISTANT_DELTA, "session", delta="hello"
+            )
+            assert await registry.send(connection, hello)
+            decoded = [json.loads(frame) for frame in connection.frames]
+            return [
+                frame["params"]
+                for frame in decoded
+                if frame.get("params", {}).get("event") == "memory_updated"
+            ]
+        finally:
+            registry.release(connection)
+            await registry.aclose()
 
-    controller.features = frozenset()
-    control._publish_memory_notice("session", "hidden")
-    await asyncio.sleep(0)
-    assert len(events) == 1
+    negotiated = await _memory_frames(frozenset({"memory_updated"}))
+    assert len(negotiated) == 1
+    assert negotiated[0]["message"] == "memory update failed: validation error"
+
+    unnegotiated = await _memory_frames(frozenset())
+    assert unnegotiated == []
 
 
 @pytest.mark.asyncio

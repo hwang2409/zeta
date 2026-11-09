@@ -293,6 +293,9 @@ class ConnectionRegistry(ReplayOutput):
         required_feature: str | None,
         fields: dict[str, object],
     ) -> bool:
+        if event not in EVENT_FEATURES:
+            # fail closed: an event the table does not name is never admitted.
+            return True
         required = EVENT_FEATURES[event]
         if required_feature is not None:
             required |= frozenset({required_feature})
