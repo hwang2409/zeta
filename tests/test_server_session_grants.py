@@ -1430,6 +1430,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     return await original_history(store, payload)
 
                 monkeypatch.setattr(approval_lifecycle, "persist_durably", gated_persist)
+                # test-contract: seam force a competing publication owner order
                 monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
                 monkeypatch.setattr(
                     ConversationStore,
