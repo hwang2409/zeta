@@ -20,6 +20,7 @@ from ..core.session import env_home
 from ..storage_format import WriterLease, mapping_mutations, open_writer
 from .client import MCPError
 from .filename import encode_mcp_filename
+from .fs import ensure_directory_below_existing_root
 
 _MAX_CREDENTIAL_RECORD_BYTES = 64 * 1024
 _LOCK_TIMEOUT_SECONDS = 1.0
@@ -217,7 +218,9 @@ class MCPCredentialStore:
 
     def _open_lock(self, name: str, operation: CredentialOperation) -> int:
         try:
-            token_store_dir(self._home).mkdir(parents=True, exist_ok=True, mode=0o700)
+            ensure_directory_below_existing_root(
+                self._home_root(), token_store_dir(self._home)
+            )
             lock_path = token_store_path(name, self._home).with_suffix(".lock")
             flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK
             flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -277,6 +280,7 @@ class MCPCredentialStore:
     def _load_transaction(
         self, name: str, operation: CredentialOperation
     ) -> CredentialSnapshot:
+        self._prepare_home(name, operation)
         with open_writer(self._home_root()):
             lock_fd = self._lock(name, operation, exclusive=False)
             try:
@@ -334,6 +338,7 @@ class MCPCredentialStore:
         self, name: str, token: MCPOAuthToken
     ) -> CredentialSnapshot:
         operation: CredentialOperation = "save_login"
+        self._prepare_home(name, operation)
         with open_writer(self._home_root()) as lease:
             lock_fd = self._lock(name, operation, exclusive=True)
             try:
@@ -351,6 +356,7 @@ class MCPCredentialStore:
         replacement: MCPOAuthToken,
     ) -> SaveIfCurrentResult:
         operation: CredentialOperation = "save_if_current"
+        self._prepare_home(name, operation)
         with open_writer(self._home_root()) as lease:
             lock_fd = self._lock(name, operation, exclusive=True)
             try:
@@ -367,6 +373,7 @@ class MCPCredentialStore:
 
     def _delete_transaction(self, name: str) -> CredentialSnapshot:
         operation: CredentialOperation = "delete"
+        self._prepare_home(name, operation)
         with open_writer(self._home_root()) as lease:
             lock_fd = self._lock(name, operation, exclusive=True)
             try:
@@ -379,6 +386,15 @@ class MCPCredentialStore:
 
     def _home_root(self) -> Path:
         return Path(self._home).expanduser() if self._home is not None else env_home()
+
+    def _prepare_home(
+        self, name: str, operation: CredentialOperation
+    ) -> None:
+        try:
+            root = self._home_root()
+            ensure_directory_below_existing_root(root, root)
+        except OSError as exc:
+            raise self._error(name, operation, CredentialStoreErrorReason.IO) from exc
 
     def _write_locked(
         self,

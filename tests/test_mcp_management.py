@@ -15,6 +15,7 @@ import pytest
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
 from zeta.core.store import ConversationStore
+from zeta.mcp import fs as mcp_fs
 from zeta.mcp.client import MCPHTTPError
 from zeta.mcp.config import load_mcp_config_overlay
 from zeta.mcp.http import StreamableHTTPMCPClient
@@ -1050,6 +1051,35 @@ async def test_mcp_startup_does_not_recreate_missing_session_cwd(
     finally:
         await loop.close()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_does_not_recreate_cwd_when_parent_deleted_during_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "worktree"
+    project.mkdir()
+    manager = MCPManagementService(home=project / ".zeta", project_dir=project)
+    original_mkdir = Path.mkdir
+    deleted = False
+
+    def delete_parent_before_root_create(
+        path: Path, *args: object, **kwargs: object
+    ) -> None:
+        nonlocal deleted
+        if path == project / ".zeta" and not deleted:
+            deleted = True
+            project.rmdir()
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(mcp_fs.Path, "mkdir", delete_parent_before_root_create)
+    try:
+        with pytest.raises(MCPManagementError, match="does not exist"):
+            await manager.add("server", scope="user", url="https://example.test")
+        assert deleted
+        assert not project.exists()
+    finally:
+        await manager.aclose()
 
 
 @pytest.mark.asyncio

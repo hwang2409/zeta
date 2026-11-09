@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from ..core.fsio import write_all
+from .fs import ensure_directory_below_existing_root
 
 MCP_STDERR_LOG_FILE_BYTES = 2 * 1024 * 1024
 MCP_STDERR_LOG_FILE_COUNT = 3
@@ -41,7 +42,7 @@ class RotatingStderrLog:
 
     @classmethod
     def _prepare(cls, path: Path) -> RotatingStderrLog:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ensure_directory_below_existing_root(path.parent.parent, path.parent)
         directory_fd = os.open(
             path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         )

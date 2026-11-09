@@ -26,6 +26,7 @@ from .config import (
     load_mcp_config_overlay,
     project_config_path,
 )
+from .fs import ensure_directory_below_existing_root
 from .oauth_store import (
     MCPCredentialStore,
     MCPCredentialStoreError,
@@ -266,13 +267,19 @@ class MCPManagementService:
                 raise MCPManagementError(
                     f"MCP config directory does not exist: {path.parent}"
                 )
-            path.parent.mkdir(parents=False, exist_ok=True)
+            try:
+                ensure_directory_below_existing_root(path.parent, path.parent)
+            except FileNotFoundError as exc:
+                raise MCPManagementError(
+                    f"MCP config directory does not exist: {path.parent}"
+                ) from exc
         else:
-            if not home_root.parent.is_dir():
+            try:
+                ensure_directory_below_existing_root(home_root, path.parent)
+            except FileNotFoundError as exc:
                 raise MCPManagementError(
                     f"MCP config directory does not exist: {home_root.parent}"
-                )
-            path.parent.mkdir(parents=True, exist_ok=True)
+                ) from exc
 
     def _project_root_for_path(self, path: Path) -> Path | None:
         if self.project_dir is None:
