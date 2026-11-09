@@ -813,6 +813,19 @@ async def test_parent_receipt_installs_only_after_the_canceled_lifecycle_is_fina
     backend = None
     try:
         if route.live:
+            mark_canceled = ConversationStore.mark_agent_canceled
+            skipped: list[str] = []
+
+            def cleanup_did_not_finalize(self: Any, parent_tool_call_id: str) -> None:
+                # the runner's cancel cleanup leaves the lifecycle running (as when its
+                # terminal fence refuses); only the receipt owner can finalize it now
+                if parent_tool_call_id == "agent-1" and not skipped:
+                    skipped.append(parent_tool_call_id)
+                    return
+                mark_canceled(self, parent_tool_call_id)
+
+            # test-contract: seam the runner's cancel cleanup does not finalize the lifecycle
+            monkeypatch.setattr(ConversationStore, "mark_agent_canceled", cleanup_did_not_finalize)
             backend = Actors(
                 {
                     "delegate": [ScriptedTurn(tool_calls=[_agent("agent-1", "child-work", False)]), _text("parent done")],
@@ -830,6 +843,7 @@ async def test_parent_receipt_installs_only_after_the_canceled_lifecycle_is_fina
             assert aborted["result"]["aborted"] is True, aborted
             backend.release_all()
             await _until(top, "turn_aborted")
+            assert skipped == ["agent-1"]
         else:
             seeded = RecoveredRoute(route.background, route.nested, "canceled")
             session_id, session_dir = await asyncio.to_thread(_seed_crashed_session, tmp_path, seeded)
@@ -877,7 +891,7 @@ async def test_child_lifecycle_rows_reach_only_child_run_events_connections(
         child_live = await _until(child, "agent_end")
         plain_live = await _until(plain, "agent_end")
         # live: only the child_run_events connection receives lifecycle events
-        assert [e["event"] for e in child_live if e["event"].startswith("child_")][0] == "child_started"
+        assert [e["event"] for e in child_live if e["event"].startswith("child_")][:1] == ["child_started"]
         assert len(_lifecycle(child_live, "child_ended", run_id)) == 1, child_live
         assert [e for e in plain_live if e["event"].startswith("child_")] == []
         # history: only the child_run_events connection sees the durable rows
