@@ -508,7 +508,7 @@ class ServerSlashSession:
             )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
-        return json.dumps(state, indent=2, sort_keys=True)
+        return state
 
 
 def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:

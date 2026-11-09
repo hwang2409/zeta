@@ -852,7 +852,7 @@ def load_project_context(
     session_project: Project | None = None,
     cwd_project: Project | None = None,
     inbox_enabled: bool = True,
-    registry: ProjectRegistry | None = None,
+    registry: ProjectRegistry | ProjectRegistryState | None = None,
     project_projection: ProjectContextProjection | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
@@ -941,6 +941,8 @@ def load_project_context(
         # A malformed or unsafe optional registry must not prevent a session from
         # starting; surface it as a startup notice instead.
         try:
+            if isinstance(registry, ProjectRegistryState):
+                registry = registry.registry
             registry = registry or project_registry(home / "projects")
             project = session_project
             if project is not None:
