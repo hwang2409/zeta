@@ -21,8 +21,8 @@ from rich.console import Console
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.commands.custom_commands import COMMAND_FILE_SIZE_LIMIT
 from zeta.core.slash import (
-    COMMAND_FILE_SIZE_LIMIT,
     INIT_PROMPT,
     CustomCommand,
     create_slash_registry,
@@ -45,6 +45,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import bash as bash_module
 from zeta.tools._shared.shell import (
     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,
     INLINE_SHELL_OUTPUT_LIMIT_MESSAGE,
@@ -2203,8 +2204,17 @@ async def test_background_macro_start_preflight_failure_closes_created_log(
 
 
 async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    spawn_entered = asyncio.Event()
+    real_spawn_background = bash_module.spawn_background
+
+    async def spawn_background(*args: Any, **kwargs: Any) -> Any:
+        spawn_entered.set()
+        return await real_spawn_background(*args, **kwargs)
+
+    # test-contract: seam macro owns its log before entering process spawn
+    monkeypatch.setattr(bash_module, "spawn_background", spawn_background)
     home = tmp_path / "home"
     _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30\n")
     output = StringIO()
@@ -2226,11 +2236,14 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
         # test-contract: seam no public event reports active provider-turn completion.
         task = app._active_task
         assert task is not None
+        await await_or_fail(spawn_entered.wait(), what="macro process spawn entry")
+        assert spawn_entered.is_set(), "macro process spawn seam was not reached"
         app.abort_active()
         await asyncio.wait_for(task, timeout=10)
 
         assert "/wait · canceled" in output.getvalue()
-        log = next(app.loop.store.session_dir.glob("macro-*.log"))
+        log = next(app.loop.store.session_dir.glob("macro-*.log"), None)
+        assert log is not None, "macro log was not created"
         assert log.exists()
         assert "canceled · log " in output.getvalue()
 

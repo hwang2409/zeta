@@ -8,14 +8,17 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.server_client import (
+    _buffer,
     assert_event_order,
     event_owner,
     frames_for_call,
+    frames_until_event,
     read_until,
     request,
+    send,
 )
-from tests.support.server_client import read as buffered_read
 
 _READ_METHODS = {"readline", "readuntil"}
 
@@ -171,23 +174,77 @@ async def test_read_until_timeout_lists_skipped_frames() -> None:
         )
 
 
+def _is_turn_end(frame: dict[str, object]) -> bool:
+    return event_owner(frame) == ("turn_end", "parent", 1)
+
+
 @pytest.mark.asyncio
-async def test_buffered_read_regression_rejects_old_direct_read() -> None:
-    reader = _Reader(
-        {"params": {"event": "tool_end"}},
-        {"params": {"event": "approval_end"}},
-        {"id": 1, "result": {}},
-    )
-    await request(reader, _Writer(), 1, "deny")
+async def test_read_until_keeps_reading_for_a_response_after_the_event() -> None:
+    reader = _Reader(_event_frame("turn_end", 1), {"id": 4, "result": {}})
+    await send(reader, _Writer(), 4, "deny")
 
-    with pytest.raises(AssertionError, match="server closed"):
-        while True:
-            line = await reader.readline()
-            assert line, "server closed the socket"
-            if json.loads(line).get("params", {}).get("event") == "tool_end":
-                break
+    frames = await read_until(reader, _is_turn_end, what="turn_end")
 
-    assert (await buffered_read(reader))["params"]["event"] == "tool_end"
+    assert [frame.get("id") for frame in frames] == [None, 4]
+    assert frames[1].raw == b'{"id": 4, "result": {}}\n'
+
+
+@pytest.mark.parametrize("helper", ["read_until", "frames_until_event"])
+@pytest.mark.asyncio
+async def test_event_reads_fail_when_a_sent_request_gets_no_response(
+    helper: str,
+) -> None:
+    reader = _Reader(_event_frame("turn_end", 1))
+    await send(reader, _Writer(), 4, "deny")
+
+    with pytest.raises(
+        AssertionError, match=r"request id 4 has no response; frames read: .*turn_end"
+    ):
+        if helper == "read_until":
+            await read_until(reader, _is_turn_end, what="turn_end")
+        else:
+            await frames_until_event(reader, "turn_end")
+
+
+@pytest.mark.asyncio
+async def test_request_consumes_buffered_frames_before_socket_reads() -> None:
+    reader = _Reader({"id": 2, "result": {}})
+    _buffer(reader).append({"id": 1, "result": {}})
+
+    assert await request(reader, _Writer(), 1, "deny") == [{"id": 1, "result": {}}]
+
+
+@pytest.mark.asyncio
+async def test_canceled_request_restores_deferred_frames() -> None:
+    read_started = asyncio.Event()
+    read_release = asyncio.Event()
+
+    class BlockingReader(_Reader):
+        async def readline(self) -> bytes:
+            read_started.set()
+            await await_or_fail(read_release.wait(), what="socket read release")
+            return b""
+
+    skipped = _event_frame("session_grants_changed", "grant")
+    reader = BlockingReader()
+    _buffer(reader).append(skipped)
+    pending = asyncio.create_task(request(reader, _Writer(), 1, "approve"))
+    try:
+        await await_or_fail(read_started.wait(), what="socket read start")
+        pending.cancel()
+        await await_or_fail(
+            asyncio.gather(pending, return_exceptions=True),
+            what="request cancellation",
+        )
+        assert list(_buffer(reader)) == [skipped]
+    finally:
+        read_release.set()
+        if not pending.done():
+            pending.cancel()
+            await await_or_fail(
+                asyncio.gather(pending, return_exceptions=True),
+                what="request cleanup",
+            )
 
 
 # The shape of the pre-#647 mistake in test_server.py: a raw readline on the
@@ -214,3 +271,18 @@ async def test_ok(reader):
     frame = await _read(reader)
 """
     assert _unbuffered_reader_reads(source, "ok") == []
+
+
+@pytest.mark.asyncio
+async def test_request_after_send_clears_the_buffered_response_id() -> None:
+    reader = _Reader(
+        {"id": 4, "result": {}}, {"id": 5, "result": {}}, _event_frame("turn_end", 1)
+    )
+    writer = _Writer()
+    await send(reader, writer, 4, "deny")
+    # request() buffers the id-4 response while it waits for its own id 5.
+    assert await request(reader, writer, 5, "status") == [{"id": 5, "result": {}}]
+
+    frames = await read_until(reader, _is_turn_end, what="turn_end")
+
+    assert [frame.get("id") for frame in frames] == [4, None]

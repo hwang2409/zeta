@@ -107,6 +107,25 @@ _SUFFIX_RE = re.compile(
 )
 
 
+def recoverable_error_result(
+    terminal_result: Callable[..., dict[str, object]],
+    failure_message: str,
+    code: str,
+    message: str,
+) -> dict[str, object]:
+    """Keep the child running after an error it can recover from."""
+    result = terminal_result(
+        state="idle",
+        text=f"agent error: {failure_message}",
+        error=False,
+        status="running",
+    )
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        structured["recoverable_error"] = {"code": code, "message": message}
+    return result
+
+
 def encode_json(value: object) -> bytes:
     """Encode JSON exactly as receipt rows and receipt payloads are encoded."""
 

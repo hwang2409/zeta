@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -70,33 +71,29 @@ from ...protocol.types import (
     ToolUseContent,
     user_message_for_turn,
 )
-from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
+from ...providers.completion import (
+    CompletionControl,
+    CompletionRetryBudget,
+    CompletionRun,
+    ResetPolicy,
+)
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
 from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from ...tools._shared.process import TaskExitInput
-from ...tools.registry import (
-    ToolExecutionContext,
-    _validate_unique_tool_call_ids,
-)
+from ...tools.registry import ToolExecutionContext, _validate_unique_tool_call_ids
 from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
-    ProviderAttemptState,
     _error_info,
     _sanitize_account_message,
-    assistant_reset_event,
     can_retry_context,
-    close_completion,
     ensure_context_reduced,
     observed_completion,
     provider_prompt_tokens,
-    provider_retry_notice,
-    start_provider_attempt,
     subscription_limit_failure,
     task_is_cancelling,
-    wait_for_provider_retry,
 )
 from ._store_writes import StoreWriteMixin
 from .backend_owners import BackendOwnerMixin
@@ -132,7 +129,6 @@ class AgentLoop(
     ProjectContextRecoveryMixin,
     MCPSession,
 ):
-    post_stream_provider_retry = True
     def __init__(
         self,
         backend: CompletionBackend,
@@ -169,9 +165,8 @@ class AgentLoop(
         freeze_skill_catalog: bool = False,
         child_turn_control: ChildTurnControl | None = None,
     ) -> None:
-        if (
-            type(max_agent_depth) is not int
-            or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
+        if type(max_agent_depth) is not int or not (
+            0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
         ):
             raise ValueError(
                 f"maximum agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
@@ -192,12 +187,10 @@ class AgentLoop(
         self.parent_session_id = parent_session_id
         # Nested loops publish lineage through the root session directory.
         self.root_session_dir = (
-            root_session_dir if root_session_dir is not None else store.session_dir
-        )
+            root_session_dir if root_session_dir is not None else store.session_dir)
         self.project_registry = project_registry
         self._configure_project_context_recovery(
-            registry=None, project_id=None, health=None, prepare=None
-        )
+            registry=None, project_id=None, health=None, prepare=None)
         self._child_lineage_publisher = child_lineage_publisher
         if (
             self._child_lineage_publisher is None
@@ -205,9 +198,7 @@ class AgentLoop(
             and project_registry is not None
         ):
             self._child_lineage_publisher = ChildLineagePublisher(
-                project_registry,
-                self.root_session_dir,
-                self.store._storage_lease,
+                project_registry, self.root_session_dir, self.store._storage_lease
             )
         self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
@@ -337,9 +328,7 @@ class AgentLoop(
         return canonical_tool_schemas(schemas)
     def _account_safe_context(self, messages: list[Message]) -> list[Message]:
         account_context = getattr(self, "account_context", None)
-        provider = (
-            account_context.active_provider if account_context is not None else None
-        )
+        provider = account_context.active_provider if account_context is not None else None
         sequence = account_context.switch_sequence if account_context is not None else 0
         if provider is None or sequence == 0:
             return messages
@@ -392,12 +381,6 @@ class AgentLoop(
     def clear_pending_steering(
         self,
         reason: Literal["clear", "turn_end"] = "clear",
-    ) -> int:
-        return self.store.drop_client_steering(reason)
-
-    def drop_pending_steering(
-        self,
-        reason: Literal["abort", "disconnect", "turn_end", "failed"],
     ) -> int:
         return self.store.drop_client_steering(reason)
 
@@ -555,6 +538,20 @@ class AgentLoop(
             return
         self.store.bind_owner_thread()
         self._activated = True
+        from ...attention_replies import AttentionReplies
+
+        def recover_attention():
+            try:
+                os.stat("attention", dir_fd=self.store.directory_fd)
+            except FileNotFoundError:
+                return
+            return AttentionReplies(
+                self.store.session_dir.parent.parent, self.store.session_id,
+                registry_state=self.tool_registry.project_registry_state,
+                on_inbox_visible=self.notify_project_inbox_publication,
+            ).recover()
+
+        await asyncio.to_thread(recover_attention)
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
             await self.tool_registry.background_tasks._notify_exit(
@@ -674,6 +671,8 @@ class AgentLoop(
         notification_turn: bool = False,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        allow_assistant_reset: bool = True,
+        task_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         self._advance_project_context_recovery()
@@ -733,24 +732,23 @@ class AgentLoop(
         turn_number = 0
         retrying_context = False
         overflow_context_tokens: int | None = None
-        retrying_provider = False
-        provider_retry_budget: ProviderRetryBudget | None = None
         self._turn_provider_retry_records = []
         recovery_state = EmptyTurnRecoveryState()
         nudge_turn_pending = False
         recovering_tool_limit = False
         consuming_notifications = False
         iteration_consuming_notifications = False
+        provider_retry_budget: CompletionRetryBudget | None = None
+        provider_budget_prompt_id: str | None = None
         while (
             self.max_turns is None
             or turn_number < self.max_turns
             or step_delivery.has_pending_edge
             or retrying_context
-            or retrying_provider
             or nudge_turn_pending
             or recovering_tool_limit
         ):
-            if not retrying_context and not retrying_provider:
+            if not retrying_context:
                 if self._abort_admitted:
                     return
                 if self.child_turn_control is not None:
@@ -769,20 +767,19 @@ class AgentLoop(
                 self._turn_output_tokens = None
                 self.tool_registry.start_batch()
                 yield StreamEvent(
-                    StreamEventType.TURN_START,
-                    data={"turn": turn_number},
+                    StreamEventType.TURN_START, data={"turn": turn_number}
                 )
             turn_abort_signal = abort_signal or self.tool_registry.abort_signal
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
-            completion: AsyncIterator[StreamEvent] | None = None
+            completion: CompletionRun | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
             provider_error_source: BaseException | ErrorInfo | None = None
             provider_error_data: dict[str, Any] = {}
             provider_retry_usage: dict[str, Any] | None = None
             incomplete_tool_name: str | None = None
-            attempt_state = ProviderAttemptState()
+            provider_started = False
             try:
                 account_context = getattr(self, "account_context", None)
                 if (
@@ -837,7 +834,7 @@ class AgentLoop(
                 steering = self.store.pending_client_steering()
                 notification_context = system_message if notification_turn else None
                 prepared_delivery = await step_delivery.prepare_request(
-                    "retry" if retrying_provider else "after_tools",
+                    "after_tools",
                     context_messages,
                     steering,
                     active_tools,
@@ -866,17 +863,30 @@ class AgentLoop(
                     yield StreamEvent(StreamEventType.ERROR, error=disposition)
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
-                provider_retry_budget = start_provider_attempt(provider_retry_budget)
-                self._turn_provider_retry_records = provider_retry_budget.records
+                if (
+                    provider_retry_budget is None
+                    or prepared_delivery.prompt_id != provider_budget_prompt_id
+                ):
+                    provider_retry_budget = CompletionRetryBudget()
+                    provider_budget_prompt_id = prepared_delivery.prompt_id
+                    self._turn_provider_retry_records = provider_retry_budget.records
                 admitted_request = prepared_delivery.admitted_request
                 assert admitted_request is not None
                 if self._abort_admitted:
                     return
-                completion = apply_retry_budget(
-                    self.context_assembler.dispatch_admitted_request(
-                        self.backend, admitted_request
+                completion = self.context_assembler.dispatch_admitted_request(
+                    self.backend,
+                    admitted_request,
+                    control=CompletionControl(
+                        abort=turn_abort_signal,
+                        reset=(
+                            ResetPolicy.ALLOW_ASSISTANT_RESET
+                            if allow_assistant_reset
+                            else ResetPolicy.NO_RESET
+                        ),
+                        budget=provider_retry_budget,
+                        task_deadline=task_deadline,
                     ),
-                    provider_retry_budget,
                 )
                 has_active_delivery = prepared_delivery.has_active_delivery
                 provider_stream = observed_completion(
@@ -885,7 +895,12 @@ class AgentLoop(
                     steering,
                 )
                 async for event in provider_stream:
-                    attempt_state.observe(event)
+                    if event.type in {
+                        StreamEventType.MESSAGE_START,
+                        StreamEventType.MESSAGE_UPDATE,
+                        StreamEventType.MESSAGE_END,
+                    }:
+                        provider_started = True
                     self.context_assembler.observe_event(event)
                     if event.type is StreamEventType.ERROR:
                         provider_error = (
@@ -940,23 +955,33 @@ class AgentLoop(
                         retryable=True,
                     )
             except asyncio.CancelledError:
-                await close_completion(completion)
+                if completion is not None:
+                    await completion.aclose()
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except GeneratorExit:
-                await close_completion(completion)
+                if completion is not None:
+                    await completion.aclose()
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except Exception as exc:
-                await close_completion(completion)
+                if completion is not None:
+                    await completion.aclose()
                 if task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
-                error = _error_info(exc, provider_error=True)
+                error = _error_info(
+                    exc, provider_error=getattr(exc, "provider_error", True)
+                )
                 provider_error = error
                 provider_error_source = exc
                 completion = None
-            cleanup_error = await close_completion(completion)
+            cleanup_error: BaseException | None = None
+            if completion is not None:
+                try:
+                    await completion.aclose()
+                except BaseException as exc:  # noqa: BLE001 - preserve close errors
+                    cleanup_error = exc
             if task_is_cancelling():
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
@@ -989,31 +1014,7 @@ class AgentLoop(
                 retry_usage = getattr(source, "retry_usage", None)
                 if provider_retry_usage is None and isinstance(retry_usage, Mapping):
                     provider_retry_usage = dict(retry_usage)
-                plan = attempt_state.retry_plan(
-                    provider_retry_budget,
-                    source,
-                    reset_supported=self.post_stream_provider_retry,
-                    turn_aborted=turn_abort_signal.is_set(),
-                    event_data=provider_error_data,
-                )
-                if plan is not None:
-                    notice = provider_retry_notice(plan)
-                    if provider_retry_usage is not None:
-                        notice = replace(
-                            notice,
-                            data={**notice.data, "usage": provider_retry_usage},
-                        )
-                    yield notice
-                    if await wait_for_provider_retry(
-                        plan.delay, turn_abort_signal, source
-                    ):
-                        provider_retry_budget.record_retry(plan)
-                        yield assistant_reset_event()
-                        partial_blocks = []
-                        assistant_message = None
-                        retrying_provider = True
-                        continue
-                if plan is None and attempt_state.started and has_active_delivery:
+                if provider_started and has_active_delivery:
                     async for publication in self._accepted_delivery_events(
                         step_delivery
                     ):
@@ -1026,7 +1027,10 @@ class AgentLoop(
                     if isinstance(original, ErrorInfo):
                         provider_error = original
                     elif isinstance(original, BaseException):
-                        provider_error = _error_info(original, provider_error=True)
+                        provider_error = _error_info(
+                            original,
+                            provider_error=getattr(original, "provider_error", True),
+                        )
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )
@@ -1040,13 +1044,13 @@ class AgentLoop(
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             retrying_context = False
-            retrying_provider = False
-            if attempt_state.started and has_active_delivery:
+            if provider_started and has_active_delivery:
                 async for publication in self._accepted_delivery_events(step_delivery):
                     yield publication
             if completion_succeeded and self.on_completion_success is not None:
                 completion_result = self.on_completion_success()
                 if inspect.isawaitable(completion_result):
+                    # test-contract: seam caller owns the completion callback
                     await completion_result
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
@@ -1092,7 +1096,9 @@ class AgentLoop(
                 durable_message(assistant_message),
                 approval_requests,
             )
-            attempt_state.persisted = True
+            completion.commit()
+            provider_retry_budget = None
+            provider_budget_prompt_id = None
             self._turn_provider_retry_records = []
             error = output_limit_error(
                 assistant_message, stop_reason=self._turn_stop_reason

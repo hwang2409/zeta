@@ -393,7 +393,9 @@ class BackgroundAgentOwner:
         while self._store_close_tasks:
             close_tasks = tuple(self._store_close_tasks)
             try:
-                await asyncio.gather(*close_tasks, return_exceptions=False)
+                # Shield: close tasks are shared, so one canceled waiter must not
+                # cancel the release that other waiters are gathering.
+                await asyncio.gather(*map(asyncio.shield, close_tasks))
             except Exception:
                 self._observed_close_failures.update(
                     task

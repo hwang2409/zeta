@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import event, request
 from tests.support.sockets import short_socket_path as _socket_path
@@ -29,6 +30,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -81,6 +83,7 @@ class _BlockingBackend(CompletionBackend):
     def __init__(self) -> None:
         self.started = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -94,6 +97,7 @@ class _BlockingBackend(CompletionBackend):
 
 
 class _FailingBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -323,12 +327,13 @@ async def test_session_history_fidelity_projects_tool_image_stubs_over_socket(
 async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
     tmp_path: Path,
 ) -> None:
-    call = ToolCall("read-1", "read", {"path": str(tmp_path / "missing")})
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    # the steer arrives while the provider streams, so it waits for the next
+    # tool boundary; the abort ends the turn first and drops it.
+    backend = _BlockingBackend()
     server, reader, writer, session_id = await _open(tmp_path, backend)
     try:
         await request(reader, writer, 3, "send", {"text": "read"})
-        await event(reader, "approval_request")
+        await await_or_fail(backend.started.wait(), what="provider start")
         await request(reader, writer, 4, "steer", {"text": "also inspect tests"})
         await request(reader, writer, 5, "abort")
         live = await event(reader, "delivery_status")

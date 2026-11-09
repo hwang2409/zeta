@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests.support.completion import completion_control
 from tests.support.fake_backend import (
     FakeBackend,
     PerActorFakeBackend,
@@ -20,7 +21,10 @@ from zeta.protocol.types import (
 
 async def _complete(backend: CompletionBackend, *prompts: str):
     messages = [Message(MessageRole.USER, [TextContent(prompt)]) for prompt in prompts]
-    return [event async for event in backend.complete(messages, [])]
+    return [
+        event
+        async for event in backend.complete(messages, [], control=completion_control())
+    ]
 
 
 @pytest.mark.asyncio
@@ -60,13 +64,17 @@ def test_fake_backend_fixture_reports_error_swallowed_by_child(
         test_swallowed="""
 import pytest
 
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 
 
 async def complete(backend, *prompts):
     messages = [Message(MessageRole.USER, [TextContent(prompt)]) for prompt in prompts]
-    return [event async for event in backend.complete(messages, [])]
+    return [
+        event
+        async for event in backend.complete(messages, [], control=completion_control())
+    ]
 
 
 @pytest.mark.asyncio

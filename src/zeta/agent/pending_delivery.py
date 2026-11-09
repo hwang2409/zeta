@@ -192,9 +192,15 @@ class StepDeliveryFlow:
                 if isinstance(item, PromptInput) and item.deadline is not None
                 else None
             )
+            return_committed_on_cancel = (
+                isinstance(item, PromptInput)
+                and item.origin is MessageOrigin.AGENT_SEND
+            )
             try:
                 result = await self.store._to_thread_durable(
-                    self.store._commit_delivery_input, item
+                    self.store._commit_delivery_input,
+                    item,
+                    _return_committed_on_cancel=return_committed_on_cancel,
                 )
             except PendingPromptWriterReloadedError:
                 if not isinstance(item, PromptInput) or item.deadline is None:
@@ -202,7 +208,9 @@ class StepDeliveryFlow:
                 assert commit_window is not None
                 retry = replace(item, deadline=time.monotonic() + commit_window)
                 result = await self.store._to_thread_durable(
-                    self.store._commit_delivery_input, retry
+                    self.store._commit_delivery_input,
+                    retry,
+                    _return_committed_on_cancel=return_committed_on_cancel,
                 )
             if result.changed and not (
                 isinstance(item, NotificationInput)
@@ -777,25 +785,6 @@ class StepDeliveryFlow:
             source == "notification" and self._low_capacity_notifications
         ):
             self._wake_sink(source)
-
-
-def _answered_question_notification_id(
-    store: ConversationStore, child_instance_id: str, message: str
-) -> str | None:
-    match = QUESTION_ANSWER_PATTERN.match(message)
-    if match is None:
-        return None
-    question_id = match.group(1)
-    return next(
-        (
-            entry.id
-            for entry in store.agent_notifications()
-            if entry.data.get("kind") == "child_question"
-            and entry.data.get("child_instance_id") == child_instance_id
-            and entry.data.get("question_id") == question_id
-        ),
-        None,
-    )
 
 
 async def send_to_run(

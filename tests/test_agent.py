@@ -1,4 +1,6 @@
+
 import asyncio
+import gc
 import json
 import os
 import re
@@ -13,7 +15,7 @@ from functools import wraps
 from io import StringIO
 from itertools import pairwise
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -31,9 +33,11 @@ from tests.support.agent_lifecycle import (
     wait_background_owner,
     watch_delegated_registrations,
 )
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
+from zeta.accounts import AccountCredentialLockTimeoutError
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.background import (
@@ -86,9 +90,11 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.codex import CodexStreamError
+from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.loop._completion import observed_completion
 from zeta.runtime.loop.empty_turn import empty_turn_tool_error
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.runtime.prompt import RuntimePrompt
@@ -112,6 +118,41 @@ pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 async def _collect(events):
     return [event async for event in events]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close", [False, True], ids=["abandoned", "closed"])
+async def test_observed_completion_does_not_leave_a_producer_task(
+    tmp_path: Path, close: bool
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.queue_client_steering(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("steer")]), MessageOrigin.USER
+        )
+    )
+    steering = store.pending_client_steering()
+    assert steering is not None
+    completion_closed = asyncio.Event()
+
+    async def completion() -> AsyncIterator[StreamEvent]:
+        try:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="reply")
+            await await_or_fail(asyncio.Event().wait(), what="completion held open")
+        finally:
+            completion_closed.set()
+
+    before = set(asyncio.all_tasks())
+    stream = observed_completion(completion(), store, steering)
+    event = await await_or_fail(anext(stream), what="first observed completion event")
+    if close:
+        await await_or_fail(stream.aclose(), what="observed completion close")
+
+    assert event.delta == "reply"
+    # test-contract: seam provider consumption must not create a detached task
+    assert set(asyncio.all_tasks()) <= before
+    assert completion_closed.is_set() is close
+    store.close()
 
 
 def _rendered_text(rendered: object) -> str:
@@ -349,6 +390,7 @@ async def test_context_overflow_compacts_and_retries_same_turn(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             if len(self.calls) == 1:
@@ -404,6 +446,7 @@ async def test_context_overflow_forces_emergency_eviction_and_retries_once(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             if len(self.calls) == 1:
@@ -464,6 +507,7 @@ async def test_context_overflow_retry_failure_persists_turn_once(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             error = RuntimeError("prompt is too long: 120 tokens > 100 maximum")
@@ -526,6 +570,7 @@ async def test_overflow_without_reduction_fails_with_diagnostic(tmp_path: Path) 
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls += 1
             error = RuntimeError("prompt is too long: 220 tokens > 200 maximum")
@@ -672,6 +717,7 @@ async def test_context_overflow_after_partial_output_is_not_retried(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls += 1
             yield StreamEvent(
@@ -1229,6 +1275,7 @@ class ParallelChildrenBackend(CompletionBackend):
             prompt: asyncio.Event() for prompt in self.child_prompts
         }
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1267,6 +1314,7 @@ class ParallelApprovalBackend(CompletionBackend):
         self.call_count = 0
         self.child_count = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1316,6 +1364,7 @@ class BackgroundBackend(CompletionBackend):
         self.child_started = asyncio.Event()
         self.release_child = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1360,6 +1409,7 @@ class NotificationWakeBackend(CompletionBackend):
         self.wake_started = asyncio.Event()
         self.release_wake = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1389,6 +1439,7 @@ class NestedBlockingBackend(CompletionBackend):
         self.grandchild_started = asyncio.Event()
         self.release_grandchild = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1418,6 +1469,7 @@ class NestedBackgroundBackend(CompletionBackend):
         self.call_count = 0
         self.grandchild_started = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1556,6 +1608,7 @@ class IdleParentRoutingBackend(CompletionBackend):
             for message in messages
         )
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1580,6 +1633,108 @@ class IdleParentRoutingBackend(CompletionBackend):
         )
 
 
+class CancelIdleTreeBackend(CompletionBackend):
+    def __init__(self, *, with_grandchild: bool) -> None:
+        self.with_grandchild = with_grandchild
+        self.calls = {"root": 0, "child": 0, "grandchild": 0}
+        self.child_idle = asyncio.Event()
+        self.question_seen = asyncio.Event()
+        self.follow_up_seen = asyncio.Event()
+
+    @staticmethod
+    def _actor(messages: Sequence[Message]) -> str:
+        prompts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        if "grandchild prompt" in prompts:
+            return "grandchild"
+        if "child prompt" in prompts:
+            return "child"
+        return "root"
+
+    @staticmethod
+    def _start_agent(call_id: str, prompt: str, description: str) -> ToolUseContent:
+        return ToolUseContent(
+            ToolCall(
+                call_id,
+                "agent",
+                {
+                    "prompt": prompt,
+                    "description": description,
+                    "agent_type": "run",
+                    "background": True,
+                },
+            )
+        )
+
+    @owned_completion
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        actor = self._actor(messages)
+        self.calls[actor] += 1
+        call = self.calls[actor]
+        blocks: list[TextContent | ToolUseContent]
+        if actor == "root":
+            blocks = (
+                [self._start_agent("start-child", "child prompt", "child")]
+                if call == 1
+                else []
+            )
+        elif actor == "child":
+            if self.with_grandchild and call == 1:
+                blocks = [
+                    self._start_agent(
+                        "start-grandchild", "grandchild prompt", "grandchild"
+                    )
+                ]
+            else:
+                if any(
+                    isinstance(block, TextContent) and block.text == "wake child"
+                    for message in messages
+                    if message.role is MessageRole.USER
+                    for block in message.content
+                ):
+                    self.follow_up_seen.set()
+                if any(
+                    message.metadata.get("zeta_event") == "agent_notifications"
+                    and any(
+                        isinstance(block, TextContent)
+                        and "grandchild needs parent" in block.text
+                        for block in message.content
+                    )
+                    for message in messages
+                ):
+                    self.question_seen.set()
+                blocks = [TextContent("WAIT")]
+        elif call == 1:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "ask-child",
+                        "ask_parent",
+                        {"question": "grandchild needs parent"},
+                    )
+                )
+            ]
+        else:
+            blocks = [TextContent("WAIT")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class ForegroundNestedBackgroundBackend(CompletionBackend):
     def __init__(self, *, background_child: bool = False) -> None:
         self.background_child = background_child
@@ -1589,6 +1744,7 @@ class ForegroundNestedBackgroundBackend(CompletionBackend):
         self.child_notification_started = asyncio.Event()
         self.release_child_notification = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1657,6 +1813,7 @@ class FinishGateBackend(CompletionBackend):
         self.handoff_schema_seen = False
         self.handoff_schema_seen_before_gate = False
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1716,7 +1873,7 @@ class FinishGateBackend(CompletionBackend):
             blocks = [ToolUseContent(child)]
         elif last_user == "grandchild prompt":
             self.grandchild_started.set()
-            await self.release_grandchild.wait()
+            await await_or_fail(self.release_grandchild.wait(), what="self.release_grandchild.wait()")
             blocks = [TextContent("evidence ready")]
         elif grandchild_started and gate is None and not notification:
             blocks = [TextContent("premature child answer")]
@@ -1771,7 +1928,7 @@ class FinishGateBackend(CompletionBackend):
                     )
                 ]
             elif self.gate_action == "stall":
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
             else:
                 blocks = [TextContent("I will wait for the evidence.")]
         elif notification:
@@ -1786,14 +1943,15 @@ class FinishGateBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
-        yield StreamEvent(
-            StreamEventType.MESSAGE_END,
-            message=Message(MessageRole.ASSISTANT, blocks),
-        )
+        # the completion owner closes the stream at MESSAGE_END; signal first.
         if gate is not None:
             self.gate_response_completed.set()
             if self.gate_calls == 3:
                 self.model_bound_reached.set()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
 
 
 class PostCapBudgetBackend(CompletionBackend):
@@ -1803,6 +1961,7 @@ class PostCapBudgetBackend(CompletionBackend):
         self.fresh_prompt_seen = asyncio.Event()
         self.gate_calls = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1844,7 +2003,7 @@ class PostCapBudgetBackend(CompletionBackend):
             )
             blocks = [ToolUseContent(grandchild)]
         elif last_user == "grandchild prompt":
-            await self.release_grandchild.wait()
+            await await_or_fail(self.release_grandchild.wait(), what="self.release_grandchild.wait()")
             blocks = [TextContent("grandchild complete")]
         elif last_user.startswith("edge prompt"):
             blocks = [TextContent("edge complete")]
@@ -1874,12 +2033,13 @@ class PostCapBudgetBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        # the completion owner closes the stream at MESSAGE_END; signal first.
+        if gate and self.gate_calls == 4:
+            self.post_cap_exhausted.set()
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
         )
-        if gate and self.gate_calls == 4:
-            self.post_cap_exhausted.set()
 
 
 class FollowUpFinishGateBackend(CompletionBackend):
@@ -1891,6 +2051,7 @@ class FollowUpFinishGateBackend(CompletionBackend):
         self.release_grandchild = asyncio.Event()
         self.gate_turns = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1999,6 +2160,7 @@ class ConversationFinishGateBackend(CompletionBackend):
         self.gate_turns = 0
         self.follow_up_seen = False
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -2134,6 +2296,7 @@ class ParallelNestedReadBackend(CompletionBackend):
             self.calls.append(call)
         self.seen_prompts: set[str] = set()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -3755,12 +3918,14 @@ async def test_finish_gate_cycles_cannot_bypass_model_cap(
     root_run = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await backend.model_bound_reached.wait()
+    await await_or_fail(
+        backend.model_bound_reached.wait(), what="model-bound finish gate"
+    )
 
     assert backend.gate_calls == 3
     assert not root_run.done()
     backend.release_grandchild.set()
-    await root_run
+    await await_or_fail(root_run, what="model-bound root turn")
     await wait_background_owner(loop)
     assert (
         store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
@@ -3798,21 +3963,49 @@ async def _run_post_cap_tool_cycle(
     monkeypatch.setattr(
         owner.conversation_channel, "publish_completion", observe_publish
     )
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await await_or_fail(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)),
+        what="root turn",
+    )
 
-    exhausted_wait = asyncio.create_task(backend.post_cap_exhausted.wait())
-    terminal_wait = asyncio.create_task(terminal_published.wait())
-    done, pending = await asyncio.wait(
-        {exhausted_wait, terminal_wait}, return_when=asyncio.FIRST_COMPLETED
+    exhausted_wait = asyncio.create_task(
+        asyncio.wait_for(backend.post_cap_exhausted.wait(), 10)
+    )
+    terminal_wait = asyncio.create_task(
+        asyncio.wait_for(terminal_published.wait(), 10)
+    )
+    done, pending = await await_or_fail(
+        asyncio.wait(
+            {exhausted_wait, terminal_wait}, return_when=asyncio.FIRST_COMPLETED
+        ),
+        what="post-cap exhaustion or terminal publication",
     )
     assert exhausted_wait in done
     assert terminal_wait not in done
     for task in pending:
         task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(*pending, return_exceptions=True),
+        what="post-cap wait cleanup",
+    )
 
     child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
     if send_fresh_prompt:
+        flow = owner.conversation_channel._delivery_targets[child_handle].flow
+        prompt_suppressed = asyncio.Event()
+        original_suppress = flow.suppress_pending
+
+        def observe_suppression(staged_ids: tuple[str, ...]) -> None:
+            prompt_suppressed.set()
+            original_suppress(staged_ids)
+
+        monkeypatch.setattr(flow, "suppress_pending", observe_suppression)
+        fresh_response = asyncio.create_task(
+            asyncio.wait_for(backend.fresh_prompt_seen.wait(), 10)
+        )
+        suppressed_response = asyncio.create_task(
+            asyncio.wait_for(prompt_suppressed.wait(), 10)
+        )
         assert (
             await send_to_run(
                 store,
@@ -3822,18 +4015,40 @@ async def _run_post_cap_tool_cycle(
             )
             is None
         )
-        await backend.fresh_prompt_seen.wait()
+        done, pending = await await_or_fail(
+            asyncio.wait(
+                {fresh_response, suppressed_response},
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
+            what="fresh prompt response or suppression",
+        )
+        for task in pending:
+            task.cancel()
+        await await_or_fail(
+            asyncio.gather(*pending, return_exceptions=True),
+            what="fresh prompt race cleanup",
+        )
+        assert fresh_response in done
+        assert suppressed_response not in done
 
-    state = next(
-        state
-        for state, _configured_timeout in deadlines.started
-        if deadlines._wakes[id(state)][1] == child_handle
+    if not send_fresh_prompt:
+        state = next(
+            state
+            for state, _configured_timeout in deadlines.started
+            if deadlines._wakes[id(state)][1] == child_handle
+        )
+        deadlines.expire_child_bound(state)
+    await await_or_fail(
+        terminal_published.wait(),
+        what=(
+            "terminal publication after fresh prompt"
+            if send_fresh_prompt
+            else "terminal publication after child deadline"
+        ),
     )
-    deadlines.expire_child_bound(state)
-    await terminal_published.wait()
     backend.release_grandchild.set()
-    await owner.wait()
-    await loop.close()
+    await await_or_fail(owner.wait(), what="background owner completion")
+    await await_or_fail(loop.close(), what="agent loop close")
     return backend
 
 
@@ -3856,6 +4071,8 @@ async def test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget(
         tmp_path, monkeypatch, send_fresh_prompt=True
     )
     assert backend.fresh_prompt_seen.is_set()
+
+
 
 
 @pytest.mark.asyncio
@@ -4089,7 +4306,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def aiter_bytes(self) -> AsyncIterator[bytes]:
             stream_started.set()
             yield b'{"message":{"content":"partial"}}\n'
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
 
     class StreamContext:
         def __init__(self) -> None:
@@ -4102,7 +4319,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def __aexit__(self, *args: object) -> None:
             self.close_started.set()
             try:
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
             except asyncio.CancelledError:
                 self.close_cancelled.set()
                 raise
@@ -4120,7 +4337,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def aclose(self) -> None:
             self.close_started.set()
             try:
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
             except asyncio.CancelledError:
                 self.close_cancelled.set()
                 raise
@@ -4139,12 +4356,16 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
 
     model_turn = asyncio.create_task(
         state.run_model_turn(
-            child_loop, OllamaBackend(stall_seconds=0).complete([], []), consume_stream
+            child_loop,
+            OllamaBackend(stall_seconds=0).complete(
+                [], [], control=completion_control()
+            ),
+            consume_stream,
         )
     )
-    await stream_started.wait()
+    await await_or_fail(stream_started.wait(), what="stream_started.wait()")
     deadlines.expire(state)
-    result = await model_turn
+    result = await await_or_fail(model_turn, what="model_turn")
     await asyncio.sleep(0)
 
     assert result is not None
@@ -5019,7 +5240,10 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
         assert policy.pending_requests() == []
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(task, return_exceptions=True),
+            what="parallel approval cleanup",
+        )
         await loop.close()
         store.close()
 
@@ -5057,12 +5281,11 @@ async def test_run_agent_tool_writes_child_run_started_before_child_work(
     monkeypatch.setattr(agent_runner_module, "_build_child_loop", build_child)
     original_complete = backend.complete
 
-    async def complete(messages, tool_schemas):
+    def complete(messages, tool_schemas, *, control):
         if len(backend.calls) == 1:
             assert any(entry.type == "child_run_started" for entry in store.entries)
             milestones.append("output")
-        async for event in original_complete(messages, tool_schemas):
-            yield event
+        return original_complete(messages, tool_schemas, control=control)
 
     backend.complete = complete
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -5613,7 +5836,7 @@ async def test_restricted_profile_keeps_eligible_child_runtime_tools(
         else ScriptedTurn([TextContent("finished")])
     )
     backend = PerActorFakeBackend(
-        [
+        parent_turns=[
             ScriptedTurn(
                 tool_calls=[
                     ToolCall(
@@ -5629,7 +5852,7 @@ async def test_restricted_profile_keeps_eligible_child_runtime_tools(
                 ]
             )
         ],
-        {"inspect the task": [child_turn]},
+        child_turns={"inspect the task": [child_turn]},
         parent_prompt="start",
         gated_child_call=0,
     )
@@ -6921,6 +7144,7 @@ class NestedLoopBoundHandlerBackend(CompletionBackend):
         self.child_a_path: Path | None = None
         self.release_child_b = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -7298,33 +7522,52 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     root_woke = asyncio.Event()
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop.set_background_wake_callback(root_woke.set)
+    child_store: ConversationStore | None = None
+    grandchild_store: ConversationStore | None = None
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
-    backend.release_grandchild.set()
-    await asyncio.wait_for(backend.child_notification_started.wait(), timeout=2)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
+        backend.release_grandchild.set()
+        await asyncio.wait_for(backend.child_notification_started.wait(), timeout=10)
 
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    root_notifications = store.agent_notifications(pending_only=False)
-    assert len(root_notifications) == 1
-    assert root_notifications[0].data["display_only"] is True
-    assert store.agent_notifications() == []
-    assert not root_woke.is_set()
-    nested_result = next(
-        message.tool_result for message in child_store.messages() if message.tool_result
-    )
-    assert nested_result.structured_content is not None
-    assert nested_result.structured_content["status"] == "running"
-    assert [
-        entry.data["status"]
-        for entry in child_store.agent_notifications(pending_only=False)
-    ] == ["completed"]
-    grandchild_store = ConversationStore(
-        child_store.session_dir / "agents", session_id="1"
-    )
-    assert grandchild_store.agent_canceled() is None
-    backend.release_child_notification.set()
-    await loop.close()
+        child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+        root_notifications = store.agent_notifications(pending_only=False)
+        assert len(root_notifications) == 1
+        assert root_notifications[0].data["display_only"] is True
+        assert store.agent_notifications() == []
+        assert not root_woke.is_set()
+        nested_result = next(
+            message.tool_result
+            for message in child_store.messages()
+            if message.tool_result
+        )
+        assert nested_result.structured_content is not None
+        assert nested_result.structured_content["status"] == "running"
+        assert [
+            entry.data["status"]
+            for entry in child_store.agent_notifications(pending_only=False)
+        ] == ["completed"]
+        grandchild_store = ConversationStore(
+            child_store.session_dir / "agents", session_id="1"
+        )
+        assert grandchild_store.agent_canceled() is None
+        backend.release_child_notification.set()
+    finally:
+        backend.release_grandchild.set()
+        backend.release_child_notification.set()
+        try:
+            await loop.close()
+        finally:
+            try:
+                if grandchild_store is not None:
+                    grandchild_store.close()
+            finally:
+                try:
+                    if child_store is not None:
+                        child_store.close()
+                finally:
+                    store.close()
 
 
 @pytest.mark.asyncio
@@ -7772,14 +8015,13 @@ async def test_failed_background_receipt_matches_error_flag(
 ) -> None:
     call = _background_agent_call()
     store = ConversationStore(tmp_path)
-    backend = PerActorFakeBackend(
-        [ScriptedTurn(tool_calls=[call])],
-        {"inspect the task": [ScriptedTurn()]},
-        parent_prompt="start",
-        gated_child_call=0,
-    )
     loop = AgentLoop(
-        backend,
+        PerActorFakeBackend(
+            parent_turns=[ScriptedTurn(tool_calls=[call]), ScriptedTurn()],
+            child_turns={"inspect the task": [ScriptedTurn()]},
+            parent_prompt="start",
+            gated_child_call=0,
+        ),
         store,
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
@@ -7787,30 +8029,27 @@ async def test_failed_background_receipt_matches_error_flag(
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
 
-    try:
-        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-        await wait_background_owner(loop)
-        notification = store.agent_notifications(pending_only=False)[0]
-        terminal = next(
-            event
-            for event in background_events
-            if event.type is StreamEventType.TOOL_EXECUTION_END
-        )
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    await wait_background_owner(loop)
+    notification = store.agent_notifications(pending_only=False)[0]
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
 
-        assert notification.data["status"] == "error"
-        assert notification.data["text"].count("error=true") == 1
-        assert notification.data["text"].count("canceled=false") == 1
-        assert terminal.tool_result is not None
-        assert terminal.tool_result.is_error is True
-        assert terminal.tool_result.is_canceled is False
-        rendered = render_event(terminal)
-        assert rendered is not None
-        assert "failed" in rendered.plain
-        assert "error=" not in rendered.plain
-        assert "canceled=" not in rendered.plain
-    finally:
-        backend.release_children.set()
-        await loop.close()
+    assert notification.data["status"] == "error"
+    assert notification.data["text"].count("error=true") == 1
+    assert notification.data["text"].count("canceled=false") == 1
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.is_error is True
+    assert terminal.tool_result.is_canceled is False
+    rendered = render_event(terminal)
+    assert rendered is not None
+    assert "failed" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -7851,10 +8090,11 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     child_started = asyncio.Event()
 
     class StartedBackend(FakeBackend):
+        @owned_completion
         async def complete(
             self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
         ) -> AsyncIterator[StreamEvent]:
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 if (
                     len(self.calls) == 2
                     and event.type is StreamEventType.MESSAGE_UPDATE
@@ -7876,7 +8116,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     await asyncio.wait_for(child_started.wait(), timeout=10)
     loop.abort()
 
-    events = await task
+    events = await await_or_fail(task, what="task")
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
@@ -7948,31 +8188,40 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(
 
 @pytest.mark.asyncio
 async def test_typed_child_type_survives_cancellation_and_reopen(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    backend = FakeBackend(
+    child_started = asyncio.Event()
+
+    class StartedBackend(FakeBackend):
+        @owned_completion
+        async def complete(
+            self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+        ) -> AsyncIterator[StreamEvent]:
+            async for event in FakeBackend.complete.__wrapped__(
+                self, messages, tool_schemas
+            ):
+                if (
+                    len(self.calls) == 2
+                    and event.type is StreamEventType.MESSAGE_UPDATE
+                ):
+                    child_started.set()
+                yield event
+
+    backend = StartedBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
             ScriptedTurn([TextContent("slow")], delay=5),
         ]
     )
-    lifecycle_started = threading.Event()
-    original_start = ConversationStore.start_agent_lifecycle
-
-    def observed_start(self, *args, **kwargs) -> None:
-        original_start(self, *args, **kwargs)
-        lifecycle_started.set()
-
-    monkeypatch.setattr(ConversationStore, "start_agent_lifecycle", observed_start)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    assert await asyncio.to_thread(lifecycle_started.wait, 10)
+    await asyncio.wait_for(child_started.wait(), timeout=10)
     loop.abort()
 
-    await task
+    await await_or_fail(task, what="canceled typed child turn")
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -8741,6 +8990,7 @@ class TerminalSendBackend(CompletionBackend):
         self.release_child = asyncio.Event()
         self.child_calls = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8783,6 +9033,7 @@ class RunBackend(CompletionBackend):
         self.release_child = asyncio.Event()
         self.child_prompts: list[str] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8804,7 +9055,9 @@ class RunBackend(CompletionBackend):
         elif last_user == "work the big task":
             self.child_prompts.append(last_user)
             self.child_started.set()
-            await self.release_child.wait()
+            await await_or_fail(
+                self.release_child.wait(), what="follow-up child release"
+            )
             blocks = [TextContent("first pass done")]
         else:
             self.child_prompts.append(last_user)
@@ -8832,6 +9085,7 @@ class FollowUpFinishBackend(CompletionBackend):
         self.release_finish = asyncio.Event()
         self.pause_before_finish = False
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8854,7 +9108,9 @@ class FollowUpFinishBackend(CompletionBackend):
         elif not self.child_prompts:
             self.child_prompts.append(last_user)
             self.child_started.set()
-            await self.release_child.wait()
+            await await_or_fail(
+                self.release_child.wait(), what="finish child release"
+            )
             blocks = [TextContent("first pass done")]
         elif (
             self.finish_attempts
@@ -8882,7 +9138,9 @@ class FollowUpFinishBackend(CompletionBackend):
             ]
         yield StreamEvent(StreamEventType.MESSAGE_START)
         if pause_before_blocks:
-            await self.release_finish.wait()
+            await await_or_fail(
+                self.release_finish.wait(), what="finish response release"
+            )
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
         yield StreamEvent(
@@ -8899,6 +9157,7 @@ class AskParentFinishBackend(CompletionBackend):
         self.release_question_finish = asyncio.Event()
         self.answer_seen = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8931,7 +9190,9 @@ class AskParentFinishBackend(CompletionBackend):
             blocks = [ToolUseContent(_run_agent_call())]
         elif not question_asked:
             self.child_started.set()
-            await self.release_child.wait()
+            await await_or_fail(
+                self.release_child.wait(), what="question child release"
+            )
             blocks = [
                 ToolUseContent(
                     ToolCall(
@@ -8954,7 +9215,10 @@ class AskParentFinishBackend(CompletionBackend):
             ]
         else:
             self.question_published.set()
-            await self.release_question_finish.wait()
+            await await_or_fail(
+                self.release_question_finish.wait(),
+                what="question finish release",
+            )
             blocks = [
                 ToolUseContent(
                     ToolCall(
@@ -8978,6 +9242,7 @@ class RetryBeforeProviderBackend(CompletionBackend):
         self.retry_sent = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8986,13 +9251,14 @@ class RetryBeforeProviderBackend(CompletionBackend):
         del messages, tool_schemas
         yield StreamEvent(StreamEventType.RETRY, data={"text": "retrying"})
         self.retry_sent.set()
-        await self.release.wait()
+        await await_or_fail(self.release.wait(), what="retry release")
 
 
 class CapturePromptBackend(CompletionBackend):
     def __init__(self) -> None:
         self.prompt_count = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -9014,6 +9280,7 @@ class CapturePromptBackend(CompletionBackend):
 
 
 class WorkerBackend(RunBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -9030,7 +9297,7 @@ class WorkerBackend(RunBackend):
             "",
         )
         if last_user != "start":
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 yield event
             return
         call = ToolCall(
@@ -9228,6 +9495,7 @@ class EarlyCloseThenAnswerBackend(CompletionBackend):
         self.calls: list[list[Message]] = []
         self.first_error = first_error
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         self.calls.append(list(messages))
@@ -9696,6 +9964,7 @@ async def test_root_delivery_committed_after_terminal_check_rearms_idle_wake(
                 flow.produce(_task_exit_input("terminal-race"))
             )
 
+    # test-contract: seam force the terminal-check/notification-commit ordering
     monkeypatch.setattr(loop, "_schedule_transcript_index", schedule_and_produce)
     loop.set_background_wake_callback(woke.set)
     events: list[StreamEvent] = []
@@ -9703,12 +9972,14 @@ async def test_root_delivery_committed_after_terminal_check_rearms_idle_wake(
         events.append(event)
         if event.type is StreamEventType.AGENT_END:
             assert producer is not None
-            notification = await producer
+            notification = await await_or_fail(
+                producer, what="terminal notification production"
+            )
             assert notification.changed
             assert not woke.is_set()
 
     assert events[-1].type is StreamEventType.AGENT_END
-    await asyncio.wait_for(woke.wait(), 1)
+    await await_or_fail(woke.wait(), what="delivery wake")
     assert [entry.id for entry in store.agent_notifications()] == [
         notification.entries[0].id
     ]
@@ -9726,6 +9997,7 @@ async def test_provider_error_does_not_ack_staged_prompt(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -9746,7 +10018,7 @@ async def test_provider_error_does_not_ack_staged_prompt(
         return retry_succeeds or len(backend.calls) < 2
 
     backend = ErrorThenAnswerBackend()
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -9764,7 +10036,7 @@ async def test_provider_error_does_not_ack_staged_prompt(
 
     events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    assert len(backend.calls) == (3 if retry_succeeds else 2)
+    assert len(backend.calls) == (3 if retry_succeeds else 5)
     request_prompt_ids = [
         [
             message.metadata["zeta.pending_prompt_id"]
@@ -9802,7 +10074,7 @@ async def test_early_close_commits_staged_delivery_only_after_successful_retry(
         return True
 
     backend = EarlyCloseThenAnswerBackend()
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -9873,17 +10145,17 @@ async def test_early_close_commits_staged_delivery_only_after_successful_retry(
 
 @pytest.mark.asyncio
 async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     backoff_started = asyncio.Event()
 
     async def wait_for_cancel(*_args, **_kwargs) -> bool:
         backoff_started.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
         return True
 
     backend = EarlyCloseThenAnswerBackend()
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", wait_for_cancel)
+    backend._completion_wait = wait_for_cancel
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -9903,10 +10175,10 @@ async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
             first_events.append(event)
 
     turn = asyncio.create_task(consume_first_turn())
-    await backoff_started.wait()
+    await await_or_fail(backoff_started.wait(), what="backoff_started.wait()")
     turn.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await turn
+        await await_or_fail(turn, what="turn")
 
     assert not any(
         event.type
@@ -9926,7 +10198,7 @@ async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
     async def retry_now(*_args, **_kwargs) -> bool:
         return True
 
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     retry_events = await _collect(loop.run_turn("resume", origin=MessageOrigin.USER))
 
     assert (
@@ -9970,7 +10242,7 @@ async def test_stall_commits_staged_prompt_only_after_successful_retry(
         return True
 
     backend = EarlyCloseThenAnswerBackend(StallError("provider stalled"))
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -10006,6 +10278,7 @@ async def test_provider_error_root_exit_admits_terminal_producer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class ErrorBackend(CompletionBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             yield StreamEvent(
@@ -10619,8 +10892,9 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     await asyncio.sleep(0)
     assert not task.done()
     release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    result = await await_or_fail(task, what="committed agent_send result")
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("queued a follow-up")
 
     assert [
         entry.data["text"]
@@ -10654,7 +10928,9 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
 
     async def blocked_cleanup(*args, **kwargs):
         cleanup_started.set()
-        await release_cleanup.wait()
+        await await_or_fail(
+            release_cleanup.wait(), what="release cleanup"
+        )
         return await original_gather(*args, **kwargs)
 
     monkeypatch.setattr(execution_module.asyncio, "gather", blocked_cleanup)
@@ -10679,7 +10955,7 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
     await asyncio.wait_for(cleanup_started.wait(), timeout=2)
     task.cancel()
     release_cleanup.set()
-    result = await task
+    result = await await_or_fail(task, what="agent send cleanup cancellation")
 
     assert result["isError"] is False
     assert result["content"][0]["text"] == (
@@ -10700,8 +10976,8 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
 
 
 @pytest.mark.asyncio
-async def test_agent_send_aborts_before_append_when_store_lock_is_held(
-    tmp_path: Path,
+async def test_agent_send_cancellation_reports_durable_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent_store = ConversationStore(tmp_path / "parent")
     child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
@@ -10726,6 +11002,35 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
     await delivery_flow.initialize()
     owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
     registry._agent_owner = owner
+    canceled = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "agent-send-canceled-before-admission",
+                "agent_send",
+                {"child_instance_id": "parent:1", "message": "not sent"},
+            )
+        )
+    )
+    canceled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(canceled, 10)
+    assert await asyncio.to_thread(child_store.pending_prompts) == []
+
+    entered_commit = threading.Event()
+    committed = threading.Event()
+    original_commit = step_delivery_store_module._commit_delivery_input
+
+    def observe_commit(store, item):
+        entered_commit.set()
+        try:
+            return original_commit(store, item)
+        finally:
+            committed.set()
+
+    # test-contract: seam observe the real durable commit admission point.
+    monkeypatch.setattr(
+        step_delivery_store_module, "_commit_delivery_input", observe_commit
+    )
     lock = child_store._append_lock()
     lock.__enter__()
     try:
@@ -10738,15 +11043,22 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
                 )
             )
         )
-        await asyncio.sleep(0)
+        await await_or_fail(
+            asyncio.to_thread(entered_commit.wait, 10),
+            what="agent_send commit to start",
+        )
         task.cancel()
-        await asyncio.sleep(0)
         assert not task.done()
     finally:
         lock.__exit__(None, None, None)
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=2)
+    await await_or_fail(
+        asyncio.to_thread(committed.wait, 10),
+        what="agent_send commit to finish",
+    )
+    result = await await_or_fail(task, what="committed agent_send result")
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("queued a follow-up")
     assert [
         entry.data["text"]
         for entry in await asyncio.to_thread(child_store.pending_prompts)
@@ -11216,6 +11528,7 @@ async def test_child_thinking_only_reply_with_pending_notification_is_nudged(
             self.store = store
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -11257,6 +11570,7 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
             self.store = store
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             call = len(self.calls)
@@ -11328,6 +11642,7 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             call = len(self.calls)
@@ -11382,6 +11697,7 @@ async def test_notification_consumption_reply_is_never_nudged(tmp_path: Path) ->
             self.store = store
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -11439,6 +11755,7 @@ async def test_nudge_notification_provider_shape(provider: str, tmp_path: Path) 
             self.store = store
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -11592,8 +11909,11 @@ async def test_subagent_pending_delivery_wins_at_recovery_cap(
             super().__init__(turns)
             self.loop: AgentLoop | None = None
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
-            async for event in super().complete(messages, tool_schemas):
+            async for event in FakeBackend.complete.__wrapped__(
+                self, messages, tool_schemas
+            ):
                 if len(self.calls) == 8 and event.type is StreamEventType.MESSAGE_END:
                     assert self.loop is not None
                     flow = await self.loop._ensure_step_delivery()
@@ -11781,6 +12101,7 @@ class _TaskOwningChildBackend(CompletionBackend):
     def __init__(self, command: str) -> None:
         self.command = command
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -11865,6 +12186,7 @@ class _TaskFinishGateBackend(CompletionBackend):
         self.follow_up_processed = asyncio.Event()
         self.noise_notification_processed = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -12074,12 +12396,6 @@ async def _start_task_gate(
     return store, loop, run, completion_published
 
 
-# quarantined: known product race - process.py publishes running=False before the exit evidence is durably pending; runtime-small process owner design r5 row 4 removes this marker (see PR #861)
-@pytest.mark.xfail(
-    raises=AssertionError,
-    strict=False,
-    reason="quarantined: known product race - process.py publishes running=False before the exit evidence is durably pending; runtime-small process owner design r5 row 4 removes this marker (see PR #861)",
-)
 @pytest.mark.asyncio
 @_finish_gate_hang_guard
 async def test_finish_gate_wait_outlives_default_bound_for_running_task(
@@ -12413,8 +12729,8 @@ async def test_agent_cancel_mixed_child_and_task_terminal_result(
     )
     store, loop, run, completion_published = await _start_task_gate(tmp_path, backend)
 
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=2)
-    await asyncio.wait_for(run, timeout=5)
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
+    await asyncio.wait_for(run, timeout=10)
     notification = await _completion_after_publication(store, completion_published)
     assert "background sub-agents" in backend.gate_text
     assert "collect mixed evidence" in backend.gate_text
@@ -12582,6 +12898,8 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
             "heredoc-secret",
         ),
     ],
+    # Stable ids: the commands embed sys.executable, which differs per machine.
+    ids=["bearer-arg", "env-token", "password-flag", "stdin-path", "fd-url", "heredoc"],
 )
 async def test_killed_task_receipt_never_contains_command_secrets(
     tmp_path: Path,
@@ -12590,6 +12908,7 @@ async def test_killed_task_receipt_never_contains_command_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FailingBackend(_TaskOwningChildBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             started = any(
                 message.role is MessageRole.TOOL_RESULT
@@ -12602,7 +12921,9 @@ async def test_killed_task_receipt_never_contains_command_secrets(
             )
             if started:
                 raise CodexStreamError("permanent", code="model_not_found")
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(
+                messages, tool_schemas, control=completion_control()
+            ):
                 yield event
 
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
@@ -12697,6 +13018,7 @@ class _ChildConsumeBackend(CompletionBackend):
         self.loop: AgentLoop | None = None
         self.saw_notification = False
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -12776,6 +13098,7 @@ class _RecordingBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -12889,6 +13212,7 @@ class ChildCwdBackend(CompletionBackend):
         self.grandchild_arguments = grandchild_arguments
         self.grandchild_tool_call = grandchild_tool_call
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -13206,6 +13530,7 @@ class ChildToolSequenceBackend(CompletionBackend):
         self.child_tool_calls = list(child_tool_calls)
         self.child_prompt = child_arguments["prompt"]
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -13332,6 +13657,7 @@ class ChildRunBackgroundBackend(CompletionBackend):
         self.child_prompt = "child-work"
         self.task_output_requested = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -13422,8 +13748,10 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     child_registry: ToolRegistry | None = None
     child_execute_entered = asyncio.Event()
     release_child_execute = asyncio.Event()
+    child_abort_signaled = asyncio.Event()
     child_abort_entered = asyncio.Event()
     original_execute = ToolRegistry.execute
+    original_abort = ToolRegistry.abort
     original_abort_approval = ToolRegistry.abort_approval
 
     async def pause_child_before_execute(
@@ -13436,8 +13764,13 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
             assert isinstance(registry.approval_policy, ChildApprovalPolicy)
             child_registry = registry
             child_execute_entered.set()
-            await release_child_execute.wait()
+            await asyncio.wait_for(release_child_execute.wait(), timeout=10)
         return await original_execute(registry, tool_call, **kwargs)
+
+    def observe_child_abort(registry: ToolRegistry) -> None:
+        if registry is child_registry:
+            child_abort_signaled.set()
+        original_abort(registry)
 
     def record_child_abort_error(
         registry: ToolRegistry,
@@ -13456,6 +13789,8 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
             raise
 
     monkeypatch.setattr(ToolRegistry, "execute", pause_child_before_execute)
+    # test-contract: seam observe the child abort signal before releasing its tool.
+    monkeypatch.setattr(ToolRegistry, "abort", observe_child_abort)
     monkeypatch.setattr(ToolRegistry, "abort_approval", record_child_abort_error)
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -13477,7 +13812,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     )
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(child_execute_entered.wait(), timeout=5)
+    await asyncio.wait_for(child_execute_entered.wait(), timeout=10)
     child_store = _child_store_for(store)
     assert any(
         message.role is MessageRole.ASSISTANT
@@ -13488,23 +13823,30 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
         for message in child_store.messages()
     )
 
-    loop.abort()
-    release_child_execute.set()
-    await asyncio.wait_for(child_abort_entered.wait(), timeout=5)
-    assert child_abort_calls > 0
-    assert abort_errors == []
-    await wait_background_owner(loop)
-    notification = store.agent_notifications(pending_only=False)[-1]
-    assert notification.data["status"] == "canceled"
+    try:
+        loop.abort()
+        await asyncio.wait_for(child_abort_signaled.wait(), timeout=10)
+        release_child_execute.set()
+        await asyncio.wait_for(child_abort_entered.wait(), timeout=10)
+        assert child_abort_calls > 0
+        assert abort_errors == []
+        await wait_background_owner(loop)
+        notification = store.agent_notifications(pending_only=False)[-1]
+        assert notification.data["status"] == "canceled"
 
-    assert notification.data["killed_task_count"] == 1
-    assert "abort_or_winner" not in notification.data["text"]
-    refreshed_child = ConversationStore(
-        child_store.root_dir,
-        session_id=child_store.session_id,
-    )
-    assert refreshed_child.agent_lifecycle()["state"] == "canceled"
-    await loop.close()
+        assert notification.data["killed_task_count"] == 1
+        assert "abort_or_winner" not in notification.data["text"]
+        refreshed_child = ConversationStore(
+            child_store.root_dir,
+            session_id=child_store.session_id,
+        )
+        try:
+            assert refreshed_child.agent_lifecycle()["state"] == "canceled"
+        finally:
+            refreshed_child.close()
+    finally:
+        release_child_execute.set()
+        await loop.close()
 
 
 @pytest.mark.asyncio
@@ -13913,13 +14255,16 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
             super().__init__(calls)
             self.recorded: list[list[Message]] = []
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
             tool_schemas: Sequence[ToolSchema],
         ) -> AsyncIterator[StreamEvent]:
             self.recorded.append(list(messages))
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(
+                messages, tool_schemas, control=completion_control()
+            ):
                 yield event
 
     backend = RecordingBackgroundBackend(
@@ -14243,6 +14588,152 @@ def test_finish_tool_description_and_child_prompt_say_finish_ends_the_run(
     assert "summary" in description
 
 
+class _ParentTaskExplicitFinishBackend(CompletionBackend):
+    def __init__(self, command: str) -> None:
+        self.command = command
+
+    @owned_completion
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        prompt = _last_user_prompt(messages)
+        results = {
+            message.tool_result.tool_call_id
+            for message in messages
+            if message.tool_result is not None
+        }
+        if prompt == "root" and "lead" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "lead",
+                        "agent",
+                        {
+                            "prompt": "lead",
+                            "description": "parent lead",
+                            "preset": "nested-lead",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif prompt == "lead" and "parent-task" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "parent-task",
+                        "run_background",
+                        {"command": self.command},
+                    )
+                )
+            ]
+        elif prompt == "lead" and "child" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "child",
+                        "agent",
+                        {
+                            "prompt": "child",
+                            "description": "explicit finisher",
+                            "preset": "nested-finisher",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif prompt == "child" and "finish" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "finish",
+                        "finish",
+                        {"status": "done", "summary": "child done"},
+                    )
+                )
+            ]
+        else:
+            blocks = [TextContent(f"{prompt} remains available")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_ignores_parent_run_background_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _ParentTaskExplicitFinishBackend(_python("import sys; sys.stdin.read()"))
+    store = ConversationStore(tmp_path)
+    catalog = _nested_handler_catalog()
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
+    loop.explicit_finish = True
+    finish_seen = asyncio.Event()
+    child_finished = asyncio.Event()
+    child_registries: list[ToolRegistry] = []
+    finish_result: ToolResult | None = None
+    original_clone = ToolRegistry.clone_for_session
+    original_unregister = loop._background_owner.unregister
+
+    def observe_clone(
+        registry: ToolRegistry, *args: object, **kwargs: object
+    ) -> ToolRegistry:
+        clone = original_clone(registry, *args, **kwargs)
+        child_registries.append(clone)
+        return clone
+
+    def observe_unregister(instance_id: str) -> None:
+        if loop._background_owner._descriptions.get(instance_id) == "explicit finisher":
+            child_finished.set()
+        original_unregister(instance_id)
+
+    def collect_event(event: StreamEvent) -> None:
+        nonlocal finish_result
+        if (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "finish"
+        ):
+            finish_result = event.tool_result
+            finish_seen.set()
+
+    monkeypatch.setattr(ToolRegistry, "clone_for_session", observe_clone)
+    monkeypatch.setattr(loop._background_owner, "unregister", observe_unregister)
+    loop.set_background_event_sink(collect_event)
+    try:
+        await _collect(loop.run_turn("root", origin=MessageOrigin.USER))
+        await await_or_fail(finish_seen.wait(), what="explicit child finish result")
+        assert finish_result is not None
+        assert finish_result.content == "finish accepted; no more work or prose is needed"
+        await await_or_fail(child_finished.wait(), what="explicit child completion")
+        assert len(child_registries) == 2
+        lead_registry = child_registries[0]
+        assert any(task.running for task in lead_registry.background_tasks.snapshot())
+    finally:
+        await loop.close()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_explicit_finish_background_child_preserves_report_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -14365,16 +14856,17 @@ async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
         description="owned child",
         parent_instance_id="root:1",
     )
-    original_complete = backend.complete
+    raw_complete = FakeBackend.complete.__wrapped__
 
-    async def release_owned_work(messages, tool_schemas):
+    @owned_completion
+    async def release_owned_work(self, messages, tool_schemas):
         if len(backend.calls) == 1:
             loop._background_owner.unregister("root:1:1")
             owned.cancel()
-        async for event in original_complete(messages, tool_schemas):
+        async for event in raw_complete(self, messages, tool_schemas):
             yield event
 
-    backend.complete = release_owned_work
+    backend.complete = MethodType(release_owned_work, backend)
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.AGENT_PROMPT))
         assert len(backend.calls) == 2
@@ -14464,6 +14956,7 @@ async def test_child_finishes_during_notification_turn_that_woke_it(
             self.child_replied = asyncio.Event()
             self.finish_sent = False
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             last_user = next(
@@ -15178,17 +15671,23 @@ async def test_last_owned_source_exit_publishes_stall_without_polling(
         await _cancel_idle_fixture(run, registry, parent, child)
 
 
+@pytest.mark.parametrize("extra_idle_wake", [False, True])
 @pytest.mark.asyncio
 async def test_question_answer_then_later_stall_starts_new_notice_episode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_idle_wake: bool
 ) -> None:
     parent, child, registry, loop, parent_flow, _wakes = await _idle_notice_fixture(
         tmp_path
     )
     idle_entries: asyncio.Queue[None] = asyncio.Queue()
+    forced_extra_idle = asyncio.Event()
+    answer_idle_entered = asyncio.Event()
+    force_extra_idle = False
+    answer_consumed = False
     prompts: list[str] = []
 
     async def consume(_loop, prompt, **kwargs):
+        nonlocal answer_consumed
         await _ack_fake_delivery(child, kwargs)
         if not prompt and loop.step_delivery.has_prompt_edge:
             prepared = await loop.step_delivery.prepare_request(
@@ -15198,6 +15697,8 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             prompt = prepared.messages[-1].content[0].text
             await loop.step_delivery.acknowledge_active()
         prompts.append(prompt)
+        if prompt == "Re q-reset: approved":
+            answer_consumed = True
         if prompt == "ask now":
             await loop._background_owner.conversation_channel.publish_question(
                 child_instance_id="root:1",
@@ -15213,7 +15714,11 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
 
     async def wait_idle(wake, _timeout):
         idle_entries.put_nowait(None)
-        await wake()
+        if force_extra_idle and not answer_consumed:
+            forced_extra_idle.set()
+        if answer_consumed:
+            answer_idle_entered.set()
+        await asyncio.wait_for(wake(), 10)
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
@@ -15256,6 +15761,10 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         prepared = await parent_flow.prepare_request("idle_start", [], None)
         assert prepared.notification_ids
         await parent_flow.acknowledge_active()
+        if extra_idle_wake:
+            force_extra_idle = True
+            loop._background_owner.conversation_channel.wake("root:1")
+            await asyncio.wait_for(forced_extra_idle.wait(), 10)
         assert (
             await send_to_run(
                 parent,
@@ -15265,7 +15774,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             )
             is None
         )
-        await asyncio.wait_for(idle_entries.get(), 10)
+        await asyncio.wait_for(answer_idle_entered.wait(), 10)
         notices = [
             entry
             for entry in parent.agent_notifications(pending_only=False)
@@ -15791,6 +16300,186 @@ async def test_idle_child_is_running_during_wake_turn(
         await registry.close()
         child_store.close()
         parent_store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_lock_exhaustion_keeps_child_alive_for_follow_up(
+    tmp_path: Path,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.exhausted = asyncio.Event()
+            self.follow_up_succeeded = asyncio.Event()
+            self._completion_wait = no_wait
+
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls += 1
+            if self.calls <= 5:
+                if self.calls == 5:
+                    self.exhausted.set()
+                raise AccountCredentialLockTimeoutError()
+            assert "continue" in _user_texts(messages)
+            self.follow_up_succeeded.set()
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(
+                    MessageRole.ASSISTANT,
+                    [TextContent("follow-up succeeded")],
+                ),
+            )
+
+    async def no_wait(_delay: float) -> None:
+        return None
+
+    def child_result(
+        text: str,
+        *,
+        state: str | None = None,
+        error: bool | None = None,
+        status: str | None = None,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        return {
+            "content": [{"type": "text", "text": text}],
+            "isError": error if error is not None else state == "failed",
+            "structuredContent": {"status": status or state},
+        }
+
+    store = ConversationStore(tmp_path)
+    store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(store)
+    backend = Backend()
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        agent_depth=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.explicit_finish = True
+    flow = await loop._ensure_step_delivery()
+    channel = loop._background_owner.conversation_channel
+    channel.register_loop("root:1")
+    loop._terminal_transition_fence = TerminalTransitionFence(
+        store,
+        notification_pending=lambda: flow.has_pending_edge,
+    )
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "start",
+            child_store=store,
+            child_path=str(tmp_path),
+            publish=lambda _status: None,
+            child_turns=lambda: 0,
+            update_turns=lambda _turns: None,
+            update_step=lambda _step: None,
+            update_tool_calls=lambda _calls: None,
+            finish_lifecycle=lambda _state, _text: {},
+            publish_lifecycle=lambda *_args, **_kwargs: None,
+            child_result=child_result,
+            error_message=str,
+        )
+    )
+    follow_up: asyncio.Task[bool] | None = None
+    try:
+        await await_or_fail(backend.exhausted.wait(), what="account retries exhausted")
+        produced = await channel.produce_to(
+            "root:1",
+            pending_delivery_module.PromptInput(
+                "continue",
+                MessageOrigin.AGENT_SEND,
+                asyncio.get_running_loop().time() + 10,
+            ),
+        )
+        assert produced is not None
+        follow_up = asyncio.create_task(
+            await_or_fail(
+                backend.follow_up_succeeded.wait(), what="successful child follow-up"
+            )
+        )
+        done, _ = await await_or_fail(
+            asyncio.wait(
+                {follow_up, run},
+                timeout=10,
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
+            what="child follow-up or terminal result",
+        )
+        assert follow_up in done, "child terminated before the follow-up succeeded"
+        assert follow_up.result() is True
+        assert backend.calls == 6
+        assert not run.done()
+        assert store.agent_lifecycle()["state"] in {"running", "idle"}
+    finally:
+        if follow_up is not None and not follow_up.done():
+            follow_up.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(follow_up, what="cancelled follow-up waiter")
+        if not run.done():
+            run.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(run, what="cancelled child run")
+        elif not run.cancelled():
+            run.exception()
+        channel.unregister_loop("root:1")
+        await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_non_account_error_still_terminates_child(tmp_path: Path) -> None:
+    class Backend(CompletionBackend):
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("auth_error", "invalid credentials"),
+            )
+
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(Backend(), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    def child_result(text: str, *, state=None, **_kwargs):
+        return {
+            "content": [{"type": "text", "text": text}],
+            "isError": state == "failed",
+            "structuredContent": {"status": state},
+        }
+
+    try:
+        result = await agent_runner_module.consume_child(
+            loop,
+            "start",
+            origin=MessageOrigin.AGENT_PROMPT,
+            child_path=str(tmp_path),
+            publish=lambda _status: None,
+            child_turns=lambda: 0,
+            update_turns=lambda _turns: None,
+            update_step=lambda _step: None,
+            update_tool_calls=lambda _calls: None,
+            finish_lifecycle=lambda _state, _text: {},
+            publish_lifecycle=lambda *_args, **_kwargs: None,
+            child_result=child_result,
+            error_message=str,
+        )
+    finally:
+        await loop.close()
+    assert result["isError"] is True
+    assert result["structuredContent"] == {"status": "failed"}
 
 
 @pytest.mark.asyncio
@@ -17668,6 +18357,391 @@ def test_child_idle_then_terminal_receipt_is_appended_and_delivered_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("with_grandchild", "wake_before_cancel"),
+    [(False, False), (True, False), (True, True)],
+    ids=["no-grandchild", "live-grandchild", "after-agent-send"],
+)
+async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_grandchild: bool,
+    wake_before_cancel: bool,
+) -> None:
+    backend = CancelIdleTreeBackend(with_grandchild=with_grandchild)
+    loop_thread = threading.get_ident()
+    cancellation_write_threads: list[int] = []
+    mark_agent_canceled = ConversationStore.mark_agent_canceled
+
+    @wraps(mark_agent_canceled)
+    def observe_cancellation_write(
+        child_store: ConversationStore, parent_tool_call_id: str
+    ) -> None:
+        if parent_tool_call_id == "start-child":
+            cancellation_write_threads.append(threading.get_ident())
+        mark_agent_canceled(child_store, parent_tool_call_id)
+
+    monkeypatch.setattr(
+        ConversationStore, "mark_agent_canceled", observe_cancellation_write
+    )
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    transition_idle = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        transition_idle(child_store)
+        lifecycle = child_store.agent_lifecycle() or {}
+        handle = lifecycle.get("handle")
+        if isinstance(handle, str) and handle.count(":") == 1:
+            backend.child_idle.set()
+
+    # test-contract: seam observes the exact idle transition without a sleep
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        max_agent_depth=3,
+    )
+    loop.explicit_finish = True
+    child_store: ConversationStore | None = None
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_idle.wait(), 10)
+        child_handle = _run_handle_from_receipt(store)
+        child_path = Path(store.agent_children()[child_handle]["child_session_path"])
+        grandchild_handle: str | None = None
+        grandchild_path: Path | None = None
+        if with_grandchild:
+            await asyncio.wait_for(backend.question_seen.wait(), 10)
+            child_store = ConversationStore(
+                child_path.parent, session_id=child_path.name, _read_only=True
+            )
+            grandchild_handle = next(iter(child_store.agent_children()))
+            assert grandchild_handle.startswith(f"{child_handle}:")
+            grandchild_path = Path(
+                child_store.agent_children()[grandchild_handle]["child_session_path"]
+            )
+            assert any(
+                entry.type == "notification"
+                and entry.data.get("kind") == "child_question"
+                and entry.data.get("status") == "pending"
+                for entry in child_store.replay()
+            )
+        if child_store is not None:
+            child_store.close()
+            child_store = None
+
+        if wake_before_cancel:
+            backend.child_idle.clear()
+            sent = await loop.tool_registry.execute(
+                ToolCall(
+                    "wake-before-cancel",
+                    "agent_send",
+                    {"child_instance_id": child_handle, "message": "wake child"},
+                )
+            )
+            assert sent["isError"] is False
+            await asyncio.wait_for(backend.follow_up_seen.wait(), 10)
+            await asyncio.wait_for(backend.child_idle.wait(), 10)
+
+        canceled = await loop.tool_registry.execute(
+            ToolCall("cancel-idle-child", "agent_cancel", {"handle": child_handle})
+        )
+        assert canceled["structuredContent"]["status"] == "cancellation_confirmed"
+        status = await loop.tool_registry.execute(
+            ToolCall("canceled-idle-status", "agent_status", {"handle": child_handle})
+        )
+        child_status = status["structuredContent"]["children"][0]
+        assert child_status["state"] == "canceled"
+        assert child_status["finished_at"] is not None
+        assert cancellation_write_threads
+        assert all(thread != loop_thread for thread in cancellation_write_threads)
+
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        if grandchild_path is not None:
+            grandchild_store = ConversationStore(
+                grandchild_path.parent,
+                session_id=grandchild_path.name,
+                _read_only=True,
+            )
+            try:
+                descendant = grandchild_store.agent_lifecycle() or {}
+                assert descendant["state"] == "canceled"
+                assert descendant["finished_at"] is not None
+            finally:
+                grandchild_store.close()
+    finally:
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        if child_store is not None:
+            child_store.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_retries_lifecycle_write_after_terminal_fence_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CancelIdleTreeBackend(with_grandchild=True)
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    transition_idle = run_consumer_module._transition_idle
+
+    def observe_idle(child_store: ConversationStore) -> None:
+        transition_idle(child_store)
+        lifecycle = child_store.agent_lifecycle() or {}
+        handle = lifecycle.get("handle")
+        if isinstance(handle, str) and handle.count(":") == 1:
+            backend.child_idle.set()
+
+    # test-contract: seam observe the target child's exact idle transition
+    monkeypatch.setattr(run_consumer_module, "_transition_idle", observe_idle)
+    mark_agent_canceled = ConversationStore.mark_agent_canceled
+    admit_abort = AgentLoop.admit_abort
+    child_handle: str | None = None
+    write_attempts = 0
+    cleanup_calls = 0
+
+    @wraps(mark_agent_canceled)
+    def fail_first_lifecycle_write(
+        child_store: ConversationStore, parent_tool_call_id: str
+    ) -> None:
+        nonlocal write_attempts
+        lifecycle = child_store.agent_lifecycle() or {}
+        if lifecycle.get("handle") == child_handle:
+            write_attempts += 1
+            if write_attempts == 1:
+                raise OSError("durable lifecycle write failed")
+        mark_agent_canceled(child_store, parent_tool_call_id)
+
+    def count_child_cleanup(child_loop: AgentLoop) -> None:
+        nonlocal cleanup_calls
+        lifecycle = child_loop.store.agent_lifecycle() or {}
+        if lifecycle.get("handle") == child_handle:
+            cleanup_calls += 1
+        admit_abort(child_loop)
+
+    monkeypatch.setattr(
+        ConversationStore, "mark_agent_canceled", fail_first_lifecycle_write
+    )
+    monkeypatch.setattr(AgentLoop, "admit_abort", count_child_cleanup)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        max_agent_depth=3,
+    )
+    loop.explicit_finish = True
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_idle.wait(), 10)
+        await asyncio.wait_for(backend.question_seen.wait(), 10)
+        child_handle = _run_handle_from_receipt(store)
+        child_path = Path(store.agent_children()[child_handle]["child_session_path"])
+        child_store = ConversationStore(
+            child_path.parent, session_id=child_path.name, _read_only=True
+        )
+        try:
+            grandchild_handle = next(iter(child_store.agent_children()))
+        finally:
+            child_store.close()
+
+        first = await loop.tool_registry.execute(
+            ToolCall("cancel-fails", "agent_cancel", {"handle": child_handle})
+        )
+        assert first["structuredContent"]["status"] == "cancellation_failed"
+        assert first["structuredContent"]["confirmation_error"] == (
+            "durable lifecycle write failed"
+        )
+        assert write_attempts == 1
+        assert cleanup_calls == 0
+
+        second = await loop.tool_registry.execute(
+            ToolCall("cancel-retries", "agent_cancel", {"handle": child_handle})
+        )
+        assert second["structuredContent"]["status"] == "cancellation_confirmed"
+        assert write_attempts == 2
+        status = await loop.tool_registry.execute(
+            ToolCall("status-after-retry", "agent_status", {"handle": child_handle})
+        )
+        assert status["structuredContent"]["children"][0]["state"] == "canceled"
+
+        try:
+            await asyncio.wait_for(loop._background_owner.wait(), 10)
+        except TimeoutError:
+            pytest.fail(
+                "canceled subtree did not drain: "
+                f"{loop._background_owner.active_instance_ids}"
+            )
+        assert cleanup_calls == 1
+        assert child_handle not in loop._background_owner.active_instance_ids
+        assert grandchild_handle not in loop._background_owner.active_instance_ids
+        third = await loop.tool_registry.execute(
+            ToolCall("cancel-again", "agent_cancel", {"handle": child_handle})
+        )
+        assert third["structuredContent"]["status"] == "already_finished"
+        assert cleanup_calls == 1
+    finally:
+        loop._background_owner.cancel_all()
+        try:
+            await asyncio.wait_for(loop._background_owner.wait(), 10)
+        except TimeoutError:
+            # test-contract: seam drain old code that cannot retry cancellation
+            watchers = tuple(loop._background_owner._watchers.values())
+            for watcher in watchers:
+                watcher.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(*watchers, return_exceptions=True), 10
+            )
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_write_fails", [False, True], ids=["writes", "fails"])
+async def test_concurrent_cancel_requests_write_once_and_retry_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_write_fails: bool,
+) -> None:
+    backend = NestedBlockingBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    event_loop = asyncio.get_running_loop()
+    previous_handler = event_loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+    event_loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    writes: list[str] = []
+    first_write_entered = asyncio.Event()
+    second_write_entered = asyncio.Event()
+    release_first_write = asyncio.Event()
+    target_id: str | None = None
+    cleanup_calls = 0
+    original_write = ConversationStore._to_thread_agent_state
+    admit_abort = AgentLoop.admit_abort
+
+    async def hold_first_cancel_write(
+        child_store: ConversationStore,
+        function: Callable[..., None],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if function.__name__ != "mark_agent_canceled" or args != ("grandchild",):
+            return await original_write(child_store, function, *args, **kwargs)
+        writes.append(function.__name__)
+        if len(writes) == 1:
+            first_write_entered.set()
+            await asyncio.wait_for(release_first_write.wait(), 10)
+            if first_write_fails:
+                raise OSError("durable lifecycle write failed")
+        else:
+            second_write_entered.set()
+        return await original_write(child_store, function, *args, **kwargs)
+
+    def count_cleanup(child_loop: AgentLoop) -> None:
+        nonlocal cleanup_calls
+        if child_loop.agent_instance_id == target_id:
+            cleanup_calls += 1
+        admit_abort(child_loop)
+
+    # test-contract: seam hold the grandchild's durable cancel write at its await
+    monkeypatch.setattr(
+        ConversationStore, "_to_thread_agent_state", hold_first_cancel_write
+    )
+    monkeypatch.setattr(AgentLoop, "admit_abort", count_cleanup)
+    task = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await asyncio.wait_for(backend.grandchild_started.wait(), 10)
+        owner = loop._background_owner
+        target_id = next(
+            instance_id
+            for instance_id, parent_id in owner._parent_ids.items()
+            if parent_id in owner._cancellers
+        )
+        request_child_cancel = owner._cancellers[target_id]
+        # The parent's cleanup route, then the child's own abort route.
+        (first,) = owner.cancel_subtree(target_id)
+        await asyncio.wait_for(first_write_entered.wait(), 10)
+        second = request_child_cancel()
+        second_write = asyncio.create_task(
+            asyncio.wait_for(second_write_entered.wait(), 10)
+        )
+        try:
+            await asyncio.wait(
+                (second.confirmation, second_write),
+                timeout=10,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            second_write.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(second_write, return_exceptions=True), 10
+            )
+        assert writes == ["mark_agent_canceled"], "second request wrote again"
+        assert await asyncio.wait_for(second.confirmation, 10) is False
+        await asyncio.wait_for(second.cleanup, 10)
+        assert cleanup_calls == 0
+
+        release_first_write.set()
+        if first_write_fails:
+            with pytest.raises(OSError, match="durable lifecycle write failed"):
+                await asyncio.wait_for(first.task, 10)
+            assert cleanup_calls == 0
+            retry = request_child_cancel()
+            assert await asyncio.wait_for(retry.confirmation, 10) is True
+            await asyncio.wait_for(retry.cleanup, 10)
+            assert writes == ["mark_agent_canceled"] * 2
+        else:
+            assert await asyncio.wait_for(first.task, 10) is True
+            assert writes == ["mark_agent_canceled"]
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(owner._cancellation_tasks), return_exceptions=True),
+            10,
+        )
+        assert cleanup_calls == 1
+        child_store = ConversationStore(
+            store.session_dir / "agents", session_id="1", _read_only=True
+        )
+        grandchild_store = ConversationStore(
+            child_store.session_dir / "agents", session_id="1", _read_only=True
+        )
+        try:
+            assert grandchild_store.agent_canceled() == {
+                "tool_call_id": "grandchild",
+                "content": "tool execution canceled",
+            }
+        finally:
+            grandchild_store.close()
+            child_store.close()
+        loop.abort()
+        await asyncio.wait_for(task, 10)
+        gc.collect()
+        assert loop_errors == []
+    finally:
+        release_first_write.set()
+        backend.release_grandchild.set()
+        loop.abort()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        try:
+            await loop.close()
+        finally:
+            store.close()
+            event_loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
 async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -17820,6 +18894,144 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         ] == rows_before
     finally:
         backend.release_worker_question.set()
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        store.close()
+
+
+class _QuietReplyChildBackend(CompletionBackend):
+    """Root starts one explicit-finish child; the child answers a follow-up quietly."""
+
+    def __init__(self, follow_up_reply: list[TextContent]) -> None:
+        self.follow_up_reply = follow_up_reply
+        self.root_calls = 0
+        self.follow_up_answered = asyncio.Event()
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+
+    @owned_completion
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        user_texts = [
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        blocks: list[TextContent | ToolUseContent]
+        if "quiet child prompt" in user_texts:
+            if any("quiet follow up" in text for text in user_texts):
+                blocks = list(self.follow_up_reply)
+                self.follow_up_answered.set()
+            else:
+                self.child_started.set()
+                await await_or_fail(self.release_child.wait(), what="child release")
+                blocks = [TextContent("WAIT")]
+        else:
+            self.root_calls += 1
+            if self.root_calls == 1:
+                call = ToolCall(
+                    "start-quiet-child",
+                    "agent",
+                    {
+                        "prompt": "quiet child prompt",
+                        "description": "quiet child",
+                        "agent_type": "run",
+                        "background": True,
+                    },
+                )
+                blocks = [ToolUseContent(call)]
+            else:
+                blocks = [TextContent("started")] if self.root_calls == 2 else []
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.parametrize("reply", ["receipt_echo", "empty"])
+@pytest.mark.asyncio
+async def test_explicit_finish_child_quiet_notification_reply_is_idle_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply: str
+) -> None:
+    from zeta.context_eviction.receipt_constructors import ASSISTANT_RECEIPT
+
+    echo = ASSISTANT_RECEIPT.format(kind="assistant text", seq=5)
+    backend = _QuietReplyChildBackend(
+        [TextContent(echo)] if reply == "receipt_echo" else []
+    )
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+    outcome = asyncio.Event()
+    idle_texts: list[object] = []
+    terminals: list[ToolResult | None] = []
+    channel = loop._background_owner.conversation_channel
+    publish_idle = channel.publish_idle
+
+    async def observe_idle(**kwargs):
+        entry = await publish_idle(**kwargs)
+        if backend.follow_up_answered.is_set():
+            idle_texts.append(kwargs["text"])
+            outcome.set()
+        return entry
+
+    def collect_event(event: StreamEvent) -> None:
+        if not backend.follow_up_answered.is_set():
+            return
+        if event.type is StreamEventType.AGENT_NOTIFICATION:
+            idle_texts.append(event.data.get("text"))
+            outcome.set()
+        elif (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "agent"
+        ):
+            terminals.append(event.tool_result)
+            outcome.set()
+
+    # test-contract: seam observes the parent idle notice after it is published
+    monkeypatch.setattr(channel, "publish_idle", observe_idle)
+    loop.set_background_event_sink(collect_event)
+    root_turn = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await await_or_fail(backend.child_started.wait(), what="child first turn")
+        handle = _run_handle_from_receipt(store)
+        sent = await loop.tool_registry.execute(
+            ToolCall(
+                "send-quiet",
+                "agent_send",
+                {"child_instance_id": handle, "message": "quiet follow up"},
+            )
+        )
+        assert sent["isError"] is False, sent
+        backend.release_child.set()
+        await await_or_fail(root_turn, what="root turn")
+        await await_or_fail(outcome.wait(), what="child outcome after quiet reply")
+        assert terminals == [], "a quiet reply must not end the explicit-finish child"
+        assert idle_texts == ["child is idle"]
+        status = await loop.tool_registry.execute(
+            ToolCall("quiet-status", "agent_status", {"handle": handle})
+        )
+        assert status["structuredContent"]["children"][0]["state"] == "idle"
+    finally:
+        backend.release_child.set()
+        root_turn.cancel()
+        await asyncio.wait_for(asyncio.gather(root_turn, return_exceptions=True), 10)
         loop._background_owner.cancel_all()
         await asyncio.wait_for(loop._background_owner.wait(), 10)
         await loop.close()
@@ -19236,6 +20448,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
             self.priority_after_retry: str | None = None
             self.priority_before_acceptance: str | None = "not-observed"
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -19265,7 +20478,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
                 self.prompt_attempts += 1
                 if prompt_outcome == "cancellation" and self.prompt_attempts == 1:
                     self.blocked.set()
-                    await asyncio.Event().wait()
+                    await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
                 if prompt_outcome == "failure" and self.prompt_attempts == 1:
                     yield StreamEvent(
                         StreamEventType.ERROR,
@@ -19298,7 +20511,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
     )
     dispatch_admitted_request = assembler.dispatch_admitted_request
 
-    def capture_dispatch(backend, request):
+    def capture_dispatch(backend, request, *, control):
         admitted_requests.append(request)
         request_texts = _user_texts(request.messages)
         steering = store.pending_client_steering()
@@ -19308,7 +20521,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
                 for text in _user_texts(steering.messages)
                 if text.startswith("steer-") and text in request_texts
             )
-        return dispatch_admitted_request(backend, request)
+        return dispatch_admitted_request(backend, request, control=control)
 
     assembler.dispatch_admitted_request = capture_dispatch
 
@@ -19340,7 +20553,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
         await asyncio.wait_for(backend.blocked.wait(), 1)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await await_or_fail(task, what="task")
         assert loop.step_delivery.prompt_priority == priority
         await run_once(stop_at_evidence=False)
     else:
@@ -19634,6 +20847,7 @@ async def test_session_host_commands_provider_retry_keeps_turn_snapshot(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -19674,7 +20888,7 @@ async def test_session_host_commands_provider_retry_keeps_turn_snapshot(
         return "captured"
 
     backend = RetryThenToolBackend()
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()

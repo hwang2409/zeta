@@ -66,6 +66,9 @@ _RAW_PUBLICATION = {
     ("accounts/publication.py", "atomic_publish", "os.replace"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "os.replace"),
     ("transcript_search/index.py", "_publish", "os.replace"),
+    ("attention_replies.py", "stage", "os.replace"),
+    ("attention_replies.py", "_finish_journal_locked", "os.replace"),
+    ("attention_replies.py", "_prepare_locked", "os.replace"),
 }
 
 _RAW_DELETION = {
@@ -119,6 +122,10 @@ _RAW_DELETION = {
     ("tools/_atomic_replace.py", "atomic_create", "unlink"),
     ("tools/_atomic_replace.py", "atomic_replace", "unlink"),
     ("tools/_shared/background_output_archive.py", "_remove_generated_log", "unlink"),
+    ("attention_replies.py", "stage", "unlink"),
+    ("attention_replies.py", "_send_staged_locked", "unlink"),
+    ("attention_replies.py", "_recover_locked", "unlink"),
+    ("attention_replies.py", "_cleanup", "unlink"),
     ("tools/_spill.py", "_evict_before", "unlink"),
     ("tools/_spill.py", "temporary_file", "unlink"),
     ("tools/_spill.py", "write_group", "unlink"),

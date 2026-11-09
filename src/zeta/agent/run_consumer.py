@@ -172,6 +172,11 @@ async def consume_run(
         )
         while not result.get("isError"):
             structured = result.get("structuredContent")
+            recoverable_error = (
+                structured.get("recoverable_error")
+                if isinstance(structured, dict)
+                else None
+            )
             idle = (
                 getattr(child_loop, "explicit_finish", False)
                 and isinstance(structured, dict)
@@ -263,8 +268,12 @@ async def consume_run(
                     and isinstance(content[0], dict)
                     and bool(str(content[0].get("text", "")).strip())
                 )
-                if ended_with_text and await idle_lifecycle.reserve_immediate_reminder(
-                    child_loop._terminal_transition_fence
+                if (
+                    ended_with_text
+                    and not isinstance(recoverable_error, dict)
+                    and await idle_lifecycle.reserve_immediate_reminder(
+                        child_loop._terminal_transition_fence
+                    )
                 ):
                     _transition_running(child_loop, child_store)
                     result = await consume_child(

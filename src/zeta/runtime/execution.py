@@ -212,7 +212,11 @@ async def run_handler_with_abort(
         await execution_signal.wait()
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        if current is not None and not current.done():
+        if (
+            current is not None
+            and not current.done()
+            and not current.cancelling()
+        ):
             current.cancel()
 
     abort_wait = asyncio.create_task(cancel_on_abort())
