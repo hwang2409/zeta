@@ -352,6 +352,58 @@ async def test_path_complete_symlink_matches_tui_without_outside_traversal(
 
 
 @pytest.mark.asyncio
+async def test_path_complete_marks_scan_cap_through_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for index in range(1000):
+        (workspace / f"entry-{index:04}.txt").touch()
+    (workspace / "zz-target.txt").touch()
+    path_module = importlib.import_module("zeta.core.path_completion")
+    original_scandir = path_module.os.scandir
+
+    class SortedEntries:
+        def __init__(self, entries):
+            self._entries = entries
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def __iter__(self):
+            return iter(self._entries)
+
+    def sorted_scandir(path):
+        entries = list(original_scandir(path))
+        entries.sort(key=lambda entry: entry.name)
+        return SortedEntries(entries)
+
+    monkeypatch.setattr(path_module.os, "scandir", sorted_scandir)
+    server = _server(tmp_path, workspace)
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, features=["path_completion"])
+        created = (await _request(reader, writer, "new", "new_session"))[-1]
+        session_id = created["result"]["session"]["session_id"]
+        result = (
+            await _request(
+                reader,
+                writer,
+                "cap",
+                "path_complete",
+                {"session_id": session_id, "text_before_cursor": "@zz"},
+            )
+        )[-1]["result"]
+        assert result["truncated"] is True
+        assert result["entries"] == []
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_path_complete_publishes_no_response_or_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -459,8 +511,12 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
             and any(frame.f_locals.get("client") is client for frame in task.get_stack())
         )
         request_task.cancel()
-        await asyncio.sleep(0)
+        loop_turn = asyncio.get_running_loop().create_future()
+        loop_turn.add_done_callback(lambda _: None)
+        asyncio.get_running_loop().call_soon(loop_turn.set_result, None)
+        await await_or_fail(loop_turn, what="path cancellation gate")
         assert not request_task.done()
+        request_task.cancel()
         release.set()
         with suppress(asyncio.CancelledError):
             await await_or_fail(request_task, what="cancelled path request")

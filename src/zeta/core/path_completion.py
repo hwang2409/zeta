@@ -91,14 +91,22 @@ def _matching_entries(
 
 
 def _escapes_base_through_symlink(directory: Path, base_dir: Path) -> bool:
+    # Only reject an actual symlink component escaping the session cwd; lexical
+    # ``..`` and ``~`` paths retain the TUI's existing completion behavior.
     try:
-        directory.relative_to(base_dir)
+        relative = directory.relative_to(base_dir)
     except ValueError:
         return False
-    try:
-        directory.resolve().relative_to(base_dir.resolve())
-    except ValueError:
-        return True
+    resolved_base = base_dir.resolve()
+    current = base_dir
+    for component in relative.parts:
+        current /= component
+        if not current.is_symlink():
+            continue
+        try:
+            current.resolve().relative_to(resolved_base)
+        except ValueError:
+            return True
     return False
 
 

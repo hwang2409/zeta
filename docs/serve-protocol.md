@@ -1534,7 +1534,10 @@ negative and is measured in Unicode code points. Clients that use UTF-16 text
 indices must convert it before replacing the active token.
 
 The result uses the same hidden-file, quoting, sorting, and scan limits as the
-TUI composer. The request returns `-32003` when `session_id` is not the active
+TUI composer. A symlink found while listing is returned as an entry, but
+completion does not descend into it when its resolved target is outside the
+session working directory. Lexical `..` and `~` prefixes keep the TUI's normal
+completion behavior. The request returns `-32003` when `session_id` is not the active
 session, `-32602` for invalid parameters, and `-32601` when the feature was not
 negotiated. It emits no event and is not available to observer connections.
 
