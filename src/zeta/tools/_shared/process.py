@@ -989,14 +989,7 @@ class BackgroundTaskRegistry:
                 phase, reason, tui_presented
             )
             try:
-                await self._commit_notice(
-                    BackgroundTaskNotice(
-                        f"background task {record.task_id} stopping",
-                        record.task_id,
-                        "stopping",
-                        record.owner,
-                    )
-                )
+                await self._commit_notice(None)
             except Exception:
                 record.terminal_phase, record.note, record.tui_presented = previous
                 raise
