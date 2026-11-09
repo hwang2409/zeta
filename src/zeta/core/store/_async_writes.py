@@ -605,6 +605,7 @@ class AsyncDurableWritesMixin:
         )
         if delta._resident_patch.replace_entries:
             self._before_incremental_state_install()
+            self._reset_generation += 1
             self._entries = entries
             self._entry_ids = {entry.id for entry in entries}
         elif entries:

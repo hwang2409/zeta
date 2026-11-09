@@ -313,7 +313,7 @@ class OllamaBackend(CompletionBackend):
     async def _complete_once(
         self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
-        async with self._lease.borrow() as client:
+        async with self._lease.borrow("ollama completion") as client:
             events = self._complete_once_with_client(client, messages, tool_schemas)
             try:
                 async for event in events:
