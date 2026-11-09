@@ -693,11 +693,14 @@ async def test_delegated_child_approval_round_trip_on_parent_and_child_streams(
         child_stream = (await serve.join(child, target))["replay"]["stream_id"]
         backend.release_all()
 
-        child_request = (await _until(child, "approval_request"))[-1]
         parent_events = await _until(parent, "approval_request")
         parent_request = parent_events[-1]
-        request_id = child_request["request_id"]
-        assert parent_request["request_id"] == request_id
+        request_id = parent_request["request_id"]
+        # the child copy is admitted with the parent copy, so it is queued by now
+        child_events = await serve.drain(child)
+        child_requests = [e for e in child_events if e["event"] == "approval_request"]
+        assert [e["request_id"] for e in child_requests] == [request_id], child_events
+        child_request = child_requests[0]
         assert (child_request["stream_id"], parent_request["stream_id"]) == (child_stream, parent_stream)
         status = await serve.controller.request(serve.request_id(), "status", {})
         assert [item["request_id"] for item in status["result"]["pending_approvals"]] == [request_id]
@@ -710,7 +713,7 @@ async def test_delegated_child_approval_round_trip_on_parent_and_child_streams(
 
         parent_events += await _until(parent, "child_ended", target)
         await await_or_fail(top.event("agent_end"), what="session settles")
-        child_events = [child_request, *await serve.drain(child)]
+        child_events += await serve.drain(child)
         parent_events += await serve.drain(parent)
         status = await serve.controller.request(serve.request_id(), "status", {})
         assert status["result"]["pending_approvals"] == []
@@ -729,6 +732,7 @@ async def test_delegated_child_approval_round_trip_on_parent_and_child_streams(
         ]
         assert len(tool_ends) == 1, child_events
         if decision == "approve":
+            assert target_file.exists(), "the approved tool did not run"
             assert target_file.read_text() == "written"
             assert tool_ends[0]["tool_result"]["is_error"] is False, tool_ends
         else:
@@ -937,6 +941,7 @@ async def test_nested_delegated_approval_reaches_the_controller_and_resumes(
         settled = await serve.controller.request(serve.request_id(), "approve", {"request_id": event["request_id"]})
         assert "error" not in settled, settled
         await _until(top, "agent_end")
+        assert target_file.exists(), "the approved nested tool did not run"
         assert target_file.read_text() == "written"
     finally:
         await _close(serve)
