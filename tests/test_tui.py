@@ -1887,6 +1887,21 @@ def test_every_stream_event_has_one_tui_owner() -> None:
     assert sum(len(owner) for owner in owners) == len(set(StreamEventType))
 
 
+def test_rate_limit_hold_renders_as_waiting_text() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.RETRY,
+            data={
+                "kind": "provider_rate_limit_hold",
+                "text": "anthropic rate limit: checking again in 5m",
+            },
+        )
+    )
+    assert rendered is not None
+    assert rendered.plain == "anthropic rate limit: checking again in 5m"
+    assert rendered.style == theme.DIM
+
+
 def test_scrollback_stream_events_render() -> None:
     call = ToolCall("contract-1", "future_tool", {"query": "sample"})
     fixtures = {
