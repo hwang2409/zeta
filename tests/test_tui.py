@@ -6935,7 +6935,7 @@ async def test_status_card_wraps_complete_project_context_health(
     )
 
     try:
-        app.slash_status_command("")
+        await asyncio.wait_for(app._slash_commands.dispatch_async(app, "/status"), 10)
         screen = render_full_screen(session, width, height=60)
         with set_app(session.app):
             screen.draw_all_floats()
@@ -6991,10 +6991,8 @@ async def test_status_card_wraps_long_path_at_separator(
         pending_approvals=(),
         context_files=(path,),
     )
-    monkeypatch.setattr(app, "slash_status", lambda: status)
-
     try:
-        app.slash_status_command("")
+        app.open_status_card(status)
         screen = render_full_screen(session, width, height=60)
         with set_app(session.app):
             screen.draw_all_floats()
