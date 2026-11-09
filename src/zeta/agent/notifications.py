@@ -209,8 +209,6 @@ class AgentNotificationMixin:
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
-        from ..runtime.loop._completion import close_completion
-
         if turn_context is not None:
             if system_message is not None:
                 raise ValueError("pass only one system message")
@@ -233,7 +231,10 @@ class AgentNotificationMixin:
             async for event in stream:
                 yield event
         finally:
-            await close_completion(stream)
+            try:
+                await stream.aclose()
+            except BaseException:  # noqa: BLE001, S110 - preserve turn cleanup
+                pass
             if self.child_turn_control is not None:
                 self.child_turn_control.abandon_completion()
             self._turn_active = False
