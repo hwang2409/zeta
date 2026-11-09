@@ -306,6 +306,8 @@ async def consume_child(
             return result
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
+        if child_loop.explicit_finish:
+            return terminal_result(state="idle", text="child is idle", status="running")
         text = "agent error: child ended without a final response"
         return terminal_result(state="failed", text=text)
     final_text = assistant_text(final_message)
@@ -314,6 +316,8 @@ async def consume_child(
             from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE
 
             return terminal_result(state="completed", text=OUTPUT_LIMIT_ERROR_MESSAGE)
+        if child_loop.explicit_finish:
+            return terminal_result(state="idle", text="child is idle", status="running")
         text = "agent error: child returned an empty final assistant message"
         return terminal_result(state="failed", text=text)
     if record_report is not None:
