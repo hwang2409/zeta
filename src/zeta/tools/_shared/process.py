@@ -996,24 +996,14 @@ class BackgroundTaskRegistry:
             process = record.process
             if process is None or not record.running:
                 return
-            previous = (
-                record.terminal_phase,
-                record.note,
-                record.note_priority,
-                record.tui_presented,
-            )
+            previous = record.terminal_phase, record.note, record.tui_presented
             record.terminal_phase = phase
             self._set_terminal_note(record, reason, _NOTE_PRIORITY_CAUSE)
             record.tui_presented = tui_presented
             try:
                 await self._commit_notice(None)
             except Exception:
-                (
-                    record.terminal_phase,
-                    record.note,
-                    record.note_priority,
-                    record.tui_presented,
-                ) = previous
+                record.terminal_phase, record.note, record.tui_presented = previous
                 raise
         await _terminate_process(
             process, self.term_grace, close_stdin=lambda: self._close_stdin(record)
@@ -1063,21 +1053,15 @@ class BackgroundTaskRegistry:
                 trim += 1
             del record.output[:trim]
             record.base_cursor += trim
-
     @staticmethod
     def _set_terminal_note(record: _BackgroundRecord, note: str, priority: int) -> None:
         if record.note is None:
             record.note = note
-            record.note_priority = priority
             return
         if note in record.note:
             return
-        if priority > record.note_priority:
-            record.note = f"{note}; {record.note}"
-        else:
-            record.note = f"{record.note}; {note}"
-        record.note_priority = max(record.note_priority, priority)
-
+        existing_priority = _NOTE_PRIORITY_CAUSE if record.terminal_phase in {"task_kill", "session_shutdown"} else _NOTE_PRIORITY_ARCHIVE
+        record.note = f"{note}; {record.note}" if priority > existing_priority else f"{record.note}; {note}"
     def _record(self, task_id: str) -> _BackgroundRecord:
         if type(task_id) is not str or not task_id:
             raise ValueError("task_id must be a nonempty string")

@@ -49,7 +49,6 @@ class _BackgroundRecord:
     running: bool = True
     exit_code: int | None = None
     note: str | None = None
-    note_priority: int = 0
     log_path: str | None = None
     remove_log_on_archive: bool = False
     log_fd: int | None = None
