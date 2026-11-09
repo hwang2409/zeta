@@ -38,6 +38,7 @@ from tests.support.account_processes import (
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
+from tests.support.owned import await_or_fail
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import (
     AccountCredentialLockTimeoutError,
@@ -453,6 +454,17 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
     ticks = 0
     stop = asyncio.Event()
+    lock_waiting = threading.Event()
+    original_bounded_guard = account_store._bounded_guard
+
+    observe_waiting = False
+
+    def observe_lock_wait(guard, timeout):
+        if observe_waiting:
+            lock_waiting.set()
+        return original_bounded_guard(guard, timeout)
+
+    monkeypatch.setattr(account_store, "_bounded_guard", observe_lock_wait)
 
     async def ticker() -> None:
         nonlocal ticks
@@ -463,15 +475,20 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
     ticker_task = asyncio.create_task(ticker())
     try:
         async with credential._async_guard(registry=False):
-            with pytest.raises(AccountError):
-                await asyncio.wait_for(
-                    asyncio.to_thread(credential_store, "codex", home=tmp_path),
-                    timeout=0.25,
-                )
+            observe_waiting = True
+            operation = asyncio.create_task(
+                asyncio.to_thread(credential_store, "codex", home=tmp_path)
+            )
+            await await_or_fail(
+                asyncio.to_thread(lock_waiting.wait, 10),
+                what="credential store lock-wait signal",
+            )
             assert ticks > 1
+            with pytest.raises(AccountError):
+                await await_or_fail(operation, what="credential store")
     finally:
         stop.set()
-        await ticker_task
+        await await_or_fail(ticker_task, what="account test ticker")
 
 
 def test_resolve_account_does_not_migrate(
