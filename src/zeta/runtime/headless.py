@@ -51,6 +51,7 @@ from typing import IO, Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
+from ..core.store import TranscriptLoadError
 from ..protocol.types import MessageOrigin
 from .driver import (
     DENIAL_MARKER,
@@ -76,7 +77,7 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
 
     try:
         app = create_app(args)
-    except SessionError as exc:
+    except (SessionError, TranscriptLoadError) as exc:
         print(f"zeta: {exc}", file=sys.stderr)
         return 1
 

@@ -21,6 +21,7 @@ from ...protocol.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    harness_notice,
 )
 from ...providers.stream_diagnostics import fd_diagnostics
 from .empty_turn import annotate_turn_metadata
@@ -37,7 +38,16 @@ class TurnPersistenceMixin:
         calls: Sequence[ToolCall],
         slots: Sequence[ToolResult | None],
     ) -> list[ToolResult]:
-        return finalize_agent_results(self, calls, slots)
+        results = finalize_agent_results(self, calls, slots)
+        for removed, fallback in self.tool_registry.take_cwd_recovery_notices():
+            self.store.append_message(
+                harness_notice(
+                    "shell cwd",
+                    f"{removed} was removed; continuing in {fallback}",
+                    event="shell_cwd_recovered",
+                )
+            )
+        return results
 
     def _annotate_current_turn(self: AgentLoop, message: Message) -> Message:
         """Apply provider metadata before any assistant message is persisted."""

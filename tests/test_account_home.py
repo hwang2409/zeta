@@ -9,6 +9,7 @@ import pytest
 
 import zeta.core.session as core_session
 import zeta.providers.stream_diagnostics as diagnostics_module
+from tests.support.completion import completion_control
 from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountId, AccountStore
 from zeta.cli.main import main
@@ -154,7 +155,7 @@ async def test_provider_runtime_state_stays_in_zeta_home(
     assert codex.token_store.path.is_relative_to(account_home)
     for backend in (claude, codex):
         with pytest.raises(RuntimeError):
-            [event async for event in backend.complete([], [])]
+            [event async for event in backend.complete([], [], control=completion_control())]
         assert backend.diagnostics_path == zeta_home / "logs/stream-diagnostics.jsonl"
     records = [
         json.loads(line)

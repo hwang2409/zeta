@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
+from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event, request
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.memory.reconciler import (
@@ -18,7 +19,7 @@ from zeta.memory.reconciler import (
     parse_proposal,
     prepare_request,
 )
-from zeta.protocol.types import MessageOrigin, ToolCall
+from zeta.protocol.types import MessageOrigin
 from zeta.server import ZetaServer
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -372,9 +373,9 @@ def test_reconciler_labels_child_and_agent_send_rows_as_non_user() -> None:
 async def test_dropped_steer_text_never_reaches_memory_reconciler(
     tmp_path: Path,
 ) -> None:
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[ToolCall("read-1", "read", {"path": "missing"})])]
-    )
+    # the steer arrives while the provider streams, so it waits for the next
+    # tool boundary; the abort ends the turn first and drops it.
+    backend = StopThenFailBackend()
     server = ZetaServer(
         provider="codex",
         home=tmp_path,
@@ -393,7 +394,7 @@ async def test_dropped_steer_text_never_reaches_memory_reconciler(
         )
         await request(reader, writer, 2, "new_session", {"provider": "codex"})
         await request(reader, writer, 3, "send", {"text": "run"})
-        await event(reader, "approval_request")
+        await await_or_fail(backend.started.wait(), what="provider start")
         await request(
             reader,
             writer,

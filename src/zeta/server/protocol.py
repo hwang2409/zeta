@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import Enum, StrEnum
 from typing import Any
 
@@ -131,6 +131,11 @@ class ErrorDescriptor(Enum):
         "session_not_found",
         "the requested session does not exist",
     )
+    SESSION_MISMATCH = (
+        -32003,
+        "session_mismatch",
+        "the requested session is not the attached session",
+    )
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
@@ -161,6 +166,11 @@ class SlashErrorCodeDescriptor(StrEnum):
     """One documented structured slash_run error code."""
 
     MCP_CREDENTIAL_STORE = "mcp_credential_store"
+
+
+class ApprovalDecision(StrEnum):
+    APPROVE = "approve"
+    DENY = "deny"
 
 
 class EventDescriptor(StrEnum):
@@ -230,7 +240,143 @@ FEATURES = (
     "served_turn_end",
     "content_read",
     "session_grants",
+    "delivery_session_guard",
 )
+
+
+class Access(StrEnum):
+    READ = "read"
+    CONTROLLER_READ = "controller_read"
+    SESSION_MUTATION = "session_mutation"
+    DELIVERY = "delivery"
+    CONTROLLER_WRITE = "controller_write"
+
+
+class MethodDescriptor(Enum):
+    """The single declaration of a served request's wire capability."""
+
+    LIST_SESSIONS = ("list_sessions", None, None, Access.READ)
+    NEW_SESSION = ("new_session", None, None, Access.CONTROLLER_WRITE)
+    RESUME = ("resume", None, None, Access.CONTROLLER_WRITE)
+    SEND = ("send", None, None, Access.DELIVERY)
+    STEER = ("steer", None, None, Access.DELIVERY)
+    APPROVE = ("approve", None, None, Access.SESSION_MUTATION)
+    DENY = ("deny", None, None, Access.SESSION_MUTATION)
+    ABORT = ("abort", None, None, Access.SESSION_MUTATION)
+    STATUS = ("status", None, None, Access.READ)
+    RENAME_SESSION = ("rename_session", "1.1", None, Access.SESSION_MUTATION)
+    DELETE_SESSION = ("delete_session", "1.1", None, Access.CONTROLLER_WRITE)
+    REPAIR_TRANSCRIPT = ("repair_transcript", "1.1", None, Access.SESSION_MUTATION)
+    SESSION_TREE = ("session_tree", "1.1", None, Access.READ)
+    SESSION_HISTORY = ("session_history", "1.1", None, Access.READ)
+    CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)
+    SWITCH_BRANCH = ("switch_branch", "1.1", None, Access.SESSION_MUTATION)
+    FORK_MESSAGE = ("fork_message", "1.1", None, Access.SESSION_MUTATION)
+    MODEL_CATALOG = ("model_catalog", "1.1", None, Access.READ)
+    SESSION_SETTINGS = ("session_settings", "1.1", None, Access.READ)
+    SET_SETTINGS = ("set_settings", "1.1", None, Access.SESSION_MUTATION)
+    SET_COMPACTION = ("set_compaction", "1.1", None, Access.SESSION_MUTATION)
+    SEND_IMAGES = ("send_images", "1.1", None, Access.DELIVERY)
+    SLASH_LIST = ("slash_list", "1.1", None, Access.CONTROLLER_READ)
+    SLASH_RUN = ("slash_run", "1.1", None, Access.SESSION_MUTATION)
+    ACCOUNT_LIST = ("account_list", "1.1", None, Access.CONTROLLER_READ)
+    ACCOUNT_LOGOUT = ("account_logout", "1.1", None, Access.CONTROLLER_WRITE)
+    ACCOUNT_REFRESH = ("account_refresh", "1.1", None, Access.CONTROLLER_WRITE)
+    ACCOUNT_SWITCH = ("account_switch", "1.1", None, Access.CONTROLLER_WRITE)
+    LOGIN_START = ("login_start", "1.1", None, Access.CONTROLLER_WRITE)
+    LOGIN_STATUS = ("login_status", "1.1", None, Access.CONTROLLER_READ)
+    LOGIN_CANCEL = ("login_cancel", "1.1", None, Access.CONTROLLER_WRITE)
+    LOGIN_PROVIDERS = ("login_providers", "1.1", None, Access.CONTROLLER_READ)
+    PING = ("ping", "1.1", "ping", Access.READ)
+    SET_TURN_CONTEXT = (
+        "set_turn_context",
+        "1.1",
+        "turn_context",
+        Access.SESSION_MUTATION,
+    )
+    LIST_PROJECTS = ("list_projects", "1.1", "projects", Access.CONTROLLER_READ)
+    PROJECT_SHOW = ("project_show", "1.1", "projects", Access.CONTROLLER_READ)
+    PROJECT_MEMORY_LOG = (
+        "project_memory_log",
+        "1.1",
+        "projects",
+        Access.CONTROLLER_READ,
+    )
+    PROJECT_INBOX = ("project_inbox", "1.1", "projects", Access.CONTROLLER_WRITE)
+    CLEAR_STEERING = ("clear_steering", None, "abort_scope", Access.SESSION_MUTATION)
+    DELIVERY_STATUS = ("delivery_status", None, "delivery_id", Access.READ)
+    SESSION_GRANTS = ("session_grants", "1.1", "session_grants", Access.READ)
+    REVOKE_SESSION_GRANTS = (
+        "revoke_session_grants",
+        "1.1",
+        "session_grants",
+        Access.SESSION_MUTATION,
+    )
+
+    def __init__(
+        self, wire: str, since: str | None, feature: str | None, access: Access
+    ) -> None:
+        if feature is not None and feature not in FEATURES:
+            raise ValueError(f"unknown method feature: {feature}")
+        self.wire, self.since, self.feature, self.access = wire, since, feature, access
+
+    @classmethod
+    def for_wire(cls, wire: str) -> MethodDescriptor | None:
+        return next((item for item in cls if item.wire == wire), None)
+
+    @classmethod
+    def advertised(cls, version: str, features: frozenset[str], role: str) -> list[str]:
+        negotiated = tuple(int(part) for part in version.split("."))
+        methods = [
+            item.wire
+            for item in cls
+            if (
+                item.since is None
+                or negotiated >= tuple(int(part) for part in item.since.split("."))
+            )
+            and (item.feature is None or item.feature in features)
+            and (role != "observer" or item.access is Access.READ)
+        ]
+        return sorted(methods) if role == "observer" else methods
+
+
+Handler = Callable[[object, str | int, dict[str, object]], object]
+
+
+_LOGIN_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
+)
+_ERGONOMICS_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in (
+        "RENAME_SESSION",
+        "DELETE_SESSION",
+        "REPAIR_TRANSCRIPT",
+        "SESSION_TREE",
+        "SESSION_HISTORY",
+        "CONTENT_READ",
+        "MODEL_CATALOG",
+        "SESSION_SETTINGS",
+        "SET_SETTINGS",
+        "SET_COMPACTION",
+        "SEND_IMAGES",
+        "SWITCH_BRANCH",
+        "FORK_MESSAGE",
+        "SLASH_LIST",
+        "SLASH_RUN",
+        "ACCOUNT_LIST",
+        "ACCOUNT_LOGOUT",
+        "ACCOUNT_REFRESH",
+        "ACCOUNT_SWITCH",
+    )
+)
+_PROJECT_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
+)
+
+
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
@@ -272,7 +418,61 @@ class FrameWriteCancelled(asyncio.CancelledError):
 FRAME_CANCEL_GRACE = 1.0
 
 
-async def finish_frame_write(codec: FrameCodec, writer: Any, payload: _Frame) -> bool:
+class FrameWriteOwner:
+    def __init__(self) -> None:
+        self._active: set[asyncio.Task[Any]] = set()
+        self._orphaned: set[asyncio.Future[bool]] = set()
+
+    async def write(
+        self,
+        codec: FrameCodec,
+        writer: Any,
+        payload: _Frame,
+        lock: asyncio.Lock,
+    ) -> bool:
+        task = asyncio.current_task()
+        assert task is not None
+        self._active.add(task)
+        try:
+            async with lock:
+                return await finish_frame_write(codec, writer, payload, owner=self)
+        finally:
+            self._active.discard(task)
+
+    def register(self, task: asyncio.Future[bool]) -> None:
+        self._orphaned.add(task)
+        task.add_done_callback(self._forget)
+
+    def _forget(self, task: asyncio.Future[bool]) -> None:
+        self._orphaned.discard(task)
+        _observe_write(task)
+
+    async def aclose(self) -> None:
+        deadline = asyncio.get_running_loop().time() + 2 * FRAME_CANCEL_GRACE
+        while self._active or self._orphaned:
+            for write in tuple(self._active):
+                write.cancel()
+            # Let canceled writers reach their handler and register the inner
+            # write here, so this pass cancels it instead of the next one.
+            await asyncio.sleep(0)
+            pending = set(self._active) | self._orphaned
+            if not pending:
+                return
+            for write in pending:
+                write.cancel()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            await asyncio.wait(pending, timeout=min(remaining, FRAME_CANCEL_GRACE))
+
+
+async def finish_frame_write(
+    codec: FrameCodec,
+    writer: Any,
+    payload: _Frame,
+    *,
+    owner: FrameWriteOwner | None = None,
+) -> bool:
     """Write one frame; through cancellation, report whether it was written.
 
     Cancellation before this call writes nothing. Cancellation during the
@@ -285,10 +485,17 @@ async def finish_frame_write(codec: FrameCodec, writer: Any, payload: _Frame) ->
         return await asyncio.shield(task)
     except asyncio.CancelledError:
         pass
-    raise FrameWriteCancelled(await _settle_canceled_write(task, writer))
+    if owner is not None:
+        owner.register(task)
+    raise FrameWriteCancelled(await _settle_canceled_write(task, writer, owner=owner))
 
 
-async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> bool:
+async def _settle_canceled_write(
+    task: asyncio.Future[bool],
+    writer: Any,
+    *,
+    owner: FrameWriteOwner | None = None,
+) -> bool:
     """Wait for the deadline, abort the transport, then finish cleanup."""
 
     loop = asyncio.get_running_loop()
@@ -301,7 +508,8 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
                 # Supported transports settle after abort. Keep observing an
                 # abnormal transport without retaining it in process-global
                 # state or coupling it to another connection.
-                task.add_done_callback(_observe_write)
+                if owner is None:
+                    task.add_done_callback(_observe_write)
                 return False
             aborted = True
             deadline = loop.time() + FRAME_CANCEL_GRACE
@@ -361,6 +569,132 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
     if requested == "1.0" and advertised in SUPPORTED_PROTOCOL_VERSIONS[1:]:
         return advertised
     return requested
+
+
+LOADED_SESSION_MUTATIONS = frozenset(
+    {
+        "abort",
+        "approve",
+        "clear_steering",
+        "deny",
+        "fork_message",
+        "rename_session",
+        "repair_transcript",
+        "revoke_session_grants",
+        "send",
+        "send_images",
+        "set_compaction",
+        "set_settings",
+        "set_turn_context",
+        "slash_run",
+        "steer",
+        "switch_branch",
+    }
+)
+
+
+async def _dispatch(
+    self, request_id: str | int, method: str, params: dict[str, Any]
+) -> object:
+    handled, result = await self._route_request(request_id, method, params)
+    if handled:
+        return result
+    descriptor = MethodDescriptor.for_wire(method)
+    if self.role == "observer" and (
+        descriptor is None or descriptor.access is not Access.READ
+    ):
+        raise ProtocolError(
+            ErrorDescriptor.OBSERVER_READ_ONLY,
+            "method is unavailable to read-only observers",
+            {"method": method},
+        )
+    if descriptor is None:
+        raise ProtocolError(
+            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
+        )
+    if descriptor.access is Access.SESSION_MUTATION:
+        self.server.control._reject_if_unhealthy()
+    if descriptor.since is not None and tuple(
+        int(part) for part in self.protocol_version.split(".")
+    ) < tuple(int(part) for part in descriptor.since.split(".")):
+        raise self._descriptor_protocol_error(descriptor)
+    if descriptor.feature is not None and descriptor.feature not in self.features:
+        raise self._descriptor_feature_error(descriptor)
+    if descriptor.access is Access.DELIVERY:
+        _require_attached_session(self.server.runtime, params)
+    return await HANDLERS[descriptor](self, request_id, params)
+
+
+def _require_attached_session(runtime: Any, params: dict[str, Any]) -> None:
+    """Reject a delivery aimed at another session before any delivery effect."""
+
+    if "session_id" not in params:
+        return
+    session_id = params["session_id"]
+    if not isinstance(session_id, str) or not session_id:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
+        )
+    attached = runtime.session_id if runtime.opened is not None else None
+    if attached is not None and session_id != attached:
+        raise ProtocolError(
+            ErrorDescriptor.SESSION_MISMATCH,
+            "session is not active",
+            {"attached_session_id": attached, "session_id": session_id},
+        )
+
+
+def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
+    async def handle(
+        client: object, request_id: str | int, params: dict[str, Any]
+    ) -> object:
+        return await client._dispatch_descriptor(request_id, descriptor, params)  # type: ignore[attr-defined]
+
+    return handle
+
+
+HANDLERS: dict[MethodDescriptor, Handler] = {
+    descriptor: _descriptor_handler(descriptor) for descriptor in MethodDescriptor
+}
+if HANDLERS.keys() != set(MethodDescriptor):
+    raise RuntimeError("serve method handlers are not exhaustive")
+
+
+def protocol_error(descriptor: MethodDescriptor) -> ProtocolError:
+    message = {
+        **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),
+        **dict.fromkeys(_ERGONOMICS_METHODS, "request requires protocol 1.1"),
+        MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
+        MethodDescriptor.PING: "ping requires the negotiated ping feature",
+        MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
+        **dict.fromkeys(
+            _PROJECT_METHODS,
+            f"{descriptor.wire} requires the negotiated projects feature",
+        ),
+        MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+        MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+    }.get(descriptor, f"{descriptor.wire} requires protocol 1.1")
+    return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
+
+
+def feature_error(descriptor: MethodDescriptor) -> ProtocolError:
+    message = {
+        MethodDescriptor.CLEAR_STEERING: "clear_steering requires the negotiated abort_scope feature",
+        MethodDescriptor.DELIVERY_STATUS: "delivery_status requires negotiated feature 'delivery_id'",
+        MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
+        MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+        MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+        MethodDescriptor.PING: "ping requires the negotiated ping feature",
+        MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
+        **dict.fromkeys(
+            _PROJECT_METHODS,
+            f"{descriptor.wire} requires the negotiated projects feature",
+        ),
+    }.get(
+        descriptor,
+        f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
+    )
+    return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
 
 
 class FrameCodec:

@@ -21,6 +21,6 @@ def test_feature_gates_do_not_compare_against_writer_epoch() -> None:
                 violations.append(f"{path.relative_to(Path.cwd())}:{node.lineno}")
 
     assert not violations, (
-        "use the feature table in src/zeta/storage_format.py: "
+        "use FEATURE_EPOCHS[<feature>] from storage_format.py: "
         + ", ".join(violations)
     )
