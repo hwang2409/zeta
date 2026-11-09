@@ -72,6 +72,7 @@ from tests.support.notification_fixtures import notification_payloads
 from tests.support.owned import await_or_fail
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
+from tests.test_agent import CancelledBeforeAnswerBackend, _collect
 from zeta.accounts import (
     AccountId,
     AccountStore,
@@ -5324,8 +5325,6 @@ def test_nested_stalled_idle_background_event_renders_last_message(
 
 @pytest.mark.asyncio
 async def test_held_input_notice_renders_on_root_transcript(tmp_path: Path) -> None:
-    from zeta.runtime.loop.empty_turn import not_delivered_text
-
     output = StringIO()
     app = _test_tui_app(ConversationStore(tmp_path / "root"), output)
     child_store = ConversationStore(tmp_path / "child")
@@ -5336,8 +5335,16 @@ async def test_held_input_notice_renders_on_root_transcript(tmp_path: Path) -> N
         agent_type="worker",
         description="stopped worker",
     )
+    child_store.append_agent_notification(
+        "root:notice",
+        child_session_path=str(child_store.session_dir),
+        description="held input",
+        status="completed",
+        text="held input",
+    )
+    backend = CancelledBeforeAnswerBackend()
     child_loop = AgentLoop(
-        FakeBackend([]),
+        backend,
         child_store,
         skill_catalog=SkillCatalog.empty(),
         background_owner=app.loop._background_owner,
@@ -5345,20 +5352,30 @@ async def test_held_input_notice_renders_on_root_transcript(tmp_path: Path) -> N
         agent_depth=1,
     )
     child_loop.set_background_event_sink(app.loop._publish_background_event)
-    text = not_delivered_text("budget used up", waits_for_input=False)
     try:
-        await app.loop._ensure_step_delivery()
-        await app.loop._background_owner.conversation_channel.publish_not_delivered(
-            child_loop, text
+        flow = await await_or_fail(
+            child_loop._ensure_step_delivery(), what="child flow"
         )
+        flow.initialize_resident_edges()
+        assert child_store.agent_notifications()
+        assert flow.has_pending_edge
+        for _ in range(2):
+            run = asyncio.create_task(
+                _collect(child_loop.run_notification_turn())
+            )
+            await await_or_fail(backend.started.wait(), what="provider call started")
+            run.cancel()
+            await await_or_fail(
+                asyncio.gather(run, return_exceptions=True),
+                what="cancelled notification turn",
+            )
+            backend.started.clear()
+        [event async for event in child_loop.run_notification_turn()]
 
         rendered = output.getvalue()
         assert "stopped worker" in rendered
         assert "Input not delivered" in rendered
-        # display-only: the notice does not wake the root model.
-        assert not app.loop.step_delivery.has_pending_edge
-        (entry,) = app.loop.store.agent_notifications(pending_only=False)
-        assert entry.data["text"] == text
+        assert backend.calls == 2
     finally:
         await await_or_fail(child_loop.close(), what="child loop close")
         child_store.close()

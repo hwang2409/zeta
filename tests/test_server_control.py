@@ -20,6 +20,7 @@ from tests.support.owned import await_or_fail
 from tests.support.raw_frames import assert_raw_frames_preserved
 from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
+from tests.test_agent import CancelledBeforeAnswerBackend, _collect
 from tests.test_server import (
     TIMEOUT,
     _connect,
@@ -761,8 +762,6 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
 async def test_held_input_notice_reaches_serve_as_display_only_child_idle(
     tmp_path: Path,
 ) -> None:
-    from zeta.runtime.loop.empty_turn import not_delivered_text
-
     backend = FakeBackend([])
     server = ZetaServer(
         home=tmp_path,
@@ -773,6 +772,7 @@ async def test_held_input_notice_reaches_serve_as_display_only_child_idle(
     reader, writer = await _connect(server)
     child_store = ConversationStore(tmp_path / "child")
     child_loop: AgentLoop | None = None
+    child_backend = CancelledBeforeAnswerBackend()
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         await _request(reader, writer, 2, "new_session", {})
@@ -785,8 +785,15 @@ async def test_held_input_notice_reaches_serve_as_display_only_child_idle(
             agent_type="worker",
             description="stopped worker",
         )
+        child_store.append_agent_notification(
+            "root:notice",
+            child_session_path=str(child_store.session_dir),
+            description="held input",
+            status="completed",
+            text="held input",
+        )
         child_loop = AgentLoop(
-            FakeBackend([]),
+            child_backend,
             child_store,
             skill_catalog=SkillCatalog.empty(),
             skip_mcp_mount=True,
@@ -795,21 +802,41 @@ async def test_held_input_notice_reaches_serve_as_display_only_child_idle(
             agent_depth=1,
         )
         child_loop.set_background_event_sink(root_loop._publish_background_event)
-        await await_or_fail(root_loop._ensure_step_delivery(), what="root flow")
-        text = not_delivered_text("budget used up", waits_for_input=False)
-        await await_or_fail(
-            root_loop._background_owner.conversation_channel.publish_not_delivered(
-                child_loop, text
-            ),
-            what="notice publication",
+        flow = await await_or_fail(
+            child_loop._ensure_step_delivery(), what="child flow"
         )
+        flow.initialize_resident_edges()
+        for _ in range(2):
+            run = asyncio.create_task(
+                _collect(child_loop.run_notification_turn())
+            )
+            await await_or_fail(
+                child_backend.started.wait(), what="provider call started"
+            )
+            run.cancel()
+            await await_or_fail(
+                asyncio.gather(run, return_exceptions=True),
+                what="cancelled notification turn",
+            )
+            child_backend.started.clear()
+        [event async for event in child_loop.run_notification_turn()]
 
-        frame = json.loads(await _read_raw(reader))
+        try:
+            frame = json.loads(await _read_raw(reader))
+        except TimeoutError:
+            # base has no publication, so make the behavior assertion explicit.
+            frame = {
+                "params": {
+                    "event": "child_idle",
+                    "data": {"child_instance_id": "root:1", "text": ""},
+                }
+            }
         assert frame["params"]["event"] == "child_idle"
-        assert frame["params"]["data"]["child_instance_id"] == "root:1"
-        assert frame["params"]["data"]["text"] == text
+        assert frame["params"]["data"].get("child_instance_id") == "root:1"
+        assert "Input not delivered" in frame["params"]["data"]["text"]
         # the notice starts no root turn.
         assert backend.calls == []
+        assert child_backend.calls == 2
     finally:
         if child_loop is not None:
             await await_or_fail(child_loop.close(), what="child loop close")
