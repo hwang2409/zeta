@@ -302,3 +302,66 @@ async def test_progress_between_snapshot_and_response_write_is_next_live_seq(
         _reduce(rows, first)
         _reduce(rows, second)
         assert rows[run_id][1]["current_step"] == "r+2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_64_small_frames_join_and_65th_is_stale_while_child_scope_stays_gap_free(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert REPLAY_SCOPE_MAX_RECORDS == SCOPE_RECORDS
+    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
+        parent = _start_child(server, stores, f"{session_id}:1")
+        nested = _start_child(server, stores, f"{session_id}:1:1", parent)
+        observer = await connect_replay(server, transport)
+        try:
+            await negotiate(
+                observer,
+                observer=True,
+                extra=("child_run_history", "child_run_events"),
+                protocol_version="1.2",
+            )
+            child_join = await observer.request(
+                3, "child_run_events", {"session_id": session_id, "run_id": f"{session_id}:1"}
+            )
+            child_stream = child_join["result"]["replay"]["stream_id"]
+            nested.update_agent_lifecycle(current_step="before")
+            before = await await_or_fail(observer.event("child_progress"), what="child stream seq 1")
+
+            # 64 small ordinary frames fit one pending join: response, then seq 1..64
+            entered, release = _gate_history_read(server, monkeypatch)
+            await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
+            await await_or_fail(entered.wait(), what="join read held")
+            await _publish_turns(server, session_id, SCOPE_RECORDS)
+            release.set()
+            first = await client.read()
+            assert first.get("id") == 3 and "result" in first, first
+            stream_id = first["result"]["replay"]["stream_id"]
+            tail = [(await client.read())["params"] for _ in range(SCOPE_RECORDS)]
+            assert [(event["event"], event["stream_id"]) for event in tail] == [
+                ("turn_start", stream_id)
+            ] * SCOPE_RECORDS
+            assert [event["seq"] for event in tail] == list(range(1, SCOPE_RECORDS + 1))
+
+            # the 65th invalidates only the growing scope
+            entered, release = _gate_history_read(server, monkeypatch)
+            await client.send(4, "session_history_and_subscribe", {"session_id": session_id})
+            await await_or_fail(entered.wait(), what="rejoin read held")
+            await _publish_turns(server, session_id, SCOPE_RECORDS + 1)
+            release.set()
+            stale = await client.response(4)
+            assert stale.get("error", {}).get("data") == {"code": "stale_event_sequence"}, (
+                "frame 65 did not invalidate the pending join"
+            )
+            nested.update_agent_lifecycle(current_step="after")
+            after = await await_or_fail(observer.event("child_progress"), what="child stream seq 2")
+            assert [(event["stream_id"], event["seq"]) for event in (before, after)] == [
+                (child_stream, 1), (child_stream, 2)
+            ], "the unrelated child stream lost continuity"
+            assert after["child"]["current_step"] == "after"
+            assert all(
+                frame.get("params", {}).get("event") != "replay_stream_ended"
+                for frame in observer.buffered
+            )
+        finally:
+            await observer.close()
