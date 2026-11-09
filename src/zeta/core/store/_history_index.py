@@ -165,12 +165,6 @@ class HistoryIndex:
             entry_type == "warning" and data.get("kind") == "transcript_recovery"
         )
 
-    @staticmethod
-    def _belongs_in_history(entry_type: str, data: Mapping[str, object]) -> bool:
-        return HistoryIndex._starts_next_group(entry_type, data) or entry_type in {
-            "client_delivery", "approval_resolution", "approval_history", "turn_end"
-        }
-
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)"
@@ -232,9 +226,11 @@ class HistoryIndex:
                 for entry in rows:
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
                     data = json.loads(encoded)
-                    if self._starts_next_group(entry_type, data):
+                    if group < 0:
+                        group = 0
+                    elif self._starts_next_group(entry_type, data):
                         group += 1
-                    history_group = group if self._belongs_in_history(entry_type, data) else None
+                    history_group = group
                     connection.execute(
                         "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
                         "VALUES(?,?,?,?,?,?,?)",
@@ -313,13 +309,11 @@ class HistoryIndex:
                 projected: list[tuple[object, int | None]] = []
                 for entry in entries:
                     data = dict(entry.data)
-                    if self._starts_next_group(entry.type, data):
+                    if current_group < 0:
+                        current_group = 0
+                    elif self._starts_next_group(entry.type, data):
                         current_group += 1
-                    group = (
-                        current_group
-                        if current_group >= 0 and self._belongs_in_history(entry.type, data)
-                        else None
-                    )
+                    group = current_group
                     projected.append((entry, group))
                 with connection:
                     connection.executemany(
