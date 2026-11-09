@@ -351,7 +351,7 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
         offset_before_dismiss = app._decisions_panel_control.offset
         assert offset_before_dismiss > 0
 
-        app._stop_decisions_refresh()
+        await app.stop_decisions_poll()
         tick_done = asyncio.Event()
         dismissal_task: asyncio.Task[None] | None = None
         original_create_task = asyncio.create_task

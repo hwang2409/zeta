@@ -647,6 +647,15 @@ def render_event(
     if event.type is StreamEventType.RETRY:
         text = event.data.get("text")
         return Text(text if type(text) is str else "retrying", style=theme.DIM)
+    if event.type is StreamEventType.TURN_END:
+        completion = event.data.get("completion")
+        if completion == "refusal":
+            return Text("model refused to answer", style=theme.WARNING)
+        if completion == "content_filter":
+            return Text("model response blocked by content filter", style=theme.WARNING)
+        # "empty" is not shown: user turns get the "no response" fallback and
+        # a silent notification turn is a valid "nothing to report".
+        return None
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         return render_agent_notification(event, identity_index)
     if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
@@ -758,6 +767,7 @@ def format_status(
     plan_state: str | None = None,
     background_count: int = 0,
     decisions_count: int = 0,
+    decisions_error: str | None = None,
     decisions_staged: int = 0,
     main_active: bool = False,
     undo_available: bool = False,
@@ -846,7 +856,9 @@ def format_status(
         segments.append(state_segment)
         if background_count > 0:
             segments.append(f"bg {background_count}")
-        if decisions_marker:
+        if decisions_error is not None:
+            segments.append(f"decisions unavailable: {decisions_error}")
+        elif decisions_marker:
             segments.append(decisions_marker)
         if main_active:
             segments.append("◆ main")
@@ -974,7 +986,12 @@ def format_status(
             value = fitted.plain.rstrip(" ·")
     rendered = Text(value, style=theme.CHROME)
     offset = 0
-    if decisions_marker:
+    if decisions_error is not None:
+        marker = f"decisions unavailable: {decisions_error}"
+        marker_start = value.find(marker)
+        if marker_start >= 0:
+            rendered.stylize(theme.ERROR, marker_start, marker_start + len(marker))
+    elif decisions_marker:
         marker = decisions_marker
         marker_start = value.find(marker)
         if marker_start >= 0:

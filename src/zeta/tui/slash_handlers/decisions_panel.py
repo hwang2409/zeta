@@ -11,11 +11,13 @@ poller keeps fresh while the app is open.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 from prompt_toolkit.document import Document
 
 from ...attention_records import Broken, broken_record_refusal
+from ...protocol.types import StreamEvent, StreamEventType
 from ...runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
@@ -28,7 +30,9 @@ from ..overlay import OverlayControl
 # attention records); a few-second cadence keeps the status-bar count fresh
 # without busy-polling.
 _POLL_INTERVAL = 2.0
-_PANEL_REFRESH_INTERVAL = 0.5
+_SCAN_TIMEOUT = 10.0
+_SCAN_RETRY_LIMIT = 3
+_SCAN_RETRY_BASE = 0.5
 
 
 def _registry_state(app: object) -> ProjectRegistryState:
@@ -45,6 +49,63 @@ def _registry_state(app: object) -> ProjectRegistryState:
     )
 
 
+def _scan_decisions(
+    home: Path,
+    session_id: str,
+    registry_state: ProjectRegistryState,
+    loop: asyncio.AbstractEventLoop,
+    work: asyncio.Future[tuple],
+) -> None:
+    from ...attention_decisions import open_decisions
+
+    attention_dir = home / "sessions" / session_id / "attention"
+
+    def signature() -> tuple[tuple[str, int, int], ...]:
+        try:
+            return tuple(
+                sorted(
+                    (
+                        path.name,
+                        path.stat().st_mtime_ns,
+                        path.stat().st_size,
+                    )
+                    for path in attention_dir.iterdir()
+                    if path.is_file()
+                )
+            )
+        except OSError:
+            return ()
+
+    try:
+        for attempt in range(_SCAN_RETRY_LIMIT + 1):
+            signature_before = signature()
+            result = open_decisions(home, session_id, registry_state)
+            # Keep the projection and its validation on the worker.
+            if signature() == signature_before or attempt == _SCAN_RETRY_LIMIT:
+                break
+    except Exception as exc:  # noqa: BLE001 - publish scan failures
+        result = exc
+    if loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(
+            _deliver_decisions_scan, work, result
+        )
+    except RuntimeError:
+        pass  # The loop closed after the check.
+
+
+def _deliver_decisions_scan(
+    work: asyncio.Future[tuple], result: tuple | Exception
+) -> None:
+    if work.done():
+        return
+    if isinstance(result, Exception):
+        work.set_exception(result)
+    else:
+        work.set_result(result)
+
+
 class DecisionsMixin:
     """Serve the interactive decisions popup and its status-bar count."""
 
@@ -54,8 +115,12 @@ class DecisionsMixin:
         self._decisions_panel_open = False
         self._decisions_count = 0
         self._decisions_staged_count = 0
-        self._decisions_poll_task: asyncio.Task[None] | None = None
-        self._decisions_refresh_task: asyncio.Task[None] | None = None
+        self._decisions_error: str | None = None
+        self._decisions_scan_task: asyncio.Task[None] | None = None
+        self._decisions_scan_work: asyncio.Future[tuple] | None = None
+        self._decisions_scan_generation = 0
+        self._decisions_scan_requested = asyncio.Event()
+        self._decisions_stopping = False
         self._decisions_restore_text = ""
         self._decisions_restore_cursor = 0
         self._decisions_answer_buffer = ""
@@ -69,6 +134,10 @@ class DecisionsMixin:
     @property
     def decisions_count(self) -> int:
         return self._decisions_count
+
+    @property
+    def decisions_error(self) -> str | None:
+        return self._decisions_error
 
     @property
     def decisions_staged_count(self) -> int:
@@ -91,17 +160,10 @@ class DecisionsMixin:
             self._consume_overlay_submission()
             await self._open_decisions_panel()
             return ""
-        from ...attention_decisions import open_decisions
-
         parts = args.split(maxsplit=2)
         if not parts or parts[0] not in {"reply", "dismiss"}:
             await DecisionsMixin._recover_decisions(self, self._decisions_session_id)
-        items = await asyncio.to_thread(
-            open_decisions,
-            self._home,
-            self._decisions_session_id,
-            _registry_state(self),
-        )
+        items = await DecisionsMixin._read_decisions(self, _SCAN_TIMEOUT)
         if parts and parts[0] in {"reply", "dismiss"}:
             if len(parts) < 2:
                 return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
@@ -137,57 +199,141 @@ class DecisionsMixin:
             for item in items
         )
 
-    # -- status-bar count poll ----------------------------------------------
+    # -- status-bar count scan ----------------------------------------------
 
     def start_decisions_poll(self) -> None:
-        if self._decisions_poll_task is not None:
-            return
-        self._decisions_poll_task = asyncio.create_task(self._decisions_poll_loop())
+        self._decisions_stopping = False
+        self.request_decisions_refresh()
 
-    def stop_decisions_poll(self) -> None:
-        task = self._decisions_poll_task
-        self._decisions_poll_task = None
+    async def stop_decisions_poll(self) -> None:
+        self._decisions_stopping = True
+        task = self._decisions_scan_task
+        self._decisions_scan_task = None
+        self._decisions_scan_requested.clear()
         if task is not None and not task.done():
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
-    async def _decisions_poll_loop(self) -> None:
+    def _refresh_decisions_for_event(self, event: StreamEvent) -> None:
+        if (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "resolve_attention"
+            and event.tool_result is not None
+            and not event.tool_result.is_error
+        ):
+            self.request_decisions_refresh()
+
+    def _advance_decisions_generation(self) -> int:
+        self._decisions_scan_generation += 1
+        return self._decisions_scan_generation
+
+    def request_decisions_refresh(self) -> None:
+        if self._decisions_stopping:
+            return
+        self._advance_decisions_generation()
+        self._decisions_scan_requested.set()
+        if self._decisions_scan_task is None or self._decisions_scan_task.done():
+            self._decisions_scan_task = asyncio.create_task(
+                self._decisions_scan_loop(), name="zeta-decisions-scan"
+            )
+
+    async def _decisions_scan_loop(self) -> None:
         while True:
-            await self._decisions_tick()
-            await asyncio.sleep(_POLL_INTERVAL)
+            self._decisions_scan_requested.clear()
+            scanned = await self._scan_decisions_with_retries()
+            if not scanned:
+                await self._decisions_scan_requested.wait()
+                continue
+            # The completed scan includes every request received while it ran.
+            self._decisions_scan_requested.clear()
+            try:
+                await asyncio.wait_for(
+                    self._decisions_scan_requested.wait(), timeout=_POLL_INTERVAL
+                )
+            except TimeoutError:
+                pass
+
+    async def _scan_decisions_with_retries(self) -> bool:
+        for attempt in range(_SCAN_RETRY_LIMIT + 1):
+            try:
+                await self._decisions_tick()
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - projection failures stay visible
+                if attempt == _SCAN_RETRY_LIMIT:
+                    self._set_decisions_error(exc)
+                    return False
+                await asyncio.sleep(_SCAN_RETRY_BASE * 2**attempt)
+        return False
+
+    def _set_decisions_error(self, error: BaseException) -> None:
+        reason = str(error).strip() or type(error).__name__
+        self._decisions_error = reason[:80]
+        self._invalidate_prompt()
+
+    async def _read_decisions(
+        self, timeout: float | None, generation: int | None = None
+    ) -> tuple:
+        requested_generation = (
+            self._advance_decisions_generation() if generation is None else generation
+        )
+        while True:
+            work = getattr(self, "_decisions_scan_work", None)
+            if work is None or work.done():
+                if work is not None and work.done() and not work.cancelled():
+                    work.exception()
+                loop = asyncio.get_running_loop()
+                work = loop.create_future()
+                self._decisions_scan_work = work
+                threading.Thread(
+                    target=_scan_decisions,
+                    args=(
+                        self._home,
+                        self._decisions_session_id,
+                        _registry_state(self),
+                        loop,
+                        work,
+                    ),
+                    name="zeta-decisions-scan",
+                    daemon=True,
+                ).start()
+            try:
+                result = await asyncio.wait_for(asyncio.shield(work), timeout=timeout)
+            finally:
+                if work.done() and self._decisions_scan_work is work:
+                    self._decisions_scan_work = None
+            if requested_generation == getattr(self, "_decisions_scan_generation", 0):
+                return result
 
     async def _decisions_tick(self) -> None:
-        from ...attention_decisions import open_decisions
+        generation = self._advance_decisions_generation()
+        try:
+            items = await self._read_decisions(_SCAN_TIMEOUT, generation)
+        except TimeoutError as exc:
+            self._set_decisions_error(exc)
+            items = await self._read_decisions(timeout=None, generation=generation)
+        replies = self._attention_replies(self._decisions_session_id)
         from ...attention_records import Broken
 
-        session_id = self._decisions_session_id
-        registry_state = _registry_state(self)
-        replies = self._attention_replies(session_id)
-
-        def read():
-            items = open_decisions(self._home, session_id, registry_state)
-            # A broken record cannot take a reply, so it never shows as staged.
-            open_ids = {
-                item.record.id
-                for item in items
-                if not isinstance(item.record, Broken)
-            }
-            staged = {
+        open_ids = {
+            item.record.id for item in items if not isinstance(item.record, Broken)
+        }
+        staged = await asyncio.to_thread(
+            lambda: {
                 item_id: reply
                 for item_id, reply in (replies.staged() if items else ())
                 if item_id in open_ids
             }
-            return items, staged
-
-        try:
-            items, staged = await asyncio.to_thread(read)
-        except OSError:
-            return
+        )
         changed = (len(items), len(staged)) != (
             self._decisions_count,
             self._decisions_staged_count,
-        )
+        ) or self._decisions_error is not None
         self._decisions_count = len(items)
         self._decisions_staged_count = len(staged)
+        self._decisions_error = None
         if self._decisions_panel_open:
             self._decisions_panel.set_items(items, staged)
             self._decisions_panel_control.set_lines(
@@ -243,7 +389,7 @@ class DecisionsMixin:
             self._decisions_panel.render_lines(), overflow_hint=True
         )
         session.layout.focus(self._decisions_panel_window)
-        self._start_decisions_refresh()
+        self.request_decisions_refresh()
         self._invalidate_prompt()
 
     def close_decisions_panel(self) -> None:
@@ -252,7 +398,6 @@ class DecisionsMixin:
         self._decisions_panel_open = False
         asyncio.create_task(self._flush_staged_decisions())
         self._decisions_panel.exit_answer()
-        self._stop_decisions_refresh()
         session = self._active_session
         if isinstance(session, FullScreenPromptSession):
             session.default_buffer.set_document(
@@ -280,23 +425,6 @@ class DecisionsMixin:
     def _decisions_session_ids(self) -> tuple[str, ...]:
         return tuple({item.session_id for item in self._decisions_panel.items})
 
-    def _start_decisions_refresh(self) -> None:
-        self._stop_decisions_refresh()
-        self._decisions_refresh_task = asyncio.create_task(
-            self._decisions_refresh_loop()
-        )
-
-    def _stop_decisions_refresh(self) -> None:
-        task = self._decisions_refresh_task
-        self._decisions_refresh_task = None
-        if task is not None and not task.done():
-            task.cancel()
-
-    async def _decisions_refresh_loop(self) -> None:
-        while self._decisions_panel_open:
-            await self._decisions_tick()
-            await asyncio.sleep(_PANEL_REFRESH_INTERVAL)
-
     # -- keyboard -----------------------------------------------------------
 
     def _decisions_key(self, key: str) -> None:
@@ -318,14 +446,13 @@ class DecisionsMixin:
         elif (
             key == "d"
             and panel.selected is not None
-            and not isinstance(panel.selected.record, Broken)
             and panel.selected.record.kind != "decision"
         ):
             self._dismiss_selected()
             return
         elif key == "a":
-            if panel.enter_answer():
-                self._decisions_answer_buffer = ""
+            panel.enter_answer()
+            self._decisions_answer_buffer = ""
         elif key == "enter":
             self._discuss_selected()
             return
@@ -397,7 +524,7 @@ class DecisionsMixin:
                 self._print_broken_outcomes(outcome)
             except (OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
-            await self._decisions_tick()
+            self.request_decisions_refresh()
             self._refresh_decisions_panel()
 
         self._decisions_panel.exit_answer()
@@ -405,9 +532,7 @@ class DecisionsMixin:
 
     def _dismiss_selected(self) -> None:
         item = self._decisions_panel.selected
-        if item is None or isinstance(item.record, Broken):
-            if item is not None:
-                self._print_system(f"attention record is broken: {item.record.reason}")
+        if item is None:
             return
 
         async def run() -> None:
@@ -423,9 +548,6 @@ class DecisionsMixin:
     def _discuss_selected(self) -> None:
         item = self._decisions_panel.selected
         if item is None or self._decisions_switching:
-            return
-        if isinstance(item.record, Broken):
-            self._print_system(broken_record_refusal(item.record))
             return
         self._decisions_switching = True
         source_id, attention_id = item.session_id, item.record.id

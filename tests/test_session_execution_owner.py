@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from zeta.core import session_execution
 from zeta.core.session import SessionManager
 from zeta.core.session_execution import (
     OwnerHint,
@@ -239,8 +240,105 @@ def test_execution_acquire_uses_only_nonblocking_flock_and_never_fsyncs(
     finally:
         os.close(directory_fd)
 
-    assert operations == [fcntl.LOCK_EX | fcntl.LOCK_NB]
+    assert operations == [fcntl.LOCK_EX | fcntl.LOCK_NB, fcntl.LOCK_UN]
     assert fsync_calls == []
+
+
+def test_release_unlocks_before_registry_removal_and_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    lease = SessionExecutionLease.acquire(
+        directory_fd,
+        session_id="session",
+        owner=OwnerHint("headless"),
+    )
+    close_started = threading.Event()
+    release_close = threading.Event()
+    close_error: list[BaseException] = []
+    real_close = session_execution.os.close
+    target_fd = lease._owned.fd
+
+    def pause_target_close(fd: int) -> None:
+        if fd == target_fd:
+            close_started.set()
+            if not release_close.wait(_WAIT_TIMEOUT_SECONDS):
+                raise AssertionError("timed out waiting to release the old lease")
+        real_close(fd)
+
+    monkeypatch.setattr(session_execution.os, "close", pause_target_close)
+    closing = threading.Thread(
+        target=lambda: _close_and_record(lease, close_error),
+        daemon=True,
+    )
+    replacement: SessionExecutionLease | None = None
+    closing.start()
+    try:
+        assert close_started.wait(_WAIT_TIMEOUT_SECONDS), (
+            "timed out at the release/close ordering seam"
+        )
+        replacement = SessionExecutionLease.acquire(
+            directory_fd,
+            session_id="session",
+            owner=OwnerHint("headless"),
+        )
+    finally:
+        release_close.set()
+        closing.join(_WAIT_TIMEOUT_SECONDS)
+        if closing.is_alive():
+            pytest.fail("lease close thread did not finish before the deadline")
+        if replacement is not None:
+            replacement.close()
+        os.close(directory_fd)
+
+    assert not close_error
+
+
+def _close_and_record(lease: SessionExecutionLease, errors: list[BaseException]) -> None:
+    try:
+        lease.close()
+    except BaseException as exc:  # noqa: BLE001 - report thread failures in test
+        errors.append(exc)
+
+
+def test_release_unlock_and_registry_removal_share_mutex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    lease = SessionExecutionLease.acquire(
+        directory_fd,
+        session_id="session",
+        owner=OwnerHint("headless"),
+    )
+    unlock_started = threading.Event()
+    release_unlock = threading.Event()
+    real_flock = session_execution.fcntl.flock
+    target_fd = lease._owned.fd
+
+    def pause_unlock(fd: int, operation: int) -> None:
+        if fd == target_fd and operation == fcntl.LOCK_UN:
+            # test-contract: seam keeps the registry entry under the mutex until unlock.
+            # RegistryLock has no held-check; its private threading.Lock is the mutex.
+            assert session_execution._REGISTRY_LOCK._lock.locked()
+            assert session_execution._REGISTRY.get(lease._owned.identity) is lease._owned
+            unlock_started.set()
+            if not release_unlock.wait(_WAIT_TIMEOUT_SECONDS):
+                raise AssertionError("timed out waiting to release the lock seam")
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(session_execution.fcntl, "flock", pause_unlock)
+    closing = threading.Thread(target=lease.close, daemon=True)
+    closing.start()
+    try:
+        assert unlock_started.wait(_WAIT_TIMEOUT_SECONDS), (
+            "timed out at the unlock/registry ordering seam"
+        )
+    finally:
+        release_unlock.set()
+        closing.join(_WAIT_TIMEOUT_SECONDS)
+        if closing.is_alive():
+            pytest.fail("lease close thread did not finish before the deadline")
+        os.close(directory_fd)
 
 
 def test_runtime_lease_record_survives_short_writes(

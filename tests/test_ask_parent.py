@@ -8,6 +8,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
@@ -81,26 +82,70 @@ def _setup(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_ask_parent_returns_immediately_and_persists_once(tmp_path: Path) -> None:
-    parent, _child, registry, handle, owner = _setup(tmp_path)
-    result = await asyncio.wait_for(
+async def test_ask_parent_returns_after_durable_question_without_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, child, registry, handle, owner = _setup(tmp_path)
+    publication_started = asyncio.Event()
+    allow_publication = asyncio.Event()
+    persisted = asyncio.Event()
+    channel = owner.conversation_channel
+    original_publish = channel.publish_question
+
+    async def observe_publish(**kwargs):
+        publication_started.set()
+        await await_or_fail(
+            allow_publication.wait(),
+            what="allow durable ask_parent question",
+        )
+        result = await original_publish(**kwargs)
+        persisted.set()
+        return result
+
+    monkeypatch.setattr(channel, "publish_question", observe_publish)
+    execution = asyncio.create_task(
         registry.execute(
             ToolCall(
                 "ask-1",
                 "ask_parent",
                 {"question": "Which approach?", "options": ["A", "B"]},
             )
-        ),
-        timeout=0.2,
+        )
     )
+    try:
+        await await_or_fail(
+            publication_started.wait(),
+            what="ask_parent publication start",
+        )
+        assert not execution.done(), "ask_parent acknowledged before persistence"
+        allow_publication.set()
+        await await_or_fail(persisted.wait(), what="durable ask_parent question")
+        result = await await_or_fail(execution, what="ask_parent tool result")
 
-    questions = parent.agent_notifications()
-    assert result["isError"] is False
-    assert "continue your work" in result["content"][0]["text"]
-    assert len(questions) == 1
-    assert questions[0].data["kind"] == "child_question"
-    assert questions[0].data["child_instance_id"] == handle
-    owner.cancel_all()
+        questions = parent.agent_notifications()
+        assert result["isError"] is False
+        assert "continue your work" in result["content"][0]["text"]
+        assert len(questions) == 1
+        assert questions[0].data["kind"] == "child_question"
+        assert questions[0].data["child_instance_id"] == handle
+        assert questions[0].data["status"] == "pending"
+        child_prompts = await await_or_fail(
+            asyncio.to_thread(child.pending_prompts),
+            what="read unanswered child prompts",
+        )
+        assert child_prompts == []
+    finally:
+        allow_publication.set()
+        if not execution.done():
+            execution.cancel()
+        await await_or_fail(
+            asyncio.gather(execution, return_exceptions=True),
+            what="ask_parent test cleanup",
+        )
+        owner.cancel_all()
+        await registry.close()
+        child.close()
+        parent.close()
 
 
 @pytest.mark.asyncio
@@ -108,24 +153,29 @@ async def test_ordinary_agent_send_is_not_consumed_as_question_answer(
     tmp_path: Path,
 ) -> None:
     parent, child, registry, handle, owner = _setup(tmp_path)
-    ask = asyncio.create_task(
+    ask = await await_or_fail(
         registry.execute(
             ToolCall("ask-1", "ask_parent", {"question": "Can I proceed?"})
-        )
+        ),
+        what="ask_parent tool result",
     )
-    for _ in range(100):
-        if parent.agent_notifications():
-            break
-        await asyncio.sleep(0.01)
+    assert ask["isError"] is False
 
-    assert await send_to_run(
-        parent,
-        handle,
-        "Proceed",
-        channel=owner.conversation_channel,
-    ) is None
-    await asyncio.wait_for(ask, timeout=0.2)
-    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["Proceed"]
+    send_error = await await_or_fail(
+        send_to_run(
+            parent,
+            handle,
+            "Proceed",
+            channel=owner.conversation_channel,
+        ),
+        what="ordinary child follow-up",
+    )
+    assert send_error is None
+    prompts = await await_or_fail(
+        asyncio.to_thread(child.pending_prompts),
+        what="read child prompts",
+    )
+    assert [entry.data["text"] for entry in prompts] == ["Proceed"]
     assert len(parent.agent_notifications()) == 1
     owner.cancel_all()
 
