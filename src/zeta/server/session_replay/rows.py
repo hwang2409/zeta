@@ -153,7 +153,6 @@ def _notification(fields: Mapping[str, Any], facts: RowFacts, owner: str | None)
 _NOTIFICATION_EVENTS = (
     EventDescriptor.SUB_AGENT_RECEIPT,
     EventDescriptor.CHILD_IDLE,
-    EventDescriptor.CHILD_HOLD,
     EventDescriptor.TASK_EXIT_NOTIFICATION,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION,
     EventDescriptor.CHILD_QUESTION,
@@ -169,7 +168,11 @@ _VARIANTS: dict[EventDescriptor, Classifier] = {
 
 # events serve never publishes on a replay stream
 NOT_PUBLISHED = frozenset(
-    {EventDescriptor.SERVED_TURN_END, EventDescriptor.REPLAY_STREAM_ENDED}
+    {
+        EventDescriptor.SERVED_TURN_END,
+        EventDescriptor.REPLAY_STREAM_ENDED,
+        EventDescriptor.CHILD_HOLD,
+    }
 )
 _LIVE_KINDS = (
     EventDescriptor.AGENT_START,
