@@ -114,6 +114,7 @@ class ServeControl:
         self.server = server
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
+        self._turn_end_published = False
         self._session_swap_active = False
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
@@ -199,6 +200,7 @@ class ServeControl:
             or (
                 self._turn_handoff_task is not None
                 and not self._turn_handoff_task.done()
+                and not self._turn_end_published
             )
             or (loop is not None and loop.notification_turn_state != "idle")
         )
@@ -211,7 +213,10 @@ class ServeControl:
 
     @contextmanager
     def reserve_session_swap(self) -> Iterator[None]:
-        if self.turn_busy():
+        if self.turn_busy() or (
+            self._turn_handoff_task is not None
+            and not self._turn_handoff_task.done()
+        ):
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
@@ -615,7 +620,7 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=agent_end is None,
+                schedule_wake=False,
             )
         if terminal_error is not None:
             await self._notify(
@@ -628,8 +633,8 @@ class ServeControl:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            if outcome is TurnOutcome.COMPLETED:
-                self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self.closing or self._session_swap_id == session_id:
@@ -721,14 +726,14 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=agent_end is None,
+                schedule_wake=False,
             )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            if outcome is TurnOutcome.COMPLETED:
-                self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            self._schedule_background_wake(session_id)
 
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -971,6 +976,8 @@ class ServeControl:
         if foreground and kind is StreamEventType.AGENT_END:
             state.turn_finished()
         await self._notify(wire_event, session_id, data=dict(event.data))
+        if kind is StreamEventType.TURN_END:
+            self._turn_end_published = True
 
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor

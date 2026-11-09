@@ -336,6 +336,7 @@ class DeliveryRequests:
             state.turn_finished()
         if control._turn_task is owner_task:
             control._turn_handoff_task = owner_task
+            control._turn_end_published = False
             control._turn_task = None
             control._turn_cancel_outcome = None
         if (
