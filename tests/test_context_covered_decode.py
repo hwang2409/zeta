@@ -47,7 +47,9 @@ def corpus() -> list[ConversationEntry]:
     ))
     entries.append(ConversationEntry(seq=10, id="marker", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 1, "source_seq_end": 3, "replaces": ["old-marker"], "view": [{"seq": 1, "message": values[1].to_dict()}, {"seq": 3, "message": values[3].to_dict()}]}))
     entries.append(ConversationEntry(seq=11, id="overlap", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 3, "source_seq_end": 4, "view": [{"seq": 3, "message": values[3].to_dict()}, {"seq": 4, "message": values[4].to_dict()}]}))
-    entries.append(ConversationEntry(seq=12, id="invalid", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 20, "source_seq_end": 21, "view": [{"seq": 99, "message": values[1].to_dict()}]}))
+    entries.append(ConversationEntry(seq=12, id="step-marker", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 6, "source_seq_end": 6, "view": [{"seq": 6, "message": values[6].to_dict()}]}))
+    entries.append(ConversationEntry(seq=13, id="reordered", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 2, "source_seq_end": 2, "view": [{"seq": 2, "message": values[2].to_dict()}]}))
+    entries.append(ConversationEntry(seq=14, id="invalid", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 20, "source_seq_end": 21, "view": [{"seq": 99, "message": values[1].to_dict()}]}))
     return entries
 
 
@@ -70,7 +72,11 @@ def reference_items(assembler: ContextAssembler, entries: list[ConversationEntry
         if entry.type != "message":
             continue
         message = Message.from_dict(entry.data["message"])
-        if assembler._is_pending_delivery_message(message):
+        metadata = message.metadata
+        if metadata.get("zeta.pending_prompt_id") == "pending-1":
+            continue
+        delivery = metadata.get("zeta.step_delivery")
+        if isinstance(delivery, dict) and "notice-1" in delivery.get("notification_ids", ()):
             continue
         if message.metadata.get("turn_failed"):
             failed_ids.update(block.tool_call.id for block in message.content if isinstance(block, ToolUseContent))
@@ -111,12 +117,13 @@ def test_covered_decode_matches_reference_projection_and_tokens(tmp_path: Path) 
 def test_covered_decode_skips_ordinary_rows(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     try:
+        store._active_pending_prompt_entries["pending-1"] = object()
         store._active_notifications["notice-1"] = object()
         entries = corpus()
         with patch.object(Message, "from_dict", wraps=Message.from_dict) as decode:
             project(store, entries)
         # test-contract: seam _visible_items is the narrow projection seam under test
-        assert decode.call_count == 9
+        assert decode.call_count == 12
     finally:
         store.close()
 
