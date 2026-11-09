@@ -20,13 +20,14 @@ from ..accounts.usage import format_usage_lines
 from ..attention_decisions import DecisionItem, open_decisions
 from ..attention_records import Broken
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
-from ..core.commands.slash_registry import SlashSurface
+from ..core.commands.slash_registry import BusyPolicy, SlashLock, SlashSurface
 from ..core.project_context import project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     SlashCommandRegistry,
     SlashStatus,
-    _format_status,
+    SlashStatusSnapshot,
+    build_slash_status,
     create_slash_registry,
 )
 from ..core.transcript_recovery.runtime import (
@@ -39,12 +40,9 @@ from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from ..project_registry import ProjectRegistryError
-from ..runtime.status import (
-    SlashStatusSnapshot,
-    build_slash_status,
-    capture_slash_status,
-)
-from . import accounts, ergonomics
+from ..runtime.status import capture_slash_status
+from . import accounts
+from .handlers import validation
 from .model_selection import apply as apply_settings
 from .protocol import (
     ErrorDescriptor,
@@ -84,6 +82,7 @@ class SlashCommandInfo:
     source: str
     client_only: bool
     unavailable: str | None
+    runs_while_busy: BusyPolicy | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -93,6 +92,7 @@ class SlashCommandInfo:
             "source": self.source,
             "client_only": self.client_only,
             "unavailable": self.unavailable,
+            "runs_while_busy": self.runs_while_busy,
         }
 
 
@@ -108,11 +108,11 @@ class ServerSlashSession:
         self,
         runtime: ServerRuntime,
         approval_control: _ApprovalProjection | None = None,
-        run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
+        slash_lock: SlashLock | None = None,
     ) -> None:
         self._runtime = runtime
         self._approval_control = approval_control
-        self._run_blocking = run_blocking
+        self.slash_lock = SlashLock() if slash_lock is None else slash_lock
 
     # --- runnable server-side ---
 
@@ -274,19 +274,9 @@ class ServerSlashSession:
     async def slash_implement(self, args: str) -> str | ModelInputEnvelope:
         return await run_implement_command(self, args)
 
-    def slash_status_command(self, args: str) -> str | Awaitable[str]:
+    def slash_status_input(self, args: str) -> tuple[bool, SlashStatusSnapshot]:
         del args
-        if self._run_blocking is None:
-            return _format_status(self.slash_status())
-        snapshot = self.status_snapshot()
-
-        async def build() -> str:
-            status = await self._run_blocking(lambda: build_slash_status(snapshot))
-            if not isinstance(status, SlashStatus):
-                raise TypeError("status worker returned an invalid projection")
-            return _format_status(status)
-
-        return build()
+        return False, self.status_snapshot()
 
     def status_snapshot(self) -> SlashStatusSnapshot:
         runtime = self._runtime
@@ -545,7 +535,7 @@ async def registry_for_request(runtime: ServerRuntime) -> SlashCommandRegistry:
     """Refresh live skills and build one registry for a serve request."""
 
     if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
+        await runtime.loop.refresh_live_config()
     return await asyncio.to_thread(build_registry, runtime)
 
 
@@ -602,20 +592,36 @@ def can_run_while_busy(registry: SlashCommandRegistry, text: str) -> bool:
         return False
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
+    policy = _busy_policy(registry, name, text)
+    if policy is BusyPolicy.READ_FORMS:
+        command = registry.command_for(name)
+        return command is not None and command.serve is not None and (
+            command.serve.can_run_while_busy(tail)
+        )
+    return policy is BusyPolicy.ALWAYS
+
+
+def _busy_policy(
+    registry: SlashCommandRegistry, name: str, text: str
+) -> BusyPolicy | None:
+    """Return the busy gate's policy for one command, or None when unknown."""
+
     command = registry.command_for(name)
     if command is not None:
         if not registry.available(command):
-            return True
-        return command.serve is not None and command.serve.can_run_while_busy(tail)
+            return BusyPolicy.ALWAYS
+        return BusyPolicy.NEVER if command.serve is None else command.serve.busy_policy
     custom = registry.custom_command_for(name)
     if custom is not None:
-        return custom.kind == "exec" or registry.needs_inline_shell_resolution(text)
+        resolves_in_client = custom.kind == "exec" or (
+            registry.needs_inline_shell_resolution(text)
+        )
+        return BusyPolicy.ALWAYS if resolves_in_client else BusyPolicy.NEVER
     if any(skill.name == name for skill in registry.skill_entries):
-        return False
-    return any(
-        prompt_name == name
-        for prompt_name, _description, _source in registry.mcp_prompt_entries
-    )
+        return BusyPolicy.NEVER
+    if any(entry[0] == name for entry in registry.mcp_prompt_entries):
+        return BusyPolicy.ALWAYS
+    return None
 
 
 async def run_command(
@@ -624,7 +630,7 @@ async def run_command(
     *,
     register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
     approval_control: _ApprovalProjection | None = None,
-    run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
+    slash_lock: SlashLock | None = None,
     busy: bool = False,
     registry: SlashCommandRegistry | None = None,
 ) -> dict[str, object]:
@@ -648,7 +654,7 @@ async def run_command(
         and command.serve is not None
         and command.serve.mutates(tail)
     ):
-        ergonomics.require_mutable(
+        validation.require_mutable(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
         )
@@ -667,7 +673,7 @@ async def run_command(
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(runtime, approval_control, run_blocking=run_blocking)
+    session = ServerSlashSession(runtime, approval_control, slash_lock=slash_lock)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}
@@ -730,6 +736,9 @@ def _entries_from_registry(
                     source="builtin",
                     client_only=unavailable is not None,
                     unavailable=unavailable,
+                    runs_while_busy=_busy_policy(
+                        registry, command.name, f"/{command.name}"
+                    ),
                 )
             )
     for command in registry.custom_commands:
@@ -748,6 +757,9 @@ def _entries_from_registry(
                     source=command.source,
                     client_only=unavailable is not None,
                     unavailable=unavailable,
+                    runs_while_busy=_busy_policy(
+                        registry, command.name, f"/{command.name}"
+                    ),
                 )
             )
     for skill in registry.skill_entries:
@@ -759,6 +771,7 @@ def _entries_from_registry(
                 source=skill.source,
                 client_only=False,
                 unavailable=None,
+                runs_while_busy=_busy_policy(registry, skill.name, f"/{skill.name}"),
             )
         )
     if include_unavailable:
@@ -771,6 +784,7 @@ def _entries_from_registry(
                     source=f"mcp:{source}",
                     client_only=True,
                     unavailable=_UNAVAILABLE_REASON,
+                    runs_while_busy=_busy_policy(registry, name, f"/{name}"),
                 )
             )
     return entries

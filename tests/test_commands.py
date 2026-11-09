@@ -4,6 +4,7 @@ import subprocess
 import threading
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Self
 
 import pytest
@@ -22,6 +23,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.commands.custom_commands import COMMAND_FILE_SIZE_LIMIT
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.slash import (
     INIT_PROMPT,
     CustomCommand,
@@ -106,8 +108,10 @@ def _approval_presentation_event(
 
 # test-contract: seam no public event reports submission-consumer completion.
 async def _drain_submission_consumer(app: TUIApp) -> None:
-    while (consumer := app._submissions._consumer) is not None:
-        await asyncio.wait_for(asyncio.shield(consumer), timeout=10)
+    pipeline = app._submissions
+    while (consumer := pipeline._consumer) is not None or pipeline._slash_tasks:
+        pending = [consumer] if consumer is not None else list(pipeline._slash_tasks.values())
+        await asyncio.wait_for(asyncio.gather(*map(asyncio.shield, pending)), timeout=10)
 
 
 # test-contract: seam no public event reports active provider-turn completion.
@@ -202,7 +206,7 @@ def test_keys_help_describes_prompt_history_search(tmp_path: Path) -> None:
     command = next(command for command in registry.builtin_commands if command.name == "keys")
 
     assert "/keys — show keyboard shortcuts" in registry.help_text()
-    assert "ctrl+r search prompt history" in command.run(None, "")
+    assert "ctrl+r search prompt history" in command.policy.handler(None, "")
 
 
 def test_init_is_in_help_and_completion(tmp_path: Path) -> None:
@@ -252,11 +256,12 @@ def test_init_returns_canned_prompt_inside_project(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
-    result = create_slash_registry(
+    registry = create_slash_registry(
         zeta_home=tmp_path / "home",
         project_dir=project,
         skill_catalog=SkillCatalog.empty(),
-    ).dispatch(object(), "/init")
+    )
+    result = registry.dispatch(SimpleNamespace(slash_lock=SlashLock()), "/init")
 
     assert isinstance(result, ModelInputEnvelope)
     assert result.text == INIT_PROMPT
@@ -305,6 +310,8 @@ async def test_mcp_prompt_completion_and_resolution() -> None:
     )
 
     class Session:
+        slash_lock = SlashLock()
+
         async def slash_mcp_prompt(
             self, name: str, arguments: dict[str, str]
         ) -> str:
@@ -347,6 +354,8 @@ async def test_mcp_prompt_missing_required_argument_does_not_call_session() -> N
     )
 
     class Session:
+        slash_lock = SlashLock()
+
         async def slash_mcp_prompt(
             self, name: str, arguments: dict[str, str]
         ) -> str:

@@ -19,6 +19,7 @@ from ..core.approval import (
     revoke_session_grants,
     session_grant_change,
 )
+from ..core.commands.slash_registry import SlashLock
 from ..core.store import ConversationStore
 from ..protocol.types import (
     ErrorInfo,
@@ -121,6 +122,9 @@ class ServeControl:
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
+        # Serve reads requests serially per connection and has one controller,
+        # so this lock never contends today; status projects its holder.
+        self.slash_lock = SlashLock(offload=self._run_blocking)
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
         self._host_binding_required = False
@@ -787,6 +791,23 @@ class ServeControl:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
             self._schedule_background_wake(session_id)
 
+    async def _publish_config_changed(
+        self, event: StreamEvent, session_id: str | None
+    ) -> None:
+        controller = (
+            self.server.connections.controller_metadata()
+            if self.server.connections is not None
+            else None
+        )
+        if controller is None or "live_config_changed" not in controller.features:
+            return
+        self._end_stale_approvals(session_id)
+        await self._notify(
+            event_contract.STREAM_EVENT_WIRE_EVENTS[event.type],
+            session_id,
+            **event_contract.config_changed_wire_fields(event),
+        )
+
     async def _event(
         self,
         event: StreamEvent,
@@ -805,6 +826,9 @@ class ServeControl:
             and state.session_id == session_id
         )
         kind = event.type
+        if kind is StreamEventType.CONFIG_CHANGED:
+            await self._publish_config_changed(event, session_id)
+            return
         if foreground:
             state.usage_tracker.record(kind, state.model)
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
