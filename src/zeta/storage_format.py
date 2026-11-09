@@ -44,6 +44,15 @@ def feature_enabled(home_epoch: int, feature: StorageFeature) -> bool:
     """Return whether a home can use the feature's stored shapes."""
     return home_epoch >= FEATURE_EPOCHS[feature]
 
+
+def writer_epoch() -> int:
+    """The epoch this writer publishes. Use this for writer-capability needs.
+
+    Feature gates must compare against FEATURE_EPOCHS / feature_enabled() instead,
+    so a new writer release does not silently change a home's feature set.
+    """
+    return WRITER_EPOCH
+
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
 # derived or ephemeral output are intentionally not gated.

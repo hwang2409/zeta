@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import ast
 import asyncio
+import io
 import json
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -17,117 +18,49 @@ from zeta.storage_format import StorageFormatError, open_writer
 from zeta.tools.registry import ToolRegistry
 
 
-def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
-    return {
-        child: parent
-        for parent in ast.walk(tree)
-        for child in ast.iter_child_nodes(parent)
-    }
-
-
-def _cli_main_path() -> Path:
-    return Path.cwd() / "src" / "zeta" / "cli" / "main.py"
-
-
-def _allowed_writer_import(node: ast.alias, path: Path) -> bool:
-    # the single unaliased import that brings WRITER_EPOCH into cli/main.py.
-    return path == _cli_main_path() and node.asname is None
-
-
-def _allowed_writer_default(
-    node: ast.Name, parents: dict[ast.AST, ast.AST], path: Path
-) -> bool:
-    if path != _cli_main_path():
-        return False
-    keyword = parents.get(node)
-    if not isinstance(keyword, ast.keyword) or keyword.arg != "default":
-        return False
-    call = parents.get(keyword)
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
-        return False
-    return (
-        call.func.attr == "add_argument"
-        and bool(call.args)
-        and isinstance(call.args[0], ast.Constant)
-        and call.args[0].value == "--target-epoch"
-    )
-
-
-def _writer_epoch_violation(
-    node: ast.AST, parents: dict[ast.AST, ast.AST], path: Path
-) -> bool:
-    if isinstance(node, ast.alias):
-        return node.name == "WRITER_EPOCH" and not _allowed_writer_import(node, path)
-    if isinstance(node, ast.Name):
-        return node.id == "WRITER_EPOCH" and not _allowed_writer_default(
-            node, parents, path
-        )
-    return isinstance(node, ast.Attribute) and node.attr == "WRITER_EPOCH"
-
-
-def _writer_epoch_violations(path: Path, source: str) -> list[str]:
-    tree = ast.parse(source, filename=str(path))
-    parents = _parent_map(tree)
+def _writer_epoch_tokens(path: Path, source: str) -> list[str]:
+    # token-level: only real WRITER_EPOCH name references count, not strings or
+    # comments. an aliased import still carries the name on its import line.
     return [
-        f"{path}:{node.lineno}"
-        for node in ast.walk(tree)
-        if _writer_epoch_violation(node, parents, path)
+        f"{path}:{token.start[0]}"
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.NAME and token.string == "WRITER_EPOCH"
     ]
 
 
-def test_feature_gates_do_not_compare_against_writer_epoch() -> None:
+def test_writer_epoch_token_only_in_storage_format() -> None:
     source_root = Path.cwd() / "src" / "zeta"
     violations = [
-        violation
+        hit
         for path in sorted(source_root.rglob("*.py"))
         if path.name != "storage_format.py"
-        for violation in _writer_epoch_violations(path, path.read_text())
+        for hit in _writer_epoch_tokens(path, path.read_text())
     ]
     assert not violations, (
-        "compare against FEATURE_EPOCHS[...] / feature_enabled() in "
-        "src/zeta/storage_format.py: "
-        + ", ".join(violations)
+        "WRITER_EPOCH must stay inside src/zeta/storage_format.py. for a feature "
+        "gate, compare against FEATURE_EPOCHS[...] / feature_enabled(); for the "
+        "writer's own epoch, call writer_epoch(). offenders: " + ", ".join(violations)
     )
 
 
 @pytest.mark.parametrize(
     "source",
     [
-        "from zeta.storage_format import WRITER_EPOCH as epoch\nif home_epoch == epoch: pass",
-        "from zeta.storage_format import WRITER_EPOCH as epoch\ndef f(value=epoch): pass",
-        "from .storage_format import WRITER_EPOCH as e\nif home_epoch == e: pass",
-        "from ..storage_format import WRITER_EPOCH as e\ndef f(value=e): pass",
-        "def f(value=WRITER_EPOCH): pass",
-        "import zeta.storage_format as sf\ndef f(value=sf.WRITER_EPOCH): pass",
-        "import storage_format as sf\nif home_epoch == sf.WRITER_EPOCH: pass",
+        # an aliased import cannot hide the name: the import line carries it.
+        "from zeta.storage_format import WRITER_EPOCH as epoch\nx = epoch",
+        # a direct comparison use.
+        "if home_epoch == WRITER_EPOCH: pass",
     ],
 )
-def test_writer_epoch_guard_rejects_aliases(source: str, tmp_path: Path) -> None:
-    path = tmp_path / "sample.py"
-    assert _writer_epoch_violations(path, source)
+def test_writer_epoch_token_checker_flags_real_references(
+    source: str, tmp_path: Path
+) -> None:
+    assert _writer_epoch_tokens(tmp_path / "sample.py", source)
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        # an aliased import hides the epoch behind another name.
-        "from ..storage_format import WRITER_EPOCH as hidden\ndef f(value=hidden): pass",
-        # a second use outside the allowed --target-epoch default.
-        'p.add_argument("--target-epoch", type=int, default=WRITER_EPOCH)\nx = WRITER_EPOCH',
-        # a module attribute use.
-        "import zeta.storage_format as sf\nx = sf.WRITER_EPOCH",
-    ],
-)
-def test_writer_epoch_guard_rejects_cli_aliases_and_extra_uses(source: str) -> None:
-    assert _writer_epoch_violations(_cli_main_path(), source)
-
-
-def test_writer_epoch_guard_accepts_the_one_cli_site() -> None:
-    source = (
-        "from ..storage_format import WRITER_EPOCH\n"
-        'p.add_argument("--target-epoch", type=int, default=WRITER_EPOCH)\n'
-    )
-    assert not _writer_epoch_violations(_cli_main_path(), source)
+def test_writer_epoch_token_checker_ignores_strings_and_comments() -> None:
+    source = '"""doc that names WRITER_EPOCH"""\n# WRITER_EPOCH in a comment\n'
+    assert not _writer_epoch_tokens(Path("sample.py"), source)
 
 
 @pytest.mark.parametrize("case", ["repair", "memory", "attention"])

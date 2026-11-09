@@ -32,7 +32,7 @@ from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
-from ..storage_format import WRITER_EPOCH, StorageFormatError, advance
+from ..storage_format import StorageFormatError, advance, writer_epoch
 from ..tui.errors import TerminalRenderError
 
 
@@ -418,7 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
     storage_format_advance = storage_format_commands.add_parser("advance")
     storage_format_advance.add_argument("--expected-epoch", type=int, required=True)
     storage_format_advance.add_argument(
-        "--target-epoch", type=int, default=WRITER_EPOCH
+        "--target-epoch", type=int, default=writer_epoch()
     )
     completion_parser = commands.add_parser(
         "completion",
