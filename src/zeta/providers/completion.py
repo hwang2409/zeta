@@ -28,6 +28,8 @@ from ..protocol.types import (
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
+RATE_LIMIT_PROBE_SECONDS = 300.0
+RATE_LIMIT_CREDENTIAL_POLL_SECONDS = 5.0
 MAX_ACCOUNT_LOCK_ATTEMPTS = 5
 MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
@@ -149,6 +151,8 @@ class RetryPlan:
     delay: float
     is_stall: bool = False
     is_account_lock: bool = False
+    is_rate_limit_hold: bool = False
+    retry_after: float | None = None
 
 
 @dataclass(slots=True)
@@ -173,8 +177,21 @@ class CompletionRetryBudget:
     attempt_started_at: float | None = None
     committed: bool = False
 
-    def start_attempt(self, owner: str, now: float, *, is_stall: bool = False) -> bool:
+    def start_attempt(
+        self,
+        owner: str,
+        now: float,
+        *,
+        is_stall: bool = False,
+        is_rate_limit_hold: bool = False,
+    ) -> bool:
         del is_stall
+        if is_rate_limit_hold:
+            self.attempt_started_at = now
+            self.attempt_records.append(
+                {"attempt": self.attempts, "owner": owner, "probe": True}
+            )
+            return True
         # lock waits have their own bound in _plan_account_lock; they do not use provider attempts
         if self.attempts - self.account_lock_attempts >= self.max_attempts:
             self.exhausted = True
@@ -211,11 +228,11 @@ class CompletionRetryBudget:
             )
             self.account_lock_exclusion_started_at = None
         generic_attempts = self.attempts - self.account_lock_attempts
+        explicit_retry_after = retry_after_seconds(source, event_data)
         if generic_attempts >= self.max_attempts:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return None
-        explicit_retry_after = retry_after_seconds(source, event_data)
         delay = retry_wait_seconds(source, generic_attempts, event_data)
         is_stall = bool(getattr(source, "is_stall", False))
         stall_seconds = getattr(source, "stall_seconds", 0.0)
@@ -235,12 +252,22 @@ class CompletionRetryBudget:
             - self.excluded_stall_seconds
             - self.excluded_account_lock_seconds
         )
+        if (
+            _rate_limit_hold(source, explicit_retry_after)
+            and elapsed + delay > MAX_PROVIDER_RETRY_SECONDS
+        ):
+            return RetryPlan(
+                attempt=self.attempts,
+                reason=retry_reason(source),
+                delay=min(delay, RATE_LIMIT_PROBE_SECONDS),
+                is_rate_limit_hold=True,
+                retry_after=explicit_retry_after,
+            )
         if (not is_stall or has_stall_duration) and elapsed + delay > MAX_PROVIDER_RETRY_SECONDS:
             self.exhausted = True
             record: dict[str, object] = {"decision": "budget-exhausted"}
             if explicit_retry_after is not None:
                 record["retry_after"] = explicit_retry_after
-                explain_unhonored_retry_after(source, explicit_retry_after)
             self.records.append(record)
             return None
         return RetryPlan(
@@ -580,6 +607,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._last_model_progress: float | None = None
         self._maximum_progress_gap = 0.0
         self._retry_usage: dict[str, Any] | None = None
+        self._rate_limit_hold = False
+        self._rate_limit_state: object | None = None
 
     def __aiter__(self) -> CompletionRun:
         return self
@@ -676,9 +705,14 @@ class CompletionRun(AsyncIterator[StreamEvent]):
 
     async def _open_attempt(self) -> None:
         now = self._clock.now()
-        if not self._control.budget.start_attempt(self._adapter.provider, now):
+        if not self._control.budget.start_attempt(
+            self._adapter.provider,
+            now,
+            is_rate_limit_hold=self._rate_limit_hold,
+        ):
             self._closed = True
             raise RuntimeError("provider retry budget exhausted")
+        self._rate_limit_hold = False
         self._attempt_salvaged = False
         self._attempt = self._adapter.create_attempt(
             self._messages, self._tool_schemas, self._token
@@ -814,9 +848,30 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             self._pending.append(StreamEvent(StreamEventType.ASSISTANT_RESET))
             self._emitted = False
         self._pending_retry = plan
+        self._rate_limit_hold = plan.is_rate_limit_hold
+        if plan.is_rate_limit_hold:
+            state = getattr(self._adapter, "rate_limit_state", None)
+            self._rate_limit_state = state() if callable(state) else None
         return True
 
     async def _wait_for_retry(self, delay: float) -> None:
+        state = getattr(self._adapter, "rate_limit_state", None)
+        if self._rate_limit_hold and callable(state):
+            remaining = delay
+            while remaining > 0:
+                step = min(remaining, RATE_LIMIT_CREDENTIAL_POLL_SECONDS)
+                await self._await_step(
+                    self._wait(step),
+                    deadline=self._control.task_deadline,
+                    deadline_error=TaskDeadlineExceeded(
+                        "finish-gate task safety bound expired"
+                    ),
+                    abort=self._control.abort,
+                )
+                if state() != self._rate_limit_state:
+                    return
+                remaining -= step
+            return
         await self._await_step(
             self._wait(delay),
             deadline=self._control.task_deadline,
@@ -881,6 +936,25 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         )
 
     def _retry_notice(self, plan: RetryPlan, error: object) -> StreamEvent:
+        if plan.is_rate_limit_hold:
+            assert plan.retry_after is not None
+            return StreamEvent(
+                StreamEventType.RETRY,
+                data={
+                    "text": (
+                        f"{self._adapter.provider} rate limit: provider asks to wait "
+                        f"{format_duration(plan.retry_after)}; checking again in "
+                        f"{format_duration(plan.delay)} (log in again or switch account "
+                        "to resume sooner)"
+                    ),
+                    "kind": "provider_rate_limit_hold",
+                    "delay": plan.delay,
+                    "retry_after": plan.retry_after,
+                    "provider": self._adapter.provider,
+                    "attempt": plan.attempt,
+                    "reason": plan.reason,
+                },
+            )
         if plan.is_account_lock:
             return StreamEvent(
                 StreamEventType.RETRY,
@@ -1112,15 +1186,23 @@ def retry_wait_seconds(
     return min(MAX_PROVIDER_RETRY_DELAY_SECONDS, random.uniform(base * 0.5, base * 1.5))
 
 
-def explain_unhonored_retry_after(source: BaseException | object, delay: float) -> None:
-    if isinstance(source, BaseException):
-        source.args = (
-            (
-                f"{source}; provider requested Retry-After of {delay:g}s, longer than "
-                f"the remaining turn retry budget (maximum "
-                f"{MAX_PROVIDER_RETRY_SECONDS:g}s); not retrying early"
-            ),
-        )
+def _rate_limit_hold(error: BaseException | object, retry_after: float | None) -> bool:
+    return retry_after is not None and getattr(error, "status_code", None) in {429, 503, 529}
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = [
+        f"{value}{unit}"
+        for value, unit in ((days, "d"), (hours, "h"), (minutes, "m"))
+        if value
+    ]
+    if secs and not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts) or "0s"
 
 
 def retry_reason(error: BaseException | object) -> str:

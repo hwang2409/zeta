@@ -158,6 +158,8 @@ async def drive_turn(
                     "reason",
                     "delay",
                     "is_stall",
+                    "retry_after",
+                    "provider",
                 ):
                     if key in data:
                         payload[key] = data[key]

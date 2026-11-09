@@ -22,7 +22,8 @@ JSONL event schema (``--format json``), one JSON object per line:
 - ``{"type": "assistant_reset"}`` — tells JSON consumers to discard the
   unfinished assistant response before processing the next attempt.
 - ``{"type": "retry", "text": <str>, "retry": <int>, "delay": <float>,
-     "kind"?: "provider_retry", "attempt"?: <int>, "reason"?: <str>,
+     "kind"?: "provider_retry"|"provider_rate_limit_hold", "attempt"?: <int>,
+     "reason"?: <str>, "retry_after"?: <float>, "provider"?: <str>,
      "is_stall"?: <bool>}`` — emitted for provider retries. Turn-level retries
   include ``kind``, ``attempt``, and ``reason``; stall retries use ``is_stall``.
   In text mode the same text is written to stderr instead. Text mode streams
