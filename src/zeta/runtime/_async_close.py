@@ -5,8 +5,6 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from ..providers.must_complete_close import task_is_cancelling
-
 _BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
 CloseFailureReporter = Callable[[int, BaseException], None]
 
@@ -131,6 +129,11 @@ def retain_background_closes(
                 done, index, report_failure
             )
         )
+
+
+def task_is_cancelling() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 async def close_transport_resources(
