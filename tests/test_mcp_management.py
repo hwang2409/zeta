@@ -1054,30 +1054,51 @@ async def test_mcp_startup_does_not_recreate_missing_session_cwd(
 
 
 @pytest.mark.asyncio
-async def test_mcp_startup_does_not_recreate_cwd_when_parent_deleted_during_create(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("config_kind", ["owned_home", "external_config"])
+async def test_mcp_startup_does_not_recreate_deleted_config_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_kind: str,
 ) -> None:
     project = tmp_path / "worktree"
     project.mkdir()
+    external = tmp_path / "external"
+    if config_kind == "external_config":
+        external.mkdir()
+        monkeypatch.setenv("ZETA_MCP_CONFIG", str(external / "mcp.json"))
     manager = MCPManagementService(home=project / ".zeta", project_dir=project)
-    original_mkdir = Path.mkdir
     deleted = False
+    original_mkdir = Path.mkdir
+    original_is_dir = Path.is_dir
 
-    def delete_parent_before_root_create(
+    def delete_owned_root_before_create(
         path: Path, *args: object, **kwargs: object
     ) -> None:
         nonlocal deleted
-        if path == project / ".zeta" and not deleted:
+        if config_kind == "owned_home" and path == project / ".zeta" and not deleted:
             deleted = True
             project.rmdir()
         original_mkdir(path, *args, **kwargs)
 
-    monkeypatch.setattr(mcp_fs.Path, "mkdir", delete_parent_before_root_create)
+    def delete_external_root_after_check(path: Path) -> bool:
+        nonlocal deleted
+        result = original_is_dir(path)
+        if config_kind == "external_config" and path == external and not deleted:
+            deleted = True
+            external.rmdir()
+        return result
+
+    monkeypatch.setattr(mcp_fs.Path, "mkdir", delete_owned_root_before_create)
+    monkeypatch.setattr(mcp_fs.Path, "is_dir", delete_external_root_after_check)
     try:
         with pytest.raises(MCPManagementError, match="does not exist"):
             await manager.add("server", scope="user", url="https://example.test")
         assert deleted
-        assert not project.exists()
+        if config_kind == "owned_home":
+            assert not project.exists()
+        else:
+            assert project.exists()
+            assert not external.exists()
     finally:
         await manager.aclose()
 

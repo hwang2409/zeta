@@ -275,7 +275,7 @@ class MCPManagementService:
                 ) from exc
         else:
             try:
-                ensure_directory_below_existing_root(home_root, path.parent)
+                ensure_directory_below_existing_root(home_root.parent, path.parent)
             except FileNotFoundError as exc:
                 raise MCPManagementError(
                     f"MCP config directory does not exist: {home_root.parent}"

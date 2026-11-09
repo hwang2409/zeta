@@ -11,9 +11,8 @@ def ensure_directory_below_existing_root(root: Path, directory: Path) -> None:
     root = root.expanduser()
     directory = directory.expanduser()
     relative = directory.relative_to(root)
-    if not root.parent.is_dir():
-        raise FileNotFoundError(root.parent)
-    root.mkdir(mode=0o700, parents=False, exist_ok=True)
+    if not root.is_dir():
+        raise FileNotFoundError(root)
     current = root
     for component in relative.parts:
         current /= component

@@ -44,7 +44,6 @@ from zeta.mcp.client import (
     parse_rpc_response,
     translate_call_result,
 )
-from zeta.mcp.config import mcp_log_path
 from zeta.mcp.envelope import MCPCallLimits
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
@@ -922,7 +921,6 @@ async def test_stdio_handshake_list_call_and_close(
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_stdio_stderr_log_does_not_recreate_deleted_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -931,10 +929,13 @@ async def test_stdio_stderr_log_does_not_recreate_deleted_cwd(
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(project / ".zeta"))
     project.rmdir()
 
-    assert stderr_log_module is not None
-    with pytest.raises(FileNotFoundError):
-        await stderr_log_module.RotatingStderrLog.prepare(mcp_log_path("server"))
-    assert not project.exists()
+    client = StdioMCPClient(_stderr_stdio_config("server"))
+    try:
+        with pytest.raises(MCPTransportError, match="Could not open MCP stderr log"):
+            await client.connect()
+        assert not project.exists()
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

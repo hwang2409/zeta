@@ -392,7 +392,7 @@ class MCPCredentialStore:
     ) -> None:
         try:
             root = self._home_root()
-            ensure_directory_below_existing_root(root, root)
+            ensure_directory_below_existing_root(root.parent, root)
         except OSError as exc:
             raise self._error(name, operation, CredentialStoreErrorReason.IO) from exc
 
