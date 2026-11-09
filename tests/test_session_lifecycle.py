@@ -540,6 +540,24 @@ def test_session_delete_resolves_unique_prefix(
     assert not (home / "sessions" / session_id).exists()
 
 
+def test_cli_resume_resolves_unique_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(_args())
+    session_id = app.loop.store.session_id
+    asyncio.run(app.close())
+
+    resumed = create_app(_args("--resume", session_id[:8]))
+    try:
+        assert resumed.loop.store.session_id == session_id
+    finally:
+        asyncio.run(resumed.close())
+
+
 def test_session_delete_rejects_ambiguous_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
