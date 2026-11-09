@@ -35,9 +35,9 @@ from zeta.tui.slash_handlers.mcp_manager import MCPManagerMixin
 
 
 def service(tmp_path, mount=None):
-    return MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "repo", mount=mount
-    )
+    project = tmp_path / "repo"
+    project.mkdir()
+    return MCPManagementService(home=tmp_path / "home", project_dir=project, mount=mount)
 
 
 @pytest.mark.asyncio
@@ -228,6 +228,7 @@ def test_status_glyph_mapping_is_complete():
 
 @pytest.mark.asyncio
 async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
+    (tmp_path / "repo").mkdir()
     loop = AgentLoop(
         FakeBackend([]),
         ConversationStore(tmp_path / "sessions"),

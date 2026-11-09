@@ -97,6 +97,7 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._row_history import RecentRowsMixin
 from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
@@ -113,6 +114,7 @@ from ._validation import (
 
 
 class ConversationStore(
+    RecentRowsMixin,
     ApprovalHistoryStoreMixin,
     AsyncDurableWritesMixin,
     PendingPromptStoreMixin,
