@@ -172,7 +172,12 @@ class HoldWake:
             return True
         self._woken = True
         # a subscription hold names its account; a rate limit uses the child's pin
-        pinned = self._accounts.get(account_provider(str(hold["provider"])) or "")
+        accounts = (
+            self._accounts.snapshot()
+            if hasattr(self._accounts, "snapshot")
+            else self._accounts
+        )
+        pinned = accounts.get(account_provider(str(hold["provider"])) or "")
         child_instance_id, child_session_path, description = self._child
         # no live parent flow (the tree is closing) must not end the held child
         with suppress(LookupError):
@@ -333,6 +338,7 @@ class ConversationChannel:
         subscription = hold.get("limit") == "subscription"
         until = datetime.fromtimestamp(hold["until"], UTC).isoformat()
         cause = "subscription limit" if subscription else "provider rate limit"
+        observed_at = datetime.now(UTC).isoformat()
         data: dict[str, Any] = {
             "origin": "notification",
             "kind": "child_hold",
@@ -347,8 +353,8 @@ class ConversationChannel:
             "retry_after": float(hold["retry_after"]),
             "text": (
                 f"child {child_instance_id} is held by a {cause} on "
-                f"{account or hold['provider']} until {until}. It stays running "
-                "and resumes by itself; cancel and restart it on another model or "
+                f"{account or hold['provider']} until {until} (as of {observed_at}); "
+                "a running child resumes by itself; cancel and restart it on another model or "
                 "account if you cannot wait."
             ),
         }
