@@ -364,10 +364,10 @@ def make_child_progress_callbacks(
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
 
-    def update_tool_calls() -> None:
+    def record_tool_call() -> None:
         child_store.update_agent_lifecycle(tool_calls=1)
 
-    return update_turns, update_tool_calls
+    return update_turns, record_tool_call
 
 
 def make_finish_limited_child_turn(
