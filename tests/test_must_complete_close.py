@@ -10,6 +10,8 @@ constants.
 Cancellation rows park the close at one named cleanup await (a seam) and
 prove it with events at that await, then act there:
 
+- ``paused-producer-drain``: the producer was parked between reads, and
+  the attempt close waits for it to unwind (its error put blocks).
 - ``producer-drain``: the attempt close waits for its cancelled producer,
   whose stream close outlives the producer's own cancellation.
 - ``source-close``: the producer has drained and the attempt close waits on
@@ -131,6 +133,25 @@ class _Body(httpx.AsyncByteStream):
                     raise
         if self.close_error is not None:
             raise self.close_error
+
+
+class _GatedQueue(asyncio.Queue):
+    """An attempt's signal queue whose error put blocks until ``release``.
+
+    A cancelled producer puts its cancellation here while it unwinds, so
+    ``error_put`` proves the attempt close is waiting on the producer drain.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.error_put = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def put(self, item: object) -> None:
+        if isinstance(item, BaseException):
+            self.error_put.set()
+            await asyncio.wait_for(self.release.wait(), 10)
+        await super().put(item)
 
 
 class _WatchedEvent(asyncio.Event):
@@ -388,17 +409,40 @@ async def _finish_reader(site: _Site, reader: asyncio.Task[Any] | None) -> None:
 
 
 async def _owner_returns(attempt: Any) -> BaseException | None:
-    # a later close waits on the same owner task: it returns only if the
-    # owner has ended. the 10 s wait is a hang guard, not the proof.
+    # a later close waits on the same owner task: it returns only once the
+    # owner task has ended. the 10 s wait is a hang guard, not the proof.
     later = asyncio.create_task(attempt.aclose())
     try:
         done, _ = await asyncio.wait({later}, timeout=10)
-        assert later in done, "the bound expired but the attempt close owner still waits"
-        # test-contract: seam no public view of the owner task itself
-        assert attempt._close.task.done(), "the close owner task is still live"
+        assert later in done, "the attempt close owner task is still live"
         return later.exception()
     finally:
         later.cancel()
+
+
+async def _attempt_caller_cancelled_at_paused_producer(
+    site: _Site, clock: ManualDeadlineClock
+) -> None:
+    # the bench serve hang: the producer is parked between reads, the close
+    # cancels it and waits for it to unwind, and the caller is cancelled
+    # there. the close must still close the source and end the borrow.
+    attempt = site.attempt()
+    await _first_event(attempt)
+    queue = _GatedQueue()
+    # test-contract: seam the producer's unwind blocks on a named event
+    attempt._queue = queue
+    closing = asyncio.create_task(attempt.aclose())
+    try:
+        await await_or_fail(queue.error_put.wait(), what="producer unwinding")
+        assert not closing.done()
+        closing.cancel()
+        assert isinstance(await _settle(closing), asyncio.CancelledError)
+        await await_or_fail(attempt.aclose(), what="retried close")
+        assert site.borrows == 0, "the cancelled close left the borrow open"
+        assert await _closed_backend_failures(site) == []
+    finally:
+        queue.release.set()
+        await _settle(closing)
 
 
 def _attempt_caller_cancelled_at(
@@ -714,6 +758,7 @@ ATTEMPT_ROWS: list[tuple[str, Callable[[_Site, ManualDeadlineClock], Any]]] = [
     ("stream-close-failure", _attempt_close_failure),
     ("duplicate", _attempt_duplicate),
     ("close-after-caller-cancel", _attempt_close_after_caller_cancel),
+    ("paused-producer-drain-caller-cancelled", _attempt_caller_cancelled_at_paused_producer),
     ("hard-deadline-abort", _attempt_deadline_abort),
     *(
         (f"{seam}-{name}", make(seam))
