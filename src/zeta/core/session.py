@@ -45,6 +45,7 @@ from .store.prompt_composition import (
 )
 from .session_files import (
     SessionError,
+    SessionIdAmbiguousError,
     SessionInUseError,
     SessionNotFoundError,
     open_session_file,
@@ -795,7 +796,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         )
         return metadata
 
-    def resolve_id(self, session_id: str) -> str:
+    def resolve_id(
+        self, session_id: str, *, min_prefix_length: int | None = None
+    ) -> str:
         """Return the full id for an exact match or unambiguous prefix."""
 
         self._validate_id(session_id)
@@ -820,9 +823,17 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             ) from exc
         if not matches:
             raise SessionNotFoundError(f"session {session_id} was not found")
-        if len(matches) > 1:
+        if min_prefix_length is not None and len(session_id) < min_prefix_length:
             raise SessionError(
-                f"session id {session_id!r} is ambiguous ({len(matches)} matches)"
+                f"session id prefix must be at least {min_prefix_length} characters"
+            )
+        if len(matches) > 1:
+            shown = ", ".join(match[:8] for match in matches[:8])
+            if len(matches) > 8:
+                shown += ", …"
+            raise SessionIdAmbiguousError(
+                f"session id {session_id!r} is ambiguous; matches: {shown}; "
+                "please provide more characters"
             )
         return matches[0]
 

@@ -23,6 +23,10 @@ class SessionNotFoundError(SessionError):
     """Raised when the requested session does not exist."""
 
 
+class SessionIdAmbiguousError(SessionError):
+    """Raised when a session id prefix matches more than one session."""
+
+
 class SessionFileReplaced(SessionError):
     """Raised when read retries keep opening an unlinked session file."""
 

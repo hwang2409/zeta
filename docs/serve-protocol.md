@@ -1083,6 +1083,7 @@ Error descriptors are:
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
 | `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
+| `session_id_ambiguous` | `-32602` | `session_id_ambiguous` | the session id prefix matches more than one session |
 | `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 
 Error objects have `code` and `message`, and may have a method-specific
