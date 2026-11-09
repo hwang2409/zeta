@@ -8,6 +8,7 @@ import hashlib
 import json
 import threading
 from tempfile import TemporaryDirectory
+from collections.abc import Callable
 
 import pytest
 
@@ -53,6 +54,15 @@ def context_root() -> Path:
         yield Path(directory)
 
 
+@pytest.fixture
+def owned_context_store(tmp_path: Path):
+    store = ConversationStore(tmp_path)
+    try:
+        yield store
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -74,28 +84,30 @@ def test_compact_json_length_matches_canonical_encoding(value: object) -> None:
 
 async def _append_during_preparation(
     store: ConversationStore,
-    assembler: ContextAssembler,
+    assembler_factory: Callable[[], ContextAssembler],
     monkeypatch: pytest.MonkeyPatch,
 ) -> AssembledContext:
     preparation_started = threading.Event()
     release_preparation = threading.Event()
     preparation_calls = 0
-    real_prepare = assembler._prepare_assembly
+    real_prepare = ContextAssembler._prepare_assembly
 
-    def blocked_prepare(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def blocked_prepare(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         nonlocal preparation_calls
         preparation_calls += 1
         if preparation_calls == 1:
             preparation_started.set()
             assert release_preparation.wait(2)
-        return real_prepare(*args, **kwargs)
+        return real_prepare(self, *args, **kwargs)
 
-    monkeypatch.setattr(assembler, "_prepare_assembly", blocked_prepare)
+    # test-contract: seam instrumentation verifies stale-head retry.
+    monkeypatch.setattr(ContextAssembler, "_prepare_assembly", blocked_prepare)
+    assembler = assembler_factory()
     assembly = asyncio.create_task(assembler.assemble_context())
     assert await asyncio.to_thread(preparation_started.wait, 2)
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("appended")]), MessageOrigin.USER))
     release_preparation.set()
-    assembled = await assembly
+    assembled = await asyncio.wait_for(assembly, 10)
 
     assert preparation_calls == 2
     return assembled
@@ -138,6 +150,147 @@ def test_needs_compaction_uses_resident_branch_without_replay(
 
 
 @pytest.mark.asyncio
+async def test_prepared_context_is_consumed_once(owned_context_store, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = owned_context_store
+    store.append_message(text(MessageRole.USER, "hello"))
+    calls = 0
+    real_prepare = ContextAssembler._prepare_assembly
+
+    def observed_prepare(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_prepare(self, *args, **kwargs)
+
+    # test-contract: seam instrumentation verifies one preparation per head.
+    monkeypatch.setattr(ContextAssembler, "_prepare_assembly", observed_prepare)
+    assembler = ContextAssembler(store, token_budget=10_000)
+    assert await assembler.prepare_context() is False
+    first = await assembler.assemble_context()
+    second = await assembler.assemble_context()
+
+    assert first.messages == second.messages
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_budget_update_discards_prepared_context(owned_context_store, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = owned_context_store
+    store.append_message(text(MessageRole.USER, "hello"))
+    budgets: list[int] = []
+    real_prepare = ContextAssembler._prepare_assembly
+
+    def observed_prepare(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        budgets.append(kwargs["assembly_budget"])
+        return real_prepare(self, *args, **kwargs)
+
+    # test-contract: seam instrumentation verifies budget invalidation.
+    monkeypatch.setattr(ContextAssembler, "_prepare_assembly", observed_prepare)
+    assembler = ContextAssembler(store, token_budget=10_000)
+    await assembler.prepare_context()
+    assembler.update_token_budget(5_000)
+    await assembler.assemble_context()
+
+    assert budgets == [10_000, 5_000]
+
+
+@pytest.mark.asyncio
+async def test_budget_update_during_preparation_retries_with_new_budget(
+    owned_context_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = owned_context_store
+    store.append_message(text(MessageRole.USER, "hello"))
+    started = threading.Event()
+    release = threading.Event()
+    budgets: list[int] = []
+    real_prepare = ContextAssembler._prepare_assembly
+
+    def blocked_prepare(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        budgets.append(kwargs["assembly_budget"])
+        if len(budgets) == 1:
+            started.set()
+            assert release.wait(2)
+        return real_prepare(self, *args, **kwargs)
+
+    # test-contract: seam instrumentation verifies concurrent budget invalidation.
+    monkeypatch.setattr(ContextAssembler, "_prepare_assembly", blocked_prepare)
+    assembler = ContextAssembler(store, token_budget=10_000)
+    task = asyncio.create_task(assembler.prepare_context())
+    assert await asyncio.to_thread(started.wait, 2)
+    assembler.update_token_budget(5_000)
+    release.set()
+    await asyncio.wait_for(task, 10)
+    await asyncio.wait_for(assembler.assemble_context(), 10)
+
+    assert budgets[:2] == [10_000, 5_000]
+
+
+@pytest.mark.asyncio
+async def test_failed_replacement_discards_previous_preparation(
+    owned_context_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = owned_context_store
+    store.append_message(text(MessageRole.USER, "hello"))
+    calls = 0
+    fail = False
+    real_prepare = ContextAssembler._prepare_assembly
+
+    def observed_prepare(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if fail:
+            raise RuntimeError("replacement failed")
+        return real_prepare(self, *args, **kwargs)
+
+    # test-contract: seam instrumentation proves failed replacement is not consumed.
+    monkeypatch.setattr(ContextAssembler, "_prepare_assembly", observed_prepare)
+    assembler = ContextAssembler(store, token_budget=10_000)
+    await assembler.prepare_context()
+    fail = True
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(assembler.prepare_context(), 10)
+    fail = False
+    await asyncio.wait_for(assembler.assemble_context(), 10)
+
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_prepared_context_retries_after_append(owned_context_store, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = owned_context_store
+    store.append_message(text(MessageRole.USER, "before"))
+    calls = 0
+    real_prepare = ContextAssembler._prepare_assembly
+
+    def observed_prepare(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_prepare(self, *args, **kwargs)
+
+    # test-contract: seam instrumentation verifies stale-head retry.
+    monkeypatch.setattr(ContextAssembler, "_prepare_assembly", observed_prepare)
+    assembler = ContextAssembler(store, token_budget=10_000)
+    await assembler.prepare_context()
+    store.append_message(text(MessageRole.USER, "after"))
+    assembled = await assembler.assemble_context()
+
+    assert calls == 2
+    assert assembled.messages[-1].content[0].text == "after"
+
+
+@pytest.mark.asyncio
+async def test_discard_prepared_context_releases_unconsumed_graph(owned_context_store) -> None:
+    store = owned_context_store
+    store.append_message(text(MessageRole.USER, "large"))
+    assembler = ContextAssembler(store, token_budget=10_000)
+
+    await assembler.prepare_context()
+    assert assembler._preparation_owner._prepared is not None
+    assembler.discard_prepared_context()
+
+    assert assembler._preparation_owner._prepared is None
+
+
+@pytest.mark.asyncio
 async def test_context_assembly_does_not_hash_messages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -166,13 +319,13 @@ async def test_context_assembly_does_not_hash_messages(
 
 @pytest.mark.asyncio
 async def test_append_during_offloop_preparation_is_included(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    owned_context_store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = ConversationStore(tmp_path)
+    store = owned_context_store
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("initial")]), MessageOrigin.USER))
-    assembler = ContextAssembler(store, token_budget=10_000)
-
-    assembled = await _append_during_preparation(store, assembler, monkeypatch)
+    assembled = await _append_during_preparation(
+        store, lambda: ContextAssembler(store, token_budget=10_000), monkeypatch
+    )
 
     assert not assembled.compacted
     assert assembled.messages[-1] == with_message_origin(
@@ -182,9 +335,9 @@ async def test_append_during_offloop_preparation_is_included(
 
 @pytest.mark.asyncio
 async def test_append_during_offloop_preparation_is_included_when_compacting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    owned_context_store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = ConversationStore(tmp_path)
+    store = owned_context_store
     call = ToolCall("read-1", "read", {"path": "large.txt"})
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("request")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
@@ -199,11 +352,11 @@ async def test_append_during_offloop_preparation_is_included_when_compacting(
         Message(MessageRole.ASSISTANT, [TextContent("result consumed")])
     )
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("latest request")]), MessageOrigin.USER))
-    assembler = ContextAssembler(
-        store, token_budget=700, retained_tail=1
+    assembled = await _append_during_preparation(
+        store,
+        lambda: ContextAssembler(store, token_budget=700, retained_tail=1),
+        monkeypatch,
     )
-
-    assembled = await _append_during_preparation(store, assembler, monkeypatch)
 
     assert assembled.compacted
     assert assembled.messages[-1] == with_message_origin(

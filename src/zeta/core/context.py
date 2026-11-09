@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 from .context_parts.budget import ContextRequestBudget
 from .context_parts.markers import ContextMarkerMixin
+from .context_parts.preparation import ContextPreparation
 from .context_parts.types import (
     AssembledContext,
     _AssemblyPreparation,
@@ -158,6 +159,12 @@ class ContextAssembler(ContextMarkerMixin):
         self._session_usage = SessionUsage(
             sink=self.usage_sink, on_growth=self.on_token_growth
         )
+        self._preparation_owner = ContextPreparation(
+            self.store,
+            self._prepare_assembly,
+            self.token_budget,
+            self.estimator_token_budget,
+        )
 
     def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
@@ -174,32 +181,28 @@ class ContextAssembler(ContextMarkerMixin):
         return self.compaction_policy.should_compact(
             self._total_tokens(messages), self.trigger_token_budget
         )
-
     @property
     def token_count(self) -> int | None:
         return self.last_context.token_count if self.last_context is not None else None
-
     @property
     def calibration_ratio(self) -> float:
         return self._request_budget.ratio
-
     @property
     def trigger_token_budget(self) -> int:
         return self._request_budget.trigger
-
     @property
     def estimator_token_budget(self) -> int:
         """Return the calibrated whole-request budget in estimator units."""
-
         return self._request_budget.estimator_budget(self.token_budget)
-
     def update_token_budget(self, token_budget: int) -> None:
         """Apply one current-model budget to all derived context limits."""
-
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
         self.token_budget = token_budget
         self._request_budget.update_provider_limit(token_budget)
+        self._preparation_owner.update_budgets(
+            token_budget, self.estimator_token_budget
+        )
 
     def update_backend(self, backend: CompletionBackend) -> None:
         """Replace the session backend without bypassing request admission."""
@@ -207,6 +210,7 @@ class ContextAssembler(ContextMarkerMixin):
         self.backend = backend
         self._request_admission.update_backend(backend)
         self.compaction_policy.backend = self._request_admission
+        self._preparation_owner.invalidate()
 
     def estimate_messages(self, messages: Sequence[Message]) -> int:
         """Count messages with the production context estimator."""
@@ -366,6 +370,26 @@ class ContextAssembler(ContextMarkerMixin):
         )
         return list(context.messages)
 
+    def discard_prepared_context(self) -> None:
+        """Drop an unconsumed preparation, including its message graph."""
+        self._preparation_owner.discard()
+
+
+    async def prepare_context(
+        self,
+        *,
+        force: bool = False,
+        reserved_estimator_tokens: int = 0,
+        system_append: str = "",
+    ) -> bool:
+        if reserved_estimator_tokens < 0:
+            raise ValueError("reserved estimator tokens must be non-negative")
+        return await self._preparation_owner.prepare(
+            force=force,
+            reserved_estimator_tokens=reserved_estimator_tokens,
+            system_append=system_append,
+        )
+
     async def assemble_context(
         self,
         *,
@@ -383,29 +407,13 @@ class ContextAssembler(ContextMarkerMixin):
         deterministic eviction pass without switching to model summarization.
         """
 
-        if reserved_estimator_tokens < 0:
-            raise ValueError("reserved estimator tokens must be non-negative")
-        assembly_budget = (
-            self.token_budget
-            if reserved_estimator_tokens == 0
-            else max(1, self.estimator_token_budget - reserved_estimator_tokens)
+        assembly_budget = self._preparation_owner.budget(reserved_estimator_tokens)
+        branch, preparation = await self._preparation_owner.prepare_and_take(
+            force=force,
+            reserved_estimator_tokens=reserved_estimator_tokens,
+            system_append=system_append,
         )
-        while True:
-            branch = self.store.active_branch_snapshot()
-            branch_id = self._branch_id(branch)
-            preparation = await asyncio.to_thread(
-                _cooperative_call,
-                self._prepare_assembly,
-                branch,
-                force=force,
-                assembly_budget=assembly_budget,
-                system_append=system_append,
-            )
-            # Cancellation is observed before accepting preparation derived
-            # from a branch that may have changed while the worker ran.
-            await asyncio.sleep(0)
-            if self.store.active_branch_head_id() == branch_id:
-                break
+        branch_id = self._branch_id(branch)
         items = preparation.items
         result_seqs = preparation.result_seqs
         boundary = preparation.boundary
