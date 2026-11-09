@@ -189,6 +189,7 @@ class ApprovalLifecycle:
         self._is_closing = is_closing
         self._grant_published = grant_published
         self._state = ApprovalMachineState()
+        self._settlement_tasks: set[asyncio.Task[object]] = set()
 
     @property
     def state(self) -> ApprovalMachineState:
@@ -535,11 +536,23 @@ class ApprovalLifecycle:
 
     async def wait_for_approval_settlement(self) -> None:
         while tasks := [
-            record.settlement
-            for record in self._state.records.values()
-            if record.settlement is not None and not record.settlement.done()
+            *self._settlement_tasks,
+            *(
+                record.settlement
+                for record in self._state.records.values()
+                if record.settlement is not None and not record.settlement.done()
+            ),
         ]:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            unique_tasks = set(tasks)
+            await asyncio.gather(*unique_tasks, return_exceptions=True)
+            self._settlement_tasks.difference_update(
+                task for task in unique_tasks if task.done()
+            )
+
+    def _start_settlement(self, operation: Awaitable[object]) -> asyncio.Task[object]:
+        task = asyncio.create_task(operation)
+        self._settlement_tasks.add(task)
+        return task
 
     def _new_record(self, target: _ApprovalTarget) -> ApprovalRecord:
         token = self._next_token()
@@ -589,14 +602,14 @@ class ApprovalLifecycle:
         else:
             return
         if record.disposition == "external":
-            task = asyncio.create_task(self._finish_external(record))
+            task = self._start_settlement(self._finish_external(record))
             self._change(record, settlement=task)
         elif record.disposition != "active" or self._is_closing():
             reason = (
                 "turn_canceled" if record.disposition == "abort" else record.disposition
             )
             record = self._reserve_record(record, reason)
-            task = asyncio.create_task(self._settle_record(record, "abort", reason))
+            task = self._start_settlement(self._settle_record(record, "abort", reason))
             self._change(record, settlement=task)
 
     def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
@@ -614,7 +627,7 @@ class ApprovalLifecycle:
                     if reserved.settlement is not None:
                         settlements.append(reserved.settlement)
                     continue
-                task = asyncio.create_task(
+                task = self._start_settlement(
                     self._settle_record(reserved, "abort", "child_cleanup")
                 )
                 self._change(reserved, settlement=task)
@@ -671,7 +684,7 @@ class ApprovalLifecycle:
         record = (
             self._change(record, grant=pending) if scope == "always_tool" else record
         )
-        settlement = asyncio.create_task(self._settle_record(record, decision))
+        settlement = self._start_settlement(self._settle_record(record, decision))
         self._change(record, settlement=settlement)
         try:
             resolution = await approval_settlement.settlement_outcome(record.admitted, settlement)
@@ -845,7 +858,7 @@ class ApprovalLifecycle:
             record = reserved
         if record.phase == "starting":
             return record.admitted
-        settlement = asyncio.create_task(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         return record.admitted
 
@@ -1153,7 +1166,7 @@ class ApprovalLifecycle:
             else "turn_canceled"
         )
         record = self._reserve_record(record, reason)
-        settlement = asyncio.create_task(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         await settlement
 
@@ -1229,6 +1242,6 @@ class ApprovalLifecycle:
         record = self._reserve(record, reason)
         if record is None or record.phase == "starting":
             return None
-        settlement = asyncio.create_task(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         return settlement

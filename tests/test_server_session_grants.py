@@ -48,6 +48,29 @@ FEATURES = ["session_grants"]
 PRECEDENCE = ["deny", "ask", "allow", "default"]
 
 
+@pytest.fixture(autouse=True)
+async def settlement_tasks_are_retrieved(monkeypatch: pytest.MonkeyPatch):
+    tasks: list[asyncio.Task[object]] = []
+    create_task = asyncio.create_task
+
+    def track_task(coro: Any, *args: Any, **kwargs: Any) -> asyncio.Task[object]:
+        task = create_task(coro, *args, **kwargs)
+        if getattr(coro, "__qualname__", "") == "ApprovalLifecycle._settle_record":
+            tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", track_task)
+    yield
+    unfinished = [task for task in tasks if not task.done()]
+    assert not unfinished, f"approval settlement tasks outlived the test: {unfinished!r}"
+    for task in tasks:
+        if not task.cancelled():
+            error = task.exception()
+            assert not isinstance(error, KeyError), (
+                f"approval settlement failed with an unexpected missing record: {error!r}"
+            )
+
+
 async def _approve_after_external_end(
     server: ZetaServer,
     reader: asyncio.StreamReader,
@@ -2024,7 +2047,9 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 ) -> None:
                     if record.target.key == "call-1":
                         owner = asyncio.current_task()
-                        current = server.control._approvals.state.records["call-1"]
+                        current = server.control._approvals.state.records.get("call-1")
+                        if current is None:
+                            return
                         if current.settlement is not owner:
                             competing_entered.set()
                             await await_or_fail(
@@ -2503,3 +2528,4 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             writer,
             *([replacement_writer] if replacement_writer is not None else []),
         )
+        assert not server.control._approvals._settlement_tasks
