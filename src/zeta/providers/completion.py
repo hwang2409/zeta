@@ -10,7 +10,6 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum, auto
 from functools import wraps
 from typing import Any, Protocol, runtime_checkable
@@ -31,12 +30,17 @@ from .must_complete_close import (
     MustCompleteClose,
     task_is_cancelling,
 )
+from .rate_limit_hold import (
+    RATE_LIMIT_CREDENTIAL_POLL_SECONDS,
+    RATE_LIMIT_PROBE_SECONDS,
+    is_rate_limit_hold,
+    rate_limit_hold_text,
+    retry_after_seconds,
+)
 
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
-RATE_LIMIT_PROBE_SECONDS = 300.0
-RATE_LIMIT_CREDENTIAL_POLL_SECONDS = 5.0
 MAX_ACCOUNT_LOCK_ATTEMPTS = 5
 MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
@@ -239,7 +243,7 @@ class CompletionRetryBudget:
             - self.excluded_account_lock_seconds
         )
         if (
-            _rate_limit_hold(source, explicit_retry_after)
+            is_rate_limit_hold(source, explicit_retry_after)
             and elapsed + delay > MAX_PROVIDER_RETRY_SECONDS
         ):
             return RetryPlan(
@@ -574,7 +578,7 @@ class CompletionCleanupError(RuntimeError):
 
 
 class ProviderAccountSwitched(Exception):
-    pass
+    """The session switched accounts during a hold; redispatch through the new backend."""
 
 
 class TaskDeadlineExceeded(TimeoutError):
@@ -893,6 +897,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         await self._wait_step(delay)
 
     async def _wait_for_rate_limit_hold(self, delay: float) -> None:
+        """Wait out a hold; a re-login wakes it, an account switch ends this run."""
+
         initial = self._rate_limit_state
         assert isinstance(initial, tuple)
         remaining = delay
@@ -901,6 +907,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             await self._wait_step(step)
             credential, account = self._hold_generation()
             if account != initial[1]:
+                # this adapter belongs to the old account; the caller redispatches
                 self._closed = True
                 raise ProviderAccountSwitched("session account changed during rate-limit hold")
             if credential != initial[0]:
@@ -1196,17 +1203,6 @@ def retryable_provider_error(
         and event_data.get("retryable") is True
     )
 
-
-def retry_after_seconds(
-    error: BaseException | object,
-    event_data: Mapping[str, Any] | None = None,
-) -> float | None:
-    value = getattr(error, "retry_after", None)
-    if value is None and event_data is not None:
-        value = event_data.get("retry_after")
-    return max(0.0, float(value)) if type(value) in {int, float} else None
-
-
 def retry_wait_seconds(
     error: BaseException | object,
     retry_number: int,
@@ -1217,30 +1213,6 @@ def retry_wait_seconds(
         return explicit_retry_after
     base = min(MAX_PROVIDER_RETRY_DELAY_SECONDS, float(2 ** (retry_number - 1)))
     return min(MAX_PROVIDER_RETRY_DELAY_SECONDS, random.uniform(base * 0.5, base * 1.5))
-
-
-def _rate_limit_hold(error: BaseException | object, retry_after: float | None) -> bool:
-    return retry_after is not None and getattr(error, "status_code", None) in {429, 503, 529}
-
-
-def rate_limit_hold_text(data: Mapping[str, Any]) -> str:
-    until = datetime.fromtimestamp(data["until"]).astimezone()
-    today = datetime.now().astimezone().date()
-    stamp = until.strftime("%H:%M" if until.date() == today else "%b %d %H:%M")
-    return (
-        f"rate-limited until {stamp} (provider asks {format_duration(data['retry_after'])}); "
-        f"checking again in {format_duration(data['delay'])}"
-    )
-
-
-def format_duration(seconds: float) -> str:
-    days, remainder = divmod(max(0, int(seconds)), 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, secs = divmod(remainder, 60)
-    parts = [f"{value}{unit}" for value, unit in ((days, "d"), (hours, "h"), (minutes, "m")) if value]
-    if secs and not parts:
-        parts.append(f"{secs}s")
-    return " ".join(parts) or "0s"
 
 
 def retry_reason(error: BaseException | object) -> str:
