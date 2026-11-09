@@ -199,7 +199,11 @@ async def status(
         "state": (
             "idle"
             if self.server.control.unhealthy() or runtime.state is None
-            else runtime.state.status
+            else (
+                "running"
+                if self.server.control.turn_busy()
+                else runtime.state.status
+            )
         ),
         "explicit_finish": (
             loop.explicit_finish

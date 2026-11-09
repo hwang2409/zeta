@@ -16,7 +16,7 @@ from ..protocol import (
     protocol_error,
 )
 from ..session_replay import join_history_and_subscribe
-from . import lifecycle, session, settings, validation
+from . import child_runs, lifecycle, session, settings, validation
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
@@ -340,6 +340,14 @@ async def revoke_session_grants(client, request_id, params):
     return result
 
 
+async def child_run_list(client, request_id, params):
+    return await child_runs.list_runs(client, params)
+
+
+async def child_run_send(client, request_id, params):
+    return await child_runs.send(client, params)
+
+
 HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.LIST_SESSIONS: list_sessions,
     MethodDescriptor.NEW_SESSION: new_session,
@@ -384,6 +392,8 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.DELIVERY_STATUS: delivery_status,
     MethodDescriptor.SESSION_GRANTS: session_grants_read,
     MethodDescriptor.REVOKE_SESSION_GRANTS: revoke_session_grants,
+    MethodDescriptor.CHILD_RUN_LIST: child_run_list,
+    MethodDescriptor.CHILD_RUN_SEND: child_run_send,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")

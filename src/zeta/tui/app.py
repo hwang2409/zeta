@@ -322,7 +322,6 @@ class TUIApp(
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._history_finder = HistoryFinder(
-            lambda: None,
             lambda: app._prompt_history.snapshot(app._viewed_session_path()),
             on_accept=lambda: app._clear_pending_attachments(),
         )
@@ -754,8 +753,8 @@ class TUIApp(
             self._presenter.print_unit(renderable, blank_before=True)
         else:
             self._presenter.print_unit(renderable)
-
     def _handle_tool_event(self, event: StreamEvent) -> bool:
+        self._refresh_decisions_for_event(event)
         if event.type is StreamEventType.TOOL_APPROVAL_START:
             if event.tool_call is not None and not event.data.get("inline_shell"):
                 self._submissions.notify_approval_started(
@@ -825,6 +824,7 @@ class TUIApp(
 
     def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
+        self._refresh_decisions_for_event(event)
         if event.type in render.BACKGROUND_EVENTS_RENDERED_IMMEDIATELY:
             self._print_unit(self._presenter.render_event(event))
             self._invalidate_stream_prompt()
@@ -854,7 +854,6 @@ class TUIApp(
             self._startup_wake_pending = True
             return
         self._submissions.wake()
-
 
     def _discard_tool_region(self) -> None:
         self._presenter.discard_tool_region()

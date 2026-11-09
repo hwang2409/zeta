@@ -136,8 +136,8 @@ async def _login_required_composition(
     )
     config = _resolve(home)
     manager = SessionManager(home)
-    project = manager.project_registry.create_project("demo", "scope", workspace)
-    manager.project_registry.initialize_memory(project.project_id)
+    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
+    await asyncio.to_thread(manager.project_registry.initialize_memory, project.project_id)
     memory_backend = _LoginRequiredBackend()
 
     def backend_builder(provider: str, model: str | None, **kwargs: object):
@@ -218,8 +218,8 @@ async def test_memory_reconciliation_builds_backend_off_event_loop(
     )
     config = _resolve(home)
     manager = SessionManager(home)
-    project = manager.project_registry.create_project("demo", "scope", workspace)
-    manager.project_registry.initialize_memory(project.project_id)
+    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
+    await asyncio.to_thread(manager.project_registry.initialize_memory, project.project_id)
 
     async def no_network(*_args: object, **_kwargs: object) -> ReconciliationResponse:
         return ReconciliationResponse('{"changes": []}', {})
@@ -263,8 +263,8 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
     )
     config = _resolve(home)
     manager = SessionManager(home)
-    project = manager.project_registry.create_project("demo", "scope", workspace)
-    manager.project_registry.initialize_memory(project.project_id)
+    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
+    await asyncio.to_thread(manager.project_registry.initialize_memory, project.project_id)
     memory_backend = _MemoryScriptBackend()
     notices: list[str] = []
 
@@ -307,11 +307,11 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
 
         project_id = composition.opened.metadata.project_id
         assert project_id is not None
-        snapshot = manager.project_registry.memory_snapshot(project_id)
+        snapshot = await asyncio.to_thread(manager.project_registry.memory_snapshot, project_id)
         assert snapshot.contents["decisions.md"].endswith(
             f"composed range {second.seq}-{second.seq}\n"
         )
-        records = manager.project_registry.memory_log(project_id)
+        records = await asyncio.to_thread(manager.project_registry.memory_log, project_id)
         assert [record["provenance"]["seq_end"] for record in records] == [
             first.seq,
             second.seq,
@@ -475,8 +475,8 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     workspace.mkdir()
     config = _resolve(home)
     manager = SessionManager(home)
-    project = manager.project_registry.create_project("demo", "scope", workspace)
-    manager.project_registry.initialize_memory(project.project_id)
+    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
+    await asyncio.to_thread(manager.project_registry.initialize_memory, project.project_id)
     original = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="fake",
@@ -560,7 +560,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
     workspace.mkdir()
     config = _resolve(home)
     manager = SessionManager(home)
-    project = manager.project_registry.create_project("demo", "scope", workspace)
+    project = await asyncio.to_thread(manager.project_registry.create_project, "demo", "scope", workspace)
     original = await asyncio.to_thread(lambda: manager.create(
         provider="codex",
         model="fake",

@@ -23,6 +23,7 @@ from tests.test_accounts_exhaustion import _account_context
 from tests.test_rate_limit_hold import _collect
 from zeta.accounts.exhaustion import classify_subscription_limit
 from zeta.accounts.store import AccountId
+from zeta.agent.conversation_channel import HoldWake
 from zeta.core.store import ConversationStore
 from zeta.core.store._step_delivery import NotificationInput
 from zeta.protocol.types import (
@@ -76,11 +77,17 @@ class HeldChildBackend(PerActorFakeBackend):
 
     provider = "codex"
 
-    def __init__(self, failures: list[BaseException], *, parent_turns: int) -> None:
+    def __init__(
+        self,
+        failures: list[BaseException],
+        *,
+        parent_turns: int,
+        background: bool = True,
+    ) -> None:
         call = ToolCall(
             "background-agent",
             "agent",
-            {"prompt": "inspect", "description": "worker", "background": True},
+            {"prompt": "inspect", "description": "worker", "background": background},
         )
         super().__init__(
             [ScriptedTurn(tool_calls=[call])]
@@ -250,8 +257,8 @@ async def test_long_rate_limit_hold_wakes_parent_once_across_reprobes(
 
 
 @pytest.mark.asyncio
-async def test_short_rate_limit_hold_does_not_wake_parent(tmp_path: Path) -> None:
-    backend = HeldChildBackend([_rate_limited(120.0)], parent_turns=1)
+async def test_boundary_rate_limit_hold_does_not_wake_parent(tmp_path: Path) -> None:
+    backend = HeldChildBackend([_rate_limited(900.0)], parent_turns=1)
     tree = await asyncio.to_thread(HeldTree, tmp_path, backend)
     try:
         await tree.start_and_hold()
@@ -259,6 +266,59 @@ async def test_short_rate_limit_hold_does_not_wake_parent(tmp_path: Path) -> Non
         backend.release.set()
         assert tree.child_ended is not None
         await await_or_fail(tree.child_ended, what="held child end")
+    finally:
+        await tree.close()
+    assert tree.holds(pending_only=False) == []
+
+
+@pytest.mark.asyncio
+async def test_new_hold_after_response_wakes_again_and_uses_current_pin() -> None:
+    published: list[dict[str, object]] = []
+
+    class Channel:
+        async def publish_hold(self, **data: object) -> None:
+            published.append(data)
+
+    class Pins(dict[str, str]):
+        def __init__(self) -> None:
+            super().__init__(codex="codex:first")
+            self.account = "codex:first"
+
+        def snapshot(self) -> dict[str, str]:
+            return {"codex": self.account}
+
+    pins = Pins()
+    wake = HoldWake(Channel(), "child", "/child", "worker", pins)
+    hold = {
+        "kind": "provider_rate_limit_hold",
+        "provider": "codex",
+        "retry_after": LONG_RETRY_AFTER,
+        "until": int(time.time()) + int(LONG_RETRY_AFTER),
+    }
+    retry = StreamEvent(StreamEventType.RETRY, data=hold)
+    assert await wake.observe(retry)
+    pins.account = "codex:second"
+    assert await wake.observe(retry)
+    assert len(published) == 1, "re-probes remain one hold"
+    assert not await wake.observe(StreamEvent(StreamEventType.MESSAGE_START))
+    assert await wake.observe(retry)
+    assert [item["account"] for item in published] == ["codex:first", "codex:second"]
+
+
+@pytest.mark.asyncio
+async def test_foreground_child_hold_does_not_wake_parent(tmp_path: Path) -> None:
+    backend = HeldChildBackend(
+        [_rate_limited(LONG_RETRY_AFTER)], parent_turns=1, background=False
+    )
+    tree = await asyncio.to_thread(HeldTree, tmp_path, backend)
+    run = asyncio.create_task(
+        _collect(tree.loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await await_or_fail(tree.backend.held.wait(), what="foreground child hold")
+        assert tree.holds() == []
+        backend.release.set()
+        await await_or_fail(run, what="foreground child end")
     finally:
         await tree.close()
     assert tree.holds(pending_only=False) == []
@@ -278,6 +338,8 @@ async def test_subscription_limit_days_away_wakes_parent_once(tmp_path: Path) ->
         assert hold["account"] == "codex:first"
         assert hold["until"] == datetime.fromtimestamp(resets_at, UTC).isoformat()
         assert "subscription limit" in str(hold["text"])
+        assert "as of " in str(hold["text"])
+        assert "a running child resumes by itself" in str(hold["text"])
         assert (await tree.child_state())["state"] == "running"
     finally:
         # the reset is days away; closing the tree cancels the held child

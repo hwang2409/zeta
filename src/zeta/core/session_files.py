@@ -9,9 +9,10 @@ import os
 import stat
 import uuid
 from collections.abc import Callable
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
+from ..locking import shape_lock
 from ..storage_format import drain_releases
 
 
@@ -47,7 +48,13 @@ def require_off_loop_lock(
 
 
 @contextmanager
-def session_directory(root: Path, session_id: str, *, exclusive: bool = False):
+def session_directory(
+    root: Path,
+    session_id: str,
+    *,
+    exclusive: bool = False,
+    lifetime: bool = False,
+):
     """Never create directories; lease the pinned directory inode itself.
 
     Shared leases cover store lifetimes and metadata mutations. Deletion needs
@@ -55,6 +62,7 @@ def session_directory(root: Path, session_id: str, *, exclusive: bool = False):
     releases the lease without leaving a stale lock file.
     """
     with ExitStack() as cleanup:
+        cleanup.enter_context(nullcontext() if lifetime else shape_lock())
         try:
             _component(session_id)
             root_fd = cleanup.enter_context(session_root(root))
@@ -155,6 +163,44 @@ def write_session_file(
         os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         if sync_directory:
             os.fsync(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def write_session_file_if_absent(
+    directory_fd: int, name: str, data: bytes
+) -> bool:
+    """Atomically publish bytes only when the destination does not exist."""
+    _component(name)
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    fd = open_session_file(
+        directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    )
+    try:
+        try:
+            stream = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            return False
+        os.fsync(directory_fd)
+        return True
     finally:
         try:
             os.unlink(temporary, dir_fd=directory_fd)

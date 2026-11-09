@@ -159,7 +159,7 @@ def probe_evict(args: argparse.Namespace) -> dict[str, Any]:
 def probe_context(args: argparse.Namespace) -> dict[str, Any]:
     """Per-turn prompt build: needs_compaction() then assemble()
     (runtime/loop/agent.py:845-866), plus the resume-time memory block refresh
-    zeta.runtime.prompt_resume._conservative_context -> refresh_project_memory."""
+    zeta.runtime.prompt_resume._conservative_context -> projected memory refresh."""
 
     out: dict[str, Any] = {
         "functions": [

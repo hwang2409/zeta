@@ -23,6 +23,7 @@ from .pending_delivery import (
     complete_delivery,
     delivery_preview,
 )
+from .turn_limit import project_notification_data
 
 WakeState = Literal["idle", "scheduled", "running"]
 
@@ -82,7 +83,7 @@ class AgentNotificationMixin:
                 StreamEventType.AGENT_NOTIFICATION,
                 data={
                     "notification_id": notification.id,
-                    **notification.data,
+                    **project_notification_data(notification.data),
                     "kind": notification.data.get("kind", "agent_completion"),
                     "tui_presented": self.store.is_agent_notification_presented_to_tui(
                         notification.id
@@ -244,6 +245,8 @@ class AgentNotificationMixin:
                 await stream.aclose()
             except BaseException:  # noqa: BLE001, S110 - preserve turn cleanup
                 pass
+            if self.child_turn_control is not None:
+                self.child_turn_control.abandon_completion()
             self._turn_active = False
             self._delivering_prompt_id = None
             flow = self.step_delivery
@@ -297,6 +300,14 @@ class AgentNotificationMixin:
         if self._notification_turn_scheduled:
             return "scheduled"
         return "idle"
+
+    def has_pending_notification_turn(self, notification_turn: bool) -> bool:
+        flow = self.step_delivery
+        return bool(
+            flow is not None
+            and flow.has_pending_edge
+            and (notification_turn or self.agent_depth > 0)
+        )
 
     def run_notification_turn(
         self,

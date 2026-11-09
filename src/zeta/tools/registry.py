@@ -1,10 +1,8 @@
 """Tool registration and MCP-compatible execution results.
-
 Text blocks always include ``truncated`` and ``full_size``. ``full_size`` is
 the original UTF-8 byte length before a character cap is applied. Fetch pages
 also include ``full_size_chars`` for their readable-text character length.
 """
-
 from __future__ import annotations
 
 import copy
@@ -72,6 +70,7 @@ from ._action_metadata import (
 from ._action_metadata import (
     resolve_approval_rule as resolve_registered_approval_rule,
 )
+from ._call_preparation import _CallPreparationMixin
 from ._live_config import _LiveConfigRegistryMixin
 from ._results import (
     _apply_error_governance,
@@ -101,17 +100,12 @@ from ._validation import (
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
     from ..skills.agent_catalog import AgentCatalog
-
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
 HandlerBinding = Literal["loop", "shared"]
-
-
 def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
     return partial(handler, registry)
-
-
 def _discover_tool_modules() -> list[str]:
     package = importlib.import_module(__package__)  # import-boundary: load the package being scanned  # fmt: skip
     modules = (
@@ -120,11 +114,8 @@ def _discover_tool_modules() -> list[str]:
         if not module_info.name.startswith("_")
     )
     return sorted(modules, key=lambda name: (name.endswith(".agent"), name))
-
-
 def _register_discovered_tools(registry: ToolRegistry) -> None:
     """Load modules with ``register(registry)``; underscore modules are helpers."""
-
     for module_name in _discover_tool_modules():
         try:
             module = importlib.import_module(module_name)  # import-boundary: load a discovered tool module  # fmt: skip
@@ -149,14 +140,10 @@ def _register_discovered_tools(registry: ToolRegistry) -> None:
             raise RuntimeError(
                 f"failed to register tool module {module_name}: {exc}"
             ) from exc
-
-
 def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
     call_ids = [tool_call.id for tool_call in tool_calls]
     if len(call_ids) != len(set(call_ids)):
         raise ValueError("duplicate tool call id in one execution batch")
-
-
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -172,16 +159,14 @@ class ToolDefinition:
     # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
     approval_subject: str | None = None
     approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None
+    call_preparer: Callable[[ToolCall], Awaitable[ToolCall]] | None = None
     actions: Mapping[str, ToolAction] | None = None
-
     def schema(self) -> ToolSchema:
         return {
             "name": self.name,
             "description": self.description,
             "parameters": copy.deepcopy(self.parameters),
         }
-
-
 def _copy_definition(
     definition: ToolDefinition, registry: ToolRegistry | None = None
 ) -> ToolDefinition:
@@ -193,11 +178,8 @@ def _copy_definition(
     return replace(
         definition, parameters=copy.deepcopy(definition.parameters), handler=handler
     )
-
-
 def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     """Open a directory descriptor for a session cwd, rejecting symlinks."""
-
     cwd_fd = -1
     try:
         cwd_fd = os.open(
@@ -214,9 +196,8 @@ def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
 
 
-class ToolRegistry(_LiveConfigRegistryMixin):
+class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
     """One provider-neutral registry for built-in and custom tools."""
-
     def __init__(
         self,
         cwd: str | Path,
@@ -245,12 +226,10 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         mcp_limits: Any = None,
     ) -> None:
         """Create a registry with a shared tool-output limit.
-
         ``max_output_chars`` bounds ordinary tool results. Terminal agent
         receipts require room for their persisted envelope and therefore use
         ``max(max_output_chars, 1000)`` instead.
         """
-
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
         self.image_policy = image_policy
@@ -355,28 +334,23 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         self._live_config_refresher: Callable[[bool], Awaitable[None]] | None = None
         if agent_catalog is None:
             from ..skills.agent_catalog import discover_packaged_agents
-
             agent_catalog = discover_packaged_agents()
         self.agent_catalog = agent_catalog
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
-
     @property
     def tool_allow(self) -> tuple[str, ...] | None:
         return self.tool_policy.allow
-
     @property
     def tool_deny(self) -> tuple[str, ...]:
         return self.tool_policy.deny
-
     def tool_is_allowed_by_policy(self, name: str) -> bool:
         definition = self._tools.get(name)
         actions = (
             tuple(definition.actions) if definition and definition.actions else None
         )
         return self.tool_policy.allows_tool(name, actions)
-
     def tool_is_allowed(self, name: str) -> bool:
         if (
             self._profile_tool_allow is not None
@@ -384,7 +358,6 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         ):
             return False
         return self.tool_is_allowed_by_policy(name)
-
     @property
     def missing_required_tools(self) -> tuple[str, ...]:
         registered = self.registered_names
@@ -412,7 +385,6 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             ):
                 missing.append(selector_text)
         return tuple(missing)
-
     @property
     def schemas(self) -> list[ToolSchema]:
         schemas: list[ToolSchema] = []
@@ -427,16 +399,13 @@ class ToolRegistry(_LiveConfigRegistryMixin):
                 schema = filtered
             schemas.append(schema)
         return schemas
-
     @property
     def tool_schemas(self) -> list[ToolSchema]:
         return self.schemas
-
     def allowed_schemas(
         self, schemas: Sequence[ToolSchema]
     ) -> list[ToolSchema]:
         """Filter an external schema snapshot through this registry's policy."""
-
         allowed: list[ToolSchema] = []
         for schema in schemas:
             name = schema.get("name")
@@ -450,7 +419,6 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             else:
                 allowed.append(copy.deepcopy(schema))
         return allowed
-
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(
@@ -458,7 +426,6 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             for name, definition in self._tools.items()
             if self.tool_is_allowed(name)
         )
-
     @property
     def definitions_by_name(self) -> Mapping[str, ToolDefinition]:
         return {
@@ -466,15 +433,12 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             for name, definition in self._tools.items()
             if self.tool_is_allowed(name)
         }
-
     @property
     def registered_names(self) -> frozenset[str]:
         """Return the current tool names without copying definitions."""
-
         return frozenset(
             name for name in self._tools if self.tool_is_allowed(name)
         )
-
     @property
     def policy_allowed_registered_names(self) -> frozenset[str]:
         """Return registered names allowed before applying a profile layer."""
@@ -500,6 +464,7 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         binding: HandlerBinding = "loop",
         approval_subject: str | None = None,
         approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
+        call_preparer: Callable[[ToolCall], Awaitable[ToolCall]] | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -572,6 +537,7 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             requires_approval=requires_approval,
             approval_subject=approval_subject,
             approval_subject_resolver=approval_subject_resolver,
+            call_preparer=call_preparer,
             actions=normalized_actions,
         )
         self._tools[name] = definition
@@ -913,6 +879,7 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         if policy is not None:
             policy.bind_rule_resolver(self.resolve_approval_rule)
             policy.bind_capability_resolver(self.resolve_tool_call_capability)
+            policy.bind_label_resolver(self.approval_label)
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
@@ -937,11 +904,10 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             except (AttributeError, KeyError, TypeError, ValueError):
                 self.abort_approval(tool_call)
                 return None
-        request = self.approval_policy.prepare(
+        return self.approval_policy.prepare(
             tool_call,
             capability=capability,
         )
-        return request
 
     async def execute(
         self,
@@ -1020,6 +986,11 @@ class ToolRegistry(_LiveConfigRegistryMixin):
                 )
             )
         try:
+            tool_call = await self.prepare_tool_call(tool_call)
+        except (KeyError, TypeError, ValueError) as exc:
+            self.abort_approval(tool_call)
+            return await finalize(_error_result(str(exc), kind="invalid_arguments"))
+        try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
         except UnknownToolAction as exc:
             self.abort_approval(tool_call)
@@ -1070,8 +1041,10 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             if abort_result is not None:
                 return await finalize(abort_result)
         execution_token = uuid.uuid4().hex
-        cleanup_binding = getattr(
-            self.approval_policy, "cleanup_execution_binding", None
+        cleanup_binding = (
+            self.approval_policy.cleanup_execution_binding
+            if self.approval_policy is not None
+            else None
         )
         try:
             gate_result, execution_signal = await self._approval_gate.run(
@@ -1093,11 +1066,9 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             )
             approved_execution = None
             if self.approval_policy is not None:
-                consume_binding = getattr(
-                    self.approval_policy, "consume_execution_binding", None
+                approved_execution = self.approval_policy.consume_execution_binding(
+                    execution_token
                 )
-                if callable(consume_binding):
-                    approved_execution = consume_binding(execution_token)
             if gate_result is not None:
                 if (
                     self.enforce_approvals
@@ -1106,7 +1077,7 @@ class ToolRegistry(_LiveConfigRegistryMixin):
                     self.denied_tools.append(tool_call.name)
                 return await finalize(_legacy_result(gate_result))
         finally:
-            if callable(cleanup_binding):
+            if cleanup_binding is not None:
                 cleanup_binding(execution_token)
         if _scope_signal is not None:
             execution_signal = _scope_signal
@@ -1220,7 +1191,6 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         if self.abort_signal is signal_state:
             self.abort_signal = self._abort_registry.new_generation()
         return self.abort_signal
-
 
     def _path(self, raw_path: object) -> Path:
         return self.policy.resolve(raw_path).absolute

@@ -30,6 +30,7 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
+from ...agent.turn_limit import parse_turn_limit_result
 from ...core.agent_progress import live_agent_lifecycle
 from ...core.agent_state import (
     BrokenAgentLifecycle,
@@ -75,9 +76,12 @@ from ..registry import (
 from .approval import ChildApprovalPolicy  # noqa: F401
 
 _TRUNCATION_NOTE = "\n[truncated]"
-_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
+_TERMINAL_AGENT_STATES = frozenset(
+    {"completed", "failed", "canceled", "turn_limit"}
+)
+_DURABLE_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 _NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
-_VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _TERMINAL_AGENT_STATES
+_VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _DURABLE_TERMINAL_AGENT_STATES
 _STATUS_REASON_FALLBACK = "child status unavailable"
 _STATUS_REASON_MAX_BYTES = MAX_AGENT_RESULT_BYTES
 _STATUS_ROW_STRING_FIELDS = (
@@ -454,6 +458,7 @@ def _lost_agent_status(
 def _project_agent_status(
     lifecycle: object,
     handle: str,
+    child_path: Path | None = None,
     *,
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
@@ -469,7 +474,7 @@ def _project_agent_status(
     state = _status_text(lifecycle.get("state", _MISSING), "state", "unknown")
     if state not in _VALID_AGENT_STATES:
         raise ValueError("invalid child metadata state")
-    if state in _TERMINAL_AGENT_STATES and finished_at is None:
+    if state in _DURABLE_TERMINAL_AGENT_STATES and finished_at is None:
         raise ValueError("terminal state has no finished_at")
     if state in _NONTERMINAL_AGENT_STATES and finished_at is not None:
         raise ValueError("non-terminal state has finished_at")
@@ -492,6 +497,13 @@ def _project_agent_status(
     )
     description = _status_text(lifecycle.get("description", _MISSING), "description")
     cwd = _status_text(lifecycle.get("cwd", _MISSING), "cwd", "")
+    projection = (
+        parse_turn_limit_result(lifecycle.get("final_result"), child_path)
+        if state == "completed" and child_path is not None
+        else None
+    )
+    if projection is not None:
+        state = projection.status
     item: dict[str, StructuredContentValue] = {
         "handle": handle,
         "state": state,
@@ -506,6 +518,9 @@ def _project_agent_status(
         "description": description,
         "cwd": cwd,
     }
+    if projection is not None:
+        item["handoff_path"] = projection.handoff_path
+        item["final_result"] = projection.readable_text
     if state == "idle":
         idle_since = lifecycle.get("idle_since")
         if type(idle_since) is str:
@@ -529,7 +544,9 @@ def _project_agent_status(
     if state == "failed" and final_result.startswith(("lost:", "unreadable:")):
         item["reason"] = final_result
     if finished_at is not None and requested_handle is not None:
-        item["final_result"] = final_result
+        item["final_result"] = (
+            projection.readable_text if projection is not None else final_result
+        )
     return item
 
 
@@ -795,6 +812,7 @@ def _read_agent_status(
                 item = _project_agent_status(
                     lifecycle,
                     handle,
+                    child_path,
                     notifications=notifications,
                     requested_handle=requested_handle,
                 )
@@ -833,100 +851,28 @@ async def _agent_status(
     requested = arguments.get("handle")
     if requested is not None and (type(requested) is not str or not requested):
         return _agent_error("handle must be a nonempty string", max_bytes)
-    owner = registry._agent_owner
-    running_handles = owner.active_instance_ids if owner is not None else None
-    try:
-        children = await asyncio.to_thread(
-            _read_agent_status,
-            registry.session_store,
-            requested_handle=requested,
-            running_handles=running_handles,
-        )
-    except (TypeError, ValueError) as exc:
-        return _agent_error(str(exc), max_bytes)
-    if requested is None:
-        finished_omitted = sum(_is_finished_agent_status(child) for child in children)
-        children = [child for child in children if not _is_finished_agent_status(child)]
-    else:
-        finished_omitted = 0
     offset = arguments.get("offset", 0)
     limit = arguments.get("limit")
     if type(offset) is not int or offset < 0:
         return _agent_error("offset must be a nonnegative integer", max_bytes)
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
-    total = len(children)
-    root_idle_usage = idle_resource_usage(children)
-    raw_page = children[offset : offset + limit if limit is not None else None]
-    page: list[dict[str, StructuredContentValue]] = []
-    for index, child in enumerate(raw_page):
-        child_offset = offset + index
-        child_truncated = child_offset + 1 < total
-        fitted = _fit_status_row(
-            child,
-            offset=child_offset,
-            total=total,
-            truncated=child_truncated,
-            next_offset=child_offset + 1 if child_truncated else None,
-            finished_omitted=finished_omitted,
-            max_bytes=max_bytes,
-        )
-        if fitted is None:
-            break
-        page.append(fitted)
+    owner = registry._agent_owner
+    running_handles = owner.active_instance_ids if owner is not None else None
+    from .subtree import read_status_result
 
-    while page:
-        next_offset = offset + len(page)
-        truncated = next_offset < total
-        result = _status_response(
-            page,
-            offset=offset,
-            total=total,
-            truncated=truncated,
-            next_offset=next_offset if truncated else None,
-            finished_omitted=finished_omitted,
-            idle_usage=root_idle_usage,
-        )
-        try:
-            fits = len(encode_json(result)) <= max_bytes
-        except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
-            fits = False
-        if fits:
-            return result
-        page.pop()
-    if offset < len(children):
-        return _agent_error("status item exceeds response limit", max_bytes)
-    count = len(children)
-    label = "child" if count == 1 else "children"
-    result = _status_response(
-        [],
-        offset=offset,
-        total=count,
-        truncated=False,
-        next_offset=None,
-        finished_omitted=finished_omitted,
-        idle_usage=root_idle_usage,
-    )
-    if count == 1:
-        result["content"] = [
-            text_block(
-                f"agent status: {count} {label}"
-                + (
-                    f"\n{finished_omitted} finished children omitted "
-                    "(query by handle for results)"
-                    if finished_omitted
-                    else ""
-                )
-            )
-        ]
     try:
-        return (
-            result
-            if len(encode_json(result)) <= max_bytes
-            else _agent_error("response exceeds response limit", max_bytes)
+        return await asyncio.to_thread(
+            read_status_result,
+            registry.session_store,
+            requested_handle=requested,
+            offset=offset,
+            limit=limit,
+            max_bytes=max_bytes,
+            running_handles=running_handles,
         )
-    except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
-        return _agent_error("response exceeds response limit", max_bytes)
+    except (TypeError, ValueError) as exc:
+        return _agent_error(str(exc), max_bytes)
 
 
 async def _agent_output(
@@ -948,9 +894,11 @@ async def _agent_output(
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
     try:
-        child_path = _active_agent_receipts(registry.session_store).get(handle)
-        if child_path is None:
-            raise ValueError("unknown child handle")
+        from .subtree import _discover
+
+        child_path = (
+            await asyncio.to_thread(_discover, registry.session_store, handle)
+        )[handle]
         cached = registry._agent_output_cache.get(child_path)
         identity, output, cacheable, result = await asyncio.to_thread(
             _read_agent_output,
@@ -1127,6 +1075,11 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
             "background": {
                 "type": "boolean",
                 "description": "Keep the child running across parent turns and return a handle.",
+            },
+            "max_turns": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum model completions across the child's lifetime.",
             },
         },
         "required": ["prompt", "description"],

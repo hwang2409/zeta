@@ -20,14 +20,23 @@ from .approval_settlement.approval_grants import (
     _ApprovalTarget,
     finish_grant,
 )
+from .approval_settlement.owner import TaskOwner
 from .connections import Admission
-from .protocol import ApprovalDecision, ErrorDescriptor, EventDescriptor, ProtocolError
+from .protocol import (
+    FRAME_CANCEL_GRACE,
+    ApprovalDecision,
+    ErrorDescriptor,
+    EventDescriptor,
+    ProtocolError,
+)
 from .session_replay.rows import DELEGATED, WRITE_FAILED, RowFacts
 
 Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
 
 logger = logging.getLogger(__name__)
+
+APPROVAL_SETTLEMENT_CLOSE_TIMEOUT = FRAME_CANCEL_GRACE
 
 
 ApprovalKey = str | tuple[str, str]
@@ -190,6 +199,11 @@ class ApprovalLifecycle:
         self._is_closing = is_closing
         self._grant_published = grant_published
         self._state = ApprovalMachineState()
+        self._task_owner = TaskOwner()
+
+    @property
+    def _settlement_tasks(self) -> dict[asyncio.Task[object], ApprovalKey]:
+        return self._task_owner.tasks
 
     @property
     def state(self) -> ApprovalMachineState:
@@ -370,6 +384,7 @@ class ApprovalLifecycle:
                 if request.child_instance_id is not None
                 else {}
             ),
+            **({"label": request.label} if request.label is not None else {}),
             **(fields or {}),
         }
 
@@ -516,7 +531,9 @@ class ApprovalLifecycle:
             for target in delegated
         }
         requests = [
-            policy.request_from_store(request_id, tool_call)
+            policy.request_from_store(
+                request_id, tool_call, label=await policy.display_label(tool_call)
+            )
             for request_id, (tool_call, decision) in foreground_states.items()
             if decision is None
         ]
@@ -534,13 +551,19 @@ class ApprovalLifecycle:
     def session_replaced(self) -> None:
         self.transition(Replace())
 
-    async def wait_for_approval_settlement(self) -> None:
-        while tasks := [
-            record.settlement
-            for record in self._state.records.values()
-            if record.settlement is not None and not record.settlement.done()
-        ]:
-            await asyncio.gather(*tasks, return_exceptions=True)
+    async def wait_for_approval_settlement(
+        self, timeout: float = APPROVAL_SETTLEMENT_CLOSE_TIMEOUT
+    ) -> None:
+        await self._task_owner.drain(timeout)
+
+    def _start_settlement(
+        self,
+        record: ApprovalRecord | ApprovalKey,
+        operation: Awaitable[object],
+        kind: str = "settlement",
+    ) -> asyncio.Task[object]:
+        key = record.target.key if isinstance(record, ApprovalRecord) else record
+        return self._task_owner.start(key, operation, kind)
 
     def _new_record(self, target: _ApprovalTarget) -> ApprovalRecord:
         token = self._next_token()
@@ -590,14 +613,14 @@ class ApprovalLifecycle:
         else:
             return
         if record.disposition == "external":
-            task = asyncio.create_task(self._finish_external(record))
+            task = self._start_settlement(record, self._finish_external(record))
             self._change(record, settlement=task)
         elif record.disposition != "active" or self._is_closing():
             reason = (
                 "turn_canceled" if record.disposition == "abort" else record.disposition
             )
             record = self._reserve_record(record, reason)
-            task = asyncio.create_task(self._settle_record(record, "abort", reason))
+            task = self._start_settlement(record, self._settle_record(record, "abort", reason))
             self._change(record, settlement=task)
 
     def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
@@ -615,8 +638,8 @@ class ApprovalLifecycle:
                     if reserved.settlement is not None:
                         settlements.append(reserved.settlement)
                     continue
-                task = asyncio.create_task(
-                    self._settle_record(reserved, "abort", "child_cleanup")
+                task = self._start_settlement(
+                    reserved, self._settle_record(reserved, "abort", "child_cleanup")
                 )
                 self._change(reserved, settlement=task)
                 settlements.append(task)
@@ -672,7 +695,7 @@ class ApprovalLifecycle:
         record = (
             self._change(record, grant=pending) if scope == "always_tool" else record
         )
-        settlement = asyncio.create_task(self._settle_record(record, decision))
+        settlement = self._start_settlement(record, self._settle_record(record, decision))
         self._change(record, settlement=settlement)
         try:
             resolution = await approval_settlement.settlement_outcome(record.admitted, settlement)
@@ -710,6 +733,7 @@ class ApprovalLifecycle:
         token = record.token
         generation = record.generation
         state = record.target.store.approval_states_snapshot().get(core_key)
+        label = None if state is None else await policy.display_label(state[0])
         current = self._state.records.get(core_key)
         if (
             current is None
@@ -725,7 +749,7 @@ class ApprovalLifecycle:
             record = self._reserve_record(record, record.disposition)
             await self._settle_record(record, "abort", record.disposition)
             return None
-        request = policy.request_from_store(core_key, state[0])
+        request = policy.request_from_store(core_key, state[0], label=label)
         record = self._change(record, request=request)
         record = self._mark_pending(record)
         record = self._change(record, published=True)
@@ -761,8 +785,9 @@ class ApprovalLifecycle:
                     "reason": reason or "turn_canceled",
                 }
                 # no resolution row was written: the end is live-only (WRITE_FAILED)
-                finish = asyncio.create_task(
-                    self._finish_record(record, synthetic, WRITE_FAILED)
+                finish = self._start_settlement(
+                    record, self._finish_record(record, synthetic, WRITE_FAILED)
+                )
                 )
                 try:
                     await approval_settlement.finish_despite_cancellation(
@@ -814,7 +839,7 @@ class ApprovalLifecycle:
             return admitted
         settlement = self.transition(Cancel(request_id, child_instance_id, reason))
         assert not isinstance(settlement, _Completed)
-        return asyncio.create_task(settlement)
+        return self._start_settlement(key, settlement)
 
     def _release_gate(
         self,
@@ -849,7 +874,7 @@ class ApprovalLifecycle:
             record = reserved
         if record.phase == "starting":
             return record.admitted
-        settlement = asyncio.create_task(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         return record.admitted
 
@@ -938,7 +963,9 @@ class ApprovalLifecycle:
             terminal=(EventDescriptor.TOOL_END, session_id, fields),
         )
         if record.terminal_watchdog is None:
-            task = asyncio.create_task(self._terminal_bound(key, record.token))
+            task = self._start_settlement(
+                key, self._terminal_bound(key, record.token), "terminal watchdog"
+            )
             self._change(record, terminal_watchdog=task)
         return True
 
@@ -971,6 +998,9 @@ class ApprovalLifecycle:
                     record.grant,
                     record.grant_committed,
                     record.grant_event_published,
+                    start_task=lambda operation, kind: self._start_settlement(
+                        record, operation, kind
+                    ),
                 )
                 record = self._change(
                     record,
@@ -1061,6 +1091,8 @@ class ApprovalLifecycle:
         durable_state = target.store.approval_states_snapshot().get(
             target.store_request_id
         )
+        # Look the label up before the ownership check, so a stale record is dropped.
+        label = None if durable_state is None else await policy.display_label(durable_state[0])
         current = self._state.records.get(key)
         if (
             current is None
@@ -1071,6 +1103,7 @@ class ApprovalLifecycle:
         await self._complete_approval_start(
             current,
             durable_state,
+            label,
             policy,
             token,
             generation,
@@ -1082,6 +1115,7 @@ class ApprovalLifecycle:
         self,
         record: ApprovalRecord,
         durable_state: tuple[ToolCall, str | None] | None,
+        label: str | None,
         policy: ApprovalPolicy,
         token: int,
         generation: int,
@@ -1105,7 +1139,7 @@ class ApprovalLifecycle:
             self._remove(target.key)
             return
         request = target.request or policy.request_from_store(
-            target.store_request_id, durable_state[0]
+            target.store_request_id, durable_state[0], label=label
         )
         record = self._change(record, request=request)
         payload = self.observe(request, fields=approval_display_fields(request))
@@ -1139,8 +1173,8 @@ class ApprovalLifecycle:
             return
         if record.disposition != "active":
             record = self._reserve_record(record, record.disposition)
-            settlement = asyncio.create_task(
-                self._settle_record(record, "abort", record.disposition)
+            settlement = self._start_settlement(
+                record, self._settle_record(record, "abort", record.disposition)
             )
             self._change(record, settlement=settlement)
             await settlement
@@ -1160,7 +1194,7 @@ class ApprovalLifecycle:
             else "turn_canceled"
         )
         record = self._reserve_record(record, reason)
-        settlement = asyncio.create_task(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         await settlement
 
@@ -1202,9 +1236,9 @@ class ApprovalLifecycle:
                 continue
             if record.publication_owner is not None:
                 if not record.publication_owner.done():
-                    asyncio.create_task(self._finish_record(record, resolution))
+                    self._start_settlement(record, self._finish_record(record, resolution))
                 continue
-            owner = asyncio.create_task(self._finish_record(record, resolution))
+            owner = self._start_settlement(record, self._finish_record(record, resolution))
             self._change(record, publication_owner=owner)
 
     async def _terminate_approval_records(
@@ -1236,6 +1270,6 @@ class ApprovalLifecycle:
         record = self._reserve(record, reason)
         if record is None or record.phase == "starting":
             return None
-        settlement = asyncio.create_task(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         return settlement

@@ -15,6 +15,7 @@ from typing import Any
 from ..core.session import SessionError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
+from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
 from ..storage_format import drain_releases, pending_releases
 from . import (
@@ -91,7 +92,8 @@ class _UnixSocketListener:
         )
         try:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with socket_lock():
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise RuntimeError(f"a server is already listening on {path}") from exc
             cls._prepare_path(path)
@@ -280,7 +282,7 @@ class ZetaServer:
         async with self._server:
             await self._server.serve_forever()
 
-    async def close(self) -> None:
+    async def close(self, *, approval_settlement_timeout: float | None = None) -> None:
         if self._idle_drain is not None:
             self._idle_drain.cancel()
             await asyncio.wait([self._idle_drain])
@@ -296,7 +298,9 @@ class ZetaServer:
                 try:
                     await self.runtime.close()
                 finally:
-                    await self.control.wait_for_approval_settlement()
+                    await self.control.wait_for_approval_settlement(
+                        approval_settlement_timeout
+                    )
             finally:
                 if self.connections is not None:
                     await self.connections.aclose()

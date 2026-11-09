@@ -110,8 +110,19 @@ def _approval_presentation_event(
 async def _drain_submission_consumer(app: TUIApp) -> None:
     pipeline = app._submissions
     while (consumer := pipeline._consumer) is not None or pipeline._slash_tasks:
-        pending = [consumer] if consumer is not None else list(pipeline._slash_tasks.values())
-        await asyncio.wait_for(asyncio.gather(*map(asyncio.shield, pending)), timeout=10)
+        pending = [task for task in (consumer, *pipeline._slash_tasks.values()) if task is not None]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *map(asyncio.shield, pending), return_exceptions=True
+                ),
+                timeout=10,
+            )
+        except TimeoutError as exc:
+            raise AssertionError(
+                "submission pipeline task did not settle; "
+                f"consumer={consumer!r}, slash_tasks={tuple(pipeline._slash_tasks)!r}"
+            ) from exc
 
 
 # test-contract: seam no public event reports active provider-turn completion.
@@ -689,8 +700,11 @@ async def test_init_becomes_the_model_user_message(tmp_path: Path) -> None:
     ],
 )
 async def test_input_loop_control_commands_exclude_their_own_submission(
-    tmp_path: Path, value: str, expected: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, expected: str
 ) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),

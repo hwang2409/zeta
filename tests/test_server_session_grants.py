@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
 import json
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from rich.console import Console
@@ -117,6 +118,8 @@ async def _approve_after_external_end(
 
 class _DelegatedBackend:
     def __init__(self) -> None:
+        self.child_one_ready = asyncio.Event()
+        self.release_child_one = asyncio.Event()
         self.child_two_ready = asyncio.Event()
         self.release_child_two = asyncio.Event()
 
@@ -160,7 +163,11 @@ class _DelegatedBackend:
             )
         elif last_user in {"child 1", "child 2"} and not has_tool_result:
             number = last_user[-1]
-            if number == "2":
+            if number == "1":
+                self.child_one_ready.set()
+                # test-contract: seam the owning journey supplies the one deadline.
+                await self.release_child_one.wait()
+            elif number == "2":
                 self.child_two_ready.set()
                 # test-contract: seam the owning journey supplies the one deadline.
                 await self.release_child_two.wait()
@@ -1319,6 +1326,160 @@ async def _first_child_bash_two_fact(
         await asyncio.gather(wire, hook, return_exceptions=True)
 
 
+def test_approval_task_creation_has_one_owner() -> None:
+    root = Path(__file__).parents[1]
+    violations: list[tuple[str, int]] = []
+    task_names = {"Task", "create_task", "ensure_future"}
+    files = [
+        root / "src/zeta/server/approval_lifecycle.py",
+        *root.glob("src/zeta/server/approval_settlement/**/*.py"),
+    ]
+    for path in files:
+        relative = str(path.relative_to(root))
+        tree = ast.parse(path.read_text())
+        imported_task_names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "asyncio":
+                for alias in node.names:
+                    if alias.name in task_names:
+                        imported_task_names.add(alias.asname or alias.name)
+
+        class TaskCallVisitor(ast.NodeVisitor):
+            def __init__(self, relative: str, imported_task_names: set[str]) -> None:
+                self.classes: list[str] = []
+                self.functions: list[str] = []
+                self.relative = relative
+                self.imported_task_names = imported_task_names
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                self.classes.append(node.name)
+                self.generic_visit(node)
+                self.classes.pop()
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Call(self, node: ast.Call) -> None:
+                callee = node.func
+                name = (
+                    callee.id
+                    if isinstance(callee, ast.Name)
+                    else callee.attr
+                    if isinstance(callee, ast.Attribute)
+                    else None
+                )
+                is_task_call = name in task_names or name in self.imported_task_names
+                allowed = (
+                    self.relative.endswith("/approval_settlement/owner.py")
+                    and self.classes == ["TaskOwner"]
+                    and self.functions == ["start"]
+                )
+                if is_task_call and not allowed:
+                    violations.append((self.relative, node.lineno))
+                self.generic_visit(node)
+
+        TaskCallVisitor(relative, imported_task_names).visit(tree)
+    assert not violations, f"unowned approval task creation: {violations!r}"
+
+
+@pytest.mark.asyncio
+async def test_terminal_watchdog_failure_is_retrieved(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle = approval_lifecycle.ApprovalLifecycle(
+        request_turn_failure=lambda: None,
+        policy=lambda: None,
+        session_id=lambda: "session-1",
+        parent_store=lambda: None,
+        offload=cast(Any, None),
+        is_closing=lambda: False,
+    )
+    request = approval_lifecycle.ApprovalRequest(
+        "call-1", ToolCall("call-1", "bash", {"command": "true"}), child_instance_id="child-1"
+    )
+    lifecycle.register_delegated(request, cast(Any, None), "child-1")
+    key = ("child-1", "call-1")
+    assert lifecycle.release_or_hold_terminal(key, "session-1", {})
+
+    async def fail_wait(*args: Any, **kwargs: Any) -> None:
+        args[0].close()
+        raise TimeoutError
+
+    def fail_release(record: Any) -> None:
+        raise RuntimeError("terminal release failed")
+
+    monkeypatch.setattr(approval_lifecycle.asyncio, "wait_for", fail_wait)
+    # test-contract: seam force the real terminal watchdog release to fail
+    monkeypatch.setattr(lifecycle, "_release_terminal", fail_release)
+    await lifecycle.wait_for_approval_settlement(0.1)
+    assert any(
+        record.message == "approval settlement task failed"
+        and record.approval_key == key
+        and record.kind == "terminal watchdog"
+        for record in caplog.records
+    )
+    assert not lifecycle._settlement_tasks
+
+
+@pytest.mark.asyncio
+async def test_server_close_bounds_stuck_approval_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("call-1", "bash", {"command": "true"})]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_persist = approval_settlement.persist_durably
+
+    async def stuck_persist(*args: object, **kwargs: object) -> object:
+        entered.set()
+        await await_or_fail(release.wait(), what="stuck approval release")
+        return await original_persist(*args, **kwargs)
+
+    monkeypatch.setattr(approval_settlement, "persist_durably", stuck_persist)
+    approve: asyncio.Task[object] | None = None
+    try:
+        await _hello_and_create(reader, writer)
+        await _request(reader, writer, 3, "send", {"text": "ask"})
+        await _event(reader, "approval_request")
+        approve = asyncio.create_task(
+            _request(reader, writer, 4, "approve", {"request_id": "call-1"})
+        )
+        await await_or_fail(entered.wait(), what="stuck approval settlement")
+        await server.close(approval_settlement_timeout=0.05)
+        assert any(
+            record.message == "approval settlement tasks stuck during close"
+            and record.approval_keys == ["call-1"]
+            for record in caplog.records
+        )
+    finally:
+        release.set()
+        if approve is not None:
+            approve.cancel()
+            await await_or_fail(
+                asyncio.gather(approve, return_exceptions=True),
+                what="approval request cleanup",
+            )
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+
+
 @pytest.mark.asyncio
 async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
     tmp_path: Path,
@@ -1365,17 +1526,34 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
             if (
                 event is EventDescriptor.APPROVAL_REQUEST
                 and fields.get("delegated") is True
+                and fields.get("tool_call", {}).get("id") == "child-bash-2"
             ):
                 publication_attempted.set()
             return result
 
         server.control._approvals._admit = observe_publication
+        await await_or_fail(
+            backend.child_one_ready.wait(), what="child 1 post-revoke ordering gate"
+        )
 
         async def second_delegate_journey() -> None:
             await _request(
                 reader, writer, 6, "revoke_session_grants", {"grant": "bash"}
             )
             await _event(reader, "session_grants_changed")
+            backend.release_child_one.set()
+            child_one_approval = await _event(reader, "approval_request")
+            assert child_one_approval["tool_call"]["id"] == "child-bash-1"
+            assert child_one_approval["delegated"] is True
+            child_one_deny = await _request(
+                reader,
+                writer,
+                61,
+                "deny",
+                {"request_id": child_one_approval["request_id"]},
+            )
+            assert child_one_deny[-1].get("error") is None, child_one_deny
+            await _frames_until_event(reader, "agent_end")
             second_send = await _request(
                 reader, writer, 7, "send", {"text": "second delegate"}
             )
@@ -1437,6 +1615,7 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
             what="second delegated approval journey",
         )
     finally:
+        backend.release_child_one.set()
         backend.release_child_two.set()
         await close_serve(server, writer)
 
@@ -2024,7 +2203,9 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 ) -> None:
                     if record.target.key == "call-1":
                         owner = asyncio.current_task()
-                        current = server.control._approvals.state.records["call-1"]
+                        current = server.control._approvals.state.records.get("call-1")
+                        if current is None:
+                            return
                         if current.settlement is not owner:
                             competing_entered.set()
                             await await_or_fail(
@@ -2219,12 +2400,31 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     )
                     snapshot_frames = await request(11, "session_grants", {})
                     assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
-                    original_status = (await request(12, "status", {}))[-1]
-                    assert original_status["result"]["state"] == "idle", (
-                        "cancel_write replacement controller did not observe the "
-                        "original turn reaching idle"
+                    # Force the real busy predicate to remain active while the
+                    # replacement controller queries status and sends.
+                    release_handoff = asyncio.Event()
+                    handoff = asyncio.create_task(
+                        await_or_fail(
+                            release_handoff.wait(),
+                            timeout=10,
+                            what="replacement turn handoff gate",
+                        )
                     )
-                    send_frames = await request(13, "send", {"text": "ask again"})
+                    server.control._turn_handoff_task = handoff
+                    try:
+                        busy_status = (await request(12, "status", {}))[-1]
+                        assert busy_status["result"]["state"] == "running"
+                        busy_send = await request(13, "send", {"text": "ask again"})
+                        assert busy_send[-1]["error"]["code"] == -32004
+                    finally:
+                        release_handoff.set()
+                        await await_or_fail(
+                            handoff, timeout=10, what="replacement turn handoff"
+                        )
+
+                    idle_status = (await request(14, "status", {}))[-1]
+                    assert idle_status["result"]["state"] == "idle"
+                    send_frames = await request(15, "send", {"text": "ask again"})
                     assert send_frames[-1].get("result", {}).get("accepted") is True, (
                         "cancel_write replacement send was not accepted: "
                         f"{send_frames[-1]!r}"
@@ -2503,3 +2703,4 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             writer,
             *([replacement_writer] if replacement_writer is not None else []),
         )
+        assert not server.control._approvals._settlement_tasks
