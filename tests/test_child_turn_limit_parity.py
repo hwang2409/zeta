@@ -13,10 +13,12 @@ from rich.text import Text
 
 import zeta.agent.runner as agent_runner_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import owned_app
 from zeta.agent.presets import AgentPreset
 from zeta.agent.runner import run_finish_gate as real_run_finish_gate
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.server.ergonomics import _history_entry_rows
 from zeta.skills import SkillCatalog
@@ -33,10 +35,13 @@ async def _unset_child_snapshot(
     release_nested = asyncio.Event()
 
     class NestedBackend(FakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             nested_started.set()
             await asyncio.wait_for(release_nested.wait(), timeout=10)
-            async for event in super().complete(messages, tool_schemas):
+            async for event in FakeBackend.complete.__wrapped__(
+                self, messages, tool_schemas
+            ):
                 yield event
 
     child_backend = FakeBackend(
@@ -156,10 +161,8 @@ async def _unset_child_snapshot(
                 model="offline",
                 console=Console(file=tui_output, force_terminal=False),
             )
-            try:
+            async with owned_app(app):
                 app._rebuild_transcript()
-            finally:
-                await app.loop.close()
             rendered = Text.from_ansi(tui_output.getvalue()).plain
             serve_rows = [
                 row

@@ -33,7 +33,7 @@ class ChildTurnControl:
     """Reserve completions against one child's lifetime limit."""
 
     def __init__(self, limit: int, child_session_path: str) -> None:
-        if type(limit) is not int or limit < 1:
+        if not valid_max_turns(limit):
             raise ValueError("child max_turns must be a positive integer")
         self.limit = limit
         self.handoff_path = str(Path(child_session_path) / HANDOFF_NAME)
@@ -77,6 +77,16 @@ class ChildTurnControl:
     @property
     def reserved(self) -> bool:
         return self._reserved
+
+
+def valid_max_turns(value: object) -> bool:
+    return type(value) is int and value >= 1
+
+
+def turn_control_for(
+    limit: int | None, child_session_path: str
+) -> ChildTurnControl | None:
+    return None if limit is None else ChildTurnControl(limit, child_session_path)
 
 
 def handoff_path(child_session_path: str | Path) -> str:

@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -18,7 +18,6 @@ from ..core.project_context import ProjectContext
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
-from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
 from ..project_context.projection import ProjectContextProjection
 from ..project_registry import ProjectRegistryError
@@ -35,7 +34,6 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
-from ..providers.factory import build_backend, credential_store
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
@@ -49,6 +47,7 @@ from .child_context import (
     _child_base_system_prompt,
     _compose_child_project_context,
     _load_child_project_context,
+    resolve_child_backend,
 )
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
@@ -73,6 +72,9 @@ from .turn_limit import (
     finalize_exhausted_child,
     make_child_progress_callbacks,
     make_finish_limited_child_turn,
+    make_publish_child_lifecycle,
+    turn_control_for,
+    valid_max_turns,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,7 @@ async def consume_child(
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
+    last_message: Message | None = None
     failure_message: str | None = None
     failure_error: tuple[str, str] | None = None
     explicit_report: dict[str, object] | None = None
@@ -132,7 +135,7 @@ async def consume_child(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
     ) -> None:
-        nonlocal failure_error, failure_message, final_message, explicit_report
+        nonlocal failure_error, failure_message, final_message, last_message, explicit_report
         final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
@@ -186,6 +189,7 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TURN_END:
+                last_message = event.message
                 turns = child_turns() + 1
                 update_turns(turns)
                 if event.data.get("tool_calls") == 0 and event.message is not None:
@@ -226,7 +230,7 @@ async def consume_child(
             await events.aclose()
         limited_result = await finalize_exhausted_child(
             control=getattr(child_loop, "child_turn_control", None),
-            text=assistant_text(final_message) if final_message is not None else "",
+            text=assistant_text(last_message) if last_message is not None else "",
             child_session_path=child_path,
             child_instance_id=child_loop.agent_instance_id or "unknown",
             child_store=child_store,
@@ -354,40 +358,6 @@ async def consume_run(
         receipt_components=receipt_components,
         **kwargs,
     )
-
-
-def resolve_child_backend(
-    loop: AgentLoop, model: object
-) -> tuple[CompletionBackend | None, str | None]:
-    """Give composed child loops a distinct backend owner."""
-    if model is None:
-        if not is_owned_completion_backend(loop.backend):
-            return loop.backend, None
-        model = loop.backend.model
-    if type(model) is not str or not model.strip():
-        return None, "agent error: model must be a nonempty string"
-    try:
-        provider = provider_for_model(model)
-    except ValueError as exc:
-        return None, f"agent error: {exc}"
-    context = getattr(loop, "account_context", None)
-    account_kwargs = context.backend_kwargs(provider) if context is not None else {}
-    store = credential_store(provider, **account_kwargs)
-    if store is not None:
-        tokens = store.read() or store.bootstrap()
-        if tokens is None:
-            message = f"agent error: not logged in to {provider}; "
-            return None, message + f"run zeta login --provider {provider}"
-    try:
-        child_budget = effective_budget_for_model(
-            provider, model, loop.context_assembler.token_budget
-        )
-        backend, _ = build_backend(
-            provider, model, token_budget=child_budget, **account_kwargs
-        )
-    except (OSError, RuntimeError, ValueError) as exc:
-        return None, f"agent error: could not start {provider} backend: {exc}"
-    return backend, None
 
 
 async def _build_child_loop(
@@ -644,9 +614,7 @@ async def run_agent_tool(
             state="failed",
         )
     requested_max_turns = arguments.get("max_turns", preset.max_turns)
-    if requested_max_turns is not None and (
-        type(requested_max_turns) is not int or requested_max_turns < 1
-    ):
+    if requested_max_turns is not None and not valid_max_turns(requested_max_turns):
         return loop._child_result_payload(
             tool_call.id,
             "agent error: max_turns must be a positive integer",
@@ -818,38 +786,18 @@ async def run_agent_tool(
         child_account_pins.snapshot() if child_account_pins is not None else {}
     )
 
-    child_turn_control = (
-        ChildTurnControl(requested_max_turns, child_path)
-        if requested_max_turns is not None
-        else None
-    )
+    child_turn_control = turn_control_for(requested_max_turns, child_path)
 
-    def publish_child_lifecycle() -> None:
-        account_store = getattr(account_context, "store", None)
-        protected_accounts = {
-            provider: account
-            for provider, account in selected_accounts.items()
-            if account_store is not None and account_store.contains(account)
-        }
-        guard = (
-            account_store.pin_guard(protected_accounts)
-            if protected_accounts
-            else nullcontext()
-        )
-        with guard:
-            child_store.start_agent_lifecycle(
-                handle=child_instance_id,
-                started_at=_now(),
-                depth=child_depth,
-                agent_type=preset.name,
-                description=description,
-                cwd=child_cwd,
-                selected_accounts={
-                    provider: str(account)
-                    for provider, account in selected_accounts.items()
-                }
-                or None,
-            )
+    publish_child_lifecycle = make_publish_child_lifecycle(
+        account_context=account_context,
+        selected_accounts=selected_accounts,
+        child_store=child_store,
+        child_instance_id=child_instance_id,
+        child_depth=child_depth,
+        preset=preset,
+        description=description,
+        child_cwd=child_cwd,
+    )
 
     try:
         await asyncio.to_thread(publish_child_lifecycle)
@@ -1004,9 +952,7 @@ async def run_agent_tool(
         store=child_store,
         child_session_path=child_path,
         turns_used=child_turns,
-        stats=lambda turns: agent_stats(
-            child_store.agent_lifecycle(), turns_used=turns
-        ),
+        stats=lambda turns: agent_stats(child_store.agent_lifecycle(), turns_used=turns),
         build_result=child_result,
     )
 
@@ -1063,7 +1009,6 @@ async def run_agent_tool(
             ),
             "receipt_components": receipt_components,
             "finish_gate_state": finish_gate_state,
-            "background": True,
             "finish_turn_limit": finish_turn_limit,
             "explicit_finish_metadata": {
                 "child_instance_id": child_instance_id,
@@ -1080,7 +1025,6 @@ async def run_agent_tool(
             ),
             "finish_gate_state": finish_gate_state,
             "child_store": child_store,
-            "background": False,
             "finish_turn_limit": finish_turn_limit,
         }
     )
