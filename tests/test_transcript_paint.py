@@ -173,31 +173,53 @@ def test_removed_and_cleared_units_leave_the_per_unit_caches() -> None:
 
 def test_search_transitions_clear_highlights_and_anchors() -> None:
     transcript = TranscriptWidget()
-    first = transcript.append(Text("alpha target"))
+    transcript.append(Text("alpha target"))
     transcript.append(Text("beta target"))
     transcript.append(Text("gamma needle"))
+    transcript.append(Text("delta needle"))
 
     assert "\x1b[48;2" not in transcript.render(60)
 
     transcript.begin_search()
+    assert transcript.search_active
     transcript.update_search("target")
+    assert transcript.search_status() == (1, 2)
     assert transcript.render(60).count("48;2") == 2
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (2, 2)
 
-    transcript.update_search("needle", anchor_key=first.key)
+    transcript.update_search("needle")
+    assert transcript.search_status() == (1, 2)
     needle_render = transcript.render(60)
     assert "needle\x1b[0m" in needle_render
     assert "target\x1b[0m" not in needle_render
 
     transcript.end_search()
+    assert not transcript.search_active
+    assert transcript.search_status() is None
     assert "\x1b[48;2" not in transcript.render(60)
+    # search anchors have no public readback; cleared state is only observable on the next focus.
     assert transcript._search_anchor_key is None
 
-    transcript.begin_search()
     transcript.update_search("needle")
+    assert transcript.search_active
+    assert transcript.search_status() == (1, 2)
     transcript.create_content(60, 1)
     assert "needle\x1b[0m" in transcript.render(60)
-    assert transcript._search_anchor_key is None
     assert transcript.scroll_offset == 2
+
+    tool_transcript = TranscriptWidget()
+    call = ToolCall("search-cache", "bash", {"command": "ls"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    tool_transcript.start_tool(call.id, call, render_event(start), start)
+    update = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_UPDATE, tool_call=call, delta="UNIQUE"
+    )
+    tool_transcript.update_tool(call.id, Text("UNIQUE"), update)
+    assert "bash" in Text.from_ansi(tool_transcript.render(72)).plain
+
+    tool_transcript.update_search("bash")
+    assert "bash" not in Text.from_ansi(tool_transcript.render(72)).plain
 
 
 def test_search_highlight_path_still_paints_matches() -> None:
