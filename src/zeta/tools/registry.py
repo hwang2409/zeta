@@ -212,7 +212,6 @@ def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
         ) from exc
     return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
 
-
 class ToolRegistry:
     """One provider-neutral registry for built-in and custom tools."""
 
@@ -1299,7 +1298,6 @@ class ToolRegistry:
         if self.abort_signal is signal_state:
             self.abort_signal = self._abort_registry.new_generation()
         return self.abort_signal
-
 
     def _path(self, raw_path: object) -> Path:
         return self.policy.resolve(raw_path).absolute
