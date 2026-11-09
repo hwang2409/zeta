@@ -119,8 +119,6 @@ from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
 TaskResult = TypeVar("TaskResult")
-
-
 @dataclass(frozen=True, slots=True)
 class _ToollessTransition:
     continue_turn: bool
@@ -128,8 +126,6 @@ class _ToollessTransition:
     nudge_turn_pending: bool
     recovery_state: EmptyTurnRecoveryState
     error: ErrorInfo | None = None
-
-
 class AgentLoop(
     BackendOwnerMixin,
     TurnPersistenceMixin,
@@ -361,10 +357,8 @@ class AgentLoop(
             self.step_delivery.capacity_changed()
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
-
     def admit_abort(self) -> None:
         self._abort_admitted = True
-
     def abort(
         self,
         *,
@@ -377,7 +371,6 @@ class AgentLoop(
             self._background_owner.cancel_all()
             if steering_drop_reason is not None:
                 self.store.drop_client_steering(steering_drop_reason)
-
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
         The running ``_run_turn`` drains this queue before the next provider
@@ -385,11 +378,9 @@ class AgentLoop(
         tool_result. Callers must pass a durable USER-role message.
         """
         self.store.queue_client_steering(message)
-
     @property
     def has_pending_steering(self) -> bool:
         return self.store.has_pending_client_steering
-
     def clear_pending_steering(
         self,
         reason: Literal["clear", "turn_end"] = "clear",
@@ -1143,29 +1134,20 @@ class AgentLoop(
             preparation_errors: set[str] = set()
             for tool_call in calls:
                 try:
-                    prepared_calls.append(
-                        await self.tool_registry.prepare_tool_call(tool_call)
-                    )
+                    prepared = await self.tool_registry.prepare_tool_call(tool_call)
                 except (KeyError, TypeError, ValueError):
-                    prepared_calls.append(tool_call)
+                    prepared = tool_call
                     preparation_errors.add(tool_call.id)
-            if any(
-                prepared is not original
-                for original, prepared in zip(calls, prepared_calls, strict=True)
-            ):
-                prepared_by_id = {
-                    prepared.id: prepared for prepared in prepared_calls
-                }
-                assistant_message = Message(
-                    assistant_message.role,
-                    [
+                prepared_calls.append(prepared)
+            if prepared_calls != calls:
+                prepared_by_id = {call.id: call for call in prepared_calls}
+                assistant_message = replace(
+                    assistant_message,
+                    content=[
                         ToolUseContent(prepared_by_id[block.tool_call.id])
-                        if isinstance(block, ToolUseContent)
-                        else block
+                        if isinstance(block, ToolUseContent) else block
                         for block in assistant_message.content
                     ],
-                    tool_result=assistant_message.tool_result,
-                    metadata=assistant_message.metadata,
                 )
                 calls = prepared_calls
             approval_requests: list[ApprovalAuditRequest] = []
