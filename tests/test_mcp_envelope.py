@@ -544,34 +544,37 @@ async def test_cancelled_spill_reservation_is_released(
     spill.configure_transient_limit(100)
     reserved = threading.Event()
     release = threading.Event()
-    completed = threading.Event()
+    released = threading.Event()
     real_reserve = spill.reserve_transient
+    real_release = spill.release_transient
 
     def gated_reserve(byte_count: int) -> None:
         real_reserve(byte_count)
         reserved.set()
-        try:
-            if not release.wait(timeout=10):
-                raise AssertionError("reservation gate timed out")
-        finally:
-            completed.set()
+        if not release.wait(timeout=10):
+            raise AssertionError("reservation gate timed out")
+
+    def observed_release(byte_count: int) -> None:
+        real_release(byte_count)
+        released.set()
 
     monkeypatch.setattr(spill, "reserve_transient", gated_reserve)
+    monkeypatch.setattr(spill, "release_transient", observed_release)
     envelope = MCPCallEnvelope(_limits(spill_after=1), spill)
     append = asyncio.create_task(envelope.append(b"x" * 100))
     try:
         assert await asyncio.to_thread(reserved.wait, 10)
         append.cancel()
-        release.set()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(append, what="cancelled append")
-        assert await asyncio.to_thread(completed.wait, 10)
+        release.set()
+        assert await asyncio.to_thread(released.wait, 10)
         await envelope.close()
 
         assert spill._transient_bytes == 0
         assert budget._used_bytes == 0
         real_reserve(100)
-        spill.release_transient(100)
+        real_release(100)
     finally:
         release.set()
         await envelope.close()
@@ -582,19 +585,23 @@ async def test_cancelled_spill_reservation_is_released(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_failed_spill_reservation_reports_quota_error(
+async def test_cancelled_failed_spill_reservation_leaks_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     budget = SpillByteBudget(max_bytes=100)
     spill = SpillStore(byte_budget=budget)
     started = threading.Event()
     release = threading.Event()
+    finished = threading.Event()
 
     def failing_reserve(_byte_count: int) -> None:
         started.set()
-        if not release.wait(timeout=10):
-            raise AssertionError("reservation gate timed out")
-        raise RuntimeError("spill budget is full")
+        try:
+            if not release.wait(timeout=10):
+                raise AssertionError("reservation gate timed out")
+            raise RuntimeError("spill budget is full")
+        finally:
+            finished.set()
 
     monkeypatch.setattr(spill, "reserve_transient", failing_reserve)
     envelope = MCPCallEnvelope(_limits(spill_after=1), spill)
@@ -602,9 +609,10 @@ async def test_cancelled_failed_spill_reservation_reports_quota_error(
     try:
         assert await asyncio.to_thread(started.wait, 10)
         append.cancel()
-        release.set()
-        with pytest.raises(MCPTransientQuotaError):
+        with pytest.raises(asyncio.CancelledError):
             await await_or_fail(append, what="failed-reservation append")
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 10)
         await envelope.close()
         assert spill._transient_bytes == 0
         assert budget._used_bytes == 0
@@ -618,7 +626,7 @@ async def test_cancelled_failed_spill_reservation_reports_quota_error(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_temporary_open_records_handle_before_returning(
+async def test_cancelled_temporary_open_closes_late_handle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     budget = SpillByteBudget(max_bytes=100)
@@ -626,7 +634,7 @@ async def test_cancelled_temporary_open_records_handle_before_returning(
     spill.configure_transient_limit(100)
     opened = threading.Event()
     release = threading.Event()
-    completed = threading.Event()
+    exited = threading.Event()
     real_temporary_file = spill.temporary_file
 
     class GatedTemporary:
@@ -638,42 +646,35 @@ async def test_cancelled_temporary_open_records_handle_before_returning(
         def __enter__(self):
             self.handle = self.context.__enter__()
             opened.set()
-            try:
-                if not release.wait(timeout=10):
-                    self.context.__exit__(None, None, None)
-                    raise AssertionError("temporary-file gate timed out")
-                return self.handle
-            finally:
-                completed.set()
+            if not release.wait(timeout=10):
+                self.context.__exit__(None, None, None)
+                raise AssertionError("temporary-file gate timed out")
+            return self.handle
 
         def __exit__(self, exc_type, exc, traceback):
             self.exits += 1
-            return self.context.__exit__(exc_type, exc, traceback)
+            try:
+                return self.context.__exit__(exc_type, exc, traceback)
+            finally:
+                exited.set()
 
     temporary = GatedTemporary()
     monkeypatch.setattr(spill, "temporary_file", lambda: temporary)
     envelope = MCPCallEnvelope(_limits(spill_after=1), spill)
     append = asyncio.create_task(envelope.append(b"{}"))
-    cancellation_returned_before_open: list[bool] = []
     try:
         assert await asyncio.to_thread(opened.wait, 10)
         append.cancel()
-
-        def observe_cancellation() -> None:
-            cancellation_returned_before_open.append(append.done())
-            release.set()
-
-        asyncio.get_running_loop().call_soon(observe_cancellation)
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(append, what="cancelled temporary-open append")
-        assert await asyncio.to_thread(completed.wait, 10)
         await envelope.close()
-
-        assert cancellation_returned_before_open == [False]
-        assert temporary.handle is not None and temporary.handle.closed
-        assert temporary.exits == 1
         assert spill._transient_bytes == 0
         assert budget._used_bytes == 0
+
+        release.set()
+        assert await asyncio.to_thread(exited.wait, 10)
+        assert temporary.handle is not None and temporary.handle.closed
+        assert temporary.exits == 1
         await envelope.close()
         assert temporary.exits == 1
     finally:

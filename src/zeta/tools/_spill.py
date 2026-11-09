@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import os
 import re
@@ -10,7 +11,7 @@ import stat
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -18,7 +19,6 @@ from pathlib import Path
 from typing import BinaryIO
 
 from ..core.session_files import SessionFileReplaced, child_directory, open_session_file
-from ..core.thread_call import run_owned_thread_call
 
 SPILL_DIRECTORY = "spill"
 SPILL_MAX_BYTES = 100 * 1024 * 1024
@@ -271,7 +271,7 @@ class SpillStore:
     ) -> dict[str, SpillArtifact]:
         """Encode and publish one text result group in a worker thread."""
 
-        return await run_owned_thread_call(
+        return await _join_write_worker(
             partial(self.write_text_group, tool, call_id, named_strings)
         )
 
@@ -306,7 +306,7 @@ class SpillStore:
         and release the advisory lock before it propagates.
         """
 
-        return await run_owned_thread_call(
+        return await _join_write_worker(
             partial(self.write_group, tool, call_id, artifacts)
         )
 
@@ -633,6 +633,27 @@ class SpillStore:
                 self._byte_budget.forget(self._directory(), name)
         except OSError:
             return
+
+
+async def _join_write_worker[T](function: Callable[[], T]) -> T:
+    """Run one spill write off-loop; any cancellation waits for it to finish.
+
+    The worker reads caller-owned parts and charges the shared byte budget, so
+    the caller may not close those parts or the store while it still runs.
+    """
+
+    worker = asyncio.get_running_loop().run_in_executor(None, function)
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        if not worker.cancelled():
+            worker.exception()
+        raise asyncio.CancelledError
+    return worker.result()
 
 
 @contextmanager
