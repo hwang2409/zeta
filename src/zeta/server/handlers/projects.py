@@ -347,8 +347,7 @@ class ProjectRequests:
 
         envelope = {
             "status": "claimed",
-            "untrusted": self.inbox._decorate(project.project_id, result).get("authority")
-            != "trusted_assignment",
+            "untrusted": result.get("origin", "local") != "local",
             "messages": [result],
         }
         optional = [

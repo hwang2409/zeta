@@ -62,6 +62,7 @@ from ..prompts import (
 from ..runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
+    project_registry,
 )
 from ..skills import SkillCatalog
 from .process_env import subprocess_env

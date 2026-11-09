@@ -26,7 +26,7 @@ from .core.session_files import (
 )
 from .project_errors import ProjectNotFoundError
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
-from .project_inbox_sent.scanner import ProjectInboxScanner
+from .project_inbox_sent.scanner import ProjectInboxScanner  # noqa: F401
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 from .session_liveness import session_is_live
 from .storage_format import (
