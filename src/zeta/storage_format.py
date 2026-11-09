@@ -596,9 +596,11 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
     fcntl.flock(fd, fcntl.LOCK_SH)
 
 
-def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
+def open_writer(home: str | Path, *, capability: int | None = None) -> WriterLease:
     """Retain a process-shared home lease after checking writer compatibility."""
     drain_releases()
+    if capability is None:
+        capability = WRITER_EPOCH
     with format_lock():
         return _open_writer(home, capability=capability)
 
@@ -665,10 +667,12 @@ def _publish_manifest(home: Path, epoch: int) -> None:
 
 
 def advance(
-    home: str | Path, *, expected_epoch: int, target_epoch: int = WRITER_EPOCH
+    home: str | Path, *, expected_epoch: int, target_epoch: int | None = None
 ) -> None:
     """Advance an idle home to a strictly newer supported writer epoch."""
 
+    if target_epoch is None:
+        target_epoch = WRITER_EPOCH
     if target_epoch > WRITER_EPOCH or target_epoch <= expected_epoch:
         raise StorageFormatError("stored-format target must be newer and supported")
     canonical = _canonical_home(home)

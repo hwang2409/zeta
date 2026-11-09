@@ -18,8 +18,8 @@ from ..storage_format import (
     ACCEPTED_KEY_SETS,
     FEATURE_EPOCHS,
     GATED_HOME_PATHS,
-    WRITER_EPOCH,
     StorageFeature,
+    writer_epoch,
 )
 from . import (
     RemoteSyncError,
@@ -71,7 +71,7 @@ finally:
 _PROJECT_AUTHORITY = rf'''
 import contextlib, fcntl, json, os, pathlib, secrets, stat, sys
 _PROJECT_LOCKS_FEATURE_EPOCH = {FEATURE_EPOCHS[StorageFeature.PROJECT_LOCKS]}
-_WRITER_EPOCH = {WRITER_EPOCH}
+_WRITER_EPOCH = {writer_epoch()}
 _GATED_HOME_PATHS = {tuple(pattern for pattern, _owner in GATED_HOME_PATHS)!r}
 _LEASE = None
 

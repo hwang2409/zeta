@@ -651,7 +651,7 @@ def test_p06_8_discussion_fork_allocation_process_progress(
     anchor = opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    attention = AttentionStore(opened.store.session_dir).request(
+    attention = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -723,7 +723,7 @@ def _open_project_attention(home: Path, project_id: str) -> tuple[str, str]:
         anchor = opened.store.append_message(
             Message(MessageRole.ASSISTANT, [TextContent("Choose")])
         )
-        record = AttentionStore(opened.store.session_dir).request(
+        record = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
             session_id=opened.store.session_id,
             project_id=project_id,
             entry_id=anchor.id,
@@ -764,7 +764,7 @@ def test_p06_6_attention_resolution_commits_message_and_record_or_neither(
     project = manager.project_registry.create_project("alpha", "Alpha")
     session_id, attention_id = _open_project_attention(tmp_path, project.project_id)
     fork_id = create_discussion_fork(tmp_path, session_id, attention_id)
-    store = AttentionStore(manager.sessions_dir / session_id)
+    store = AttentionStore(manager.sessions_dir / session_id, writer_epoch=5)
     send_started = threading.Event()
     send_go = threading.Event()
     original_send = ProjectInbox.send
@@ -893,7 +893,7 @@ def test_p06_8_attention_resolution_process_progress(tmp_path: Path) -> None:
         )
         if outcome[0] == "refused":
             assert outcome[1] in {"InboxError", "ProjectRegistryBusyError"}, outcome
-            assert AttentionStore(manager.sessions_dir / other_session).get(
+            assert AttentionStore(manager.sessions_dir / other_session, writer_epoch=5).get(
                 other_attention
             ).status == "open"
         send_release.set()
@@ -914,7 +914,7 @@ def test_p06_8_attention_resolution_process_progress(tmp_path: Path) -> None:
         # finishes it first, so the item is already resolved either way.
         assert [item.status for item in retried.items] == ["already-resolved"]
         assert retried.message_id in _inbox_ids(manager, project.project_id)
-        assert AttentionStore(manager.sessions_dir / other_session).get(
+        assert AttentionStore(manager.sessions_dir / other_session, writer_epoch=5).get(
             other_attention
         ).decision == "opponent answer"
     finally:

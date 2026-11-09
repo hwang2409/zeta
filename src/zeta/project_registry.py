@@ -877,6 +877,38 @@ class ProjectRegistry(
         ) as project_fd:
             return read(project_fd)
 
+    def record_session(
+        self,
+        project_id: str,
+        *,
+        session_id: str,
+        transcript_path: str,
+        role: str = "session",
+        parent_session_id: str | None = None,
+    ) -> None:
+        self.record_sessions(
+            project_id,
+            [
+                {
+                    "session_id": session_id,
+                    "transcript_path": transcript_path,
+                    "role": role,
+                    "parent_session_id": parent_session_id,
+                }
+            ],
+        )
+
+    def record_sessions(
+        self, project_id: str, records: list[Mapping[str, object]]
+    ) -> None:
+        prepared = self._prepare_session_records(project_id, records)
+        if not prepared:
+            return
+        with self._project_lock(
+            project_id, "sessions", exclusive=True
+        ) as project_fd:
+            self._update_sessions_locked(project_fd, set(), prepared)
+
     @staticmethod
     def _prepare_session_records(
         project_id: str, records: list[Mapping[str, object]]
