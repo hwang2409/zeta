@@ -28,7 +28,8 @@ from zeta.protocol.types import (
     ToolCall,
     with_message_origin,
 )
-from zeta.server import ZetaServer, ergonomics
+from zeta.server import ZetaServer
+from zeta.server.handlers import history as history_module
 from zeta.server.protocol import EventDescriptor
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -480,7 +481,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
     observer_reader, observer_writer = await _observer(server, 3)
     entered = threading.Event()
     release = threading.Event()
-    original_history = ergonomics.history
+    original_history = history_module.history
 
     def gated_history(
         runtime: Any, params: dict[str, Any], **kwargs: Any
@@ -489,7 +490,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
         assert release.wait(TIMEOUT)
         return original_history(runtime, params)
 
-    monkeypatch.setattr(ergonomics, "history", gated_history)
+    monkeypatch.setattr(history_module, "history", gated_history)
     try:
         request = asyncio.create_task(
             _request(
@@ -692,8 +693,32 @@ async def _controller_event_stream(
             reader, is_event("sub_agent_receipt"), what="sub_agent_receipt"
         )
         await send(reader, writer, 4, "deny", {"request_id": "call-1"})
-        frames += await read_until(reader, is_event("turn_end"), what="turn_end")
-        raw = b"".join(frame.raw for frame in frames)
+        frames += await read_until(
+            reader,
+            lambda frame: (
+                is_event("turn_end")(frame)
+                and frame.get("params", {}).get("data", {}).get("turn") == 1
+            ),
+            what="turn_end",
+        )
+        deny_response = next(frame for frame in frames if frame.get("id") == 4)
+        assert deny_response["result"] == {
+            "accepted": True,
+            "request_id": "call-1",
+            "decision": "deny",
+        }
+        turn_one_end = next(
+            index
+            for index, frame in enumerate(frames)
+            if (
+                is_event("turn_end")(frame)
+                and frame.get("params", {}).get("data", {}).get("turn") == 1
+            )
+        )
+        bounded_frames = frames[: turn_one_end + 1]
+        if deny_response not in bounded_frames:
+            bounded_frames.append(deny_response)
+        raw = b"".join(frame.raw for frame in bounded_frames)
         assert session_id.encode() in raw
         return raw
     finally:
