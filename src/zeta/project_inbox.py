@@ -322,10 +322,7 @@ class ProjectInbox:
             if self.sent_tracker is not None and self.sent_tracker.session_id == session
             else SentMessageTracker(self.sessions_root, session)
         )
-        with SessionReferenceGate(
-            self.registry.root.parent, self.registry._storage_lease
-        ).shared(referenced_ids=(session,)):
-            outcome = tracker.record(message_id, target.project_id)
+        outcome = tracker.record(message_id, target.project_id)
         return message_id, outcome
 
     def _publish_outgoing(
