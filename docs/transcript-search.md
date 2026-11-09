@@ -24,6 +24,14 @@ cursor and rechecks the session's project binding. A version mismatch or corrupt
 database does not serve stale rows; operator rebuild publishes a fresh database.
 Index failures are logged and do not fail an agent turn.
 
+When a new schema version first opens on a home that only has an older index,
+or finds its version file empty while the project has linked sessions, it builds
+that project's index once from the linked sessions. This one-time backfill runs
+off the event loop under the version lock; concurrent callers see an "index
+building" state rather than blocking or an empty result. It happens exactly once
+per version: a completed build bumps the index generation, so a project whose
+linked sessions are all unbound does not rebuild on every open.
+
 Operator diagnostics are available from the CLI:
 
 ```sh
