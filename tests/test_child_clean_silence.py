@@ -89,6 +89,8 @@ class _ChildBackend(CompletionBackend):
         self.work_started = asyncio.Event()
         self.release_initial = asyncio.Event()
         self.notification_called = asyncio.Event()
+        self.notification_ready = asyncio.Event()
+        self.release_notification = asyncio.Event()
 
     @owned_completion
     async def complete(
@@ -134,7 +136,18 @@ class _ChildBackend(CompletionBackend):
             blocks = [TextContent("working")]
         else:
             self.notification_called.set()
-            blocks = [ThinkingContent("still working")]
+            thinking = ThinkingContent("still working")
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=thinking)
+            self.notification_ready.set()
+            await await_or_fail(
+                self.release_notification.wait(), what="notification response release"
+            )
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [thinking]),
+            )
+            return
         async for event in _message_events(blocks):
             yield event
 
@@ -302,13 +315,19 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
                 ),
                 what="first background task exit",
             )
-            if ending == "non_explicit":
+            if ending == "thinking_only":
+                await await_or_fail(
+                    child_backend.notification_ready.wait(),
+                    what="thinking-only notification response",
+                )
+            if ending in {"thinking_only", "non_explicit"}:
                 await await_or_fail(
                     registry.background_tasks.input(
                         running[1].task_id, "done\n", eof=True
                     ),
                     what="second background task exit",
                 )
+            if ending == "non_explicit":
                 await await_or_fail(
                     asyncio.gather(
                         *(record.process.wait() for record in registry.background_tasks.records)
@@ -318,8 +337,11 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
                 child_backend.release_initial.set()
         if ending == "non_explicit":
             await await_or_fail(
-                child_backend.notification_called.wait(), what="plain notification turn"
+                child_backend.notification_ready.wait(), what="plain notification turn"
             )
+        if ending in {"thinking_only", "non_explicit"}:
+            child_backend.release_notification.set()
+        if ending == "non_explicit":
             await await_or_fail(child_ended.wait(), what="plain child failure")
         else:
             await await_or_fail(silence_done.wait(), what="clean silence result")
@@ -336,6 +358,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
         assert rows[0]["state"] == expected_state
     finally:
         child_backend.release_initial.set()
+        child_backend.release_notification.set()
         first.release.set()
         second.release.set()
         active = loop._background_owner.active_instance_ids
