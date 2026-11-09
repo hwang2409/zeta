@@ -108,6 +108,8 @@ def test_covered_decode_skips_ordinary_rows(tmp_path: Path) -> None:
         entries = corpus()
         with patch.object(Message, "from_dict", wraps=Message.from_dict) as decode:
             project(store, entries)
-        assert decode.call_count < sum(entry.type == "message" for entry in entries)
+        # exact corpus count: ordinary covered rows contribute zero decodes
+        # test-contract: seam _visible_items is the narrow projection seam under test
+        assert decode.call_count == 5
     finally:
         store.close()
