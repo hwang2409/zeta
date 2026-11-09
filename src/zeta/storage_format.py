@@ -43,7 +43,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
     StorageFeature.PROJECT_LOCKS: 6,
-    StorageFeature.SESSION_RETENTION: SESSION_RETENTION_FEATURE_EPOCH,
+    StorageFeature.SESSION_RETENTION: 7,
 }
 
 
