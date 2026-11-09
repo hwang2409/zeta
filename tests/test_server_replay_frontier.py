@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +26,7 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
-from zeta.core.store import _row_history
+from zeta.core.store import ConversationStore, _row_history
 from zeta.model_input import ModelInputEnvelope
 from zeta.protocol.types import (
     Message,
@@ -750,19 +751,38 @@ async def test_row_older_than_lookup_window_ends_older_streams_only(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_generation_overcount_keeps_row_backed_frame_on_stream(
-    tmp_path: Path, transport: Transport
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     serve = await _serve(tmp_path, transport, FakeBackend([]))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def pause_before_write() -> None:
+        entered.set()
+        assert release.wait(10)
+
     try:
         _tool_rows(serve.store, "frontier-call")
         await serve.join(serve.observer)
-        # This is the over-count from an async replace_entries install after an external append.
-        serve.store._reset_generation += 1
+        _tool_rows(serve.store, "covered-call")
+        monkeypatch.setattr(serve.store, "_before_committed_mutation", pause_before_write)
+        pending = asyncio.create_task(
+            serve.store.append_message_async(Message(MessageRole.ASSISTANT, [TextContent("trigger")]))
+        )
+        await await_or_fail(asyncio.to_thread(entered.wait, 10), what="async store write")
+        external = ConversationStore(serve.store.root_dir, session_id=serve.session_id)
+        try:
+            external.append_message(Message(MessageRole.ASSISTANT, [TextContent("external")]))
+        finally:
+            external.close()
+        release.set()
+        await await_or_fail(pending, what="async store append")
         await _publish_tool_end(serve, "covered-call")
         frames = await serve.live(serve.observer)
         assert [frame["event"] for frame in frames] == ["tool_end"], frames
         assert not any(frame["event"] == "replay_stream_ended" for frame in frames)
     finally:
+        release.set()
         await _close(serve)
 
 
