@@ -69,6 +69,7 @@ EVENT_FEATURES = {
     EventDescriptor.TOOL_END: NO_FEATURE,
     EventDescriptor.SUB_AGENT_RECEIPT: NO_FEATURE,
     EventDescriptor.CHILD_IDLE: NO_FEATURE,
+    EventDescriptor.CHILD_HOLD: NO_FEATURE,
     EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
     EventDescriptor.CHILD_QUESTION: NO_FEATURE,
@@ -880,6 +881,27 @@ class ConnectionRegistry(ReplayOutput):
                 ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
             )
         return result
+
+    async def read_tree(self, connection: Any, params: dict[str, Any]) -> object:
+        return await self.read_session(connection, "session_tree", params)
+
+    async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
+        return await self.read_session(connection, "session_history", params)
+
+    async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
+        return await self.read_session(connection, "content_read", params)
+
+    async def read_catalog(self, connection: Any) -> object:
+        return await self.run_read(
+            connection,
+            lambda: settings.catalog(connection.server.runtime),
+        )
+
+    async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
+        return await self.run_read(
+            connection,
+            lambda: settings.settings(connection.server.runtime),
+        )
 
     async def read_session(
         self, connection: Any, method: str, params: dict[str, Any]
