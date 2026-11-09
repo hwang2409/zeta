@@ -133,6 +133,57 @@ Example response:
 {"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.0","server":"zeta","capabilities":{"requests":["list_sessions","new_session","resume","send","steer","approve","deny","abort","status"],"notifications":["event"]}}}
 ```
 
+## method table
+
+The server declares each request method once. `since` is the first protocol version
+that advertises the method. A feature value means the client must negotiate that
+feature. Observer connections receive only methods with `read` access.
+
+| method | since | feature | access |
+| --- | --- | --- | --- |
+| `list_sessions` | `1.0` | `none` | `read` |
+| `new_session` | `1.0` | `none` | `controller_write` |
+| `resume` | `1.0` | `none` | `controller_write` |
+| `send` | `1.0` | `none` | `delivery` |
+| `steer` | `1.0` | `none` | `delivery` |
+| `approve` | `1.0` | `none` | `session_mutation` |
+| `deny` | `1.0` | `none` | `session_mutation` |
+| `abort` | `1.0` | `none` | `session_mutation` |
+| `status` | `1.0` | `none` | `read` |
+| `rename_session` | `1.1` | `none` | `session_mutation` |
+| `delete_session` | `1.1` | `none` | `controller_write` |
+| `repair_transcript` | `1.1` | `none` | `session_mutation` |
+| `session_tree` | `1.1` | `none` | `read` |
+| `session_history` | `1.1` | `none` | `read` |
+| `content_read` | `1.1` | `content_read` | `read` |
+| `switch_branch` | `1.1` | `none` | `session_mutation` |
+| `fork_message` | `1.1` | `none` | `session_mutation` |
+| `model_catalog` | `1.1` | `none` | `read` |
+| `session_settings` | `1.1` | `none` | `read` |
+| `set_settings` | `1.1` | `none` | `session_mutation` |
+| `set_compaction` | `1.1` | `none` | `session_mutation` |
+| `send_images` | `1.1` | `none` | `delivery` |
+| `slash_list` | `1.1` | `none` | `controller_read` |
+| `slash_run` | `1.1` | `none` | `session_mutation` |
+| `account_list` | `1.1` | `none` | `controller_read` |
+| `account_logout` | `1.1` | `none` | `controller_write` |
+| `account_refresh` | `1.1` | `none` | `controller_write` |
+| `account_switch` | `1.1` | `none` | `controller_write` |
+| `login_start` | `1.1` | `none` | `controller_write` |
+| `login_status` | `1.1` | `none` | `controller_read` |
+| `login_cancel` | `1.1` | `none` | `controller_write` |
+| `login_providers` | `1.1` | `none` | `controller_read` |
+| `ping` | `1.1` | `ping` | `read` |
+| `set_turn_context` | `1.1` | `turn_context` | `session_mutation` |
+| `list_projects` | `1.1` | `projects` | `controller_read` |
+| `project_show` | `1.1` | `projects` | `controller_read` |
+| `project_memory_log` | `1.1` | `projects` | `controller_read` |
+| `project_inbox` | `1.1` | `projects` | `controller_write` |
+| `clear_steering` | `1.0` | `abort_scope` | `session_mutation` |
+| `delivery_status` | `1.0` | `delivery_id` | `read` |
+| `session_grants` | `1.1` | `session_grants` | `read` |
+| `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
+
 ## common JSON-RPC shapes
 
 Every request has `jsonrpc` (`"2.0"`), `id` (a string or integer), `method`
@@ -404,6 +455,9 @@ Params: exactly one of `text` or `input_id`. `text` is a non-empty direct user
 message. `input_id` is available only with `model_input_ids` and refers to a
 server-owned `model_input` returned by `slash_run`. With the negotiated
 `delivery_id` feature, params can also contain `delivery_id` as described below.
+An optional `session_id` names the session the client means; a different
+session returns `-32003` `session_mismatch` and delivers nothing (see
+"delivery session guard").
 The result acknowledges scheduling with `accepted` (`true`) and `session_id`.
 Streaming starts as notifications. Only one turn can run at a time. With the
 `user_message_event` feature, a `user_message` event with `mode: "send"`
@@ -420,7 +474,8 @@ precedes the acknowledgement.
 ### `steer`
 
 Params: required `text`, a non-empty string. With the negotiated `delivery_id`
-feature, params can also contain `delivery_id` as described below. The server
+feature, params can also contain `delivery_id` as described below. An optional
+`session_id` is checked as for `send` (see "delivery session guard"). The server
 queues this user message at the next safe provider boundary. A turn must be
 running. With the `user_message_event` feature, a `user_message` event with
 `mode: "steer"` precedes the acknowledgement.
@@ -431,6 +486,35 @@ running. With the `user_message_event` feature, a `user_message` event with
 
 ```json
 {"jsonrpc":"2.0","id":6,"result":{"accepted":true}}
+```
+
+### delivery session guard (`delivery_session_guard` feature)
+
+`send`, `steer`, and `send_images` accept an optional `session_id`: the session
+the client means to deliver to. `send_images` already requires it. If it is not
+the attached session, the request returns `-32003` with message
+`session is not active` and data
+`{"code":"session_mismatch","attached_session_id":"<attached>","session_id":"<requested>"}`
+and delivers nothing: no transcript row, no `user_message` echo, no turn or
+steering, and no `delivery_id` record. The check runs before the `delivery_id`
+lookup, so a mismatched retry of an ID already delivered on the attached
+session returns this error, not `duplicate: true`. A `session_id` that is not a
+non-empty string returns `-32602`. With no `session_id`, `send` and `steer`
+behave as before. With no attached session, the existing `-32003` errors apply.
+
+The server enforces the guard whether or not the client negotiated the
+feature. The feature only tells the client the guard exists: a server that
+does not echo `delivery_session_guard` ignores `session_id` on `send` and
+`steer` and delivers to its attached session. Servers before this feature
+rejected a mismatched `send_images` with the same code and message but no
+`data`.
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"send","params":{"text":"hello","session_id":"old123"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":7,"error":{"code":-32003,"message":"session is not active","data":{"code":"session_mismatch","attached_session_id":"abc123","session_id":"old123"}}}
 ```
 
 ### client delivery IDs (`delivery_id` feature)
@@ -974,6 +1058,7 @@ Error descriptors are:
 | `controller_output_overflow` | `-32011` | none | controller output overflow |
 | `observer_output_overflow` | `-32011` | none | observer output overflow |
 | `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `transcript_repair_requires_upgrade` | `-32013` | `transcript_repair_requires_upgrade` | transcript repair requires the stored-format upgrade |
 | `corrupt_transcript` | `-32000` | `corrupt_transcript` | transcript is corrupt or uses an unsupported format |
 | `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
 | `account_lock_timeout` | `-32008` | `account_lock_timeout` | another process holds the selected account lock |
@@ -988,6 +1073,7 @@ Error descriptors are:
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
 | `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
+| `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A new `send` or `send_images` turn on a detached session that
@@ -1121,6 +1207,7 @@ Event fields are:
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
+| `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. It is an informational notice that a retry is
@@ -1329,7 +1416,7 @@ error code and message. Provider status and origin remain internal.
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
-- `session_settings`: returns `model` and `approval_mode`.
+- `session_settings`: returns `model`, `approval_mode`, and `plan_mode`.
 - `account_list`: takes `session_id` and returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
@@ -1370,7 +1457,8 @@ error code and message. Provider status and origin remain internal.
   error. All modes, including `summary`, return `-32602` with
   `compaction mode selection was removed; eviction is always used`. New clients
   must not advertise or send this request.
-- `send_images`: takes `text` (possibly empty) and `images`, a list of one to four
+- `send_images`: takes a required `session_id` (the attached session; see
+  "delivery session guard"), `text` (possibly empty), and `images`, a list of one to four
   objects with `name`, `mime_type`, and base64 `data`. With both `delivery_id`
   and `send_images_delivery_id` negotiated, it also accepts `delivery_id` with
   the validation, idempotency, status, echo, and history behavior described
@@ -1422,8 +1510,10 @@ implementation for the frontend client. Two RPCs cover the surface.
     its authorship stay server-side.
   - `client_only`: the command exists but must run in the client (name is
     echoed back for the client's dispatch table).
-  - `unknown`: no command matched the leading token.
-  - `error`: the shared dispatcher reported a bounded failure `text`.
+  - `unknown`: the shared dispatcher did not handle the input as a command, so the client may use it as model input; this includes multiline or non-slash-safe input, existing root-absolute paths, and argument-bearing input without a close command match. Path detection uses the host filesystem, so `/tmp` passes through only where that path exists.
+  - `error`: the shared dispatcher reported a bounded failure `text`, such as
+    an unknown slash-safe command. The text tells users to type `//` to send
+    the command as model input and may include a close-match suggestion.
 
 Structured slash error codes are:
 
@@ -1440,8 +1530,8 @@ The shared slash registry has this order and surface availability:
 | `mcp` | yes | show MCP server status |
 | `model` | yes | pick a model or switch to one: `/model [name]` |
 | `vim` | yes | show or change vim mode |
-| `plan` | no | show or change plan mode |
-| `implement` | no | implement the proposed plan |
+| `plan` | yes | show or change plan mode |
+| `implement` | yes | implement the proposed plan |
 | `project-instructions` | yes | open or create private project instructions in your editor |
 | `init` | yes | generate or improve project instructions |
 | `paste` | no | paste an image |
@@ -1457,10 +1547,11 @@ The shared slash registry has this order and surface availability:
 | `project` | yes | show or initialize the current project |
 | `inbox` | yes | list this project's inbox |
 | `memory` | yes | show, retry, or undo automatic memory updates |
+| `repair-transcript` | yes | repair one corrupt transcript: `/repair-transcript <session> confirm` |
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
 | `tasks` | no | inspect background processes |
-| `decisions` | no | answer or discuss open decisions |
+| `decisions` | yes | read, reply, dismiss, or batch-reply to attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |
 | `approve` | no | `/approve [key]` |
@@ -1470,9 +1561,16 @@ The shared slash registry has this order and surface availability:
 | `restart` | no | restart this session from the local checkout (reinstall after `pyproject` changes) |
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
 
+The `/decisions` list includes broken attention records instead of hiding them. A
+broken item is additive: it has `id`, `path`, and `reason` fields in attention
+payloads, and contains no request body. `reason` is one of `unreadable`,
+`invalid_name`, `invalid_json`, `invalid_schema`, `id_mismatch`, or `too_large`.
+Reply, dismiss, stage, and batch-reply operations refuse broken ids without
+changing their bytes.
+
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/project`,
-`/project-instructions`, `/status`, and `/vim`. `/project` shows the current
+`/implement`, `/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/plan`,
+`/project`, `/project-instructions`, `/status`, and `/vim`. `/project` shows the current
 association, and `/project init` discovers the working directory and associates
 this session. The mutating
 form is rejected while a turn, child, or approval is active. Runnable user
@@ -1514,6 +1612,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `send_images_delivery_id` | with `delivery_id`, lets `send_images` accept durable idempotency IDs; matching echoes and history rows use `user_message_delivery_id` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
+| `live_config_changed` | live skill and agent-profile reloads emit `config_changed` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 | `model_input_ids` | `slash_run` stores generated model input server-side and returns a single-use `input_id` accepted by `send` |
@@ -1531,6 +1630,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
+| `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to

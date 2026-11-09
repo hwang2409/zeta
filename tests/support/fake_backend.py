@@ -21,6 +21,7 @@ from zeta.protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.providers.completion import owned_completion
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +93,7 @@ class FakeBackend(CompletionBackend):
         }
         _CREATED_FAKE_BACKENDS.append(self)
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -193,6 +195,7 @@ class PerActorFakeBackend:
             else set(gated_child_prompts)
         )
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         actor_prompt = _public_input_prompt(
             messages, {*self.parent_prompts, *self.children}
@@ -212,7 +215,7 @@ class PerActorFakeBackend:
                 await asyncio.wait_for(self.release_children.wait(), ACTOR_WAIT_TIMEOUT)
             except TimeoutError as error:
                 raise AssertionError("children were not released") from error
-        stream = backend.complete(messages, tool_schemas)
+        stream = FakeBackend.complete.__wrapped__(backend, messages, tool_schemas)
         if (
             child_prompt is None
             and self.parent.calls

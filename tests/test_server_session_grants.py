@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from typing import Any
 
 import pytest
 from rich.console import Console
+from websockets.asyncio.client import connect
 
+from tests.support import server_client
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
-from tests.support.server_client import approve_and_collect_grant, read
+from tests.support.server_client import _buffer, approve_and_collect_grant, read
 from tests.test_server import (
     TIMEOUT,
     _connect,
@@ -31,15 +36,91 @@ from tests.test_server_websocket import (
     _read_json,
     _send_json,
 )
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
-from zeta.server import ZetaServer
+from zeta.providers.completion import owned_completion
+from zeta.server import ZetaServer, approval_lifecycle
+from zeta.server.approval_lifecycle import ExternalEnd
+from zeta.server.protocol import EventDescriptor
 from zeta.tui.app import TUIApp
 
 FEATURES = ["session_grants"]
 PRECEDENCE = ["deny", "ask", "allow", "default"]
 
 
+async def _approve_after_external_end(
+    server: ZetaServer,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str,
+    request_id: int,
+    approval_request_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    approval_module = importlib.import_module("zeta.server.approval_lifecycle")
+    committed = asyncio.Event()
+    release = asyncio.Event()
+    external_entered = asyncio.Event()
+    original_persist = approval_module.persist_durably
+    original_finish = server.control._approvals._finish_record
+
+    async def gated_finish(record: object, resolution: dict[str, str]) -> None:
+        external_entered.set()
+        await original_finish(record, resolution)  # type: ignore[arg-type]
+
+    async def gated_persist(*args: object, **kwargs: object) -> object:
+        result = await original_persist(*args, **kwargs)
+        committed.set()
+        await await_or_fail(release.wait(), what="release durable approval")
+        return result
+
+    monkeypatch.setattr(approval_module, "persist_durably", gated_persist)
+    # test-contract: seam force the ExternalEnd ownership interleaving
+    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
+    approve = asyncio.create_task(
+        _request(
+            reader,
+            writer,
+            request_id,
+            "approve",
+            {"request_id": approval_request_id, "scope": "always_tool"},
+        )
+    )
+    try:
+        await await_or_fail(committed.wait(), what="durable approval commit")
+        external_end = asyncio.create_task(
+            server.control._approvals.transition(
+                approval_module.ExternalEnd(approval_request_id, session_id, {})
+            )
+        )
+        await await_or_fail(external_entered.wait(), what="external approval finish")
+        await await_or_fail(external_end, what="external approval end")
+        release.set()
+        approve_frames = await await_or_fail(approve, what="approve response")
+        response = approve_frames[-1]["result"]
+        assert response["request_id"] == approval_request_id
+        assert response["scope"] == "always_tool"
+        buffered = list(_buffer(reader))
+        grant_events = [
+            frame
+            for frame in buffered
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+        ]
+        assert len(grant_events) == 1, buffered
+        assert grant_events[0]["params"]["data"]["change"] == "grant"
+        assert grant_events[0]["params"]["data"]["changed"] == ["bash"]
+        return approve_frames, buffered
+    finally:
+        release.set()
+
+
 class _DelegatedBackend:
+    def __init__(self) -> None:
+        self.child_two_ready = asyncio.Event()
+        self.release_child_two = asyncio.Event()
+
+    @owned_completion
     async def complete(self, messages: Any, tool_schemas: Any):
         del tool_schemas
         last_user_index, last_user = next(
@@ -79,6 +160,10 @@ class _DelegatedBackend:
             )
         elif last_user in {"child 1", "child 2"} and not has_tool_result:
             number = last_user[-1]
+            if number == "2":
+                self.child_two_ready.set()
+                # test-contract: seam the owning journey supplies the one deadline.
+                await self.release_child_two.wait()
             turn = ScriptedTurn(
                 tool_calls=[
                     ToolCall(
@@ -90,7 +175,8 @@ class _DelegatedBackend:
             )
         else:
             turn = ScriptedTurn([TextContent("done")])
-        async for event in FakeBackend([turn]).complete(messages, []):
+        backend = FakeBackend([turn])
+        async for event in FakeBackend.complete.__wrapped__(backend, messages, []):
             yield event
 
 
@@ -99,10 +185,13 @@ class _GatedBackend(FakeBackend):
         super().__init__(turns)
         self.release_next_call = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages: Any, tool_schemas: Any):
         if len(self.calls) == 1:
-            await self.release_next_call.wait()
-        async for event in super().complete(messages, tool_schemas):
+            await asyncio.wait_for(self.release_next_call.wait(), 10)
+        async for event in FakeBackend.complete.__wrapped__(
+            self, messages, tool_schemas
+        ):
             yield event
 
 
@@ -237,20 +326,6 @@ async def _wait_idle(
             return request_id
 
 
-async def _assert_completes_in_ready_turns(
-    task: asyncio.Task[Any], *, turns: int = 20
-) -> Any:
-    loop = asyncio.get_running_loop()
-    for _ in range(turns):
-        if task.done():
-            break
-        turn = loop.create_future()
-        loop.call_soon(turn.set_result, None)
-        await turn
-    assert task.done(), "controller response waited for observer output"
-    return await task
-
-
 async def _hello_and_create(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -278,6 +353,7 @@ async def _hello_and_create(
 async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transport(
     tmp_path: Path,
     transport: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = ToolCall("call-1", "bash", {"command": "printf first"})
     second = ToolCall("call-2", "bash", {"command": "printf second"})
@@ -305,9 +381,24 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
 
         await _request(reader, writer, 3, "send", {"text": "first"})
         assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
-        await approve_and_collect_grant(
-            reader, writer, 4, "call-1", "always_tool", ["bash"]
+        approve_frames, buffered = await _approve_after_external_end(
+            server,
+            reader,
+            writer,
+            monkeypatch,
+            session_id=session_id,
+            request_id=4,
+            approval_request_id="call-1",
         )
+        assert approve_frames[-1]["result"]["accepted"] is True
+        grant_events = [
+            frame
+            for frame in buffered
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+        ]
+        assert len(grant_events) == 1, buffered
+        assert grant_events[0]["params"]["data"]["changed"] == ["bash"]
+        await _event(reader, "session_grants_changed")
 
         snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
         assert snapshot == {
@@ -362,7 +453,97 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
 
 
 @pytest.mark.asyncio
-async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -> None:
+async def test_always_tool_grant_survives_external_end_during_approve_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = ToolCall("call-1", "bash", {"command": "printf first"})
+    second = ToolCall("call-2", "bash", {"command": "printf second"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[first]),
+            ScriptedTurn(tool_calls=[second]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    committed = asyncio.Event()
+    release = asyncio.Event()
+    external_entered = asyncio.Event()
+    original_persist = approval_lifecycle.persist_durably
+    original_finish = server.control._approvals._finish_record
+
+    async def gated_finish(record: object, resolution: dict[str, str]) -> None:
+        external_entered.set()
+        await original_finish(record, resolution)  # type: ignore[arg-type]
+
+    async def gated_persist(*args: object, **kwargs: object) -> object:
+        result = await original_persist(*args, **kwargs)
+        committed.set()
+        await asyncio.wait_for(release.wait(), 10)
+        return result
+
+    monkeypatch.setattr(approval_lifecycle, "persist_durably", gated_persist)
+    # test-contract: seam force the ExternalEnd ownership interleaving
+    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
+    try:
+        _, session_id = await _hello_and_create(reader, writer)
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
+
+        approve = asyncio.create_task(
+            _request(
+                reader,
+                writer,
+                4,
+                "approve",
+                {"request_id": "call-1", "scope": "always_tool"},
+            )
+        )
+        await await_or_fail(committed.wait(), what="durable approval commit")
+        external_end = asyncio.create_task(
+            server.control._approvals.transition(ExternalEnd("call-1", session_id, {}))
+        )
+        await await_or_fail(external_entered.wait(), what="external approval finish")
+        await await_or_fail(external_end, what="external approval end")
+        release.set()
+        approve_frames = await await_or_fail(approve, what="approve response")
+        assert approve_frames[-1]["result"]["decision"] == "approve"
+        buffered = list(_buffer(reader))
+        grant_events = [
+            frame
+            for frame in buffered
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+        ]
+        assert len(grant_events) == 1, buffered
+        assert grant_events[0]["params"]["data"]["changed"] == ["bash"]
+
+        await _frames_until_event(reader, "turn_end")
+        snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
+        assert snapshot["session_id"] == session_id
+        assert snapshot["session_grants"] == ["bash"]
+
+        await _request(reader, writer, 6, "send", {"text": "second"})
+        frames = await _frames_until_event(reader, "turn_end")
+        assert not any(
+            frame.get("params", {}).get("event") == "approval_request"
+            for frame in frames
+        ), frames
+    finally:
+        release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_grant_flow_over_authenticated_websocket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     call = ToolCall("call-1", "bash", {"command": "printf websocket"})
     backend = FakeBackend(
         [
@@ -378,30 +559,66 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     await server.start()
-    reader, writer, status, _headers = await _connect_websocket(
-        server, token=None, protocol_token=server._websocket.token
+    assert server._websocket is not None
+    websocket = await connect(
+        f"ws://127.0.0.1:{server._websocket.port}/",
+        subprotocols=["zeta.v1", f"zeta.bearer.{server._websocket.token}"],
     )
-    assert status == 101
+    assert websocket.subprotocol == "zeta.v1"
 
     async def request(
         request_id: int, method: str, params: dict[str, object]
     ) -> list[dict[str, Any]]:
-        await _send_json(
-            writer,
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            },
-        )
-        frames = []
-        while True:
-            frame = await _read_json(reader)
-            frames.append(frame)
-            if frame.get("id") == request_id:
-                return frames
+        async def read_response() -> list[dict[str, Any]]:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            frames = []
+            while True:
+                payload = await websocket.recv()
+                assert isinstance(payload, str), "serve sent a binary WebSocket frame"
+                frame = json.loads(payload)
+                frames.append(frame)
+                if frame.get("id") == request_id:
+                    return frames
 
+        return await await_or_fail(
+            read_response(), what=f"{method} WebSocket response"
+        )
+
+    async def event(name: str) -> dict[str, Any]:
+        async def read_event() -> dict[str, Any]:
+            while True:
+                payload = await websocket.recv()
+                assert isinstance(payload, str), "serve sent a binary WebSocket frame"
+                frame = json.loads(payload)
+                if frame.get("params", {}).get("event") == name:
+                    return frame
+
+        return await await_or_fail(read_event(), what=f"{name} WebSocket event")
+
+    setup_started = asyncio.Event()
+    release_setup = asyncio.Event()
+    original_run_setup = server.runtime._run_setup
+
+    async def gated_run_setup(*args: Any, **kwargs: Any):
+        setup_started.set()
+        await await_or_fail(
+            release_setup.wait(), what="test to release new_session setup"
+        )
+        return await original_run_setup(*args, **kwargs)
+
+    # test-contract: seam no public setup gate exposes request/setup ordering
+    monkeypatch.setattr(server.runtime, "_run_setup", gated_run_setup)
+    create_task: asyncio.Task[list[dict[str, Any]]] | None = None
     try:
         hello = (
             await request(
@@ -414,7 +631,15 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
             )
         )[-1]["result"]
         assert "session_grants" in hello["capabilities"]["features"]
-        created = await request(2, "new_session", {"provider": "codex"})
+        create_task = asyncio.create_task(
+            request(2, "new_session", {"provider": "codex"})
+        )
+        await await_or_fail(setup_started.wait(), what="new_session setup to start")
+        assert not create_task.done(), "new_session responded before setup completed"
+        release_setup.set()
+        created = await await_or_fail(
+            create_task, what="new_session WebSocket response after setup release"
+        )
         assert any(
             frame.get("params", {}).get("data", {}).get("change") == "reset"
             for frame in created
@@ -428,10 +653,8 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
             ),
             None,
         )
-        while approval is None:
-            frame = await _read_json(reader)
-            if frame.get("params", {}).get("event") == "approval_request":
-                approval = frame
+        if approval is None:
+            approval = await event("approval_request")
         approved = await request(
             4,
             "approve",
@@ -453,7 +676,15 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
         )
         assert revoked[-1]["result"]["grants"]["session_grants"] == []
     finally:
-        await close_serve(server, writer)
+        release_setup.set()
+        if create_task is not None and not create_task.done():
+            create_task.cancel()
+            await await_or_fail(
+                asyncio.gather(create_task, return_exceptions=True),
+                what="canceled new_session request cleanup",
+            )
+        await websocket.close()
+        await close_serve(server)
 
 
 @pytest.mark.asyncio
@@ -632,6 +863,8 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
     reader, writer = await _connect(server)
     observer_writer: asyncio.StreamWriter | None = None
     replacement_writer: asyncio.StreamWriter | None = None
+    release_observer = asyncio.Event()
+    release_controller_read = asyncio.Event()
     try:
         await _hello_and_create(reader, writer)
         observer_reader, observer_writer = await _observer(
@@ -641,26 +874,55 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         await _event(reader, "approval_request")
         assert server.connections is not None
         observer_connection = server.connections._observers[0].connection
-        original_write = observer_connection._write_physical
+        controller_connection = server.connections._controller.connection
+        original_observer_write = observer_connection._write_physical
+        original_controller_write = controller_connection._write_physical
+        original_client_read = server_client.read
         observer_blocked = asyncio.Event()
-        release_observer = asyncio.Event()
+        approve_response_written = asyncio.Event()
+        revoke_response_written = asyncio.Event()
 
         async def block_observer(payload: bytes) -> bool:
             if b"session_grants_changed" in payload:
                 observer_blocked.set()
                 await asyncio.wait_for(release_observer.wait(), 10)
-            return await original_write(payload)
+            return await original_observer_write(payload)
 
-        # test-contract: seam gate the real observer transport write
+        async def observe_controller_write(payload: bytes) -> bool:
+            written = await original_controller_write(payload)
+            if b'"id":4' in payload:
+                approve_response_written.set()
+            if b'"id":5' in payload:
+                revoke_response_written.set()
+            return written
+
+        async def block_controller_read(
+            stream: asyncio.StreamReader,
+        ) -> dict[str, Any]:
+            await asyncio.wait_for(release_controller_read.wait(), 10)
+            return await original_client_read(stream)
+
+        # test-contract: seam gate the real observer and controller transports
         monkeypatch.setattr(observer_connection, "_write_physical", block_observer)
+        # test-contract: seam observe the real controller transport write
+        monkeypatch.setattr(
+            controller_connection, "_write_physical", observe_controller_write
+        )
+        monkeypatch.setattr(server_client, "read", block_controller_read)
         approve = asyncio.create_task(
             approve_and_collect_grant(
                 reader, writer, 4, "call-1", "always_tool", ["bash"]
             )
         )
         await asyncio.wait_for(observer_blocked.wait(), 10)
-        controller_event = await asyncio.wait_for(
-            _assert_completes_in_ready_turns(approve), 10
+        await asyncio.wait_for(approve_response_written.wait(), 10)
+        # test-contract: seam real controller wire write precedes observer release
+        assert not release_observer.is_set(), (
+            "controller response required observer write completion"
+        )
+        release_controller_read.set()
+        controller_event = await await_or_fail(
+            approve, what="controller grant response after wire write"
         )
         release_observer.set()
         observer_event = await _event(observer_reader, "session_grants_changed")
@@ -679,8 +941,13 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
             )
         )
         await asyncio.wait_for(observer_blocked.wait(), 10)
-        revoke_frames = await asyncio.wait_for(
-            _assert_completes_in_ready_turns(revoke), 10
+        await asyncio.wait_for(revoke_response_written.wait(), 10)
+        # test-contract: seam real controller wire write precedes observer release
+        assert not release_observer.is_set(), (
+            "revoke response required observer write completion"
+        )
+        revoke_frames = await await_or_fail(
+            revoke, what="controller revoke response after wire write"
         )
         assert revoke_frames[-1]["result"]["removed"] == ["bash"]
         release_observer.set()
@@ -717,6 +984,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         assert snapshot["session_grants"] == []
     finally:
         release_observer.set()
+        release_controller_read.set()
         await close_serve(
             server,
             writer,
@@ -993,6 +1261,64 @@ async def test_session_grant_exactness_noops_feature_gate_and_fifo_sentinels(
         await close_serve(server, writer)
 
 
+async def _collect_second_parent_terminal(
+    reader: asyncio.StreamReader,
+    release_child: asyncio.Event,
+) -> tuple[list[dict[str, Any]], str]:
+    frames: list[dict[str, Any]] = []
+    while True:
+        buffered = _buffer(reader)
+        if buffered:
+            frame = buffered.popleft()
+        else:
+            frame = await read(reader)
+        frames.append(frame)
+        if frame.get("params", {}).get("event") == "agent_end":
+            release_child.set()
+            return frames, "parent agent end"
+
+
+async def _read_until_child_bash_two(
+    reader: asyncio.StreamReader, frames: list[dict[str, Any]]
+) -> str:
+    while True:
+        buffered = _buffer(reader)
+        if buffered:
+            frame = buffered.popleft()
+        else:
+            frame = await read(reader)
+        frames.append(frame)
+        params = frame.get("params", {})
+        if params.get("tool_call", {}).get("id") != "child-bash-2":
+            continue
+        event = params.get("event")
+        if event == "approval_request":
+            return "child-bash-2 approval_request"
+        if event in {"tool_start", "tool_end"}:
+            return f"child-bash-2 {event} before any approval_request"
+
+
+async def _first_child_bash_two_fact(
+    reader: asyncio.StreamReader,
+    frames: list[dict[str, Any]],
+    publication_attempted: asyncio.Event,
+) -> str:
+    wire = asyncio.create_task(_read_until_child_bash_two(reader, frames))
+    # test-contract: seam this coroutine is the await_or_fail argument.
+    hook = asyncio.create_task(publication_attempted.wait())
+    try:
+        # test-contract: seam this coroutine is the await_or_fail argument.
+        await asyncio.wait({wire, hook}, return_when=asyncio.FIRST_COMPLETED)
+        if wire.done():
+            return wire.result()
+        return "publication hook"
+    finally:
+        for task in (wire, hook):
+            task.cancel()
+        # test-contract: seam this coroutine is the await_or_fail argument.
+        await asyncio.gather(wire, hook, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
     tmp_path: Path,
@@ -1031,17 +1357,87 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
                 break
         await _wait_idle(reader, writer, 30)
 
-        await _request(reader, writer, 6, "revoke_session_grants", {"grant": "bash"})
-        await _event(reader, "session_grants_changed")
-        await _request(reader, writer, 7, "send", {"text": "second delegate"})
-        approval = await _event(reader, "approval_request")
-        assert approval["tool_call"]["id"] == "child-bash-2"
-        assert approval["delegated"] is True
-        await _request(
-            reader, writer, 8, "deny", {"request_id": approval["request_id"]}
+        publication_attempted = asyncio.Event()
+        original_admit = server.control._approvals._admit
+
+        def observe_publication(event, session_id, **fields):
+            result = original_admit(event, session_id, **fields)
+            if (
+                event is EventDescriptor.APPROVAL_REQUEST
+                and fields.get("delegated") is True
+            ):
+                publication_attempted.set()
+            return result
+
+        server.control._approvals._admit = observe_publication
+
+        async def second_delegate_journey() -> None:
+            await _request(
+                reader, writer, 6, "revoke_session_grants", {"grant": "bash"}
+            )
+            await _event(reader, "session_grants_changed")
+            second_send = await _request(
+                reader, writer, 7, "send", {"text": "second delegate"}
+            )
+            # test-contract: seam this coroutine is the await_or_fail argument.
+            await backend.child_two_ready.wait()
+            snapshot = (await _request(reader, writer, 31, "session_grants"))[-1][
+                "result"
+            ]
+            assert snapshot["session_grants"] == []
+            frames, terminal = await _collect_second_parent_terminal(
+                reader, backend.release_child_two
+            )
+            ended_on = await _first_child_bash_two_fact(
+                reader, frames, publication_attempted
+            )
+            sentinel = await _request(reader, writer, 32, "session_grants")
+            buffered = _buffer(reader)
+            frames.extend(buffered)
+            buffered.clear()
+            frames.extend(sentinel)
+            approval = next(
+                (
+                    frame["params"]
+                    for frame in frames
+                    if frame.get("params", {}).get("event") == "approval_request"
+                    and frame.get("params", {}).get("tool_call", {}).get("id")
+                    == "child-bash-2"
+                ),
+                None,
+            )
+            terminal = "delegated approval" if approval is not None else ended_on
+            assert approval is not None, (
+                "child-bash-2 did not request delegated approval; "
+                f"wait ended on: {ended_on}; second send response={second_send!r}; "
+                f"all buffered frames={frames!r}; "
+                f"live parent session_grants={snapshot!r}"
+            )
+            assert terminal == "delegated approval"
+            assert any(
+                frame.get("params", {}).get("event") == "tool_end"
+                and frame.get("params", {}).get("tool_call", {}).get("id")
+                == "agent-2"
+                for frame in frames
+            )
+            assert any(
+                frame.get("params", {}).get("event") == "agent_end"
+                for frame in frames
+            )
+            assert approval["tool_call"]["id"] == "child-bash-2"
+            assert approval["delegated"] is True
+            await _request(
+                reader, writer, 8, "deny", {"request_id": approval["request_id"]}
+            )
+            await _frames_until_event(reader, "turn_end")
+
+        await await_or_fail(
+            second_delegate_journey(),
+            timeout=300,
+            what="second delegated approval journey",
         )
-        await _frames_until_event(reader, "turn_end")
     finally:
+        backend.release_child_two.set()
         await close_serve(server, writer)
 
 
@@ -1131,12 +1527,28 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
     reader, writer = await _connect(server)
     replacement_writer: asyncio.StreamWriter | None = None
     try:
-        await _hello_and_create(reader, writer)
+        _, session_id = await _hello_and_create(reader, writer)
         await _request(reader, writer, 3, "send", {"text": "grant"})
         await _event(reader, "approval_request")
-        await approve_and_collect_grant(
-            reader, writer, 4, "call-1", "always_tool", ["bash"]
+        approve_frames, buffered = await _approve_after_external_end(
+            server,
+            reader,
+            writer,
+            monkeypatch,
+            session_id=session_id,
+            request_id=4,
+            approval_request_id="call-1",
         )
+        assert approve_frames[-1]["result"]["accepted"] is True
+        grant_events = [
+            frame
+            for frame in buffered
+            if frame.get("params", {}).get("event") == "session_grants_changed"
+        ]
+        assert len(grant_events) == 1, buffered
+        assert grant_events[0]["params"]["data"]["grants"]["session_grants"] == [
+            "bash"
+        ]
         await _frames_until_event(reader, "turn_end")
 
         assert server.connections is not None
@@ -1185,5 +1597,387 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
     finally:
         await close_serve(
             server,
+            *([replacement_writer] if replacement_writer is not None else []),
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "normal_owner",
+        "duplicate",
+        "deny",
+        "external_end",
+        "cancel_settle",
+        "cancel_finish",
+        "cancel_publish",
+        "cancel_history",
+        "cancel_write",
+        "restart_replay",
+    ],
+)
+@pytest.mark.asyncio
+async def test_session_grant_lifecycle_table_over_unix_protocol(
+    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise grant ownership and every cancellation await over unix serve."""
+    GrantPublication = getattr(approval_lifecycle, "GrantPublication", None)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("call-1", "bash", {"command": "true"})]),
+            ScriptedTurn(tool_calls=[ToolCall("call-2", "bash", {"command": "true"})]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    replacement_reader: asyncio.StreamReader | None = None
+    replacement_writer: asyncio.StreamWriter | None = None
+    try:
+        _, session_id = await _hello_and_create(reader, writer)
+        await _request(reader, writer, 3, "send", {"text": "grant"})
+        assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
+        cancel = case.startswith("cancel_")
+        if case == "deny":
+            response = (
+                await _request(reader, writer, 4, "deny", {"request_id": "call-1"})
+            )[-1]
+            assert response["result"]["decision"] == "deny"
+            assert not any(
+                frame.get("params", {}).get("event") == "session_grants_changed"
+                for frame in _buffer(reader)
+            )
+        else:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            settlement: asyncio.Task[object] | None = None
+            if case in {"cancel_settle", "external_end"}:
+                original_commit = ConversationStore._commit_storage_command
+
+                async def gated_commit(store: ConversationStore, command: object) -> object:
+                    result = await original_commit(store, command)
+                    if type(command).__name__ == "_ResolveApprovalCommand":
+                        # test-contract: seam gate the named production await
+                        entered.set()
+                        await await_or_fail(release.wait(), what="durable settlement")
+                    return result
+
+                # test-contract: seam gate the typed durable write owner
+                monkeypatch.setattr(
+                    ConversationStore, "_commit_storage_command", gated_commit
+                )
+            elif case == "cancel_finish" and GrantPublication is not None:
+                original_finish = GrantPublication.finish
+
+                async def gated_finish(
+                    publication: GrantPublication,
+                    request: Any,
+                    committed: bool,
+                    event_published: bool,
+                ) -> tuple[bool, bool]:
+                    # test-contract: seam gate the named production await
+                    entered.set()
+                    await await_or_fail(release.wait(), what="grant finish")
+                    return await original_finish(
+                        publication, request, committed, event_published
+                    )
+
+                monkeypatch.setattr(GrantPublication, "finish", gated_finish)
+            elif case == "cancel_publish" and GrantPublication is not None:
+                original_publish = GrantPublication.publish
+
+                async def gated_publish(
+                    publication: GrantPublication, rule: str
+                ) -> None:
+                    # test-contract: seam gate the named production await
+                    entered.set()
+                    await await_or_fail(release.wait(), what="grant publication")
+                    await original_publish(publication, rule)
+
+                monkeypatch.setattr(GrantPublication, "publish", gated_publish)
+            elif case == "cancel_history":
+                original_history = ConversationStore.append_approval_history_async
+
+                async def gated_history(
+                    store: ConversationStore, payload: dict[str, object]
+                ) -> object:
+                    result = await original_history(store, payload)
+                    # test-contract: seam gate the named production await
+                    entered.set()
+                    await await_or_fail(release.wait(), what="approval history")
+                    return result
+
+                monkeypatch.setattr(
+                    ConversationStore,
+                    "append_approval_history_async",
+                    gated_history,
+                )
+            elif case == "cancel_write":
+                assert server.connections is not None
+                controller = server.connections._controller
+                assert controller is not None
+                original_write = controller.connection._write_physical
+
+                async def gated_write(payload: bytes) -> bool:
+                    if b"session_grants_changed" in payload:
+                        # test-contract: seam gate the named production await
+                        entered.set()
+                        await await_or_fail(release.wait(), what="grant physical write")
+                    return await original_write(payload)
+
+                # test-contract: seam gate the real physical-write await
+                monkeypatch.setattr(
+                    controller.connection, "_write_physical", gated_write
+                )
+            if case in {"cancel_finish", "cancel_publish"} and GrantPublication is None:
+                original_grant_publish = server.control.publish_session_grant_change
+
+                async def gated_grant_publish(change: Any) -> None:
+                    # test-contract: seam gate the named production await
+                    entered.set()
+                    await await_or_fail(release.wait(), what="grant publication")
+                    await original_grant_publish(change)
+
+                monkeypatch.setattr(
+                    server.control, "publish_session_grant_change", gated_grant_publish
+                )
+
+            if case == "cancel_history":
+                record = server.control._approvals.state.records["call-1"]
+                server.control._approvals._change(
+                    record,
+                    target=replace(record.target, history_store=record.target.store),
+                    history_published=True,
+                )
+            approve = asyncio.create_task(
+                _request(
+                    reader,
+                    writer,
+                    4,
+                    "approve",
+                    {"request_id": "call-1", "scope": "always_tool"},
+                )
+            )
+            if case == "external_end":
+                await await_or_fail(entered.wait(), what="durable settlement")
+                external_end = asyncio.create_task(
+                    server.control._approvals.transition(
+                        ExternalEnd("call-1", session_id, {})
+                    )
+                )
+                release.set()
+                await await_or_fail(external_end, what="external approval end")
+            if cancel:
+                await await_or_fail(entered.wait(), what=f"{case} gate")
+                record = server.control._approvals.state.records.get("call-1")
+                if record is not None:
+                    settlement = record.settlement
+                original_turn = server.control._turn_task
+                assert original_turn is not None
+                cancel_target = settlement or approve
+                if settlement is not None:
+                    assert not settlement.done()
+                cancel_target.cancel()
+                release.set()
+                with pytest.raises((asyncio.CancelledError, AssertionError)):
+                    await await_or_fail(approve, what="canceled approve")
+            else:
+                frames = await await_or_fail(approve, what="approve response")
+                assert frames[-1]["result"]["decision"] == "approve"
+
+            if cancel:
+                published = [
+                    frame
+                    for frame in _buffer(reader)
+                    if frame.get("params", {}).get("event") == "session_grants_changed"
+                ]
+                assert len(published) == 1, (
+                    f"{case} must publish one grant-change event before replacement; "
+                    f"observed {published!r}"
+                )
+                assert not server.control._approvals.state.records, (
+                    f"{case} left an approval record after grant settlement"
+                )
+                original_frames = list(_buffer(reader))
+                _buffer(reader).clear()
+                await await_or_fail(
+                    asyncio.gather(original_turn, return_exceptions=True),
+                    what=f"{case} original turn end",
+                )
+                (
+                    replacement_reader,
+                    replacement_writer,
+                ) = await asyncio.open_unix_connection(str(server.socket_path))
+                replacement_frames = await _request(
+                    replacement_reader,
+                    replacement_writer,
+                    10,
+                    "hello",
+                    {"protocol_version": "1.2", "features": FEATURES},
+                )
+                snapshot_frames = await _request(
+                    replacement_reader, replacement_writer, 11, "session_grants"
+                )
+                snapshot = snapshot_frames[-1]["result"]
+                assert snapshot["session_grants"] == ["bash"]
+                original_status = (
+                    await await_or_fail(
+                        _request(replacement_reader, replacement_writer, 12, "status"),
+                        what=f"{case} original turn terminal status",
+                    )
+                )[-1]
+                assert original_status["result"]["state"] == "idle", (
+                    f"{case} replacement controller did not observe the original "
+                    "turn reaching idle"
+                )
+                send_frames = await await_or_fail(
+                    _request(
+                        replacement_reader,
+                        replacement_writer,
+                        13,
+                        "send",
+                        {"text": "ask again"},
+                    ),
+                    what=f"{case} replacement send response",
+                )
+                send_response = send_frames[-1]
+                assert send_response.get("result", {}).get("accepted") is True, (
+                    f"{case} replacement send was not accepted: {send_response!r}"
+                )
+                next_turn = await await_or_fail(
+                    _frames_until_event(replacement_reader, "turn_end"),
+                    what=f"{case} replacement turn end",
+                )
+                assert not any(
+                    frame.get("params", {}).get("event") == "approval_request"
+                    for frame in next_turn
+                ), f"{case} replacement unexpectedly asked for approval"
+                replacement_frames.extend(snapshot_frames)
+                replacement_frames.extend(_buffer(replacement_reader))
+                changed = [
+                    frame
+                    for frame in [*original_frames, *replacement_frames]
+                    if frame.get("params", {}).get("event") == "session_grants_changed"
+                ]
+                assert len(changed) == 1, (
+                    f"{case} must publish exactly one grant-change event; "
+                    f"observed {changed!r}"
+                )
+                assert not server.control._approvals.state.records, (
+                    f"{case} left an approval record after replacement turn"
+                )
+            else:
+                grant_events = [
+                    frame
+                    for frame in _buffer(reader)
+                    if frame.get("params", {}).get("event") == "session_grants_changed"
+                ]
+                assert len(grant_events) == (0 if case == "deny" else 1)
+                if case == "duplicate":
+                    _buffer(reader).clear()
+                    assert server.runtime.opened is not None
+                    duplicate_call = ToolCall(
+                        "call-2", "bash", {"command": "true"}
+                    )
+                    server.runtime.opened.store.append_approval_request(
+                        "call-2", duplicate_call
+                    )
+                    before = (await _request(reader, writer, 5, "session_grants"))[-1]
+                    assert before["result"]["session_grants"] == ["bash"]
+                    duplicate_response = (
+                        await _request(
+                            reader,
+                            writer,
+                            6,
+                            "approve",
+                            {"request_id": "call-2", "scope": "always_tool"},
+                        )
+                    )[-1]
+                    assert duplicate_response.get("result", {}).get("accepted") is True, (
+                        f"duplicate approval was not accepted: {duplicate_response!r}"
+                    )
+                    sentinel = (await _request(reader, writer, 7, "session_grants"))[-1]
+                    assert sentinel["result"]["session_grants"] == ["bash"]
+                    duplicate_events = [
+                        frame
+                        for frame in _buffer(reader)
+                        if frame.get("params", {}).get("event")
+                        == "session_grants_changed"
+                    ]
+                    assert not duplicate_events, (
+                        "duplicate grant changed the event stream: "
+                        f"{duplicate_events!r}"
+                    )
+        if not cancel:
+            restarted = case == "restart_replay"
+            if restarted:
+                await _frames_until_event(reader, "turn_end")
+                await close_serve(server, writer)
+                writer = None  # type: ignore[assignment]
+                replay_backend = FakeBackend(
+                    [
+                        ScriptedTurn(
+                            tool_calls=[ToolCall("call-2", "bash", {"command": "true"})]
+                        ),
+                        ScriptedTurn([TextContent("done")]),
+                    ]
+                )
+                server = ZetaServer(
+                    home=tmp_path,
+                    socket_path=_socket_path(tmp_path),
+                    provider="codex",
+                    backend_factory=lambda provider, model, home: (
+                        replay_backend,
+                        model or "offline",
+                    ),
+                )
+                reader, writer = await _connect(server)
+                await _request(
+                    reader,
+                    writer,
+                    10,
+                    "hello",
+                    {"protocol_version": "1.2", "features": FEATURES},
+                )
+                await _request(
+                    reader,
+                    writer,
+                    11,
+                    "resume",
+                    {"session_id": session_id},
+                )
+                reset = await _event(reader, "session_grants_changed")
+                assert reset["data"]["change"] == "reset"
+            snapshot = (await _request(reader, writer, 6, "session_grants"))[-1][
+                "result"
+            ]
+            expected_grants = [] if case in {"deny", "restart_replay"} else ["bash"]
+            assert snapshot["session_grants"] == expected_grants
+            if restarted:
+                await _request(reader, writer, 12, "send", {"text": "ask again"})
+                assert (await _event(reader, "approval_request"))[
+                    "request_id"
+                ] == "call-2"
+                await _request(
+                    reader,
+                    writer,
+                    13,
+                    "deny",
+                    {"request_id": "call-2"},
+                )
+                await _frames_until_event(reader, "turn_end")
+            else:
+                await _frames_until_event(reader, "turn_end")
+            assert not server.control._approvals.state.records
+    finally:
+        release.set() if "release" in locals() else None
+        await close_serve(
+            server,
+            writer,
             *([replacement_writer] if replacement_writer is not None else []),
         )

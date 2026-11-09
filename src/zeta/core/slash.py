@@ -23,7 +23,6 @@ from ..skills import (
     SkillCatalog,
 )
 from .commands.custom_commands import (
-    COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
     load_custom_commands,
 )
@@ -126,7 +125,6 @@ class UsageTracker:
                     estimated_cost_usd=_snapshot_cost(self.provider, snapshot),
                 )
             self._accumulate_cost(snapshot)
-
     def _accumulate_cost(self, snapshot: UsageSnapshot) -> None:
         if snapshot.model is None:
             return
@@ -153,7 +151,6 @@ class UsageTracker:
                 else None
             ),
         )
-
     def _counters(self) -> dict[str, int]:
         return {
             "input_tokens": self.source.uncached_input_tokens_this_session,
@@ -170,7 +167,6 @@ class CompactionSummary:
     turn: int
     entries_folded: int
     tokens_saved: int
-
 
 @dataclass(frozen=True, slots=True)
 class ModelPricing:
@@ -547,9 +543,20 @@ class SlashStatus:
     explicit_finish: bool = False
     connection_setup_counts: tuple[dict[str, object], ...] = ()
     max_agent_depth: int = 3
+    unavailable_accounts: tuple[str, ...] = ()
 
 
 class SlashSession(Protocol):
+    plan_mode: bool
+    active: bool
+    pending_approvals: object
+
+    def set_plan_mode(self, enabled: bool) -> Awaitable[None] | None: ...
+
+    def invalidate_prompt(self) -> None: ...
+
+    def plan_mode_background_blocker(self) -> str | None: ...
+
     def slash_status_command(self, args: str) -> str: ...
 
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope: ...
@@ -606,7 +613,9 @@ class SlashSession(Protocol):
 
     def slash_project(self, args: str) -> str: ...
 
-    def slash_memory(self, args: str) -> str: ...
+    def slash_memory(self, args: str) -> str | Awaitable[str]: ...
+
+    def slash_repair_transcript(self, args: str) -> str | Awaitable[str]: ...
 
     def slash_inbox(self, args: str) -> str: ...
 
@@ -684,6 +693,7 @@ def _format_status(status: SlashStatus) -> str:
         f"tokens_in_current_context: {context_tokens}",
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
+        "unavailable_accounts: " + (", ".join(status.unavailable_accounts) or "none"),
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
         status.mcp_summary,
         "usage:",
@@ -860,8 +870,12 @@ def _run_project(session: SlashSession, args: str) -> str:
     return session.slash_project(args)
 
 
-def _run_memory(session: SlashSession, args: str) -> str:
+def _run_memory(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_memory(args)
+
+
+def _run_repair_transcript(session: SlashSession, args: str) -> str | Awaitable[str]:
+    return session.slash_repair_transcript(args)
 
 
 def _run_inbox(session: SlashSession, args: str) -> str:
@@ -929,11 +943,6 @@ def _memory_read_only(args: str) -> bool:
     return action in {"", "retry", "log"} or action.startswith("log ")
 
 
-def _mcp_read_only(_args: str) -> bool:
-    # MCP status can initialize and reconcile the live mount on the event loop.
-    return False
-
-
 def _vim_mutates(args: str) -> bool:
     return args.strip().lower() in {"on", "off", "toggle"}
 
@@ -954,6 +963,10 @@ def _mcp_mutates(args: str) -> bool:
         "logout",
         "reconnect",
     }
+
+
+def _decisions_mutates(args: str) -> bool:
+    return args.strip().partition(" ")[0] in {"dismiss", "reply"}
 
 
 def create_slash_registry(
@@ -991,7 +1004,7 @@ def create_slash_registry(
             "show MCP server status",
             ServeSlash(
                 mutates=_mcp_mutates,
-                runs_while_busy=_mcp_read_only,
+                runs_while_busy=_never_mutates,
             ),
         )
     )
@@ -1017,9 +1030,18 @@ def create_slash_registry(
             ),
         )
     )
-    registry.register(SlashCommand("plan", _run_plan, "show or change plan mode"))
     registry.register(
-        SlashCommand("implement", _run_implement, "implement the proposed plan")
+        SlashCommand(
+            "plan",
+            _run_plan,
+            "show or change plan mode",
+            ServeSlash(),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "implement", _run_implement, "implement the proposed plan", ServeSlash()
+        )
     )
     instruction_handler = lambda session, args: project_instructions_command(
         session,
@@ -1105,12 +1127,25 @@ def create_slash_registry(
         )
     )
     registry.register(
+        SlashCommand(
+            "repair-transcript",
+            _run_repair_transcript,
+            "repair one corrupt transcript: /repair-transcript <session> confirm",
+            ServeSlash(mutates=lambda _args: True),
+        )
+    )
+    registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")
     )
     registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
     registry.register(SlashCommand("tasks", _run_tasks, "inspect background processes"))
     registry.register(
-        SlashCommand("decisions", _run_decisions, "answer or discuss open decisions")
+        SlashCommand(
+            "decisions",
+            _run_decisions,
+            "read, reply, dismiss, or batch-reply to attention items",
+            ServeSlash(mutates=_decisions_mutates),
+        )
     )
     registry.register(
         SlashCommand(

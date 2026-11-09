@@ -6,6 +6,9 @@ import re
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from ...storage_format import reject_unknown_keys
+from ._async_writes import _AppendChildRunStartedCommand
+
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
     from ._store import ConversationStore
@@ -19,6 +22,15 @@ _MAX_TIMESTAMP_BYTES = 64
 
 def _bounded_utf8(value: str, limit: int) -> str:
     return value.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+
+def child_run_segments(parent_session_id: str, run_id: str | None) -> tuple[int, ...]:
+    """Map one public child id to its validated numeric directory segments."""
+    if run_id is None:
+        return ()
+    parse_child_run_id(parent_session_id, run_id)
+    prefix = f"{parent_session_id}:"
+    return tuple(int(segment) for segment in run_id[len(prefix) :].split(":"))
 
 
 def parse_child_run_id(parent_session_id: str, run_id: str) -> tuple[int, str | None]:
@@ -38,16 +50,26 @@ def parse_child_run_id(parent_session_id: str, run_id: str) -> tuple[int, str | 
     return int(segments[-1]), run_id.rpartition(":")[0] if len(segments) > 1 else None
 
 
+def verify_child_run_directory(directory_fd: int, run_id: str) -> None:
+    """Verify that a pinned child directory belongs to the selected public id."""
+    from ..checkpoints import load_session_json
+    from ..session_files import read_session_file
+
+    value = load_session_json(read_session_file(directory_fd, "agent_lifecycle.json"))
+    if not isinstance(value, Mapping) or value.get("handle") != run_id:
+        raise ValueError("child directory identity does not match child run id")
+
+
 def validate_child_run_started_data(data: Mapping[str, Any]) -> None:
     """Validate the bounded internal start-row payload."""
+    reject_unknown_keys(data, "child_run")
     run_id = data.get("run_id")
     parent_run_id = data.get("parent_run_id")
     name = data.get("name")
     task = data.get("task")
     started_at = data.get("started_at")
     if (
-        set(data) - {"run_id", "parent_run_id", "name", "task", "started_at"}
-        or type(run_id) is not str
+        type(run_id) is not str
         or not run_id
         or len(run_id.encode("utf-8")) > _MAX_RUN_ID_BYTES
         or type(parent_run_id) not in {str, type(None)}
@@ -69,8 +91,10 @@ def validate_child_run_started_data(data: Mapping[str, Any]) -> None:
     ):
         raise ValueError("invalid child run started payload")
     parts = run_id.split(":")
-    if len(parts) < 2 or len(parts) - 1 > _MAX_RUN_DEPTH or any(
-        _RUN_SEGMENT.fullmatch(part) is None for part in parts[1:]
+    if (
+        len(parts) < 2
+        or len(parts) - 1 > _MAX_RUN_DEPTH
+        or any(_RUN_SEGMENT.fullmatch(part) is None for part in parts[1:])
     ):
         raise ValueError("invalid child run id")
     expected_parent = ":".join(parts[:-1]) if len(parts) > 2 else None
@@ -108,12 +132,13 @@ class ChildRunStoreMixin:
         on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         """Append the spawn row off-loop and publish it before returning."""
-        return await self._to_thread_durable(
-            self.append_child_run_started,
-            run_id,
-            parent_run_id,
-            name,
-            task,
-            started_at,
-            _on_persisted=on_persisted,
+        return await self._commit_storage_command(
+            _AppendChildRunStartedCommand(
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                name=name,
+                task=task,
+                started_at=started_at,
+                callback=on_persisted,
+            )
         )

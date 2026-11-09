@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from tests.support.serve_close import close_serve
+from tests.support.server_client import expect_no_response, send
+from tests.support.server_client import read as client_read
 
 
 def _run_owner_test(pytester: pytest.Pytester, source: str):
@@ -73,6 +76,210 @@ async def test_leaked_server(tmp_path):
     result.assert_outcomes(failed=1)
     result.stdout.fnmatch_lines(["*AssertionError: original body failure*"])
     assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_app_owner_closes_after_body_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_leaked_app(tmp_path):
+    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty())
+    app = TUIApp(loop, provider="codex", model="offline")
+    cancelled = asyncio.Event()
+    async def active():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+    app._active_task = asyncio.create_task(active())
+    original_close = app.close
+    async def close_and_prove():
+        await original_close()
+        assert cancelled.is_set()
+        Path("closed").write_text("closed")
+    app.close = close_and_prove
+    assert False, "original body failure"
+""",
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*AssertionError: original body failure*"])
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_app_owner_reports_pending_task_on_closed_loop(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_pending_task_outlives_loop(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    foreign_loop = asyncio.new_event_loop()
+    async def active():
+        await asyncio.Event().wait()
+    task = foreign_loop.create_task(active(), name="outlives-closed-loop")
+    foreign_loop.close()
+    app._active_task = task
+    original_close = app.close
+    async def close_and_prove():
+        await original_close()
+        Path("closed").write_text("closed")
+    app.close = close_and_prove
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(
+        ["*TUIApp active task still pending on a closed event loop: *outlives-closed-loop*created at *"]
+    )
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_app_owner_accepts_done_task_on_closed_loop(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import threading
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_done_task_outlives_loop(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    tasks = []
+    def finish_task():
+        foreign_loop = asyncio.new_event_loop()
+        task = foreign_loop.create_task(asyncio.sleep(0), name="done-closed-loop")
+        foreign_loop.run_until_complete(task)
+        foreign_loop.close()
+        tasks.append(task)
+    thread = threading.Thread(target=finish_task)
+    thread.start()
+    await asyncio.wait_for(asyncio.to_thread(thread.join), 10)
+    app._active_task = tasks[0]
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
+def test_app_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_explicit_close(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    await app.close()
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
+def test_app_owner_reports_bounded_close_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_hanging_app_close(tmp_path):
+    app = TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    async def hang():
+        await asyncio.Event().wait()
+    app.close = hang
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*hang: TUIApp.close did not finish within 10 s*"])
+
+
+def test_two_apps_and_server_close_in_dependency_order(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+from pathlib import Path
+import pytest
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.runtime.loop import AgentLoop
+from zeta.server import ZetaServer
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+def app(tmp_path):
+    return TUIApp(AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+
+@pytest.mark.asyncio
+async def test_owners(tmp_path):
+    first = app(tmp_path / "first")
+    second = app(tmp_path / "second")
+    for value in (first, second):
+        original = value.close
+        async def close(original=original):
+            await original()
+            with Path("order").open("a") as marker:
+                marker.write("a")
+        value.close = close
+    server = ZetaServer(home=tmp_path / "server", port=0, provider="codex")
+    await server.start()
+    original = server.close
+    async def close_server():
+        with Path("order").open("a") as marker:
+            marker.write("s")
+        await original()
+    server.close = close_server
+""",
+    )
+    result.assert_outcomes(passed=1)
+    assert (pytester.path / "order").read_text() == "aas"
 
 
 def test_server_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
@@ -296,3 +503,66 @@ async def test_close_serve_drains_server_when_cancelled(phase: str) -> None:
         if not close_task.done():
             close_task.cancel()
         await asyncio.wait_for(asyncio.gather(close_task, return_exceptions=True), 10)
+
+
+class _ClientWriter(_Writer):
+    def write(self, data: bytes) -> None:
+        del data
+
+    async def drain(self) -> None:
+        return None
+
+
+def _stream(*frames: dict[str, object]) -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    for frame in frames:
+        reader.feed_data(json.dumps(frame).encode() + b"\n")
+    reader.feed_eof()
+    return reader
+
+
+_TURN_END = {"method": "event", "params": {"event": "turn_end"}}
+
+
+@pytest.mark.asyncio
+async def test_close_serve_fails_when_a_read_loop_stopped_before_a_response() -> None:
+    server = _Server()
+    writer = _ClientWriter(server)
+    reader = _stream(_TURN_END)
+    await send(reader, writer, 4, "deny")
+    # A plain read loop that stops at an event, before the id-4 response.
+    while (await client_read(reader))["params"]["event"] != "turn_end":
+        pass
+
+    with pytest.raises(
+        AssertionError, match=r"^request id 4 has no response; frames read: \[\]$"
+    ):
+        await close_serve(server, writer)
+    assert server.closed and writer.closed
+
+
+@pytest.mark.asyncio
+async def test_close_serve_reads_a_response_written_after_the_event() -> None:
+    server = _Server()
+    writer = _ClientWriter(server)
+    reader = _stream(_TURN_END, {"id": 4, "result": {}})
+    await send(reader, writer, 4, "deny")
+    assert (await client_read(reader))["params"]["event"] == "turn_end"
+
+    await close_serve(server, writer)
+
+    assert reader.at_eof(), "close_serve must read the id-4 response"
+    assert server.closed and writer.closed
+
+
+@pytest.mark.asyncio
+async def test_close_serve_accepts_a_declared_unanswered_request() -> None:
+    server = _Server()
+    writer = _ClientWriter(server)
+    reader = _stream()
+    await send(reader, writer, 4, "shutdown")
+    expect_no_response(reader, 4)
+
+    await close_serve(server, writer)
+
+    assert server.closed and writer.closed

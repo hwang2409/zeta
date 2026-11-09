@@ -20,12 +20,9 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from zeta.attention_decisions import DecisionItem, open_decisions
-from zeta.attention_forks import (
-    create_discussion_fork,
-    deliver_attention_decision,
-    release_discussion_fork,
-)
+from zeta.attention_forks import create_discussion_fork, release_discussion_fork
 from zeta.attention_records import AttentionStore
+from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
@@ -73,9 +70,9 @@ def _request(opened, project_id, title, why, **kw):
 
 def test_status_bar_shows_decisions_only_when_present() -> None:
     with_count = format_status("codex", "fake", "idle", decisions_count=2).plain
-    assert "● 2 decisions" in with_count
+    assert "● 2 attention items" in with_count
     singular = format_status("codex", "fake", "idle", decisions_count=1).plain
-    assert "● 1 decision" in singular
+    assert "● 1 attention item" in singular
     none = format_status("codex", "fake", "idle", decisions_count=0).plain
     assert "decision" not in none
 
@@ -92,9 +89,7 @@ def test_status_bar_shows_main_indicator_during_discussion() -> None:
 
 def _decisions_app(home: Path, opened) -> TUIApp:
     return TUIApp(
-        AgentLoop(
-            FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
-        ),
+        AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="fake",
         zeta_home=home,
@@ -112,9 +107,7 @@ async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -
     _request(other, project.project_id, "Other", "Not this one.")
 
     app = _decisions_app(tmp_path, current)
-    child = ConversationStore(
-        current.store.session_dir / "agents", session_id="child"
-    )
+    child = ConversationStore(current.store.session_dir / "agents", session_id="child")
     app._agent_navigation.current_path = child.session_dir
     await app._decisions_tick()
 
@@ -148,7 +141,9 @@ async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> 
     await app._decisions_tick()
     assert app.decisions_count == 1
 
-    fork_id = await asyncio.to_thread(lambda: create_discussion_fork(tmp_path, current.store.session_id, record.id))
+    fork_id = await asyncio.to_thread(
+        lambda: create_discussion_fork(tmp_path, current.store.session_id, record.id)
+    )
     fork = manager.open(fork_id)
     registry = ToolRegistry(
         tmp_path,
@@ -216,6 +211,10 @@ async def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> Non
         _home=tmp_path,
         _decisions_session_id=current.store.session_id,
         loop=current,
+        _run_attention_operation=lambda operation, *args: asyncio.to_thread(
+            operation, *args
+        ),
+        _attention_replies=lambda session_id: AttentionReplies(tmp_path, session_id),
     )
     output = await DecisionsMixin.slash_decisions(app, "")
     assert "Current" in output
@@ -249,7 +248,9 @@ def test_discussion_fork_decisions_use_source_session(tmp_path: Path) -> None:
 # -- popup rendering --------------------------------------------------------
 
 
-def _item(session_id: str, title: str, why: str, options=(), recommendation=None) -> DecisionItem:
+def _item(
+    session_id: str, title: str, why: str, options=(), recommendation=None
+) -> DecisionItem:
     from zeta.attention_records import AttentionRecord
 
     record = AttentionRecord(
@@ -274,9 +275,7 @@ def test_decisions_popup_lists_items_and_offers_options() -> None:
     one = _item("1" * 32, "Pick DB", "Choose a durable store.", ["SQLite", "Postgres"])
     two = _item("2" * 32, "Pick region", "Where to deploy the worker.")
     # Distinct ids so selection is stable.
-    two = DecisionItem(
-        two.session_id, "p", "proj", replace(two.record, id="b" * 32)
-    )
+    two = DecisionItem(two.session_id, "p", "proj", replace(two.record, id="b" * 32))
     panel.set_items([one, two])
     text = _plain(panel.render_lines())
     assert "Pick DB" in text
@@ -331,23 +330,26 @@ def test_quick_answer_delivers_to_asking_session_and_closes(tmp_path: Path) -> N
     answerer = _session(tmp_path, project.project_id)
     record = _request(asker, project.project_id, "Pick DB", "Choose one.")
 
-    message_id, _, already = deliver_attention_decision(
-        tmp_path, record, "Use SQLite.", from_session=answerer.store.session_id
+    outcome = AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=answerer.store.session_id
     )
-    assert already is False
+    assert not outcome.already_resolved
+    assert outcome.message_id is not None
 
     inbox = ProjectInbox(manager.project_registry, sessions_root=tmp_path / "sessions")
     new = inbox.new_ids(project.project_id, session_id=asker.store.session_id)
-    assert new == (message_id,)
-    message = inbox.claim(project.project_id, message_id, asker.store.session_id)
+    assert new == (outcome.message_id,)
+    message = inbox.claim(
+        project.project_id, outcome.message_id, asker.store.session_id
+    )
     assert "Use SQLite." in message["body"]
     assert AttentionStore(asker.store.session_dir).get(record.id).status == "resolved"
 
     # A repeat is idempotent and reports the prior delivery.
-    _, _, again = deliver_attention_decision(
-        tmp_path, record, "Use SQLite.", from_session=answerer.store.session_id
+    again = AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=answerer.store.session_id
     )
-    assert again is True
+    assert again.already_resolved
 
     asker.store.close()
     answerer.store.close()
@@ -416,12 +418,17 @@ def test_return_without_decision_unbinds_so_item_can_be_rediscussed(
         entry_seq=anchor.seq,
     )
     fork_id = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
-    assert AttentionStore(asker.store.session_dir).get(record.id).fork_session_id == fork_id
+    assert (
+        AttentionStore(asker.store.session_dir).get(record.id).fork_session_id
+        == fork_id
+    )
 
     source = release_discussion_fork(tmp_path, fork_id)
     assert source == asker.store.session_id
     # Open item: the binding is cleared so a fresh fork starts next time.
-    assert AttentionStore(asker.store.session_dir).get(record.id).fork_session_id is None
+    assert (
+        AttentionStore(asker.store.session_dir).get(record.id).fork_session_id is None
+    )
     new_fork = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
     assert new_fork != fork_id
     asker.store.close()
@@ -443,11 +450,8 @@ def test_return_after_decision_keeps_resolved_binding(tmp_path: Path) -> None:
         entry_seq=anchor.seq,
     )
     fork_id = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
-    deliver_attention_decision(
-        tmp_path,
-        AttentionStore(asker.store.session_dir).get(record.id),
-        "Use SQLite.",
-        from_session=fork_id,
+    AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=fork_id
     )
     source = release_discussion_fork(tmp_path, fork_id)
     assert source == asker.store.session_id
@@ -505,19 +509,26 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
         session = app._make_session()
         app._active_session = session
         app._install_full_screen_layout(session)
-        why = "\n".join(
-            f"why paragraph {index} has useful context " + "useful context " * 12
-            for index in range(17)
-        ) + "\ntail-marker"
+        why = (
+            "\n".join(
+                f"why paragraph {index} has useful context " + "useful context " * 12
+                for index in range(17)
+            )
+            + "\ntail-marker"
+        )
         item = _item(
             "1" * 32,
             "Which deployment should we use?",
             why,
-            options=["first option with enough detail to wrap", "second option with enough detail to wrap", "third option with enough detail to wrap"],
+            options=[
+                "first option with enough detail to wrap",
+                "second option with enough detail to wrap",
+                "third option with enough detail to wrap",
+            ],
             recommendation="Use the first option because it is safest.",
         )
         app._decisions_panel.set_items([item])
-        app.open_decisions_panel()
+        await app._open_decisions_panel()
 
         async def render() -> tuple[Screen, MouseHandlers]:
             session.app.output = _FixedSizeOutput(width, height)
@@ -526,7 +537,12 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
             session.layout.update_parents_relations()
             with set_app(session.app):
                 session.layout.container.write_to_screen(
-                    screen, handlers, WritePosition(0, 0, width, height), "", False, None
+                    screen,
+                    handlers,
+                    WritePosition(0, 0, width, height),
+                    "",
+                    False,
+                    None,
                 )
                 screen.draw_all_floats()
             return screen, handlers
@@ -602,7 +618,10 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
         assert "↑ more · pgup" in wheel_text
 
         press(Keys.PageUp)
-        assert app._decisions_panel_control.offset < app._decisions_panel_control._max_offset()
+        assert (
+            app._decisions_panel_control.offset
+            < app._decisions_panel_control._max_offset()
+        )
         second = _item("2" * 32, "Other decision", "short", ["Keep"])
         app._decisions_panel.set_items([second])
         app._refresh_decisions_panel()
@@ -617,7 +636,10 @@ def test_decisions_short_detail_has_no_overflow_indicator() -> None:
     control = OverlayControl()
     control.set_lines(panel.render_lines())
     content = control.create_content(width=80, height=24)
-    text = "\\n".join("".join(fragment[1] for fragment in content.get_line(i)) for i in range(content.line_count))
+    text = "\\n".join(
+        "".join(fragment[1] for fragment in content.get_line(i))
+        for i in range(content.line_count)
+    )
     assert "more" not in text
 
 
@@ -627,18 +649,24 @@ def test_decisions_wraps_wide_unbroken_tokens_by_cells() -> None:
     lines = panel.render_lines()
     question = [line for line in lines if "界" in _plain([line])]
     assert question
-    assert all(sum(max(0, get_cwidth(c)) for c in _plain([line])) <= 66 for line in question)
+    assert all(
+        sum(max(0, get_cwidth(c)) for c in _plain([line])) <= 66 for line in question
+    )
 
 
 def test_decisions_detail_keeps_full_text_and_recommendation() -> None:
     panel = DecisionsPanel()
-    panel.set_items([_item(
-        "1" * 32,
-        "A very long decision title that must remain readable in the detail view",
-        "A long explanation that should wrap across multiple rows instead of being truncated.",
-        ["The first option has enough text to wrap too."],
-        recommendation="Prefer the first option because it is safer.",
-    )])
+    panel.set_items(
+        [
+            _item(
+                "1" * 32,
+                "A very long decision title that must remain readable in the detail view",
+                "A long explanation that should wrap across multiple rows instead of being truncated.",
+                ["The first option has enough text to wrap too."],
+                recommendation="Prefer the first option because it is safer.",
+            )
+        ]
+    )
     text = _plain(panel.render_lines())
     assert "A very long decision title that must remain readable" in text
     assert "truncated" in text

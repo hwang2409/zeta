@@ -8,32 +8,51 @@ import copy
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-import httpx
-from prompt_toolkit.patch_stdout import patch_stdout
-
-from ..accounts import (
-    AccountCredentialLockTimeoutError,
-    AccountCredentials,
-    AccountError,
-    AccountId,
-    AccountStore,
-    AccountUsage,
-)
-from ..accounts.login import login_failure_message, login_named_account
-from ..accounts.usage import format_usage_lines, usage_json
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
-from ..core.login_flow import run_login
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
-from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
-from ..providers.factory import credential_store
 from ..storage_format import WRITER_EPOCH, StorageFormatError, advance
-from ..tui.app import create_app
-from ..tui.key_bindings import TerminalRenderError
+
+if TYPE_CHECKING:
+    import httpx
+
+    from ..accounts import AccountCredentials, AccountId, AccountStore
+    from ..oauth import OAuthTokens
+
+
+def __getattr__(name: str) -> object:
+    # Keep existing test patch seams without importing command dependencies at startup.
+    if name == "httpx":
+        import httpx
+
+        return httpx
+    if name == "credential_store":
+        from ..providers.factory import credential_store
+
+        return credential_store
+    if name == "run_login":
+        from ..core.login_flow import run_login
+
+        return run_login
+    if name == "patch_stdout":
+        from prompt_toolkit.patch_stdout import patch_stdout
+
+        return patch_stdout
+    if name == "TerminalRenderError":
+        from ..tui.errors import TerminalRenderError
+
+        return TerminalRenderError
+    if name == "OAUTH_REFRESH_TIMEOUT_SECONDS":
+        from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
+
+        return OAUTH_REFRESH_TIMEOUT_SECONDS
+    raise AttributeError(name)
 
 
 def _tool_patterns_arg(value: str) -> str:
@@ -433,16 +452,21 @@ def build_parser() -> argparse.ArgumentParser:
 def _run_login(
     provider: str, label: str = "default", replace_existing: bool = False
 ) -> str | None:
+    from ..accounts.login import login_named_account
+    from ..core.login_flow import run_login as default_run_login
+
     return login_named_account(
         env_home(),
         provider,
         label,
         replace_existing=replace_existing,
-        login=run_login,
+        login=globals().get("run_login") or default_run_login,
     )
 
 
 def _login_label(args: argparse.Namespace) -> str:
+    from ..accounts import AccountError, AccountStore
+
     if args.account is not None:
         return args.account
     if not sys.stdin.isatty():
@@ -458,6 +482,8 @@ def _login_label(args: argparse.Namespace) -> str:
 
 
 def _handle_login(args: argparse.Namespace) -> int:
+    from ..accounts.login import login_failure_message
+
     try:
         handle = _run_login(args.provider, _login_label(args), args.replace)
     except KeyboardInterrupt:
@@ -473,6 +499,8 @@ def _handle_login(args: argparse.Namespace) -> int:
 
 
 def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
+    from ..accounts.usage import format_usage_lines, usage_json
+
     accounts = store.list_display()
     if as_json:
         print(
@@ -482,6 +510,7 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
                         "account": str(item),
                         "id": str(item.account),
                         "detail": item.detail,
+                        "available": item.available,
                         "default": store.default(item.account.provider) == item.account,
                         "usage": usage_json(item.usage),
                     }
@@ -497,7 +526,15 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
             if store.default(item.account.provider) == item.account
             else ""
         )
-        lines.append(str(item) + (f"  {item.detail}" if item.detail else "") + marker)
+        availability = (
+            "  unavailable: credentials missing" if not item.available else ""
+        )
+        lines.append(
+            str(item)
+            + (f"  {item.detail}" if item.detail else "")
+            + availability
+            + marker
+        )
         lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
     print("\n".join(lines))
 
@@ -507,6 +544,8 @@ def _expiry_iso(expires_at: float) -> str:
 
 
 def _refresh_failure(exc: RuntimeError) -> dict[str, object]:
+    from ..accounts import AccountCredentialLockTimeoutError
+
     if isinstance(exc, AccountCredentialLockTimeoutError) or isinstance(
         exc.__cause__, AccountCredentialLockTimeoutError
     ):
@@ -526,9 +565,15 @@ def _refresh_failure(exc: RuntimeError) -> dict[str, object]:
 async def _read_safe_account_status(
     credentials: AccountCredentials,
 ) -> tuple[OAuthTokens | None, dict[str, object]]:
+    from ..accounts import AccountCredentialLockTimeoutError, AccountError
+    from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS as default_refresh_timeout
+
+    refresh_timeout = globals().get(
+        "OAUTH_REFRESH_TIMEOUT_SECONDS", default_refresh_timeout
+    )
     try:
         tokens = await asyncio.to_thread(
-            credentials.read, lock_timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            credentials.read, lock_timeout=refresh_timeout
         )
     except AccountCredentialLockTimeoutError:
         return None, {
@@ -566,7 +611,9 @@ async def _account_status(
     refresh: bool,
     client: httpx.AsyncClient,
 ) -> tuple[dict[str, object], bool]:
-    credentials = credential_store(
+    from ..providers.factory import credential_store as default_credential_store
+
+    credentials = (globals().get("credential_store") or default_credential_store)(
         "claude" if account.provider == "anthropic" else account.provider,
         home=store.home,
         account=account,
@@ -614,6 +661,8 @@ async def _account_status(
 def _migration_pending_status(
     provider: str, default: AccountId | None, *, refresh: bool
 ) -> dict[str, object]:
+    from ..accounts import AccountId
+
     status: dict[str, object] = {
         "provider": provider,
         "account": "default",
@@ -657,7 +706,9 @@ async def _account_statuses(
         for name in sorted(pending_providers)
     ]
     all_ok = bool(accounts) and not pending_providers
-    async with httpx.AsyncClient() as client:
+    import httpx as httpx_module
+
+    async with (globals().get("httpx") or httpx_module).AsyncClient() as client:
         for item in accounts:
             status, ok = await _account_status(
                 store,
@@ -699,6 +750,8 @@ def _print_account_statuses(
 
 
 def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> int:
+    from ..accounts import AccountError, AccountUsage
+
     if args.action == "default":
         if not args.account:
             raise AccountError("default requires provider:name")
@@ -734,6 +787,8 @@ def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> int:
 
 
 def _handle_accounts(args: argparse.Namespace) -> int:
+    from ..accounts import AccountError, AccountStore
+
     if args.action == "login":
         if args.account not in {"anthropic", "codex"}:
             print("login requires anthropic or codex", file=sys.stderr)
@@ -812,6 +867,8 @@ def _create_tui_app(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
 ) -> object | None:
+    from ..tui.bootstrap import create_app
+
     try:
         if args.continue_session or args.resume is not None:
             print("Loading session…", flush=True)
@@ -847,6 +904,18 @@ def _run_tui_lifecycle(
             restart_cancels_work = False
             new_session_requested = False
             try:
+                from prompt_toolkit.patch_stdout import (
+                    patch_stdout as default_patch_stdout,
+                )
+
+                from ..tui.errors import (
+                    TerminalRenderError as default_terminal_render_error,
+                )
+
+                patch_stdout = globals().get("patch_stdout") or default_patch_stdout
+                terminal_render_error = (
+                    globals().get("TerminalRenderError") or default_terminal_render_error
+                )
                 with patch_stdout(raw=True):
                     restart_requested, restart_cancels_work = asyncio.run(
                         _run_tui(run_app, args)
@@ -857,7 +926,7 @@ def _run_tui_lifecycle(
                     app = None
                     args.continue_session = False
                     args.resume = None
-            except TerminalRenderError as exc:
+            except terminal_render_error as exc:
                 print(f"zeta: {exc}", file=sys.stderr)
                 _print_exit_hint(app)
                 exit_status = 1
@@ -918,6 +987,33 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
         print(f"resume manually: zeta --resume {session_id}", file=sys.stderr)
         return 1
     return 0
+
+
+def _run_console(run: Callable[[], int]) -> int:
+    try:
+        return run()
+    except StorageFormatError as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        from ..accounts import AccountError
+
+        if not isinstance(exc, AccountError):
+            raise
+        print(f"zeta: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run_tui_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    entrypoint: str,
+    original_argv: list[str],
+) -> int:
+    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    if restart_session_id is not None:
+        return _exec_restart(entrypoint, original_argv, restart_session_id)
+    return exit_status
 
 
 async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
@@ -1135,18 +1231,11 @@ def _main(argv: list[str] | None = None) -> int:
         return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
-    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
-    if restart_session_id is not None:
-        return _exec_restart(entrypoint, original_argv, restart_session_id)
-    return exit_status
+    return _run_tui_command(args, parser, entrypoint, original_argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:
-        return _main(argv)
-    except StorageFormatError as exc:
-        print(f"zeta: {exc}", file=sys.stderr)
-        return 2
+    return _run_console(lambda: _main(argv))
 
 
 __all__ = ["build_parser", "main"]

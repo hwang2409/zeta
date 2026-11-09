@@ -31,12 +31,19 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...core.agent_progress import live_agent_lifecycle
+from ...core.agent_state import (
+    BrokenAgentLifecycle,
+    LoadedAgentLifecycle,
+    MissingAgentLifecycle,
+    read_agent_lifecycle_state,
+)
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
     load_session_json,
 )
 from ...core.child_lifecycle import select_legacy_child_lifecycle
+from ...core.session_execution import execution_owner_state
 from ...core.session_files import (
     child_directory,
     open_session_file,
@@ -52,6 +59,7 @@ from ...protocol.types import (
     ToolCall,
     ToolUseContent,
 )
+from ...skills.agent_catalog import AgentCatalog
 from ..agent_send import (  # noqa: F401
     AGENT_SEND_COMMIT_TIMEOUT_SECONDS,
     register_send,
@@ -305,6 +313,23 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
         return read_session_file(directory_fd, name)
 
 
+def _read_child_lifecycle(
+    store: ConversationStore, child_path: Path
+) -> tuple[object, str | None]:
+    with ExitStack() as cleanup:
+        directory_fd = store.directory_fd
+        for component in child_path.relative_to(store.session_dir.absolute()).parts:
+            directory_fd = cleanup.enter_context(
+                child_directory(directory_fd, component)
+            )
+        return (
+            read_agent_lifecycle_state(
+                directory_fd, child_path / "agent_lifecycle.json"
+            ),
+            execution_owner_state(directory_fd),
+        )
+
+
 def _read_agent_transcript(
     child_path: Path,
     cached: tuple[tuple[int, int, int], str] | None,
@@ -391,44 +416,48 @@ def _read_agent_output(
     return identity, output, cacheable, result
 
 
-def _unknown_agent_status(
+def _unreadable_agent_status(
     handle: str, *, reason: str, started_at: object = None
 ) -> dict[str, StructuredContentValue]:
     return {
         "handle": handle,
-        "state": "unknown",
+        "state": "failed",
         "started_at": (started_at if type(started_at) is str else "unknown"),
-        "finished_at": None,
+        "finished_at": "unknown",
         "elapsed": 0.0,
         "turns_used": 0,
         "tool_calls": 0,
-        "current_step": "unknown",
+        "current_step": "unreadable",
         "depth": 0,
         "agent_type": "general",
         "description": "",
-        "reason": reason,
+        "reason": f"unreadable: {reason}",
     }
 
 
+def _lost_agent_status(
+    item: dict[str, StructuredContentValue], *, requested: bool
+) -> dict[str, StructuredContentValue]:
+    lost = dict(item)
+    lost.update(
+        state="failed",
+        finished_at="unknown",
+        elapsed=0.0,
+        current_step="lost",
+        reason="lost: owner process exited",
+    )
+    if requested:
+        lost["final_result"] = "lost: owner process exited"
+    return lost
+
+
 def _project_agent_status(
-    store: object,
+    lifecycle: object,
     handle: str,
-    child_path: Path,
     *,
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
 ) -> dict[str, StructuredContentValue]:
-    live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
-    try:
-        durable = load_session_json(
-            _read_child_file(store, child_path, "agent_lifecycle.json")
-        )
-    except (OSError, ValueError) as exc:
-        if live is None:
-            raise ValueError("could not read child state") from exc
-        lifecycle = live
-    else:
-        lifecycle = select_legacy_child_lifecycle(durable, live)
     if type(lifecycle) is not dict:
         raise ValueError("lifecycle data is not an object")
     if lifecycle.get("handle") != handle:
@@ -497,16 +526,23 @@ def _project_agent_status(
         if finished_at is not None
         else ""
     )
+    if state == "failed" and final_result.startswith(("lost:", "unreadable:")):
+        item["reason"] = final_result
     if finished_at is not None and requested_handle is not None:
         item["final_result"] = final_result
     return item
 
 
 def _is_finished_agent_status(child: dict[str, StructuredContentValue]) -> bool:
+    reason = child.get("reason")
     return (
         type(child.get("state")) is str
         and child.get("state") in _TERMINAL_AGENT_STATES
         and child.get("finished_at") is not None
+        and not (
+            isinstance(reason, str)
+            and reason.startswith(("lost:", "unreadable:"))
+        )
     )
 
 
@@ -545,7 +581,7 @@ def _status_response(
             "child {handle}: state: {state}; started_at: {started_at}; "
             "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
             "turns_used: {turns_used}; step: {current_step}; "
-            "{cwd_field}result: {final_result}{report_status_field}{unknown_reason}"
+            "{cwd_field}result: {final_result}{report_status_field}{reason_field}"
         ).format(
             **{
                 **child,
@@ -558,10 +594,8 @@ def _status_response(
                     if child.get("report_status")
                     else ""
                 ),
-                "unknown_reason": (
-                    f"; reason: {child['reason']}"
-                    if child.get("state") == "unknown"
-                    else ""
+                "reason_field": (
+                    f"; reason: {child['reason']}" if child.get("reason") else ""
                 ),
             }
         )
@@ -678,7 +712,7 @@ def _fit_status_row(
         if not changed:
             break
 
-    minimal = _unknown_agent_status(
+    minimal = _unreadable_agent_status(
         str(row.get("handle", "")),
         reason="row too large",
     )
@@ -725,6 +759,7 @@ def _read_agent_status(
     store: object,
     *,
     requested_handle: str | None = None,
+    running_handles: frozenset[str] | None = None,
 ) -> list[dict[str, StructuredContentValue]]:
     session_dir = getattr(store, "session_dir", None)
     if not isinstance(session_dir, Path):
@@ -741,16 +776,42 @@ def _read_agent_status(
         if requested_handle is not None and handle != requested_handle:
             continue
         try:
-            item = _project_agent_status(
-                store,
-                handle,
-                child_path,
-                notifications=notifications,
-                requested_handle=requested_handle,
-            )
+            lifecycle_read, owner_state = _read_child_lifecycle(store, child_path)
+            if isinstance(lifecycle_read, MissingAgentLifecycle):
+                item = _unreadable_agent_status(
+                    handle, reason="missing lifecycle record"
+                )
+            elif isinstance(lifecycle_read, BrokenAgentLifecycle):
+                item = _unreadable_agent_status(
+                    handle, reason=lifecycle_read.reason
+                )
+            elif isinstance(lifecycle_read, LoadedAgentLifecycle):
+                live = live_agent_lifecycle(
+                    child_path / "agent_lifecycle.json"
+                )
+                lifecycle = select_legacy_child_lifecycle(
+                    lifecycle_read.value, live
+                )
+                item = _project_agent_status(
+                    lifecycle,
+                    handle,
+                    notifications=notifications,
+                    requested_handle=requested_handle,
+                )
+                if (
+                    running_handles is not None
+                    and handle not in running_handles
+                    and owner_state in {None, "recovery"}
+                    and item["state"] in _NONTERMINAL_AGENT_STATES
+                ):
+                    item = _lost_agent_status(
+                        item, requested=requested_handle is not None
+                    )
+            else:
+                raise TypeError("unknown lifecycle read result")
         except Exception as exc:  # noqa: BLE001 - every child needs a safe row
             children.append(
-                _unknown_agent_status(
+                _unreadable_agent_status(
                     handle,
                     reason=_sanitize_status_reason(exc),
                 )
@@ -772,11 +833,14 @@ async def _agent_status(
     requested = arguments.get("handle")
     if requested is not None and (type(requested) is not str or not requested):
         return _agent_error("handle must be a nonempty string", max_bytes)
+    owner = registry._agent_owner
+    running_handles = owner.active_instance_ids if owner is not None else None
     try:
         children = await asyncio.to_thread(
             _read_agent_status,
             registry.session_store,
             requested_handle=requested,
+            running_handles=running_handles,
         )
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)
@@ -998,78 +1062,87 @@ async def _agent(
     )
 
 
+def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
+    """Build the catalog-dependent agent tool schema without registry state."""
+
+    agent_names = catalog.names()
+    agent_description = catalog.description()
+    description = (
+        "Delegate multi-step exploration or research that would pollute the "
+        "main context. The child has its own bounded context and may spawn "
+        "one level of grandchildren, but grandchildren cannot spawn agents. "
+        "Pass model to run the child on another provider's model and "
+        "orchestrate it from here. Pass cwd to start the child in another "
+        "directory or git worktree so its bash session and relative file "
+        "paths resolve there instead of your own working directory. The "
+        "returned child_instance_id is the "
+        "stable handle for agent_status. Background completion is announced "
+        "automatically: while you run, after your current tool call and "
+        "before your next model call; while you are idle, at your next "
+        "turn. Do not poll. "
+        "Built-in types: "
+        f"{agent_description}"
+    )
+    parameters: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string"},
+            "description": {"type": "string"},
+            "agent_type": {
+                "type": "string",
+                "enum": agent_names,
+                "description": agent_description,
+            },
+            "preset": {
+                "type": "string",
+                "enum": agent_names,
+                "description": (
+                    "Alias for agent_type. Select a preset from the session catalog."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "enum": known_model_names(),
+                "description": (
+                    "Run the child on this model instead of inheriting the "
+                    "parent's. The provider follows from the model, so this "
+                    "is how one provider delegates to another. Implies "
+                    "background unless background is passed explicitly; "
+                    "--print runs children synchronously."
+                ),
+            },
+            "cwd": {
+                "type": "string",
+                "description": (
+                    "Directory the child works in: its bash session cwd and "
+                    "relative read/edit/write paths resolve here. Absolute, "
+                    "or relative to your own working directory; must be an "
+                    "existing directory (a symlinked directory is rejected). "
+                    "Pass this when delegating work in another directory or "
+                    "git worktree so the child does not run in your checkout. "
+                    "Omit to inherit your working directory. Grandchildren "
+                    "default to their parent's cwd."
+                ),
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Keep the child running across parent turns and return a handle.",
+            },
+        },
+        "required": ["prompt", "description"],
+        "additionalProperties": False,
+    }
+    return description, parameters
+
+
 def register(registry: ToolRegistry) -> None:
-    agent_names = registry.agent_catalog.names()
-    agent_description = registry.agent_catalog.description()
+    description, parameters = agent_tool_schema(registry.agent_catalog)
     registry.register_session_tool(
         "agent",
         _agent,
         binding="shared",
-        description=(
-            "Delegate multi-step exploration or research that would pollute the "
-            "main context. The child has its own bounded context and may spawn "
-            "one level of grandchildren, but grandchildren cannot spawn agents. "
-            "Pass model to run the child on another provider's model and "
-            "orchestrate it from here. Pass cwd to start the child in another "
-            "directory or git worktree so its bash session and relative file "
-            "paths resolve there instead of your own working directory. The "
-            "returned child_instance_id is the "
-            "stable handle for agent_status. Background completion is announced "
-            "automatically: while you run, after your current tool call and "
-            "before your next model call; while you are idle, at your next "
-            "turn. Do not poll. "
-            "Built-in types: "
-            f"{agent_description}"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string"},
-                "description": {"type": "string"},
-                "agent_type": {
-                    "type": "string",
-                    "enum": agent_names,
-                    "description": agent_description,
-                },
-                "preset": {
-                    "type": "string",
-                    "enum": agent_names,
-                    "description": (
-                        "Alias for agent_type. Select a preset from the session catalog."
-                    ),
-                },
-                "model": {
-                    "type": "string",
-                    "enum": known_model_names(),
-                    "description": (
-                        "Run the child on this model instead of inheriting the "
-                        "parent's. The provider follows from the model, so this "
-                        "is how one provider delegates to another. Implies "
-                        "background unless background is passed explicitly; "
-                        "--print runs children synchronously."
-                    ),
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": (
-                        "Directory the child works in: its bash session cwd and "
-                        "relative read/edit/write paths resolve here. Absolute, "
-                        "or relative to your own working directory; must be an "
-                        "existing directory (a symlinked directory is rejected). "
-                        "Pass this when delegating work in another directory or "
-                        "git worktree so the child does not run in your checkout. "
-                        "Omit to inherit your working directory. Grandchildren "
-                        "default to their parent's cwd."
-                    ),
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "Keep the child running across parent turns and return a handle.",
-                },
-            },
-            "required": ["prompt", "description"],
-            "additionalProperties": False,
-        },
+        description=description,
+        parameters=parameters,
         requires_approval=False,
         parallel_safe=True,
     )
@@ -1079,8 +1152,9 @@ def register(registry: ToolRegistry) -> None:
         binding="shared",
         description=(
             "Inspect child agents from this session. Pass a child handle for "
-            "one child, or omit it to list unfinished children. Finished children "
-            "are omitted from list responses; query by handle for their results. "
+            "one child, or omit it to list unfinished children plus terminal "
+            "lost or unreadable records. Other finished children are omitted from "
+            "list responses; query by handle for their results. "
             "Completion is announced automatically. Use this for on-demand "
             "inspection, not polling."
         ),

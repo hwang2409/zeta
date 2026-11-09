@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import time
 import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
@@ -23,10 +25,92 @@ from .agent_progress import (
     publish_live_agent_lifecycle,
     remove_live_agent_lifecycle,
 )
-from .checkpoints import ConversationIntegrityError, _now
-from .session_files import child_directory, write_session_file
+from .checkpoints import ConversationIntegrityError, _now, load_session_json
+from .session_files import child_directory, read_session_file, write_session_file
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
+_TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
+
+
+@dataclass(frozen=True, slots=True)
+class MissingAgentLifecycle:
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedAgentLifecycle:
+    value: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class BrokenAgentLifecycle:
+    path: Path
+    reason: str
+    recoverability: Literal["preserve"] = "preserve"
+    preserved: bool = True
+
+
+AgentLifecycleRead = MissingAgentLifecycle | LoadedAgentLifecycle | BrokenAgentLifecycle
+
+
+def _validate_status_lifecycle(value: object) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ValueError("lifecycle data is not an object")
+    lifecycle = value
+    state = lifecycle.get("state")
+    finished_at = lifecycle.get("finished_at")
+    if state not in _AGENT_STATES:
+        raise ValueError("invalid child metadata state")
+    for field in ("started_at", "finished_at"):
+        timestamp = lifecycle.get(field)
+        if timestamp is None and field == "finished_at":
+            continue
+        if type(timestamp) is not str:
+            raise ValueError("invalid child timestamps")
+        try:
+            datetime.fromisoformat(timestamp)
+        except ValueError as exc:
+            raise ValueError("invalid child timestamps") from exc
+    if state in _TERMINAL_AGENT_STATES and finished_at is None:
+        raise ValueError("terminal state has no finished_at")
+    if state not in _TERMINAL_AGENT_STATES and finished_at is not None:
+        raise ValueError("non-terminal state has finished_at")
+    for field, minimum in (("turns_used", 0), ("tool_calls", 0), ("depth", 1)):
+        field_value = lifecycle.get(field, 0 if field != "depth" else None)
+        if type(field_value) is not int or field_value < minimum:
+            raise ValueError(f"invalid child metadata {field}")
+    for field in ("current_step", "agent_type"):
+        if type(lifecycle.get(field)) is not str:
+            raise ValueError(f"invalid child metadata {field}")
+    for field in ("handle", "description"):
+        if field in lifecycle and type(lifecycle[field]) is not str:
+            raise ValueError(f"invalid child metadata {field}")
+    elapsed = lifecycle.get("elapsed", 0.0)
+    if type(elapsed) not in {int, float} or not math.isfinite(elapsed) or elapsed < 0:
+        raise ValueError("invalid child metadata elapsed")
+    if "final_result" in lifecycle and type(lifecycle["final_result"]) is not str:
+        raise ValueError("invalid child final_result")
+    return lifecycle
+
+
+def read_agent_lifecycle_state(directory_fd: int, path: Path) -> AgentLifecycleRead:
+    """Read one lifecycle without collapsing missing or broken evidence."""
+
+    try:
+        raw = read_session_file(directory_fd, "agent_lifecycle.json")
+    except FileNotFoundError:
+        return MissingAgentLifecycle(path)
+    except OSError:
+        return BrokenAgentLifecycle(path, "could not read child state")
+    try:
+        value = load_session_json(raw)
+    except (ConversationIntegrityError, TypeError, ValueError):
+        return BrokenAgentLifecycle(path, "invalid lifecycle json")
+    try:
+        return LoadedAgentLifecycle(_validate_status_lifecycle(value))
+    except (TypeError, ValueError) as exc:
+        reason = str(exc).strip() or "invalid child lifecycle"
+        return BrokenAgentLifecycle(path, reason)
 
 
 def _session_state_mutations(
@@ -154,9 +238,10 @@ def drop_invalid_killed_task_metadata(
             "killed_task_ids_truncated",
         ):
             lifecycle.pop(field, None)
-    if "final_result_is_receipt" in lifecycle and type(
-        lifecycle["final_result_is_receipt"]
-    ) is not bool:
+    if (
+        "final_result_is_receipt" in lifecycle
+        and type(lifecycle["final_result_is_receipt"]) is not bool
+    ):
         warnings.warn(
             "agent lifecycle has invalid receipt marker; "
             f"dropping it: {lifecycle_path}",
@@ -530,7 +615,7 @@ class AgentStateMixin:
         state: str | None = None,
         idle_since: str | None = None,
     ) -> None:
-        """Update a live child's process-local progress."""
+        """Update a live child's progress; ``tool_calls`` adds to its total."""
 
         if current_step is not None and not current_step:
             raise ValueError("agent lifecycle step must be nonempty")
@@ -549,7 +634,7 @@ class AgentStateMixin:
         if turns_used is not None:
             self._agent_lifecycle["turns_used"] = turns_used
         if tool_calls is not None:
-            self._agent_lifecycle["tool_calls"] = tool_calls
+            self._agent_lifecycle["tool_calls"] += tool_calls
         if state is not None:
             self._agent_lifecycle["state"] = state
         if idle_since is not None:
@@ -619,7 +704,9 @@ class AgentStateMixin:
             if killed_task_count is not None:
                 self._agent_lifecycle["killed_task_count"] = killed_task_count
             if killed_task_ids_truncated is not None:
-                self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
+                self._agent_lifecycle["killed_task_ids_truncated"] = (
+                    killed_task_ids_truncated
+                )
             self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
                 self._agent_lifecycle,
                 finished_at=resolved_finished_at,
@@ -681,7 +768,9 @@ class AgentStateMixin:
             if killed_task_count is not None:
                 self._agent_lifecycle["killed_task_count"] = killed_task_count
             if killed_task_ids_truncated is not None:
-                self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
+                self._agent_lifecycle["killed_task_ids_truncated"] = (
+                    killed_task_ids_truncated
+                )
             self._write_agent_lifecycle()
 
     async def finalize_background_agent(
@@ -698,41 +787,59 @@ class AgentStateMixin:
     ) -> tuple[str, ...]:
         """Transfer direct markers and durably publish one terminal lifecycle."""
 
+        from .store._async_writes import (
+            _FinishAgentChildCommand,
+            _FinishAgentLifecycleCommand,
+            _FinishAgentParentCommand,
+            _MarkAgentCanceledCommand,
+            _RegisterAgentChildCommand,
+        )
+
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
-            await self._to_thread_agent_state(
-                self.mark_agent_canceled, canceled_tool_call_id
+            await self._commit_storage_command(
+                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id)
             )
         else:
             for marker_key, marker in self.agent_children().items():
-                tool_call, registration_values = _agent_child_registration_values(marker)
-                await parent_store._to_thread_agent_state(
-                    parent_store.register_agent_child,
-                    tool_call,
-                    **registration_values,
+                tool_call, registration_values = _agent_child_registration_values(
+                    marker
                 )
-                await self._to_thread_agent_state(
-                    self.finish_agent_child, marker_key
+                await parent_store._commit_storage_command(
+                    _RegisterAgentChildCommand(
+                        tool_call=tool_call, **registration_values
+                    )
+                )
+                await self._commit_storage_command(
+                    _FinishAgentChildCommand(marker_key=marker_key)
                 )
                 child_instance_id = marker.get("child_instance_id")
                 if type(child_instance_id) is str:
                     transferred.append(child_instance_id)
-            await self._to_thread_agent_state(self.finish_agent_parent)
-        await self._to_thread_agent_state(
-            self.finish_agent_lifecycle,
-            terminal_state,
-            final_result=final_result,
-            turns_used=turns_used,
-            killed_task_ids=killed_task_ids,
-            killed_task_count=killed_task_count,
-            killed_task_ids_truncated=killed_task_ids_truncated,
-            canonical_receipt=True,
+            await self._commit_storage_command(_FinishAgentParentCommand())
+        await self._commit_storage_command(
+            _FinishAgentLifecycleCommand(
+                state=terminal_state,
+                final_result=final_result,
+                turns_used=turns_used,
+                killed_task_ids=killed_task_ids,
+                killed_task_count=killed_task_count,
+                killed_task_ids_truncated=killed_task_ids_truncated,
+                canonical_receipt=True,
+            )
         )
         return tuple(transferred)
 
     def _write_agent_lifecycle(self) -> None:
         """Atomically write lifecycle data without changing session state bytes."""
 
+        existing = read_agent_lifecycle_state(
+            self.directory_fd, self.agent_lifecycle_path
+        )
+        if isinstance(existing, BrokenAgentLifecycle):
+            raise ConversationIntegrityError(
+                "agent lifecycle is broken; refusing to overwrite preserved bytes"
+            )
         if (
             self._agent_lifecycle is not None
             and "final_result_is_receipt" in self._agent_lifecycle

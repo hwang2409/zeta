@@ -7,6 +7,7 @@ import os
 import shutil
 import threading
 from io import StringIO
+from multiprocessing.connection import Connection, wait
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,9 +61,10 @@ def test_malformed_run_ids_are_rejected(run_id: str) -> None:
         parse_child_run_id("session", "session:" + "1" * 250)
 
 
-def _append_in_spawn(path: str) -> None:
+def _append_in_spawn(path: str, ready: Connection) -> None:
     store = ConversationStore(Path(path), session_id="session")
     store.append_child_run_started("session:1", None, "worker", "task", "now")
+    ready.send("appended")
     os.kill(os.getpid(), 9)
 
 
@@ -157,10 +159,31 @@ def test_start_row_is_durable_before_child_execution_and_published(tmp_path: Pat
 
 def test_crash_after_start_row_recovers(tmp_path: Path) -> None:
     ctx = multiprocessing.get_context("spawn")
-    child = ctx.Process(target=_append_in_spawn, args=(str(tmp_path),))
-    child.start()
-    child.join(5)
-    assert child.exitcode == -9
+    ready_reader, ready_writer = ctx.Pipe(duplex=False)
+    child = ctx.Process(target=_append_in_spawn, args=(str(tmp_path), ready_writer))
+    try:
+        child.start()
+        ready_writer.close()
+        # Spawn start-up imports zeta in a new interpreter; on a loaded runner
+        # that can take far longer than the append itself, so wait for the
+        # child's signal, and stop early if the child dies before sending it.
+        wait([ready_reader, child.sentinel], timeout=120)
+        try:
+            signal = ready_reader.recv() if ready_reader.poll() else None
+        except EOFError:
+            signal = None
+        assert signal == "appended", (
+            f"child did not finish the append (exitcode={child.exitcode})"
+        )
+        child.join(120)
+        assert child.exitcode is not None, "child did not exit after the append"
+        assert child.exitcode == -9
+    finally:
+        ready_reader.close()
+        if child.is_alive():
+            child.kill()
+            child.join(10)
+        child.close()
     store = ConversationStore(tmp_path, session_id="session", _read_only=True)
     try:
         assert len(store.entries) == 1

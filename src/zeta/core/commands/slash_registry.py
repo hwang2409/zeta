@@ -14,6 +14,7 @@ from ...mcp.prompt_commands import MCPPromptCommands, SlashPromptError, dispatch
 from ...model_input import ModelInputEnvelope, skill_model_input
 from ...protocol.types import MessageOrigin
 from ...skills import SkillCatalog, SkillMeta, is_slash_safe_name, load_skill_prompt
+from ...skills.catalog import LiveSkillProjection, prepare_slash_projection
 from ...skills.invocation import dollar_skill_mentions
 from .custom_commands import (
     CustomCommand,
@@ -22,6 +23,7 @@ from .custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
+from .slash_errors import unknown_slash_command
 
 if TYPE_CHECKING:
     from ..slash import SlashSession
@@ -80,6 +82,8 @@ class SlashCommandRegistry:
         self._commands: dict[str, SlashCommand] = {}
         self._custom_commands: dict[str, CustomCommand] = {}
         self._skills: dict[str, SkillMeta] = {}
+        self._skill_notices: tuple[str, ...] = ()
+        self._skill_warning_notices: frozenset[str] = frozenset()
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
         self._mcp_prompts = MCPPromptCommands(self._notices, self._warning_notices)
@@ -121,13 +125,13 @@ class SlashCommandRegistry:
     def notices(self) -> tuple[str, ...]:
         """Return non-fatal load notices for the session-start display."""
 
-        return tuple(self._notices)
+        return (*self._notices, *self._skill_notices)
 
     @property
     def warning_notices(self) -> frozenset[str]:
         """Return notices that need prominent display."""
 
-        return frozenset(self._warning_notices)
+        return self._skill_warning_notices.union(self._warning_notices)
 
     def command_for(self, name: str) -> SlashCommand | None:
         """Return the shared builtin named ``name``, if it exists."""
@@ -186,26 +190,26 @@ class SlashCommandRegistry:
             return
         self._custom_commands[command.name] = command
 
+    def prepare_live_config(
+        self, catalog: SkillCatalog, _agents: object
+    ) -> LiveSkillProjection:
+        return prepare_slash_projection(
+            catalog, self._commands, self._custom_commands
+        )
+
+    def commit_live_config(self, prepared: object) -> None:
+        """Commit one worker-prepared slash projection by reference."""
+
+        if not isinstance(prepared, LiveSkillProjection):
+            raise TypeError("expected a live skill projection")
+        self._skills = prepared.skills
+        self._skill_notices = prepared.notices
+        self._skill_warning_notices = prepared.warning_notices
+
     def register_skills(self, catalog: SkillCatalog) -> None:
         """Replace skills after built-ins and custom commands."""
 
-        self._skills.clear()
-        self._notices.extend(
-            notice for notice in catalog.notices if notice not in self._notices
-        )
-        self._warning_notices.update(catalog.notices)
-        for skill in catalog.skills:
-            if skill.name in self._commands:
-                notice = f"ignored skill {skill.path}: shadows built-in /{skill.name}"
-            elif skill.name in self._custom_commands:
-                notice = (
-                    f"ignored skill {skill.path}: shadows custom command /{skill.name}"
-                )
-            else:
-                self._skills[skill.name] = skill
-                continue
-            self._notices.append(notice)
-            self._warning_notices.add(notice)
+        self.commit_live_config(self.prepare_live_config(catalog, None))
 
     def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command or expand registered dollar-skill mentions."""
@@ -251,9 +255,14 @@ class SlashCommandRegistry:
                 parts[1] if len(parts) == 2 else "",
                 display_text=value,
             )
-        if custom is None or custom.kind != "exec":
-            return None
-        return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
+        if custom is not None:
+            if custom.kind != "exec":
+                return None
+            return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
+        return unknown_slash_command(
+            value, name, parts[1] if len(parts) == 2 else "",
+            (entry[0] for entry in self.completion_entries),
+        )
 
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""

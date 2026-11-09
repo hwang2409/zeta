@@ -137,12 +137,22 @@ async def test_new_session_promotes_healthy_cwd_project_after_malformed_finding(
 
         assert metadata.project_id == healthy.project_id
         assert server.runtime.loop.root_project_id == healthy.project_id
-        assert server.runtime.loop.project_context_health is not None
-        assert server.runtime.loop.project_context_health.code == "malformed_project"
-        assert (
-            server.runtime.loop.project_context_health.project_id
-            == malformed.project_id
-        )
+        assert server.port is not None
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        try:
+            await _hello(reader, writer)
+            status_response = await _request(
+                reader,
+                writer,
+                2,
+                "slash_run",
+                {"session_id": metadata.session_id, "text": "/status"},
+            )
+            status = status_response[-1]["result"]
+            assert "project_context_health: healthy" in status["text"]
+        finally:
+            writer.close()
+            await writer.wait_closed()
     finally:
         await server.close()
 

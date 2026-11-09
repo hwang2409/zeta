@@ -28,7 +28,9 @@ _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
 pytest_plugins = (
-    ("pytester", "tests.support.fake_backend") if _IS_REPOSITORY_TESTS else ()
+    ("pytester", "tests.support.fake_backend", "tests.support.exit_watchdog")
+    if _IS_REPOSITORY_TESTS
+    else ()
 )
 os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
 
@@ -43,22 +45,34 @@ def _is_repository_test_path(path: Path) -> bool:
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 
+_OWNER_COUNTS = None
+_OWNER_COUNT_GROUPS = []
+_OWNER_LEAK_BASELINE = _TEST_SITE_PACKAGES / "owner_leak_ratchet.txt"
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
+    global _OWNER_COUNTS
     if not _IS_REPOSITORY_TESTS:
-        return
-    root = Path(str(session.config.rootpath)).resolve()
-    if root != _REPOSITORY_ROOT:
         return
     import zeta
 
     imported = Path(zeta.__file__).resolve()
-    source = (root / "src").resolve()
+    source = (_REPOSITORY_ROOT / "src").resolve()
     if not imported.is_relative_to(source):
         pytest.exit(
             f"wrong zeta import: {imported}; expected source under {source}. "
             f"run uv run pytest from the worktree root or set PYTHONPATH={source}",
             returncode=2,
         )
+    is_xdist_controller = (
+        bool(getattr(session.config.option, "numprocesses", None))
+        and not hasattr(session.config, "workerinput")
+    )
+    if not is_xdist_controller:
+        from tests.support.owner_counts import OwnerCounts
+
+        _OWNER_COUNTS = OwnerCounts()
+        _OWNER_COUNTS.install()
 
 
 def pytest_collection_modifyitems(
@@ -528,6 +542,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     """Report retained fds and stop workers before they approach FD_SETSIZE."""
     del nextitem
     global _FD_RETAINED_MAX, _FD_START_COUNT
+    if _OWNER_COUNTS is not None:
+        _OWNER_COUNTS.node_start(item.nodeid)
     before = _open_file_descriptors()
     if _FD_START_COUNT is None:
         _FD_START_COUNT = len(before)
@@ -536,6 +552,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
             for descriptor, description in before.items()
         )
     yield
+    if _OWNER_COUNTS is not None:
+        _OWNER_COUNTS.node_finish(item.nodeid)
     after = _open_file_descriptors()
     previous_count = _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
     if previous_count is not None and len(after) > previous_count:
@@ -602,8 +620,36 @@ def _fd_summary() -> str:
     )
 
 
+def _finish_owner_counts(session: pytest.Session) -> None:
+    from tests.support.owner_counts import gate_failures, merge_rows, write_rows
+
+    errors = []
+    if _OWNER_COUNTS is not None:
+        owner_rows = _OWNER_COUNTS.rows()
+        _OWNER_COUNTS.uninstall()
+    else:
+        try:
+            owner_rows = merge_rows(_OWNER_COUNT_GROUPS)
+        except ValueError as exc:
+            errors.append(str(exc))
+            owner_rows = []
+    worker_output = getattr(session.config, "workeroutput", None)
+    if worker_output is not None:
+        worker_output["owner_count_rows"] = owner_rows
+    else:
+        if observed_path := os.environ.get("ZETA_OWNER_COUNTS"):
+            write_rows(Path(observed_path), owner_rows)
+        errors.extend(gate_failures(owner_rows, _OWNER_LEAK_BASELINE))
+        if errors:
+            print("\n" + "\n".join(errors), flush=True)
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    if _IS_REPOSITORY_TESTS:
+        _finish_owner_counts(session)
+
     gc.collect()
     end = _open_file_descriptors()
     _update_fd_owners(end, "session-finish")
@@ -634,6 +680,9 @@ def pytest_testnodedown(node, error) -> None:
     del error
     # A crashed worker goes down without workeroutput; xdist reports the crash.
     worker_output = getattr(node, "workeroutput", None) or {}
+    owner_rows = worker_output.get("owner_count_rows")
+    if owner_rows is not None:
+        _OWNER_COUNT_GROUPS.append(owner_rows)
     summary = worker_output.get("fd_summary")
     if summary is not None:
         print(summary, flush=True)
@@ -645,7 +694,7 @@ def pytest_testnodedown(node, error) -> None:
 def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
-    from zeta.storage_format import advance, open_writer
+    from zeta.storage_format import advance, drain_releases, open_writer
     from zeta.tools import ToolRegistry
 
     stores = []
@@ -724,12 +773,14 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
             store.close()
     for manager in reversed(managers):
         manager._release_storage_lease()
+    drain_releases()  # the manager finalizer only queues its release
 
 
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
-    from tests.support.owned import await_or_fail
+    from tests.support.owned import await_or_fail, close_owned_app
+    from tests.support.owner_counts import SAFETY_NET_CLOSING
     from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
@@ -741,6 +792,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     from zeta.storage_format import open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
+    from zeta.tui.app import TUIApp
 
     loops: list[AgentLoop] = []
     stores: list[ConversationStore] = []
@@ -751,6 +803,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     registries: list[ToolRegistry] = []
     servers: list[ZetaServer] = []
     closed_servers: set[ZetaServer] = set()
+    apps: list[TUIApp] = []
+    closed_apps: weakref.WeakSet[TUIApp] = weakref.WeakSet()
     test_home_leases = {}
     loop_init = AgentLoop.__init__
     loop_close = AgentLoop.close
@@ -770,6 +824,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     background_init = BackgroundTaskRegistry.__init__
     server_init = ZetaServer.__init__
     server_close = ZetaServer.close
+    app_init = TUIApp.__init__
+    app_close = TUIApp.close
     store_close = ConversationStore.close
     registry_close = ToolRegistry.close
 
@@ -882,6 +938,18 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         server_init(server, *args, **kwargs)
         servers.append(server)
 
+    @wraps(app_init)
+    def tracked_app_init(app, *args, **kwargs):
+        app_init(app, *args, **kwargs)
+        apps.append(app)
+
+    @wraps(app_close)
+    async def tracked_app_close(app, *args, **kwargs):
+        await app_close(app, *args, **kwargs)
+        closed_apps.add(app)
+        if app in apps:
+            apps.remove(app)
+
     @wraps(server_close)
     async def tracked_server_close(server, *args, **kwargs):
         await server_close(server, *args, **kwargs)
@@ -911,54 +979,71 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(ZetaServer, "__init__", tracked_server_init)
     # test-contract: seam records successful server closes for idempotent teardown
     monkeypatch.setattr(ZetaServer, "close", tracked_server_close)
+    # test-contract: seam tracks and closes apps created by tests
+    monkeypatch.setattr(TUIApp, "__init__", tracked_app_init)
+    # test-contract: seam records successful app closes for idempotent teardown
+    monkeypatch.setattr(TUIApp, "close", tracked_app_close)
     yield
-    first_error: BaseException | None = None
+    closing = SAFETY_NET_CLOSING.set(True)
+    try:
+        first_error: BaseException | None = None
 
-    async def close_server(server: ZetaServer) -> None:
-        nonlocal first_error
-        try:
-            await await_or_fail(server.close(), what="ZetaServer.close")
-        except BaseException as exc:  # noqa: BLE001 - close every owner
-            if first_error is None:
-                first_error = exc
+        # Apps own loops and stores, so close them before those lower-level owners.
+        for app in reversed(apps.copy()):
+            if app not in closed_apps:
+                try:
+                    await await_or_fail(close_owned_app(app), what="TUIApp.close")
+                except BaseException as exc:  # noqa: BLE001 - close every owner
+                    if first_error is None:
+                        first_error = exc
 
-    for server in reversed(servers):
-        if server not in closed_servers:
-            await close_server(server)
-    for reconciler in reversed(memory_reconcilers):
-        try:
-            await reconciler.close()
-        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-            pass
-    for loop in reversed(loops):
-        if not loop._closed:
+        async def close_server(server: ZetaServer) -> None:
+            nonlocal first_error
             try:
-                await loop_close(loop)
+                await await_or_fail(server.close(), what="ZetaServer.close")
+            except BaseException as exc:  # noqa: BLE001 - close every owner
+                if first_error is None:
+                    first_error = exc
+
+        for server in reversed(servers):
+            if server not in closed_servers:
+                await close_server(server)
+        for reconciler in reversed(memory_reconcilers):
+            try:
+                await reconciler.close()
             except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
                 pass
-    for registry in reversed(registries):
-        if not registry._closed:
+        for loop in reversed(loops):
+            if not loop._closed:
+                try:
+                    await loop_close(loop)
+                except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                    pass
+        for registry in reversed(registries):
+            if not registry._closed:
+                try:
+                    await registry_close(registry)
+                except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                    pass
+        for store in reversed((*stores, *composed_stores)):
+            if not store._closed:
+                try:
+                    store_close(store)
+                except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                    pass
+        for workspace in reversed(workspaces):
             try:
-                await registry_close(registry)
+                workspace.close()
             except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
                 pass
-    for store in reversed((*stores, *composed_stores)):
-        if not store._closed:
-            try:
-                store_close(store)
-            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-                pass
-    for workspace in reversed(workspaces):
-        try:
-            workspace.close()
-        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-            pass
-    for manager in reversed(managers):
-        manager._release_storage_lease()
-    for lease in test_home_leases.values():
-        lease.close()
-    if first_error is not None:
-        raise first_error
+        for manager in reversed(managers):
+            manager._release_storage_lease()
+        for lease in test_home_leases.values():
+            lease.close()
+        if first_error is not None:
+            raise first_error
+    finally:
+        SAFETY_NET_CLOSING.reset(closing)
 
 
 @pytest.fixture

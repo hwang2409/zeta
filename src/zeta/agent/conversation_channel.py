@@ -11,8 +11,84 @@ from ..core.checkpoints import ConversationEntry
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 
 if TYPE_CHECKING:
+    from ..runtime.loop import AgentLoop
     from .background import BackgroundAgentOwner
     from .pending_delivery import DeliveryInput, ProducerResult, StepDeliveryFlow
+
+
+def _append_recovery_notification(
+    store: ConversationStore,
+    data: dict[str, object],
+    *,
+    display_only: bool,
+) -> ConversationEntry:
+    report = (
+        {"status": data["report_status"]}
+        | {
+            key: data[key]
+            for key in ("summary", "head_sha", "verdict")
+            if key in data
+        }
+        if "report_status" in data
+        else None
+    )
+    return store.append_agent_notification_if_absent(
+        str(data["child_instance_id"]),
+        child_session_path=str(data["child_session_path"]),
+        description=str(data["description"]),
+        status=str(data["status"]),
+        text=str(data["text"]),
+        stats=data.get("stats") if isinstance(data.get("stats"), dict) else None,
+        killed_task_ids=(
+            data.get("killed_task_ids")
+            if isinstance(data.get("killed_task_ids"), list)
+            else None
+        ),
+        killed_task_count=(
+            data.get("killed_task_count")
+            if isinstance(data.get("killed_task_count"), int)
+            else None
+        ),
+        killed_task_ids_truncated=data.get("killed_task_ids_truncated") is True,
+        display_only=display_only,
+        report=report,
+    )[0]
+
+
+def recover_completion_mirrors(
+    root_store: ConversationStore,
+    parent_store: ConversationStore,
+    child_instance_id: str,
+    fallback_data: dict[str, object] | None = None,
+) -> ConversationEntry | None:
+    """Durably restore each intended completion recipient before cleanup."""
+
+    root_notification = root_store.sync_agent_completion_notification(
+        child_instance_id
+    )
+    parent_notification = (
+        root_notification
+        if parent_store is root_store
+        else parent_store.sync_agent_completion_notification(child_instance_id)
+    )
+    source = parent_notification or root_notification
+    if source is None and fallback_data is None:
+        return None
+    data = dict(source.data) if source is not None else fallback_data
+    assert data is not None
+    if root_notification is None:
+        root_notification = _append_recovery_notification(
+            root_store,
+            data,
+            display_only=parent_store is not root_store,
+        )
+    if parent_notification is None:
+        parent_notification = _append_recovery_notification(
+            parent_store,
+            data,
+            display_only=False,
+        )
+    return root_notification
 
 
 @dataclass(slots=True)
@@ -174,6 +250,35 @@ class ConversationChannel:
             NotificationInput("child_idle", data),
         )
         return result.entries[0] if result.entries else None
+
+    async def publish_not_delivered(self, child_loop: AgentLoop, text: str) -> None:
+        """Show input a stop held back on the root transcript; it wakes no agent."""
+
+        from ..protocol.types import StreamEvent, StreamEventType
+        from .pending_delivery import NotificationInput
+
+        store = child_loop.store
+        child_instance_id = child_loop.agent_instance_id or ""
+        lifecycle = store.agent_lifecycle() or {}
+        data: dict[str, Any] = {
+            "origin": "notification",
+            "kind": "child_idle",
+            "child_instance_id": child_instance_id,
+            "child_session_path": str(store.session_dir),
+            "description": str(lifecycle.get("description") or child_instance_id),
+            "status": "child_idle",
+            "text": text[-MAX_AGENT_NOTIFICATION_TEXT:],
+            # display-only: a waking notice would re-trigger the stop it reports.
+            "display_only": True,
+        }
+        result = await self.produce_to(None, NotificationInput("child_idle", data))
+        for entry in result.entries:
+            child_loop._publish_background_event(
+                StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={"notification_id": entry.id, **entry.data},
+                )
+            )
 
     async def publish_completion(
         self,

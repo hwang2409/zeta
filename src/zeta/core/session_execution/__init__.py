@@ -12,7 +12,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ...storage_format import WriterLease
+from ...storage_format import RegistryLock, WriterLease, drain_releases
 from ..checkpoints import ConversationIntegrityError
 from ..fsio import write_all
 from ..session_files import SessionInUseError, open_session_file
@@ -71,7 +71,7 @@ class _OwnedLease:
 
 
 _REGISTRY: dict[tuple[int, int], _OwnedLease] = {}
-_REGISTRY_LOCK = threading.Lock()
+_REGISTRY_LOCK = RegistryLock()
 
 
 def _read_owner_hint(fd: int) -> tuple[str | None, int | None, str | None]:
@@ -117,6 +117,36 @@ def session_owner_status(directory_fd: int) -> tuple[bool, int | None]:
     return True, pid
 
 
+def execution_owner_state(
+    directory_fd: int,
+) -> Literal["owned", "recovery", "external"] | None:
+    """Inspect kernel-backed ownership without trusting a reusable pid."""
+
+    stat = os.fstat(directory_fd)
+    identity = (stat.st_dev, stat.st_ino)
+    with _REGISTRY_LOCK:
+        local = _REGISTRY.get(identity)
+        if (
+            local is not None
+            and local.pid == os.getpid()
+            and local.state in {"owned", "recovery"}
+        ):
+            return local.state
+    try:
+        fd = open_session_file(directory_fd, RUNTIME_LEASE_NAME, os.O_RDWR)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "external"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
+
+
 def _publish_owner(fd: int, owner: OwnerHint, epoch: str) -> None:
     record = json.dumps(
         {
@@ -154,6 +184,7 @@ class SessionExecutionLease:
         """Acquire immediately or raise a typed refusal without mutating the session."""
 
         # the loop may do non-waiting local file ops; anything that can wait or fsyncs goes off-loop
+        drain_releases()  # a lease this process dropped must not refuse its next owner
         stat = os.fstat(directory_fd)
         identity = (stat.st_dev, stat.st_ino)
         with _REGISTRY_LOCK:

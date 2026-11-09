@@ -207,11 +207,6 @@ class MessageFinder:
             self._clamp_selection()
             return True
 
-    def rank_all(self) -> None:
-        """Rank the current query synchronously (only for tests/non-UI callers)."""
-
-        self.publish(self.rank())
-
     @property
     def rows(self) -> tuple[FinderRow, ...]:
         return self._rows

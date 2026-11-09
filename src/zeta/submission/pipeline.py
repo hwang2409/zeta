@@ -290,12 +290,6 @@ class SubmissionPipeline:
         self._ensure_open()
         self._send(_UndoAction())
 
-    def approval_action(
-        self, decision: ApprovalDecision, requested_key: str | None
-    ) -> None:
-        self._ensure_open()
-        self._send(_ApprovalAction(decision, requested_key))
-
     async def approval_command(
         self,
         decision: ApprovalDecision,
@@ -454,7 +448,7 @@ class SubmissionPipeline:
                     self._retry_oldest_ready()
 
     async def _on_submit(self, message: _Submit) -> None:
-        await self._host.loop.refresh_skills()
+        await self._host.loop.refresh_live_config()
         entry = _Entry(message.submission)
         entry.acknowledged = message.acknowledged
         self._entries[entry.submission.id] = entry
@@ -1116,6 +1110,8 @@ class SubmissionPipeline:
     def _abort_entry(self, entry: _Entry) -> None:
         if entry.signal is not None:
             entry.signal.abort()
+        if entry is self._provider_entry:
+            self._host.loop.abort(foreground_only=True)
         self._abort_approvals(entry)
         if entry is self._provider_entry:
             if self._provider_task is not None and not self._provider_task.done():

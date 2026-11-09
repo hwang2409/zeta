@@ -14,6 +14,7 @@ from .protocol import (
     EventDescriptor,
     FrameCodec,
     FrameWriteCancelled,
+    MethodDescriptor,
     ProtocolError,
     _Frame,
 )
@@ -108,6 +109,7 @@ class ConnectionRegistry:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
         self._controller: _Connection | None = None
+        self._controller_output_paused = False
         self._observers: list[_Connection] = []
         self._closed = False
         self._read_condition = threading.Condition()
@@ -174,10 +176,6 @@ class ConnectionRegistry:
                 "another client is already connected",
             ) from exc
         connection.role = role
-        if role == "controller":
-            connection.server.runtime.set_post_stream_provider_retry(
-                "assistant_reset" in features
-            )
         return role
 
     def _claim(
@@ -208,6 +206,10 @@ class ConnectionRegistry:
         state = self._connections.get(connection)
         return state is not None and state is self._controller
 
+    def activate_controller(self, connection: Any) -> None:
+        if self.is_controller(connection):
+            self._controller_output_paused = False
+
     def controller_metadata(self) -> ControllerMetadata | None:
         state = self._controller
         if state is None:
@@ -227,6 +229,8 @@ class ConnectionRegistry:
     ) -> tuple[Admission, _Frame | None, _OutputState | None]:
         if state is None:
             return Admission("no_controller"), None, None
+        if state is self._controller and self._controller_output_paused:
+            return Admission("not_writable"), None, None
         if required_feature is not None and required_feature not in state.features:
             return Admission("feature_rejected"), None, None
         if (
@@ -271,7 +275,7 @@ class ConnectionRegistry:
         self._enqueue(
             output,
             _OutputFrame(frame),
-            wake=True,
+            wake=self._phase_allows_writes(output),
         )
         return outcome
 
@@ -300,7 +304,7 @@ class ConnectionRegistry:
             self._enqueue(
                 output,
                 _OutputFrame(frame),
-                wake=output.phase == "flushing",
+                wake=self._phase_allows_writes(output),
             )
             return True
         return await self._send_frame(output, frame)
@@ -317,7 +321,9 @@ class ConnectionRegistry:
         states = tuple(
             state
             for state in (self._controller, *self._observers)
-            if state is not None and feature in state.features
+            if state is not None
+            and feature in state.features
+            and (state is not self._controller or not self._controller_output_paused)
         )
         for state in states:
             frame = state.connection.codec.notification(event, session_id, data=data)
@@ -334,6 +340,7 @@ class ConnectionRegistry:
             return
         if state is self._controller:
             self._controller = None
+            self._controller_output_paused = True
         if state in self._observers:
             self._observers.remove(state)
         output = state.output
@@ -431,6 +438,10 @@ class ConnectionRegistry:
         output.pending_callers -= 1
         if output.pending_callers == 0:
             output.callers_settled.set()
+
+    @staticmethod
+    def _phase_allows_writes(output: _OutputState) -> bool:
+        return output.phase in {"flushing", "ready"}
 
     def _enqueue(
         self, output: _OutputState, frame: _OutputFrame, *, wake: bool = True
@@ -674,15 +685,24 @@ class ConnectionRegistry:
         self._cancel_overflow_deadline(output)
         if role == "observer":
             self._clear_output(output)
-            if output.writer_task is not None:
+            if (
+                output.writer_task is not None
+                and output.writer_task is not asyncio.current_task()
+            ):
                 output.writer_task.cancel()
             return
+        self._clear_output(output, result=False)
+        writer_task = output.writer_task
+        current_task = asyncio.current_task()
         if (
-            output.current_frame is None
-            and not output.queue
-            and output.writer_task is not None
+            writer_task is None
+            or writer_task is current_task
+            or output.current_write is current_task
         ):
-            output.writer_task.cancel()
+            return
+        if output.current_frame is not None:
+            self._finish_future(output.current_frame.future, False)
+        writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
         while output.queue:
@@ -779,14 +799,6 @@ class ConnectionRegistry:
             session_id=session_id,
         )
 
-    async def run_observer_read(
-        self, connection: Any, callable: Callable[[], Any]
-    ) -> Any:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            raise RuntimeError("observer is not connected")
-        return await self.run_blocking(callable)
-
     def _read_worker(self) -> None:
         while True:
             with self._read_condition:
@@ -820,12 +832,6 @@ class ConnectionRegistry:
         else:
             future.set_exception(error)
 
-    @staticmethod
-    def requests_for_role(role: str, requests: list[str]) -> list[str]:
-        if role == "observer":
-            return sorted(OBSERVER_REQUESTS.intersection(requests))
-        return requests
-
     async def route_request(
         self,
         connection: Any,
@@ -836,9 +842,10 @@ class ConnectionRegistry:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
             return False, None
-        if method not in OBSERVER_REQUESTS or (
-            method == "list_sessions" and "project_id" in params
-        ):
+        descriptor = MethodDescriptor.for_wire(method)
+        if descriptor is None or descriptor.access.value != "read":
+            return False, None
+        if method == "list_sessions" and "project_id" in params:
             raise ProtocolError(
                 ErrorDescriptor.OBSERVER_READ_ONLY,
                 "method is unavailable to read-only observers",

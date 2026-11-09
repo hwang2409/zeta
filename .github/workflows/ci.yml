@@ -37,6 +37,8 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: ./.github/workflows/pytest
         if: matrix.os == 'ubuntu-latest'
         with:
@@ -68,6 +70,14 @@ jobs:
       - name: Run ruff
         run: uv run --frozen ruff check --output-format github
 
+      - name: Reject owner leak baseline growth
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          base=$(python scripts/lint_test_quality.py --base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF")
+          python scripts/check_owner_leak_baseline.py "$base"
+
       - name: Reject new low-signal test patterns
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
@@ -75,6 +85,7 @@ jobs:
         run: |
           base=$(python scripts/lint_test_quality.py --base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF")
           git diff --unified=0 "$base" HEAD -- ':(glob)**/*.py' | python scripts/lint_test_quality.py -
+          python scripts/lint_test_quality.py --polling-spins
 
   browser:
     name: browser
@@ -82,6 +93,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
@@ -91,11 +104,17 @@ jobs:
         run: uv run --frozen pytest -q tests/test_server_gamma.py
 
   fresh-old-home:
-    name: fresh zeta on old home
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    name: fresh zeta on old home (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
@@ -103,3 +122,16 @@ jobs:
           enable-cache: false
       - name: Start installed zeta on old home
         run: python scripts/smoke_old_home.py
+      - name: Compare stored-format predecessor
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: uv run --frozen python scripts/storage_format_compatibility.py --output-dir storage-format-artifacts
+      - name: Archive stored-format selection and probes
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-format-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            storage-format-artifacts/storage-format-predecessor-sha
+            storage-format-artifacts/storage-format-predecessor.json
+            storage-format-artifacts/storage-format-candidate.json
+            storage-format-artifacts/uv.lock

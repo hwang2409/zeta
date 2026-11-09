@@ -148,6 +148,224 @@ def test_await_deadline_rule_rejects_unbounded_waits(
     )
 
 
+@pytest.mark.parametrize(
+    ("case", "source", "expected_lines"),
+    [
+        (
+            "direct asyncio",
+            "import asyncio\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [3],
+        ),
+        (
+            "direct anyio",
+            "import anyio\nasync def test_spin():\n    while not ready:\n        await anyio.sleep(0)\n",
+            [3],
+        ),
+        (
+            "unenforced clock assignment",
+            "import asyncio\nasync def test_spin():\n    deadline = clock() + 10\n    while not ready:\n        now = clock()\n        await asyncio.sleep(0)\n",
+            [4],
+        ),
+        (
+            "clock comparison does not exit",
+            "import asyncio\nasync def test_spin():\n    while not ready:\n        if clock() > deadline:\n            ignored = True\n        await asyncio.sleep(0)\n",
+            [3],
+        ),
+        (
+            "timeout none",
+            "import asyncio\nasync def test_spin():\n    async with asyncio.timeout(None):\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [4],
+        ),
+        (
+            "finite timeout",
+            "import asyncio\nasync def test_spin():\n    async with asyncio.timeout(10):\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "finite timeout at",
+            "import asyncio\nasync def test_spin():\n    async with asyncio.timeout_at(deadline):\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "finite wait for",
+            "import asyncio\nasync def test_spin():\n    await asyncio.wait_for(loop(), 10)\n",
+            [],
+        ),
+        (
+            "await or fail",
+            "import asyncio\nasync def test_spin():\n    await await_or_fail(loop())\n",
+            [],
+        ),
+        (
+            "from import sleep",
+            "from asyncio import sleep\nasync def test_spin():\n    while not ready:\n        await sleep(0)\n",
+            [],
+        ),
+        (
+            "module alias",
+            "import asyncio as aio\nasync def test_spin():\n    while not ready:\n        await aio.sleep(0)\n",
+            [],
+        ),
+        (
+            "from alias",
+            "from asyncio import sleep as tick\nasync def test_spin():\n    while not ready:\n        await tick(0)\n",
+            [],
+        ),
+        (
+            "itertools count",
+            "import asyncio, itertools\nasync def test_spin():\n    for _ in itertools.count():\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "itertools cycle",
+            "import asyncio, itertools\nasync def test_spin():\n    for _ in itertools.cycle(items):\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "two argument iter",
+            "import asyncio\nasync def test_spin():\n    for _ in iter(read, stop):\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "executor polling",
+            "import asyncio\nasync def test_spin():\n    for item in executor.map(work, items):\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "finite one argument iter",
+            "import asyncio\nasync def test_spin():\n    for _ in iter([1, 2]):\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "sleep only in nested definition",
+            "import asyncio\nasync def test_outer():\n    while ready:\n        async def nested():\n            await asyncio.sleep(0)\n        break\n",
+            [],
+        ),
+        (
+            "nested direct loop checked independently",
+            "import asyncio\nasync def test_outer():\n    while ready:\n        async def nested():\n            while not ready:\n                await asyncio.sleep(0)\n        break\n",
+            [5],
+        ),
+        (
+            "class local shadow",
+            "import asyncio\nclass Tests:\n    asyncio = fake\n    async def test_spin(self):\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "dotted import only",
+            "import asyncio.tasks\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "parameter rebound",
+            "import asyncio\nasync def test_spin(asyncio):\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "local rebound",
+            "import asyncio\nasync def test_spin():\n    asyncio = fake\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "definition rebound",
+            "import asyncio\ndef asyncio():\n    pass\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "exception target rebound",
+            "import asyncio\nasync def test_spin():\n    try:\n        work()\n    except Error as asyncio:\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "delete rebound",
+            "import asyncio\nasync def test_spin():\n    del asyncio\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "global declaration rebound",
+            "import asyncio\nasync def test_spin():\n    global asyncio\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "match capture rebound",
+            "import asyncio\nasync def test_spin(value):\n    match value:\n        case asyncio:\n            pass\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "walrus rebound",
+            "import asyncio\nasync def test_spin():\n    if (asyncio := fake):\n        pass\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "for target rebound",
+            "import asyncio\nasync def test_spin():\n    for asyncio in modules:\n        pass\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "another import rebound",
+            "import asyncio\nimport json as asyncio\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "nested free variable owned by parameter",
+            "import asyncio\nasync def outer(asyncio):\n    async def test_spin():\n        while not ready:\n            await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "module star import vetoes asyncio",
+            "import asyncio\nfrom x import *\nasync def test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "function star import vetoes asyncio",
+            "import asyncio\nasync def test_spin():\n    from x import *\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "module star import vetoes anyio",
+            "import anyio\nfrom x import *\nasync def test_spin():\n    while not ready:\n        await anyio.sleep(0)\n",
+            [],
+        ),
+        (
+            "function star import vetoes anyio",
+            "import anyio\nasync def test_spin():\n    from x import *\n    while not ready:\n        await anyio.sleep(0)\n",
+            [],
+        ),
+        (
+            "ast parse only syntax",
+            "import asyncio\ndef test_spin():\n    while not ready:\n        await asyncio.sleep(0)\n",
+            [],
+        ),
+        (
+            "nonzero sleep and new exact spin",
+            "import asyncio\nasync def test_allowlisted():\n    while first:\n        await asyncio.sleep(1)\n    while second:\n        await asyncio.sleep(0)\n",
+            [5],
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) and "\n" not in value else None,
+)
+def test_polling_spin_rule_acceptance_table(
+    tmp_path: Path, case: str, source: str, expected_lines: list[int]
+) -> None:
+    del case
+
+    findings = [
+        finding
+        for finding in _lint(tmp_path, source)
+        if finding.message.startswith("polling loop without a deadline:")
+    ]
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ004", line) for line in expected_lines
+    ]
+    for finding in findings:
+        assert finding.message == (
+            "polling loop without a deadline: wrap the wait in await_or_fail "
+            "(tests/support/owned.py) or give it an explicit deadline "
+            "(asyncio.timeout(N)), or wait on an event set by the producer"
+        )
+
+
 def test_await_deadline_rule_catches_pr_765_original_bare_task_await(
     tmp_path: Path,
 ) -> None:
@@ -824,6 +1042,135 @@ def test_rule_checks_only_added_test_lines(tmp_path: Path) -> None:
     assert _lint(tmp_path, source, {3}) == []
 
 
+def test_src_zeta_keeps_existing_test_rules(tmp_path: Path) -> None:
+    source = "async def test_existing():\n    time.sleep(1)\n"
+
+    findings = _lint(tmp_path, source, path="src/zeta/example/tests/test_example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 2)]
+
+
+@pytest.mark.parametrize(
+    ("source", "method"),
+    [
+        ("async def check(value: Path):\n    value.{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ]
+    + [
+        ("class Tool:\n    x: Path\n\n    async def check(self):\n        self.x.{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ]
+    + [
+        ("class Tool:\n    def __init__(self):\n        self.x = Path('x')\n\n    async def check(self):\n        self.x.{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ]
+    + [
+        ("async def check(root):\n    (root / 'x').{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ]
+    + [
+        ("async def check():\n    (Path('root') / 'x').{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ],
+)
+def test_tq007_path_receiver_shapes(tmp_path: Path, source: str, method: str) -> None:
+    rendered = "from pathlib import Path\n\n" + source.format(method=method)
+    findings = _lint(tmp_path, rendered, path="src/zeta/example.py")
+    call_line = next(
+        number for number, line in enumerate(rendered.splitlines(), 1) if f".{method}()" in line
+    )
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ007", call_line)]
+
+
+@pytest.mark.parametrize("call", [
+    "asyncio.to_thread(Path('x').exists())",
+    "asyncio.to_thread(open('x'))",
+    "loop.run_in_executor(None, open('x'))",
+])
+def test_tq007_scans_invoked_offload_arguments(tmp_path: Path, call: str) -> None:
+    source = f"from pathlib import Path\n\nasync def check():\n    await {call}\n"
+
+    findings = _lint(tmp_path, source, path="src/zeta/example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ007", 4)]
+
+
+def test_tq007_allows_uncalled_offload_receivers(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def check(path):
+    await asyncio.to_thread(path.exists)
+    await asyncio.to_thread(open, path)
+    await loop.run_in_executor(None, open, path)
+"""
+
+    assert _lint(tmp_path, source, path="src/zeta/example.py") == []
+
+
+def test_tq007_flags_filesystem_calls_in_async_functions(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def guard():
+    Path("cwd").is_dir()
+    open("log", "w")
+    os.stat("cwd")
+"""
+
+    findings = _lint(tmp_path, source, path="src/zeta/example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ007", 4),
+        ("TQ007", 5),
+        ("TQ007", 6),
+    ]
+    assert "asyncio.to_thread" in findings[0].message
+    assert "guard" in findings[0].message
+
+
+def test_tq007_skips_nested_sync_and_off_loop_arguments(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def outer():
+    def sync():
+        Path("old").is_dir()
+    await asyncio.to_thread(Path("safe").is_dir)
+    mapping.exists()
+"""
+
+    assert _lint(tmp_path, source, path="src/zeta/example.py") == []
+
+
+def test_tq007_requires_a_reasoned_marker(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def guarded():
+    # async-blocking: reviewed because the path is already off-loop
+    Path("safe").is_dir()
+
+async def unguarded():
+    # async-blocking:
+    Path("unsafe").is_dir()
+"""
+
+    findings = _lint(tmp_path, source, path="src/zeta/example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ007", 9)]
+
+
+def test_tq007_diff_mode_ignores_untouched_old_hit(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def old():
+    Path("old").is_dir()
+
+async def new():
+    return 1
+"""
+
+    assert _lint(tmp_path, source, added_lines={7}, path="src/zeta/example.py") == []
+
+
 def test_rule_ignores_pure_reindent(tmp_path: Path) -> None:
     source = """def test_existing():
     if enabled:
@@ -940,6 +1287,99 @@ async def test_new_wait():
     findings = quality.lint_all(tmp_path)
 
     assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 5)]
+
+
+@pytest.mark.parametrize(
+    ("case", "current_source", "expected_exit", "new_lines", "stale_count"),
+    [
+        (
+            "replaced loop gets a new slot and leaves the old slot stale",
+            """import asyncio
+async def test_existing_wait():
+    while entirely_new_condition:
+        await asyncio.sleep(0)
+""",
+            1,
+            [3],
+            1,
+        ),
+        (
+            "unrelated line shift keeps the slot",
+            """
+import asyncio
+async def test_existing_wait():
+    while first:
+        await asyncio.sleep(0)
+""",
+            0,
+            [],
+            0,
+        ),
+        (
+            "fixed loop leaves its slot stale",
+            """import asyncio
+async def test_existing_wait():
+    assert ready
+""",
+            1,
+            [],
+            1,
+        ),
+        (
+            "second identical loop gets a distinct ordinal",
+            """import asyncio
+async def test_existing_wait():
+    while first:
+        await asyncio.sleep(0)
+    while first:
+        await asyncio.sleep(0)
+""",
+            1,
+            [5],
+            0,
+        ),
+    ],
+)
+def test_polling_spin_allowlist_uses_content_identity_through_cli(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    case: str,
+    current_source: str,
+    expected_exit: int,
+    new_lines: list[int],
+    stale_count: int,
+) -> None:
+    del case
+    target = tmp_path / "tests/test_example.py"
+    target.parent.mkdir()
+    target.write_text(
+        """import asyncio
+async def test_existing_wait():
+    while first:
+        await asyncio.sleep(0)
+"""
+    )
+    _, polling_spins, trees = quality._scan_deadline_findings(tmp_path)
+    slots = quality._polling_spin_slots(polling_spins, trees)
+    (tmp_path / quality.POLLING_SPIN_RATCHET_PATH).write_text(
+        "".join(f"{slot}\n" for slot in slots)
+    )
+    target.write_text(current_source)
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = quality.main(["--polling-spins"])
+    output = capsys.readouterr().out.splitlines()
+
+    assert exit_code == expected_exit
+    assert [
+        int(line.split(":", 2)[1])
+        for line in output
+        if line.endswith(quality.POLLING_SPIN_ERROR)
+    ] == new_lines
+    assert sum("stale polling-spin allowlist entry" in line for line in output) == (
+        stale_count
+    )
 
 
 def test_write_ratchet_command_records_each_function_once(
@@ -1126,7 +1566,8 @@ def test_merge_resolution_passes_pull_request_body() -> None:
 
     assert "types: [opened, synchronize, reopened, edited]" in workflow
     assert "name: merge resolution" in workflow
-    assert "github.event.changes.body != null" in workflow
+    assert "if: github.event_name" not in workflow
+    assert "group: merge-resolution-${{ github.event.pull_request.number || github.run_id }}" in workflow
     assert "PR_BODY: ${{ github.event.pull_request.body }}" not in workflow
     script = Path("scripts/ci_merge_resolution.sh").read_text()
     assert 'gh pr view "$PR_NUMBER" --json body -q .body' in script
@@ -1142,3 +1583,245 @@ def test_non_test_python_files_are_ignored(tmp_path: Path) -> None:
     target.write_text(source)
 
     assert lint_diff(_diff(path, source), tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "codes"),
+    [
+        ("tests/test_x.py", "async def test_x():\n    await x\n", {"TQ004"}),
+        (
+            "tests/conftest.py",
+            'import os\nos.environ["ZETA_HOME"] = "x"\n',
+            {"TQ005"},
+        ),
+        (
+            "sitecustomize.py",
+            'import os\nos.environ["ZETA_HOME"] = "x"\n',
+            {"TQ005"},
+        ),
+        (
+            "conftest.py",
+            'import os\nos.environ["ZETA_HOME"] = "x"\n',
+            {"TQ005"},
+        ),
+        (
+            "src/zeta/x.py",
+            (
+                'from pathlib import Path\nimport asyncio\n'
+                'async def x():\n    await x\n'
+                '    await asyncio.to_thread(Path("x").exists())\n'
+            ),
+            {"TQ007"},
+        ),
+        (
+            "src/zeta/tests/test_y.py",
+            (
+                'from pathlib import Path\nimport asyncio\n'
+                'async def test_y():\n    await x\n'
+                '    await asyncio.to_thread(Path("x").exists())\n'
+            ),
+            {"TQ004", "TQ007"},
+        ),
+        ("scripts/x.py", "async def x():\n    await x\n", set()),
+    ],
+)
+def test_lint_diff_applies_rule_families_by_path(
+    tmp_path: Path, path: str, source: str, codes: set[str]
+) -> None:
+    target = tmp_path / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source)
+
+    assert {finding.code for finding in lint_diff(_diff(path, source), tmp_path)} == codes
+
+
+# The pre-migration helper behind CI run 42502453427: it stopped at turn_end while
+# the deny response (id 4) was still on its way.
+_PAST_RAW_SERVE_READ = """
+import asyncio
+import json
+
+
+async def _read_raw_until(reader, frames, predicate):
+    while True:
+        frame = await asyncio.wait_for(reader.readline(), 10)
+        assert frame
+        frames.append(frame)
+        decoded = json.loads(frame)
+        if predicate(decoded):
+            return decoded
+"""
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "flagged"),
+    [
+        ("tests/test_server_observers.py", _PAST_RAW_SERVE_READ, True),
+        (
+            "tests/test_x.py",
+            "async def f(self):\n    return await self.replay_reader.readline()\n",
+            True,
+        ),
+        # Websocket and HTTP framing reads are not newline JSON-RPC frames.
+        (
+            "tests/test_x.py",
+            (
+                "async def f(replay_reader):\n"
+                "    return await replay_reader.readexactly(4)\n"
+            ),
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "async def f(reader):\n"
+                "    # test-contract: transport fake HTTP server request line\n"
+                "    return await reader.readline()\n"
+            ),
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "async def f(reader):\n"
+                "    # test-contract: seam wrong kind for a reader\n"
+                "    return await reader.readline()\n"
+            ),
+            True,
+        ),
+        ("tests/support/server_client.py", _PAST_RAW_SERVE_READ, False),
+        (
+            "tests/test_x.py",
+            "async def f(process):\n    return await process.stdout.readline()\n",
+            False,
+        ),
+    ],
+)
+def test_raw_serve_socket_reads_must_use_the_shared_client(
+    tmp_path: Path, path: str, source: str, flagged: bool
+) -> None:
+    findings = [
+        finding
+        for finding in _lint(tmp_path, source, path=path)
+        if finding.code == "TQ008"
+    ]
+
+    assert bool(findings) is flagged
+    assert all(
+        "use tests/support/server_client.py read helpers" in finding.message
+        and "'# test-contract: transport <reason>'" in finding.message
+        for finding in findings
+    )
+
+
+def test_transport_marker_does_not_excuse_a_missing_deadline(tmp_path: Path) -> None:
+    source = "async def test_wait():\n    await ready.wait()  # test-contract: transport x\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
+# The three shapes the review named (tests/test_server.py:9002 and :11936,
+# tests/test_server_session_grants.py:1041): requests nothing tracked, so the
+# read helpers and close_serve could stop before their responses arrived.
+_RAW_DUMPS_ENCODE_PLUS_NEWLINE = """
+def f(writer, sid):
+    writer.write(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "blocked-status",
+                "method": "slash_run",
+                "params": {"session_id": sid, "text": "/status"},
+            }
+        ).encode()
+        + b"\\n"
+    )
+"""
+_RAW_PARENTHESIZED_DUMPS_ENCODE = """
+def f(writer, approval):
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "deny",
+                    "params": {"request_id": approval["request_id"]},
+                }
+            )
+            + "\\n"
+        ).encode()
+    )
+"""
+_RAW_BYTES_LITERAL = (
+    "def f(writer):\n"
+    "    writer.write(b'{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"status\"}\\n')\n"
+)
+_RAW_FSTRING = (
+    "def f(writer, n):\n"
+    "    writer.write(f'{{\"id\": {n}, \"method\": \"status\"}}\\n'.encode())\n"
+)
+_RAW_WRITELINES = (
+    "def f(writer):\n"
+    "    writer.writelines([json.dumps({'id': 1, 'method': 'status'}).encode()])\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "flagged"),
+    [
+        ("tests/test_x.py", _RAW_DUMPS_ENCODE_PLUS_NEWLINE, True),
+        ("tests/test_x.py", _RAW_PARENTHESIZED_DUMPS_ENCODE, True),
+        ("tests/test_x.py", _RAW_BYTES_LITERAL, True),
+        ("tests/test_x.py", _RAW_FSTRING, True),
+        ("tests/test_x.py", _RAW_WRITELINES, True),
+        ("tests/support/server_client.py", _RAW_PARENTHESIZED_DUMPS_ENCODE, False),
+        # A response has no method and a notification has no id: neither gets a
+        # response, so neither leaves a frame for a reader to miss.
+        (
+            "tests/test_x.py",
+            "def f(writer):\n    writer.write(json.dumps({'id': 1, 'result': {}}))\n",
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            "def f(writer):\n    writer.write(json.dumps({'method': 'cancel'}))\n",
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "def f(writer):\n"
+                "    # test-contract: transport malformed frame the server must reject\n"
+                "    writer.write(b'{\"id\":1,\"method\":NaN}\\n')\n"
+            ),
+            False,
+        ),
+        (
+            "tests/test_x.py",
+            (
+                "def f(writer):\n"
+                "    # test-contract: seam wrong kind for a raw request\n"
+                "    writer.write(b'{\"id\":1,\"method\":\"status\"}\\n')\n"
+            ),
+            True,
+        ),
+    ],
+)
+def test_raw_serve_requests_must_use_the_shared_client(
+    tmp_path: Path, path: str, source: str, flagged: bool
+) -> None:
+    findings = [
+        finding
+        for finding in _lint(tmp_path, source, path=path)
+        if finding.code == "TQ009"
+    ]
+
+    assert bool(findings) is flagged
+    assert all(
+        "send serve requests with tests/support/server_client.py send()" in f.message
+        and "'# test-contract: transport <reason>'" in f.message
+        for f in findings
+    )

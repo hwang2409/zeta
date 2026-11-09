@@ -49,29 +49,47 @@ def _niceness_command() -> str:
     return _python_command("import os; print(os.getpriority(os.PRIO_PROCESS, 0))")
 
 
-def _descendant_command(child_pid: Path | None = None) -> str:
-    child = "import os,signal,pathlib\n"
+def _descendant_command(
+    child_pid: Path | None = None, release_path: Path | None = None
+) -> str:
+    child = "import os,signal,pathlib,time\n"
     if child_pid:
         child += f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
-    child += "signal.pause()"
+    if release_path:
+        child += "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        child += (
+            "while not pathlib.Path("
+            f"{str(release_path)!r}"
+            ").exists(): time.sleep(0.01)\n"
+        )
+    else:
+        child += "signal.pause()"
     parent = (
-        "import subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
-        + "time.sleep(5)"
+        "import pathlib,subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        + (
+            f"while not pathlib.Path({str(release_path)!r}).exists(): time.sleep(0.01)"
+            if release_path
+            else "time.sleep(5)"
+        )
     )
     return _python_command(parent)
 
 
 @asynccontextmanager
-async def _owned_descendant(pid_file: Path):
+async def _owned_descendant(
+    pid_file: Path, release_path: Path | None = None
+):
     try:
         yield
     finally:
+        if release_path is not None:
+            release_path.touch()
         if pid_file.exists():
             pid = int(pid_file.read_text())
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
-                await wait_pid_exited(pid)
+            await wait_pid_exited(pid)
 
 
 async def _collect_loop(loop: AgentLoop) -> list[object]:
@@ -521,7 +539,7 @@ async def test_terminate_unregistered_drains_stdout_and_stderr() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bash_invalid_start_cwd_falls_back_without_persisting(
+async def test_bash_removed_start_cwd_falls_back_and_persists(
     tmp_path: Path,
 ) -> None:
     missing = tmp_path / "missing"
@@ -530,9 +548,83 @@ async def test_bash_invalid_start_cwd_falls_back_without_persisting(
 
     result = await registry.execute(ToolCall("bash-missing-cwd", "bash", {"cmd": "pwd"}))
 
-    assert result["isError"] is True
-    assert result["structuredContent"]["cwd_after"] == str(missing)
-    assert registry.bash_cwd == str(missing)
+    assert result["isError"] is False
+    assert result["structuredContent"]["cwd_after"] == str(tmp_path)
+    assert registry.bash_cwd == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bash_restart_recovers_persisted_removed_cwd(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session-cwd"
+    persisted_cwd = tmp_path / "persisted-cwd"
+    session_cwd.mkdir()
+    persisted_cwd.mkdir()
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, cwd=session_cwd)
+    registry = ToolRegistry(
+        session_cwd, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        changed = await registry.execute(
+            ToolCall(
+                "persist-cwd",
+                "bash",
+                {"command": f"cd {shlex.quote(str(persisted_cwd))}"},
+            )
+        )
+        assert changed["isError"] is False
+        session_id = store.session_id
+    finally:
+        await registry.close()
+        store.close()
+
+    persisted_cwd.rmdir()
+    reopened = ConversationStore(root, session_id=session_id)
+    restarted = ToolRegistry(
+        session_cwd,
+        session_store=reopened,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        result = await restarted.execute(
+            ToolCall("recover-persisted-cwd", "bash", {"command": "pwd"})
+        )
+
+        assert result["isError"] is False
+        assert result["structuredContent"]["stdout"].strip() == str(tmp_path)
+        assert restarted.bash_cwd == str(tmp_path)
+        assert reopened.bash_cwd == str(tmp_path)
+    finally:
+        await restarted.close()
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_bash_recovers_when_session_cwd_is_removed_during_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_cwd = tmp_path / "session-cwd"
+    session_cwd.mkdir()
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
+    registry.verify_cwd_identity()
+    original_open = registry._open_cwd
+
+    def remove_then_open() -> int:
+        session_cwd.rmdir()
+        return original_open()
+
+    # test-contract: seam force removal after identity verification but before fd open.
+    monkeypatch.setattr(registry, "_open_cwd", remove_then_open)
+    try:
+        result = await registry.execute(
+            ToolCall("remove-during-bind", "bash", {"command": "pwd"})
+        )
+
+        assert result["isError"] is False, result
+        assert result["structuredContent"]["stdout"].strip() == str(tmp_path)
+        assert registry.bash_cwd == str(tmp_path)
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
@@ -1604,28 +1696,62 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
-async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
+async def test_bash_timeout_kills_and_reaps_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     child_pid = tmp_path / "timeout-child.pid"
+    release_path = tmp_path / "timeout-release"
+    timeout_ready = asyncio.Event()
+    timeout_fired = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def wait_for_readiness(delay: float) -> None:
+        if delay == 0.5:
+            await asyncio.wait_for(timeout_ready.wait(), 10)
+            timeout_fired.set()
+            return
+        await real_sleep(delay)
+
+    monkeypatch.setattr(bash_module.asyncio, "sleep", wait_for_readiness)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    async with _owned_descendant(child_pid):
+    async with _owned_descendant(child_pid, release_path):
         execution = asyncio.create_task(
             registry.execute(
                 ToolCall(
                     "bash-timeout",
                     "bash",
                     {
-                        "command": _descendant_command(child_pid=child_pid),
+                        "command": _descendant_command(
+                            child_pid=child_pid, release_path=release_path
+                        ),
                         "timeout": 0.5,
                     },
                 )
             )
         )
         child_pid_value = await read_pid_file(child_pid)
-        result = await asyncio.wait_for(execution, 10)
-        await wait_pid_exited(child_pid_value)
+        timeout_ready.set()
+        await await_or_fail(timeout_fired.wait(), what="bash timeout awaitable")
+        done, _ = await asyncio.wait({execution}, timeout=10)
+        if not done:
+            release_path.touch()
+            result = await await_or_fail(
+                execution, what="bash execution after timeout fallback release"
+            )
+        else:
+            result = execution.result()
 
-        assert result["isError"] is True
+        assert result["isError"] is True, (
+            "bash did not return a timeout result after its timeout fired"
+        )
+        try:
+            await wait_pid_exited(child_pid_value)
+        except AssertionError as error:
+            raise AssertionError(
+                "bash timeout did not terminate the descendant process"
+            ) from error
+
         assert "timed out after" in result["content"][0]["text"]
         assert result["structuredContent"]["timed_out"] is True
         assert result["structuredContent"]["error"]["tool"] == "bash"

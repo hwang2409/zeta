@@ -244,10 +244,14 @@ class ContextAssembler(ContextMarkerMixin):
         self,
         backend: CompletionBackend,
         request: AdmittedSessionRequest,
-    ):
+        *,
+        control: Any,
+    ) -> Any:
         """Dispatch a request previously admitted for the current session."""
 
-        return self._request_admission.dispatch(backend, request)
+        return self._request_admission.dispatch(
+            backend, request, control=control
+        )
 
     @property
     def provider_attempt_estimate(self) -> int | None:
@@ -1108,14 +1112,14 @@ class ContextAssembler(ContextMarkerMixin):
     def _total_tokens(self, messages: Sequence[Message]) -> int:
         return self._request_budget.calibrated_tokens(self._count(messages))
 
-    def _is_pending_delivery_message(self, message: Message) -> bool:
-        prompt_id = message.metadata.get("zeta.pending_prompt_id")
+    def _is_pending_delivery_metadata(self, metadata: Mapping[str, Any]) -> bool:
+        prompt_id = metadata.get("zeta.pending_prompt_id")
         if (
             type(prompt_id) is str
             and prompt_id in self.store._active_pending_prompt_entries
         ):
             return True
-        delivery = message.metadata.get("zeta.step_delivery")
+        delivery = metadata.get("zeta.step_delivery")
         notification_ids = (
             delivery.get("notification_ids") if isinstance(delivery, dict) else ()
         )
@@ -1123,6 +1127,9 @@ class ContextAssembler(ContextMarkerMixin):
             notification_id in self.store._active_notifications
             for notification_id in notification_ids
         )
+
+    def _is_pending_delivery_message(self, message: Message) -> bool:
+        return self._is_pending_delivery_metadata(message.metadata)
 
     def _visible_items(
         self, entries: Sequence[ConversationEntry]
@@ -1162,7 +1169,19 @@ class ContextAssembler(ContextMarkerMixin):
                 continue
             if entry.type != "message":
                 continue
-            message = Message.from_dict(entry.data["message"])
+            raw_message = entry.data["message"]
+            raw_metadata = raw_message.get("metadata", {})
+            covered = any(
+                start <= entry.seq <= end for start, end in compacted_ranges
+            )
+            if (
+                covered
+                and type(raw_metadata) is dict
+                and not raw_metadata.get(FAILED_TURN_MARKER)
+                and not self._is_pending_delivery_metadata(raw_metadata)
+            ):
+                continue
+            message = Message.from_dict(raw_message)
             if self._is_pending_delivery_message(message):
                 continue
             if message.metadata.get(FAILED_TURN_MARKER):
@@ -1172,7 +1191,7 @@ class ContextAssembler(ContextMarkerMixin):
                     if isinstance(block, ToolUseContent)
                 )
                 continue
-            if any(start <= entry.seq <= end for start, end in compacted_ranges):
+            if covered:
                 continue
             if (
                 message.role is MessageRole.TOOL_RESULT

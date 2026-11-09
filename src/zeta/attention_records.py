@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import stat
 import uuid
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from .storage_format import WRITER_EPOCH, require_closed_variant
+
+AttentionKind = Literal["decision", "answer", "decided", "deferred"]
+AttentionReason = Literal[
+    "unreadable",
+    "invalid_name",
+    "invalid_json",
+    "invalid_schema",
+    "id_mismatch",
+    "too_large",
+]
 
 from .core.session_files import (
     child_directory,
@@ -20,8 +29,51 @@ from .core.session_files import (
     session_directory,
     write_session_file,
 )
+from .storage_format import reject_unknown_keys
 
 _MAX_RECORD_BYTES = 256 * 1024
+_MAX_BROKEN_ID_CHARS = 160
+
+
+def _safe_broken_id(filename: str) -> str:
+    rendered = "".join(
+        character if character.isprintable() else "�" for character in filename
+    )
+    if len(rendered) <= _MAX_BROKEN_ID_CHARS:
+        return rendered
+    return rendered[: _MAX_BROKEN_ID_CHARS - 3] + "..."
+
+
+@dataclass(frozen=True, slots=True)
+class Missing:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Loaded:
+    value: AttentionRecord
+
+
+@dataclass(frozen=True, slots=True)
+class Broken:
+    id: str
+    path: str
+    reason: AttentionReason
+    recoverability: str
+    bytes: bytes
+
+
+RecordState = Missing | Loaded | Broken
+
+
+def broken_record_refusal(record: Broken) -> str:
+    return (
+        f"attention record {record.id} is broken ({record.reason}); "
+        f"repair {record.path} before replying"
+    )
+
+
+ATTENTION_KIND_EPOCH = 5
 
 
 def _now() -> str:
@@ -45,13 +97,17 @@ class AttentionRecord:
     resolved_at: str | None = None
     fork_session_id: str | None = None
     decision: str | None = None
+    kind: AttentionKind = "decision"
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> AttentionRecord:
+        reject_unknown_keys(value, "attention_record")
         allowed = set(cls.__dataclass_fields__)
         if not set(value).issubset(allowed):
             raise ValueError("unknown attention record fields")
         normalized = dict(value)
+        normalized["kind"] = value.get("kind", "decision")
+        require_closed_variant("attention.kind", normalized["kind"])
         normalized["options"] = tuple(value.get("options", ()))
         record = cls(**normalized)
         if (
@@ -71,7 +127,7 @@ class AttentionRecord:
         return record
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "id": self.id,
             "created_at": self.created_at,
             "session_id": self.session_id,
@@ -88,13 +144,17 @@ class AttentionRecord:
             "fork_session_id": self.fork_session_id,
             "decision": self.decision,
         }
+        if self.kind != "decision":
+            result["kind"] = self.kind
+        return result
 
 
 class AttentionStore:
     """Own attention records behind one small session-local interface."""
 
-    def __init__(self, session_dir: Path):
+    def __init__(self, session_dir: Path, *, writer_epoch: int = WRITER_EPOCH):
         self.session_dir = Path(session_dir)
+        self.writer_epoch = writer_epoch
         self.directory = self.session_dir / "attention"
 
     def request(
@@ -109,7 +169,19 @@ class AttentionStore:
         options: list[str] | tuple[str, ...] = (),
         recommendation: str | None = None,
         lane: str = "orchestrator",
+        kind: AttentionKind = "decision",
     ) -> AttentionRecord:
+        require_closed_variant("attention.kind", kind)
+        if kind != "decision" and self.writer_epoch < ATTENTION_KIND_EPOCH:
+            raise ValueError(
+                "non-decision attention kinds require the one-way shared cutover: "
+                f"zeta storage-format advance --expected-epoch {self.writer_epoch} "
+                f"--target-epoch {ATTENTION_KIND_EPOCH}"
+            )
+        if kind != "decision" and (options or recommendation is not None):
+            raise ValueError(
+                "non-decision attention kinds cannot have options or recommendation"
+            )
         if (
             not isinstance(title, str)
             or not title.strip()
@@ -145,86 +217,112 @@ class AttentionStore:
             options=tuple(item.strip() for item in options),
             recommendation=recommendation.strip() if recommendation else None,
             status="open",
+            kind=kind,
         )
         self.replace(record, create_directory=True)
         return record
 
-    def get(self, attention_id: str) -> AttentionRecord:
+    def _broken(
+        self,
+        path: Path,
+        reason: AttentionReason,
+        raw: bytes = b"",
+        *,
+        record_id: str | None = None,
+    ) -> Broken:
+        return Broken(
+            path.stem if record_id is None else record_id,
+            self._relative_path(path),
+            reason,
+            "manual repair",
+            raw,
+        )
+
+    def record_state(self, attention_id: str) -> RecordState:
         if len(attention_id) != 32 or any(
             character not in "0123456789abcdef" for character in attention_id
         ):
             raise ValueError("invalid attention id")
-        value = _bounded_json(self.directory / f"{attention_id}.json")
-        if not isinstance(value, dict):
-            raise TypeError("attention record must be a JSON object")
-        return AttentionRecord.from_dict(value)
+        path = self.directory / f"{attention_id}.json"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return Missing()
+        except OSError:
+            return self._broken(path, "unreadable")
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                os.close(fd)
+                return self._broken(path, "unreadable")
+            with os.fdopen(fd, "rb") as stream:
+                raw = stream.read(_MAX_RECORD_BYTES + 1)
+        except OSError:
+            return self._broken(path, "unreadable")
+        try:
+            if len(raw) > _MAX_RECORD_BYTES:
+                raise ValueError("too large")
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise TypeError("not an object")
+            record = AttentionRecord.from_dict(value)
+            if record.id != attention_id:
+                raise LookupError("id mismatch")
+            return Loaded(record)
+        except json.JSONDecodeError:
+            reason = "invalid_json"
+        except TypeError:
+            reason = "invalid_schema"
+        except LookupError:
+            reason = "id_mismatch"
+        except ValueError as exc:
+            reason = "too_large" if str(exc) == "too large" else "invalid_schema"
+        return self._broken(path, reason, raw)
 
-    def resolve(
-        self,
-        attention_id: str,
-        *,
-        session_id: str,
-        decision: str,
-        before_commit: Callable[[AttentionRecord], None] | None = None,
-    ) -> tuple[AttentionRecord, bool]:
-        """Resolve one owned record, running winner-only delivery before its commit."""
-        decision = decision.strip()
-        if not decision:
-            raise ValueError("decision must be nonempty")
-        with self._resolution_lock():
-            current = self.get(attention_id)
-            if current.session_id != session_id:
-                raise ValueError("attention record does not belong to this session")
-            if current.status == "resolved":
-                return current, True
-            if before_commit is not None:
-                before_commit(current)
-            resolved = replace(
-                current,
-                status="resolved",
-                resolved_at=_now(),
-                decision=decision,
-            )
-            self.replace(resolved)
-            return resolved, False
+    def _relative_path(self, path: Path) -> str:
+        return path.relative_to(self.session_dir).as_posix()
 
-    @contextmanager
-    def _resolution_lock(self) -> Iterator[None]:
-        with (
-            session_directory(self.session_dir.parent, self.session_dir.name) as (
-                _,
-                session_fd,
-            ),
-            child_directory(session_fd, "attention") as attention_fd,
-        ):
-            fcntl.flock(attention_fd, fcntl.LOCK_EX)
-            try:
-                lock_fd = open_session_file(
-                    attention_fd, ".resolution.lock", os.O_RDWR | os.O_CREAT
-                )
-            finally:
-                fcntl.flock(attention_fd, fcntl.LOCK_UN)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                yield
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
+    def get(self, attention_id: str) -> AttentionRecord:
+        state = self.record_state(attention_id)
+        if isinstance(state, Loaded):
+            return state.value
+        if isinstance(state, Missing):
+            raise FileNotFoundError(attention_id)
+        raise ValueError(f"broken attention record: {state.reason}")
 
-    def list(self) -> tuple[AttentionRecord, ...]:
+    def list(self) -> tuple[AttentionRecord | Broken, ...]:
         try:
             paths = tuple(self.directory.iterdir())
         except (FileNotFoundError, NotADirectoryError, PermissionError):
             return ()
-        records: list[AttentionRecord] = []
+        records: list[AttentionRecord | Broken] = []
         for path in paths:
             if path.suffix != ".json":
                 continue
-            try:
-                records.append(self.get(path.stem))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            if len(path.stem) != 32 or any(
+                character not in "0123456789abcdef" for character in path.stem
+            ):
+                records.append(
+                    self._broken(
+                        path,
+                        "invalid_name",
+                        record_id=_safe_broken_id(path.name),
+                    )
+                )
                 continue
-        return tuple(sorted(records, key=lambda item: item.created_at))
+            state = self.record_state(path.stem)
+            if isinstance(state, Loaded):
+                records.append(state.value)
+            elif isinstance(state, Broken):
+                records.append(state)
+        return tuple(
+            sorted(
+                records,
+                key=lambda item: (
+                    item.created_at if isinstance(item, AttentionRecord) else item.path
+                ),
+            )
+        )
 
     def replace(
         self, record: AttentionRecord, *, create_directory: bool = False

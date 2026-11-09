@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 
 from tests.support.fake_backend import FakeBackend
-from zeta.agent.conversation_channel import ConversationChannel
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -94,11 +93,11 @@ async def test_resume_warm_writer_does_not_reload_root(
     full_root_loads = 0
     original = ConversationStore._load_full
 
-    def count_root_loads(store: ConversationStore) -> None:
+    def count_root_loads(store: ConversationStore, *args: object, **kwargs: object) -> None:
         nonlocal full_root_loads
         if store.path == root_path:
             full_root_loads += 1
-        original(store)
+        original(store, *args, **kwargs)
 
     runtime = _runtime(home, tmp_path)
     with patch.object(ConversationStore, "_load_full", count_root_loads):
@@ -147,7 +146,9 @@ async def test_warm_writer_admits_pending_prompt_notification_and_terminal_after
         await runtime.close()
 
 
-def _opened_store_with_writer_snapshot(tmp_path: Path, session_id: str) -> ConversationStore:
+def _opened_store_with_writer_snapshot(
+    tmp_path: Path, session_id: str
+) -> ConversationStore:
     created = ConversationStore(tmp_path, session_id=session_id)
     created.append_message(
         with_message_origin(
@@ -166,7 +167,9 @@ async def test_warm_writer_sees_external_append_between_open_and_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     resident = _opened_store_with_writer_snapshot(tmp_path, "external-append")
-    external = ConversationStore(tmp_path, session_id=resident.session_id, _must_exist=True)
+    external = ConversationStore(
+        tmp_path, session_id=resident.session_id, _must_exist=True
+    )
     external.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("external")]), MessageOrigin.USER
@@ -176,10 +179,10 @@ async def test_warm_writer_sees_external_append_between_open_and_start(
     reloads = 0
     original = ConversationStore._load_full
 
-    def count_reloads(store: ConversationStore) -> None:
+    def count_reloads(store: ConversationStore, *args: object, **kwargs: object) -> None:
         nonlocal reloads
         reloads += 1
-        original(store)
+        original(store, *args, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
     flow = StepDeliveryFlow(resident)
@@ -211,16 +214,16 @@ async def test_warm_writer_falls_back_on_replaced_or_truncated_log(
     reloads = 0
     original = ConversationStore._load_full
 
-    def count_reloads(store: ConversationStore) -> None:
+    def count_reloads(store: ConversationStore, *args: object, **kwargs: object) -> None:
         nonlocal reloads
         reloads += 1
-        original(store)
+        original(store, *args, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
     flow = StepDeliveryFlow(resident)
     await flow.initialize()
     try:
-        assert reloads == 1
+        assert reloads == (2 if damage == "torn" else 1)
     finally:
         await asyncio.to_thread(resident.close)
 
@@ -295,33 +298,12 @@ async def test_warm_writer_appends_are_structurally_isolated(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_resume_recovery_runs_on_unpublished_store(tmp_path: Path) -> None:
+async def test_resume_recovery_restores_durable_completion(tmp_path: Path) -> None:
     home = tmp_path / "home"
     session_id = await asyncio.to_thread(_seed_session, home, tmp_path, children=2)
     runtime = _runtime(home, tmp_path)
-    sinks_ready = False
-    publications = 0
-    original_produce = ConversationChannel.produce_to
 
-    async def checked_produce(self, target_instance_id, item):
-        nonlocal publications
-        assert sinks_ready
-        publications += 1
-        return await original_produce(self, target_instance_id, item)
-
-    runtime.set_background_event_sink(lambda _session_id, _event: None)
-    original_bind = runtime._bind_background_event_sink
-
-    def bind(state):
-        nonlocal sinks_ready
-        original_bind(state)
-        sinks_ready = True
-
-    with (
-        patch.object(runtime, "_bind_background_event_sink", side_effect=bind),
-        patch.object(ConversationChannel, "produce_to", checked_produce),
-    ):
-        await runtime.resume_session(session_id)
+    await runtime.resume_session(session_id)
     try:
         assert runtime.opened is not None
         assert runtime.opened.store.agent_children() == {}
@@ -335,7 +317,6 @@ async def test_resume_recovery_runs_on_unpublished_store(tmp_path: Path) -> None
         assert [item.data["child_instance_id"] for item in notifications] == [
             f"{session_id}:1"
         ]
-        assert publications == 1
     finally:
         await runtime.close()
 
@@ -374,43 +355,6 @@ async def test_resume_recovery_cancel_during_setup_is_safe(tmp_path: Path) -> No
         notifications = runtime.opened.store.agent_notifications(pending_only=False)
         assert [item.data["child_instance_id"] for item in notifications] == [
             f"{session_id}:1"
-        ]
-    finally:
-        await runtime.close()
-
-
-@pytest.mark.asyncio
-async def test_resume_recovery_cancel_during_notification_publication_is_safe(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    session_id = await asyncio.to_thread(_seed_session, home, tmp_path, children=3)
-    runtime = _runtime(home, tmp_path)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    original_produce = ConversationChannel.produce_to
-
-    async def gated_produce(self, target_instance_id, item):
-        if not entered.is_set():
-            entered.set()
-            await release.wait()
-        return await original_produce(self, target_instance_id, item)
-
-    with patch.object(ConversationChannel, "produce_to", gated_produce):
-        resume = asyncio.create_task(runtime.resume_session(session_id))
-        await asyncio.wait_for(entered.wait(), 2)
-        resume.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await resume
-
-    await runtime.resume_session(session_id)
-    try:
-        assert runtime.opened is not None
-        notifications = runtime.opened.store.agent_notifications(pending_only=False)
-        assert [item.data["child_instance_id"] for item in notifications] == [
-            f"{session_id}:1",
-            f"{session_id}:2",
         ]
     finally:
         await runtime.close()

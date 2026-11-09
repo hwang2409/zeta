@@ -13,18 +13,26 @@ import uuid
 import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Mapping
 
 from ..skills import SkillCatalog
-from ..storage_format import advance, mapping_mutations, open_writer
+from ..storage_format import advance, mapping_mutations, open_writer, release_later
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore, TranscriptLoadError
+from .transcript_recovery import (
+    RepairResult,
+    RepairTarget,
+    recovery_status,
+    set_memory_review_required,
+)
+from .transcript_recovery.runtime import format_repair_transcript_command
+from .store._child_runs import child_run_segments
 from .session_execution import (
     OwnerHint,
     OwnerSurface,
@@ -124,7 +132,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self.home = Path(home) if home is not None else env_home()
         self._owner_surface = owner_surface
         self._storage_lease = open_writer(self.home)
-        self._release_storage_lease = weakref.finalize(self, self._storage_lease.close)
+        self._release_storage_lease = weakref.finalize(
+            self, release_later, self._storage_lease.close
+        )
         self.user_home = (
             (Path(user_home) if user_home is not None else Path.home())
             .expanduser()
@@ -137,6 +147,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self.project_registry_state = state
         self.project_registry = state.registry
         self.project_registry_unavailable = state.unavailable
+
+    @property
+    def observed_storage_epoch(self) -> int:
+        """Return the home epoch held by this manager's writer lease."""
+        return self._storage_lease.observed_epoch
 
     def create(
         self,
@@ -349,6 +364,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         if store.cwd != metadata.cwd:
             store.close()
             raise SessionError(f"session {session_id} cwd does not match its metadata")
+        if not _read_only:
+            self._complete_root_recovery(metadata, store)
         if _read_only:
             return OpenedSession(metadata, store)
         metadata._execution_lease = store.execution_lease
@@ -361,6 +378,130 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             store.close()
             raise
         return OpenedSession(metadata, store)
+
+    def repair_transcript(
+        self,
+        session_id: str,
+        child_run_id: str | None = None,
+        *,
+        resident_memory_commit: Callable[[str, int, bool], None] | None = None,
+    ) -> RepairResult:
+        """Repair one diagnosed root or child transcript."""
+        metadata = self.read_metadata(session_id)
+        target = RepairTarget(session_id, child_run_id)
+        segments = child_run_segments(session_id, child_run_id)
+        session_dir = self.sessions_dir / session_id
+        for segment in segments:
+            session_dir = session_dir / "agents" / str(segment)
+        store = ConversationStore(
+            session_dir.parent,
+            session_id=session_dir.name,
+            cwd=metadata.cwd,
+            _must_exist=True,
+            _storage_lease=self._storage_lease,
+            _owner_surface="recovery",
+            _recovery_owner=True,
+            _repair_explicit=True,
+            _repair_target=target,
+        )
+        try:
+            result = store.last_repair_result
+            if result is None:
+                raise SessionError(
+                    f"session {session_id} transcript does not need repair"
+                )
+            if child_run_id is None:
+                return self._complete_root_recovery(
+                    metadata,
+                    store,
+                    result,
+                    resident_memory_commit=resident_memory_commit,
+                )
+            return result
+        finally:
+            store.close()
+
+    def _complete_root_recovery(
+        self,
+        metadata: SessionMetadata,
+        store: ConversationStore,
+        result: RepairResult | None = None,
+        *,
+        resident_memory_commit: Callable[[str, int, bool], None] | None = None,
+    ) -> RepairResult | None:
+        """Close memory state before a repaired root store is published."""
+        status = recovery_status(store.directory_fd, RepairTarget(metadata.session_id))
+        record = status.latest_committed
+        if record is None or record.memory_step == "resumed":
+            return result
+
+        overlaps: tuple[str, ...] = ()
+        registry = self.project_registry
+        if metadata.project_id is not None and registry is not None:
+            overlaps = registry.overlapping_automatic_versions(
+                metadata.project_id,
+                session_id=metadata.session_id,
+                retained_last_sequence=record.cutoff_sequence,
+                diagnosed_at=record.diagnosis_timestamp,
+            )
+            if resident_memory_commit is not None:
+                resident_memory_commit(
+                    record.quarantine_id,
+                    record.cutoff_sequence,
+                    bool(overlaps),
+                )
+            else:
+                self._commit_detached_memory_recovery(
+                    metadata,
+                    store,
+                    quarantine_id=record.quarantine_id,
+                    retained_last_sequence=record.cutoff_sequence,
+                    paused=bool(overlaps),
+                )
+        set_memory_review_required(
+            store.directory_fd, record.quarantine_id, required=bool(overlaps)
+        )
+        if result is None or result.quarantine_id != record.quarantine_id:
+            result = RepairResult(
+                record.quarantine_id,
+                record.target,
+                record.cutoff_sequence,
+                record.expected_source_digest,
+                record.repaired_digest,
+                bool(overlaps),
+            )
+        return replace(
+            result,
+            memory_review_required=bool(overlaps),
+            overlapping_memory_versions=overlaps,
+        )
+
+    def _commit_detached_memory_recovery(
+        self,
+        metadata: SessionMetadata,
+        store: ConversationStore,
+        *,
+        quarantine_id: str,
+        retained_last_sequence: int,
+        paused: bool,
+    ) -> None:
+        from ..memory.reconciliation_state import ReconciliationState
+
+        state = ReconciliationState(
+            store.session_dir / "memory-reconcile.json",
+            project_id=metadata.project_id,
+            session_id=metadata.session_id,
+            diagnostics_path=self.home / "logs" / "memory-reconciliation.jsonl",
+            storage_lease=self._storage_lease,
+        )
+        if state.recovery_quarantine_id == quarantine_id:
+            return
+        state.reset_for_recovery(
+            generation=state.generation + 1,
+            retained_last_sequence=retained_last_sequence,
+            quarantine_id=quarantine_id,
+            paused=paused,
+        )
 
     def _reconcile_project_link(self, session_id: str) -> None:
         registry = self.project_registry
@@ -744,6 +885,24 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         row = load_session_json(line)
                         lines.append(json.dumps(row, separators=(",", ":")))
         except (ConversationIntegrityError, OSError) as exc:
+            try:
+                ConversationStore(
+                    self.sessions_dir,
+                    session_id=full_id,
+                    _read_only=True,
+                    _must_exist=True,
+                ).close()
+            except TranscriptLoadError as diagnosis:
+                repair_hint = (
+                    f"; run {format_repair_transcript_command(full_id)}"
+                    if diagnosis.repair_available
+                    else ""
+                )
+                raise SessionError(
+                    f"session {full_id} could not be exported: {diagnosis}{repair_hint}"
+                ) from exc
+            except (ConversationIntegrityError, OSError):
+                pass
             raise SessionError(f"session {full_id} could not be exported") from exc
         return "\n".join(lines) + "\n"
 
@@ -851,6 +1010,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self, directory_fd: int, metadata: SessionMetadata, *, sync: bool = True
     ) -> None:
         value = metadata.to_storage_dict()
+        # Refuse a shape the reader would reject, so no writer leaves an
+        # unreadable meta.json behind.
+        SessionMetadata.from_dict(
+            value, path=self.sessions_dir / metadata.session_id / "meta.json"
+        )
         delete = () if "tool_allow_layers" in value else ("tool_allow_layers",)
         self._storage_lease.publish_json(
             directory_fd,

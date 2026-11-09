@@ -5,14 +5,88 @@ import os
 import pty
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+import zeta.cli.main as cli_main
 from tests.support.processes import read_pty_until, reap_process
 from zeta.cli.main import build_parser, main
 from zeta.core.commands.completion import completion_script
 from zeta.project_registry import ProjectRegistry
+
+
+def test_cli_import_does_not_import_command_only_modules() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import zeta.cli.main; "
+                "assert not any(name in sys.modules for name in ("
+                "'httpx', 'prompt_toolkit.patch_stdout', 'zeta.accounts.login', "
+                "'zeta.providers.factory', 'zeta.tui.errors'))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("argv", [["completion", "zsh"], ["--help"]])
+def test_cli_dispatch_keeps_heavy_modules_out_of_light_commands(
+    argv: list[str],
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import zeta.cli.main as cli; "
+                f"argv = {argv!r}\n"
+                "try:\n    cli.main(argv)\n"
+                "except SystemExit as exc:\n    assert exc.code == 0\n"
+                "assert not any(name in sys.modules for name in "
+                "('httpx', 'zeta.accounts', 'zeta.oauth'))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stderr == ""
+
+
+def test_cli_account_error_exit_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from zeta.accounts import AccountError
+
+    def raise_account_error(_: list[str] | None) -> int:
+        raise AccountError("account failed")
+
+    # test-contract: seam patch the console entry point to verify AccountError identity.
+    monkeypatch.setattr(cli_main, "_main", raise_account_error)
+
+    assert cli_main.main([]) == 2
+    assert capsys.readouterr().err == "zeta: account failed\n"
+
+
+def test_cli_import_does_not_import_tui_app() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from zeta.cli.main import build_parser; build_parser().parse_args(['-p', 'hello']); build_parser().parse_args(['serve', '--port', '0']); print('zeta.tui.app' in sys.modules)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "False"
 
 
 def test_removed_fake_provider_has_clear_cli_error(

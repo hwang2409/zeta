@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import copy
 import fcntl
 import hashlib
@@ -10,14 +11,17 @@ import json
 import os
 import secrets
 import stat
+import sys
 import threading
+import weakref
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 3
+WRITER_EPOCH: Final = 5
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -35,6 +39,105 @@ GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
     ("mcp-tokens", "zeta.mcp.oauth_store"),
 )
 
+# Persisted mappings that reject unknown keys.  Names are wire-shape names, not
+# Python type names, so a conditional variant can be compared independently.
+ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
+    "hook_config": frozenset({"hook"}),
+    "hook_record": frozenset({"event", "command", "timeout_seconds", "tools", "on_error"}),
+    "notification_marker": frozenset({"notification_id"}),
+    "turn_history": frozenset({"turn_id", "reason"}),
+    "prompt_component": frozenset({"offset", "length", "digest"}),
+    "approval_fact": frozenset({"action"}),
+    "approval_display": frozenset({"effective_cwd", "resolved_path", "utf8_bytes"}),
+    "child_run": frozenset({"run_id", "parent_run_id", "name", "task", "started_at"}),
+    "pending_queue_closed": frozenset(),
+    "client_delivery_accepted_outcome": frozenset({"accepted", "session_id"}),
+    "client_delivery_steer_accepted_outcome": frozenset({"accepted"}),
+    "fact_floor_root": frozenset({"version", "oldest", "newest"}),
+    "fact_floor_aggregate": frozenset({"fact", "first_seq", "last_seq", "value_rank"}),
+    "fact_pr": frozenset({"type", "pr"}),
+    "fact_pr_verdict": frozenset({"type", "pr", "verdict"}),
+    "fact_pr_head": frozenset({"type", "pr", "sha"}),
+    "fact_child_status": frozenset({"type", "handle", "status"}),
+    "fact_child_head": frozenset({"type", "handle", "sha"}),
+    "storage_manifest": frozenset({"writer_epoch"}),
+    "project_session_reference": frozenset({"session_id", "transcript_path", "role", "parent_session_id", "recorded_at"}),
+    "remote_memory_sync_state": frozenset({"schema", "project_id", "files", "conflicts"}),
+    "remote_memory_sync_conflict": frozenset({"digests"}),
+    "entry_sync_state": frozenset({"schema", "project_id", "format", "entries", "schema_digest", "conflicts", "transition"}),
+    "entry_sync_schema_conflict": frozenset({"kind", "digests"}),
+    "entry_sync_entry_conflict": frozenset({"kind", "entry_ids", "digests"}),
+    "entry_sync_transition": frozenset({"id", "previous_state", "resolutions", "candidates"}),
+    "entry_sync_schema_resolution_candidate": frozenset({"kind", "local", "remote", "prepared"}),
+    "entry_sync_entry_resolution_candidate": frozenset({"kind", "entry_ids", "local", "remote", "prepared"}),
+    "account_publication_marker": frozenset({"provider", "name", "sha256"}),
+    "memory_history_provenance": frozenset({"session_id", "seq_start", "seq_end", "fragment_start", "fragment_end", "model", "usage"}),
+    "entry_memory_snapshot_reference": frozenset({"state"}),
+    "legacy_memory_snapshot": frozenset(
+        {"brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"}
+    ),
+    "eviction_reasoning_receipt_metadata": frozenset({"context_evicted", "source_seq"}),
+    'todo_item': frozenset({'content', 'status'}),
+    'response_action': frozenset({'action'}),
+    'response_action_report': frozenset({'action', 'report'}),
+    'response_report': frozenset({'head_sha', 'status', 'summary', 'verdict'}),
+    'child_idle_notification': frozenset({'ask_parent_question_id', 'child_instance_id', 'child_session_path', 'description', 'display_only', 'kind', 'origin', 'status', 'text'}),
+    'project_registry_record': frozenset({'canonical_integration_root', 'created_at', 'lanes', 'name', 'project_id', 'repo_agents', 'schema_version', 'scope', 'updated_at'}),
+    'memory_state_root': frozenset({'compacted_through_version', 'entries', 'format', 'generation', 'project_id', 'schema'}),
+    'memory_schema': frozenset({'kinds', 'profile', 'version'}),
+    'memory_kind': frozenset({'default_expiry_days', 'description', 'key', 'name', 'prompt_max_entries', 'prompt_mode', 'prompt_priority'}),
+    'memory_entry': frozenset({'accepted_at', 'accepted_by', 'automatic', 'created_at', 'expires_at', 'expiry_is_default', 'id', 'kind', 'last_operation_id', 'migration_order', 'migration_source', 'project_id', 'representation', 'section', 'seen_at', 'sources', 'status', 'superseded_by', 'supersedes', 'text', 'updated_at', 'valid_from', 'valid_until'}),
+    'memory_missing_entry': frozenset({'id', 'missing'}),
+    'memory_source': frozenset({'evidence_rank', 'observed_at', 'origins', 'seq_end', 'seq_start', 'session_id'}),
+    'memory_migration_source': frozenset({'source_digest', 'source_version'}),
+    'memory_operation_receipt': frozenset({'automatic', 'operation_id', 'reason', 'reconciliation_key', 'result_ids', 'target_ids', 'type'}),
+    'background_output_journal_commit': frozenset({'length', 'offset', 'task_id'}),
+    'client_delivery_send_acceptance': frozenset({'delivery_id', 'method', 'outcome', 'status'}),
+    'client_delivery_steer_acceptance': frozenset({'delivery_id', 'method', 'outcome', 'status'}),
+    'client_delivery_queued_steer_acceptance_message': frozenset({'accepted_message', 'delivery_id', 'method', 'outcome', 'status'}),
+    'client_delivery_delivered_transition': frozenset({'delivery_id', 'method', 'status'}),
+    'client_delivery_dropped_transition': frozenset({'delivery_id', 'method', 'reason', 'status'}),
+    'tool_result_text': frozenset({'annotations', 'full_size', 'full_size_chars', 'next_offset', 'spill_path', 'text', 'truncated', 'type'}),
+    'tool_result_image': frozenset({'annotations', 'caption', 'data', 'height', 'mimeType', 'path', 'size', 'type', 'width'}),
+    'tool_result_resource': frozenset({'annotations', 'resource', 'type'}),
+    'tool_result_resource_contents': frozenset({'blob', 'mimeType', 'text', 'uri'}),
+    'tool_result_annotations': frozenset({'audience', 'lastModified', 'priority'}),
+    'attention_record': frozenset({'created_at', 'kind', 'decision', 'entry_id', 'entry_seq', 'fork_session_id', 'id', 'lane', 'options', 'project_id', 'recommendation', 'resolved_at', 'session_id', 'status', 'title', 'why'}),
+    'attention_fork_meta': frozenset({'attention_id', 'forked_at_entry', 'forked_from_session'}),
+    "transcript_recovery.evidence": frozenset(
+        {
+            "schema",
+            "quarantine_id",
+            "target",
+            "source_digest",
+            "source_size",
+            "first_bad_row",
+            "first_bad_offset",
+            "valid_prefix_end",
+            "retained_last_sequence",
+            "repaired_digest",
+            "diagnosed_at",
+            "payload_digest",
+            "payload_size",
+        }
+    ),
+    "transcript_recovery.state": frozenset(
+        {
+            "schema",
+            "quarantine_id",
+            "target",
+            "state",
+            "expected_source_digest",
+            "repaired_digest",
+            "cutoff_sequence",
+            "diagnosis_timestamp",
+            "memory_step",
+        }
+    ),
+    "transcript_recovery.target": frozenset({"root_session_id", "child_run_id"}),
+}
+
+
 BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
     "memory-current.json": frozenset({("history",)}),
     "meta.json": frozenset({("prompt_components",)}),
@@ -42,6 +145,7 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "attention.kind": frozenset({"decision", "answer", "decided", "deferred"}),
     "account.provider": frozenset({"anthropic", "codex"}),
     "account_registry.version": frozenset({1}),
     "conversation.entry_type": frozenset(
@@ -74,13 +178,44 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "project.session_role": frozenset({"session", "orchestrator", "worker"}),
     "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
     "sent_message_ledger.schema_version": frozenset({1}),
+    "transcript_recovery.evidence_schema": frozenset({"zeta.transcript-quarantine.v1"}),
+    "transcript_recovery.state_schema": frozenset({"zeta.transcript-recovery.v1"}),
+    "transcript_recovery.state": frozenset({"pending", "committed", "abandoned"}),
+    "transcript_recovery.memory_step": frozenset(
+        {"not_required", "review_pending", "resumed"}
+    ),
+    "warning.transcript_recovery.kind": frozenset({"transcript_recovery"}),
 }
+
+RECOVERY_STATE_MEMORY_PAIRS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {
+        ("pending", "not_required"),
+        ("pending", "review_pending"),
+        ("committed", "not_required"),
+        ("committed", "review_pending"),
+        ("committed", "resumed"),
+        ("abandoned", "not_required"),
+    }
+)
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
 
 class StorageFormatError(ValueError):
     """Raised when a home cannot be accessed by this stored-format version."""
+
+
+def reject_unknown_keys(payload: Mapping[str, object], shape: str) -> None:
+    """Enforce the one authoritative accepted-key declaration for a payload."""
+
+    accepted = ACCEPTED_KEY_SETS.get(shape)
+    if accepted is None:
+        raise StorageFormatError(f"stored key shape is not registered: {shape}")
+    unknown = set(payload) - accepted
+    if unknown:
+        raise StorageFormatError(
+            f"unknown keys for {shape}: {sorted(unknown)!r}"
+        )
 
 
 def require_closed_variant(shape: str, value: object) -> object:
@@ -92,6 +227,58 @@ def require_closed_variant(shape: str, value: object) -> object:
     if value not in accepted:
         raise StorageFormatError(f"unsupported stored variant for {shape}: {value!r}")
     return value
+
+
+def registry_dump() -> dict[str, object]:
+    """Return the deterministic compatibility registry for this release."""
+
+    return {
+        "writer_epoch": WRITER_EPOCH,
+        "closed_variants": {
+            name: sorted(values, key=lambda value: (type(value).__name__, repr(value)))
+            for name, values in sorted(CLOSED_VARIANTS.items())
+        },
+        "broad_owned_subtrees": {
+            name: sorted(".".join(path) for path in paths)
+            for name, paths in sorted(BROAD_OWNED_SUBTREES.items())
+        },
+        "accepted_key_sets": {
+            name: sorted(values) for name, values in sorted(ACCEPTED_KEY_SETS.items())
+        },
+    }
+
+
+def compare_registry_dumps(
+    predecessor: Mapping[str, object], candidate: Mapping[str, object]
+) -> None:
+    """Reject registry changes unless the candidate epoch is strictly newer."""
+
+    previous_epoch = predecessor.get("writer_epoch")
+    candidate_epoch = candidate.get("writer_epoch")
+    if type(previous_epoch) is not int or type(candidate_epoch) is not int:
+        raise StorageFormatError("registry dump has an invalid writer_epoch")
+    changes: list[str] = []
+    for registry_name, label in (
+        ("closed_variants", "registry value"),
+        ("broad_owned_subtrees", "broad-owned subtree"),
+        ("accepted_key_sets", "accepted key"),
+    ):
+        before = predecessor.get(registry_name, {})
+        after = candidate.get(registry_name, {})
+        if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+            raise StorageFormatError(f"registry dump has invalid {registry_name}")
+        for shape in sorted(set(before) | set(after)):
+            old = set(before.get(shape, ()))
+            new = set(after.get(shape, ()))
+            for value in sorted(old ^ new, key=repr):
+                changes.append(f"shape {shape}: {label} {value!r} changed")
+    if changes and candidate_epoch <= previous_epoch:
+        raise StorageFormatError(
+            "; ".join(changes)
+            + "; registry delta requires WRITER_EPOCH = latest origin/main + 1 "
+            "(candidate must be greater than the predecessor's); "
+            "bump the epoch in src/zeta/storage_format.py"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +319,100 @@ type Mutation = SetValue | DeleteValue | ReplaceSubtree | PatchRecords
 PublishBytes = Callable[[int, str, bytes], None]
 
 
+# Lease release that is safe to start from a garbage-collector finalizer.
+# The collector can run a finalizer at any allocation on any thread, including
+# while some thread holds a lease registry lock, so a finalizer that took that
+# lock could deadlock. A finalizer only queues the release with release_later
+# and never runs it. Normal code runs the queue at safe points with
+# drain_releases: after the last registry lock in the process is released,
+# before a lease is acquired, after an explicit close, and at exit. An explicit
+# close releases its own leases with release_now, never through the queue, so
+# its locks are free when it returns even if another thread is draining.
+# Release callbacks may take only RegistryLock locks.
+
+
+class _ThreadState(threading.local):
+    held = 0
+    draining = False
+
+
+_STATE = _ThreadState()
+_PENDING: deque[tuple[Callable[..., None], tuple[Any, ...]]] = deque()
+# Only normal code touches the process-wide count; finalizers never read it.
+_HELD_LOCK = threading.Lock()
+_held = 0
+
+
+def release_later(close: Callable[..., None], *args: Any) -> None:
+    """Finalizer callback: queue ``close(*args)`` for the next safe point. Takes no lock."""
+
+    _PENDING.append((close, args))
+
+
+def pending_releases() -> bool:
+    """Whether a release is queued. Takes no lock; a later append is seen next call."""
+
+    return bool(_PENDING)
+
+
+def drain_releases() -> None:
+    """Run queued releases; a no-op on a thread that holds a registry lock or is draining."""
+
+    if _STATE.held or _STATE.draining:
+        return
+    _STATE.draining = True
+    try:
+        # A collection inside a close only appends; this loop picks it up.
+        while True:
+            try:
+                close, args = _PENDING.popleft()
+            except IndexError:
+                return
+            try:
+                close(*args)
+            except Exception:  # noqa: BLE001 - a failed release must not fail the unrelated caller
+                sys.excepthook(*sys.exc_info())
+    finally:
+        _STATE.draining = False
+
+
+def release_now(finalizer: weakref.finalize) -> None:
+    """Explicit close: run the owner's own release here, at most once, then drain the queue."""
+
+    detached = finalizer.detach()  # the finalizer can no longer queue it too
+    if detached is not None:
+        _owner, _release_later, (close, *args), _kwargs = detached
+        close(*args)
+    drain_releases()
+
+
+atexit.register(drain_releases)
+
+
+class RegistryLock:
+    """A non-reentrant lock; the last holder in the process drains releases after it lets go."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> None:
+        global _held
+        self._lock.acquire()
+        with _HELD_LOCK:
+            _held += 1
+        _STATE.held += 1
+
+    def __exit__(self, *_exc: object) -> None:
+        global _held
+        _STATE.held -= 1
+        with _HELD_LOCK:
+            _held -= 1
+            last = not _held
+        self._lock.release()
+        if last and _PENDING:
+            drain_releases()
+
+
 @dataclass(slots=True)
 class _RegistryEntry:
     fd: int
@@ -141,7 +422,7 @@ class _RegistryEntry:
 
 
 _REGISTRY: dict[Path, _RegistryEntry] = {}
-_REGISTRY_LOCK = threading.RLock()
+_REGISTRY_LOCK = RegistryLock()
 
 
 @contextmanager
@@ -227,12 +508,9 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
         decoder = json.JSONDecoder()
         text = raw.decode()
         value, end = decoder.raw_decode(text)
-        if (
-            text[end:].strip()
-            or type(value) is not dict
-            or set(value) != {"writer_epoch"}
-        ):
+        if text[end:].strip() or type(value) is not dict:
             raise ValueError
+        reject_unknown_keys(value, "storage_manifest")
         epoch = value["writer_epoch"]
         if type(epoch) is not int or epoch < 0:
             raise ValueError
@@ -287,6 +565,7 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
 def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
     """Retain a process-shared home lease after checking writer compatibility."""
 
+    drain_releases()
     canonical = _canonical_home(home)
     with _REGISTRY_LOCK:
         registered = _REGISTRY.get(canonical)
@@ -528,6 +807,13 @@ class WriterLease:
         self._entry = entry
         self._closed = False
 
+    @property
+    def observed_epoch(self) -> int:
+        """Return the home epoch observed when this lease was acquired."""
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        return self._entry.epoch
+
     def retain(self) -> WriterLease:
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
@@ -575,6 +861,8 @@ class WriterLease:
         publish: PublishBytes,
         path: tuple[str, ...] = (),
         initial: object | None = None,
+        validate: Callable[[object], None] | None = None,
+        on_invalid_json: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Patch and explicitly delete object records by identity."""
 
@@ -585,12 +873,20 @@ class WriterLease:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
                 raw: object = ([] if not path else {}) if initial is None else initial
+                exists = False
             else:
+                exists = True
                 try:
                     with os.fdopen(fd, "rb") as stream:
                         raw = json.load(stream)
-                except (OSError, ValueError) as exc:
+                except (ValueError, RecursionError) as exc:
+                    if on_invalid_json is not None:
+                        on_invalid_json()
                     raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+                except OSError as exc:
+                    raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+            if validate is not None and exists:
+                validate(raw)
             records = raw
             if path:
                 if type(raw) is not dict:
