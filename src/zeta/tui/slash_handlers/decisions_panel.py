@@ -220,17 +220,52 @@ class DecisionsMixin:
             self._decisions_scan_work = work
             args = (self._home, self._decisions_session_id, _registry_state(self))
 
+            attention_dir = (
+                self._home
+                / "sessions"
+                / self._decisions_session_id
+                / "attention"
+            )
+
+            def signature() -> tuple[tuple[str, int, int], ...]:
+                try:
+                    return tuple(
+                        sorted(
+                            (
+                                path.name,
+                                path.stat().st_mtime_ns,
+                                path.stat().st_size,
+                            )
+                            for path in attention_dir.iterdir()
+                            if path.is_file()
+                        )
+                    )
+                except OSError:
+                    return ()
+
             def deliver(result: tuple | Exception) -> None:
                 if work.done():
                     return
                 if isinstance(result, Exception):
                     work.set_exception(result)
                 else:
-                    work.set_result(result)
+                    items, scanned_signature = result
+                    if signature() != scanned_signature:
+                        threading.Thread(
+                            target=scan, name="zeta-decisions-scan", daemon=True
+                        ).start()
+                        return
+                    work.set_result(items)
 
             def scan() -> None:
                 try:
+                    signature_before = signature()
                     result = open_decisions(*args)
+                    # A record can change while the off-loop scan runs. Do not
+                    # publish a projection from before that change.
+                    if signature() != signature_before:
+                        result = open_decisions(*args)
+                    result = (result, signature())
                 except Exception as exc:  # noqa: BLE001 - publish scan failures
                     result = exc
                 if loop.is_closed():
