@@ -69,9 +69,10 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
+from tests.test_agent import CancelledBeforeAnswerBackend, _collect
 from zeta.accounts import (
     AccountId,
     AccountStore,
@@ -92,6 +93,7 @@ from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.project_context.projection import ProjectContextHealth
+from zeta.project_registry import ProjectRegistry
 from zeta.providers.anthropic import (
     AnthropicBackend,
     AnthropicCredentialDriver,
@@ -4314,6 +4316,23 @@ def test_render_event_error_is_visible() -> None:
     assert "reason: provider stopped" in renderable_plain(rendered)
 
 
+def test_no_progress_loop_renders_as_named_non_retryable_error() -> None:
+    message = (
+        "the model was called 2 times with the same request and nothing new was "
+        "saved; stopped to avoid repeat spend. Input not delivered: it is held "
+        "and goes with the next message."
+    )
+    rendered = render_event(
+        StreamEvent(StreamEventType.ERROR, error=ErrorInfo("no_progress_loop", message))
+    )
+
+    assert isinstance(rendered, Panel)
+    plain = renderable_plain(rendered)
+    assert "model loop stopped · no_progress_loop" in plain
+    assert "goes with the next message." in plain
+    assert "retry: ctrl+y" not in plain
+
+
 def test_account_lock_timeout_renders_as_retryable_error() -> None:
     message = (
         "cannot access codex:work: another process holds the account lock; "
@@ -5317,6 +5336,65 @@ def test_nested_stalled_idle_background_event_renders_last_message(
     rendered = output.getvalue()
     assert "nested verifier" in rendered
     assert "nested verifier is waiting for review" in rendered
+
+
+@pytest.mark.asyncio
+async def test_held_input_notice_renders_on_root_transcript(tmp_path: Path) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path / "root"), output)
+    child_store = ConversationStore(tmp_path / "child")
+    child_store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="stopped worker",
+    )
+    child_store.append_agent_notification(
+        "root:notice",
+        child_session_path=str(child_store.session_dir),
+        description="held input",
+        status="completed",
+        text="held input",
+    )
+    backend = CancelledBeforeAnswerBackend()
+    child_loop = AgentLoop(
+        backend,
+        child_store,
+        skill_catalog=SkillCatalog.empty(),
+        background_owner=app.loop._background_owner,
+        agent_instance_id="root:1",
+        agent_depth=1,
+    )
+    child_loop.set_background_event_sink(app.loop._publish_background_event)
+    try:
+        flow = await await_or_fail(
+            child_loop._ensure_step_delivery(), what="child flow"
+        )
+        flow.initialize_resident_edges()
+        assert child_store.agent_notifications()
+        assert flow.has_pending_edge
+        for _ in range(2):
+            run = asyncio.create_task(
+                _collect(child_loop.run_notification_turn())
+            )
+            await await_or_fail(backend.started.wait(), what="provider call started")
+            run.cancel()
+            await await_or_fail(
+                asyncio.gather(run, return_exceptions=True),
+                what="cancelled notification turn",
+            )
+            backend.started.clear()
+        [event async for event in child_loop.run_notification_turn()]
+
+        rendered = output.getvalue()
+        assert "stopped worker" in rendered
+        assert "Input not delivered" in rendered
+        assert backend.calls == 2
+    finally:
+        await await_or_fail(child_loop.close(), what="child loop close")
+        child_store.close()
+        await await_or_fail(app.close(), what="tui app close")
 
 
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
@@ -14817,14 +14895,14 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
             refresh_rendered.set()
 
     app._repaint_accounts_picker = repaint_and_signal
-    monkeypatch.setattr("zeta.accounts.usage.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("zeta.accounts.store.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
     locked = threading.Event()
     release = threading.Event()
 
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait()
+            release.wait(10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
@@ -14832,7 +14910,9 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        await refresh_rendered.wait()
+        await await_or_fail(
+            refresh_rendered.wait(), what="busy account refresh render"
+        )
         assert app._accounts_picker is not None
         assert app._accounts_picker.usages is not None
         assert app._accounts_picker.usages[account].error == (
@@ -14844,7 +14924,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
         assert "refresh failed: account busy" in plain
     finally:
         release.set()
-        holder.join()
+        holder.join(10)
         opened.store.close()
 
 
@@ -15385,6 +15465,54 @@ async def test_history_finder_does_not_cross_session_boundaries(
     assert len(batches) == 1
     assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()
+
+
+@pytest.mark.asyncio
+async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
+    tmp_path: Path,
+) -> None:
+    writer = await asyncio.to_thread(open_writer, tmp_path)
+    projects = ProjectRegistry(tmp_path / "projects")
+    project = projects.create_project("alpha", "alpha")
+    store = ConversationStore(
+        tmp_path / "sessions", session_id="a" * 32, cwd=tmp_path
+    )
+    ledger = store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=projects,
+        inbox_enabled=True,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    try:
+        activation_error = None
+        try:
+            await loop.activate()
+        except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
+            activation_error = exc
+        assert activation_error is None
+        app = TUIApp(loop, provider="codex", model="offline")
+        async with owned_app(app):
+            app._full_screen_active = lambda: True
+            app._rebuild_transcript()
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "sent history is incomplete (invalid_json)" in rendered
+            assert "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project-inbox-sent.json" in rendered
+            assert "file was not changed" in rendered
+            assert "unless the repaired ledger includes their IDs" in rendered
+    finally:
+        await loop.close()
+        store.close()
+        await asyncio.to_thread(writer.close)
 
 
 @pytest.mark.parametrize(
