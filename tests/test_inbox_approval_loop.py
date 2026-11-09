@@ -7,8 +7,10 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
@@ -16,15 +18,20 @@ from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
+    StreamEvent,
     StreamEventType,
     TextContent,
     ToolCall,
     ToolUseContent,
 )
 from zeta.runtime.loop import AgentLoop
+from zeta.server.approval_lifecycle import ApprovalLifecycle, Close, Start
+from zeta.server.connections import Admission
+from zeta.server.protocol import EventDescriptor
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
 from zeta.tools.registry import ToolRegistry
+from zeta.tui.app import TUIApp
 
 SRC = Path(__file__).parents[1] / "src" / "zeta"
 
@@ -121,28 +128,33 @@ async def test_name_grant_sends_first_inbox_call_through_real_turn(tmp_path: Pat
         inbox = ProjectInbox(projects, sessions_root=home / "sessions")
         delivered = (await asyncio.to_thread(inbox.list, beta.project_id))["new"]
         assert [message["title"] for message in delivered] == ["send-beta"]
-        call = _persisted_calls(store, "send-beta")[0]
-        assert policy.request_from_store(call.id, call).label is None
+        assert _call_state(loop, policy, "send-beta") == []
     finally:
         await loop.close()
         store.close()
 
 
+def _call_state(loop: AgentLoop, policy: ApprovalPolicy, call_id: str) -> list[str]:
+    """Name every per-call container on the registry or policy that still holds the call."""
+    return [
+        f"{type(owner).__name__}.{name}"
+        for owner in (loop.tool_registry, policy)
+        for name, value in vars(owner).items()
+        if isinstance(value, (dict, set, frozenset)) and call_id in value
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("decision", ["allow", "deny", "abort"])
-async def test_settled_inbox_approval_drops_its_display_label(
-    tmp_path: Path, decision: str
-) -> None:
-    _home_dir, projects, alpha, beta, store = await asyncio.to_thread(_home, tmp_path)
+async def test_settled_inbox_approval_leaves_no_call_state(tmp_path: Path, decision: str) -> None:
+    _home_dir, projects, alpha, _beta, store = await asyncio.to_thread(_home, tmp_path)
     policy = ApprovalPolicy(default="ask", store=store)
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[_send("send-label")]), ScriptedTurn(content=[TextContent("ok")])]
     )
     loop = _loop(tmp_path, projects, alpha, store, policy, backend)
-    pending_labels: list[str | None] = []
 
     def settle(call: ToolCall) -> None:
-        pending_labels.append(policy.request_from_store(call.id, call).label)
         if decision == "allow":
             policy.approve(call.id)
         elif decision == "deny":
@@ -153,10 +165,104 @@ async def test_settled_inbox_approval_drops_its_display_label(
     try:
         prompts = await asyncio.wait_for(_turn(loop, settle), 30)
         assert prompts == ["send-label"]
-        assert pending_labels == [f"beta ({beta.project_id})"]
-        call = _persisted_calls(store, "send-label")[0]
-        assert policy.request_from_store(call.id, call).label is None, "label outlived its call"
+        assert _call_state(loop, policy, "send-label") == [], "label outlived its call"
     finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["cancel_durable_append", "prepare_approval_raises"])
+async def test_prepared_call_that_never_dispatches_leaves_no_call_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    _home_dir, projects, alpha, beta, store = await asyncio.to_thread(_home, tmp_path)
+    policy = ApprovalPolicy(default="ask", store=store)
+    backend = FakeBackend([ScriptedTurn(tool_calls=[_send("send-fail")])])
+    loop = _loop(tmp_path, projects, alpha, store, policy, backend)
+    reached: list[str] = []
+
+    def append(message, approval_requests):
+        # The durable append is synchronous, so a cancellation here surfaces from inside it.
+        reached.extend(call.arguments["project"] for _id, call, *_rest in approval_requests)
+        raise asyncio.CancelledError
+
+    def prepare_approval(call: ToolCall):
+        reached.append(call.arguments["project"])
+        raise RuntimeError("prepare_approval failed")
+
+    if failure == "cancel_durable_append":
+        monkeypatch.setattr(store, "append_message_with_approval_requests", append)
+    else:
+        monkeypatch.setattr(loop.tool_registry, "prepare_approval", prepare_approval)
+    try:
+        with pytest.raises((asyncio.CancelledError, RuntimeError)):
+            await asyncio.wait_for(_turn(loop), 30)
+        assert reached == [beta.project_id], "the failure must come after call preparation"
+        assert _call_state(loop, policy, "send-fail") == [], "label outlived its call"
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_inbox_approval_names_beta_in_tui_card_and_serve_event(
+    tmp_path: Path,
+) -> None:
+    _home_dir, projects, alpha, beta, store = await asyncio.to_thread(_home, tmp_path)
+    policy = ApprovalPolicy(default="ask", store=store)
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_send("send-shown")]), ScriptedTurn(content=[TextContent("ok")])]
+    )
+    loop = _loop(tmp_path, projects, alpha, store, policy, backend)
+    admitted: list[dict[str, object]] = []
+
+    def admit(event: object, session_id: object, **fields: object) -> Admission:
+        admitted.append(fields)
+        return Admission("admitted")
+
+    async def offload(job):
+        return job()
+
+    lifecycle = ApprovalLifecycle(
+        admit=admit,
+        request_turn_failure=lambda: None,
+        policy=lambda: policy,
+        session_id=lambda: "session",
+        parent_store=lambda: None,
+        offload=offload,
+        is_closing=lambda: False,
+    )
+    app = TUIApp(loop, provider="codex", model="offline", approval_policy=policy)
+    cards: list[str] = []
+
+    async def show(event: StreamEvent) -> None:
+        await await_or_fail(
+            lifecycle.transition(Start(event, "session", EventDescriptor.APPROVAL_REQUEST)),
+            what="serve approval start",
+        )
+        app._present_pending_approvals()
+        # getattr: the lookup tasks do not exist on the pre-fix base, which must reach the assert.
+        lookups = getattr(app, "_approval_label_tasks", ())
+        await await_or_fail(asyncio.gather(*lookups), what="tui label lookup")
+        cards.append(Text.from_ansi(app._transcript.render(120)).plain)
+        policy.deny(event.tool_call.id)
+
+    async def drive() -> None:
+        async for event in loop.run_turn("send it", origin=MessageOrigin.USER):
+            if event.type is StreamEventType.TOOL_APPROVAL_START and event.tool_call is not None:
+                await show(event)
+
+    try:
+        async with owned_app(app):
+            app._full_screen_active = lambda: True
+            await asyncio.wait_for(drive(), 30)
+            label = f"beta ({beta.project_id})"
+            assert [fields.get("label") for fields in admitted] == [label]
+            assert len(cards) == 1 and f"allow {label}?" in cards[0], cards
+            assert _call_state(loop, policy, "send-shown") == []
+    finally:
+        await await_or_fail(lifecycle.transition(Close()), what="serve approval close")
         await loop.close()
         store.close()
 

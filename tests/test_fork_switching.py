@@ -487,6 +487,7 @@ def test_visible_approval_card_is_removed_when_request_ends() -> None:
         remove=lambda old, *, leading_blank: removed.append(old)
     )
     app._invalidate_prompt = lambda: None
+    app._approval_policy = None
     owner = SimpleNamespace()
     request = ApprovalRequest("main", ToolCall("main", "read", {"path": "x"}))
 
@@ -511,6 +512,7 @@ def test_shortcut_card_tracks_first_pending_approval(
                 remove=lambda unit, *, leading_blank: None
             )
             self._invalidate_prompt = lambda: None
+            self._approval_policy = None
 
         @property
         def local_pending_approvals(self) -> tuple[ApprovalRequest, ...]:
@@ -608,6 +610,7 @@ def test_replaced_approval_handle_renders_new_card(
         remove=lambda old, *, leading_blank: removed.append(old)
     )
     app._invalidate_prompt = lambda: None
+    app._approval_policy = None
     owner = SimpleNamespace()
     old_request = ApprovalRequest("same", ToolCall("same", "read", {"path": "x"}))
     replacement = ApprovalRequest(
