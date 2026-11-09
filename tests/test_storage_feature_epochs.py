@@ -90,6 +90,8 @@ def test_feature_gates_do_not_compare_against_writer_epoch() -> None:
     [
         "from zeta.storage_format import WRITER_EPOCH as epoch\nif home_epoch == epoch: pass",
         "from zeta.storage_format import WRITER_EPOCH as epoch\ndef f(value=epoch): pass",
+        "def f(value=WRITER_EPOCH): pass",
+        "import zeta.storage_format as sf\ndef f(value=sf.WRITER_EPOCH): pass",
         "import zeta.storage_format as sf\nif home_epoch == sf.WRITER_EPOCH: pass",
     ],
 )
