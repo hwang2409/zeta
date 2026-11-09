@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import subprocess
 import sys
@@ -25,7 +26,16 @@ CONTRACT_ERROR = (
     "'# test-contract: complexity <reason>', 'durability <reason>', or "
     "'seam <reason>' on this line or the line above"
 )
-CONTRACT_KINDS = {"bootstrap", "complexity", "durability", "latency", "seam"}
+CONTRACT_KINDS = {
+    "bootstrap",
+    "complexity",
+    "durability",
+    "latency",
+    "seam",
+    "transport",
+}
+# A transport marker only names a non-serve reader; it does not excuse a missing deadline.
+DEADLINE_MARKER_KINDS = CONTRACT_KINDS - {"transport"}
 ASYNC_BLOCKING_CODE = "TQ007"
 ASYNC_BLOCKING_ERROR = (
     "sync filesystem call {call} in async def {function} blocks the event loop; "
@@ -86,9 +96,15 @@ AWAIT_DEADLINE_ERROR = (
     "await without a deadline: use `await await_or_fail(x, what=...)` "
     "(tests/support/owned.py), or asyncio.wait_for(x, 10)"
 )
+POLLING_SPIN_ERROR = (
+    "polling loop without a deadline: wrap the wait in await_or_fail "
+    "(tests/support/owned.py) or give it an explicit deadline "
+    "(asyncio.timeout(N)), or wait on an event set by the producer"
+)
 SYNC_DEADLINE_ERROR = "blocking wait without a deadline: pass timeout=10"
 AWAIT_DEADLINE_CODE = "TQ004"
 RATCHET_PATH = Path("tests/test_quality_ratchet.txt")
+POLLING_SPIN_RATCHET_PATH = Path("tests/test_polling_spin_ratchet.txt")
 GLOBAL_BOOTSTRAP_ALLOWLIST = {
     "ZETA_TEST_PARENT_PID",  # harness identity for child-process ownership checks
     "ZETA_STALL_WATCHDOG",  # disables an unrelated watchdog during test setup
@@ -96,6 +112,25 @@ GLOBAL_BOOTSTRAP_ALLOWLIST = {
     "ZETA_TEST_LIVE_HOME",  # identifies the guarded live-home fixture
     "ZETA_TEST_OWNERSHIP_TOKEN",  # authenticates writes from guarded children
 }
+RAW_SERVE_READ_CODE = "TQ008"
+RAW_SERVE_READ_ERROR = (
+    "raw serve-socket read bypasses the shared client: use "
+    "tests/support/server_client.py read helpers (send + read_until), which keep "
+    "reading until every sent request has its response; mark a reader that is "
+    "not a newline JSON-RPC serve socket with "
+    "'# test-contract: transport <reason>' on this line or the line above"
+)
+# Serve frames on a socket are newline-framed, so readline is the only raw read the
+# shared client can replace; readuntil/readexactly read HTTP or websocket framing.
+RAW_SERVE_READ_METHODS = {"readline"}
+SERVE_CLIENT_MODULE = Path("tests/support/server_client.py")
+RAW_SERVE_WRITE_CODE = "TQ009"
+RAW_SERVE_WRITE_ERROR = (
+    "send serve requests with tests/support/server_client.py send() so read "
+    "helpers and close_serve read the response; mark a deliberate malformed or "
+    "raw-transport frame with '# test-contract: transport <reason>'"
+)
+RAW_SERVE_WRITE_METHODS = {"write", "writelines"}
 
 
 @dataclass(frozen=True)
@@ -560,6 +595,143 @@ def _inside_timeout_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> b
     )
 
 
+def _scoped_walk(node: ast.AST) -> list[ast.AST]:
+    result: list[ast.AST] = []
+
+    class Visitor(ast.NodeVisitor):
+        def generic_visit(self, current: ast.AST) -> None:
+            result.append(current)
+            for child in ast.iter_child_nodes(current):
+                if isinstance(
+                    child,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+                ):
+                    continue
+                self.visit(child)
+
+    Visitor().visit(node)
+    return result
+
+
+def _binds_name(node: ast.AST, name: str, direct_imports: set[int]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == name and not isinstance(node.ctx, ast.Load)
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, ast.alias):
+        bound = node.asname or node.name.split(".")[0]
+        return (node.name == "*" or bound == name) and id(node) not in direct_imports
+    return any(
+        value == name or isinstance(value, list) and name in value
+        for field in ("name", "names", "rest")
+        if (value := getattr(node, field, None)) is not None
+    )
+
+
+def _direct_sleep_modules(tree: ast.Module) -> set[str]:
+    """Return direct sleep modules whose names have no uncertain binding.
+
+    An unrelated binding anywhere in the file, including a trailing ``del asyncio``
+    or a star import, disables that module for the whole file. This deliberate false
+    negative avoids scoping false positives.
+    """
+    direct_aliases: set[int] = set()
+    direct_imports: Counter[str] = Counter()
+    for statement in filter(lambda node: isinstance(node, ast.Import), tree.body):
+        for imported in statement.names:
+            if (imported.name, imported.asname) in {("asyncio", None), ("anyio", None)}:
+                direct_aliases.add(id(imported))
+                direct_imports[imported.name] += 1
+
+    candidates: set[str] = set()
+    for module, count in direct_imports.items():
+        if count == 1:
+            candidates.add(module)
+
+    for node in ast.walk(tree):
+        for module in tuple(candidates):
+            if _binds_name(node, module, direct_aliases):
+                candidates.remove(module)
+    return candidates
+
+
+def _literal_zero_sleep(node: ast.AST, modules: set[str]) -> bool:
+    return (
+        isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "sleep"
+        and isinstance(node.value.func.value, ast.Name)
+        and node.value.func.value.id in modules
+        and bool(node.value.args)
+        and isinstance(node.value.args[0], ast.Constant)
+        and not isinstance(node.value.args[0].value, bool)
+        and node.value.args[0].value == 0
+    )
+
+
+def _finite_polling_timeout(node: ast.AsyncWith) -> bool:
+    return any(
+        isinstance(call := item.context_expr, ast.Call)
+        and _name(call.func) in {"asyncio.timeout", "asyncio.timeout_at"}
+        and bool(call.args)
+        and not (
+            isinstance(call.args[0], ast.Constant) and call.args[0].value is None
+        )
+        for item in node.items
+    )
+
+
+def _polling_spin_findings(
+    path: Path,
+    tree: ast.Module,
+    eligible_nodes: set[ast.AST] | None = None,
+) -> list[Finding]:
+    modules = _direct_sleep_modules(tree)
+    findings: list[Finding] = []
+
+    class Visitor(ast.NodeVisitor):
+        deadline_depth = 0
+
+        def _visit_scope(self, node: ast.AST) -> None:
+            previous = self.deadline_depth
+            self.deadline_depth = 0
+            self.generic_visit(node)
+            self.deadline_depth = previous
+
+        visit_FunctionDef = _visit_scope
+        visit_AsyncFunctionDef = _visit_scope
+        visit_ClassDef = _visit_scope
+
+        def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+            self.deadline_depth += _finite_polling_timeout(node)
+            self.generic_visit(node)
+            self.deadline_depth -= _finite_polling_timeout(node)
+
+        def visit_While(self, node: ast.While) -> None:
+            if (
+                not self.deadline_depth
+                and (eligible_nodes is None or node in eligible_nodes)
+                and any(
+                    _literal_zero_sleep(child, modules)
+                    for child in _scoped_walk(node)
+                )
+            ):
+                findings.append(
+                    Finding(
+                        path,
+                        node.lineno,
+                        node.col_offset + 1,
+                        AWAIT_DEADLINE_CODE,
+                        POLLING_SPIN_ERROR,
+                    )
+                )
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return findings
+
+
 def _inside_deadline_argument(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     child = node
     for ancestor in _enclosing_nodes(node, parents):
@@ -680,7 +852,7 @@ def _deadline_findings(
     if _is_unbounded_sync_wait(node, parents):
         return (
             []
-            if _has_marker(lines, node.lineno, CONTRACT_KINDS)
+            if _has_marker(lines, node.lineno, DEADLINE_MARKER_KINDS)
             else [
                 Finding(
                     path,
@@ -707,7 +879,7 @@ def _deadline_findings(
     )
     if (
         not violates
-        or _has_marker(lines, node.lineno, CONTRACT_KINDS)
+        or _has_marker(lines, node.lineno, DEADLINE_MARKER_KINDS)
         or _bounded_asyncio_wait(value)
         or _inside_timeout_context(node, parents)
         or _inside_deadline_argument(node, parents)
@@ -737,7 +909,83 @@ def _scan_added_nodes(
         findings.extend(_timing_findings(path, node, lines))
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
         findings.extend(_contract_findings(path, node, lines, new_private_patches))
+        findings.extend(_raw_serve_read_findings(path, node, lines))
+        findings.extend(_raw_serve_write_findings(path, node, lines))
     return findings
+
+
+def _raw_serve_read_findings(
+    path: Path, node: ast.AST, lines: list[str]
+) -> list[Finding]:
+    """Flag line reads on a stream reader named like a serve socket reader."""
+    if (
+        path == SERVE_CLIENT_MODULE
+        or not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Attribute)
+        or node.func.attr not in RAW_SERVE_READ_METHODS
+    ):
+        return []
+    receiver = _name(node.func.value).rsplit(".", 1)[-1]
+    if (
+        receiver != "reader" and not receiver.endswith("_reader")
+    ) or _has_marker(lines, node.lineno, {"transport"}):
+        return []
+    return [
+        Finding(
+            path,
+            node.lineno,
+            node.col_offset + 1,
+            RAW_SERVE_READ_CODE,
+            RAW_SERVE_READ_ERROR,
+        )
+    ]
+
+
+def _is_jsonrpc_request(node: ast.AST) -> bool:
+    """True for a request literal: a dict, or str/bytes text, with both id and method.
+
+    A response has no method and a notification has no id; neither expects a
+    response, so neither is a request.
+    """
+    for child in ast.walk(node):
+        if isinstance(child, ast.Dict):
+            keys = {key.value for key in child.keys if isinstance(key, ast.Constant)}
+            if {"id", "method"} <= keys:
+                return True
+    text = "".join(
+        child.value if isinstance(child.value, str) else child.value.decode("latin-1")
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, (str, bytes))
+    )
+    return '"id"' in text and '"method"' in text
+
+
+def _raw_serve_write_findings(
+    path: Path, node: ast.AST, lines: list[str]
+) -> list[Finding]:
+    """Flag a JSON-RPC request literal written to a stream outside the shared client.
+
+    shortcut: a request built in a variable first is not seen; widen to name
+    tracking if such writes show up.
+    """
+    if (
+        path == SERVE_CLIENT_MODULE
+        or not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Attribute)
+        or node.func.attr not in RAW_SERVE_WRITE_METHODS
+        or not any(_is_jsonrpc_request(arg) for arg in node.args)
+        or _has_marker(lines, node.lineno, {"transport"})
+    ):
+        return []
+    return [
+        Finding(
+            path,
+            node.lineno,
+            node.col_offset + 1,
+            RAW_SERVE_WRITE_CODE,
+            RAW_SERVE_WRITE_ERROR,
+        )
+    ]
 
 
 def _scan_deadline_nodes(
@@ -1123,6 +1371,13 @@ def lint_source(
             )
         ]
 
+    try:
+        compile(source, str(path), "exec")
+    except SyntaxError:
+        polling_spin_enabled = False
+    else:
+        polling_spin_enabled = True
+
     lines = source.splitlines()
     literal_names = _literal_names(tree)
     serialized_names = _serialized_names(tree)
@@ -1152,6 +1407,10 @@ def lint_source(
         findings.extend(_async_blocking_findings(path, tree, lines, added))
     if "test" in families:
         findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents))
+        if polling_spin_enabled:
+            findings.extend(
+                _polling_spin_findings(path, tree, set(deadline_nodes))
+            )
         findings.extend(_global_bootstrap_findings(path, tree, source, added))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
@@ -1198,8 +1457,9 @@ def finding_ratchet_key(root: Path, finding: Finding) -> str:
 
 def _scan_deadline_findings(
     root: Path,
-) -> tuple[list[Finding], dict[Path, ast.AST]]:
+) -> tuple[list[Finding], list[Finding], dict[Path, ast.AST]]:
     findings: list[Finding] = []
+    polling_spins: list[Finding] = []
     trees: dict[Path, ast.AST] = {}
     for source_path in sorted((root / "tests").rglob("*.py")):
         path = source_path.relative_to(root)
@@ -1214,23 +1474,51 @@ def _scan_deadline_findings(
         }
         for node in ast.walk(tree):
             findings.extend(_deadline_findings(path, node, lines, parents))
-    return findings, trees
+        polling_spins.extend(_polling_spin_findings(path, tree))
+    findings.extend(polling_spins)
+    return findings, polling_spins, trees
 
 
-def _read_ratchet(root: Path) -> set[str]:
-    ratchet_path = root / RATCHET_PATH
-    if not ratchet_path.is_file():
+def _read_allowlist(root: Path, path: Path) -> set[str]:
+    allowlist_path = root / path
+    if not allowlist_path.is_file():
         return set()
     return {
         line.strip()
-        for line in ratchet_path.read_text(encoding="utf-8").splitlines()
+        for line in allowlist_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     }
 
 
+def _read_ratchet(root: Path) -> set[str]:
+    return _read_allowlist(root, RATCHET_PATH)
+
+
+def _polling_spin_slots(
+    findings: list[Finding], trees: dict[Path, ast.AST]
+) -> dict[str, Finding]:
+    slots: dict[str, Finding] = {}
+    counts: Counter[str] = Counter()
+    for finding in sorted(findings, key=lambda item: (str(item.path), item.line)):
+        tree = trees[finding.path]
+        function_key = f"{finding.path}::{_function_at_line(tree, finding.line)}"
+        loop = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.While) and node.lineno == finding.line
+        )
+        fingerprint = hashlib.sha256(
+            ast.dump(loop, include_attributes=False).encode()
+        ).hexdigest()[:16]
+        identity = f"{function_key}::{fingerprint}"
+        counts[identity] += 1
+        slots[f"{identity}::{counts[identity]}"] = finding
+    return slots
+
+
 def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Finding]:
     root = Path.cwd() if root is None else root
-    findings, trees = _scan_deadline_findings(root)
+    findings, polling_spins, trees = _scan_deadline_findings(root)
     for source_path in sorted((root / "src" / "zeta").rglob("*.py")):
         path = source_path.relative_to(root)
         source = source_path.read_text(encoding="utf-8")
@@ -1247,17 +1535,55 @@ def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Find
     if not use_ratchet:
         return findings
     ratchet = _read_ratchet(root)
-    return [
+    visible = {
         finding
         for finding in findings
         if f"{finding.path}::{_function_at_line(trees[finding.path], finding.line)}"
         not in ratchet
+    }
+    current_slots = _polling_spin_slots(polling_spins, trees)
+    allowed_slots = _read_allowlist(root, POLLING_SPIN_RATCHET_PATH)
+    visible.update(
+        finding for slot, finding in current_slots.items() if slot not in allowed_slots
+    )
+    for stale_slot in sorted(allowed_slots - current_slots.keys()):
+        path_text = stale_slot.split("::", 1)[0]
+        visible.add(
+            Finding(
+                Path(path_text),
+                1,
+                1,
+                AWAIT_DEADLINE_CODE,
+                f"stale polling-spin allowlist entry {stale_slot}; delete it",
+            )
+        )
+    return sorted(visible, key=lambda item: (str(item.path), item.line, item.column))
+
+
+def lint_polling_spins(root: Path | None = None) -> list[Finding]:
+    root = Path.cwd() if root is None else root
+    _, polling_spins, trees = _scan_deadline_findings(root)
+    current_slots = _polling_spin_slots(polling_spins, trees)
+    allowed_slots = _read_allowlist(root, POLLING_SPIN_RATCHET_PATH)
+    findings = [
+        finding for slot, finding in current_slots.items() if slot not in allowed_slots
     ]
+    for stale_slot in sorted(allowed_slots - current_slots.keys()):
+        findings.append(
+            Finding(
+                Path(stale_slot.split("::", 1)[0]),
+                1,
+                1,
+                AWAIT_DEADLINE_CODE,
+                f"stale polling-spin allowlist entry {stale_slot}; delete it",
+            )
+        )
+    return sorted(findings, key=lambda item: (str(item.path), item.line, item.column))
 
 
 def write_ratchet(root: Path | None = None) -> tuple[int, int]:
     root = Path.cwd() if root is None else root
-    findings, _ = _scan_deadline_findings(root)
+    findings, _, _ = _scan_deadline_findings(root)
     keys = sorted({finding_ratchet_key(root, finding) for finding in findings})
     (root / RATCHET_PATH).write_text("".join(f"{key}\n" for key in keys))
     return len(findings), len(keys)
@@ -1289,6 +1615,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if arguments == ["--all"]:
         findings = lint_all()
+    elif arguments == ["--polling-spins"]:
+        findings = lint_polling_spins()
     elif len(arguments) == 1:
         diff = (
             sys.stdin.read()
@@ -1299,7 +1627,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             "usage: lint_test_quality.py <unified-diff-path|-> | --all | "
-            "--write-ratchet | --base <pull_request|push|workflow_dispatch> "
+            "--polling-spins | --write-ratchet | "
+            "--base <pull_request|push|workflow_dispatch> "
             "[base-ref]",
             file=sys.stderr,
         )

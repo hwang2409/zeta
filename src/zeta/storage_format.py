@@ -349,6 +349,12 @@ def release_later(close: Callable[..., None], *args: Any) -> None:
     _PENDING.append((close, args))
 
 
+def pending_releases() -> bool:
+    """Whether a release is queued. Takes no lock; a later append is seen next call."""
+
+    return bool(_PENDING)
+
+
 def drain_releases() -> None:
     """Run queued releases; a no-op on a thread that holds a registry lock or is draining."""
 
