@@ -297,10 +297,16 @@ def _approval_subject(
     project = arguments.get("project")
     if not isinstance(project, str) or registry.project_registry is None:
         return None
-    project_id = resolve_project_ref(registry.project_registry, project)
-    if project_id is None:
-        raise ValueError(f"unknown inbox target project {project!r}")
-    return project_id
+    # Capability resolution runs on the event loop; resolve names in the worker
+    # that executes the inbox operation instead of taking the identity lock here.
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        project_id = resolve_project_ref(registry.project_registry, project)
+        if project_id is None:
+            raise ValueError(f"unknown inbox target project {project!r}")
+        return project_id
+    return project
 
 
 def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:

@@ -86,6 +86,24 @@ def _provider_text(provider: str, result: dict) -> str:
 
 
 @pytest.mark.asyncio
+async def test_inbox_approval_subject_keeps_canonical_project_ids(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    try:
+        project_id = registry.project_id
+        assert project_id is not None
+        capability = registry.resolve_call(
+            "inbox", {"action": "send", "project": project_id}
+        )
+        assert capability.subject_value == project_id
+        assert capability.arguments["project"] == project_id
+    finally:
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_inbox_publications_are_off_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
