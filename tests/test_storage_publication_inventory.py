@@ -131,6 +131,7 @@ _RAW_DELETION = {
     ("tools/_spill.py", "_unlink_if_safe", "unlink"),
     ("transcript_search/index.py", "_remove_sqlite_sidecars", "unlink"),
     ("transcript_search/index.py", "_temporary_database", "unlink"),
+    ("transcript_search/index.py", "_clear_building_path", "unlink"),
     ("tui/paste_runtime/__init__.py", "_delete_staged", "unlink"),
 }
 

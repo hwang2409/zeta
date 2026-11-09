@@ -379,6 +379,10 @@ class StoreRuntimeLeaseMixin:
         )
 
     @property
+    def observed_storage_epoch(self) -> int:
+        return self._storage_lease.observed_epoch
+
+    @property
     def execution_lease(self) -> SessionExecutionLease:
         if self._runtime_lease is None:
             raise ConversationIntegrityError("read-only store has no execution lease")

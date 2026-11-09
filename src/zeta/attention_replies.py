@@ -19,6 +19,7 @@ from .attention_records import (
     Broken,
     Missing,
     broken_record_refusal,
+    observed_epoch_for_session,
 )
 from .project_inbox import ProjectInbox
 from .runtime.project_registry_state import (
@@ -122,7 +123,7 @@ class AttentionReplies:
                     recovered,
                     items=(ReplyItemOutcome(attention_id, "already-resolved"),),
                 )
-            AttentionStore(self.session_dir).replace(
+            AttentionStore(self.session_dir, writer_epoch=observed_epoch_for_session(self.session_dir)).replace(
                 replace(record, status="resolved", resolved_at=_now(), decision=reply)
             )
             return self._outcome(
@@ -343,7 +344,7 @@ class AttentionReplies:
                 )
             if record.kind == "decision":
                 self._raise_conflict("decision attention items require a reply")
-            AttentionStore(self.session_dir).replace(
+            AttentionStore(self.session_dir, writer_epoch=observed_epoch_for_session(self.session_dir)).replace(
                 replace(record, status="resolved", resolved_at=_now(), decision=None)
             )
             return self._outcome(
@@ -423,7 +424,7 @@ class AttentionReplies:
         return state
 
     def _record_state(self, attention_id: str) -> AttentionRecord | Broken:
-        state = AttentionStore(self.session_dir).record_state(attention_id)
+        state = AttentionStore(self.session_dir, writer_epoch=observed_epoch_for_session(self.session_dir)).record_state(attention_id)
         if isinstance(state, Missing):
             raise FileNotFoundError(attention_id)
         return state if isinstance(state, Broken) else state.value
@@ -556,7 +557,7 @@ class AttentionReplies:
         pairs = self._journal_pairs(journal)
         if not pairs:
             raise ValueError("attention journal is empty")
-        store = AttentionStore(self.session_dir)
+        store = AttentionStore(self.session_dir, writer_epoch=observed_epoch_for_session(self.session_dir))
         for item_id, reply in pairs:
             state = store.record_state(item_id)
             if isinstance(state, Broken):
@@ -622,7 +623,7 @@ class AttentionReplies:
         for record, (_, reply) in zip(records, pairs):
             current = self._record(record.id)
             if current.status == "open":
-                AttentionStore(self.session_dir).replace(
+                AttentionStore(self.session_dir, writer_epoch=observed_epoch_for_session(self.session_dir)).replace(
                     replace(
                         current, status="resolved", resolved_at=_now(), decision=reply
                     )

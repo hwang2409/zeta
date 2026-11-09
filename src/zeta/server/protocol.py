@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from enum import Enum, StrEnum
 from typing import Any
 
@@ -192,6 +192,7 @@ class EventDescriptor(StrEnum):
     TOOL_END = "tool_end"
     SUB_AGENT_RECEIPT = "sub_agent_receipt"
     CHILD_IDLE = "child_idle"
+    CHILD_HOLD = "child_hold"
     TASK_EXIT_NOTIFICATION = "task_exit_notification"
     PROJECT_INBOX_NOTIFICATION = "project_inbox_notification"
     CHILD_QUESTION = "child_question"
@@ -342,8 +343,6 @@ class MethodDescriptor(Enum):
         return sorted(methods) if role == "observer" else methods
 
 
-Handler = Callable[[object, str | int, dict[str, object]], object]
-
 
 _LOGIN_METHODS = frozenset(
     MethodDescriptor[name]
@@ -375,7 +374,12 @@ _ERGONOMICS_METHODS = frozenset(
 )
 _PROJECT_METHODS = frozenset(
     MethodDescriptor[name]
-    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
+    for name in (
+        "LIST_PROJECTS",
+        "PROJECT_SHOW",
+        "PROJECT_MEMORY_LOG",
+        "PROJECT_INBOX",
+    )
 )
 
 
@@ -383,6 +387,7 @@ MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
 TOOL_OUTPUT_MAX_BYTES = 8_000
+
 
 
 def hello_result(
@@ -573,95 +578,6 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
     return requested
 
 
-LOADED_SESSION_MUTATIONS = frozenset(
-    {
-        "abort",
-        "approve",
-        "clear_steering",
-        "deny",
-        "fork_message",
-        "rename_session",
-        "repair_transcript",
-        "revoke_session_grants",
-        "send",
-        "send_images",
-        "set_compaction",
-        "set_settings",
-        "set_turn_context",
-        "slash_run",
-        "steer",
-        "switch_branch",
-    }
-)
-
-
-async def _dispatch(
-    self, request_id: str | int, method: str, params: dict[str, Any]
-) -> object:
-    handled, result = await self._route_request(request_id, method, params)
-    if handled:
-        return result
-    descriptor = MethodDescriptor.for_wire(method)
-    if self.role == "observer" and (
-        descriptor is None or descriptor.access is not Access.READ
-    ):
-        raise ProtocolError(
-            ErrorDescriptor.OBSERVER_READ_ONLY,
-            "method is unavailable to read-only observers",
-            {"method": method},
-        )
-    if descriptor is None:
-        raise ProtocolError(
-            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
-        )
-    if descriptor.access is Access.SESSION_MUTATION:
-        self.server.control._reject_if_unhealthy()
-    if descriptor.since is not None and tuple(
-        int(part) for part in self.protocol_version.split(".")
-    ) < tuple(int(part) for part in descriptor.since.split(".")):
-        raise self._descriptor_protocol_error(descriptor)
-    if descriptor.feature is not None and descriptor.feature not in self.features:
-        raise self._descriptor_feature_error(descriptor)
-    if descriptor.access is Access.DELIVERY:
-        _require_attached_session(self.server.runtime, params)
-    return await HANDLERS[descriptor](self, request_id, params)
-
-
-def _require_attached_session(runtime: Any, params: dict[str, Any]) -> None:
-    """Reject a delivery aimed at another session before any delivery effect."""
-
-    if "session_id" not in params:
-        return
-    session_id = params["session_id"]
-    if not isinstance(session_id, str) or not session_id:
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
-        )
-    attached = runtime.session_id if runtime.opened is not None else None
-    if attached is not None and session_id != attached:
-        raise ProtocolError(
-            ErrorDescriptor.SESSION_MISMATCH,
-            "session is not active",
-            {"attached_session_id": attached, "session_id": session_id},
-        )
-
-
-def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
-    async def handle(
-        client: object, request_id: str | int, params: dict[str, Any]
-    ) -> object:
-        return await client._dispatch_descriptor(request_id, descriptor, params)  # type: ignore[attr-defined]
-
-    return handle
-
-
-HANDLERS: dict[MethodDescriptor, Handler] = {
-    descriptor: _descriptor_handler(descriptor) for descriptor in MethodDescriptor
-}
-if HANDLERS.keys() != set(MethodDescriptor):
-    raise RuntimeError("serve method handlers are not exhaustive")
-
-
 def protocol_error(descriptor: MethodDescriptor) -> ProtocolError:
     message = {
         **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),
@@ -697,6 +613,8 @@ def feature_error(descriptor: MethodDescriptor) -> ProtocolError:
         f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
     )
     return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
+
+
 
 
 class FrameCodec:

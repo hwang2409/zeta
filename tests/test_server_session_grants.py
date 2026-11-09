@@ -39,7 +39,7 @@ from tests.test_server_websocket import (
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
-from zeta.server import ZetaServer, approval_lifecycle
+from zeta.server import ZetaServer, approval_lifecycle, approval_settlement
 from zeta.server.approval_lifecycle import ExternalEnd
 from zeta.server.protocol import EventDescriptor
 from zeta.tui.app import TUIApp
@@ -62,7 +62,7 @@ async def _approve_after_external_end(
     committed = asyncio.Event()
     release = asyncio.Event()
     external_entered = asyncio.Event()
-    original_persist = approval_module.persist_durably
+    original_persist = approval_settlement.persist_durably
     original_finish = server.control._approvals._finish_record
 
     async def gated_finish(record: object, resolution: dict[str, str]) -> None:
@@ -75,7 +75,7 @@ async def _approve_after_external_end(
         await await_or_fail(release.wait(), what="release durable approval")
         return result
 
-    monkeypatch.setattr(approval_module, "persist_durably", gated_persist)
+    monkeypatch.setattr(approval_settlement, "persist_durably", gated_persist)
     # test-contract: seam force the ExternalEnd ownership interleaving
     monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
     approve = asyncio.create_task(
@@ -475,7 +475,7 @@ async def test_always_tool_grant_survives_external_end_during_approve_settlement
     committed = asyncio.Event()
     release = asyncio.Event()
     external_entered = asyncio.Event()
-    original_persist = approval_lifecycle.persist_durably
+    original_persist = approval_settlement.persist_durably
     original_finish = server.control._approvals._finish_record
 
     async def gated_finish(record: object, resolution: dict[str, str]) -> None:
@@ -488,7 +488,7 @@ async def test_always_tool_grant_survives_external_end_during_approve_settlement
         await asyncio.wait_for(release.wait(), 10)
         return result
 
-    monkeypatch.setattr(approval_lifecycle, "persist_durably", gated_persist)
+    monkeypatch.setattr(approval_settlement, "persist_durably", gated_persist)
     # test-contract: seam force the ExternalEnd ownership interleaving
     monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
     try:
@@ -1481,6 +1481,7 @@ async def test_duplicate_grant_emits_no_event_before_positive_fifo_sentinel(
             "approve",
             {"request_id": "call-2", "scope": "always_tool"},
         )
+        # test-contract: transport inspect events before the raw response frame
         writer.write(
             (
                 json.dumps(
@@ -1577,6 +1578,7 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
             )
         )[-1]["result"]
         assert "session_grants" in hello["capabilities"]["features"]
+        # test-contract: transport read one snapshot response without event buffering
         replacement_writer.write(
             (
                 json.dumps(
@@ -1601,6 +1603,57 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         )
 
 
+@pytest.mark.asyncio
+async def test_abort_canceled_settlement_keeps_controller_connected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = ToolCall("abort-call", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    gate_enabled = False
+    original_commit = ConversationStore._commit_storage_command
+
+    async def gated_commit(store: ConversationStore, command: object) -> object:
+        nonlocal gate_enabled
+        result = await original_commit(store, command)
+        if gate_enabled and type(command).__name__ == "_ResolveApprovalCommand":
+            entered.set()
+            await await_or_fail(release.wait(), what="abort settlement")
+        return result
+
+    # test-contract: seam gate the settlement's typed durable write owner
+    monkeypatch.setattr(ConversationStore, "_commit_storage_command", gated_commit)
+    reader, writer = await _connect(server)
+    try:
+        await _hello_and_create(reader, writer)
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        gate_enabled = True
+        abort = asyncio.create_task(_request(reader, writer, 4, "abort"))
+        await await_or_fail(entered.wait(), what="abort settlement gate")
+        record = server.control._approvals.state.records[approval["request_id"]]
+        assert record.settlement is not None
+        record.settlement.cancel()
+        release.set()
+        frames = await await_or_fail(abort, what="abort response")
+        assert frames[-1]["result"] == {"aborted": True}
+        approval_end = await _event(reader, "approval_end")
+        assert approval_end["reason"] == "turn_canceled"
+        status = (await _request(reader, writer, 5, "status"))[-1]
+        assert status["result"]["state"] in {"idle", "running"}
+    finally:
+        release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
 @pytest.mark.parametrize(
     "case",
     [
@@ -1613,12 +1666,18 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         "cancel_publish",
         "cancel_history",
         "cancel_write",
+        "cancel_owner_exit",
+        "fail_approval_end_publish",
+        "fail_grant_event_publish",
+        "fail_response_write",
+        "abort",
+        "replacement",
         "restart_replay",
     ],
 )
 @pytest.mark.asyncio
-async def test_session_grant_lifecycle_table_over_unix_protocol(
-    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+async def test_session_grant_lifecycle_table_over_real_transports(
+    tmp_path: Path, transport: str, case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Exercise grant ownership and every cancellation await over unix serve."""
     GrantPublication = getattr(approval_lifecycle, "GrantPublication", None)
@@ -1631,45 +1690,241 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
     )
     server = ZetaServer(
         home=tmp_path,
-        socket_path=_socket_path(tmp_path),
+        socket_path=_socket_path(tmp_path) if transport == "unix" else None,
+        port=0 if transport == "websocket" else None,
+        ws_port=0 if transport == "websocket" else None,
         provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer = await _connect(server)
+    if transport == "unix":
+        reader, writer = await _connect(server)
+    else:
+        await server.start()
+        reader, writer, status, _headers = await _connect_websocket(
+            server, token=None, protocol_token=server._websocket.token
+        )
+        assert status == 101
     replacement_reader: asyncio.StreamReader | None = None
     replacement_writer: asyncio.StreamWriter | None = None
+    observed: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+
+    async def read_websocket_json() -> dict[str, Any]:
+        while True:
+            try:
+                return await _read_json(reader)
+            except TimeoutError:
+                continue
+            except AssertionError as exc:
+                raise AssertionError("server closed the websocket") from exc
+
+    async def request(request_id: int, method: str, params: dict[str, object]) -> list[dict[str, Any]]:
+        if transport == "unix":
+            frames = await _request(reader, writer, request_id, method, params)
+        else:
+            await _send_json(writer, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            frames = []
+            while True:
+                frame = await read_websocket_json()
+                frames.append(frame)
+                if frame.get("id") == request_id:
+                    break
+        observed.extend(frames)
+        if transport == "websocket":
+            pending.extend(frames)
+        return frames
+
+    async def receive_response(request_id: int) -> list[dict[str, Any]]:
+        frames = []
+        while True:
+            frame = await (
+                _read(reader) if transport == "unix" else read_websocket_json()
+            )
+            frames.append(frame)
+            if frame.get("id") == request_id:
+                break
+        observed.extend(frames)
+        if transport == "websocket":
+            pending.extend(frames)
+        return frames
+
+    async def event(name: str) -> dict[str, Any]:
+        if transport == "websocket":
+            for index, frame in enumerate(pending):
+                if frame.get("params", {}).get("event") == name:
+                    pending.pop(index)
+                    return frame["params"]
+        while True:
+            frame = await (
+                _event(reader, name)
+                if transport == "unix"
+                else read_websocket_json()
+            )
+            if transport == "websocket" and frame.get("params", {}).get("event") != name:
+                pending.append(frame)
+                continue
+            observed.append(frame)
+            return frame["params"] if transport == "websocket" else frame
+
+    def buffered() -> list[dict[str, Any]]:
+        return _buffer(reader) if transport == "unix" else pending
+
+    async def frames_until(name: str) -> list[dict[str, Any]]:
+        if transport == "unix":
+            frames = await _frames_until_event(reader, name)
+        else:
+            frames = []
+            while True:
+                if pending:
+                    frame = pending.pop(0)
+                else:
+                    frame = await read_websocket_json()
+                frames.append(frame)
+                if frame.get("params", {}).get("event") == name:
+                    break
+        observed.extend(frames)
+        return frames
+
+    async def hello_create() -> tuple[dict[str, Any], str]:
+        hello = (await request(1, "hello", {"protocol_version": "1.2", "features": FEATURES}))[-1]["result"]
+        assert "session_grants" in hello["capabilities"]["features"]
+        created = (await request(2, "new_session", {"provider": "codex"}))[-1]["result"]
+        reset = await event("session_grants_changed")
+        assert reset["data"]["change"] == "reset"
+        return hello, created["session"]["session_id"]
     try:
-        _, session_id = await _hello_and_create(reader, writer)
-        await _request(reader, writer, 3, "send", {"text": "grant"})
-        assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
+        _, session_id = await hello_create()
+        await request( 3, "send", {"text": "grant"})
+        assert (await event("approval_request"))["request_id"] == "call-1"
+        if case in {"abort", "replacement"}:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original_commit = ConversationStore._commit_storage_command
+
+            async def gated_replacement_commit(
+                store: ConversationStore, command: object
+            ) -> object:
+                result = await original_commit(store, command)
+                if type(command).__name__ == "_ResolveApprovalCommand":
+                    # test-contract: seam gate the replacement's durable write owner
+                    entered.set()
+                    await await_or_fail(release.wait(), what="replacement settlement")
+                return result
+
+            # test-contract: seam gate the replacement settlement await
+            monkeypatch.setattr(
+                ConversationStore, "_commit_storage_command", gated_replacement_commit
+            )
+            abort = asyncio.create_task(request(4, "abort", {}))
+            await await_or_fail(entered.wait(), what="replacement settlement gate")
+            if case == "replacement":
+                replacement_request = {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "new_session",
+                    "params": {"provider": "codex"},
+                }
+                if transport == "unix":
+                    writer.write((json.dumps(replacement_request) + "\n").encode())
+                    await writer.drain()
+                else:
+                    await _send_json(writer, replacement_request)
+            record = server.control._approvals.state.records["call-1"]
+            assert record.settlement is not None
+            record.settlement.cancel()
+            release.set()
+            abort_frames = await await_or_fail(abort, what="abort response")
+            assert abort_frames[-1]["result"] == {"aborted": True}
+            if case == "replacement":
+                replacement_frames = await await_or_fail(
+                    receive_response(5), what="new session response"
+                )
+                assert (
+                    replacement_frames[-1]["result"]["session"]["session_id"]
+                    != session_id
+                )
+            if case == "abort":
+                await event("approval_end")
+            approval_ends = [
+                params
+                for frame in observed
+                if (params := frame.get("params", frame)).get("event")
+                == "approval_end"
+                and params.get("request_id") == "call-1"
+            ]
+            assert len(approval_ends) == 1
+            assert approval_ends[0]["reason"] == "turn_canceled"
+            status = (await request(6, "status", {}))[-1]
+            assert status["result"]["state"] in {"idle", "running"}
+            assert not server.control._approvals.state.records
+            return
         cancel = case.startswith("cancel_")
         if case == "deny":
             response = (
-                await _request(reader, writer, 4, "deny", {"request_id": "call-1"})
+                await request( 4, "deny", {"request_id": "call-1"})
             )[-1]
             assert response["result"]["decision"] == "deny"
             assert not any(
                 frame.get("params", {}).get("event") == "session_grants_changed"
-                for frame in _buffer(reader)
+                for frame in buffered()
             )
         else:
             entered = asyncio.Event()
             release = asyncio.Event()
             settlement: asyncio.Task[object] | None = None
             gate_owner: asyncio.Task[object] | None = None
+            all_frames: list[dict[str, Any]] = []
+            failed_write = asyncio.Event()
+            failed_payloads: list[bytes] = []
+            if case.startswith("fail_"):
+                assert server.connections is not None
+                controller = server.connections._controller
+                assert controller is not None
+                original_write = controller.connection._write_physical
+
+                async def fail_named_publish(payload: bytes) -> bool:
+                    compact = payload.replace(b" ", b"")
+                    should_fail = (
+                        case == "fail_approval_end_publish"
+                        and b'"event":"approval_end"' in compact
+                        or case == "fail_grant_event_publish"
+                        and b'"event":"session_grants_changed"' in compact
+                        and b'"change":"grant"' in compact
+                        or case == "fail_response_write"
+                        and b'"id":4' in compact
+                        and b'"result"' in compact
+                    )
+                    if should_fail and not failed_write.is_set():
+                        failed_payloads.append(payload)
+                        failed_write.set()
+                        raise OSError(f"injected {case}")
+                    return await original_write(payload)
+
+                # test-contract: seam fail each controller publication write once
+                monkeypatch.setattr(
+                    controller.connection, "_write_physical", fail_named_publish
+                )
             if case in {"cancel_settle", "external_end"}:
                 original_commit = ConversationStore._commit_storage_command
 
-                async def gated_commit(
-                    store: ConversationStore, command: object
-                ) -> object:
+                async def gated_commit(store: ConversationStore, command: object) -> object:
                     nonlocal gate_owner
-                    result = await original_commit(store, command)
-                    if type(command).__name__ == "_ResolveApprovalCommand":
+                    is_resolution = type(command).__name__ == "_ResolveApprovalCommand"
+                    if case == "cancel_settle" and is_resolution:
+                        # test-contract: prove the settlement task owns the gated await
                         gate_owner = asyncio.current_task()
                         record = server.control._approvals.state.records["call-1"]
                         assert gate_owner is record.settlement
-                        # test-contract: seam gate the named production await
+                        # test-contract: cancel before the real durable operation begins
+                        entered.set()
+                        await await_or_fail(release.wait(), what="durable settlement")
+                    result = await original_commit(store, command)
+                    if case == "external_end" and is_resolution:
+                        # test-contract: prove the settlement task owns the gated await
+                        gate_owner = asyncio.current_task()
+                        record = server.control._approvals.state.records["call-1"]
+                        assert gate_owner is record.settlement
+                        # test-contract: gate after the real durable operation commits
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")
                     return result
@@ -1749,7 +2004,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 )
             elif case == "cancel_history":
                 original_history = ConversationStore.append_approval_history_async
-                original_persist = approval_lifecycle.persist_durably
+                original_persist = approval_settlement.persist_durably
                 original_finish = server.control._approvals._finish_record
                 committed = asyncio.Event()
                 release_persist = asyncio.Event()
@@ -1794,13 +2049,48 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                         raise
                     return await original_history(store, payload)
 
-                monkeypatch.setattr(approval_lifecycle, "persist_durably", gated_persist)
+                monkeypatch.setattr(
+                    approval_settlement, "persist_durably", gated_persist
+                )
                 # test-contract: seam force a competing publication owner order
-                monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
+                monkeypatch.setattr(
+                    server.control._approvals, "_finish_record", gated_finish
+                )
                 monkeypatch.setattr(
                     ConversationStore,
                     "append_approval_history_async",
                     gated_history,
+                )
+            elif case == "cancel_owner_exit":
+                original_settle_record = (
+                    approval_lifecycle.ApprovalLifecycle._settle_record
+                )
+
+                async def gated_owner_exit(
+                    lifecycle: Any,
+                    record: Any,
+                    decision: str,
+                    reason: str | None = None,
+                ) -> dict[str, str]:
+                    nonlocal settlement
+                    nonlocal gate_owner
+                    result = await original_settle_record(
+                        lifecycle, record, decision, reason
+                    )
+                    settlement = asyncio.current_task()
+                    gate_owner = settlement
+                    # test-contract: seam capture the lifecycle owner task
+                    assert settlement is not None
+                    # test-contract: seam gate owner exit after shared admission
+                    entered.set()
+                    await await_or_fail(release.wait(), what="settlement owner exit")
+                    return result
+
+                # test-contract: seam gate the lifecycle owner exit
+                monkeypatch.setattr(
+                    approval_lifecycle.ApprovalLifecycle,
+                    "_settle_record",
+                    gated_owner_exit,
                 )
             elif case == "cancel_write":
                 assert server.connections is not None
@@ -1814,9 +2104,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                         # test-contract: seam gate the real dead-peer write
                         gate_owner = asyncio.current_task()
                         entered.set()
-                        await await_or_fail(
-                            release.wait(), what="grant physical write"
-                        )
+                        await await_or_fail(release.wait(), what="grant physical write")
                     return await original_write(payload)
 
                 # test-contract: seam gate the real physical-write await
@@ -1847,15 +2135,26 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     target=replace(record.target, history_store=record.target.store),
                     history_published=True,
                 )
-            approve = asyncio.create_task(
-                _request(
-                    reader,
-                    writer,
-                    4,
-                    "approve",
-                    {"request_id": "call-1", "scope": "always_tool"},
-                )
-            )
+            approve_params = {
+                "request_id": "call-1",
+                "scope": "always_tool",
+            }
+            approve: asyncio.Task[list[dict[str, Any]]] | None = None
+            if case == "fail_response_write":
+                approve_request = {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "approve",
+                    "params": approve_params,
+                }
+                if transport == "unix":
+                    writer.write((json.dumps(approve_request) + "\n").encode())
+                    await writer.drain()
+                else:
+                    await _send_json(writer, approve_request)
+                await await_or_fail(failed_write.wait(), what="approve response failure")
+            else:
+                approve = asyncio.create_task(request(4, "approve", approve_params))
             competing: asyncio.Task[object] | None = None
             if case == "cancel_history":
                 await await_or_fail(committed.wait(), what="approval settlement commit")
@@ -1871,8 +2170,6 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 release_persist.set()
             if case == "external_end":
                 await await_or_fail(entered.wait(), what="durable settlement")
-                record = server.control._approvals.state.records["call-1"]
-                assert gate_owner is record.settlement
                 external_end = asyncio.create_task(
                     server.control._approvals.transition(
                         ExternalEnd("call-1", session_id, {})
@@ -1890,41 +2187,146 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 assert gate_owner is not None
                 assert not gate_owner.done()
                 if case == "cancel_write":
+                    # test-contract: cancel_write aborts the real controller transport
                     assert (
                         gate_owner.get_coro().__qualname__
                         == "ConnectionRegistry._write_physical"
                     )
                     writer.transport.abort()
-                else:
-                    if case in {"cancel_settle", "cancel_history"}:
-                        assert gate_owner is settlement
-                    gate_owner.cancel()
+                    release.set()
+                    await await_or_fail(
+                        asyncio.gather(original_turn, return_exceptions=True),
+                        what=f"{case} original turn task",
+                    )
+                    assert not server.control._approvals.state.records
+                    if transport == "unix":
+                        reader, writer = await asyncio.open_unix_connection(
+                            str(server.socket_path)
+                        )
+                    else:
+                        reader, writer, status, _headers = await _connect_websocket(
+                            server, token=None, protocol_token=server._websocket.token
+                        )
+                        assert status == 101
+                    pending.clear()
+                    await request(
+                        10,
+                        "hello",
+                        {
+                            "protocol_version": "1.2",
+                            "features": [*FEATURES, "approval_reconnect"],
+                        },
+                    )
+                    snapshot_frames = await request(11, "session_grants", {})
+                    assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
+                    original_status = (await request(12, "status", {}))[-1]
+                    assert original_status["result"]["state"] == "idle", (
+                        "cancel_write replacement controller did not observe the "
+                        "original turn reaching idle"
+                    )
+                    send_frames = await request(13, "send", {"text": "ask again"})
+                    assert send_frames[-1].get("result", {}).get("accepted") is True, (
+                        "cancel_write replacement send was not accepted: "
+                        f"{send_frames[-1]!r}"
+                    )
+                    next_turn = await frames_until("turn_end")
+                    assert not any(
+                        frame.get("params", {}).get("event") == "approval_request"
+                        for frame in next_turn
+                    ), "cancel_write replacement unexpectedly asked for approval"
+                    changed = [
+                        frame
+                        for frame in observed
+                        if frame.get("params", {}).get("event")
+                        == "session_grants_changed"
+                        and frame.get("params", {}).get("data", {}).get("change")
+                        == "grant"
+                    ]
+                    assert len(changed) == 0, (
+                        "cancel_write must publish no grant-change event to a dead "
+                        f"peer; observed {changed!r}"
+                    )
+                    assert not server.control._approvals.state.records
+                    return
+                assert approve is not None
+                if case in {"cancel_settle", "cancel_history"}:
+                    assert gate_owner is settlement
+                if settlement is not None:
+                    assert not settlement.done()
+                gate_owner.cancel()
                 release.set()
                 if case == "cancel_history":
                     release_competing.set()
-                with pytest.raises((asyncio.CancelledError, AssertionError)):
-                    await await_or_fail(approve, what=f"{case} interrupted approve")
+                frames = await await_or_fail(approve, what=f"{case} approve response")
+                all_frames.extend(frames)
+                assert frames[-1]["result"]["decision"] == "approve"
                 if competing is not None:
-                    await await_or_fail(competing, what="competing approval publication")
+                    await await_or_fail(
+                        competing, what="competing approval publication"
+                    )
+            elif case.startswith("fail_"):
+                if approve is not None:
+                    frames = await await_or_fail(approve, what=f"{case} response")
+                    all_frames.extend(frames)
+                await await_or_fail(failed_write.wait(), what=f"{case} write")
+                assert len(failed_payloads) == 1
+                status_frames = await await_or_fail(
+                    request(10, "status", {}), what=f"{case} live controller status"
+                )
+                all_frames.extend(status_frames)
+                assert status_frames[-1]["result"]["state"] in {
+                    "idle",
+                    "running",
+                    "tool",
+                }
+                snapshot_frames = await request(11, "session_grants", {})
+                all_frames.extend(snapshot_frames)
+                assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
+                assert server.runtime.opened is not None
+                resolution = server.runtime.opened.store.approval_resolution_data(
+                    "call-1"
+                )
+                assert resolution is not None
+                assert resolution["decision"] == "allow"
+                wire_frames = (
+                    [*all_frames, *buffered()]
+                    if transport == "unix"
+                    else all_frames
+                )
+                grant_events = [
+                    frame
+                    for frame in wire_frames
+                    if frame.get("params", {}).get("event")
+                    == "session_grants_changed"
+                    and frame.get("params", {}).get("data", {}).get("change")
+                    == "grant"
+                ]
+                approval_ends = [
+                    frame
+                    for frame in wire_frames
+                    if frame.get("params", {}).get("event") == "approval_end"
+                ]
+                responses = [frame for frame in wire_frames if frame.get("id") == 4]
+                assert len(grant_events) == (
+                    0 if case == "fail_grant_event_publish" else 1
+                )
+                assert len(approval_ends) == (1 if case == "fail_response_write" else 0)
+                assert len(responses) == (0 if case == "fail_response_write" else 1)
+                if case == "fail_grant_event_publish":
+                    assert responses[0]["error"]["message"] == (
+                        "approval persistence failed: injected fail_grant_event_publish"
+                    )
+                elif case == "fail_approval_end_publish":
+                    assert responses[0]["result"]["decision"] == "approve"
+                assert not server.control._approvals.state.records
+                return
             else:
+                assert approve is not None
                 frames = await await_or_fail(approve, what="approve response")
+                all_frames.extend(frames)
                 assert frames[-1]["result"]["decision"] == "approve"
 
             if cancel:
-                published = [
-                    frame
-                    for frame in _buffer(reader)
-                    if frame.get("params", {}).get("event") == "session_grants_changed"
-                ]
-                if case != "cancel_write":
-                    assert len(published) == 1, (
-                        f"{case} must publish one grant-change event before replacement; "
-                        f"observed {published!r}"
-                    )
-                if case != "cancel_write":
-                    assert not server.control._approvals.state.records, (
-                        f"{case} left an approval record after grant settlement"
-                    )
                 if case == "cancel_history":
                     assert server.runtime.opened is not None
                     history = [
@@ -1934,94 +2336,68 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     ]
                     assert [row["event"] for row in history] == ["approval_end"]
                     assert history[0]["request_id"] == "call-1"
-                original_frames = list(_buffer(reader))
-                _buffer(reader).clear()
-                await await_or_fail(
-                    asyncio.gather(original_turn, return_exceptions=True),
-                    what=f"{case} original turn task",
-                )
-                assert not server.control._approvals.state.records, (
-                    f"{case} left an approval record after original turn"
-                )
-                (
-                    replacement_reader,
-                    replacement_writer,
-                ) = await asyncio.open_unix_connection(str(server.socket_path))
-                replacement_frames = await _request(
-                    replacement_reader,
-                    replacement_writer,
-                    10,
-                    "hello",
-                    {
-                        "protocol_version": "1.2",
-                        "features": [*FEATURES, "approval_reconnect"],
-                    },
-                )
-                snapshot_frames = await _request(
-                    replacement_reader, replacement_writer, 11, "session_grants"
-                )
-                snapshot = snapshot_frames[-1]["result"]
-                assert snapshot["session_grants"] == ["bash"]
-                if case == "cancel_write":
-                    original_status = (
-                        await await_or_fail(
-                            _request(
-                                replacement_reader, replacement_writer, 12, "status"
-                            ),
-                            what="cancel_write original turn status",
-                        )
-                    )[-1]
-                    assert original_status["result"]["state"] == "idle", (
-                        "cancel_write replacement controller did not observe the "
-                        "original turn reaching idle"
-                    )
-                    send_frames = await await_or_fail(
-                        _request(
-                            replacement_reader,
-                            replacement_writer,
-                            13,
-                            "send",
-                            {"text": "ask again"},
-                        ),
-                        what="cancel_write replacement send response",
-                    )
-                    send_response = send_frames[-1]
-                    assert send_response.get("result", {}).get("accepted") is True, (
-                        "cancel_write replacement send was not accepted: "
-                        f"{send_response!r}"
-                    )
-                    next_turn = await await_or_fail(
-                        _frames_until_event(replacement_reader, "turn_end"),
-                        what="cancel_write replacement turn end",
-                    )
-                    assert not any(
-                        frame.get("params", {}).get("event") == "approval_request"
-                        for frame in next_turn
-                    ), "cancel_write replacement unexpectedly asked for approval"
-                replacement_frames.extend(snapshot_frames)
-                replacement_frames.extend(_buffer(replacement_reader))
-                changed = [
+                published = [
                     frame
-                    for frame in [*original_frames, *replacement_frames]
+                    for frame in buffered()
                     if frame.get("params", {}).get("event") == "session_grants_changed"
                 ]
-                expected_changes = 0 if case == "cancel_write" else 1
-                assert len(changed) == expected_changes, (
-                    f"{case} must publish {expected_changes} grant-change events; "
-                    f"observed {changed!r}"
+                assert len(published) == 1, (
+                    f"{case} must publish one grant-change event; observed {published!r}"
+                )
+                await await_or_fail(
+                    asyncio.gather(original_turn, return_exceptions=True),
+                    what=f"{case} original turn end",
+                )
+                status = (
+                    await await_or_fail(
+                        request(10, "status", {}),
+                        what=f"{case} live controller status",
+                    )
+                )[-1]
+                assert status["result"]["state"] == "idle", (
+                    f"{case} live controller did not remain connected: {status!r}"
+                )
+                snapshot_frames = await request(11, "session_grants", {})
+                all_frames.extend(snapshot_frames)
+                snapshot = snapshot_frames[-1]
+                assert snapshot["result"]["session_grants"] == ["bash"]
+                send_frames = await request(12, "send", {"text": "ask again"}
+                )
+                all_frames.extend(send_frames)
+                send_response = send_frames[-1]
+                assert send_response.get("result", {}).get("accepted") is True
+                next_turn = await await_or_fail(
+                    frames_until("turn_end"),
+                    what=f"{case} next turn end",
+                )
+                all_frames.extend(next_turn)
+                assert not any(
+                    frame.get("params", {}).get("event") == "approval_request"
+                    for frame in next_turn
+                )
+                changed: list[dict[str, Any]] = []
+                for frame in [*all_frames, *observed]:
+                    if (
+                        frame.get("params", {}).get("event") == "session_grants_changed"
+                        and frame.get("params", {}).get("data", {}).get("change") == "grant"
+                        and frame not in changed
+                    ):
+                        changed.append(frame)
+                assert len(changed) == 1, (
+                    f"{case} must publish exactly one grant-change event; observed {changed!r}"
                 )
                 assert not server.control._approvals.state.records, (
-                    f"{case} left an approval record after replacement turn"
+                    f"{case} left an approval record after grant settlement"
                 )
             else:
                 grant_events = [
                     frame
-                    for frame in _buffer(reader)
+                    for frame in buffered()
                     if frame.get("params", {}).get("event") == "session_grants_changed"
                 ]
                 assert len(grant_events) == (0 if case == "deny" else 1)
                 if case == "duplicate":
-                    _buffer(reader).clear()
+                    buffered().clear()
                     assert server.runtime.opened is not None
                     duplicate_call = ToolCall(
                         "call-2", "bash", {"command": "true"}
@@ -2029,13 +2405,10 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     server.runtime.opened.store.append_approval_request(
                         "call-2", duplicate_call
                     )
-                    before = (await _request(reader, writer, 5, "session_grants"))[-1]
+                    before = (await request(5, "session_grants", {}))[-1]
                     assert before["result"]["session_grants"] == ["bash"]
                     duplicate_response = (
-                        await _request(
-                            reader,
-                            writer,
-                            6,
+                        await request(6,
                             "approve",
                             {"request_id": "call-2", "scope": "always_tool"},
                         )
@@ -2043,11 +2416,11 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     assert duplicate_response.get("result", {}).get("accepted") is True, (
                         f"duplicate approval was not accepted: {duplicate_response!r}"
                     )
-                    sentinel = (await _request(reader, writer, 7, "session_grants"))[-1]
+                    sentinel = (await request(7, "session_grants", {}))[-1]
                     assert sentinel["result"]["session_grants"] == ["bash"]
                     duplicate_events = [
                         frame
-                        for frame in _buffer(reader)
+                        for frame in buffered()
                         if frame.get("params", {}).get("event")
                         == "session_grants_changed"
                     ]
@@ -2058,7 +2431,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
         if not cancel:
             restarted = case == "restart_replay"
             if restarted:
-                await _frames_until_event(reader, "turn_end")
+                await frames_until("turn_end")
                 await close_serve(server, writer)
                 writer = None  # type: ignore[assignment]
                 replay_backend = FakeBackend(
@@ -2071,50 +2444,51 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 )
                 server = ZetaServer(
                     home=tmp_path,
-                    socket_path=_socket_path(tmp_path),
+                    socket_path=_socket_path(tmp_path) if transport == "unix" else None,
+                    port=0 if transport == "websocket" else None,
+                    ws_port=0 if transport == "websocket" else None,
                     provider="codex",
                     backend_factory=lambda provider, model, home: (
                         replay_backend,
                         model or "offline",
                     ),
                 )
-                reader, writer = await _connect(server)
-                await _request(
-                    reader,
-                    writer,
-                    10,
+                if transport == "unix":
+                    reader, writer = await _connect(server)
+                else:
+                    await server.start()
+                    reader, writer, status, _headers = await _connect_websocket(
+                        server, token=None, protocol_token=server._websocket.token
+                    )
+                    assert status == 101
+                pending.clear()
+                await request(10,
                     "hello",
                     {"protocol_version": "1.2", "features": FEATURES},
                 )
-                await _request(
-                    reader,
-                    writer,
-                    11,
+                await request(11,
                     "resume",
                     {"session_id": session_id},
                 )
-                reset = await _event(reader, "session_grants_changed")
+                reset = await event("session_grants_changed")
                 assert reset["data"]["change"] == "reset"
-            snapshot = (await _request(reader, writer, 6, "session_grants"))[-1][
+            snapshot = (await request(6, "session_grants", {}))[-1][
                 "result"
             ]
             expected_grants = [] if case in {"deny", "restart_replay"} else ["bash"]
             assert snapshot["session_grants"] == expected_grants
             if restarted:
-                await _request(reader, writer, 12, "send", {"text": "ask again"})
-                assert (await _event(reader, "approval_request"))[
+                await request( 12, "send", {"text": "ask again"})
+                assert (await event("approval_request"))[
                     "request_id"
                 ] == "call-2"
-                await _request(
-                    reader,
-                    writer,
-                    13,
+                await request(13,
                     "deny",
                     {"request_id": "call-2"},
                 )
-                await _frames_until_event(reader, "turn_end")
+                await frames_until("turn_end")
             else:
-                await _frames_until_event(reader, "turn_end")
+                await frames_until("turn_end")
             assert not server.control._approvals.state.records
     finally:
         release.set() if "release" in locals() else None

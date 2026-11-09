@@ -45,7 +45,7 @@ async def test_serve_decisions_lists_broken_record_without_body(tmp_path: Path) 
         assert registry is not None
         project_id = await asyncio.to_thread(registry.create_project, "broken", "test")
         record = await _seed_attention_record(
-            AttentionStore(opened.store.session_dir),
+            AttentionStore(opened.store.session_dir, writer_epoch=5),
             session_id,
             project_id.project_id,
             "secret request",
@@ -84,7 +84,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
         project_id = (
             await asyncio.to_thread(registry.create_project, "serve attention", "test")
         ).project_id
-        store = AttentionStore(opened.store.session_dir)
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         records = await await_or_fail(
             asyncio.gather(
                 *(
@@ -317,7 +317,7 @@ async def test_serve_batch_sends_good_items_and_refuses_broken_one(
         project_id = (
             await asyncio.to_thread(registry.create_project, "serve attention", "test")
         ).project_id
-        store = AttentionStore(opened.store.session_dir)
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         good, bad = [
             await asyncio.to_thread(
                 store.request,
@@ -374,7 +374,7 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
         project_id = (
             await asyncio.to_thread(registry.create_project, "invalid batch", "test")
         ).project_id
-        store = AttentionStore(opened.store.session_dir)
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         sealed = await _seed_attention_record(store, session_id, project_id, "sealed")
         invalid = await _seed_attention_record(store, session_id, project_id, "invalid")
         _leave_sealed_reply(tmp_path / "home", session_id, sealed.id, monkeypatch)
@@ -425,7 +425,7 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
         project_id = (
             await asyncio.to_thread(registry.create_project, "operation error", "test")
         ).project_id
-        store = AttentionStore(opened.store.session_dir)
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         sealed = await _seed_attention_record(store, session_id, project_id, "sealed")
         target = await _seed_attention_record(store, session_id, project_id, "target")
         _leave_sealed_reply(tmp_path / "home", session_id, sealed.id, monkeypatch)
@@ -494,7 +494,7 @@ async def test_cancelled_serve_adapter_still_checks_late_publication(
             await asyncio.to_thread(registry.create_project, "cancel serve", "test")
         ).project_id
         record = await _seed_attention_record(
-            AttentionStore(opened.store.session_dir), session_id, project_id, "late"
+            AttentionStore(opened.store.session_dir, writer_epoch=5), session_id, project_id, "late"
         )
         real_send = ProjectInbox.send
 
