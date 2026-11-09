@@ -291,7 +291,9 @@ class HTTPClientLease:
         self.connection_setup_count = int(self.owned)
         self._borrowers: Counter[str] = Counter()
         self._background_reporter_registered = False
-        self._close = MustCompleteClose("http client", LEASE_DRAIN_BOUND)
+        self._close = MustCompleteClose(
+            "http client", LEASE_DRAIN_BOUND, self._open_borrows
+        )
         self._drained = asyncio.Event()
         self._drained.set()
         self._retired = False
@@ -317,20 +319,19 @@ class HTTPClientLease:
     def retire(self) -> None:
         self._retired = True
 
+    def _open_borrows(self) -> str:
+        names = ", ".join(sorted(+self._borrowers))
+        return f"borrows still open: {names}" if names else ""
+
     async def _close_owned(self) -> None:
         try:
             # test-contract: seam the close owner bounds this drain
             await self._drained.wait()
         finally:
-            # the drain bound expired or the drain ended: close the client
-            # either way, and name any borrow that never ended.
+            # the drain ended or the owner's bound cancelled it: close the
+            # client either way (the owner names any borrow that never ended).
             if self.owned:
                 await self.client.aclose()
-            if self._borrowers:
-                raise RuntimeError(
-                    "http client closed with borrows still open: "
-                    + ", ".join(sorted(+self._borrowers))
-                )
 
     def start_close(self) -> None:
         self.retire()
