@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from ..project_errors import ProjectRegistryError
 from ..project_memory_history import (
     PROJECT_MEMORY_FILES,
     MemoryContextEntry,
