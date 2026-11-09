@@ -1600,7 +1600,6 @@ async def test_slash_and_named_settings_read_serve_control_not_store(
         )
         session = ServerSlashSession(server.runtime)
         session._approval_control = server.control
-        server._client.protocol_version = "1.1"
         status = session.slash_status()
         assert status.pending_approvals == ("call-1 (read)",)
         with pytest.raises(ProtocolError) as error:
