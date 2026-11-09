@@ -1,8 +1,11 @@
 import asyncio
 import shlex
 import subprocess
+import threading
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Self
 
 import pytest
 from prompt_toolkit import PromptSession
@@ -19,8 +22,9 @@ from rich.console import Console
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.commands.custom_commands import COMMAND_FILE_SIZE_LIMIT
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.slash import (
-    COMMAND_FILE_SIZE_LIMIT,
     INIT_PROMPT,
     CustomCommand,
     create_slash_registry,
@@ -43,6 +47,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import bash as bash_module
 from zeta.tools._shared.shell import (
     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,
     INLINE_SHELL_OUTPUT_LIMIT_MESSAGE,
@@ -59,6 +64,22 @@ from zeta.tui.composer import (
     build_key_bindings,
 )
 from zeta.tui.render import render_approval_card, render_event
+
+
+class _TrackedLog:
+    def __init__(self, handle: Any) -> None:
+        self.handle = handle
+        self.closed = threading.Event()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.handle.close()
+        self.closed.set()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.handle, name)
 
 
 def _write_command(directory: Path, name: str, content: str) -> None:
@@ -87,8 +108,10 @@ def _approval_presentation_event(
 
 # test-contract: seam no public event reports submission-consumer completion.
 async def _drain_submission_consumer(app: TUIApp) -> None:
-    while (consumer := app._submissions._consumer) is not None:
-        await asyncio.wait_for(asyncio.shield(consumer), timeout=10)
+    pipeline = app._submissions
+    while (consumer := pipeline._consumer) is not None or pipeline._slash_tasks:
+        pending = [consumer] if consumer is not None else list(pipeline._slash_tasks.values())
+        await asyncio.wait_for(asyncio.gather(*map(asyncio.shield, pending)), timeout=10)
 
 
 # test-contract: seam no public event reports active provider-turn completion.
@@ -183,7 +206,7 @@ def test_keys_help_describes_prompt_history_search(tmp_path: Path) -> None:
     command = next(command for command in registry.builtin_commands if command.name == "keys")
 
     assert "/keys — show keyboard shortcuts" in registry.help_text()
-    assert "ctrl+r search prompt history" in command.run(None, "")
+    assert "ctrl+r search prompt history" in command.policy.handler(None, "")
 
 
 def test_init_is_in_help_and_completion(tmp_path: Path) -> None:
@@ -233,11 +256,12 @@ def test_init_returns_canned_prompt_inside_project(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
-    result = create_slash_registry(
+    registry = create_slash_registry(
         zeta_home=tmp_path / "home",
         project_dir=project,
         skill_catalog=SkillCatalog.empty(),
-    ).dispatch(object(), "/init")
+    )
+    result = registry.dispatch(SimpleNamespace(slash_lock=SlashLock()), "/init")
 
     assert isinstance(result, ModelInputEnvelope)
     assert result.text == INIT_PROMPT
@@ -286,6 +310,8 @@ async def test_mcp_prompt_completion_and_resolution() -> None:
     )
 
     class Session:
+        slash_lock = SlashLock()
+
         async def slash_mcp_prompt(
             self, name: str, arguments: dict[str, str]
         ) -> str:
@@ -328,6 +354,8 @@ async def test_mcp_prompt_missing_required_argument_does_not_call_session() -> N
     )
 
     class Session:
+        slash_lock = SlashLock()
+
         async def slash_mcp_prompt(
             self, name: str, arguments: dict[str, str]
         ) -> str:
@@ -2088,16 +2116,114 @@ async def test_exec_macro_deny_renders_denied_receipt(
         await asyncio.wait_for(approval_presented.wait(), timeout=10)
 
         assert policy.deny(app.pending_approvals[0].key)
-        await task
+        await asyncio.wait_for(task, 10)
 
         assert "/deploy · denied" in output.getvalue()
         assert "/deploy · failed" not in output.getvalue()
         assert store.messages() == []
 
 
-async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
+@pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
+async def test_canceled_macro_creates_log_before_shell_bind(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    background: bool,
 ) -> None:
+    import zeta.tools._shared.shell_cwd as shell_cwd_module
+
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    log_path = tmp_path / f"macro-{'background' if background else 'foreground'}.log"
+    entered = threading.Event()
+    release = threading.Event()
+    original = shell_cwd_module._bind_shell_cwd
+
+    def blocked(*args: object, **kwargs: object):
+        entered.set()
+        assert release.wait(10)
+        return original(*args, **kwargs)
+
+    # test-contract: seam hold cwd binding after the macro log has been created.
+    monkeypatch.setattr(shell_cwd_module, "_bind_shell_cwd", blocked)
+    task = asyncio.create_task(
+        run_shell_macro(
+            registry,
+            ToolCall("macro-cancel-before-start", "bash", {"command": "true"}),
+            log_path,
+            stream_sink=lambda _event: None,
+            lifecycle_sink=lambda _kind: None,
+            background=background,
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
+        task.cancel()
+        release.set()
+        result = await asyncio.wait_for(task, 10)
+
+        assert result.is_canceled is True
+        assert result.structured_content == {"log_path": str(log_path)}
+        assert log_path.is_file()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await registry.close()
+
+
+async def test_background_macro_start_preflight_failure_closes_created_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    log_path = tmp_path / "preflight-failure.log"
+    tracked: list[_TrackedLog] = []
+    original_open = registry.background_tasks.open_log
+    original_start = registry.background_tasks.start
+
+    def tracked_open(path: str | Path) -> _TrackedLog:
+        handle = _TrackedLog(original_open(path))
+        tracked.append(handle)
+        return handle
+
+    async def fail_start(*args: Any, **kwargs: Any) -> tuple[str, int]:
+        await registry.background_tasks.close()
+        return await original_start(*args, **kwargs)
+
+    monkeypatch.setattr(registry.background_tasks, "open_log", tracked_open)
+    monkeypatch.setattr(registry.background_tasks, "start", fail_start)
+    try:
+        result = await run_shell_macro(
+            registry,
+            ToolCall("macro-preflight", "bash", {"command": "true"}),
+            log_path,
+            stream_sink=lambda _event: None,
+            lifecycle_sink=lambda _kind: None,
+            background=True,
+        )
+
+        assert result.is_error is True
+        assert result.structured_content["log_path"] == str(log_path)
+        assert log_path.is_file()
+        assert tracked[0].handle.closed
+    finally:
+        for handle in tracked:
+            handle.handle.close()
+        await registry.close()
+
+
+async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawn_entered = asyncio.Event()
+    real_spawn_background = bash_module.spawn_background
+
+    async def spawn_background(*args: Any, **kwargs: Any) -> Any:
+        spawn_entered.set()
+        return await real_spawn_background(*args, **kwargs)
+
+    # test-contract: seam macro owns its log before entering process spawn
+    monkeypatch.setattr(bash_module, "spawn_background", spawn_background)
     home = tmp_path / "home"
     _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30\n")
     output = StringIO()
@@ -2119,11 +2245,14 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
         # test-contract: seam no public event reports active provider-turn completion.
         task = app._active_task
         assert task is not None
+        await await_or_fail(spawn_entered.wait(), what="macro process spawn entry")
+        assert spawn_entered.is_set(), "macro process spawn seam was not reached"
         app.abort_active()
         await asyncio.wait_for(task, timeout=10)
 
         assert "/wait · canceled" in output.getvalue()
-        log = next(app.loop.store.session_dir.glob("macro-*.log"))
+        log = next(app.loop.store.session_dir.glob("macro-*.log"), None)
+        assert log is not None, "macro log was not created"
         assert log.exists()
         assert "canceled · log " in output.getvalue()
 

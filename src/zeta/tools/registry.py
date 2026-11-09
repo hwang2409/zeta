@@ -72,6 +72,7 @@ from ._action_metadata import (
 from ._action_metadata import (
     resolve_approval_rule as resolve_registered_approval_rule,
 )
+from ._live_config import _LiveConfigRegistryMixin
 from ._results import (
     _apply_error_governance,
     _BoundedText,  # noqa: F401 - preserve the registry import
@@ -80,6 +81,11 @@ from ._results import (
     _normalize_result_async,
     _success_result,
     text_block,
+)
+from ._shared.cwd_state import (
+    SessionCwdRemoved,
+    open_session_cwd,
+    open_verified_directory,
 )
 from ._shared.process import BackgroundTaskRegistry
 from ._shared.sandbox import SandboxPolicy
@@ -208,7 +214,7 @@ def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
 
 
-class ToolRegistry:
+class ToolRegistry(_LiveConfigRegistryMixin):
     """One provider-neutral registry for built-in and custom tools."""
 
     def __init__(
@@ -331,6 +337,7 @@ class ToolRegistry:
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
+        self._cwd_recovery_notices: list[tuple[str, str]] = []
         self._tools: dict[str, ToolDefinition] = {}
         # Set by MCPMount.  It is deliberately copied by clone_for_session so
         # discovery remains available in child sessions without sharing tools.
@@ -343,7 +350,7 @@ class ToolRegistry:
         self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
-        self._skill_refresher: Callable[[bool], Awaitable[None]] | None = None
+        self._live_config_refresher: Callable[[bool], Awaitable[None]] | None = None
         if agent_catalog is None:
             from ..skills.agent_catalog import discover_packaged_agents
 
@@ -352,17 +359,6 @@ class ToolRegistry:
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
-
-    def set_skill_refresher(
-        self, refresher: Callable[[bool], Awaitable[None]]
-    ) -> None:
-        """Let tools request one live catalog refresh."""
-
-        self._skill_refresher = refresher
-
-    async def refresh_skills(self, *, force: bool = False) -> None:
-        if self._skill_refresher is not None:
-            await self._skill_refresher(force)
 
     @property
     def tool_allow(self) -> tuple[str, ...] | None:
@@ -896,6 +892,15 @@ class ToolRegistry:
             self._session_store.set_bash_cwd(cwd)
         self.bash_cwd = cwd
 
+    def commit_cwd_recovery(self, removed_cwd: str, fallback: str) -> None:
+        self.update_bash_cwd(fallback)
+        self._cwd_recovery_notices.append((removed_cwd, fallback))
+
+    def take_cwd_recovery_notices(self) -> tuple[tuple[str, str], ...]:
+        notices = tuple(self._cwd_recovery_notices)
+        self._cwd_recovery_notices.clear()
+        return notices
+
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         if self.enforce_approvals and policy is None:
             raise ValueError("cannot remove an enforced approval policy")
@@ -1216,40 +1221,18 @@ class ToolRegistry:
     def _path(self, raw_path: object) -> Path:
         return self.policy.resolve(raw_path).absolute
 
-    def verify_cwd_identity(self) -> None:
-        """Fail closed if the pathname no longer names the captured cwd."""
+    def verify_cwd_identity(self, *, allow_removed: bool = False) -> None:
+        """Fail closed if the pathname names a directory other than the captured cwd."""
 
-        cwd_fd = self._open_cwd()
+        try:
+            cwd_fd = self._open_cwd()
+        except SessionCwdRemoved:
+            if allow_removed:
+                return
+            raise
         os.close(cwd_fd)
 
-    @staticmethod
-    def open_verified_directory(path: str | Path, identity: tuple[int, int]) -> int:
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            stat_result = os.fstat(fd)
-        except OSError as exc:
-            if "fd" in locals():
-                os.close(fd)
-            raise ValueError("approved shell cwd was replaced") from exc
-        if (stat_result.st_dev, stat_result.st_ino) != identity:
-            os.close(fd)
-            raise ValueError("approved shell cwd was replaced")
-        return fd
+    open_verified_directory = staticmethod(open_verified_directory)
 
     def _open_cwd(self) -> int:
-        try:
-            cwd_fd = os.open(
-                self.cwd,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            )
-        except OSError as exc:
-            raise ValueError("session cwd was replaced") from exc
-        try:
-            cwd_stat = os.fstat(cwd_fd)
-        except OSError as exc:
-            os.close(cwd_fd)
-            raise ValueError("session cwd was replaced") from exc
-        if (cwd_stat.st_dev, cwd_stat.st_ino) != self._cwd_identity:
-            os.close(cwd_fd)
-            raise ValueError("session cwd was replaced")
-        return cwd_fd
+        return open_session_cwd(self.cwd, self._cwd_identity)

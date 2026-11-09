@@ -10,7 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .attention_records import AttentionRecord, AttentionStore
+from .attention_records import (
+    AttentionRecord,
+    AttentionStore,
+    Broken,
+    observed_epoch_for_session,
+)
 from .project_errors import ProjectRegistryError
 from .project_registry import ProjectRegistry
 from .runtime.project_registry_state import (
@@ -25,7 +30,7 @@ class DecisionItem:
     session_id: str
     project_id: str | None
     project_name: str
-    record: AttentionRecord
+    record: AttentionRecord | Broken
 
 
 def _project_names(registry: ProjectRegistry | None) -> dict[str, str]:
@@ -36,6 +41,26 @@ def _project_names(registry: ProjectRegistry | None) -> dict[str, str]:
     except (OSError, ProjectRegistryError):
         return {}
     return {project.project_id: project.name for project in projects}
+
+
+def _decision_item(
+    session_id: str, record: AttentionRecord | Broken, names: dict[str, str]
+) -> DecisionItem:
+    if isinstance(record, Broken):
+        return DecisionItem(session_id, None, "Unassigned", record)
+    return DecisionItem(
+        session_id,
+        record.project_id,
+        names.get(record.project_id or "", "Unassigned"),
+        record,
+    )
+
+
+def _decision_sort_key(item: DecisionItem) -> tuple[bool, str]:
+    record = item.record
+    if isinstance(record, Broken):
+        return True, record.path
+    return record.kind != "decision", record.created_at
 
 
 def open_decisions(
@@ -55,22 +80,12 @@ def open_decisions(
         return ()
     state = registry_state or available_project_registry(home / "projects")
     names = _project_names(state.registry)
-    items = [
-        DecisionItem(
-            session_id=session_id,
-            project_id=record.project_id,
-            project_name=names.get(record.project_id or "", "Unassigned"),
-            record=record,
-        )
-        for record in AttentionStore(session_dir).list()
-        if record.status == "open"
-    ]
-    return tuple(
-        sorted(
-            items,
-            key=lambda item: (item.record.kind != "decision", item.record.created_at),
-        )
+    items = (
+        _decision_item(session_id, record, names)
+        for record in AttentionStore(session_dir, writer_epoch=observed_epoch_for_session(session_dir)).list()
+        if isinstance(record, Broken) or record.status == "open"
     )
+    return tuple(sorted(items, key=_decision_sort_key))
 
 
 __all__ = ["DecisionItem", "open_decisions"]

@@ -22,7 +22,9 @@ JSONL event schema (``--format json``), one JSON object per line:
 - ``{"type": "assistant_reset"}`` — tells JSON consumers to discard the
   unfinished assistant response before processing the next attempt.
 - ``{"type": "retry", "text": <str>, "retry": <int>, "delay": <float>,
-     "kind"?: "provider_retry", "attempt"?: <int>, "reason"?: <str>,
+     "kind"?: "provider_retry"|"provider_rate_limit_hold", "attempt"?: <int>,
+     "reason"?: <str>, "retry_after"?: <float>, "until"?: <float>,
+     "provider"?: <str>,
      "is_stall"?: <bool>}`` — emitted for provider retries. Turn-level retries
   include ``kind``, ``attempt``, and ``reason``; stall retries use ``is_stall``.
   In text mode the same text is written to stderr instead. Text mode streams
@@ -51,6 +53,7 @@ from typing import IO, Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
+from ..core.store import TranscriptLoadError
 from ..protocol.types import MessageOrigin
 from .driver import (
     DENIAL_MARKER,
@@ -76,7 +79,7 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
 
     try:
         app = create_app(args)
-    except SessionError as exc:
+    except (SessionError, TranscriptLoadError) as exc:
         print(f"zeta: {exc}", file=sys.stderr)
         return 1
 

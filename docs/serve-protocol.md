@@ -457,6 +457,9 @@ Params: exactly one of `text` or `input_id`. `text` is a non-empty direct user
 message. `input_id` is available only with `model_input_ids` and refers to a
 server-owned `model_input` returned by `slash_run`. With the negotiated
 `delivery_id` feature, params can also contain `delivery_id` as described below.
+An optional `session_id` names the session the client means; a different
+session returns `-32003` `session_mismatch` and delivers nothing (see
+"delivery session guard").
 The result acknowledges scheduling with `accepted` (`true`) and `session_id`.
 Streaming starts as notifications. Only one turn can run at a time. With the
 `user_message_event` feature, a `user_message` event with `mode: "send"`
@@ -473,7 +476,8 @@ precedes the acknowledgement.
 ### `steer`
 
 Params: required `text`, a non-empty string. With the negotiated `delivery_id`
-feature, params can also contain `delivery_id` as described below. The server
+feature, params can also contain `delivery_id` as described below. An optional
+`session_id` is checked as for `send` (see "delivery session guard"). The server
 queues this user message at the next safe provider boundary. A turn must be
 running. With the `user_message_event` feature, a `user_message` event with
 `mode: "steer"` precedes the acknowledgement.
@@ -484,6 +488,35 @@ running. With the `user_message_event` feature, a `user_message` event with
 
 ```json
 {"jsonrpc":"2.0","id":6,"result":{"accepted":true}}
+```
+
+### delivery session guard (`delivery_session_guard` feature)
+
+`send`, `steer`, and `send_images` accept an optional `session_id`: the session
+the client means to deliver to. `send_images` already requires it. If it is not
+the attached session, the request returns `-32003` with message
+`session is not active` and data
+`{"code":"session_mismatch","attached_session_id":"<attached>","session_id":"<requested>"}`
+and delivers nothing: no transcript row, no `user_message` echo, no turn or
+steering, and no `delivery_id` record. The check runs before the `delivery_id`
+lookup, so a mismatched retry of an ID already delivered on the attached
+session returns this error, not `duplicate: true`. A `session_id` that is not a
+non-empty string returns `-32602`. With no `session_id`, `send` and `steer`
+behave as before. With no attached session, the existing `-32003` errors apply.
+
+The server enforces the guard whether or not the client negotiated the
+feature. The feature only tells the client the guard exists: a server that
+does not echo `delivery_session_guard` ignores `session_id` on `send` and
+`steer` and delivers to its attached session. Servers before this feature
+rejected a mismatched `send_images` with the same code and message but no
+`data`.
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"send","params":{"text":"hello","session_id":"old123"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":7,"error":{"code":-32003,"message":"session is not active","data":{"code":"session_mismatch","attached_session_id":"abc123","session_id":"old123"}}}
 ```
 
 ### client delivery IDs (`delivery_id` feature)
@@ -836,6 +869,11 @@ Clients use `turn_id` to correlate this durable outcome with a negotiated
 {"jsonrpc":"2.0","id":9,"result":{"session":null,"state":"idle","explicit_finish":false,"pending_approvals":[],"usage":{},"compaction_markers":0}}
 ```
 
+While a slash command runs, `status` also carries
+`slash_command: {"name": "/status", "state": "running"}`. `state` is `waiting`
+after the command was cancelled and is finishing work it already started. The
+field is omitted when no slash command runs.
+
 ### `ping`
 
 Requires the `ping` feature; otherwise `-32601`. Params: none. The result is
@@ -1061,6 +1099,7 @@ Error descriptors are:
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
 | `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
+| `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A new `send` or `send_images` turn on a detached session that
@@ -1194,10 +1233,41 @@ Event fields are:
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
+| `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 
-The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
-and `is_stall: boolean`. It is an informational notice that a retry is
-scheduled. Unknown provider keys remain allowed inside `data`.
+The `retry` data can contain `retry: integer`, `delay: number` (seconds),
+`text: string`, and `is_stall: boolean`. It is an informational notice that a
+retry is scheduled. A provider retry can also include `kind: "provider_retry"`,
+`attempt: integer`, and `reason: string`.
+
+For a long provider rate limit, the retry data uses
+`kind: "provider_rate_limit_hold"`. This means the turn is held and will
+re-probe the provider rate limit; it is not an error. The hold ends when the
+provider succeeds, the turn is canceled, its deadline expires, or the
+credential/account changes. This kind can include these fields:
+
+| field | type and unit | meaning |
+| --- | --- | --- |
+| `delay` | number, seconds | delay before the next probe |
+| `retry_after` | number, seconds | provider-requested rate-limit duration |
+| `provider` | string | provider name |
+| `attempt` | integer | provider attempt number |
+| `reason` | string | reason for the hold; `"subscription_limit"` for a subscription limit |
+| `limit` | string | `"rate"` for a provider Retry-After hold, `"subscription"` for a subscription limit |
+| `account` | string | `provider:name` of the limited account; only when `limit` is `"subscription"` |
+| `until` | number, Unix timestamp in seconds | wall-clock time when the provider-requested hold ends, emitted as the numeric epoch value from `time.time()`; for a subscription limit, the provider's reset time |
+| `text` | string | human-readable hold status |
+
+A subscription limit (Codex HTTP 429 with `error.type: "usage_limit_reached"`)
+uses the same kind with `limit: "subscription"`. The turn holds until the
+reset time instead of ending, and `text` reads `<account> subscription limit
+until <local reset>; switch account or log in to resume`. A re-login or a user
+account switch wakes the hold at once and probes again. The runtime never
+switches accounts by itself: an `account_limit` event with the recovery
+suggestion follows the `retry` event, and only the client or user acts on it.
+
+These fields are additive. Older clients can ignore them. Unknown provider
+keys remain allowed inside `data`.
 
 `assistant_reset` is emitted only when the client negotiated the
 `assistant_reset` feature and a scheduled retry will actually start. It follows
@@ -1443,7 +1513,8 @@ error code and message. Provider status and origin remain internal.
   error. All modes, including `summary`, return `-32602` with
   `compaction mode selection was removed; eviction is always used`. New clients
   must not advertise or send this request.
-- `send_images`: takes `text` (possibly empty) and `images`, a list of one to four
+- `send_images`: takes a required `session_id` (the attached session; see
+  "delivery session guard"), `text` (possibly empty), and `images`, a list of one to four
   objects with `name`, `mime_type`, and base64 `data`. With both `delivery_id`
   and `send_images_delivery_id` negotiated, it also accepts `delivery_id` with
   the validation, idempotency, status, echo, and history behavior described
@@ -1482,9 +1553,19 @@ implementation for the frontend client. Two RPCs cover the surface.
   `client_only: true` and the stable machine-readable reason
   `unavailable: "requires_tui"`. Invalid `include_unavailable` values return
   `-32602`.
+  Each entry also has `runs_while_busy`, read from the same policy that the
+  busy gate of `slash_run` uses:
+  - `always`: every form runs while a turn is running. Client-only entries
+    have this value, because `slash_run` answers them with `client_only`.
+  - `never`: every form returns `-32004` while a turn is running (for
+    example `/plan`, `/compact`, skills, and prompt macros).
+  - `read_forms`: only the read forms run while a turn is running (for
+    example bare `/status` or bare `/memory`); other forms return `-32004`.
+  A missing field means unknown: older servers do not send it, so a client
+  must send the command and handle `-32004`.
 - `slash_run`: params `session_id` and `text` (the raw composer value
-  starting with `/`). Rejects the request when a turn is running with
-  `-32004`. Returns a `kind` discriminator:
+  starting with `/`). When a turn is running, it rejects the forms that
+  `runs_while_busy` does not allow with `-32004`. Returns a `kind` discriminator:
   - `output`: `text` is the composed notice to render as a quiet receipt. For
     `/status`, this is the same operational view as the TUI, including configured
     hooks, recent cache-hit history, and model-attributed estimated cost. The
@@ -1536,7 +1617,7 @@ The shared slash registry has this order and surface availability:
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
 | `tasks` | no | inspect background processes |
-| `decisions` | yes | read, reply to, or dismiss attention items |
+| `decisions` | yes | read, reply, dismiss, or batch-reply to attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |
 | `approve` | no | `/approve [key]` |
@@ -1545,6 +1626,13 @@ The shared slash registry has this order and surface availability:
 | `accounts` | yes | list, switch, or label accounts |
 | `restart` | no | restart this session from the local checkout (reinstall after `pyproject` changes) |
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
+
+The `/decisions` list includes broken attention records instead of hiding them. A
+broken item is additive: it has `id`, `path`, and `reason` fields in attention
+payloads, and contains no request body. `reason` is one of `unreadable`,
+`invalid_name`, `invalid_json`, `invalid_schema`, `id_mismatch`, or `too_large`.
+Reply, dismiss, stage, and batch-reply operations refuse broken ids without
+changing their bytes.
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
 `/implement`, `/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/plan`,
@@ -1590,6 +1678,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `send_images_delivery_id` | with `delivery_id`, lets `send_images` accept durable idempotency IDs; matching echoes and history rows use `user_message_delivery_id` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
+| `live_config_changed` | live skill and agent-profile reloads emit `config_changed` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 | `model_input_ids` | `slash_run` stores generated model input server-side and returns a single-use `input_id` accepted by `send` |
@@ -1607,6 +1696,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
+| `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to

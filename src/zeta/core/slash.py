@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import inspect
 import os
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -9,7 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
-from ..mcp.prompt_commands import SlashPromptError  # noqa: F401 - public export
+from ..mcp.prompt_commands import SlashPromptError
 from ..model_input import ModelInputEnvelope
 from ..protocol.types import (
     Message,
@@ -22,8 +24,8 @@ from ..runtime.project_registry_state import ProjectRegistryState
 from ..skills import (
     SkillCatalog,
 )
+from .checkpoints import active_branch
 from .commands.custom_commands import (
-    COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
     load_custom_commands,
 )
@@ -31,8 +33,11 @@ from .commands.slash_registry import (
     ServeSlash,
     SlashCommand,
     SlashCommandRegistry,
-    SlashResult,
+    SlashHandler,
+    SlashLock,
     SlashSurface,
+    always,
+    never,
 )
 from .project_context import (
     discover_project_root,
@@ -542,9 +547,33 @@ class SlashStatus:
     transcript_index_failure: str | None = None
     project_context_health: str | None = None
     explicit_finish: bool = False
-    connection_setup_counts: tuple[dict[str, object], ...] = ()
+    connection_setup_counts: tuple[Mapping[str, object], ...] = ()
     max_agent_depth: int = 3
     unavailable_accounts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SlashStatusSnapshot:
+    """Loop-owned status values plus append-only transcript references."""
+
+    base: SlashStatus
+    transcript_entries: tuple[ConversationEntry, ...]
+    token_counter: Callable[[Message], int]
+
+
+def build_slash_status(snapshot: SlashStatusSnapshot) -> SlashStatus:
+    """Finish the shared projection, including transcript-sized work."""
+
+    entries = copy.deepcopy(active_branch(snapshot.transcript_entries))
+    return replace(
+        snapshot.base,
+        compaction_marker_count=sum(entry.type == "compaction" for entry in entries),
+        checkpoint_count=sum(entry.type == "checkpoint" for entry in entries),
+        compaction_history=compaction_history(entries, snapshot.token_counter),
+    )
+
+
+type _SlashOutcome = str | ModelInputEnvelope | SlashPromptError
 
 
 class SlashSession(Protocol):
@@ -558,7 +587,12 @@ class SlashSession(Protocol):
 
     def plan_mode_background_blocker(self) -> str | None: ...
 
-    def slash_status_command(self, args: str) -> str: ...
+    @property
+    def slash_lock(self) -> SlashLock: ...
+
+    def slash_status_input(self, args: str) -> tuple[bool, SlashStatusSnapshot]: ...
+
+    def open_status_card(self, status: SlashStatus) -> None: ...
 
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope: ...
 
@@ -776,28 +810,33 @@ def _format_estimated_cost(status: SlashStatus) -> str:
     return f"${total:.6f}"
 
 
-def _run_status(session: SlashSession, args: str) -> str:
-    return session.slash_status_command(args)
+def _delegate(method: str, *, strip: bool = False) -> SlashHandler:
+    """Await one session method; TUI methods are sync, serve methods async."""
+
+    async def handler(session: SlashSession, args: str) -> _SlashOutcome:
+        result = getattr(session, method)(args.strip() if strip else args)
+        return await result if inspect.isawaitable(result) else result
+
+    return handler
 
 
-async def _run_mcp(session: SlashSession, args: str) -> str | ModelInputEnvelope:
-    return await session.slash_mcp(args.strip())
+def _prepare_status(
+    session: SlashSession, args: str
+) -> tuple[bool, SlashStatusSnapshot]:
+    return session.slash_status_input(args)
 
 
-def _run_model(session: SlashSession, args: str) -> str:
-    return session.slash_model(args.strip())
+def _build_status(inputs: tuple[bool, SlashStatusSnapshot]) -> tuple[bool, SlashStatus]:
+    card, snapshot = inputs
+    return card, build_slash_status(snapshot)
 
 
-def _run_vim(session: SlashSession, args: str) -> str:
-    return session.slash_vim(args.strip())
-
-
-def _run_plan(session: SlashSession, args: str) -> str | ModelInputEnvelope:
-    return session.slash_plan(args.strip())
-
-
-def _run_implement(session: SlashSession, args: str) -> str | ModelInputEnvelope:
-    return session.slash_implement(args.strip())
+def _publish_status(session: SlashSession, output: tuple[bool, SlashStatus]) -> str:
+    card, status = output
+    if card:
+        session.open_status_card(status)
+        return ""
+    return _format_status(status)
 
 
 def _run_init(
@@ -815,78 +854,6 @@ async def _run_compact(session: SlashSession, args: str) -> str:
     return await session.slash_compact()
 
 
-def _run_paste(session: SlashSession, args: str) -> str | Awaitable[str]:
-    return session.slash_paste(args)
-
-
-def _run_checkpoint(session: SlashSession, args: str) -> str:
-    return session.slash_checkpoint(args)
-
-
-def _run_runs(session: SlashSession, args: str) -> str | Awaitable[str]:
-    return session.slash_runs(args)
-
-
-def _run_tasks(session: SlashSession, args: str) -> str:
-    return session.slash_tasks(args)
-
-
-def _run_decisions(session: SlashSession, args: str) -> str | Awaitable[str]:
-    return session.slash_decisions(args)
-
-
-def _run_send(session: SlashSession, args: str) -> str | Awaitable[str]:
-    return session.slash_send(args)
-
-
-def _run_fork(session: SlashSession, args: str) -> str:
-    return session.slash_fork(args)
-
-
-def _run_tree(session: SlashSession, args: str) -> str:
-    return session.slash_tree(args)
-
-
-def _run_tools(session: SlashSession, args: str) -> str:
-    return session.slash_tools(args)
-
-
-def _run_undo(session: SlashSession, args: str) -> str:
-    return session.slash_undo(args)
-
-
-def _run_redo(session: SlashSession, args: str) -> str:
-    return session.slash_redo(args)
-
-
-def _run_new(session: SlashSession, args: str) -> str:
-    return session.slash_new(args)
-
-
-def _run_name(session: SlashSession, args: str) -> str:
-    return session.slash_name(args)
-
-
-def _run_project(session: SlashSession, args: str) -> str:
-    return session.slash_project(args)
-
-
-def _run_memory(session: SlashSession, args: str) -> str | Awaitable[str]:
-    return session.slash_memory(args)
-
-
-def _run_repair_transcript(session: SlashSession, args: str) -> str | Awaitable[str]:
-    return session.slash_repair_transcript(args)
-
-
-def _run_inbox(session: SlashSession, args: str) -> str:
-    return session.slash_inbox(args)
-
-
-def _run_theme(session: SlashSession, args: str) -> str:
-    return session.slash_theme(args)
-
-
 def _run_keys(_session: SlashSession, _args: str) -> str:
     return """ctrl+r search prompt history
 ctrl+f find transcript messages
@@ -896,40 +863,12 @@ enter submit · ctrl+j insert newline
 esc cancel popup · tab toggle finder preview"""
 
 
-def _run_approve(session: SlashSession, args: str) -> SlashResult:
-    return session.slash_approve(args)
-
-
-def _run_always(session: SlashSession, args: str) -> SlashResult:
-    return session.slash_always(args)
-
-
-def _run_deny(session: SlashSession, args: str) -> SlashResult:
-    return session.slash_deny(args)
-
-
-def _run_accounts(session: SlashSession, args: str) -> SlashResult:
-    return session.slash_accounts(args)
-
-
-def _run_restart(session: SlashSession, args: str) -> str:
-    return session.slash_restart(args)
-
-
-def _run_permissions(session: SlashSession, args: str) -> str:
-    return session.slash_permissions(args)
-
-
 def _has_args(args: str) -> bool:
     return bool(args.strip())
 
 
 def _no_args(args: str) -> bool:
     return not args.strip()
-
-
-def _never_mutates(_args: str) -> bool:
-    return False
 
 
 def _memory_mutates(args: str) -> bool:
@@ -989,210 +928,227 @@ def create_slash_registry(
         else discover_project_root(Path.cwd())
     )
     project_root = None if project_eligible is False else private_project_root
+    # shortcut: until the worker migration (PR 2) these run on the loop as
+    # before; each later moves to SlashCommand.worker or keeps a loop reason.
+    pending = "runs on the loop until its worker migration"
+    loop_owned = "changes loop-owned session or UI state"
+    native = "awaits native async work owned by the loop"
     registry.register(
-        SlashCommand(
+        SlashCommand.worker(
             "status",
-            _run_status,
+            _prepare_status,
+            _build_status,
+            _publish_status,
             "show session status",
-            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+            serve=ServeSlash(mutates=never, runs_while_busy=_no_args),
         )
     )
-    registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
+    safe = SlashCommand.loop_safe
+    registry.register(safe("keys", _run_keys, "show keyboard shortcuts", reason=pending))
     registry.register(
-        SlashCommand(
+        safe(
             "mcp",
-            _run_mcp,
+            _delegate("slash_mcp", strip=True),
             "show MCP server status",
-            ServeSlash(
-                mutates=_mcp_mutates,
-                runs_while_busy=_never_mutates,
-            ),
+            serve=ServeSlash(mutates=_mcp_mutates, runs_while_busy=never),
+            reason=native,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "model",
-            _run_model,
+            _delegate("slash_model", strip=True),
             "pick a model or switch to one: /model [name]",
-            ServeSlash(
-                mutates=_has_args,
-                runs_while_busy=_no_args,
-            ),
+            serve=ServeSlash(mutates=_has_args, runs_while_busy=_no_args),
+            reason=loop_owned,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "vim",
-            _run_vim,
+            _delegate("slash_vim", strip=True),
             "show or change vim mode",
-            ServeSlash(
-                mutates=_vim_mutates,
-                runs_while_busy=_no_args,
-            ),
+            serve=ServeSlash(mutates=_vim_mutates, runs_while_busy=_no_args),
+            reason=loop_owned,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "plan",
-            _run_plan,
+            _delegate("slash_plan", strip=True),
             "show or change plan mode",
-            ServeSlash(),
+            serve=ServeSlash(),
+            reason=loop_owned,
         )
     )
     registry.register(
-        SlashCommand(
-            "implement", _run_implement, "implement the proposed plan", ServeSlash()
+        safe(
+            "implement",
+            _delegate("slash_implement", strip=True),
+            "implement the proposed plan",
+            serve=ServeSlash(),
+            reason=loop_owned,
         )
     )
-    instruction_handler = lambda session, args: project_instructions_command(
-        session,
-        args,
-        private_project_root,
-        Path(effective_home).expanduser().resolve() if effective_home else None,
-        project_registry_state,
-    )
+
+    async def instruction_handler(session: SlashSession, args: str) -> str:
+        return await project_instructions_command(
+            session,
+            args,
+            private_project_root,
+            Path(effective_home).expanduser().resolve() if effective_home else None,
+            project_registry_state,
+        )
+
     registry.register(
-        SlashCommand(
+        safe(
             "project-instructions",
             instruction_handler,
             "open or create private project instructions in your editor",
-            ServeSlash(),
+            serve=ServeSlash(),
+            reason=native,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "init",
             lambda session, args: _run_init(session, args, project_root),
             "generate or improve project instructions",
-            ServeSlash(),
+            serve=ServeSlash(),
+            reason=pending,
         )
     )
-    registry.register(SlashCommand("paste", _run_paste, "paste an image"))
     registry.register(
-        SlashCommand(
+        safe("paste", _delegate("slash_paste"), "paste an image", reason=native)
+    )
+    registry.register(
+        safe(
             "compact",
             _run_compact,
             "compact the context",
-            ServeSlash(mutates=lambda _args: True),
+            serve=ServeSlash(mutates=always),
+            reason=native,
         )
     )
-    registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
+    for name, method, description, reason in (
+        ("checkpoint", "slash_checkpoint", "save a checkpoint", pending),
+        ("fork", "slash_fork", "fork from a prior user message or checkpoint", pending),
+        ("tree", "slash_tree", "list branches or switch to one", pending),
+        ("tools", "slash_tools", "list tools or trust project tools", pending),
+        ("undo", "slash_undo", "restore the previous workspace snapshot", pending),
+        ("redo", "slash_redo", "restore the next workspace snapshot", pending),
+        ("new", "slash_new", "start a fresh session in this window", loop_owned),
+        ("name", "slash_name", "name the current session for the picker", loop_owned),
+    ):
+        registry.register(safe(name, _delegate(method), description, reason=reason))
     registry.register(
-        SlashCommand(
-            "fork",
-            _run_fork,
-            "fork from a prior user message or checkpoint",
-        )
-    )
-    registry.register(SlashCommand("tree", _run_tree, "list branches or switch to one"))
-    registry.register(
-        SlashCommand("tools", _run_tools, "list tools or trust project tools")
-    )
-    registry.register(
-        SlashCommand("undo", _run_undo, "restore the previous workspace snapshot")
-    )
-    registry.register(
-        SlashCommand("redo", _run_redo, "restore the next workspace snapshot")
-    )
-    registry.register(
-        SlashCommand("new", _run_new, "start a fresh session in this window")
-    )
-    registry.register(
-        SlashCommand("name", _run_name, "name the current session for the picker")
-    )
-    registry.register(
-        SlashCommand(
+        safe(
             "project",
-            _run_project,
+            _delegate("slash_project"),
             "show or initialize the current project",
-            ServeSlash(
-                mutates=_project_mutates,
-                runs_while_busy=_no_args,
-            ),
+            serve=ServeSlash(mutates=_project_mutates, runs_while_busy=_no_args),
+            reason=native,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "inbox",
-            _run_inbox,
+            _delegate("slash_inbox"),
             "list this project's inbox",
-            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+            serve=ServeSlash(mutates=never, runs_while_busy=_no_args),
+            reason=native,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "memory",
-            _run_memory,
+            _delegate("slash_memory"),
             "show, retry, or undo automatic memory updates",
-            ServeSlash(mutates=_memory_mutates, runs_while_busy=_memory_read_only),
+            serve=ServeSlash(
+                mutates=_memory_mutates, runs_while_busy=_memory_read_only
+            ),
+            reason=native,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "repair-transcript",
-            _run_repair_transcript,
+            _delegate("slash_repair_transcript"),
             "repair one corrupt transcript: /repair-transcript <session> confirm",
-            ServeSlash(mutates=lambda _args: True),
+            serve=ServeSlash(mutates=always),
+            reason=native,
         )
     )
+    for name, method, description, reason in (
+        ("theme", "slash_theme", "list themes or switch the active theme", pending),
+        ("runs", "slash_runs", "list live agent runs", pending),
+        ("tasks", "slash_tasks", "inspect background processes", loop_owned),
+    ):
+        registry.register(safe(name, _delegate(method), description, reason=reason))
     registry.register(
-        SlashCommand("theme", _run_theme, "list themes or switch the active theme")
-    )
-    registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
-    registry.register(SlashCommand("tasks", _run_tasks, "inspect background processes"))
-    registry.register(
-        SlashCommand(
+        safe(
             "decisions",
-            _run_decisions,
-            "read, reply to, or dismiss attention items",
-            ServeSlash(mutates=_decisions_mutates),
+            _delegate("slash_decisions"),
+            "read, reply, dismiss, or batch-reply to attention items",
+            serve=ServeSlash(mutates=_decisions_mutates),
+            reason=native,
         )
     )
     registry.register(
-        SlashCommand(
-            "send", _run_send, "send a follow-up to a run: /send <id> <message>"
+        safe(
+            "send",
+            _delegate("slash_send"),
+            "send a follow-up to a run: /send <id> <message>",
+            reason=native,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "help",
             lambda _session, _args: registry.help_text(),
             "list commands",
-            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+            serve=ServeSlash(mutates=never, runs_while_busy=_no_args),
+            reason=pending,
         )
     )
-    registry.register(SlashCommand("approve", _run_approve, "/approve [key]"))
+    approval = "completes a pending approval decision; never waits for input"
     registry.register(
-        SlashCommand(
+        safe("approve", _delegate("slash_approve"), "/approve [key]", reason=approval)
+    )
+    registry.register(
+        safe(
             "always",
-            _run_always,
+            _delegate("slash_always"),
             "/always [key] — allow this tool/action for the running session",
+            reason=approval,
         )
     )
-    registry.register(SlashCommand("deny", _run_deny, "/deny [key]"))
     registry.register(
-        SlashCommand(
+        safe("deny", _delegate("slash_deny"), "/deny [key]", reason=approval)
+    )
+    registry.register(
+        safe(
             "accounts",
-            _run_accounts,
+            _delegate("slash_accounts"),
             "list, switch, or label accounts",
-            ServeSlash(
-                mutates=_has_args,
-                runs_while_busy=_no_args,
-            ),
+            serve=ServeSlash(mutates=_has_args, runs_while_busy=_no_args),
+            reason=native,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "restart",
-            _run_restart,
+            _delegate("slash_restart"),
             "restart this session from the local checkout (reinstall after pyproject changes)",
+            reason=loop_owned,
         )
     )
     registry.register(
-        SlashCommand(
+        safe(
             "permissions",
-            _run_permissions,
+            _delegate("slash_permissions"),
             "show rules; revoke a session grant: /permissions revoke <grant>; clear all: /permissions clear",
+            reason=loop_owned,
         )
     )
     result = load_custom_commands(

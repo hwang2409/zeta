@@ -16,7 +16,10 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
+
+if TYPE_CHECKING:
+    from zeta.project_registry import ProjectRegistry
 
 from zeta.core.checkpoints import ConversationEntry, active_branch
 from zeta.core.store._log import PersistedAppend
@@ -362,9 +365,9 @@ def _split_utf8(value: str, max_bytes: int) -> list[str]:
     return chunks or [""]
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SANITIZER_VERSION = 2
-INDEX_FILENAME = "transcript-index.sqlite3"
+INDEX_FILENAME = f"transcript-index-v{SCHEMA_VERSION}.sqlite3"
 MAX_ACTIVE_TAIL_BYTES = 1024 * 1024
 _TOKEN = re.compile(r"[\w.-]+", re.UNICODE)
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
@@ -438,20 +441,6 @@ class IndexStatus:
     detail: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class EvalResult:
-    query_count: int
-    recall_at: dict[int, float]
-    mrr: float
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "query_count": self.query_count,
-            "recall_at": {str(key): value for key, value in self.recall_at.items()},
-            "mrr": self.mrr,
-        }
-
-
 class TranscriptIndex:
     """Own one project's complete derived index behind a small interface."""
 
@@ -461,7 +450,8 @@ class TranscriptIndex:
         self.project_dir = Path(project_dir)
         self.project_id = project_id
         self.path = self.project_dir / INDEX_FILENAME
-        self.lock_path = self.project_dir / ".transcript-index.lock"
+        self.lock_path = self.path.with_name(f".{self.path.name}.lock")
+        self.building_path = self.path.with_name(f".{self.path.name}.building")
         try:
             self.project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             with self._write_guard():
@@ -512,8 +502,9 @@ class TranscriptIndex:
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
                         source_inode, source_mtime_ns, source_ctime_ns,
-                        source_size, incremental_ready, last_entry_id, active_tail_json
-                    ) VALUES (?, 0, ?, 0, 0, 0, 0, 0, 1, NULL, '[]')
+                        source_size, incremental_ready, last_entry_id, active_tail_json,
+                        prefix_digest
+                    ) VALUES (?, 0, ?, 0, 0, 0, 0, 0, 1, NULL, '[]', NULL)
                     ON CONFLICT(session_id) DO UPDATE SET last_seq=excluded.last_seq""",
                     (session_id, cursor),
                 )
@@ -523,34 +514,60 @@ class TranscriptIndex:
                 f"could not update transcript index: {exc}"
             ) from exc
 
+    @classmethod
+    def _reference(cls, project_dir: Path, project_id: str) -> TranscriptIndex:
+        index = object.__new__(cls)
+        index.project_dir = Path(project_dir)
+        index.project_id = project_id
+        index.path = index.project_dir / INDEX_FILENAME
+        index.lock_path = index.path.with_name(f".{index.path.name}.lock")
+        index.building_path = index.path.with_name(f".{index.path.name}.building")
+        return index
+
+    def _backfill_if_empty(self, sources: Sequence[TranscriptSource]) -> None:
+        with self._write_guard():
+            if self.path.exists():
+                status = self._status()
+                if not (status.ready and status.session_count == 0 and sources):
+                    return
+            elif not sources:
+                with self._temporary_database() as temporary_path:
+                    self._initialize(temporary_path)
+                    self._publish(temporary_path)
+                return
+            self.building_path.touch(mode=0o600)
+            try:
+                self._rebuild_locked(sources)
+            finally:
+                self._clear_building_path()
+
     def rebuild(self, sources: Iterable[TranscriptSource]) -> IndexStatus:
         """Build a fresh generation and atomically publish it."""
 
-        sources = tuple(sources)
         with self._write_guard():
-            generation = self._generation_best_effort() + 1
-            try:
-                with self._temporary_database() as temporary_path:
-                    replacement = object.__new__(TranscriptIndex)
-                    replacement.project_dir = self.project_dir
-                    replacement.project_id = self.project_id
-                    replacement.path = temporary_path
-                    replacement.lock_path = self.lock_path
-                    replacement._initialize(temporary_path)
-                    with closing(replacement._connect()) as connection:
-                        connection.execute(
-                            "UPDATE metadata SET value = ? WHERE key = 'generation'",
-                            (str(generation),),
-                        )
-                        connection.commit()
-                    for source in sources:
-                        replacement._append_locked(source, force_full=True)
-                    self._publish(temporary_path)
-                    return self._status()
-            except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
-                raise TranscriptIndexError(
-                    f"could not rebuild transcript index: {exc}"
-                ) from exc
+            return self._rebuild_locked(tuple(sources))
+
+    def _rebuild_locked(self, sources: Sequence[TranscriptSource]) -> IndexStatus:
+        generation = self._generation_best_effort() + 1
+        try:
+            with self._temporary_database() as temporary_path:
+                replacement = self._reference(temporary_path, self.project_id)
+                replacement.path = temporary_path
+                replacement._initialize(temporary_path)
+                with closing(replacement._connect()) as connection:
+                    connection.execute(
+                        "UPDATE metadata SET value = ? WHERE key = 'generation'",
+                        (str(generation),),
+                    )
+                    connection.commit()
+                for source in sources:
+                    replacement._append_locked(source, force_full=True)
+                self._publish(temporary_path)
+                return self._status()
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            raise TranscriptIndexError(
+                f"could not rebuild transcript index: {exc}"
+            ) from exc
 
     def delete_session(self, session_id: str) -> None:
         with self._write_guard():
@@ -574,6 +591,8 @@ class TranscriptIndex:
     def search(self, query: str, *, limit: int = 10) -> tuple[SearchHit, ...]:
         """Rank all-term matches first, then rare-term partial matches."""
 
+        if self._is_building():
+            raise TranscriptIndexUnavailable("index building")
         with self._read_guard():
             return self._search(query, limit=limit)
 
@@ -628,8 +647,57 @@ class TranscriptIndex:
             ) from exc
 
     def status(self) -> IndexStatus:
+        if self._is_building():
+            return self._building_status()
         with self._read_guard():
             return self._status()
+
+    def _is_building(self) -> bool:
+        """Report whether a backfill is in progress for this version.
+
+        A backfill touches the marker only while it holds the write lock and
+        removes it before releasing, so a marker whose lock is free is a crashed
+        build: we clear it and let the next open rebuild the empty index instead
+        of wedging search forever.
+        """
+
+        if not self.building_path.exists():
+            return False
+        try:
+            fd = os.open(
+                self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+            )
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return True
+        try:
+            self._clear_building_path()
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        return False
+
+    def _clear_building_path(self) -> None:
+        self.building_path.unlink(missing_ok=True)
+
+    def _building_status(self) -> IndexStatus:
+        return IndexStatus(
+            project_id=self.project_id,
+            schema_version=SCHEMA_VERSION,
+            sanitizer_version=SANITIZER_VERSION,
+            generation=self._generation_best_effort(),
+            unit_count=0,
+            session_count=0,
+            cursors={},
+            path=self.path,
+            size_bytes=self.path.stat().st_size if self.path.exists() else 0,
+            ready=False,
+            detail="index building",
+        )
 
     def _status(self) -> IndexStatus:
         version, sanitizer, generation, detail = self._version_state()
@@ -717,8 +785,9 @@ class TranscriptIndex:
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
                         source_inode, source_mtime_ns, source_ctime_ns,
-                        source_size, incremental_ready, last_entry_id, active_tail_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_size, incremental_ready, last_entry_id, active_tail_json,
+                        prefix_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         byte_offset=excluded.byte_offset,
                         last_seq=excluded.last_seq,
@@ -729,7 +798,8 @@ class TranscriptIndex:
                         source_size=excluded.source_size,
                         incremental_ready=excluded.incremental_ready,
                         last_entry_id=excluded.last_entry_id,
-                        active_tail_json=excluded.active_tail_json""",
+                        active_tail_json=excluded.active_tail_json,
+                        prefix_digest=excluded.prefix_digest""",
                     (
                         source.session_id,
                         read.byte_offset,
@@ -742,6 +812,7 @@ class TranscriptIndex:
                         incremental_ready,
                         read.last_entry_id,
                         tail_json,
+                        read.prefix_digest,
                     ),
                 )
                 connection.commit()
@@ -781,7 +852,7 @@ class TranscriptIndex:
         row = connection.execute(
             """SELECT byte_offset, last_seq, source_device, source_inode,
                 source_mtime_ns, source_ctime_ns, source_size, incremental_ready,
-                last_entry_id, active_tail_json
+                last_entry_id, active_tail_json, prefix_digest
             FROM session_cursors WHERE session_id = ?""",
             (session_id,),
         ).fetchone()
@@ -792,6 +863,7 @@ class TranscriptIndex:
             bool(row[7]),
             str(row[8]) if row[8] is not None else None,
             tuple(json.loads(row[9])),
+            str(row[10]) if row[10] is not None else None,
         )
 
     @staticmethod
@@ -1013,53 +1085,60 @@ class _ProjectFileGuard:
             self.thread_lock.release()
 
 
-def evaluate_manifest(manifest_path: Path, units_path: Path) -> EvalResult:
-    """Evaluate the frozen corpus through the production FTS5 search path."""
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    units = [
-        TranscriptUnit.from_dict(json.loads(line))
-        for line in units_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    project_ids = {unit.project_id for unit in units}
-    if len(project_ids) != 1:
-        raise ValueError("evaluation units must belong to one project")
-    project_id = project_ids.pop()
-    rankings: list[list[str]] = []
-    targets: list[set[str]] = []
-    with tempfile.TemporaryDirectory() as directory:
-        index = TranscriptIndex(Path(directory) / project_id, project_id)
-        by_session: dict[str, list[TranscriptUnit]] = {}
-        for unit in units:
-            by_session.setdefault(unit.session_id, []).append(unit)
-        for session_id, session_units in by_session.items():
-            index.append_units(
-                session_id,
-                session_units,
-                cursor=max(unit.seq_end for unit in session_units),
+def linked_transcript_sources(
+    registry: ProjectRegistry, project_id: str
+) -> tuple[TranscriptSource, ...]:
+    """Select the linked parent sessions owned by project transcript search."""
+
+    sources = []
+    for link in registry.list_session_links(project_id, limit=10_000):
+        session_id = link.get("session_id")
+        transcript_path = link.get("transcript_path")
+        if (
+            isinstance(session_id, str)
+            and isinstance(transcript_path, str)
+            and is_indexable_top_level_project_session(
+                agent_depth=0,
+                project_id=project_id,
+                parent_session_id=link.get("parent_session_id"),
+                session_dir=Path(transcript_path),
             )
-        for case in manifest["queries"]:
-            rankings.append(
-                [hit.unit_id for hit in index.search(case["query"], limit=10)]
+        ):
+            sources.append(
+                TranscriptSource(session_id, Path(transcript_path), project_id)
             )
-            targets.append(set(case["target_unit_ids"]))
-    recall = {
-        k: sum(
-            bool(set(ranking[:k]) & target)
-            for ranking, target in zip(rankings, targets, strict=True)
-        )
-        / len(targets)
-        for k in (1, 5, 10)
-    }
-    reciprocal = []
-    for ranking, target in zip(rankings, targets, strict=True):
-        rank = next(
-            (index for index, unit_id in enumerate(ranking, 1) if unit_id in target),
-            None,
-        )
-        reciprocal.append(1.0 / rank if rank else 0.0)
-    return EvalResult(len(targets), recall, sum(reciprocal) / len(reciprocal))
+    return tuple(sources)
+
+
+def open_project_index(
+    registry: ProjectRegistry, project_id: str
+) -> TranscriptIndex:
+    """Open the current index, backfilling a missing or empty version once.
+
+    The backfill source list is read from the registry only when the version
+    file is missing or is ready but empty, so the common ready path stays off
+    the registry. A project with no registry entry has nothing to backfill, so
+    we return a plain index whose empty file exists for the caller to append to.
+    """
+
+    from zeta.project_errors import ProjectRegistryError
+
+    project_dir = registry.root / project_id
+    project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    index = TranscriptIndex._reference(project_dir, project_id)
+    if index._is_building():
+        return index
+    if index.path.exists():
+        status = index.status()
+        if not (status.ready and status.session_count == 0):
+            return index
+    try:
+        sources = linked_transcript_sources(registry, project_id)
+    except ProjectRegistryError:
+        return TranscriptIndex(project_dir, project_id)
+    index._backfill_if_empty(sources)
+    return index
 
 
 def delete_indexed_session(
@@ -1130,7 +1209,8 @@ CREATE TABLE session_cursors (
     source_size INTEGER NOT NULL CHECK(source_size >= 0),
     incremental_ready INTEGER NOT NULL CHECK(incremental_ready IN (0, 1)),
     last_entry_id TEXT,
-    active_tail_json TEXT NOT NULL
+    active_tail_json TEXT NOT NULL,
+    prefix_digest TEXT
 ) WITHOUT ROWID;
 CREATE TABLE units (
     id INTEGER PRIMARY KEY,

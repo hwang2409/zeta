@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
 from ..core.project_context import ProjectContext
+from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
@@ -36,6 +37,7 @@ from ..protocol.types import (
     is_owned_completion_backend,
 )
 from ..providers.factory import build_backend, credential_store
+from ..providers.rate_limit_hold import rate_limit_hold_text
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
@@ -44,6 +46,7 @@ from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
+from . import child_context as _child_context
 from .background import CancellationRequest, finish_background_child
 from .child_context import (
     _child_base_system_prompt,
@@ -64,6 +67,8 @@ from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_detail
 from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
 
+_compose_child_system_prompt = _child_context._compose_child_system_prompt
+
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
 if TYPE_CHECKING:
@@ -80,7 +85,7 @@ async def consume_child(
     child_turns: Callable[[], int],
     update_turns: Callable[[int], None],
     update_step: Callable[[str], None],
-    update_tool_calls: Callable[[int], None],
+    record_tool_call: Callable[[], None],
     finish_lifecycle: Callable[[str, str], dict[str, object]],
     publish_lifecycle: Callable[..., None],
     child_result: Callable[..., dict[str, object]],
@@ -95,7 +100,7 @@ async def consume_child(
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
     failure_message: str | None = None
-    tool_calls = 0
+    failure_error: tuple[str, str] | None = None
     explicit_report: dict[str, object] | None = None
 
     def terminal_result(
@@ -118,11 +123,18 @@ async def consume_child(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
     ) -> None:
-        nonlocal failure_message, final_message, tool_calls, explicit_report
+        nonlocal failure_error, failure_message, final_message, explicit_report
         final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
+                update_step(status)
+                publish(status)
+            elif (
+                event.type is StreamEventType.RETRY
+                and event.data.get("kind") == "provider_rate_limit_hold"
+            ):
+                status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
                 publish(status)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -142,8 +154,7 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TOOL_EXECUTION_START:
-                tool_calls += 1
-                update_tool_calls(tool_calls)
+                record_tool_call()
                 name = event.tool_call.name if event.tool_call is not None else "tool"
                 arguments = (
                     event.tool_call.arguments if event.tool_call is not None else {}
@@ -180,6 +191,7 @@ async def consume_child(
                 if gate_control is not None and gate_control.turn_ended():
                     return
             elif event.type is StreamEventType.ERROR and event.error is not None:
+                failure_error = (event.error.code, event.error.message)
                 failure_message = event.error.message
 
     def owned_children() -> tuple[tuple[str, str], ...]:
@@ -280,6 +292,20 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
+        if failure_error is not None and failure_error[0] in {"account_lock_timeout", "no_progress_loop"}:
+            result = terminal_result(
+                state="idle",
+                text=f"agent error: {failure_message}",
+                error=False,
+                status="running",
+            )
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                structured["recoverable_error"] = {
+                    "code": failure_error[0],
+                    "message": failure_error[1],
+                }
+            return result
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
@@ -458,6 +484,13 @@ async def _build_child_loop(
         child_context = await asyncio.to_thread(
             _child_base_system_prompt, loop, cwd_override, child_registry
         )
+        child_scope = getattr(loop, "_live_config_scope", None)
+        child_home = Path(loop.active_home) if loop.active_home else env_home()
+        child_project_dir = (
+            child_scope.project_dir
+            if child_scope is not None
+            else Path(child_registry.cwd)
+        )
         child_context = _compose_child_project_context(
             child_context,
             preset,
@@ -487,7 +520,12 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            live_config_home=child_home,
+            live_config_project_dir=child_project_dir,
+            freeze_live_config=child_scope is None,
         )
+
+        await child_loop.refresh_live_config(publish=False)
 
         def prepare_child_project_context(
             projection: ProjectContextProjection,
@@ -972,8 +1010,8 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
 
-    def update_tool_calls(tool_calls: int) -> None:
-        child_store.update_agent_lifecycle(tool_calls=tool_calls)
+    def record_tool_call() -> None:
+        child_store.update_agent_lifecycle(tool_calls=1)
 
     consume = consume_run if follow_up_loop else consume_child
     loop._background_owner.causal_episodes.associate_new_member(
@@ -1015,7 +1053,7 @@ async def run_agent_tool(
             publish=publish,
             child_turns=child_turns,
             update_turns=update_turns,
-            update_tool_calls=update_tool_calls,
+            record_tool_call=record_tool_call,
             update_step=update_step,
             finish_lifecycle=finish_lifecycle,
             publish_lifecycle=publish_lifecycle,

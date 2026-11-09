@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 FinishGateOutcome = Literal["completed", "handed_off", "task_safety_expired"]
 POST_CAP_CAUSAL_TURNS = 3
+_FINISH_GATE_DETAIL_CAP = 20
+_FINISH_GATE_DETAIL_BYTES = 64
+_FINISH_GATE_MESSAGE_BYTES = 5_000
 ConsumeEvents = Callable[
     [AsyncIterator[StreamEvent], "FinishGateControl | None"], Awaitable[None]
 ]
@@ -27,23 +30,79 @@ ConsumeEvents = Callable[
 def finish_gate_message(
     children: tuple[tuple[str, str], ...], tasks: tuple[tuple[str, str], ...]
 ) -> Message:
-    running: list[str] = []
-    if children:
-        child_list = ", ".join(
-            f"{handle}: {description}" for handle, description in children
-        )
-        running.append(
-            f"{len(children)} background sub-agents still running: {child_list}"
-        )
-    if tasks:
-        task_list = ", ".join(f"{task_id}: {headline}" for task_id, headline in tasks)
-        running.append(f"{len(tasks)} background tasks still running: {task_list}")
     stop_choices = []
     if children:
         stop_choices.append("cancel sub-agents with agent_cancel")
     if tasks:
         stop_choices.append("stop tasks with task_kill")
-    text = (
+    running = _format_finish_gate_details(children, tasks, stop_choices)
+    text = _finish_gate_text(running, stop_choices)
+    return harness_notice("finish gate", text, event="agent_finish_gate")
+
+
+def _format_finish_gate_details(
+    children: tuple[tuple[str, str], ...],
+    tasks: tuple[tuple[str, str], ...],
+    stop_choices: list[str],
+) -> list[str]:
+    groups = [
+        (children, "background sub-agents", "more sub-agents", "agent_status"),
+        (tasks, "background tasks", "more tasks", "task_list"),
+    ]
+    selected = [0, 0]
+    limit = min(_FINISH_GATE_DETAIL_CAP, len(children)) + min(
+        _FINISH_GATE_DETAIL_CAP, len(tasks)
+    )
+    for _ in range(limit):
+        group_index = next(
+            (
+                index
+                for index, (items, *_rest) in enumerate(groups)
+                if selected[index] < min(_FINISH_GATE_DETAIL_CAP, len(items))
+            ),
+            None,
+        )
+        if group_index is None:
+            break
+        selected[group_index] += 1
+        candidate = _render_finish_gate_details(groups, selected)
+        candidate_text = _finish_gate_text(candidate, stop_choices)
+        if (
+            len(
+                harness_notice("finish gate", candidate_text, event="agent_finish_gate")
+                .content[0]
+                .text.encode()
+            )
+            >= _FINISH_GATE_MESSAGE_BYTES
+        ):
+            selected[group_index] -= 1
+            break
+    return _render_finish_gate_details(groups, selected)
+
+
+def _render_finish_gate_details(
+    groups: list[tuple[tuple[tuple[str, str], ...], str, str, str]], selected: list[int]
+) -> list[str]:
+    running = []
+    for (items, label, omitted_label, guidance), count in zip(groups, selected):
+        if not items:
+            continue
+        entries = ", ".join(
+            f"{identifier}: {_truncate_finish_gate_detail(detail)}"
+            for identifier, detail in items[:count]
+        )
+        omitted = len(items) - count
+        details = (
+            f"{entries}; {omitted} {omitted_label} omitted; use {guidance}"
+            if omitted
+            else entries
+        )
+        running.append(f"{len(items)} {label} still running: {details}")
+    return running
+
+
+def _finish_gate_text(running: list[str], stop_choices: list[str]) -> str:
+    return (
         f"You have {'; '.join(running)}. You cannot finish yet. Choose one: "
         "(a) wait: reply WAIT and end this turn; completions and task exits "
         "will wake you, with no polling; (b) "
@@ -54,7 +113,14 @@ def finish_gate_message(
         "agent completes; task output remains in this child session's task archive. "
         "A finish-gate safety bound applies if a task never exits."
     )
-    return harness_notice("finish gate", text, event="agent_finish_gate")
+
+
+def _truncate_finish_gate_detail(value: str) -> str:
+    return (
+        value[:_FINISH_GATE_DETAIL_BYTES]
+        .encode("utf-8")[:_FINISH_GATE_DETAIL_BYTES]
+        .decode("utf-8", errors="ignore")
+    )
 
 
 @dataclass(eq=False, slots=True)
@@ -240,8 +306,17 @@ class FinishGateState:
                 finally:
                     close = getattr(events, "aclose", None)
                     if close is not None:
-                        await close()
+                        close_task = asyncio.create_task(close())
+                        if loop.time() >= self._task_deadline():
+                            close_task.cancel()
+                            # test-contract: seam canceled completion close must drain
+                            await asyncio.gather(close_task, return_exceptions=True)
+                        else:
+                            # test-contract: seam timeout_at owns the close deadline
+                            await close_task
         except TimeoutError:
+            if task_running_at_entry and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if (
                 flow is not None
@@ -291,6 +366,8 @@ class FinishGateState:
         loop = asyncio.get_running_loop()
         deadline = self._task_deadline() if tasks_running else self._child_deadline()
         if loop.time() >= deadline:
+            if tasks_running and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if (
                 flow is not None
@@ -300,10 +377,13 @@ class FinishGateState:
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
         try:
             async with asyncio.timeout_at(deadline):
+                # test-contract: seam timeout_at owns the transition deadline
                 await child_loop._background_owner.conversation_channel.wait(
                     child_loop.agent_instance_id or ""
                 )
         except TimeoutError:
+            if tasks_running and loop.time() >= self._task_deadline():
+                return _task_safety_expired()
             flow = getattr(child_loop, "step_delivery", None)
             if (
                 flow is not None
@@ -346,6 +426,10 @@ class FinishGateState:
         assert self.child_deadline is not None
         return self.child_deadline
 
+    def completion_task_deadline(self, child_loop: AgentLoop) -> float | None:
+        """Bound a gate turn's provider completion while tasks still run."""
+        return self._task_deadline() if self.owned_tasks(child_loop) else None
+
     def _task_deadline(self) -> float:
         assert self.task_deadline is not None
         return self.task_deadline
@@ -368,6 +452,7 @@ async def await_owned_work(
             return
         try:
             async with asyncio.timeout_at(deadline):
+                # test-contract: seam timeout_at owns the transition deadline
                 await child_loop._background_owner.conversation_channel.wait(
                     child_loop.agent_instance_id or ""
                 )
@@ -414,7 +499,10 @@ async def _run_finish_gate(
     try:
         result = await state.run_model_turn(
             child_loop,
-            child_loop.run_harness_notice_turn(finish_gate_message(children, tasks)),
+            child_loop.run_harness_notice_turn(
+                finish_gate_message(children, tasks),
+                task_deadline=state.completion_task_deadline(child_loop),
+            ),
             consume_events,
         )
         if result is not None:
@@ -486,14 +574,26 @@ async def _handle_pending_notification(
             child_loop.agent_instance_id or "", flow.pending_ids()
         )
         if episode is None:
+            from ..runtime.loop.empty_turn import not_delivered_text
+
+            channel = child_loop._background_owner.conversation_channel
             flow.suppress_pending(exhausted_ids)
-            child_loop._background_owner.conversation_channel.clear_wake(
-                child_loop.agent_instance_id or ""
-            )
+            channel.clear_wake(child_loop.agent_instance_id or "")
+            if exhausted_ids:
+                await channel.publish_not_delivered(
+                    child_loop,
+                    not_delivered_text(
+                        f"the budget of {POST_CAP_CAUSAL_TURNS} automatic turns "
+                        "after the finish gate is used up",
+                        waits_for_input=child_loop.explicit_finish,
+                    ),
+                )
             return await state.wait_transition(child_loop, tasks_running=tasks_running)
     return await state.run_model_turn(
         child_loop,
-        child_loop.run_notification_turn(),
+        child_loop.run_notification_turn(
+            task_deadline=state.completion_task_deadline(child_loop)
+        ),
         consume_events,
         episode,
     )

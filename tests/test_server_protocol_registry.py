@@ -732,6 +732,12 @@ STRUCTURED_ERROR_FIXTURES = (
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session grant not found","data":{"code":"session_grant_not_found","grant":"bash"}}}\n',
     ),
     (
+        ErrorDescriptor.SESSION_MISMATCH,
+        "session is not active",
+        {"attached_session_id": "s1", "session_id": "s2"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32003,"message":"session is not active","data":{"code":"session_mismatch","attached_session_id":"s1","session_id":"s2"}}}\n',
+    ),
+    (
         ErrorDescriptor.SESSION_NOT_FOUND,
         "session missing",
         {"session_id": "s1"},

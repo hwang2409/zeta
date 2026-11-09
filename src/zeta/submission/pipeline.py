@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from itertools import count
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from uuid import uuid4
 
 from ..core.abort import AbortSignal
@@ -30,6 +30,20 @@ from ..tools._shared.shell import (
 )
 from ..tui.composer import UndoCandidate, parse_input
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
+from .messages import (
+    _AbortAction,
+    _ApprovalAction,
+    _ApprovalLifecycle,
+    _CommandDone,
+    _DurableToolDone,
+    _Message,
+    _PreprocessingDone,
+    _ProviderDone,
+    _Retry,
+    _SlashDone,
+    _Submit,
+    _UndoAction,
+)
 from .model import (
     Submission,
     SubmissionHost,
@@ -38,74 +52,6 @@ from .model import (
     dispatch_provider,
 )
 from .notification_retry import NotificationOutcome, NotificationRetry
-
-
-class _Message(Protocol):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class _Submit:
-    submission: Submission
-    acknowledged: asyncio.Future[None] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _Retry:
-    submission: Submission
-    user_message: Message
-    acknowledged: asyncio.Future[None]
-
-
-@dataclass(frozen=True, slots=True)
-class _PreprocessingDone:
-    submission: Submission
-    model_input: ModelInputEnvelope | None = None
-    error: BaseException | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _CommandDone:
-    submission: Submission
-    receipt: str | None = None
-    error: BaseException | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _ProviderDone:
-    submission: Submission
-    task: asyncio.Task[NotificationOutcome]
-
-
-@dataclass(frozen=True, slots=True)
-class _DurableToolDone:
-    request_id: str
-    task: asyncio.Task[Any]
-
-
-@dataclass(frozen=True, slots=True)
-class _ApprovalLifecycle:
-    submission: Submission
-    kind: str
-    call: ToolCall
-
-
-@dataclass(frozen=True, slots=True)
-class _ApprovalAction:
-    decision: ApprovalDecision
-    requested_key: str | None
-    acknowledged: asyncio.Future[None] | None = None
-    always: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _AbortAction:
-    submission_id: int | None
-
-
-@dataclass(frozen=True, slots=True)
-class _UndoAction:
-    pass
 
 
 class SubmissionPipeline:
@@ -147,7 +93,11 @@ class SubmissionPipeline:
             ),
         )
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
-        self._control_entry: _Entry | None = None
+        # Running slash dispatches by submission id; each holds or awaits the
+        # session slash lock, so the consumer stays free for aborts and approvals.
+        self._slash_tasks: dict[int, asyncio.Task[Any]] = {}
+        # Submissions queued behind a running slash command keep their order.
+        self._deferred: deque[_Message] = deque()
         self._closed = False
         self._shutting_down = False
 
@@ -165,17 +115,24 @@ class SubmissionPipeline:
 
     @property
     def active(self) -> bool:
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if self._slash_tasks and current not in self._slash_tasks.values():
+            # A running slash command is work; only the command itself ignores it.
+            return True
         return any(
             (
                 entry.state in self._NONTERMINAL or entry is self._provider_entry
             )
-            and entry is not self._control_entry
+            and entry.submission.id not in self._slash_tasks
             for entry in self._entries.values()
         ) or (
-            self._control_entry is None
+            not self._slash_tasks
             and any(
                 isinstance(message, (_Submit, _Retry))
-                for message in self._messages._queue
+                for message in (*self._deferred, *self._messages._queue)
             )
         ) or bool(self._durable_tasks)
 
@@ -290,12 +247,6 @@ class SubmissionPipeline:
         self._ensure_open()
         self._send(_UndoAction())
 
-    def approval_action(
-        self, decision: ApprovalDecision, requested_key: str | None
-    ) -> None:
-        self._ensure_open()
-        self._send(_ApprovalAction(decision, requested_key))
-
     async def approval_command(
         self,
         decision: ApprovalDecision,
@@ -348,6 +299,9 @@ class SubmissionPipeline:
                 entry.signal.abort()
             if entry.child_task is not None and not entry.child_task.done():
                 entry.child_task.cancel()
+        for task in self._slash_tasks.values():
+            if not task.done():
+                task.cancel()
         for task in self._durable_tasks.values():
             if not task.done():
                 task.cancel()
@@ -357,6 +311,7 @@ class SubmissionPipeline:
             task
             for task in (
                 *self._preprocessing_waiters.values(),
+                *self._slash_tasks.values(),
                 self._provider_task,
                 *self._durable_tasks.values(),
             )
@@ -407,10 +362,38 @@ class SubmissionPipeline:
         if self._consumer is None or self._consumer.done():
             self._consumer = asyncio.create_task(self._consume())
 
+    def _slash_route(self, message: _Message) -> bool:
+        if not isinstance(message, _Submit):
+            return False
+        parsed = parse_input(message.submission.text)
+        commands = self._host._slash_commands
+        return (
+            parsed is not None
+            and not self._host._exit_requested
+            and commands.exec_command_for(parsed) is None
+            and not commands.needs_inline_shell_resolution(parsed)
+            and commands.routes(self._host, parsed)
+        )
+
+    def _next_message(self) -> _Message | None:
+        if self._deferred and (
+            not self._slash_tasks or self._slash_route(self._deferred[0])
+        ):
+            return self._deferred.popleft()
+        while True:
+            message = self._messages.get_nowait()
+            if isinstance(message, (_Submit, _Retry)) and (
+                self._deferred
+                or (self._slash_tasks and not self._slash_route(message))
+            ):
+                self._deferred.append(message)
+                continue
+            return message
+
     async def _consume(self) -> None:
         while not self._shutting_down:
             try:
-                message = self._messages.get_nowait()
+                message = self._next_message()
             except asyncio.QueueEmpty:
                 if self._consumer is asyncio.current_task():
                     self._consumer = None
@@ -428,6 +411,8 @@ class SubmissionPipeline:
                     await self._on_preprocessing_done(message)
                 elif isinstance(message, _CommandDone):
                     self._on_command_done(message)
+                elif isinstance(message, _SlashDone):
+                    await self._on_slash_done(message)
                 elif isinstance(message, _ProviderDone):
                     self._on_provider_done(message)
                 elif isinstance(message, _DurableToolDone):
@@ -454,7 +439,7 @@ class SubmissionPipeline:
                     self._retry_oldest_ready()
 
     async def _on_submit(self, message: _Submit) -> None:
-        await self._host.loop.refresh_skills()
+        await self._host.loop.refresh_live_config()
         entry = _Entry(message.submission)
         entry.acknowledged = message.acknowledged
         self._entries[entry.submission.id] = entry
@@ -468,37 +453,66 @@ class SubmissionPipeline:
                 self._start_command(entry, command)
             elif self._host._slash_commands.needs_inline_shell_resolution(parsed):
                 self._start_preprocessing(entry)
+            elif self._host._slash_commands.routes(self._host, parsed):
+                self._start_slash(entry, parsed)
             else:
-                self._control_entry = entry
-                try:
-                    slash_output = await self._host._slash_commands.dispatch_async(
-                        self._host, parsed
-                    )
-                finally:
-                    self._control_entry = None
-                if isinstance(slash_output, SlashPromptError):
-                    self._host._restore_pending_submission(entry.submission)
-                    self._host._print_system(slash_output.message)
-                    self._finish_entry(entry, SubmissionState.CANCELED)
-                elif isinstance(slash_output, ModelInputEnvelope):
-                    entry.model_input = slash_output
-                    entry.attachment_value = entry.submission.text
-                    await self._prepare_submission(entry, parsed)
-                elif slash_output is not None:
-                    self._host._release_attachment_paths(
-                        entry.submission.attachment_paths
-                    )
-                    self._record_prompt(entry)
-                    self._host._handle_slash_output(slash_output)
-                    self._finish_entry(entry, SubmissionState.CANCELED)
-                else:
-                    await self._prepare_submission(entry, parsed)
+                await self._prepare_submission(entry, parsed)
+        self._ack_settled(entry)
+
+    def _ack_settled(self, entry: _Entry) -> None:
         if entry.state in {
             SubmissionState.CANCELED,
             SubmissionState.READY,
             SubmissionState.DISPATCHED,
         }:
             self._ack_entry(entry)
+
+    def _start_slash(self, entry: _Entry, parsed: str) -> None:
+        entry.state = SubmissionState.PREPROCESSING
+        entry.signal = self._new_signal()
+        task = asyncio.create_task(
+            self._host._slash_commands.dispatch_async(self._host, parsed)
+        )
+        entry.child_task = task
+        self._slash_tasks[entry.submission.id] = task
+        task.add_done_callback(
+            lambda completed, submission=entry.submission: self._send(
+                _SlashDone(submission, completed)
+            )
+        )
+
+    async def _on_slash_done(self, message: _SlashDone) -> None:
+        self._slash_tasks.pop(message.submission.id, None)
+        entry = self._entry_for(message.submission)
+        if entry is None:
+            return
+        entry.child_task = None
+        task = message.task
+        if task.cancelled() or entry.state is SubmissionState.CANCELED:
+            self._cancel_or_restore(entry)
+            return
+        try:
+            slash_output = task.result()
+        except Exception as exc:  # noqa: BLE001 - the consumer reports command failures
+            self._host._print_system(f"submission failed: {exc}")
+            self._cancel_entry(entry)
+            return
+        if isinstance(slash_output, SlashPromptError):
+            self._host._restore_pending_submission(entry.submission)
+            self._host._print_system(slash_output.message)
+            self._finish_entry(entry, SubmissionState.CANCELED)
+        elif isinstance(slash_output, ModelInputEnvelope):
+            entry.model_input = slash_output
+            entry.attachment_value = entry.submission.text
+            await self._prepare_submission(entry, entry.parsed)
+        elif slash_output is not None:
+            self._host._release_attachment_paths(entry.submission.attachment_paths)
+            self._record_prompt(entry)
+            self._host._handle_slash_output(slash_output)
+            self._finish_entry(entry, SubmissionState.CANCELED)
+        else:
+            await self._prepare_submission(entry, entry.parsed)
+        self._ack_settled(entry)
 
     def _on_wake(self) -> None:
         self._notification_retry.request_wake()
@@ -1231,6 +1245,8 @@ class SubmissionPipeline:
     def _drain_acknowledgements(self) -> None:
         for entry in self._entries.values():
             self._ack_entry(entry)
+        while self._deferred:
+            self._ack_message(self._deferred.popleft())
         while True:
             try:
                 message = self._messages.get_nowait()
