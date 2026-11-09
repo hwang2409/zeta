@@ -23,6 +23,7 @@ from tempfile import TemporaryDirectory
 import httpx
 import pytest
 from rich.console import Console
+
 from zeta.server.approval_settlement.owner import TaskOwner
 
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
