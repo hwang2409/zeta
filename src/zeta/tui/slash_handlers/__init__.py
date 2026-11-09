@@ -7,6 +7,7 @@ cap. ``TUIApp`` mixes these in, so they run against its attributes.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import json
 from typing import Any
@@ -24,6 +25,7 @@ from ...accounts.login import login_failure_message, login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.commands.plan_commands import run_implement_command, run_plan_command
+from ...core.commands.slash_registry import SlashLock, waiting_message
 from ...core.project_context import project_command_view
 from ...core.session import (
     SessionError,
@@ -31,7 +33,7 @@ from ...core.session import (
     normalize_session_name,
     persist_metadata_change,
 )
-from ...core.slash import SlashStatus, _format_status
+from ...core.slash import SlashStatus, SlashStatusSnapshot, build_slash_status
 from ...core.transcript_recovery.runtime import (
     TranscriptRepairRequiresUpgrade,
     repair_transcript_for_runtime,
@@ -43,7 +45,7 @@ from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import StreamEvent, StreamEventType
 from ...providers.factory import build_backend
-from ...runtime.status import build_slash_status, capture_slash_status
+from ...runtime.status import capture_slash_status
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -59,6 +61,18 @@ def _validate_model_name(provider: str, model: str) -> None:
 
 class SlashHandlerMixin:
     """Serve the session-state slash commands the registry dispatches."""
+
+    @functools.cached_property
+    def slash_lock(self) -> SlashLock:
+        """The TUI waits visibly behind the running command."""
+
+        return SlashLock(
+            contended=lambda holder: self._print_system(waiting_message(holder)),
+            waiting=lambda holder: self._print_system(waiting_message(holder)),
+            late_output=lambda output: (
+                self._handle_slash_output(output) if isinstance(output, str) else None
+            ),
+        )
 
     async def slash_approve(self, args: str) -> str:
         """Approve the first pending request, or the request with this key."""
@@ -106,14 +120,16 @@ class SlashHandlerMixin:
             return
         await controller.resolve_approval(decision, requested_key, always=always)
 
-    def slash_status_command(self, args: str) -> str:
-        if not args.strip() and self._full_screen_active():
+    def slash_status_input(self, args: str) -> tuple[bool, SlashStatusSnapshot]:
+        card = not args.strip() and self._full_screen_active()
+        if card:
             self._consume_overlay_submission()
-            self.open_status_card()
-            return ""
-        return _format_status(self.slash_status())
+        return card, self._status_snapshot()
 
     def slash_status(self) -> SlashStatus:
+        return build_slash_status(self._status_snapshot())
+
+    def _status_snapshot(self) -> SlashStatusSnapshot:
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
@@ -128,21 +144,19 @@ class SlashHandlerMixin:
             viewed_health = (
                 viewed_loop.project_context_health if viewed_loop is not None else None
             )
-        return build_slash_status(
-            capture_slash_status(
-                self.loop,
-                session_id=self.loop.store.session_id,
-                provider=self.provider,
-                model=self.model,
-                context_files=self._context_files,
-                vim_mode=self.vim_mode,
-                pending_approvals=pending,
-                usage_tracker=self._usage_tracker,
-                project_context_health=(
-                    viewed_health.summary if viewed_health is not None else None
-                ),
-                transcript_session_id=viewed_path.name,
-            )
+        return capture_slash_status(
+            self.loop,
+            session_id=self.loop.store.session_id,
+            provider=self.provider,
+            model=self.model,
+            context_files=self._context_files,
+            vim_mode=self.vim_mode,
+            pending_approvals=pending,
+            usage_tracker=self._usage_tracker,
+            project_context_health=(
+                viewed_health.summary if viewed_health is not None else None
+            ),
+            transcript_session_id=viewed_path.name,
         )
 
     def model_choices(self) -> tuple[str, ...]:
@@ -639,7 +653,7 @@ class SlashHandlerMixin:
         if discovery is None or not pending:
             return "tools: no project tools waiting for trust"
         notices, trusted = trust_project_tools(self.loop.tool_registry, discovery)
-        self.loop.tool_schemas = list(self.loop.tool_registry.schemas)
+        self.loop.tool_schemas = tuple(self.loop.tool_registry.schemas)
         for notice in notices:
             self._print_system(notice)
         names = sorted({tool.module_stem for tool in trusted})

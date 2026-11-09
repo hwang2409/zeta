@@ -30,6 +30,7 @@ from ..memory.provider import complete_reconciliation
 from ..memory.reconciler import ReconciliationResponse
 from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
+from ..providers.completion import CompletionRetryBudget
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from ..storage_format import open_writer
@@ -69,6 +70,8 @@ class RuntimeComposition:
     loop: AgentLoop
     policy: ApprovalPolicy
     model: str
+    project_dir: Path
+    repo_root: Path
     external_tools: ExternalToolDiscovery
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
@@ -95,7 +98,6 @@ def compose_runtime(
     project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
     memory_notice: Callable[[str], None] | None = None,
-    post_stream_provider_retry: bool = True,
     require_selected_account: bool = True,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
@@ -245,8 +247,8 @@ def compose_runtime(
             "retained_tail": metadata.retained_tail,
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
-            "skill_home": home,
-            "skill_project_dir": (
+            "live_config_home": home,
+            "live_config_project_dir": (
                 project_discovery.primary_root
                 if project_discovery is not None
                 and project_discovery.primary_root is not None
@@ -308,7 +310,6 @@ def compose_runtime(
             **loop_kwargs,
         )
         loop.explicit_finish = config.agents_explicit_finish
-        loop.post_stream_provider_retry = post_stream_provider_retry
 
         def prepare_project_context(projection: Any) -> ProjectContext:
             cwd_project = (
@@ -369,7 +370,11 @@ def compose_runtime(
             memory_backend: CompletionBackend | None = None
             memory_backend_lock = asyncio.Lock()
 
-            async def invoke_memory(prompt: str) -> ReconciliationResponse:
+            async def invoke_memory(
+                prompt: str, budget: CompletionRetryBudget | None = None
+            ) -> ReconciliationResponse:
+                if budget is None:
+                    budget = CompletionRetryBudget()
                 nonlocal memory_backend
                 if memory_backend is None:
                     async with memory_backend_lock:
@@ -387,7 +392,7 @@ def compose_runtime(
                                 token_budget=effective_budget,
                             )
                             loop.register_backend_owner(memory_backend)
-                return await complete_reconciliation(memory_backend, prompt)
+                return await complete_reconciliation(memory_backend, prompt, budget)
 
             assert project_registry is not None
             memory_storage_lease = open_writer(home)
@@ -440,7 +445,7 @@ def compose_runtime(
             project_dir=repo_root / ".zeta",
             allow_external_tools=config.allow_external_tools,
         )
-        loop.tool_schemas = list(loop.tool_registry.schemas)
+        loop.tool_schemas = tuple(loop.tool_registry.schemas)
         if background_event_sink is not None:
             loop.set_background_event_sink(background_event_sink)
         composition = RuntimeComposition(
@@ -448,6 +453,12 @@ def compose_runtime(
             loop=loop,
             policy=policy,
             model=selected_model,
+            project_dir=repo_root,
+            repo_root=(
+                project_discovery.repo_root
+                if project_discovery is not None
+                else Path(metadata.cwd).resolve()
+            ),
             external_tools=external_tools,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,

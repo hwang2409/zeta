@@ -1,6 +1,20 @@
 """Conversation store public API."""
 
+# isort: skip_file
+
+# isort: skip
 from ._log import SCHEMA, InstalledEntriesDelta, PersistedAppend, TranscriptLoadError
+from ._row_history import (
+    RECENT_ROW_WINDOW,
+    ApprovalHistory,
+    ApprovalRequest,
+    ApprovalResolution,
+    AssistantResponseAfter,
+    DeliveredMessage,
+    RecentRowKey,
+    ToolResult,
+    UserTurnMessageAfter,
+)
 from ._store import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -46,19 +60,48 @@ from ._store import (
     warnings,
     weakref,
 )
+from ..checkpoints.mutation import (
+    AppendConversationRows,
+    CommittedDelta,
+    CommittedLogCursor,
+    ConversationAddress,
+    ConversationDedupeConflict,
+    ConversationDedupeKey,
+    ConversationGenerationConflict,
+    ConversationMutation,
+    ConversationRow,
+    ConversationTargetOwned,
+    commit_conversation_async,
+)
 
 __all__ = [
     "AGENT_COMPLETION_NOTIFICATION_KIND",
     "MAX_AGENT_NOTIFICATION_TEXT",
     "MAX_PENDING_PROMPT_TEXT",
+    "RECENT_ROW_WINDOW",
     "SCHEMA",
     "TASK_EXITED_NOTIFICATION_KIND",
     "AgentStateMixin",
     "Any",
+    "AppendConversationRows",
+    "ApprovalHistory",
+    "ApprovalRequest",
+    "ApprovalResolution",
+    "AssistantResponseAfter",
     "CheckpointForkMixin",
+    "CommittedDelta",
+    "CommittedLogCursor",
+    "ConversationAddress",
+    "ConversationDedupeConflict",
+    "ConversationDedupeKey",
     "ConversationEntry",
+    "ConversationGenerationConflict",
     "ConversationIntegrityError",
+    "ConversationMutation",
+    "ConversationRow",
     "ConversationStore",
+    "ConversationTargetOwned",
+    "DeliveredMessage",
     "ExitStack",
     "InstalledEntriesDelta",
     "Iterable",
@@ -71,12 +114,16 @@ __all__ = [
     "PendingPromptQueue",
     "PendingPromptsClosedError",
     "PersistedAppend",
+    "RecentRowKey",
     "Self",
     "TodoItem",
     "ToolCall",
+    "ToolResult",
     "ToolUseContent",
     "TranscriptLoadError",
+    "UserTurnMessageAfter",
     "child_directory",
+    "commit_conversation_async",
     "contextmanager",
     "copy",
     "encode_json",

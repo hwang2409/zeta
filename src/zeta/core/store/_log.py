@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from ...agent.receipt import encode_json
-from ...storage_format import WRITER_EPOCH
+from ...storage_format import StorageFeature, feature_enabled
 from ..checkpoints import (
     CONVERSATION_ENTRY_TYPES,
     ConversationEntry,
@@ -31,15 +31,15 @@ from ..checkpoints import (
     _now,
     load_session_json,
 )
+from ..checkpoints.entry_types import sent_message_receipts
 from ..session_files import open_session_file
 from ..transcript_recovery import (
-    TRANSCRIPT_REPAIR_EPOCH,
     TranscriptSourceFacts,
     ValidatedPrefix,
     reconcile_pending,
     repair_transcript,
 )
-from ._startup_facts import sent_message_receipts
+from ..transcript_recovery.stream import TranscriptStream
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
@@ -192,7 +192,10 @@ class _DetachedLogState:
 class _PhysicalRow:
     row_number: int
     byte_offset: int
+    prefix_digest: str
     value: dict[str, Any] | None
+    terminated: bool
+    final: bool
     torn: bool = False
 
 
@@ -225,12 +228,12 @@ class _FullLoadValidator:
         "_client_delivery_outcomes",
     )
 
-    def __init__(
-        self, store: ConversationStore, raw: bytes, stat: os.stat_result
-    ) -> None:
+    def __init__(self, store: ConversationStore, source: TranscriptStream) -> None:
         self.store = store
-        self.raw = raw
-        self.stat = stat
+        self.source = source
+        # The resident rows stay a prefix only if the digest at their count matches.
+        self.baseline = (len(store._entries), store._entry_prefix_digest)
+        self._digest_at_baseline: bytes | None = b"" if not store._entries else None
         self.state = copy.copy(store)
         self.state._entries = []
         self.state._entry_prefix_digest = b""
@@ -256,8 +259,9 @@ class _FullLoadValidator:
             valid_prefix_end=None if row.row_number == 1 else row.byte_offset,
             reason_code=reason_code,
             repairable=repairable,
-            raw=self.raw,
-            stat=self.stat,
+            stat=self.source.stat,
+            prefix_digest=row.prefix_digest,
+            source_digest=self.source.finish_digest(),
             validated_prefix=(
                 self.validated_prefix(row.byte_offset) if row.row_number > 1 else None
             ),
@@ -344,6 +348,8 @@ class _FullLoadValidator:
         self.rows_by_id[entry.id] = row
         self.state._entry_ids.add(entry.id)
         self.state._record_entry_prefix(entry)
+        if len(self.state._entries) == self.baseline[0]:
+            self._digest_at_baseline = self.state._entry_prefix_digest
         self.state._sent_message_receipts.extend(sent_message_receipts(entry))
         if (
             entry.type == "notification"
@@ -431,14 +437,22 @@ class _FullLoadValidator:
                 valid_prefix_end=None,
                 reason_code="missing_header",
                 repairable=False,
-                raw=self.raw,
-                stat=self.stat,
+                stat=self.source.stat,
+                prefix_digest=hashlib.sha256().hexdigest(),
+                source_digest=self.source.finish_digest(),
             )
         if self.state._entries:
             self._select_branch(self.state._entries[-1])
         self.state._rebuild_client_deliveries(self.state._entries)
+        if self.resets_resident_rows:
+            self.store._reset_generation += 1
         for attribute in self._STATE_ATTRIBUTES:
             setattr(self.store, attribute, getattr(self.state, attribute))
+
+    @property
+    def resets_resident_rows(self) -> bool:
+        """True when the loaded log is not an extension of the resident rows."""
+        return self._digest_at_baseline != self.baseline[1]
 
 
 class ConversationLogMixin:
@@ -600,25 +614,6 @@ class ConversationLogMixin:
             return
         self._publish_prepared_entries_installed(self._owned_installed_delta(delta))
 
-    @classmethod
-    def _installed_delta_from_baseline(
-        cls,
-        entries: list[ConversationEntry],
-        baseline: tuple[int, bytes],
-    ) -> InstalledEntriesDelta:
-        """Prepare an owned suffix, or reset when the old log is not a prefix."""
-        count, expected_digest = baseline
-        if count > len(entries):
-            return "reset"
-        digest = b""
-        for index in range(count):
-            digest = cls._next_entry_prefix_digest(
-                digest, cls._encoded_entry_line(entries[index])
-            )
-        if digest != expected_digest:
-            return "reset"
-        return cls._owned_installed_delta(tuple(entries[count:]))
-
     def _install_log_state(
         self: ConversationStore, state: _DetachedLogState
     ) -> _DetachedLogState:
@@ -754,6 +749,8 @@ class ConversationLogMixin:
             self._sent_message_receipts = []
             self._reset_incremental_validation_state()
             self._rebuild_client_deliveries(self._entries)
+            if had_entries:
+                self._reset_generation += 1
             header = {
                 "schema": SCHEMA,
                 "session_id": self.session_id,
@@ -838,11 +835,11 @@ class ConversationLogMixin:
         valid_prefix_end: int | None,
         reason_code: str,
         repairable: bool,
-        raw: bytes,
         stat: os.stat_result,
+        prefix_digest: str,
+        source_digest: str,
         validated_prefix: ValidatedPrefix | None = None,
     ) -> TranscriptLoadError:
-        prefix_end = valid_prefix_end or 0
         return TranscriptLoadError(
             kind=kind,
             session_id=self.session_id,
@@ -851,21 +848,18 @@ class ConversationLogMixin:
             valid_prefix_end=valid_prefix_end,
             reason_code=reason_code,
             repairable=repairable,
-            repair_available=(
-                repairable
-                and self._storage_lease.observed_epoch >= TRANSCRIPT_REPAIR_EPOCH
-            ),
+            repair_available=repairable and self._repair_enabled,
             source_device=stat.st_dev,
             source_inode=stat.st_ino,
             source_size=stat.st_size,
-            prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
+            prefix_digest=prefix_digest,
             source_facts=(
                 TranscriptSourceFacts(
                     device=stat.st_dev,
                     inode=stat.st_ino,
                     size=stat.st_size,
-                    source_digest=hashlib.sha256(raw).hexdigest(),
-                    prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
+                    source_digest=source_digest,
+                    prefix_digest=prefix_digest,
                     first_bad_row=row_number,
                     first_bad_offset=byte_offset,
                     prefix=validated_prefix,
@@ -879,84 +873,102 @@ class ConversationLogMixin:
             ),
         )
 
-    @staticmethod
-    def _recovery_prefix_for_error(
-        validated_prefix: Callable[[int], ValidatedPrefix] | None,
-        row_offset: int,
-        *,
-        repairable: bool,
-    ) -> ValidatedPrefix | None:
-        if not repairable or validated_prefix is None:
-            return None
-        return validated_prefix(row_offset)
-
     def _iter_physical_rows(
         self: ConversationStore,
-        raw: bytes,
-        stat: os.stat_result,
-        validated_prefix: Callable[[int], ValidatedPrefix] | None = None,
+        source: TranscriptStream,
+        validated_prefix: Callable[[int], ValidatedPrefix],
     ) -> Iterator[_PhysicalRow]:
         """Yield decoded physical rows and one marker for a writable torn tail."""
-        offset = 0
-        lines = raw.splitlines(keepends=True)
-        for index, line in enumerate(lines):
-            if index and index % 64 == 0:
+        for raw_row in source.rows():
+            if raw_row.row_number > 1 and (raw_row.row_number - 1) % 64 == 0:
                 time.sleep(0.0001)
-            row_number = index + 1
-            row_offset = offset
             try:
-                value = load_session_json(line)
+                value = load_session_json(raw_row.data)
             except ConversationIntegrityError as exc:
                 torn = (
-                    index == len(lines) - 1
-                    and not line.endswith(b"\n")
+                    raw_row.final
+                    and not raw_row.terminated
                     and isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeError))
                 )
+                row = _PhysicalRow(
+                    raw_row.row_number,
+                    raw_row.byte_offset,
+                    raw_row.prefix_digest,
+                    None,
+                    raw_row.terminated,
+                    raw_row.final,
+                    torn=torn,
+                )
                 if torn and not self._read_only:
-                    yield _PhysicalRow(row_number, row_offset, None, torn=True)
+                    yield row
                     return
+                repairable = raw_row.row_number > 1
                 raise self._transcript_error(
                     kind=(
                         "unrecoverable_header"
-                        if index == 0
+                        if raw_row.row_number == 1
                         else "torn_tail"
                         if torn
                         else "invalid_row"
                     ),
-                    row_number=row_number,
-                    byte_offset=row_offset,
-                    valid_prefix_end=None if index == 0 else row_offset,
+                    row_number=raw_row.row_number,
+                    byte_offset=raw_row.byte_offset,
+                    valid_prefix_end=(
+                        None if raw_row.row_number == 1 else raw_row.byte_offset
+                    ),
                     reason_code="invalid_json",
-                    repairable=index > 0,
-                    raw=raw,
-                    stat=stat,
-                    validated_prefix=self._recovery_prefix_for_error(
-                        validated_prefix, row_offset, repairable=index > 0
+                    repairable=repairable,
+                    stat=source.stat,
+                    prefix_digest=raw_row.prefix_digest,
+                    source_digest=source.finish_digest(),
+                    validated_prefix=(
+                        validated_prefix(raw_row.byte_offset) if repairable else None
                     ),
                 ) from exc
+            row = _PhysicalRow(
+                raw_row.row_number,
+                raw_row.byte_offset,
+                raw_row.prefix_digest,
+                value if isinstance(value, dict) else None,
+                raw_row.terminated,
+                raw_row.final,
+            )
             if not isinstance(value, dict):
+                repairable = raw_row.row_number > 1
                 raise self._transcript_error(
-                    kind="unrecoverable_header" if index == 0 else "invalid_row",
-                    row_number=row_number,
-                    byte_offset=row_offset,
-                    valid_prefix_end=None if index == 0 else row_offset,
+                    kind=(
+                        "unrecoverable_header"
+                        if raw_row.row_number == 1
+                        else "invalid_row"
+                    ),
+                    row_number=raw_row.row_number,
+                    byte_offset=raw_row.byte_offset,
+                    valid_prefix_end=(
+                        None if raw_row.row_number == 1 else raw_row.byte_offset
+                    ),
                     reason_code="row_not_object",
-                    repairable=index > 0,
-                    raw=raw,
-                    stat=stat,
-                    validated_prefix=self._recovery_prefix_for_error(
-                        validated_prefix, row_offset, repairable=index > 0
+                    repairable=repairable,
+                    stat=source.stat,
+                    prefix_digest=raw_row.prefix_digest,
+                    source_digest=source.finish_digest(),
+                    validated_prefix=(
+                        validated_prefix(raw_row.byte_offset) if repairable else None
                     ),
                 )
-            offset += len(line)
-            yield _PhysicalRow(row_number, row_offset, value)
+            yield row
+
+    @property
+    def _repair_enabled(self: ConversationStore) -> bool:
+        return feature_enabled(
+            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
+        )
 
     def _repair_explicit_load_error(
-        self: ConversationStore, error: TranscriptLoadError
+        self: ConversationStore, error: TranscriptLoadError, since: tuple[int, int]
     ) -> bool:
         if not self._repair_explicit or error._source_facts is None:
             return False
-        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+        if not self._repair_enabled:
             raise error
         self._last_repair_result = repair_transcript(
             self.directory_fd,
@@ -966,33 +978,33 @@ class ConversationLogMixin:
             memory_review_required=self._repair_target.child_run_id is None,
         )
         self._repair_explicit = False
-        self._load_full()
+        self._load_full(since)
         return True
 
     def _repair_torn_row(
         self: ConversationStore,
-        torn_offset: int | None,
+        torn_row: _PhysicalRow | None,
         validator: _FullLoadValidator,
-        stat: os.stat_result,
-        raw: bytes,
-        delta: tuple[ConversationEntry, ...],
+        source: TranscriptStream,
+        since: tuple[int, int],
     ) -> bool:
-        if torn_offset is None:
+        if torn_row is None:
             return False
-        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+        torn_offset = torn_row.byte_offset
+        if not self._repair_enabled:
             self._repair_torn_tail_legacy(torn_offset)
             self._log_offset = torn_offset
-            self._publish_entries_installed(delta)
+            self._publish_reload(since)
             self._append_torn_warning_legacy()
             return True
         prefix = validator.validated_prefix(torn_offset)
-        source = TranscriptSourceFacts(
-            device=stat.st_dev,
-            inode=stat.st_ino,
-            size=stat.st_size,
-            source_digest=hashlib.sha256(raw).hexdigest(),
-            prefix_digest=hashlib.sha256(raw[:torn_offset]).hexdigest(),
-            first_bad_row=len(raw[:torn_offset].splitlines()) + 1,
+        source_facts = TranscriptSourceFacts(
+            device=source.stat.st_dev,
+            inode=source.stat.st_ino,
+            size=source.stat.st_size,
+            source_digest=source.finish_digest(),
+            prefix_digest=torn_row.prefix_digest,
+            first_bad_row=torn_row.row_number,
             first_bad_offset=torn_offset,
             prefix=prefix,
             diagnosed_at=_now(),
@@ -1000,7 +1012,7 @@ class ConversationLogMixin:
         self._last_repair_result = repair_transcript(
             self.directory_fd,
             self._repair_target,
-            source,
+            source_facts,
             strict_reopen=self._strict_reopen_repaired_transcript,
             memory_review_required=False,
         )
@@ -1009,54 +1021,66 @@ class ConversationLogMixin:
             RuntimeWarning,
             stacklevel=2,
         )
-        self._load_full()
+        self._load_full(since)
         return True
 
-    def _load_full(self: ConversationStore) -> None:
+    def _publish_reload(self: ConversationStore, since: tuple[int, int]) -> None:
+        """Publish one reload: a reset if any install in it bumped the generation."""
+        if self.on_entries_installed is None:
+            return
+        generation, count = since
+        self._publish_entries_installed(
+            "reset"
+            if self._reset_generation != generation
+            else tuple(self._entries[count:])
+        )
+
+    def _load_full(
+        self: ConversationStore, since: tuple[int, int] | None = None
+    ) -> None:
+        # Nested reloads (repairs) receive the outer reload's start, so the
+        # whole operation publishes once against the rows resident before it.
+        if since is None:
+            since = (self._reset_generation, len(self._entries))
         self._full_reload_count += 1
-        if not self._read_only and self._storage_lease.observed_epoch == WRITER_EPOCH:
+        if not self._read_only and self._repair_enabled:
             reconcile_pending(
                 self.directory_fd,
                 self._repair_target,
                 strict_reopen=self._strict_reopen_repaired_transcript,
             )
-        baseline = (len(self._entries), self._entry_prefix_digest)
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
             stat = os.fstat(fd)
-            raw = self._read_fd(fd, stat.st_size)
+            source = TranscriptStream(fd, stat)
+            validator = _FullLoadValidator(self, source)
+            torn_row: _PhysicalRow | None = None
+            last_row: _PhysicalRow | None = None
+            try:
+                for physical_row in self._iter_physical_rows(
+                    source, validator.validated_prefix
+                ):
+                    last_row = physical_row
+                    if physical_row.torn:
+                        torn_row = physical_row
+                        break
+                    validator.accept(physical_row)
+                validator.finish()
+            except TranscriptLoadError as error:
+                if self._repair_explicit_load_error(error, since):
+                    return
+                raise
+
+            if self._repair_torn_row(torn_row, validator, source, since):
+                return
+            source.finish_digest()
+            if not self._read_only and last_row is not None and not last_row.terminated:
+                self._write_bytes(b"\n")
+            else:
+                self._set_log_stat(stat)
+            self._publish_reload(since)
         finally:
             os.close(fd)
-
-        validator = _FullLoadValidator(self, raw, stat)
-        torn_offset: int | None = None
-        try:
-            for physical_row in self._iter_physical_rows(
-                raw, stat, validator.validated_prefix
-            ):
-                if physical_row.torn:
-                    torn_offset = physical_row.byte_offset
-                    break
-                validator.accept(physical_row)
-            validator.finish()
-        except TranscriptLoadError as error:
-            if self._repair_explicit_load_error(error):
-                return
-            raise
-
-        delta = (
-            self._installed_delta_from_baseline(self._entries, baseline)
-            if self.on_entries_installed is not None
-            else ()
-        )
-        if self._repair_torn_row(torn_offset, validator, stat, raw, delta):
-            return
-        if not self._read_only and not raw.endswith(b"\n"):
-            self._write_bytes(b"\n")
-            self._publish_entries_installed(delta)
-        else:
-            self._set_log_stat(stat)
-            self._publish_entries_installed(delta)
 
     def _validate_header(self: ConversationStore, header: dict[str, Any]) -> None:
         header_data = header.get("data")
@@ -1149,20 +1173,20 @@ class ConversationLogMixin:
     def _strict_reopen_repaired_transcript(self: ConversationStore) -> None:
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
-            stat = os.fstat(fd)
-            raw = self._read_fd(fd, stat.st_size)
+            source = TranscriptStream(fd, os.fstat(fd))
+            validator = _FullLoadValidator(self, source)
+            for physical_row in self._iter_physical_rows(
+                source, validator.validated_prefix
+            ):
+                if physical_row.torn:
+                    raise ConversationIntegrityError(
+                        f"invalid conversation row {physical_row.row_number}: {self.path}"
+                    )
+                validator.accept(physical_row)
+            validator.finish()
+            source.finish_digest()
         finally:
             os.close(fd)
-        validator = _FullLoadValidator(self, raw, stat)
-        for physical_row in self._iter_physical_rows(
-            raw, stat, validator.validated_prefix
-        ):
-            if physical_row.torn:
-                raise ConversationIntegrityError(
-                    f"invalid conversation row {physical_row.row_number}: {self.path}"
-                )
-            validator.accept(physical_row)
-        validator.finish()
 
     def _repair_torn_tail_legacy(self: ConversationStore, offset: int) -> None:
         with os.fdopen(

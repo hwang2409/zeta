@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ import pytest
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.raw_frames import assert_raw_frames_preserved
 from tests.support.serve_close import close_serve
+from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import TIMEOUT, _connect, _read, _request
 from zeta.protocol.types import (
@@ -26,7 +28,8 @@ from zeta.protocol.types import (
     ToolCall,
     with_message_origin,
 )
-from zeta.server import ZetaServer, ergonomics
+from zeta.server import ZetaServer
+from zeta.server.handlers import history as history_module
 from zeta.server.protocol import EventDescriptor
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -238,7 +241,6 @@ async def test_observer_hello_has_no_controller_side_effects(
         "set_background_event_sink",
         "set_memory_notice_sink",
         "set_background_wake_sink",
-        "set_post_stream_provider_retry",
     ):
         original = getattr(server.runtime, name)
         monkeypatch.setattr(
@@ -479,7 +481,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
     observer_reader, observer_writer = await _observer(server, 3)
     entered = threading.Event()
     release = threading.Event()
-    original_history = ergonomics.history
+    original_history = history_module.history
 
     def gated_history(
         runtime: Any, params: dict[str, Any], **kwargs: Any
@@ -488,7 +490,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
         assert release.wait(TIMEOUT)
         return original_history(runtime, params)
 
-    monkeypatch.setattr(ergonomics, "history", gated_history)
+    monkeypatch.setattr(history_module, "history", gated_history)
     try:
         request = asyncio.create_task(
             _request(
@@ -636,20 +638,6 @@ async def test_pre_hello_connections_are_bounded(tmp_path: Path) -> None:
         await server.close()
 
 
-async def _read_raw_until(
-    reader: asyncio.StreamReader,
-    frames: list[bytes],
-    predicate: Any,
-) -> dict[str, Any]:
-    while True:
-        frame = await asyncio.wait_for(reader.readline(), TIMEOUT)
-        assert frame
-        frames.append(frame)
-        decoded = json.loads(frame)
-        if predicate(decoded):
-            return decoded
-
-
 async def _controller_event_stream(
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -673,41 +661,26 @@ async def _controller_event_stream(
     )
     reader, writer = await _connect(server)
     observer_socket: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
-    frames: list[bytes] = []
 
-    async def send(request_id: int, method: str, params: dict[str, object]) -> None:
-        writer.write(
-            (
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n"
-            ).encode()
-        )
-        await asyncio.wait_for(writer.drain(), TIMEOUT)
+    def is_event(name: str) -> Callable[[dict[str, Any]], bool]:
+        return lambda frame: frame.get("params", {}).get("event") == name
 
     try:
-        await send(1, "hello", {"protocol_version": "1.2"})
-        await _read_raw_until(reader, frames, lambda frame: frame.get("id") == 1)
-        await send(2, "new_session", {"provider": "codex"})
-        session = await _read_raw_until(
-            reader, frames, lambda frame: frame.get("id") == 2
-        )
+        await send(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await read_until(reader, lambda frame: frame.get("id") == 1, what="hello")
+        await send(reader, writer, 2, "new_session", {"provider": "codex"})
+        session = (
+            await read_until(
+                reader, lambda frame: frame.get("id") == 2, what="new_session"
+            )
+        )[-1]
         session_id = session["result"]["session"]["session_id"]
         if observer:
             observer_socket = await _observer(server, 20)
-        frames.clear()  # Compare the foreground/background event scenario, not setup metadata.
-        await send(3, "send", {"text": "use the tool"})
-        await _read_raw_until(
-            reader,
-            frames,
-            lambda frame: frame.get("params", {}).get("event") == "approval_request",
+        # Compare the foreground/background event scenario, not setup metadata.
+        await send(reader, writer, 3, "send", {"text": "use the tool"})
+        frames = await read_until(
+            reader, is_event("approval_request"), what="approval_request"
         )
         assert server.runtime.loop is not None
         server.runtime.loop._publish_background_event(
@@ -716,19 +689,38 @@ async def _controller_event_stream(
                 data={"kind": "agent_completion", "text": "background done"},
             )
         )
-        await _read_raw_until(
-            reader,
-            frames,
-            lambda frame: frame.get("params", {}).get("event") == "sub_agent_receipt",
+        frames += await read_until(
+            reader, is_event("sub_agent_receipt"), what="sub_agent_receipt"
         )
-        await send(4, "deny", {"request_id": "call-1"})
-        await _read_raw_until(
+        await send(reader, writer, 4, "deny", {"request_id": "call-1"})
+        frames += await read_until(
             reader,
-            frames,
-            lambda frame: frame.get("params", {}).get("event") == "turn_end",
+            lambda frame: (
+                is_event("turn_end")(frame)
+                and frame.get("params", {}).get("data", {}).get("turn") == 1
+            ),
+            what="turn_end",
         )
-        assert session_id.encode() in b"".join(frames)
-        return b"".join(frames)
+        deny_response = next(frame for frame in frames if frame.get("id") == 4)
+        assert deny_response["result"] == {
+            "accepted": True,
+            "request_id": "call-1",
+            "decision": "deny",
+        }
+        turn_one_end = next(
+            index
+            for index, frame in enumerate(frames)
+            if (
+                is_event("turn_end")(frame)
+                and frame.get("params", {}).get("data", {}).get("turn") == 1
+            )
+        )
+        bounded_frames = frames[: turn_one_end + 1]
+        if deny_response not in bounded_frames:
+            bounded_frames.append(deny_response)
+        raw = b"".join(frame.raw for frame in bounded_frames)
+        assert session_id.encode() in raw
+        return raw
     finally:
         if observer_socket is not None:
             observer_socket[1].close()

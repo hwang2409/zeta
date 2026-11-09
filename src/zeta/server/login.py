@@ -7,7 +7,13 @@ from pathlib import Path
 
 import httpx
 
-from ..accounts import AccountCredentialLockTimeoutError, AccountStore
+from ..accounts import (
+    AccountCredentialLockTimeoutError,
+    AccountId,
+    AccountRegistryBrokenError,
+    AccountRegistryMissingError,
+    AccountStore,
+)
 from ..core.login_flow import (
     LoginError,
     LoginPortInUseError,
@@ -20,7 +26,6 @@ from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from .protocol import ErrorDescriptor, ProtocolError
 
-REQUESTS = ["login_start", "login_status", "login_cancel", "login_providers"]
 LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
 
 
@@ -75,37 +80,58 @@ class Logins:
             rows.append({"provider": provider, "credentials_present": present})
         return {"providers": rows}
 
-    async def request(self, method: str, params: dict) -> dict:
-        if method == "login_providers":
-            return await asyncio.to_thread(self.providers)
+    async def login_providers(self, params: dict) -> dict:
+        return await asyncio.to_thread(self.providers)
+
+    def _provider_task(self, params: dict) -> tuple[str, asyncio.Task[dict] | None]:
         provider = params.get("provider")
         if provider not in ("claude", "codex"):
             raise ProtocolError(
                 ErrorDescriptor.INVALID_PARAMS, "unsupported login provider"
             )
-        task = self.tasks.get(provider)
-        if method == "login_start":
-            if task is not None and not task.done():
-                raise ProtocolError(
-                    ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending"
-                )
-            url = asyncio.get_running_loop().create_future()
-            operation = _LoginOperation()
-            task = asyncio.create_task(self._run(provider, url, operation))
-            self.tasks[provider] = task
-            self.operations[provider] = operation
-            await asyncio.wait((url, task), return_when=asyncio.FIRST_COMPLETED)
-            if task.done():
-                return task.result()
-            return {"state": "pending", "authorization_url": url.result()}
-        if task is None:
-            return {"state": "idle"}
-        if method == "login_cancel" and not task.done():
+        return provider, self.tasks.get(provider)
+
+    async def login_start(self, params: dict) -> dict:
+        provider, task = self._provider_task(params)
+        if task is not None and not task.done():
+            raise ProtocolError(
+                ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending"
+            )
+        url = asyncio.get_running_loop().create_future()
+        operation = _LoginOperation()
+        task = asyncio.create_task(self._run(provider, url, operation))
+        self.tasks[provider] = task
+        self.operations[provider] = operation
+        await asyncio.wait((url, task), return_when=asyncio.FIRST_COMPLETED)
+        if task.done():
+            return task.result()
+        return {"state": "pending", "authorization_url": url.result()}
+
+    async def login_status(self, params: dict) -> dict:
+        _provider, task = self._provider_task(params)
+        return self._task_status(task)
+
+    async def login_cancel(self, params: dict) -> dict:
+        provider, task = self._provider_task(params)
+        if task is not None and not task.done():
             self.operations[provider].cancel(task)
             await asyncio.gather(task, return_exceptions=True)
+        return self._task_status(task)
+
+    @staticmethod
+    def _task_status(task: asyncio.Task[dict] | None) -> dict:
+        if task is None:
+            return {"state": "idle"}
         if task.cancelled():
             return {"state": "cancelled"}
         return task.result() if task.done() else {"state": "pending"}
+
+    def _prepare(self, login_provider: str):
+        # Refuse before the browser opens; the publish step checks again under lock.
+        AccountStore(account_home(self.home)).refuse_orphaning_registration(
+            AccountId(login_provider, "default")
+        )
+        return build_login_provider(login_provider, self.home)
 
     async def _attempt(
         self,
@@ -114,9 +140,7 @@ class Logins:
         operation: _LoginOperation,
     ) -> dict:
         try:
-            login = await asyncio.to_thread(
-                build_login_provider, login_provider, self.home
-            )
+            login = await asyncio.to_thread(self._prepare, login_provider)
             async with asyncio.timeout(self.timeout):
                 await run_login(
                     login,
@@ -135,7 +159,11 @@ class Logins:
                 "login_lock_timeout",
                 "Sign-in could not save credentials because the account is busy. Please try again.",
             )
-        except LoginPublicationError as exc:
+        except (
+            LoginPublicationError,
+            AccountRegistryBrokenError,
+            AccountRegistryMissingError,
+        ) as exc:
             return failure("login_save_failed", str(exc))
         except LoginPortInUseError as exc:
             provider_label = exc.provider.capitalize()

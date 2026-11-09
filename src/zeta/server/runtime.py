@@ -40,6 +40,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..providers.completion import owned_completion
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
@@ -47,15 +48,11 @@ from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
-from ..tools._shared.background_task_types import BackgroundTaskNotice
-from ..tools._shared.run_work import background_task_row
-from .protocol import EventDescriptor
 
 BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]
 SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
-RunWorkEventSink = Callable[[str, EventDescriptor, dict[str, object]], None]
 ApprovalControlBinder = Callable[[ApprovalPolicy], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
 _SETUP_SHUTDOWN_WAIT_SECONDS = 1.0
@@ -68,6 +65,7 @@ class _TestScriptedBackend(CompletionBackend):
     def __init__(self, model: str) -> None:
         self.model = model
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -134,6 +132,8 @@ class SessionState:
     opened: OpenedSession
     loop: AgentLoop
     policy: ApprovalPolicy
+    project_dir: Path
+    repo_root: Path
     usage: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker = field(init=False)
     status: str = "idle"
@@ -149,6 +149,8 @@ class SessionState:
             opened=composition.opened,
             loop=composition.loop,
             policy=composition.policy,
+            project_dir=composition.project_dir,
+            repo_root=composition.repo_root,
         )
 
     @property
@@ -220,8 +222,6 @@ class ServerRuntime:
         self._background_wake_sink: SessionWakeSink | None = None
         self._approval_control_binder: ApprovalControlBinder | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
-        self._run_work_event_sink: RunWorkEventSink | None = None
-        self._post_stream_provider_retry = False
         self._setup_reapers: set[asyncio.Task[None]] = set()
 
     def backend_for_model(
@@ -304,6 +304,18 @@ class ServerRuntime:
     def session_id(self) -> str:
         return self.metadata.session_id
 
+    @property
+    def project_dir(self) -> Path:
+        if self._state is None:
+            raise RuntimeError("server has no active session")
+        return self._state.project_dir
+
+    @property
+    def repo_root(self) -> Path:
+        if self._state is None:
+            raise RuntimeError("server has no active session")
+        return self._state.repo_root
+
     async def initialize_project_registry(self) -> None:
         """Probe registry availability once outside the event loop."""
 
@@ -331,13 +343,6 @@ class ServerRuntime:
         unavailable = self.manager.project_registry_unavailable
         return unavailable.warning if unavailable is not None else None
 
-    def set_post_stream_provider_retry(self, enabled: bool) -> None:
-        """Apply the serve client's negotiated retry display capability."""
-
-        self._post_stream_provider_retry = enabled
-        if self._state is not None:
-            self._state.loop.post_stream_provider_retry = enabled
-
     def set_approval_control_binder(self, binder: ApprovalControlBinder) -> None:
         self._approval_control_binder = binder
 
@@ -351,12 +356,6 @@ class ServerRuntime:
     def set_memory_notice_sink(self, sink: MemoryNoticeSink | None) -> None:
         """Attach the frontend callback for automatic memory updates."""
         self._memory_notice_sink = sink
-        if self._state is not None:
-            self._bind_background_event_sink(self._state)
-
-    def set_run_work_event_sink(self, sink: RunWorkEventSink | None) -> None:
-        """Attach the frontend callback for committed task and todo updates."""
-        self._run_work_event_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
 
@@ -392,7 +391,7 @@ class ServerRuntime:
 
     def _prepare_new_session(
         self, session_cwd: Path, provider: str | None, model: str | None
-    ) -> tuple[object, object, object, object, object]:
+    ) -> tuple[object, object, object, object, object, object]:
         discovery = discover_project(session_cwd, user_home=self.home.parent)
         repo_root = discovery.primary_root or discovery.cwd
         config = self._config(provider, model, project_root=repo_root)
@@ -423,11 +422,18 @@ class ServerRuntime:
             registry=registry,
             project_projection=projection,
         )
-        return config, skill_catalog, agent_catalog, context, session_project
+        return (
+            config,
+            skill_catalog,
+            agent_catalog,
+            context,
+            session_project,
+            discovery,
+        )
 
     def _prepare_resumed_session(
         self, opened: OpenedSession, session_cwd: Path
-    ) -> tuple[object, object]:
+    ) -> tuple[object, object, object]:
         discovery = discover_project(session_cwd, user_home=self.home.parent)
         repo_root = discovery.primary_root or discovery.cwd
         config = self._config(
@@ -460,23 +466,28 @@ class ServerRuntime:
             registry=registry,
             project_projection=projection,
         )
-        return config, resumed_prompt
+        return config, resumed_prompt, discovery
+
+    async def _session_cwd(self, metadata: SessionMetadata) -> Path:
+        session_cwd = Path(metadata.cwd)
+        if not await asyncio.to_thread(session_cwd.is_dir):
+            raise ValueError(
+                f"session working directory no longer exists: {metadata.cwd}"
+            )
+        return session_cwd
 
     async def resume_session(
         self, session_id: str, *, force: bool = False
     ) -> SessionMetadata:
         if self._state is not None and self._state.session_id == session_id:
             if not force:
+                await self._session_cwd(self.metadata)
                 return self.metadata
             await self.close()
         metadata = await asyncio.to_thread(self.manager.read_metadata, session_id)
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
-        session_cwd = Path(metadata.cwd)
-        if not await asyncio.to_thread(session_cwd.is_dir):
-            raise ValueError(
-                f"session working directory no longer exists: {metadata.cwd}"
-            )
+        session_cwd = await self._session_cwd(metadata)
 
         composition = await self._run_setup(session_cwd, session_id=session_id)
         await self._replace(composition)
@@ -502,7 +513,7 @@ class ServerRuntime:
                     prepared = await asyncio.to_thread(
                         self._prepare_resumed_session, opened, session_cwd
                     )
-                    config, resumed_prompt = prepared
+                    config, resumed_prompt, discovery = prepared
                     kwargs = {
                         "config": config,
                         "provider": opened.metadata.provider,
@@ -512,14 +523,20 @@ class ServerRuntime:
                         "agent_catalog": resumed_prompt.agent_catalog,
                         "opened": opened,
                         "project_id": opened.metadata.project_id,
+                        "project_discovery": discovery,
                     }
                 else:
                     prepared = await asyncio.to_thread(
                         self._prepare_new_session, session_cwd, provider, model
                     )
-                    config, skill_catalog, agent_catalog, context, session_project = (
-                        prepared
-                    )
+                    (
+                        config,
+                        skill_catalog,
+                        agent_catalog,
+                        context,
+                        session_project,
+                        discovery,
+                    ) = prepared
                     kwargs = {
                         "config": config,
                         "provider": config.provider,
@@ -532,6 +549,7 @@ class ServerRuntime:
                             if session_project is not None
                             else None
                         ),
+                        "project_discovery": discovery,
                     }
                 return await asyncio.to_thread(
                     self._compose,
@@ -640,37 +658,6 @@ class ServerRuntime:
             raise
 
     def _bind_background_event_sink(self, state: SessionState) -> None:
-        run_work_sink = self._run_work_event_sink
-        if run_work_sink is None:
-            state.loop.tool_registry.background_tasks.set_notice_sink(None)
-            state.opened.store.set_todo_change_sink(None)
-        else:
-            session_id = state.session_id
-            registry = state.loop.tool_registry.background_tasks
-
-            def task_changed(notice: object) -> None:
-                if not isinstance(notice, BackgroundTaskNotice):
-                    return
-                task = next(
-                    (item for item in registry.snapshot() if item.task_id == notice.task_id),
-                    None,
-                )
-                if task is not None:
-                    run_work_sink(
-                        session_id,
-                        EventDescriptor.BACKGROUND_TASK_UPDATED,
-                        {"task": background_task_row(task)},
-                    )
-
-            registry.set_notice_sink(task_changed)
-            state.opened.store.set_todo_change_sink(
-                lambda todo: run_work_sink(
-                    session_id,
-                    EventDescriptor.TODO_UPDATED,
-                    {"todo": [dict(item) for item in todo]},
-                )
-            )
-
         sink = self._background_event_sink
         wake_sink = self._background_wake_sink
         if sink is None:
@@ -732,7 +719,6 @@ class ServerRuntime:
             auto_project=False,
             project_id=project_id,
             on_plan_mode_change=persist_plan_mode,
-            post_stream_provider_retry=self._post_stream_provider_retry,
             require_selected_account=(
                 self.backend_factory is None and not self._test_scripted_provider
             ),

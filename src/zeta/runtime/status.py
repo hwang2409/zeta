@@ -2,29 +2,16 @@
 
 from __future__ import annotations
 
-import copy
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from types import MappingProxyType
 
-from ..core.checkpoints import ConversationEntry, active_branch
 from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashStatus,
+    SlashStatusSnapshot,
     UsageTracker,
-    compaction_history,
 )
 from ..core.todo import todo_count_tuple
-from ..protocol.types import Message
 from .loop import AgentLoop
-
-
-@dataclass(frozen=True, slots=True)
-class SlashStatusSnapshot:
-    """Loop-owned status values plus append-only transcript references."""
-
-    base: SlashStatus
-    transcript_entries: tuple[ConversationEntry, ...]
-    token_counter: Callable[[Message], int]
 
 
 def capture_slash_status(
@@ -80,7 +67,9 @@ def capture_slash_status(
             model_window=MODEL_CONTEXT_WINDOWS.get(provider, {}).get(model),
             mcp_summary=loop.mcp_summary,
             explicit_finish=loop.explicit_finish,
-            connection_setup_counts=loop.connection_setup_counts(),
+            connection_setup_counts=tuple(
+                MappingProxyType(dict(item)) for item in loop.connection_setup_counts()
+            ),
             max_agent_depth=loop.max_agent_depth,
             automatic_memory_failure=(
                 loop.memory_reconciler.automatic_memory_status
@@ -99,16 +88,4 @@ def capture_slash_status(
         ),
         transcript_entries=loop.store.resident_entries_snapshot(),
         token_counter=context_assembler.token_counter,
-    )
-
-
-def build_slash_status(snapshot: SlashStatusSnapshot) -> SlashStatus:
-    """Finish the shared projection, including transcript-sized work."""
-
-    entries = copy.deepcopy(active_branch(snapshot.transcript_entries))
-    return replace(
-        snapshot.base,
-        compaction_marker_count=sum(entry.type == "compaction" for entry in entries),
-        checkpoint_count=sum(entry.type == "checkpoint" for entry in entries),
-        compaction_history=compaction_history(entries, snapshot.token_counter),
     )

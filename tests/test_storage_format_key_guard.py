@@ -23,7 +23,7 @@ _ALLOWED_REASONS = {
 
 # Each row is (module, function, reason). Persisted payloads must not be allowlisted.
 _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
-    ("zeta.accounts.store", "_registry_reference_index", "in-memory value"),
+    ("zeta.accounts.registry", "_registry_reference_index", "in-memory value"),
     ("zeta.config.settings", "_strip_unsafe_project_keys", "settings"),
     ("zeta.config.settings", "_merge_tool_policy", "settings"),
     ("zeta.config.settings", "_validate", "settings"),
@@ -42,12 +42,11 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     ("zeta.project_memory_history", "_import_memory_locked", "in-memory value"),
     ("zeta.project_registry", "update_memory", "in-memory value"),
     ("zeta.protocol.tool_batches", "without_incomplete_tool_batches", "in-memory value"),
-    ("zeta.server.connections", "capture_read", "rpc params"),
+    ("zeta.server.connections", "read_content", "rpc params"),
     ("zeta.server.control", "revoke", "rpc params"),
-    ("zeta.server.entry_project_views", "_only", "rpc params"),
-    ("zeta.server.ergonomics", "_validate_history_params", "rpc params"),
+    ("zeta.server.handlers.history", "_validate_history_params", "rpc params"),
+    ("zeta.server.handlers.projects", "_only", "rpc params"),
     ("zeta.server.host_commands.__init__", "parse", "rpc params"),
-    ("zeta.server.project_requests", "_only", "rpc params"),
     ("zeta.tools._validation", "_validate_schema", "tool arguments"),
     ("zeta.tools._validation", "_schema_equal", "tool arguments"),
     ("zeta.tools._validation", "_validate_schema_definition", "tool arguments"),

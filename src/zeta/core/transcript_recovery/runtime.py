@@ -8,9 +8,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ...storage_format import FEATURE_EPOCHS, StorageFeature, feature_enabled
 from ..store import ConversationStore
 from ..store._child_runs import child_run_segments
-from . import TRANSCRIPT_REPAIR_EPOCH, RepairResult, RepairTarget
+from . import RepairResult, RepairTarget
 
 if TYPE_CHECKING:
     from ...memory.auto import AutoMemoryReconciler
@@ -22,20 +23,30 @@ class TranscriptRepairRequiresUpgrade(ValueError):
 
     def __init__(self, home_epoch: int) -> None:
         self.home_epoch = home_epoch
-        self.required_epoch = TRANSCRIPT_REPAIR_EPOCH
+        self.required_epoch = FEATURE_EPOCHS[StorageFeature.TRANSCRIPT_REPAIR]
         super().__init__(
             "transcript repair needs the stored-format upgrade "
-            f"(home epoch {home_epoch}, needs {TRANSCRIPT_REPAIR_EPOCH})"
+            f"(home epoch {home_epoch}, needs {self.required_epoch})"
         )
 
 
 def transcript_repair_available(manager: SessionManager) -> bool:
-    return manager.observed_storage_epoch >= TRANSCRIPT_REPAIR_EPOCH
+    return feature_enabled(
+        manager.observed_storage_epoch, StorageFeature.TRANSCRIPT_REPAIR
+    )
 
 
 def require_transcript_repair(manager: SessionManager) -> None:
     if not transcript_repair_available(manager):
         raise TranscriptRepairRequiresUpgrade(manager.observed_storage_epoch)
+
+
+def format_repair_transcript_command(
+    session_id: str, child_run_id: str | None = None
+) -> str:
+    """Build the explicit repair command for a transcript target."""
+    target = f" {child_run_id}" if child_run_id is not None else ""
+    return f"/repair-transcript {session_id}{target} confirm"
 
 
 def repair_command_for_child_path(path: Path) -> str:
@@ -54,7 +65,7 @@ def repair_command_for_child_path(path: Path) -> str:
     ]
     if not root or not segments:
         return ""
-    return f"/repair-transcript {root} {root}:{':'.join(segments)}"
+    return format_repair_transcript_command(root, f"{root}:{':'.join(segments)}")
 
 
 def _resident_memory_commit(

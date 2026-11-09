@@ -20,7 +20,7 @@ from tempfile import TemporaryDirectory
 from typing import Mapping
 
 from ..skills import SkillCatalog
-from ..storage_format import advance, mapping_mutations, open_writer
+from ..storage_format import advance, mapping_mutations, open_writer, release_later
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
@@ -31,6 +31,7 @@ from .transcript_recovery import (
     recovery_status,
     set_memory_review_required,
 )
+from .transcript_recovery.runtime import format_repair_transcript_command
 from .store._child_runs import child_run_segments
 from .session_execution import (
     OwnerHint,
@@ -131,7 +132,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self.home = Path(home) if home is not None else env_home()
         self._owner_surface = owner_surface
         self._storage_lease = open_writer(self.home)
-        self._release_storage_lease = weakref.finalize(self, self._storage_lease.close)
+        self._release_storage_lease = weakref.finalize(
+            self, release_later, self._storage_lease.close
+        )
         self.user_home = (
             (Path(user_home) if user_home is not None else Path.home())
             .expanduser()
@@ -882,6 +885,24 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         row = load_session_json(line)
                         lines.append(json.dumps(row, separators=(",", ":")))
         except (ConversationIntegrityError, OSError) as exc:
+            try:
+                ConversationStore(
+                    self.sessions_dir,
+                    session_id=full_id,
+                    _read_only=True,
+                    _must_exist=True,
+                ).close()
+            except TranscriptLoadError as diagnosis:
+                repair_hint = (
+                    f"; run {format_repair_transcript_command(full_id)}"
+                    if diagnosis.repair_available
+                    else ""
+                )
+                raise SessionError(
+                    f"session {full_id} could not be exported: {diagnosis}{repair_hint}"
+                ) from exc
+            except (ConversationIntegrityError, OSError):
+                pass
             raise SessionError(f"session {full_id} could not be exported") from exc
         return "\n".join(lines) + "\n"
 
@@ -989,6 +1010,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self, directory_fd: int, metadata: SessionMetadata, *, sync: bool = True
     ) -> None:
         value = metadata.to_storage_dict()
+        # Refuse a shape the reader would reject, so no writer leaves an
+        # unreadable meta.json behind.
+        SessionMetadata.from_dict(
+            value, path=self.sessions_dir / metadata.session_id / "meta.json"
+        )
         delete = () if "tool_allow_layers" in value else ("tool_allow_layers",)
         self._storage_lease.publish_json(
             directory_fd,

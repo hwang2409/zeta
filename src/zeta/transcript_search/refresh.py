@@ -9,13 +9,17 @@ import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS, PersistedAppend
 from zeta.transcript_search.index import (
-    TranscriptIndex,
     TranscriptIndexError,
     TranscriptSource,
+    open_project_index,
 )
+
+if TYPE_CHECKING:
+    from zeta.project_registry import ProjectRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +30,7 @@ class _RefreshState:
     waiters: list[asyncio.Future[None]] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
     failure: str | None = None
+    registry: ProjectRegistry | None = None
 
 
 _REFRESH_STATES: weakref.WeakKeyDictionary[
@@ -49,7 +54,7 @@ def transcript_index_refresh_failure(
 
 
 async def refresh_transcript_index(
-    projects_root: Path,
+    registry: ProjectRegistry,
     project_id: str,
     session_id: str,
     session_dir: Path,
@@ -58,9 +63,11 @@ async def refresh_transcript_index(
     """Coalesce project refreshes and perform every filesystem operation off-loop."""
 
     loop = asyncio.get_running_loop()
+    projects_root = registry.root
     key = (Path(projects_root).resolve(), project_id)
     states = _REFRESH_STATES.setdefault(loop, {})
     state = states.setdefault(key, _RefreshState())
+    state.registry = registry
     incoming = TranscriptSource(session_id, session_dir, project_id, append_receipts)
     existing = state.pending.get(session_id)
     state.pending[session_id] = (
@@ -79,7 +86,7 @@ async def _refresh_pending(
     pending = tuple(state.pending.values())
     state.pending.clear()
     try:
-        await asyncio.to_thread(_refresh_sources, key[0], key[1], pending)
+        await asyncio.to_thread(_refresh_sources, state.registry, key[1], pending)
     except (
         OSError,
         sqlite3.Error,
@@ -145,10 +152,10 @@ def _merge_refresh_sources(
 
 
 def _refresh_sources(
-    projects_root: Path,
+    registry: ProjectRegistry,
     project_id: str,
     sources: Sequence[TranscriptSource],
 ) -> None:
-    index = TranscriptIndex(projects_root / project_id, project_id)
+    index = open_project_index(registry, project_id)
     for source in sources:
         index.append(source)

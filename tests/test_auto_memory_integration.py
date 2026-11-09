@@ -15,6 +15,7 @@ from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.codex import CodexLoginRequiredError
 from zeta.config.settings import load_settings, resolve
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
 from zeta.core.slash import create_slash_registry
@@ -31,6 +32,7 @@ from zeta.protocol.types import (
     ToolSchema,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.providers.factory import build_backend
 from zeta.runtime.composition import RuntimeComposition, compose_runtime
 from zeta.server.control import ServeControl
@@ -44,6 +46,7 @@ class _MemoryScriptBackend(CompletionBackend):
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
@@ -86,6 +89,7 @@ class _LoginRequiredBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls = 0
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
@@ -96,6 +100,7 @@ class _LoginRequiredBackend(CompletionBackend):
 
 
 class _UnusedBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSchema]
     ) -> AsyncIterator[StreamEvent]:
@@ -185,7 +190,8 @@ idle_minutes = 2
 def test_memory_slash_command_dispatches_log_and_undo() -> None:
     calls: list[str] = []
     session = SimpleNamespace(
-        slash_memory=lambda args: calls.append(args) or f"memory:{args}"
+        slash_memory=lambda args: calls.append(args) or f"memory:{args}",
+        slash_lock=SlashLock(),
     )
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
@@ -453,7 +459,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -537,7 +543,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -576,7 +582,9 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
             "normalindexcanary", origin=MessageOrigin.USER
         ):
             pass
-        await asyncio.gather(*tuple(normal.loop._tracked_tasks))
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(normal.loop._tracked_tasks)), 10
+        )
     finally:
         await normal.loop.close()
 
@@ -589,7 +597,9 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
             "forkonlyindexcanary", origin=MessageOrigin.USER
         ):
             pass
-        await asyncio.gather(*tuple(discussion.loop._tracked_tasks))
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(discussion.loop._tracked_tasks)), 10
+        )
     finally:
         await discussion.loop.close()
 

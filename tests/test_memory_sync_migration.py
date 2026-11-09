@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.storage_homes import initialize_storage_home
 from zeta.cli import project as project_cli
 from zeta.core.project_context import load_project_context, refresh_project_memory
@@ -53,7 +54,7 @@ from zeta.remote_sync.project_publish import (
 )
 from zeta.remote_sync.project_publish import publish_version as publish_remote_version
 from zeta.remote_sync.ssh import SshTransport
-from zeta.server.project_requests import ProjectRequests
+from zeta.server.handlers.projects import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
@@ -385,7 +386,7 @@ async def test_public_migration_end_to_end_with_real_content(
         + "\n"
     )
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         return json.dumps(
             {
                 "operations": [
@@ -447,11 +448,8 @@ async def test_public_migration_end_to_end_with_real_content(
         runtime=SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list)),
         codec=FrameCodec(),
         registry=registry,
-    ).dispatch(
-        1,
-        "project_show",
-        {"project_id": project_id},
-        features=frozenset({"projects-memory-v2"}),
+    ).show(
+        1, {"project_id": project_id}, entry_response=True
     )
     assert shown["memory"]["profile"] == "zeta"
     pushed = await asyncio.to_thread(
@@ -631,9 +629,9 @@ async def test_inflight_format_one_reconciliation_during_migration(
     provider_started = asyncio.Event()
     release_provider = asyncio.Event()
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         provider_started.set()
-        await release_provider.wait()
+        await await_or_fail(release_provider.wait(), what="release_provider.wait()")
         return json.dumps(
             {
                 "changes": [
@@ -662,10 +660,10 @@ async def test_inflight_format_one_reconciliation_during_migration(
     )
     runner.before_eviction(1, 1)
     drain = asyncio.create_task(runner.drain())
-    await provider_started.wait()
+    await await_or_fail(provider_started.wait(), what="provider_started.wait()")
     await asyncio.to_thread(registry.migrate_memory, project_id)
     release_provider.set()
-    await drain
+    await await_or_fail(drain, what="drain")
     await runner.close()
 
     assert registry.memory_format(project_id) == 2
@@ -1006,7 +1004,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
         runtime = SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list))
         ProjectRequests(
             home=home, runtime=runtime, codec=FrameCodec(), registry=registry
-        ).dispatch(1, "project_show", {"project_id": project_id})
+        ).show(1, {"project_id": project_id}, entry_response=False)
     elif entry_point == "sync-push":
         await asyncio.to_thread(
             push_project_memory,
@@ -1072,7 +1070,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             + "\n"
         )
 
-        async def invoke(prompt: str) -> str:
+        async def invoke(prompt: str, budget) -> str:
             expected = json.loads(
                 prompt.split("Current digest: ", 1)[1].splitlines()[0]
             )

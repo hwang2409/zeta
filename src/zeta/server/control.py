@@ -19,6 +19,7 @@ from ..core.approval import (
     revoke_session_grants,
     session_grant_change,
 )
+from ..core.commands.slash_registry import SlashLock
 from ..core.store import ConversationStore
 from ..protocol.types import (
     ErrorInfo,
@@ -121,6 +122,9 @@ class ServeControl:
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
+        # Serve reads requests serially per connection and has one controller,
+        # so this lock never contends today; status projects its holder.
+        self.slash_lock = SlashLock(offload=self._run_blocking)
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
         self._host_binding_required = False
@@ -150,6 +154,7 @@ class ServeControl:
         *,
         origin: MessageOrigin = MessageOrigin.USER,
         persist_user_message: bool = True,
+        allow_assistant_reset: bool = True,
     ) -> None:
         host_commands = self._active_host_commands
         self._turn_task = asyncio.create_task(
@@ -160,6 +165,7 @@ class ServeControl:
                 persist_user_message=persist_user_message,
                 host_commands=host_commands,
                 turn_id=uuid.uuid4().hex,
+                allow_assistant_reset=allow_assistant_reset,
             )
         )
 
@@ -543,6 +549,7 @@ class ServeControl:
         persist_user_message: bool = True,
         host_commands: SessionHostCommands | None = None,
         turn_id: str,
+        allow_assistant_reset: bool = True,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -567,6 +574,7 @@ class ServeControl:
                 host_instruction=""
                 if host_commands is None
                 else host_commands.instruction,
+                allow_assistant_reset=allow_assistant_reset,
             ):
                 if pending_turn_end is not None:
                     if event.type is StreamEventType.AGENT_END:
@@ -783,6 +791,23 @@ class ServeControl:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
             self._schedule_background_wake(session_id)
 
+    async def _publish_config_changed(
+        self, event: StreamEvent, session_id: str | None
+    ) -> None:
+        controller = (
+            self.server.connections.controller_metadata()
+            if self.server.connections is not None
+            else None
+        )
+        if controller is None or "live_config_changed" not in controller.features:
+            return
+        self._end_stale_approvals(session_id)
+        await self._notify(
+            event_contract.STREAM_EVENT_WIRE_EVENTS[event.type],
+            session_id,
+            **event_contract.config_changed_wire_fields(event),
+        )
+
     async def _event(
         self,
         event: StreamEvent,
@@ -801,6 +826,9 @@ class ServeControl:
             and state.session_id == session_id
         )
         kind = event.type
+        if kind is StreamEventType.CONFIG_CHANGED:
+            await self._publish_config_changed(event, session_id)
+            return
         if foreground:
             state.usage_tracker.record(kind, state.model)
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]

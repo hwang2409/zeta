@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 import zeta.providers.transport as transport_module
+from tests.support.completion import completion_control
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from zeta.protocol.types import StreamEventType
 from zeta.providers.anthropic import (
@@ -121,7 +122,7 @@ def _setup(provider: ProviderContract, tmp_path: Path, handler: Any):
 
 
 async def _collect(backend: Any):
-    return [event async for event in backend.complete([], [])]
+    return [event async for event in backend.complete([], [], control=completion_control())]
 
 
 @pytest.mark.asyncio
@@ -289,30 +290,36 @@ async def test_retry_after_above_local_cap_is_not_shortened(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", PROVIDERS)
-async def test_retry_after_longer_than_budget_fails_without_retry(
+async def test_retry_after_longer_than_budget_enters_hold(
     provider, tmp_path, monkeypatch
 ):
     requests, sleeps = [], []
 
     async def handler(request):
         requests.append(request)
-        return httpx.Response(
-            429,
-            headers={"retry-after": "120"},
-            json={"error": {"message": "busy"}},
-            request=request,
-        )
+        if len(requests) == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "120"},
+                json={"error": {"message": "busy"}},
+                request=request,
+            )
+        return httpx.Response(200, text=provider.success_sse, request=request)
 
     async def record_sleep(delay):
         sleeps.append(delay)
 
     monkeypatch.setattr(transport_module.asyncio, "sleep", record_sleep)
     _store, client, backend = _setup(provider, tmp_path, handler)
-    with pytest.raises(provider.http_error_type, match=r"Retry-After of 120s"):
-        await _collect(backend)
+    events = await _collect(backend)
 
-    assert len(requests) == 1
-    assert sleeps == []
+    assert len(requests) == 2
+    assert any(
+        event.type is StreamEventType.RETRY
+        and event.data.get("kind") == "provider_rate_limit_hold"
+        for event in events
+    )
+    assert sum(sleeps) == 120.0
     await client.aclose()
 
 
