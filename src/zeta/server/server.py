@@ -28,6 +28,7 @@ from .handlers.projects import (
     ProjectRequests,
     project_request_error,
 )
+from .handlers.registry import dispatch as _dispatch_request
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
@@ -40,7 +41,6 @@ from .protocol import (
     hello_result,
     negotiate_protocol_version,
 )
-from .protocol import _dispatch as _dispatch_request
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts

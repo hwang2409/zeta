@@ -387,13 +387,6 @@ TOOL_OUTPUT_MAX_BYTES = 8_000
 
 
 
-async def _dispatch(
-    self, request_id: str | int, method: str, params: dict[str, Any]
-) -> object:
-    from .handlers.registry import dispatch
-
-    return await dispatch(self, request_id, method, params)
-
 def hello_result(
     protocol_version: str, capabilities: dict[str, object], warning: str | None
 ) -> dict[str, object]:
