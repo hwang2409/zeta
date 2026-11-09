@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from ...core.session import SessionNotFoundError
 from ...core.session_execution import SessionOwnedError
+from ...core.session_files import SessionIdAmbiguousError, SessionNotFoundError
 from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError
@@ -62,6 +62,24 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
             session_id = validation.required_string(params, "session_id")
+            try:
+                session_id = await asyncio.to_thread(
+                    self.server.runtime.manager.resolve_id,
+                    session_id,
+                    min_prefix_length=4,
+                )
+            except SessionIdAmbiguousError as exc:
+                raise ProtocolError(
+                    ErrorDescriptor.SESSION_ID_AMBIGUOUS,
+                    str(exc),
+                    {"session_id": session_id, "candidates": list(exc.candidates)},
+                ) from exc
+            except SessionNotFoundError as exc:
+                raise ProtocolError(
+                    ErrorDescriptor.SESSION_NOT_FOUND,
+                    str(exc),
+                    {"session_id": session_id},
+                ) from exc
             unhealthy_same_session = (
                 self.server.control.unhealthy()
                 and self.server.runtime.session_id == session_id
@@ -72,14 +90,14 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                     await self.server.runtime.resume_session(
                         session_id, force=True
                     )
+                except SessionOwnedError as exc:
+                    raise session_owned_protocol_error(exc) from exc
                 except SessionNotFoundError as exc:
                     raise ProtocolError(
                         ErrorDescriptor.SESSION_NOT_FOUND,
                         str(exc),
                         {"session_id": session_id},
                     ) from exc
-                except SessionOwnedError as exc:
-                    raise session_owned_protocol_error(exc) from exc
                 except Exception as exc:
                     raise ProtocolError(
                         ErrorDescriptor.INTERNAL_ERROR,
@@ -88,14 +106,14 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
             else:
                 try:
                     await self.server.runtime.resume_session(session_id)
+                except SessionOwnedError as exc:
+                    raise session_owned_protocol_error(exc) from exc
                 except SessionNotFoundError as exc:
                     raise ProtocolError(
                         ErrorDescriptor.SESSION_NOT_FOUND,
                         str(exc),
                         {"session_id": session_id},
                     ) from exc
-                except SessionOwnedError as exc:
-                    raise session_owned_protocol_error(exc) from exc
             self.server.control._active_host_commands = candidate
             self.server.control._host_binding_required = (
                 "session_host_commands" in self.features
