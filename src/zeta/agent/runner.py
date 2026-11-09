@@ -36,7 +36,7 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
-from ..providers.factory import build_backend, credential_store
+from ..providers.factory import build_backend, child_credential_error, credential_store
 from ..providers.rate_limit_hold import rate_limit_hold_text
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
@@ -363,11 +363,8 @@ def resolve_child_backend(
     context = getattr(loop, "account_context", None)
     account_kwargs = context.backend_kwargs(provider) if context is not None else {}
     store = credential_store(provider, **account_kwargs)
-    if store is not None:
-        tokens = store.read() or store.bootstrap()
-        if tokens is None:
-            message = f"agent error: not logged in to {provider}; "
-            return None, message + f"run zeta login --provider {provider}"
+    if (error := child_credential_error(store, provider)) is not None:
+        return None, error
     try:
         child_budget = effective_budget_for_model(
             provider, model, loop.context_assembler.token_budget

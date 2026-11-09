@@ -12,7 +12,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from ..accounts import AccountCredentials, AccountId, AccountStore
+from ..accounts import (
+    AccountCredentialLockTimeoutError,
+    AccountCredentials,
+    AccountId,
+    AccountStore,
+)
 from ..codex import CodexCredentialDriver
 from ..config.settings import load_settings
 from ..core.session import account_home, env_home
@@ -90,6 +95,20 @@ def _anthropic_credential(
             f"{API_KEY_OPT_IN_VAR} and run `zeta login` for subscription OAuth"
         )
     return AnthropicApiKeyCredential(api_key)
+
+
+def child_credential_error(
+    store: AccountCredentials | None, provider: str
+) -> str | None:
+    if store is None:
+        return None
+    try:
+        tokens = store.read() or store.bootstrap()
+    except AccountCredentialLockTimeoutError:
+        return None
+    if tokens is None:
+        return f"agent error: not logged in to {provider}; run zeta login --provider {provider}"
+    return None
 
 
 def build_backend(
@@ -182,6 +201,7 @@ __all__ = [
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_OLLAMA_MODEL",
     "build_backend",
+    "child_credential_error",
     "credential_store",
     "provider_for_model",
 ]
