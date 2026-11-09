@@ -12804,8 +12804,13 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             assert len(frames_for_call(frames, approval["request_id"])) == 2
             key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
-                with pytest.raises(asyncio.CancelledError):
-                    await asyncio.wait_for(settlement, timeout=10)
+                await asyncio.wait_for(settlement, timeout=10)
+                status_frames = await _request(reader, writer, 5, "status")
+                frames.extend(status_frames)
+                assert status_frames[-1].get("result", {}).get("state") in {
+                    "idle",
+                    "running",
+                }
             else:
                 frames += await read_until(
                     reader,
