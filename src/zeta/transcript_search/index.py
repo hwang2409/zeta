@@ -447,7 +447,7 @@ class TranscriptIndex:
         self.project_dir = Path(project_dir)
         self.project_id = project_id
         self.path = self.project_dir / INDEX_FILENAME
-        self.lock_path = self.project_dir / ".transcript-index.lock"
+        self.lock_path = self.path.with_name(f".{self.path.name}.lock")
         try:
             self.project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             with self._write_guard():

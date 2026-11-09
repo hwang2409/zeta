@@ -368,7 +368,7 @@ def test_deletion_and_reassignment(tmp_path: Path) -> None:
 
 
 def test_v4_and_v5_processes_search_the_same_home(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = _source(
         tmp_path / "sessions",
@@ -421,13 +421,40 @@ print('v4-found', flush=True)
         v5.append(source)
         assert v5.search("mixed version canary")
 
-        assert process.stdin is not None
-        process.stdin.write("search\n")
-        process.stdin.flush()
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            assert selector.select(10), "v4 process did not finish its search"
-        result = process.stdout.readline().strip()
+        lock_held = threading.Event()
+        release_append = threading.Event()
+        append_errors: list[BaseException] = []
+        original_append = v5._append_locked
+
+        def hold_append(source: TranscriptSource, *, force_full: bool = False):
+            lock_held.set()
+            assert release_append.wait(10), "test did not release v5 append"
+            return original_append(source, force_full=force_full)
+
+        def append_with_held_lock() -> None:
+            try:
+                v5.append(source)
+            except BaseException as exc:  # noqa: BLE001 - assert thread failure
+                append_errors.append(exc)
+
+        # test-contract: seam hold append after it acquires the production lock
+        monkeypatch.setattr(v5, "_append_locked", hold_append)
+        append_thread = threading.Thread(target=append_with_held_lock)
+        append_thread.start()
+        try:
+            assert lock_held.wait(10), "v5 append did not acquire its lock"
+            assert process.stdin is not None
+            process.stdin.write("search\n")
+            process.stdin.flush()
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                assert selector.select(10), "v4 search blocked on the v5 append lock"
+            result = process.stdout.readline().strip()
+        finally:
+            release_append.set()
+            append_thread.join(timeout=10)
+        assert not append_thread.is_alive(), "v5 append did not finish"
+        assert not append_errors
         returncode = process.wait(timeout=10)
         assert process.stderr is not None
         error = process.stderr.read()
