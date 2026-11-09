@@ -69,7 +69,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import (
@@ -92,6 +92,7 @@ from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.project_context.projection import ProjectContextHealth
+from zeta.project_registry import ProjectRegistry
 from zeta.providers.anthropic import (
     AnthropicBackend,
     AnthropicCredentialDriver,
@@ -168,6 +169,7 @@ from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
 from zeta.tui.cards.decisions import DecisionsPanel
+from zeta.tui.cards.shared import MAX_CARD_LINES
 from zeta.tui.cards.tasks_panel import BackgroundTasksPanel
 from zeta.tui.cards.tool import TOOL_CARD_REGISTRY
 from zeta.tui.layout import (
@@ -1837,7 +1839,11 @@ async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
 ) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     try:
-        assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {"exec"}
+        assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {
+            "exec",
+            "finish",
+            "agent_handoff",
+        }
     finally:
         await registry.close()
 
@@ -2060,13 +2066,13 @@ def _render_notification_transcript(
 
 def test_agent_notification_adds_one_blank_line_before_receipt() -> None:
     assert _render_notification_transcript() == (
-        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turns"
+        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turn"
     )
 
 
 def test_agent_notification_does_not_double_existing_blank_line() -> None:
     assert _render_notification_transcript(preceding_blank=True) == (
-        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turns"
+        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turn"
     )
 
 
@@ -2082,15 +2088,15 @@ def test_first_agent_notification_has_no_leading_blank_line() -> None:
     presenter.print_unit(render_event(_agent_notification_event()), blank_before=True)
 
     assert Text.from_ansi(transcript.render(120)).plain == (
-        "⏺ inspect repository · completed · 1.0s · 1 turns"
+        "⏺ inspect repository · completed · 1.0s · 1 turn"
     )
 
 
 def test_consecutive_agent_notifications_have_one_blank_line_between_receipts() -> None:
     assert _render_notification_transcript(receipts=2) == (
         "pr link\n\n"
-        "⏺ inspect repository · completed · 1.0s · 1 turns\n\n"
-        "⏺ inspect repository · completed · 1.0s · 1 turns"
+        "⏺ inspect repository · completed · 1.0s · 1 turn\n\n"
+        "⏺ inspect repository · completed · 1.0s · 1 turn"
     )
 
 
@@ -2098,7 +2104,7 @@ def test_tool_card_then_agent_notification_has_one_blank_line() -> None:
     rendered = _render_notification_transcript(tool_card=True)
 
     assert "read README.md" in rendered
-    assert "\n\n⏺ inspect repository · completed · 1.0s · 1 turns" in rendered
+    assert "\n\n⏺ inspect repository · completed · 1.0s · 1 turn" in rendered
 
 
 @pytest.mark.parametrize("status", ["error", "canceled"])
@@ -12845,17 +12851,19 @@ async def test_dup_failure_is_reported_not_success(
     loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
     try:
         persistence.schedule("first")
-        await asyncio.sleep(0)
         with pytest.raises(OSError, match="Too many open files"):
             await persistence.flush_pending()
         assert DraftPersistence(tmp_path / "draft").load() == ""
         assert persistence.pending_text == "first"
         fail_dup = False
         await persistence.flush_pending()
+        persistence.schedule("first")
     finally:
-        os.close(directory_fd)
-        await persistence.shutdown_pending()
-        storage_lease.close()
+        try:
+            await persistence.shutdown_pending()
+        finally:
+            os.close(directory_fd)
+            storage_lease.close()
 
     assert exceptions == []
     assert (
@@ -14618,11 +14626,11 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait(1)
+            release.wait(10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
-    assert locked.wait(1)
+    assert locked.wait(10)
     publisher_waiting = threading.Event()
     original_lifecycle_guard = AccountStore._lifecycle_guard
 
@@ -14633,22 +14641,43 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
             yield
 
     monkeypatch.setattr(AccountStore, "_lifecycle_guard", waiting_lifecycle_guard)
-    publisher = threading.Thread(
-        target=lambda: named_account_credentials(home, "codex", "work").save(
-            OAuthTokens("new-access", "new-refresh", 9_999_999_999)
-        )
+    publisher_errors: list[BaseException] = []
+    published_tokens = OAuthTokens(
+        "new-access", "new-refresh", 9_999_999_999, email="henry@example.com"
     )
+
+    def publish_credentials() -> None:
+        try:
+            # separate product bug: save merges email before verifying tokens.
+            named_account_credentials(home, "codex", "work").save(
+                published_tokens
+            )
+        except BaseException as exc:  # noqa: BLE001 - assert the thread outcome below
+            publisher_errors.append(exc)
+
+    publisher = threading.Thread(target=publish_credentials)
     publisher.start()
-    assert publisher_waiting.wait(1)
+    assert publisher_waiting.wait(10)
     try:
         assert await app.slash_accounts("") == ""
         assert app._accounts_picker is not None
         assert publisher.is_alive()
     finally:
         release.set()
-        holder.join()
-        publisher.join()
+        await asyncio.to_thread(holder.join, 10)
+        await asyncio.to_thread(publisher.join, 10)
         opened.store.close()
+
+    assert not holder.is_alive()
+    assert not publisher.is_alive()
+    assert publisher_errors == []
+    assert (
+        await asyncio.wait_for(
+            asyncio.to_thread(named_account_credentials(home, "codex", "work").read),
+            10,
+        )
+        == published_tokens
+    )
 
 
 def test_accounts_panel_labels_codex_primary_as_seven_day() -> None:
@@ -14780,14 +14809,14 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
             refresh_rendered.set()
 
     app._repaint_accounts_picker = repaint_and_signal
-    monkeypatch.setattr("zeta.accounts.usage.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("zeta.accounts.store.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
     locked = threading.Event()
     release = threading.Event()
 
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait()
+            release.wait(10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
@@ -14795,7 +14824,9 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        await refresh_rendered.wait()
+        await await_or_fail(
+            refresh_rendered.wait(), what="busy account refresh render"
+        )
         assert app._accounts_picker is not None
         assert app._accounts_picker.usages is not None
         assert app._accounts_picker.usages[account].error == (
@@ -14807,7 +14838,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
         assert "refresh failed: account busy" in plain
     finally:
         release.set()
-        holder.join()
+        holder.join(10)
         opened.store.close()
 
 
@@ -15348,3 +15379,148 @@ async def test_history_finder_does_not_cross_session_boundaries(
     assert len(batches) == 1
     assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()
+
+
+@pytest.mark.asyncio
+async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
+    tmp_path: Path,
+) -> None:
+    writer = await asyncio.to_thread(open_writer, tmp_path)
+    projects = ProjectRegistry(tmp_path / "projects")
+    project = projects.create_project("alpha", "alpha")
+    store = ConversationStore(
+        tmp_path / "sessions", session_id="a" * 32, cwd=tmp_path
+    )
+    ledger = store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=projects,
+        inbox_enabled=True,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    try:
+        activation_error = None
+        try:
+            await loop.activate()
+        except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
+            activation_error = exc
+        assert activation_error is None
+        app = TUIApp(loop, provider="codex", model="offline")
+        async with owned_app(app):
+            app._full_screen_active = lambda: True
+            app._rebuild_transcript()
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "sent history is incomplete (invalid_json)" in rendered
+            assert "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project-inbox-sent.json" in rendered
+            assert "file was not changed" in rendered
+            assert "unless the repaired ledger includes their IDs" in rendered
+    finally:
+        await loop.close()
+        store.close()
+        await asyncio.to_thread(writer.close)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "content", "structured_content"),
+    [
+        (
+            "finish",
+            "finish accepted",
+            {
+                "status": "done",
+                "summary": "summary paragraph. " * 200,
+                "verdict": "pass",
+                "head_sha": "abcdef1234567",
+            },
+        ),
+        (
+            "agent_handoff",
+            "background child agents handed off; reason: " + "reason paragraph. " * 200,
+            None,
+        ),
+    ],
+)
+def test_finish_and_handoff_cards_cap_long_detail(
+    tool_name: str, content: str, structured_content: dict[str, str] | None
+) -> None:
+    call = ToolCall(f"{tool_name}-detail", tool_name, {})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, content, structured_content=structured_content),
+    )
+    rendered = render_event(event)
+    assert rendered is not None
+
+    output = StringIO()
+    _test_console(output, width=38).print(rendered)
+    snapshot = Text.from_ansi(output.getvalue()).plain.rstrip()
+    body = [line[2:-2] for line in snapshot.splitlines()[2:-1]]
+    if tool_name == "finish":
+        assert any(line.startswith("summary: ") for line in body)
+        start = next(index for index, line in enumerate(body) if line.startswith("summary: "))
+        end = next(
+            (index for index in range(start + 1, len(body)) if body[index].strip().startswith(("verdict:", "head_sha:"))),
+            len(body),
+        )
+        body = body[start:end]
+    visible = [line for line in body if "… +" not in line]
+    assert len(visible) == MAX_CARD_LINES
+    assert len([line for line in body if "… +" in line]) == 1
+    expected_omitted = 185 if tool_name == "finish" else 120
+    assert f"… +{expected_omitted} lines" in snapshot
+
+
+def test_finish_and_handoff_cards_handle_fallback_detail() -> None:
+    cases = (
+        ("finish", "finish fallback", None),
+        ("finish", "finish malformed", {"summary": object()}),
+        ("agent_handoff", "handoff fallback", {"unexpected": "field"}),
+    )
+    for tool_name, content, structured in cases:
+        call = ToolCall(f"{tool_name}-fallback", tool_name, {})
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, content, structured_content=structured),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        _test_console(output, width=38).print(rendered)
+        snapshot = Text.from_ansi(output.getvalue()).plain
+        assert content in snapshot
+        assert "object at 0x" not in snapshot
+
+
+def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
+    for tool_name, content, structured in (
+        ("finish", "finish accepted", {"summary": "short summary"}),
+        ("agent_handoff", "short reason", None),
+    ):
+        call = ToolCall(f"{tool_name}-short", tool_name, {})
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(
+                    call.id, content, structured_content=structured
+                ),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        _test_console(output, width=100).print(rendered)
+        snapshot = Text.from_ansi(output.getvalue()).plain
+        assert "… +" not in snapshot
+        assert "short summary" in snapshot or "short reason" in snapshot

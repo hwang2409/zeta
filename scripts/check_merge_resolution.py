@@ -6,8 +6,11 @@ import argparse
 import ast
 import difflib
 import hashlib
+import json
+import os
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 
@@ -34,7 +37,7 @@ def same_item(left: Item, right: Item) -> bool:
 
 
 def _item_in(items: dict, item: Item) -> bool:
-    return any(same_item(item, candidate) for candidate in items.values())
+    return item_key(item) in items
 
 
 def _definition_fingerprint(
@@ -475,22 +478,43 @@ def _direct_main_parent(
 
 
 def _train_chain_parent(
-    parents: list[str], first_parent_chain: set[str], origin_main: str
-) -> tuple[int | None, str]:
+    parents: list[str],
+    first_parent_chain: set[str],
+    origin_main: str,
+    train_head: str | None,
+) -> tuple[int | None, str, str]:
+    """Pick the train side of a merge on a train branch.
+
+    Without train evidence, only an all-merge chain qualifies. With
+    --train-head (CI passes it for train/* PRs, built per AGENTS.md as
+    train/<lane>-<n> from origin/main with a git merge --no-ff of each PR
+    head), the train side is the parent on the train head's own first-parent
+    chain, so plain fix commits between the train's merges are allowed.
+    """
     if not origin_main:
-        return None, ""
+        return None, "", "neither parent qualifies"
     matches = [
         index
         for index, parent in enumerate(parents)
         if _train_parent_qualifies(parent, first_parent_chain)
     ]
     if len(matches) == 1:
-        return matches[0], "the selected parent is the train merge chain"
-    return None, ""
+        return matches[0], "the selected parent is the train merge chain", ""
+    if len(matches) > 1:
+        return None, "", "both parents qualify"
+    if not train_head:
+        return None, "", "neither parent qualifies"
+    train_chain = set(
+        git("rev-list", "--first-parent", train_head, "^" + origin_main).splitlines()
+    )
+    matches = [index for index, parent in enumerate(parents) if parent in train_chain]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is on the --train-head first-parent chain", ""
+    return None, "", "neither parent qualifies"
 
 
 def _identify_main_parent(
-    parents: list[str],
+    parents: list[str], train_head: str | None
 ) -> tuple[int | None, str, str, str]:
     """Identify the main parent, or return evidence for an explicit refusal."""
     try:
@@ -508,17 +532,11 @@ def _identify_main_parent(
             origin_main,
             "exactly one parent is on origin/main ancestry",
         )
-    index, reason = _train_chain_parent(parents, first_parent_chain, origin_main)
+    index, reason, details = _train_chain_parent(
+        parents, first_parent_chain, origin_main, train_head
+    )
     if index is not None:
         return index, reason, origin_main, "exactly one parent is the train merge chain"
-    train_matches = [
-        parent
-        for parent in parents
-        if origin_main and _train_parent_qualifies(parent, first_parent_chain)
-    ]
-    details = (
-        "both parents qualify" if len(train_matches) > 1 else "neither parent qualifies"
-    )
     return None, "", origin_main, details
 
 
@@ -579,11 +597,11 @@ def _validate_override(
 
 
 def resolve_parent(
-    commit: str, parents: list[str], main_sha: str | None
+    commit: str, parents: list[str], main_sha: str | None, train_head: str | None
 ) -> tuple[str, str, str] | None:
     p1, p2 = parents
     print(f"parents: 1={p1} 2={p2}")
-    index, reason, origin_main, details = _identify_main_parent(parents)
+    index, reason, origin_main, details = _identify_main_parent(parents, train_head)
     if main_sha is not None:
         index = _validate_override(
             commit, parents, main_sha, index, origin_main, details
@@ -792,15 +810,19 @@ def _parse_error_status(
     final_revision: str | None,
     final_sources: dict[tuple[str, str], str | None],
     final_error_path: str | None,
+    base: str,
 ) -> int:
     revision, path, syntax = error
+    # The merge base view is not the merge: a later fix of the merge cannot excuse it.
+    label = "merge base" if revision == base else "merge"
     lines = text.splitlines()
     if any(line.startswith(f"merge-resolution: {path} parse ->") for line in lines):
-        print(f"allowed merge parse diagnostic: {revision}:{path}")
+        print(f"allowed {label} parse diagnostic: {revision}:{path}")
         return 0
     final_text = final_sources.get((final_revision, path)) if final_revision else None
     fixed_later = (
-        final_revision
+        revision != base
+        and final_revision
         and commit != final_revision
         and final_error_path is None
         and final_text is not None
@@ -816,7 +838,7 @@ def _parse_error_status(
         )
         return 0
     print(
-        f"merge does not parse: {revision}:{path}:{syntax.lineno} (conflict marker?)",
+        f"{label} does not parse: {revision}:{path}:{syntax.lineno} (conflict marker?)",
         file=sys.stderr,
     )
     return 2
@@ -1083,6 +1105,57 @@ def _render_finding(
     )
 
 
+def _base_view(main: str, branch: str) -> str:
+    bases = git("merge-base", "--all", main, branch).splitlines()
+    base = bases[0]
+    for index, other in enumerate(bases[1:], 1):
+        tree = _merge_bases(base, other, bases[0])
+        base = (
+            git(
+                "-c", "user.name=zeta merge checker",
+                "-c", "user.email=zeta@example.invalid",
+                "commit-tree", tree, "-p", base, "-p", other,
+                input="virtual merge base\n",
+            ).strip()
+            if index < len(bases) - 1
+            else tree
+        )
+    return base
+
+
+def _merge_bases(left: str, right: str, real_base: str) -> str:
+    result = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", left, right],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, result.stdout, result.stderr
+        )
+    tree, *conflicted = [field for field in result.stdout.split("\0") if field]
+    if not conflicted:
+        return tree
+    # A real common ancestor can only over-report a loss; Git's conflicted tree has markers.
+    paths = sorted(set(conflicted))
+    print(f"merge bases conflict on {', '.join(paths)}; using base {real_base} for them")
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+
+        def index_git(*args: str, input: str = "") -> str:
+            return subprocess.check_output(
+                ["git", "--literal-pathspecs", *args], text=True, input=input, env=env
+            )
+
+        index_git("read-tree", tree)
+        listed = "".join(f"{path}\0" for path in paths)
+        index_git("update-index", "--force-remove", "-z", "--stdin", input=listed)
+        entries = index_git("ls-tree", "-r", "-z", real_base, "--", *paths)
+        index_git("update-index", "-z", "--index-info", input=entries)
+        return index_git("write-tree").strip()
+
+
 def _merge_paths(base: str, main: str, branch: str, commit: str) -> tuple[set[str], set[str]]:
     changed = set(git("diff", "--name-only", base, main).splitlines())
     all_paths = {
@@ -1111,7 +1184,7 @@ def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: 
 
 
 def _parse_merge_data(commit: str, main: str, branch: str, args):
-    base = git("merge-base", main, branch).strip()
+    base = _base_view(main, branch)
     text = "\n".join(
         [git("log", "-1", "--format=%B", commit)]
         + ([args.allow.read()] if args.allow else [])
@@ -1151,6 +1224,71 @@ def _filter_findings(findings: list[Item], text: str) -> list[Item]:
     ]
 
 
+def _borrow_skip_reason(pull: dict, author: str) -> str | None:
+    head_repo = (pull.get("head") or {}).get("repo") or {}
+    base = pull.get("base") or {}
+    if head_repo.get("full_name") != (base.get("repo") or {}).get("full_name"):
+        return "fork head"
+    if base.get("ref") != "main":
+        return f"base {base.get('ref')}"
+    if (pull.get("user") or {}).get("login") != author:
+        return "other author"
+    # An abandoned PR's body is no longer a reviewed statement.
+    if pull.get("state") == "closed" and not pull.get("merged_at"):
+        return "closed without merge"
+    return None
+
+
+def _matching_lines(body: str, findings: list[Item], remaining: list[Item]) -> list[str]:
+    return sorted(
+        {line for line in body.splitlines() if any(marker(line, item, findings) for item in remaining)}
+    )
+
+
+def _candidate_lines(
+    data: dict, findings: list[Item], remaining: list[Item]
+) -> tuple[dict[int, list[str]], list[str]]:
+    found: dict[int, list[str]] = {}
+    skipped = []
+    # The PR being checked always contains its own merges; its body is already applied.
+    for pull in (pull for pull in data["pulls"] if pull.get("number") != data["pr"]):
+        skip = _borrow_skip_reason(pull, data["author"])
+        if skip:
+            skipped.append(f"#{pull.get('number')} ({skip})")
+            continue
+        lines = _matching_lines(pull.get("body") or "", findings, remaining)
+        if lines:
+            found[pull["number"]] = lines
+    return found, skipped
+
+
+def borrowed_overrides(
+    lookup: str, commit: str, findings: list[Item], remaining: list[Item]
+) -> tuple[str, str]:
+    """Return override lines borrowed from the PR that introduced this merge, and why.
+
+    A stacked PR contains its base PR's merge commits; the base PR body already
+    explains them. Any doubt returns no text, so the check is never weaker.
+    """
+    try:
+        data = json.loads(lookup)
+        if data.get("commit") != commit:
+            return "", f"lookup is for commit {data.get('commit')}, not {commit}"
+        pulls = data.get("pulls")
+        if data.get("error") or not isinstance(pulls, list):
+            message = pulls.get("message") if isinstance(pulls, dict) else pulls
+            return "", f"PR lookup failed: {data.get('error')}: {message}"
+        found, skipped = _candidate_lines(data, findings, remaining)
+    except (ValueError, AttributeError, KeyError, TypeError) as exc:
+        return "", f"PR lookup is unreadable: {exc!r}"
+    numbers = ", ".join(f"#{number}" for number in sorted(found))
+    if len({tuple(lines) for lines in found.values()}) > 1:
+        return "", f"conflicting override lines in {numbers}"
+    if not found:
+        return "", "no PR with a matching override line; skipped: " + (", ".join(skipped) or "none")
+    return "\n".join(next(iter(found.values()))), f"override lines from {numbers}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("commit", nargs="?", default="HEAD")
@@ -1158,8 +1296,17 @@ def main() -> int:
         "--main-sha",
         help="exact object name of the merge parent that carries main",
     )
+    parser.add_argument(
+        "--train-head",
+        help="head of the train/* branch; its first-parent chain is the main side",
+    )
     parser.add_argument("--allow", type=argparse.FileType("r"))
     parser.add_argument("--pr-body-file", type=argparse.FileType("r"))
+    parser.add_argument(
+        "--borrow-file",
+        type=argparse.FileType("r"),
+        help="JSON {commit, pr, author, pulls: <GET commits/<sha>/pulls>} for stacked PRs",
+    )
     parser.add_argument(
         "--final", help="revision whose final tree contains later fixes and moves"
     )
@@ -1169,7 +1316,7 @@ def main() -> int:
     if len(parents) != 2:
         print(f"{commit} is not a two-parent merge; nothing to check")
         return 0
-    resolved = resolve_parent(commit, parents, args.main_sha)
+    resolved = resolve_parent(commit, parents, args.main_sha, args.train_head)
     if resolved is None:
         return 2
     main, branch, _reason = resolved
@@ -1183,13 +1330,12 @@ def main() -> int:
         == git("rev-parse", f"{final_revision}^{{commit}}").strip()
     ):
         final_revision = None
-    if final_revision:
+    final_items = {}
+    final_sources = {}
+    final_error_path = None
+    final_lines = []
+    if error and final_revision:
         final_items, final_sources, final_error_path, final_lines = _final_index(final_revision)
-    else:
-        final_items = {}
-        final_sources = {}
-        final_error_path = None
-        final_lines = []
     if error:
         return _parse_error_status(
             error,
@@ -1198,6 +1344,7 @@ def main() -> int:
             final_revision,
             final_sources,
             final_error_path,
+            revisions[0],
         )
     old_items, main_items, branch_items, merge_items = (
         parsed[revision] for revision in revisions
@@ -1210,9 +1357,16 @@ def main() -> int:
         _element_findings(old_items, main_items, branch_items, merge_items, unresolved)
     )
     findings.extend(line_findings)
-    findings = _filter_findings(findings, text)
-    if final_revision:
+    if final_revision and findings:
+        final_items, final_sources, final_error_path, final_lines = _final_index(final_revision)
         findings = _report_final_moves(findings, final_items, final_lines)
+    all_findings = findings
+    findings = _filter_findings(all_findings, text)
+    if findings and args.borrow_file:
+        full = git("rev-parse", f"{commit}^{{commit}}").strip()
+        extra, reason = borrowed_overrides(args.borrow_file.read(), full, all_findings, findings)
+        print(f"{'borrowed' if extra else 'did not borrow'} overrides: {reason}")
+        findings = _filter_findings(all_findings, f"{text}\n{extra}")
     if findings:
         for finding in findings:
             _render_finding(finding, main_items, branch_items, merge_items)

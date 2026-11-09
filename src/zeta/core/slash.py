@@ -26,7 +26,6 @@ from ..skills import (
 )
 from .checkpoints import active_branch
 from .commands.custom_commands import (
-    COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
     load_custom_commands,
 )
@@ -1092,7 +1091,7 @@ def create_slash_registry(
         safe(
             "decisions",
             _delegate("slash_decisions"),
-            "read, reply to, or dismiss attention items",
+            "read, reply, dismiss, or batch-reply to attention items",
             serve=ServeSlash(mutates=_decisions_mutates),
             reason=native,
         )
