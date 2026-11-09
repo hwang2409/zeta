@@ -498,14 +498,21 @@ class ServerSlashSession:
         if registry is None or project_id is None:
             return "project inbox unavailable: session is not associated with a project"
         try:
-            state = await asyncio.to_thread(
-                ProjectInbox(
-                    registry, sessions_root=registry.root.parent / "sessions"
-                ).command,
-                project_id,
-                args,
-                from_session=runtime.opened.metadata.session_id,
+            inbox = ProjectInbox(
+                registry, sessions_root=registry.root.parent / "sessions"
             )
+            operation = inbox.command if args.strip() else inbox.list
+            state = await asyncio.to_thread(
+                operation,
+                project_id,
+                **(
+                    {"from_session": runtime.opened.metadata.session_id}
+                    if args.strip()
+                    else {}
+                ),
+            )
+            if not args.strip():
+                state = json.dumps(state, indent=2, sort_keys=True)
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
         return state

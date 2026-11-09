@@ -62,7 +62,6 @@ from ..prompts import (
 from ..runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
-    project_registry,
 )
 from ..skills import SkillCatalog
 from .process_env import subprocess_env
@@ -852,7 +851,7 @@ def load_project_context(
     session_project: Project | None = None,
     cwd_project: Project | None = None,
     inbox_enabled: bool = True,
-    registry: ProjectRegistry | ProjectRegistryState | None = None,
+    registry: ProjectRegistry | ProjectRegistryState,
     project_projection: ProjectContextProjection | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
@@ -941,10 +940,16 @@ def load_project_context(
         # A malformed or unsafe optional registry must not prevent a session from
         # starting; surface it as a startup notice instead.
         try:
+            project = session_project
             if isinstance(registry, ProjectRegistryState):
                 registry = registry.registry
-            registry = registry or project_registry(home / "projects")
-            project = session_project
+            available_registry = registry
+            if (
+                project is not None
+                and available_registry is None
+                and project_projection is None
+            ):
+                raise ProjectRegistryError("project registry is unavailable")
             if project is not None:
                 manual_memory_sections: list[str] = []
                 automatic_memory_sections: list[str] = []
@@ -989,13 +994,16 @@ def load_project_context(
                             context_entries = (
                                 project_projection.memory
                                 if project_projection is not None
-                                else registry.load_memory_for_context(
+                                else available_registry.load_memory_for_context(
                                     project.project_id
                                 )
                             )
                         except UnsupportedMemoryFormatError:
-                            snapshot = registry._entry_memory_state_for_context(
-                                project.project_id
+                            assert available_registry is not None
+                            snapshot = (
+                                available_registry._entry_memory_state_for_context(
+                                    project.project_id
+                                )
                             )
                             entry_projection = render_entry_memory(
                                 snapshot.state,
@@ -1006,7 +1014,7 @@ def load_project_context(
                         else:
                             for entry in context_entries:
                                 path = (
-                                    registry.root
+                                    available_registry.root
                                     / project.project_id
                                     / "memory"
                                     / entry.name

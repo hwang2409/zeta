@@ -208,6 +208,7 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "inbox.kind": frozenset(
         {"bug_report", "change_request", "question", "info", "reply"}
     ),
+    "inbox_delegation": frozenset({"from_project", "kind"}),
     "inbox.schema_version": frozenset({1}),
     "memory.format": frozenset({1, 2}),
     "project.repo_agents": frozenset({"include", "ignore"}),
@@ -668,10 +669,12 @@ def _publish_manifest(home: Path, epoch: int) -> None:
 
 
 def advance(
-    home: str | Path, *, expected_epoch: int, target_epoch: int = WRITER_EPOCH
+    home: str | Path, *, expected_epoch: int, target_epoch: int | None = None
 ) -> None:
     """Advance an idle home to a strictly newer supported writer epoch."""
 
+    if target_epoch is None:
+        target_epoch = WRITER_EPOCH
     if target_epoch > WRITER_EPOCH or target_epoch <= expected_epoch:
         raise StorageFormatError("stored-format target must be newer and supported")
     canonical = _canonical_home(home)

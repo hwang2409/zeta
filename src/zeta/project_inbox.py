@@ -26,6 +26,7 @@ from .core.session_files import (
 )
 from .project_errors import ProjectNotFoundError
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
+from .project_inbox_sent.scanner import ProjectInboxScanner
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 from .session_liveness import session_is_live
 from .storage_format import (
@@ -35,6 +36,7 @@ from .storage_format import (
     feature_enabled,
     mapping_mutations,
     open_writer,
+    reject_unknown_keys,
     require_closed_variant,
 )
 
@@ -130,80 +132,6 @@ def _validate_json_shape(value: object) -> None:
             stack.append((child, depth + 1))
 
 
-class ProjectInboxScanner:
-    """Poll incoming directories and sender-owned sent-message records."""
-
-    def __init__(
-        self,
-        registry: ProjectRegistry,
-        project_id: str,
-        *,
-        sessions_root: Path,
-        session_id: str | None = None,
-        tracker: SentMessageTracker | None = None,
-    ) -> None:
-        if tracker is not None and tracker.session_id != session_id:
-            raise ValueError("sent-message tracker belongs to another session")
-        self.inbox = ProjectInbox(
-            registry, sessions_root=sessions_root, sent_tracker=tracker
-        )
-        self.project_id = project_id
-        self.session_id = session_id
-        self.tracker = tracker or (
-            SentMessageTracker(sessions_root, session_id)
-            if session_id is not None
-            else None
-        )
-        self._activation_sent_outcome: SentLedgerOutcome[None] | None = None
-        self._fingerprint: tuple[tuple[int, int, int, int] | None, ...] | None = None
-
-    def scan(self) -> tuple[str, ...] | None:
-        current = self._directory_fingerprint()
-        if self._fingerprint is not None and current == self._fingerprint:
-            return None
-        message_ids = self.inbox.new_ids(self.project_id, session_id=self.session_id)
-        self._fingerprint = (
-            current
-            if any(item is not None for item in current)
-            else self._directory_fingerprint()
-        )
-        return message_ids
-
-    def scan_sent(self) -> tuple[dict[str, Any], ...]:
-        """Read only sender-tracked targets; empty tracking has no inbox I/O."""
-        if self.tracker is None or self.session_id is None:
-            return ()
-        if not self.tracker.broken_cached and not self.tracker._pending:
-            return ()
-        source = self.inbox._resolve_project(self.project_id)
-        outcome = self.tracker.sent_view(
-            self.inbox, source.project_id, self.tracker._receipts
-        )
-        return tuple(
-            item
-            for item in outcome.result
-            if "done" not in item.get("reported", [])
-        )
-
-    def mark_reported(self, statuses: Iterator[tuple[str, str]]) -> None:
-        if self.tracker is not None:
-            self.tracker.mark_reported(statuses)
-
-    def _directory_fingerprint(self) -> tuple[tuple[int, int, int, int] | None, ...]:
-        inbox = self.inbox.registry.root / self.project_id / "inbox"
-        result: list[tuple[int, int, int, int] | None] = []
-        for name in ("new", "claimed"):
-            try:
-                info = (inbox / name).stat(follow_symlinks=False)
-            except FileNotFoundError:
-                result.append(None)
-            else:
-                result.append(
-                    (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
-                )
-        return tuple(result)
-
-
 class ProjectInbox:
     """Own inbox storage, validation, claiming, completion, and stale recovery."""
 
@@ -284,8 +212,12 @@ class ProjectInbox:
             raise InboxError("invalid inbox delegations")
         result: set[tuple[str, str]] = set()
         for item in value["delegations"]:
-            if not isinstance(item, dict) or set(item) != {"from_project", "kind"}:
+            if not isinstance(item, dict):
                 raise InboxError("invalid inbox delegations")
+            try:
+                reject_unknown_keys(item, "inbox_delegation")
+            except ValueError as exc:
+                raise InboxError("invalid inbox delegations") from exc
             source, kind = item.get("from_project"), item.get("kind")
             if not isinstance(source, str) or not isinstance(kind, str):
                 raise InboxError("invalid inbox delegations")
@@ -1336,4 +1268,5 @@ class ProjectInbox:
             if not stat.S_ISREG(body_info.st_mode) or body_info.st_nlink != 1:
                 raise InboxError("unsafe done history body")
             os.unlink(body_name, dir_fd=bodies_fd)
+
 

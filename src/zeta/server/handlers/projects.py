@@ -287,10 +287,11 @@ class ProjectRequests:
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
         state = self.inbox.read(project.project_id)
-        messages = [
-            self._bounded_message(request_id, self.inbox._decorate(project.project_id, item))
+        messages = [self._bounded_message(request_id, item) for item in state[status]]
+        decorated = {
+            item["id"]: self.inbox._decorate(project.project_id, item)
             for item in state[status]
-        ]
+        }
         invalid = [item for item in state["invalid"] if item["status"] == status]
         return self._page(
             request_id,
@@ -301,7 +302,9 @@ class ProjectRequests:
             extra_for_page=lambda page: {
                 "status": status,
                 "untrusted": any(
-                    message.get("authority") != "trusted_assignment" for message in page
+                    decorated.get(message.get("id"), {}).get("authority")
+                    != "trusted_assignment"
+                    for message in page
                 ),
                 "invalid": invalid,
             },
@@ -344,7 +347,8 @@ class ProjectRequests:
 
         envelope = {
             "status": "claimed",
-            "untrusted": result.get("authority") != "trusted_assignment",
+            "untrusted": self.inbox._decorate(project.project_id, result).get("authority")
+            != "trusted_assignment",
             "messages": [result],
         }
         optional = [
