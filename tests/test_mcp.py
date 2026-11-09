@@ -3294,9 +3294,8 @@ async def test_malformed_mcp_trust_reports_offline_recovery(
     trust_path.parent.mkdir(parents=True)
     trust_path.write_bytes(original)
 
-    loop = AgentLoop(
-        FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()
-    )
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
     try:
         output = await loop.slash_mcp("")
@@ -3310,6 +3309,7 @@ async def test_malformed_mcp_trust_reports_offline_recovery(
         assert trust_path.read_bytes() == original
     finally:
         await loop.close()
+        store.close()
 
 
 def test_overlay_project_shadows_home(
