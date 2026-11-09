@@ -1208,9 +1208,29 @@ Event fields are:
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 
-The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
-and `is_stall: boolean`. It is an informational notice that a retry is
-scheduled. Unknown provider keys remain allowed inside `data`.
+The `retry` data can contain `retry: integer`, `delay: number` (seconds),
+`text: string`, and `is_stall: boolean`. It is an informational notice that a
+retry is scheduled. A provider retry can also include `kind: "provider_retry"`,
+`attempt: integer`, and `reason: string`.
+
+For a long provider rate limit, the retry data uses
+`kind: "provider_rate_limit_hold"`. This means the turn is held and will
+re-probe the provider rate limit; it is not an error. The hold ends when the
+provider succeeds, the turn is canceled, its deadline expires, or the
+credential/account changes. This kind can include these fields:
+
+| field | type and unit | meaning |
+| --- | --- | --- |
+| `delay` | number, seconds | delay before the next probe |
+| `retry_after` | number, seconds | provider-requested rate-limit duration |
+| `provider` | string | provider name |
+| `attempt` | integer | provider attempt number |
+| `reason` | string | reason for the hold |
+| `until` | number, Unix timestamp in seconds | wall-clock time when the provider-requested hold ends, emitted as the numeric epoch value from `time.time()` |
+| `text` | string | human-readable hold status |
+
+These fields are additive. Older clients can ignore them. Unknown provider
+keys remain allowed inside `data`.
 
 `assistant_reset` is emitted only when the client negotiated the
 `assistant_reset` feature and a scheduled retry will actually start. It follows
