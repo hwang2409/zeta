@@ -35,7 +35,7 @@ from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
-from zeta.server.handlers import history_projection, send_images
+from zeta.server.handlers import send_images, settings
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -109,7 +109,7 @@ async def test_controller_model_catalog_works_before_session_attachment(
             return iter(sorted(super().__iter__(), reverse=True))
 
     monkeypatch.setattr(
-        history_projection,
+        settings,
         "PROVIDER_MODELS",
         {"test": ReverseSet({"model-a", "model-b"})},
     )
