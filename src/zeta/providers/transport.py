@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import time
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -14,7 +15,12 @@ from typing import Any, ClassVar, TypeVar
 
 import httpx
 
-from .completion import is_control_exception, merge_exception, report_transport_activity
+from .completion import (
+    is_control_exception,
+    merge_exception,
+    report_transport_activity,
+)
+from .must_complete_close import MustCompleteClose, task_is_cancelling
 from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
@@ -26,6 +32,8 @@ _BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
 _BACKGROUND_CLEANUP_REPORT_TASKS: set[asyncio.Task[object]] = set()
 _MAX_BACKGROUND_CLEANUP_REPORTS = 16
 _dropped_cleanup_reports = 0
+# how long a lease close waits for open borrows before it closes the client anyway
+LEASE_DRAIN_BOUND = 30.0
 CloseFailureReporter = Callable[[int, BaseException], None]
 
 
@@ -264,9 +272,9 @@ class HTTPClientLease:
     """Own one completion client and drain active borrows before closing it."""
 
     __slots__ = (
-        "_active_borrows",
         "_background_reporter_registered",
-        "_close_task",
+        "_borrowers",
+        "_close",
         "_drained",
         "_retired",
         "client",
@@ -280,57 +288,71 @@ class HTTPClientLease:
         self.owned = configured is None
         self.client = configured or httpx.AsyncClient(timeout=timeout)
         self.connection_setup_count = int(self.owned)
-        self._active_borrows = 0
+        self._borrowers: Counter[str] = Counter()
         self._background_reporter_registered = False
-        self._close_task: asyncio.Task[None] | None = None
+        self._close = MustCompleteClose(
+            "http client", LEASE_DRAIN_BOUND, self._open_borrows
+        )
         self._drained = asyncio.Event()
         self._drained.set()
         self._retired = False
 
+    @property
+    def _active_borrows(self) -> int:
+        return self._borrowers.total()
+
     @contextlib.asynccontextmanager
-    async def borrow(self) -> AsyncIterator[httpx.AsyncClient]:
+    async def borrow(self, borrower: str) -> AsyncIterator[httpx.AsyncClient]:
         if self._retired:
             raise RuntimeError("completion backend is retired")
-        self._active_borrows += 1
+        self._borrowers[borrower] += 1
         self._drained.clear()
         try:
             yield self.client
         finally:
-            self._active_borrows -= 1
-            if self._active_borrows == 0:
+            self._borrowers[borrower] -= 1
+            if not +self._borrowers:
+                self._borrowers.clear()
                 self._drained.set()
 
     def retire(self) -> None:
         self._retired = True
 
+    def _open_borrows(self) -> str:
+        names = ", ".join(sorted(+self._borrowers))
+        return f"borrows still open: {names}" if names else ""
+
     async def _close_owned(self) -> None:
-        await self._drained.wait()
-        if self.owned:
-            await self.client.aclose()
+        try:
+            # test-contract: seam the close owner bounds this drain
+            await self._drained.wait()
+        finally:
+            # the drain ended or the owner's bound cancelled it: close the
+            # client either way (the owner names any borrow that never ended).
+            if self.owned:
+                await self.client.aclose()
 
     def start_close(self) -> None:
         self.retire()
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_owned())
+        self._close.start(self._close_owned)
 
     async def aclose(
         self, report_failure: CloseFailureReporter | None = None
     ) -> None:
         self.start_close()
-        assert self._close_task is not None
-        task = self._close_task
+        assert self._close.task is not None
         try:
-            await asyncio.shield(task)
+            await self._close.wait()
         except asyncio.CancelledError:
             if report_failure is not None and not self._background_reporter_registered:
                 self._background_reporter_registered = True
-                _retain_background_closes((task,), report_failure)
+                _retain_background_closes((self._close.task,), report_failure)
             raise
 
     async def refresh(
         self, refresh_token: Callable[[httpx.AsyncClient], Awaitable[str]]
     ) -> str:
-        async with self.borrow() as client:
+        async with self.borrow("token refresh") as client:
             return await refresh_token(client)
 
 
@@ -413,11 +435,6 @@ async def sse_lines[E: RuntimeError](
 
 
 
-
-
-def task_is_cancelling() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
 
 
 def request_error[ErrorT: RuntimeError](

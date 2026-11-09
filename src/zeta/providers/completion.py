@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import errno
 import random
-import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
@@ -23,6 +22,12 @@ from ..protocol.types import (
     StreamEventType,
     ToolSchema,
     ToolUseContent,
+)
+from .must_complete_close import (
+    DeadlineClock,
+    MonotonicDeadlineClock,
+    MustCompleteClose,
+    task_is_cancelling,
 )
 
 MAX_PROVIDER_ATTEMPTS = 5
@@ -60,26 +65,6 @@ class AttemptSignal:
     activity: TransportActivity
     event: StreamEvent | None = None
 
-
-class DeadlineClock(Protocol):
-    def now(self) -> float: ...
-
-    async def wait_until(self, deadline: float) -> None: ...
-
-
-class MonotonicDeadlineClock:
-    def now(self) -> float:
-        return time.monotonic()
-
-    async def wait_until(self, deadline: float) -> None:
-        loop = asyncio.get_running_loop()
-        ready = loop.create_future()
-        timer = loop.call_at(deadline, ready.set_result, None)
-        try:
-            # test-contract: seam this future is the injected deadline clock
-            await ready
-        finally:
-            timer.cancel()
 
 
 def is_control_exception(value: BaseException) -> bool:
@@ -344,12 +329,18 @@ def is_completion_sentinel(event: StreamEvent) -> bool:
 _ATTEMPT_END = object()
 
 
+# how long an attempt close may run before its owner stops it; below the
+# lease drain bound, so a stuck close releases its borrow before the lease
+# close names it.
+ATTEMPT_CLOSE_BOUND = 20.0
+
+
 class IteratorProviderAttempt:
     """Expose decoder activity and output through one owned attempt handle."""
 
     def __init__(self, source: AsyncIterator[StreamEvent]) -> None:
         self._source = source
-        self._closed = False
+        self._close = MustCompleteClose("provider attempt", ATTEMPT_CLOSE_BOUND)
         self._producer: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[AttemptSignal | BaseException | object] = (
             asyncio.Queue()
@@ -402,40 +393,67 @@ class IteratorProviderAttempt:
         return item
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._producer is not None and not self._producer.done():
-            self._producer.cancel()
-            # test-contract: seam producer cancellation must drain fully
-            await asyncio.gather(self._producer, return_exceptions=True)
-            # this close cancelled the producer; a bare cancellation is not a
-            # source outcome (a chained one still carries the source error).
-            if (
-                isinstance(self._producer_error, asyncio.CancelledError)
-                and self._producer_error.__cause__ is None
-            ):
-                self._producer_error = None
-        elif self._producer is not None:
-            # test-contract: seam producer completion must drain fully
-            await asyncio.gather(self._producer, return_exceptions=True)
+        # the close runs as one owned task: a cancelled caller (task deadline,
+        # client disconnect, server close) cannot stop it before the source
+        # closes and releases what it holds (an HTTP lease borrow); it only
+        # tells the close not to wait on slow transport closes.
+        self._close.start(self._close_source)
+        if task_is_cancelling():
+            self._close.abort()
+        try:
+            await self._close.wait()
+        except asyncio.CancelledError:
+            self._close.abort()
+            raise
+
+    async def _close_source(self) -> None:
+        producer = self._producer
+        if producer is not None:
+            if producer.cancel():
+                await _drain_cancelled(producer)
+                # this close cancelled the producer; a bare cancellation is not
+                # a source outcome (a chained one still carries the source error).
+                if (
+                    isinstance(self._producer_error, asyncio.CancelledError)
+                    and self._producer_error.__cause__ is None
+                ):
+                    self._producer_error = None
+            else:
+                # test-contract: seam producer completion must drain fully
+                await asyncio.gather(producer, return_exceptions=True)
         close = getattr(self._source, "aclose", None)
         if close is not None:
             try:
+                # test-contract: seam the owner abort or bound ends this source close
                 await close()
             except asyncio.CancelledError as error:
                 if self._producer_error is not None:
                     raise error from self._producer_error
                 raise
-        if (
-            self._producer_error is not None
-            and not self._error_delivered
-            and (
-                not isinstance(self._producer_error, asyncio.CancelledError)
-                or self._producer_error.__cause__ is not None
-            )
-        ):
-            raise self._producer_error
+        if self._undelivered_error is not None:
+            raise self._undelivered_error
+
+    @property
+    def _undelivered_error(self) -> BaseException | None:
+        error = self._producer_error
+        if error is None or self._error_delivered:
+            return None
+        if isinstance(error, asyncio.CancelledError) and error.__cause__ is None:
+            return None
+        return error
+
+
+async def _drain_cancelled(producer: asyncio.Task[None]) -> None:
+    """Wait for a cancelled producer to unwind; an owner abort does not skip it."""
+    try:
+        # test-contract: seam producer cancellation must drain fully
+        await asyncio.gather(producer, return_exceptions=True)
+    except asyncio.CancelledError:
+        # abort: the gather passed the cancellation on to the producer, and the
+        # close keeps waiting for it to release what it holds. this wait is not
+        # bounded here: the owner's terminal bound cancels it and stops waiting.
+        # test-contract: seam the owner bound ends this drain
+        await asyncio.gather(producer, return_exceptions=True)
 
 
 class AuthIteratorProviderAttempt(IteratorProviderAttempt):

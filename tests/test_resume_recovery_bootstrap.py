@@ -93,11 +93,11 @@ async def test_resume_warm_writer_does_not_reload_root(
     full_root_loads = 0
     original = ConversationStore._load_full
 
-    def count_root_loads(store: ConversationStore) -> None:
+    def count_root_loads(store: ConversationStore, *args: object, **kwargs: object) -> None:
         nonlocal full_root_loads
         if store.path == root_path:
             full_root_loads += 1
-        original(store)
+        original(store, *args, **kwargs)
 
     runtime = _runtime(home, tmp_path)
     with patch.object(ConversationStore, "_load_full", count_root_loads):
@@ -179,10 +179,10 @@ async def test_warm_writer_sees_external_append_between_open_and_start(
     reloads = 0
     original = ConversationStore._load_full
 
-    def count_reloads(store: ConversationStore) -> None:
+    def count_reloads(store: ConversationStore, *args: object, **kwargs: object) -> None:
         nonlocal reloads
         reloads += 1
-        original(store)
+        original(store, *args, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
     flow = StepDeliveryFlow(resident)
@@ -214,10 +214,10 @@ async def test_warm_writer_falls_back_on_replaced_or_truncated_log(
     reloads = 0
     original = ConversationStore._load_full
 
-    def count_reloads(store: ConversationStore) -> None:
+    def count_reloads(store: ConversationStore, *args: object, **kwargs: object) -> None:
         nonlocal reloads
         reloads += 1
-        original(store)
+        original(store, *args, **kwargs)
 
     monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
     flow = StepDeliveryFlow(resident)
