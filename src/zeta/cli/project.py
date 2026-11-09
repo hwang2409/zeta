@@ -7,6 +7,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import IO, Any
 
 from ..core.session import env_home
@@ -18,6 +19,20 @@ from ..project_registry import ProjectRegistry, ProjectRegistryError
 from ..runtime.project_registry_state import project_registry
 
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
+
+
+def _memory_projection(registry: Any, project_id: str) -> Any:
+    transactions = getattr(registry, "memory_transactions", None)
+    if transactions is not None:
+        return transactions.read(project_id)
+    format_id = registry.memory_format(project_id)
+    if format_id == 2:
+        view = registry._entry_memory_view(project_id)
+        mirrors = registry._entry_memory_mirrors(project_id)
+    else:
+        view = {name: content for name, content in registry.load_memory(project_id)}
+        mirrors = view
+    return SimpleNamespace(format=format_id, view=lambda: view, mirror_files=lambda: mirrors)
 
 
 def add_subcommand(commands: argparse._SubParsersAction) -> None:
@@ -143,11 +158,11 @@ def run(
                 ).authorize(
                     action="accept", target=args.remote, preview=preview, noun=noun
                 )
-                if registry.memory_transactions.read(project_id).format == 2:
+                if _memory_projection(registry, project_id).format == 2:
                     registry._accept_memory_entry(project_id, args.remote)
                 else:
                     registry.accept_memory(project_id, args.remote)
-                value = registry.memory_transactions.read(project_id).view()
+                value = _memory_projection(registry, project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "accept":
@@ -170,11 +185,11 @@ def run(
                 ).authorize(
                     action="accept", target=args.action, preview=preview, noun=noun
                 )
-                if registry.memory_transactions.read(project_id).format == 2:
+                if _memory_projection(registry, project_id).format == 2:
                     registry._accept_memory_entry(project_id, args.action)
                 else:
                     registry.accept_memory(project_id, args.action)
-                value = registry.memory_transactions.read(project_id).view()
+                value = _memory_projection(registry, project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.project in {"push", "pull", "resolve"}:
@@ -208,7 +223,7 @@ def run(
                         file=err,
                     )
                     registry.finalize_memory_migration(project_id)
-                value = registry.memory_transactions.read(project_id).view()
+                value = _memory_projection(registry, project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "resolve":
@@ -225,7 +240,7 @@ def run(
                     raise ProjectRegistryError(
                         "memory resolve requires at least one entry ID"
                     )
-                if registry.memory_transactions.read(project_id).format != 2:
+                if _memory_projection(registry, project_id).format != 2:
                     raise ProjectRegistryError("memory resolve requires format-2 memory")
                 target = ", ".join(entry_ids)
                 MemoryMutationAuthorization.terminal(
@@ -240,7 +255,7 @@ def run(
                     entry_ids,
                     reason=getattr(args, "reason", None) or "resolved by user",
                 )
-                value = registry.memory_transactions.read(project_id).view()
+                value = _memory_projection(registry, project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "schema":
@@ -266,7 +281,7 @@ def run(
                     kind_mappings=mappings,
                     resolve_kinds=frozenset(getattr(args, "resolve_kind", [])),
                 )
-                value = registry.memory_transactions.read(project_id).view()
+                value = _memory_projection(registry, project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if (
@@ -290,7 +305,7 @@ def run(
                 else registry.show_project(name=args.project).project_id
             )
             supplied = list(args.set) + list(args.from_file)
-            projection = registry.memory_transactions.read(project_id)
+            projection = _memory_projection(registry, project_id)
             memory_format = projection.format
             if not supplied:
                 if memory_format == 2:
@@ -327,10 +342,10 @@ def run(
                 )
                 if memory_format == 2:
                     registry._replace_entry_kind(project_id, name, content)
-                    value = registry.memory_transactions.read(project_id).view()
+                    value = _memory_projection(registry, project_id).view()
                 else:
                     registry.update_memory(project_id, {name: content})
-                    value = registry.memory_transactions.read(project_id).view()
+                    value = _memory_projection(registry, project_id).view()
         elif args.project_verb == "list":
             value = [
                 project.to_dict()
