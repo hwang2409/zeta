@@ -104,7 +104,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
-from zeta.runtime.loop.empty_turn import empty_turn_error
+from zeta.runtime.loop.empty_turn import DispatchProgress, empty_turn_error
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import (
     ApprovalLifecycle,
@@ -1127,6 +1127,43 @@ async def _ready(server: ZetaServer, protocol_version: str = "1.0"):
     await _request(reader, writer, 1, "hello", {"protocol_version": protocol_version})
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     return reader, writer
+
+
+@pytest.mark.asyncio
+async def test_serve_reports_no_progress_stop_and_accepts_next_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    original_admit = DispatchProgress.admit
+
+    def repeated_admit(self, store, prepared, flow, retrying_context, **kwargs):
+        # the real stop path: the same request admitted a third time in a row.
+        original_admit(self, store, prepared, flow, retrying_context, **kwargs)
+        original_admit(self, store, prepared, flow, retrying_context, **kwargs)
+        return original_admit(self, store, prepared, flow, retrying_context, **kwargs)
+
+    monkeypatch.setattr(DispatchProgress, "admit", repeated_admit)
+    reader, writer = await _ready(server, "1.1")
+    try:
+        frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        while not any(
+            frame.get("params", {}).get("event") == "agent_end" for frame in frames
+        ):
+            frames.append(await _read(reader))
+        events = [frame["params"] for frame in frames if frame.get("method") == "event"]
+        error = next(event for event in events if event["event"] == "error")
+        assert error["error"]["code"] == "no_progress_loop"
+        assert "Input not delivered: it is held and goes with the next message." in error["error"]["message"]
+        assert not any(event["event"] == "assistant_message" for event in events)
+
+        monkeypatch.setattr(DispatchProgress, "admit", original_admit)
+        await _request(reader, writer, 4, "send", {"text": "again"})
+        committed = await _event(reader, "assistant_message")
+        assert committed["message"]["role"] == "assistant"
+    finally:
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -11933,13 +11970,15 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
     runtime_end = asyncio.Event()
     runtime_end_handled = asyncio.Event()
     release = asyncio.Event()
-    original = ConversationStore._to_thread_durable
+    original = ConversationStore.resolve_approval_async
     approvals = server.control._approvals
     original_end = approvals._end_approval
 
-    async def gated_durable(self, function, *args, **kwargs):
-        result = await original(self, function, *args, **kwargs)
-        if function.__name__ == "resolve_approval" and args[0] == "gated-call":
+    async def gated_durable(self, request_id, decision, *, reason=None):
+        result = await original(
+            self, request_id, decision, reason=reason
+        )
+        if request_id == "gated-call":
             persisted.set()
             await asyncio.wait_for(release.wait(), timeout=10)
         return result
@@ -11950,7 +11989,7 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
         runtime_end_handled.set()
 
     # test-contract: seam no public hook exists between durable approval commit and settlement
-    monkeypatch.setattr(ConversationStore, "_to_thread_durable", gated_durable)
+    monkeypatch.setattr(ConversationStore, "resolve_approval_async", gated_durable)
     # test-contract: seam forces the runtime end event before settlement resumes
     monkeypatch.setattr(approvals, "_end_approval", record_runtime_end)
     reader, writer = await _ready(server)
