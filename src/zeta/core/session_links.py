@@ -22,7 +22,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -149,6 +149,7 @@ def persist_pending_root_link(
     lease: WriterLease,
     *,
     previous_project_id: str | None = None,
+    _reference_gate: SessionReferenceGate | None = None,
 ) -> None:
     """Durably publish a root-session linkage intent before registry mutation."""
 
@@ -159,11 +160,23 @@ def persist_pending_root_link(
         "previous_project_id": previous_project_id,
         "transcript_path": str(Path(sessions_dir) / session_id),
     }
-    with (
-        SessionReferenceGate(Path(sessions_dir).parent, lease).shared(
+    gate = _reference_gate or SessionReferenceGate(Path(sessions_dir).parent, lease)
+    authority = (
+        nullcontext(gate)
+        if _reference_gate is not None
+        else gate.shared(
             installed_ids=(session_id,),
             referenced_ids=(parent_session_id,) if parent_session_id is not None else (),
-        ),
+        )
+    )
+    if _reference_gate is not None:
+        gate.validate(
+            (session_id, parent_session_id)
+            if parent_session_id is not None
+            else (session_id,)
+        )
+    with (
+        authority,
         session_directory(sessions_dir, session_id) as (_, directory_fd),
         project_links_lock(directory_fd),
     ):
@@ -180,6 +193,8 @@ def persist_pending_child_link(
     root_session_dir: os.PathLike[str],
     link: dict[str, object],
     lease: WriterLease,
+    *,
+    _reference_gate: SessionReferenceGate | None = None,
 ) -> None:
     """Durably record a child-lineage intent in the ROOT's pending index.
 
@@ -191,15 +206,22 @@ def persist_pending_child_link(
     """
     root = Path(root_session_dir)
     name = _encode_link_name(str(link["session_id"]))
+    installed_ids = (str(link["session_id"]),)
+    referenced_ids = tuple(
+        session_id
+        for session_id in (link.get("parent_session_id"), root.name)
+        if isinstance(session_id, str)
+    )
+    gate = _reference_gate or SessionReferenceGate(root.parent.parent, lease)
+    authority = (
+        nullcontext(gate)
+        if _reference_gate is not None
+        else gate.shared(installed_ids=installed_ids, referenced_ids=referenced_ids)
+    )
+    if _reference_gate is not None:
+        gate.validate((*installed_ids, *referenced_ids))
     with (
-        SessionReferenceGate(root.parent.parent, lease).shared(
-            installed_ids=(str(link["session_id"]),),
-            referenced_ids=tuple(
-                session_id
-                for session_id in (link.get("parent_session_id"), root.name)
-                if isinstance(session_id, str)
-            ),
-        ),
+        authority,
         session_directory(root.parent, root.name) as (_, root_fd),
         project_links_lock(root_fd),
         child_directory(root_fd, PENDING_CHILD_LINKS_DIRNAME, create=True) as pending_fd,
