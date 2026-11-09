@@ -99,16 +99,23 @@ class ReplayClient:
         return await self.response(request_id)
 
     async def event(self, name: str | None = None) -> dict[str, Any]:
+        """The first matching event in arrival order; other frames stay buffered in order."""
+        def matches(frame: dict[str, Any]) -> bool:
+            params = frame.get("params")
+            return isinstance(params, dict) and (name is None or params.get("event") == name)
+
+        # a match may sit behind other buffered frames (two events can arrive in either order)
+        for index, frame in enumerate(self.buffered):
+            if matches(frame):
+                del self.buffered[index]
+                return frame["params"]
         skipped: list[dict[str, Any]] = []
         try:
-            while True:
-                frame = await self.read() if not skipped else await self._read_wire()
-                params = frame.get("params")
-                if isinstance(params, dict) and (name is None or params.get("event") == name):
-                    return params
+            while not matches(frame := await self._read_wire()):
                 skipped.append(frame)
+            return frame["params"]
         finally:
-            self.buffered.extendleft(reversed(skipped))
+            self.buffered.extend(skipped)
 
     async def close(self) -> None:
         self.writer.close()
