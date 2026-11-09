@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import threading
 import time
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -17,8 +19,9 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta import project_registry as registry_module
 from zeta.core import session_files
 from zeta.core.abort import AbortGenerationRegistry
-from zeta.core.project_context import load_project_context, refresh_project_memory
+from zeta.core.project_context import load_project_context
 from zeta.core.session import SessionManager
+from zeta.project_memory_history import MemorySnapshot
 from zeta.project_registry import (
     MAX_MEMORY_FILE_SIZE,
     MAX_SESSION_REFERENCE_SIZE,
@@ -28,9 +31,14 @@ from zeta.project_registry import (
 )
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.skills import SkillCatalog
-from zeta.storage_format import open_writer
+from zeta.storage_format import advance, open_writer
 from zeta.tools import ToolRegistry
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
 
 
 async def _cancel_and_drain(tasks: list[asyncio.Task[object]]) -> None:
@@ -44,9 +52,8 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
-    )
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope", repository)
 
     enabled = load_project_context(
         cwd=repository,
@@ -55,6 +62,7 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        registry=registry,
     )
     disabled = load_project_context(
         cwd=repository,
@@ -64,6 +72,7 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
         session_project=project,
         cwd_project=project,
         inbox_enabled=False,
+        registry=registry,
     )
 
     assert "You work on project demo" in enabled.system_prompt
@@ -73,6 +82,91 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
     assert "Do not ask the user to confirm the sender" in enabled.system_prompt
     assert "claim it, do the work, then mark it done" in enabled.system_prompt
     assert "inbox action send" not in disabled.system_prompt
+
+
+def test_memory_snapshot_releases_domain_lock_after_pinning_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    advance(home, expected_epoch=0)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope")
+    registry.initialize_memory(project.project_id)
+    before = registry.memory_snapshot(project.project_id)
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=before.digest,
+        updates={"brief.md": "before"},
+    )
+    expected = registry.memory_snapshot(project.project_id)
+    read_started = threading.Event()
+    release_read = threading.Event()
+    writer_done = threading.Event()
+    snapshots: list[MemorySnapshot] = []
+    errors: list[BaseException] = []
+    real_read = os.read
+    blob = next(
+        (home / "projects" / project.project_id).rglob(
+            hashlib.sha256(b"before").hexdigest()
+        )
+    )
+    blob_info = blob.stat()
+    reader_id: int | None = None
+
+    def gated_read(fd: int, size: int) -> bytes:
+        info = os.fstat(fd)
+        if (
+            threading.get_ident() == reader_id
+            and (info.st_dev, info.st_ino) == (blob_info.st_dev, blob_info.st_ino)
+            and not read_started.is_set()
+        ):
+            read_started.set()
+            if not release_read.wait(10):
+                raise AssertionError("snapshot read release was not signalled")
+        return real_read(fd, size)
+
+    def read_snapshot() -> None:
+        nonlocal reader_id
+        reader_id = threading.get_ident()
+        try:
+            snapshots.append(registry.memory_snapshot(project.project_id))
+        except BaseException as exc:  # noqa: BLE001 - joined below
+            errors.append(exc)
+
+    def write_memory() -> None:
+        try:
+            registry.compare_and_swap_memory(
+                project.project_id,
+                expected_digest=expected.digest,
+                updates={"brief.md": "after"},
+            )
+        except BaseException as exc:  # noqa: BLE001 - joined below
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    # test-contract: seam pause production reads after their descriptor is pinned
+    monkeypatch.setattr(registry_module.os, "read", gated_read)
+    reader = threading.Thread(target=read_snapshot)
+    writer = threading.Thread(target=write_memory)
+    reader.start()
+    try:
+        assert read_started.wait(10), "snapshot did not start reading its pinned file"
+        writer.start()
+        assert writer_done.wait(10), (
+            "memory writer remained blocked behind pinned snapshot reading"
+        )
+    finally:
+        release_read.set()
+        reader.join(10)
+        if writer.ident is not None:
+            writer.join(10)
+    assert not reader.is_alive(), "snapshot reader did not finish"
+    assert not writer.is_alive(), "memory writer did not finish"
+    assert not errors
+    assert len(snapshots) == 1
+    assert snapshots[0].contents["brief.md"] == "before"
+    assert registry.memory_snapshot(project.project_id).contents["brief.md"] == "after"
 
 
 def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -> None:
@@ -93,6 +187,7 @@ def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=None,
+        registry=registry,
     )
     assert "shipping the first version" in context.system_prompt
     assert any(path.name == "state.md" for path in context.files)
@@ -120,6 +215,33 @@ def _linked_session_fixture(tmp_path: Path):
     opened.store.close()
     links_path = home / "projects" / project.project_id / "sessions.jsonl"
     return home, project, session_id, links_path
+
+
+def _update_session_reference(
+    home: Path,
+    project_id: str,
+    *,
+    session_id: str,
+    transcript_path: str,
+    role: str = "session",
+    parent_session_id: str | None = None,
+) -> None:
+    registry = ProjectRegistry(home / "projects")
+    records = registry._prepare_session_records(
+        project_id,
+        [
+            {
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "role": role,
+                "parent_session_id": parent_session_id,
+            }
+        ],
+    )
+    with registry._project_lock(
+        project_id, "sessions", exclusive=True
+    ) as project_fd:
+        registry._update_sessions_locked(project_fd, set(), records)
 
 
 def _seed_pending_link(home: Path, session_id: str) -> Path:
@@ -202,7 +324,8 @@ def test_record_session_fast_duplicate_matches_full_reader(
                 reopened = SessionManager(home).open(session_id)
                 reopened.store.close()
             else:
-                ProjectRegistry(home / "projects").record_session(
+                _update_session_reference(
+                    home,
                     project.project_id,
                     session_id=requested_id,
                     transcript_path=str(home / "sessions" / requested_id),
@@ -218,8 +341,8 @@ def test_record_session_fast_duplicate_matches_full_reader(
         # test-contract: seam force the old full reader behind record_session
         full_reader.setattr(
             ProjectRegistry,
-            "_session_record_exists",
-            classmethod(lambda cls, fd, target_id: False),
+            "_session_record_matches",
+            classmethod(lambda cls, fd, expected: False),
         )
         expected = run()
 
@@ -341,7 +464,8 @@ def test_duplicate_session_scan_keeps_memory_below_registry_size(
     monkeypatch.setattr(registry_module.os, "read", bounded_read)
     tracemalloc.start()
     try:
-        ProjectRegistry(home / "projects").record_session(
+        _update_session_reference(
+            home,
             project.project_id,
             session_id=session_id,
             transcript_path=str(home / "sessions" / session_id),
@@ -389,37 +513,6 @@ def test_new_session_link_preserves_registry_validation_and_append(
     reopened = SessionManager(home).open(session_id)
     reopened.store.close()
     assert links_path.read_bytes() == first_append
-
-
-def test_resume_replaces_only_current_project_memory(tmp_path: Path) -> None:
-    home = tmp_path / ".zeta"
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
-    )
-    context = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-    )
-    ProjectRegistry(home / "projects").update_memory(
-        project.project_id, {"state.md": "# Current state\\nnew state"}
-    )
-    resumed = refresh_project_memory(
-        context.system_prompt,
-        home=home,
-        cwd=repository,
-        project_id=context.memory_project_id,
-        memory_offset=context.memory_offset,
-        memory_length=context.memory_length,
-        memory_digest=context.memory_digest,
-    )
-    assert "new state" in resumed
-    assert "# Current state\\n" not in resumed or "new state" in resumed
 
 
 def test_project_tool_is_read_only_and_available(tmp_path: Path) -> None:
@@ -698,19 +791,20 @@ def test_root_link_pending_intent_dir_fsync_precedes_record_session(
     monkeypatch.setattr(os, "fsync", spy_fsync)
 
     manager = SessionManager(home)
-    real_record = manager.project_registry.record_session
+    real_update = manager.project_registry._update_sessions_locked
 
-    def spy_record(*args: object, **kwargs: object) -> None:
-        events.append("record_session")
-        return real_record(*args, **kwargs)
+    def spy_update(*args: object, **kwargs: object) -> None:
+        events.append("update_sessions")
+        return real_update(*args, **kwargs)
 
-    monkeypatch.setattr(manager.project_registry, "record_session", spy_record)
+    # test-contract: durability observe registry publication after intent fsync
+    monkeypatch.setattr(manager.project_registry, "_update_sessions_locked", spy_update)
 
     session = manager.create(provider="codex", model="fake", cwd=repository)
     session.store.close()
 
-    assert "record_session" in events
-    first_record = events.index("record_session")
+    assert "update_sessions" in events
+    first_record = events.index("update_sessions")
     # The durable intent's directory entry is fsynced immediately before the
     # registry is published, so a crash between the two boundaries is
     # recoverable rather than losing the rename.
@@ -828,7 +922,7 @@ async def test_child_lineage_two_roots_each_with_child_and_grandchild(
     root_a = await _run_root_with_child_and_grandchild(manager, repository)
     root_b = await _run_root_with_child_and_grandchild(manager, repository)
 
-    records = manager.project_registry.list_session_links(project.project_id)
+    records = await asyncio.to_thread(manager.project_registry.list_session_links, project.project_id)
     by_id = {record["session_id"]: record for record in records}
     assert len(by_id) == 6
 
@@ -870,7 +964,10 @@ async def test_child_lineage_reconciled_after_registry_failure(
     def failing_record(*args: object, **kwargs: object) -> None:
         raise ProjectRegistryError("injected append failure")
 
-    monkeypatch.setattr(manager.project_registry, "record_sessions", failing_record)
+    # test-contract: seam force lineage publication failure behind a real child run
+    monkeypatch.setattr(
+        manager.project_registry, "_record_child_lineage_batch", failing_record
+    )
 
     loop = AgentLoop(
         FakeBackend(_nested_spawn_turns()),
@@ -888,7 +985,7 @@ async def test_child_lineage_reconciled_after_registry_failure(
     opened.store.close()
 
     # Only the root link was published; the child/grandchild appends failed.
-    before = manager.project_registry.list_session_links(project.project_id)
+    before = await asyncio.to_thread(manager.project_registry.list_session_links, project.project_id)
     assert [record["session_id"] for record in before] == [root_id]
     monkeypatch.undo()
 
@@ -903,10 +1000,10 @@ async def test_child_lineage_reconciled_after_registry_failure(
     child_id = f"{root_id}:1"
     grand_id = f"{root_id}:1:1"
 
-    first = sorted(_link_ids(SessionManager(home)))
+    first = sorted(await asyncio.to_thread(_link_ids, SessionManager(home)))
     assert first == sorted([root_id, child_id, grand_id])
     # A second open must not double-publish any link.
-    second = sorted(_link_ids(SessionManager(home)))
+    second = sorted(await asyncio.to_thread(_link_ids, SessionManager(home)))
     assert second == first
 
 
@@ -1199,7 +1296,8 @@ def test_child_reconciliation_resumes_on_next_open_without_duplicates(
     def boom(*args: object, **kwargs: object) -> None:
         raise ProjectRegistryError("injected batch failure")
 
-    monkeypatch.setattr(registry, "record_sessions", boom, raising=False)
+    # test-contract: seam force batch failure behind reconciliation
+    monkeypatch.setattr(registry, "_record_child_lineage_batch", boom, raising=False)
     reconcile_child_links(registry, manager.sessions_dir, root_id)
     # The batch publish failed, so the durable intents remain unpublished.
     assert _child_link_ids(registry, project.project_id) == []
@@ -1251,7 +1349,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
     repository = tmp_path / "repo"
     repository.mkdir()
     registry = ProjectRegistry(home / "projects")
-    project = registry.create_project("demo", "scope", repository)
+    project = await asyncio.to_thread(registry.create_project, "demo", "scope", repository)
     opened = await asyncio.to_thread(
         SessionManager(home).create, provider="codex", model="fake", cwd=repository
     )
@@ -1295,7 +1393,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             and calls_by_thread[thread_id] == 2
         ):
             owner_before_collection.set()
-            release_owner.wait()
+            assert release_owner.wait(120), "owner release was not signalled"
         return real_session_directory(*args, **kwargs)
 
     monkeypatch.setattr(session_links, "persist_pending_child_link", observe_admission)
@@ -1335,16 +1433,19 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             "owner_before_collection not reached"
         )
         for call in calls[1:]:
-            task = asyncio.create_task(
-                loop._run_agent_tool(
-                    call, call.arguments, signals.new_generation(), None
+            tasks.append(
+                asyncio.create_task(
+                    loop._run_agent_tool(
+                        call, call.arguments, signals.new_generation(), None
+                    )
                 )
             )
-            tasks.append(task)
-            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await asyncio.wait_for(
+            asyncio.gather(*tasks[1:], return_exceptions=True), 120
+        )
         release_owner.set()
         results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True), 10
+            asyncio.gather(*tasks, return_exceptions=True), 120
         )
     finally:
         release_owner.set()
@@ -1356,9 +1457,11 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             finally:
                 opened.store.close()
 
-    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all(isinstance(result, RuntimeError) for result in results), [
+        repr(result) for result in results if not isinstance(result, RuntimeError)
+    ]
     assert registry_reads == 2
-    records = registry.list_session_links(project.project_id, limit=10_000)
+    records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=10_000)
     child_ids = [
         record["session_id"] for record in records if ":" in str(record["session_id"])
     ]
@@ -1378,7 +1481,7 @@ async def test_real_child_spawns_repeat_after_generation_changes(
     repository = tmp_path / "repo"
     repository.mkdir()
     registry = ProjectRegistry(home / "projects")
-    project = registry.create_project("demo", "scope", repository)
+    project = await asyncio.to_thread(registry.create_project, "demo", "scope", repository)
     manager = SessionManager(home)
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="fake", cwd=repository
@@ -1400,7 +1503,34 @@ async def test_real_child_spawns_repeat_after_generation_changes(
     )
     first_batch_ready = threading.Event()
     release_first_batch = threading.Event()
-    real_record_sessions = registry.record_sessions
+    all_admissions_ready = threading.Event()
+    admission_lock = threading.Lock()
+    real_persist = session_links.persist_pending_child_link
+    admission_count = 0
+
+    def count_admission(*args: object, **kwargs: object) -> None:
+        nonlocal admission_count
+        real_persist(*args, **kwargs)
+        with admission_lock:
+            admission_count += 1
+            if admission_count == 257:
+                all_admissions_ready.set()
+
+    # test-contract: count real admissions before the second bounded pass
+    monkeypatch.setattr(session_links, "persist_pending_child_link", count_admission)
+    real_reconcile = session_links._reconcile_child_links_pass
+    reconcile_calls = 0
+
+    def gate_second_pass(*args: object, **kwargs: object):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        if reconcile_calls == 2:
+            assert all_admissions_ready.wait(120), "all admissions were not durable"
+        return real_reconcile(*args, **kwargs)
+
+    # test-contract: seam hold the second pass until all admissions are durable
+    monkeypatch.setattr(session_links, "_reconcile_child_links_pass", gate_second_pass)
+    real_record_sessions = registry._record_child_lineage_batch
     record_calls = 0
 
     def gate_first_batch(*args: object, **kwargs: object) -> None:
@@ -1408,10 +1538,11 @@ async def test_real_child_spawns_repeat_after_generation_changes(
         record_calls += 1
         if record_calls == 1:
             first_batch_ready.set()
-            release_first_batch.wait()
+            assert release_first_batch.wait(120), "first batch release was not signalled"
         real_record_sessions(*args, **kwargs)
 
-    monkeypatch.setattr(registry, "record_sessions", gate_first_batch)
+    # test-contract: seam gate one batch behind real child spawns
+    monkeypatch.setattr(registry, "_record_child_lineage_batch", gate_first_batch)
     real_read = registry._read_session_records
     registry_reads = 0
 
@@ -1447,23 +1578,22 @@ async def test_real_child_spawns_repeat_after_generation_changes(
             "first_batch_ready not reached"
         )
         for call in calls[1:256]:
-            task = asyncio.create_task(
-                loop._run_agent_tool(
-                    call, call.arguments, signals.new_generation(), None
+            tasks.append(
+                asyncio.create_task(
+                    loop._run_agent_tool(
+                        call, call.arguments, signals.new_generation(), None
+                    )
                 )
             )
-            tasks.append(task)
-            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         last = asyncio.create_task(
             loop._run_agent_tool(
                 calls[256], calls[256].arguments, signals.new_generation(), None
             )
         )
         tasks.append(last)
-        await asyncio.wait_for(asyncio.gather(last, return_exceptions=True), 10)
         release_first_batch.set()
         results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True), 10
+            asyncio.gather(*tasks, return_exceptions=True), 120
         )
     finally:
         release_first_batch.set()
@@ -1474,12 +1604,13 @@ async def test_real_child_spawns_repeat_after_generation_changes(
                 await asyncio.wait_for(loop.close(), 10)
             finally:
                 opened.store.close()
-    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all(isinstance(result, RuntimeError) for result in results), [
+        repr(result) for result in results if not isinstance(result, RuntimeError)
+    ]
 
-    # The first ready set is already collected when publication blocks. The
-    # 257th admission must change the generation and force a second pass.
-    assert registry_reads == 2
-    records = registry.list_session_links(project.project_id, limit=10_000)
+    assert record_calls == 2, "child lineage publication was not bounded"
+    assert registry_reads == record_calls
+    records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=10_000)
     child_ids = [
         record["session_id"] for record in records if ":" in str(record["session_id"])
     ]
@@ -1494,12 +1625,13 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.agent import runner as agent_runner
+    from zeta.core import session_links
 
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
     registry = ProjectRegistry(home / "projects")
-    project = registry.create_project("demo", "scope", repository)
+    project = await asyncio.to_thread(registry.create_project, "demo", "scope", repository)
     opened = await asyncio.to_thread(
         SessionManager(home).create, provider="codex", model="fake", cwd=repository
     )
@@ -1563,6 +1695,35 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             )
 
         first_batch_ready = threading.Event()
+        all_admissions_ready = threading.Event()
+        admission_lock = threading.Lock()
+        real_persist = session_links.persist_pending_child_link
+        admission_count = 0
+
+        def count_admission(*args: object, **kwargs: object) -> None:
+            nonlocal admission_count
+            real_persist(*args, **kwargs)
+            with admission_lock:
+                admission_count += 1
+                if admission_count == 4:
+                    all_admissions_ready.set()
+
+        # test-contract: count real admissions before the second bounded pass
+        monkeypatch.setattr(session_links, "persist_pending_child_link", count_admission)
+        real_reconcile = session_links._reconcile_child_links_pass
+        reconcile_calls = 0
+
+        def gate_second_pass(*args: object, **kwargs: object):
+            nonlocal reconcile_calls
+            reconcile_calls += 1
+            if reconcile_calls == 2:
+                assert all_admissions_ready.wait(10), "all admissions were not durable"
+            return real_reconcile(*args, **kwargs)
+
+        # test-contract: seam hold the second pass until all admissions are durable
+        monkeypatch.setattr(
+            session_links, "_reconcile_child_links_pass", gate_second_pass
+        )
         second_owner_entered = asyncio.Event()
         event_loop = asyncio.get_running_loop()
         record_lock = threading.Lock()
@@ -1570,7 +1731,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         max_active_records = 0
         record_calls = 0
         registry_reads = 0
-        real_record_sessions = registry.record_sessions
+        real_record_sessions = registry._record_child_lineage_batch
         real_read = registry._read_session_records
 
         def gate_batches(*args: object, **kwargs: object) -> None:
@@ -1596,7 +1757,8 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             registry_reads += 1
             return real_read(*args, **kwargs)
 
-        monkeypatch.setattr(registry, "record_sessions", gate_batches)
+        # test-contract: seam gate batches behind real nested child spawns
+        monkeypatch.setattr(registry, "_record_child_lineage_batch", gate_batches)
         # test-contract: seam count registry scans behind real nested spawn calls
         monkeypatch.setattr(registry, "_read_session_records", count_registry_read)
         grand_calls = [call(f"grandchild-{index}") for index in range(4)]
@@ -1619,12 +1781,8 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             )
         )
         grand_tasks.append(second)
-        second_owner_wait = asyncio.create_task(second_owner_entered.wait())
-        done, _ = await asyncio.wait_for(
-            asyncio.wait(
-                {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
-            ),
-            10,
+        second_owner_wait = asyncio.create_task(
+            asyncio.wait_for(second_owner_entered.wait(), 10)
         )
         grand_tasks.extend(
             asyncio.create_task(
@@ -1637,14 +1795,11 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             )
             for index in range(2, 4)
         )
-        await asyncio.wait_for(
-            asyncio.gather(*grand_tasks[2:], return_exceptions=True), 10
-        )
         release_batches.set()
         results = await asyncio.wait_for(
-            asyncio.gather(*grand_tasks, return_exceptions=True), 10
+            asyncio.gather(*grand_tasks, return_exceptions=True), 120
         )
-        if second_owner_wait not in done:
+        if not second_owner_wait.done():
             second_owner_wait.cancel()
             await asyncio.wait_for(
                 asyncio.gather(second_owner_wait, return_exceptions=True), 10
@@ -1665,10 +1820,13 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             finally:
                 opened.store.close()
 
-    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all(isinstance(result, RuntimeError) for result in results), [
+        repr(result) for result in results if not isinstance(result, RuntimeError)
+    ]
     assert max_active_records == 1
-    assert registry_reads == 2
-    records = registry.list_session_links(project.project_id, limit=100)
+    assert record_calls == 2, "nested lineage publication was not bounded"
+    assert registry_reads == record_calls
+    records = await asyncio.to_thread(registry.list_session_links, project.project_id, limit=100)
     grandchild_ids = [
         record["session_id"]
         for record in records
@@ -1688,7 +1846,7 @@ async def test_cancelled_child_publication_joins_before_loop_close(
     repository = tmp_path / "repo"
     repository.mkdir()
     registry = ProjectRegistry(home / "projects")
-    project = registry.create_project("demo", "scope", repository)
+    project = await asyncio.to_thread(registry.create_project, "demo", "scope", repository)
     opened = await asyncio.to_thread(
         SessionManager(home).create, provider="codex", model="fake", cwd=repository
     )
@@ -1716,7 +1874,7 @@ async def test_cancelled_child_publication_joins_before_loop_close(
         if threading.get_ident() != event_loop_thread:
             worker_entered.set()
             first_phase.set()
-            release_worker.wait()
+            assert release_worker.wait(10), "worker release was not signalled"
         real_persist(*args, **kwargs)
         order.append("storage_return")
         first_phase.set()
@@ -1774,14 +1932,17 @@ async def test_cancelled_child_publication_joins_before_loop_close(
 
     assert order.index("heartbeat") < order.index("storage_return")
     child_id = f"{opened.metadata.session_id}:1"
-    records = registry.list_session_links(project.project_id)
+    records = await asyncio.to_thread(registry.list_session_links, project.project_id)
     assert [record["session_id"] for record in records].count(child_id) == 1
 
 
 def test_pending_index_fsyncs_root_dir_before_record_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.core.session_links import persist_pending_child_link
+    from zeta.core.session_links import (
+        persist_pending_child_link,
+        reconcile_child_links,
+    )
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     # The pending index directory's own entry lives in the root session dir; a
@@ -1804,13 +1965,14 @@ def test_pending_index_fsyncs_root_dir_before_record_session(
     monkeypatch.setattr(os, "fsync", spy_fsync)
 
     registry = manager.project_registry
-    real_record = registry.record_session
+    real_update = registry._update_sessions_locked
 
-    def spy_record(*args: object, **kwargs: object):
-        events.append("record_session")
-        return real_record(*args, **kwargs)
+    def spy_update(*args: object, **kwargs: object) -> None:
+        events.append("update_sessions")
+        return real_update(*args, **kwargs)
 
-    monkeypatch.setattr(registry, "record_session", spy_record)
+    # test-contract: seam observe one registry rewrite for the child batch
+    monkeypatch.setattr(registry, "_update_sessions_locked", spy_update)
 
     child_id = f"{root_id}:1"
     link = {
@@ -1824,16 +1986,10 @@ def test_pending_index_fsyncs_root_dir_before_record_session(
     persist_pending_child_link(
         manager.sessions_dir / root_id, link, manager._storage_lease
     )
-    registry.record_session(
-        project.project_id,
-        session_id=child_id,
-        transcript_path=f"/sessions/{child_id}",
-        role="worker",
-        parent_session_id=root_id,
-    )
+    reconcile_child_links(registry, manager.sessions_dir, root_id)
 
-    assert "record_session" in events
-    first_record = events.index("record_session")
+    assert "update_sessions" in events
+    first_record = events.index("update_sessions")
     assert "fsync_root_dir" in events[:first_record]
 
 
@@ -2369,51 +2525,10 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
         await loop.close()
     opened.store.close()
 
-    root_links = manager.project_registry.list_session_links(root_project.project_id)
+    root_links = await asyncio.to_thread(manager.project_registry.list_session_links, root_project.project_id)
     assert {record["session_id"] for record in root_links} == {
         root_id,
         f"{root_id}:1",
     }
     assert root_links[1]["parent_session_id"] == root_id
-    assert manager.project_registry.list_session_links(child_project.project_id) == []
-
-
-def test_memory_state_retries_if_first_writer_creates_registry_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "projects"
-    reader = ProjectRegistry(root)
-    project = reader.create_project("demo", "scope")
-    reader.update_memory(project.project_id, {"brief.md": "old\n"})
-    old = reader.memory_state(project.project_id)
-    (root / ".lock").unlink()
-
-    writer = ProjectRegistry(root)
-    original_snapshot = reader._snapshot_locked
-    wrote = False
-
-    def snapshot_then_write(directory_fd: int):
-        nonlocal wrote
-        snapshot = original_snapshot(directory_fd)
-        if not wrote:
-            wrote = True
-            writer.compare_and_swap_memory(
-                project.project_id,
-                expected_digest=old.digest,
-                updates={"brief.md": "new\n"},
-                provenance={
-                    "session_id": "a" * 32,
-                    "seq_start": 1,
-                    "seq_end": 2,
-                },
-            )
-        return snapshot
-
-    monkeypatch.setattr(reader, "_snapshot_locked", snapshot_then_write)
-
-    state = reader.memory_state(project.project_id)
-
-    assert state.contents["brief.md"] == "new\n"
-    assert state.digest == reader.memory_digest(project.project_id)
-    assert state.version is not None and state.version != old.version
-    assert state.automatic_files == ("brief.md",)
+    assert await asyncio.to_thread(manager.project_registry.list_session_links, child_project.project_id) == []

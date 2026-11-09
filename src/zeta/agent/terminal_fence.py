@@ -82,3 +82,18 @@ class TerminalTransitionFence:
         return await self._store.idle_nudge_eligible(
             self._persisted_notification_ids()
         )
+
+
+async def persist_confirmed_cancel(
+    fence: TerminalTransitionFence | None,
+    store: ConversationStore,
+    parent_tool_call_id: str,
+) -> bool:
+    """Persist one child cancellation; False when a finish already won."""
+    if fence is not None and not await fence.cancel():
+        transition = await store.terminal_transition()
+        lifecycle = store.agent_lifecycle() or {}
+        if transition != "cancel" or lifecycle.get("state") == "canceled":
+            return False
+    await store.mark_agent_canceled_async(parent_tool_call_id)
+    return True

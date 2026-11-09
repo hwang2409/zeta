@@ -61,8 +61,8 @@ class EntryMemoryViewMixin:
 
     def _entry_memory_state_for_context(self, project_id: str) -> EntryMemorySnapshot:
         """Load format-2 context and best-effort repair its derived mirrors."""
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 snapshot = self._entry_snapshot_locked(directory_fd)
                 self._refresh_entry_memory_mirror(
@@ -76,24 +76,26 @@ class EntryMemoryViewMixin:
 
     def _entry_memory_state(self, project_id: str) -> EntryMemorySnapshot:
         """Read format-2 state through the storage seam."""
-        def read(root_fd: int) -> EntryMemorySnapshot:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> EntryMemorySnapshot:
+            directory_fd = os.dup(project_fd)
             try:
                 return self._entry_snapshot_locked(directory_fd)
             finally:
                 os.close(directory_fd)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
     def memory_format(self, project_id: str) -> int:
         """Return the authoritative format without activating either format."""
-        def read(root_fd: int) -> int:
-            return self._memory_format_locked(root_fd, project_id)
+        def read(project_fd: int) -> int:
+            return self._memory_format_locked(project_fd, project_id)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
-    def _memory_format_locked(self, root_fd: int, project_id: str) -> int:
-        directory_fd = self._project_dir(root_fd, project_id)
+    def _memory_format_locked(self, project_fd: int, project_id: str) -> int:
+        directory_fd = os.dup(project_fd)
         try:
             pointer = self._pointer(directory_fd)
             if pointer is None:
@@ -152,8 +154,8 @@ class EntryMemoryViewMixin:
         if type(limit) is not int or not 1 <= limit <= 10_000:
             raise ProjectRegistryError("invalid memory log limit")
 
-        def read(root_fd: int) -> list[dict[str, object]]:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> list[dict[str, object]]:
+            directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
                 if kind is not None and kind not in {
@@ -221,14 +223,15 @@ class EntryMemoryViewMixin:
             finally:
                 os.close(directory_fd)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
     def _entry_memory_version(
         self, project_id: str, version: str
     ) -> tuple[dict[str, object], EntryMemoryState, EntryMemoryState]:
         """Read one retained receipt and its structured before/after states."""
-        def read(root_fd: int) -> tuple[dict[str, object], EntryMemoryState, EntryMemoryState]:
-            directory_fd = self._project_dir(root_fd, project_id)
+        def read(project_fd: int) -> tuple[dict[str, object], EntryMemoryState, EntryMemoryState]:
+            directory_fd = os.dup(project_fd)
             try:
                 self._entry_snapshot_locked(directory_fd)
                 pointer = self._pointer(directory_fd)
@@ -263,4 +266,5 @@ class EntryMemoryViewMixin:
             finally:
                 os.close(directory_fd)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)

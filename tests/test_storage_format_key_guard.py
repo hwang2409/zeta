@@ -50,7 +50,6 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     ("zeta.tools._validation", "_validate_schema", "tool arguments"),
     ("zeta.tools._validation", "_schema_equal", "tool arguments"),
     ("zeta.tools._validation", "_validate_schema_definition", "tool arguments"),
-    ("zeta.tools.agent_control", "_status", "in-memory value"),
     ("zeta.tools.inbox.__init__", "_validate_action", "tool arguments"),
     ("zeta.tools.todo.__init__", "_todo", "tool arguments"),
 )

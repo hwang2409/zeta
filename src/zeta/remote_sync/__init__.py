@@ -28,6 +28,7 @@ from ..core.session_files import SessionError, SessionInUseError, session_direct
 from ..core.session_metadata import SessionMetadata
 from ..core.store import ConversationStore
 from ..core.transcript_recovery import RepairTarget, validate_recovery_records
+from ..locking import shape_lock
 from ..storage_format import WriterLease, open_writer
 from .errors import RemoteSyncError
 from .memory import (
@@ -375,6 +376,7 @@ def _snapshot_locks(root: Path) -> Iterator[None]:
             if path != root_lock and path.is_file() and not path.is_symlink()
         )
         for lock_path in candidates:
+            stack.enter_context(shape_lock())
             handle = stack.enter_context(lock_path.open("rb"))
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
