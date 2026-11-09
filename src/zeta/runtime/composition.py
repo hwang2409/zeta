@@ -30,6 +30,7 @@ from ..memory.provider import complete_reconciliation
 from ..memory.reconciler import ReconciliationResponse
 from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
+from ..providers.completion import CompletionRetryBudget
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from ..storage_format import open_writer
@@ -95,7 +96,6 @@ def compose_runtime(
     project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
     memory_notice: Callable[[str], None] | None = None,
-    post_stream_provider_retry: bool = True,
     require_selected_account: bool = True,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
@@ -308,7 +308,6 @@ def compose_runtime(
             **loop_kwargs,
         )
         loop.explicit_finish = config.agents_explicit_finish
-        loop.post_stream_provider_retry = post_stream_provider_retry
 
         def prepare_project_context(projection: Any) -> ProjectContext:
             cwd_project = (
@@ -369,7 +368,11 @@ def compose_runtime(
             memory_backend: CompletionBackend | None = None
             memory_backend_lock = asyncio.Lock()
 
-            async def invoke_memory(prompt: str) -> ReconciliationResponse:
+            async def invoke_memory(
+                prompt: str, budget: CompletionRetryBudget | None = None
+            ) -> ReconciliationResponse:
+                if budget is None:
+                    budget = CompletionRetryBudget()
                 nonlocal memory_backend
                 if memory_backend is None:
                     async with memory_backend_lock:
@@ -387,7 +390,7 @@ def compose_runtime(
                                 token_budget=effective_budget,
                             )
                             loop.register_backend_owner(memory_backend)
-                return await complete_reconciliation(memory_backend, prompt)
+                return await complete_reconciliation(memory_backend, prompt, budget)
 
             assert project_registry is not None
             memory_storage_lease = open_writer(home)

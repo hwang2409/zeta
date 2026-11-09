@@ -491,6 +491,8 @@ async def test_fetch_decodes_gzip_response_from_raw_stream(
             "raw response",
         ),
     ],
+    # Stable ids: gzip.compress output bytes differ between Python versions.
+    ids=["gzip", "zlib", "raw-deflate"],
 )
 async def test_fetch_decodes_supported_content_encodings(
     tmp_path: Path,

@@ -45,6 +45,7 @@ from .approval_lifecycle import (
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
 from .protocol import (
+    ApprovalDecision,
     ErrorDescriptor,
     EventDescriptor,
     FrameWriteCancelled,
@@ -149,6 +150,7 @@ class ServeControl:
         *,
         origin: MessageOrigin = MessageOrigin.USER,
         persist_user_message: bool = True,
+        allow_assistant_reset: bool = True,
     ) -> None:
         host_commands = self._active_host_commands
         self._turn_task = asyncio.create_task(
@@ -159,6 +161,7 @@ class ServeControl:
                 persist_user_message=persist_user_message,
                 host_commands=host_commands,
                 turn_id=uuid.uuid4().hex,
+                allow_assistant_reset=allow_assistant_reset,
             )
         )
 
@@ -427,14 +430,14 @@ class ServeControl:
         return self._approvals.cleanup_delegated(child_instance_id)
 
     async def resolve_approval(
-        self, method: str, request_id: str, scope: str = "once"
+        self, method: ApprovalDecision, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         loop = self.server.runtime.loop
         policy = self.server.runtime.policy
         if loop is None or policy is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         result, core_key = await self._approvals.transition(
-            Decide(method, request_id, scope)
+            Decide(ApprovalDecision(method), request_id, scope)
         )
         assert isinstance(result, dict)
         if (
@@ -542,6 +545,7 @@ class ServeControl:
         persist_user_message: bool = True,
         host_commands: SessionHostCommands | None = None,
         turn_id: str,
+        allow_assistant_reset: bool = True,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -566,6 +570,7 @@ class ServeControl:
                 host_instruction=""
                 if host_commands is None
                 else host_commands.instruction,
+                allow_assistant_reset=allow_assistant_reset,
             ):
                 if pending_turn_end is not None:
                     if event.type is StreamEventType.AGENT_END:
