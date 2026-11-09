@@ -65,7 +65,6 @@ def _writer_epoch_violations(path: Path, source: str) -> list[str]:
         is_attribute = (
             isinstance(node, ast.Attribute)
             and node.attr == "WRITER_EPOCH"
-            and isinstance(node.value, ast.Name)
         )
         if (is_name or is_attribute) and not _allowed_writer_default(node, parents, path):
             violations.append(f"{path}:{node.lineno}")
