@@ -202,11 +202,12 @@ async def test_rejoin_after_stale_converges_while_63_children_stay_busy(
             for child in children.values():
                 child.update_agent_lifecycle(current_step=step)
         await _lifecycle_applied(server)
-        # 4. 126 progress callbacks made no pending record, charge, or seq
-        assert replay.is_pending(server._client)
-        assert replay.pending_tail(server._client) == []
-        assert scope not in replay._scopes
-        assert replay._next_sequences[server._client] == 1
+        held = (
+            replay.is_pending(server._client),
+            len(replay.pending_tail(server._client)),
+            scope in replay._scopes,
+            replay._next_sequences.get(server._client),
+        )
         release.set()
         # producers keep changing after the read returns, before admission
         for child in children.values():
@@ -214,7 +215,9 @@ async def test_rejoin_after_stale_converges_while_63_children_stay_busy(
         joined = await client.response(4)
 
         # 5. the response carries the latest revision of each active run in its page
-        assert "error" not in joined, joined
+        assert joined.get("error") is None, "the rejoin did not converge"
+        # 4. 126 progress callbacks made no pending record, charge, or seq
+        assert held == (True, 0, False, 1)
         stream_id = joined["result"]["replay"]["stream_id"]
         messages = joined["result"]["messages"]
         starts = [row["run_id"] for row in messages if row.get("event") == "child_started"]
@@ -276,21 +279,23 @@ async def test_progress_between_snapshot_and_response_write_is_next_live_seq(
         child.update_agent_lifecycle(current_step="r+1")
         await _lifecycle_applied(server)
         release_write.set()
+        response = await client.read()
+        assert response.get("id") == 3, f"an event preceded the join response: {response}"
+        # the connection serves its next request only after the join call returned
+        assert "error" not in await client.request(4, "status", {})
         child.update_agent_lifecycle(current_step="r+2")
         await _lifecycle_applied(server)
 
-        response = await client.read()
-        assert response.get("id") == 3, f"an event preceded the join response: {response}"
         stream_id = response["result"]["replay"]["stream_id"]
         baseline = [row for row in response["result"]["messages"] if row.get("event") == "child_progress"]
         assert [(row["run_id"], row["revision"]) for row in baseline] == [(run_id, revision)]
         rows: dict[str, tuple[int, dict[str, Any]]] = {}
         _reduce(rows, baseline[0])
         first = (await client.read())["params"]
-        second = (await client.read())["params"]
         assert (first["event"], first["stream_id"], first["seq"], first["revision"]) == (
             "child_progress", stream_id, 1, revision + 1,
         ), "progress after the snapshot was not the next live seq"
+        second = (await client.read())["params"]
         assert (second["event"], second["stream_id"], second["seq"], second["revision"]) == (
             "child_progress", stream_id, 2, revision + 2,
         )
