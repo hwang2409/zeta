@@ -16,12 +16,14 @@ import pytest
 
 from tests.support.notification_fixtures import notification_payloads
 from zeta import storage_format
-from zeta.core import agent_state
+from zeta.core import agent_state, transcript_recovery
+from zeta.core.session_files import session_directory
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationEntry,
     ConversationIntegrityError,
     ConversationStore,
+    TranscriptLoadError,
     _async_writes,
 )
 from zeta.core.store._step_delivery import PromptInput
@@ -78,6 +80,36 @@ def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
         assert [row["data"]["message"] for row in rows] == ["0", "1", "2"]
     finally:
         reopened.close()
+
+
+def test_history_index_rejects_a_repaired_transcript_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, session_id="history-repair")
+    store.append_many([("warning", {"message": "retained"})])
+    facts = store._history_index_facts()
+    store.close()
+    transcript = root / "history-repair" / "conversation.jsonl"
+    transcript.write_bytes(transcript.read_bytes() + b'{"seq":"invalid"}\\n')
+    with pytest.raises(TranscriptLoadError) as raised:
+        refused = ConversationStore(root, session_id="history-repair", _read_only=True)
+        refused.close()
+    source_facts = raised.value._source_facts
+    with session_directory(root, "history-repair") as (_, directory_fd):
+        transcript_recovery.repair_transcript(
+            directory_fd,
+            transcript_recovery.RepairTarget("history-repair"),
+            source_facts,
+            strict_reopen=lambda: None,
+            memory_review_required=False,
+        )
+    repaired = ConversationStore(root, session_id="history-repair")
+    try:
+        assert repaired._history_index is not None
+        with pytest.raises(RuntimeError) as raised:
+            repaired._history_index.page({"after": 0}, facts)
+        assert raised.value.__class__.__name__ == "StaleHistorySnapshot"
+    finally:
+        repaired.close()
 
 
 def test_history_index_close_waits_for_an_inflight_page(

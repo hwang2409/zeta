@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path as _socket_path
@@ -157,12 +158,13 @@ async def test_real_socket_branch_during_read_is_stale_and_not_cached(
         pending = asyncio.create_task(
             request(reader, writer, 4, "session_history", {"session_id": session_id, "offset": 0})
         )
-        await asyncio.to_thread(branch_ready.wait)
+        await await_or_fail(asyncio.to_thread(branch_ready.wait), what="history projection")
         server.runtime.opened.store.append_message_fork(
             server.runtime.opened.store.active_branch_snapshot()[0].id
         )
         release_projection.set()
-        response = (await pending)[-1]
+        response = (await await_or_fail(pending, what="history request"))[-1]
+        assert "error" in response, response
         assert response["error"]["code"] == -32009
         assert response["error"]["data"] == {"code": "stale_history_snapshot"}
         fresh = await _history_request(reader, writer, 5, session_id, {"offset": 0})
