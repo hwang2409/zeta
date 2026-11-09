@@ -325,6 +325,8 @@ class ApprovalAbortPolicy(Protocol):
 
     def set_display_label(self, request_id: str, label: str) -> None: ...
 
+    def forget_display_label(self, request_id: str) -> None: ...
+
     def consume_execution_binding(self, execution_token: str) -> ApprovedExecution | None: ...
 
     def cleanup_execution_binding(self, execution_token: str) -> None: ...
@@ -430,16 +432,14 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 resolved = True
             except (KeyError, TypeError, ValueError):
                 resolved = False
-        return ApprovalRequest(
-            request_id,
-            tool_call,
-            label=self._display_labels.get(request_id),
-            action=action,
-            capability_resolved=resolved,
-        )
+        label = self._display_labels.get(request_id)
+        return ApprovalRequest(request_id, tool_call, label=label, action=action, capability_resolved=resolved)
 
     def set_display_label(self, request_id: str, label: str) -> None:
         self._display_labels[request_id] = label
+
+    def forget_display_label(self, request_id: str) -> None:
+        self._display_labels.pop(request_id, None)
 
     def bind_capability_resolver(
         self, resolver: Callable[[ToolCall], ApprovalCapability]
@@ -1023,12 +1023,8 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
             return None
         if self.decide(capability) is ApprovalDecision.ASK:
-            return ApprovalRequest(
-                tool_call.id,
-                tool_call,
-                label=self._display_labels.get(tool_call.id),
-                action=capability.action,
-            )
+            label = self._display_labels.get(tool_call.id)
+            return ApprovalRequest(tool_call.id, tool_call, label=label, action=capability.action)
         return None
 
     async def authorize(

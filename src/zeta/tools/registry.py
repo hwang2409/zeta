@@ -5,7 +5,6 @@ also include ``full_size_chars`` for their readable-text character length.
 """
 from __future__ import annotations
 
-import asyncio
 import copy
 import importlib
 import inspect
@@ -37,12 +36,10 @@ from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
 from ..media.image_policy import ANTHROPIC_IMAGE_POLICY, ImagePolicy
 from ..protocol.types import (
-    Message,
     StructuredToolResult,
     ToolCall,
     ToolResult,
     ToolSchema,
-    ToolUseContent,
 )
 from ..runtime.execution import (
     ToolExecutionContext,
@@ -73,6 +70,7 @@ from ._action_metadata import (
 from ._action_metadata import (
     resolve_approval_rule as resolve_registered_approval_rule,
 )
+from ._call_preparation import _CallPreparationMixin
 from ._live_config import _LiveConfigRegistryMixin
 from ._results import (
     _apply_error_governance,
@@ -198,7 +196,7 @@ def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
 
 
-class ToolRegistry(_LiveConfigRegistryMixin):
+class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
     """One provider-neutral registry for built-in and custom tools."""
     def __init__(
         self,
@@ -255,7 +253,6 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         # rediscover it through ambient ZETA_HOME.
         self.project_registry = project_registry
         self.project_registry_state: ProjectRegistryState | None = None
-        self._approval_labels: dict[str, str] = {}
         self.inbox_enabled = inbox_enabled
         self.inbox_target_ids: frozenset[str] | None = None
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
@@ -879,69 +876,6 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             policy.bind_rule_resolver(self.resolve_approval_rule)
             policy.bind_capability_resolver(self.resolve_tool_call_capability)
 
-    async def prepare_tool_calls(
-        self, assistant_message: Message
-    ) -> tuple[Message, list[ToolCall], set[str]]:
-        calls = [
-            block.tool_call
-            for block in assistant_message.content
-            if isinstance(block, ToolUseContent)
-        ]
-        prepared_calls: list[ToolCall] = []
-        preparation_errors: set[str] = set()
-        for tool_call in calls:
-            try:
-                prepared = await self.prepare_tool_call(tool_call)
-            except (KeyError, TypeError, ValueError):
-                prepared = tool_call
-                preparation_errors.add(tool_call.id)
-            prepared_calls.append(prepared)
-        if prepared_calls != calls:
-            prepared_by_id = {call.id: call for call in prepared_calls}
-            assistant_message = replace(
-                assistant_message,
-                content=[
-                    ToolUseContent(prepared_by_id[block.tool_call.id])
-                    if isinstance(block, ToolUseContent)
-                    else block
-                    for block in assistant_message.content
-                ],
-            )
-        return assistant_message, prepared_calls, preparation_errors
-
-    async def prepare_tool_call(self, tool_call: ToolCall) -> ToolCall:
-        """Prepare one call before approval, persistence, and execution."""
-        definition = self._tools.get(tool_call.name)
-        if definition is None:
-            return tool_call
-        if definition.call_preparer is None:
-            return tool_call
-        if self.approval_policy is not None:
-            await self.approval_policy.prepare_rules(self._prepare_approval_rule)
-        prepared = await definition.call_preparer(tool_call)
-        if (
-            tool_call.name == "inbox"
-            and tool_call.arguments.get("action") == "send"
-            and isinstance(tool_call.arguments.get("project"), str)
-            and prepared.arguments.get("project") != tool_call.arguments["project"]
-        ):
-            self._approval_labels[tool_call.id] = (
-                f"{tool_call.arguments['project']} ({prepared.arguments['project']})"
-            )
-        return prepared
-
-    async def _prepare_approval_rule(self, rule: ApprovalRule) -> ApprovalRule:
-        resolved = self.resolve_approval_rule(rule)
-        subject = resolved.subject_pattern
-        if resolved.tool != "inbox" or resolved.action != "send" or not isinstance(subject, str):
-            return resolved
-        from ..project_registry import resolve_project_ref
-        from ..project_schema import PROJECT_ID_PATTERN
-        if PROJECT_ID_PATTERN.fullmatch(subject) or self.project_registry is None:
-            return resolved
-        project_id = await asyncio.to_thread(resolve_project_ref, self.project_registry, subject)
-        return resolved if project_id is None else replace(resolved, subject_pattern=project_id)
-
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
             return None
@@ -965,9 +899,6 @@ class ToolRegistry(_LiveConfigRegistryMixin):
             except (AttributeError, KeyError, TypeError, ValueError):
                 self.abort_approval(tool_call)
                 return None
-        label = self._approval_labels.get(tool_call.id)
-        if label is not None:
-            self.approval_policy.set_display_label(tool_call.id, label)
         return self.approval_policy.prepare(
             tool_call,
             capability=capability,
@@ -1143,6 +1074,7 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         finally:
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
+            self.forget_approval_labels((tool_call,))
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
@@ -1214,6 +1146,7 @@ class ToolRegistry(_LiveConfigRegistryMixin):
         """Abort an unresolved approval without replacing a concurrent decision."""
         if self.approval_policy is None:
             return None
+        self.approval_policy.forget_display_label(tool_call.id)
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
         except (KeyError, UnknownToolAction, InvalidActionArguments, TypeError, ValueError):

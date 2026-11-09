@@ -39,6 +39,7 @@ class TurnPersistenceMixin:
         slots: Sequence[ToolResult | None],
     ) -> list[ToolResult]:
         results = finalize_agent_results(self, calls, slots)
+        self.tool_registry.forget_approval_labels(calls)
         for removed, fallback in self.tool_registry.take_cwd_recovery_notices():
             self.store.append_message(
                 harness_notice(
