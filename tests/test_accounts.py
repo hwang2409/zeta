@@ -30,7 +30,7 @@ import zeta.oauth as oauth_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.login as provider_login_module
 import zeta.server.login as server_login
-from tests.support.account_homes import build_account_home
+from tests.support.account_homes import build_account_home, home_snapshot
 from tests.support.account_processes import (
     crash_logout,
     hold_account_credential_lock,
@@ -49,6 +49,7 @@ from zeta.accounts import (
     AccountStore,
     SessionAccountContext,
 )
+from zeta.accounts.login import login_named_account
 from zeta.agent.runner import resolve_child_backend
 from zeta.core.login_flow import LoginPublicationError
 from zeta.core.session import SessionManager, account_home
@@ -808,9 +809,10 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
 
     async def ticker() -> None:
         nonlocal ticks
-        while not stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0)
 
     ticker_task = asyncio.create_task(ticker())
     try:
@@ -1149,6 +1151,7 @@ def test_migration_happy_path_anthropic(tmp_path: Path) -> None:
 def test_migration_bounds_refused_directory_warnings(tmp_path: Path) -> None:
     # a long home path (as on CI runners) must not hide the account name
     home = initialize_storage_home(tmp_path / ("h" * 150))
+    _write_empty_registry(home)
     provider_root = home / "accounts" / "codex"
     provider_root.mkdir(parents=True)
     for index in range(20):
@@ -1309,7 +1312,7 @@ def test_migration_is_noop_when_already_migrated(tmp_path: Path) -> None:
     )
 
 
-def test_migration_does_not_delete_legacy_file_newer_than_migrated_copy(
+def test_migration_does_not_lose_a_legacy_login_that_expires_later_than_migrated_copy(
     tmp_path: Path,
 ) -> None:
     _write_legacy(tmp_path, "codex")
@@ -1320,13 +1323,49 @@ def test_migration_does_not_delete_legacy_file_newer_than_migrated_copy(
     newer = OAuthTokens("newer-access", "newer-refresh", 10_000_000_000.0)
     legacy = tmp_path / "codex-oauth.json"
     legacy.write_text(json.dumps(newer.to_dict()))
-    newer_mtime = destination_mtime + 1_000_000_000
-    os.utime(legacy, ns=(newer_mtime, newer_mtime))
+    # a restored copy: the newer login carries the older mtime
+    older_mtime = destination_mtime - 1_000_000_000
+    os.utime(legacy, ns=(older_mtime, older_mtime))
 
     store.migrate()
 
     assert json.loads(destination.read_text()) == newer.to_dict()
     assert not legacy.exists()
+
+
+# in-process: a headless start would try a network refresh of the 0-expiry account token
+@pytest.mark.parametrize("registry", [False, True], ids=("registry-missing", "registry-loaded"))
+@pytest.mark.parametrize("legacy_mtime_newer", [False, True], ids=("account-mtime-newer", "legacy-mtime-newer"))
+def test_migration_keeps_both_logins_when_the_account_file_has_no_expiry(
+    tmp_path: Path, legacy_mtime_newer: bool, registry: bool
+) -> None:
+    account = AccountId("codex", "default")
+    store = build_account_home(tmp_path, (account,), available=(account,), defaults=(account,))
+    registry_bytes = store.registry.read_bytes()
+    if not registry:
+        store.registry.unlink()
+    destination = store.credential_path(account)
+    destination.write_text(json.dumps({"access_token": "old-access", "refresh_token": "old-refresh"}))
+    legacy = tmp_path / "codex-oauth.json"
+    legacy.write_text(json.dumps(OAuthTokens("new-access", "new-refresh", 9.5e9).to_dict()))
+    newer, older = 1_700_000_001_000_000_000, 1_700_000_000_000_000_000
+    os.utime(legacy, ns=(newer, newer) if legacy_mtime_newer else (older, older))
+    os.utime(destination, ns=(older, older) if legacy_mtime_newer else (newer, newer))
+    account_bytes, legacy_bytes = destination.read_bytes(), legacy.read_bytes()
+
+    warnings = AccountStore(tmp_path).migrate()
+
+    assert destination.read_bytes() == account_bytes
+    assert legacy.read_bytes() == legacy_bytes
+    warning = (
+        f"kept {destination} and {legacy}: could not tell which login is newer; "
+        "delete the one you do not want, then restart zeta"
+    )
+    assert [w for w in warnings if "could not tell which login is newer" in w] == [warning]
+    if registry:
+        assert store.registry.read_bytes() == registry_bytes
+    else:
+        assert not store.registry.exists()
 
 
 def test_account_files_are_0600_and_dirs_are_private(tmp_path: Path) -> None:
@@ -2489,8 +2528,16 @@ def test_logout_crash_partway_through_cleanup_is_swept(tmp_path: Path) -> None:
     assert not (tmp_path / "account-locks" / account.provider / account.name).exists()
 
 
+def _write_empty_registry(home: Path) -> None:
+    (home / "accounts.json").write_text(
+        json.dumps({"version": 1, "accounts": {}, "defaults": {}, "labels": {}})
+        + "\n"
+    )
+
+
 def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
     initialize_storage_home(tmp_path)
+    _write_empty_registry(tmp_path)
     path = tmp_path / "accounts" / "codex" / ".logout-deadbeef" / "oauth.json"
     path.parent.mkdir(parents=True)
     os.chmod(path.parent, 0o700)
@@ -2499,6 +2546,164 @@ def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
     AccountStore(tmp_path).migrate()
 
     assert not path.parent.exists()
+
+
+_MISSING_REGISTRY_REFUSAL = (
+    "accounts.json is missing but other account directories exist; "
+    "restore accounts.json before adding an account"
+)
+_BROKEN_REGISTRY_REFUSAL = (
+    "accounts.json is unreadable; kept it and every account directory; "
+    "repair or restore accounts.json, then restart zeta"
+)
+_REGISTRY_REFUSALS = {
+    "missing": _MISSING_REGISTRY_REFUSAL,
+    "broken": _BROKEN_REGISTRY_REFUSAL,
+}
+
+
+def _unload_registry(home: Path, state: str) -> None:
+    if state == "missing":
+        (home / "accounts.json").unlink()
+    else:
+        (home / "accounts.json").write_bytes(b"{")
+
+
+@pytest.mark.parametrize("registry_state", ["missing", "broken"])
+@pytest.mark.parametrize("step", ["before_browser", "at_publish"])
+def test_refused_login_leaves_the_home_byte_for_byte_unchanged(
+    tmp_path: Path, step: str, registry_state: str
+) -> None:
+    existing = AccountId("codex", "work")
+    refused = AccountId("anthropic", "default")
+    build_account_home(tmp_path, (existing,), available=(existing,))
+    registry = (tmp_path / "accounts.json").read_bytes()
+    _unload_registry(tmp_path, registry_state)
+    store = AccountStore(tmp_path)
+    # Create every lock file the login opens first, so the snapshot holds them
+    # and any later file, directory, or lock content change is a failure.
+    store.migrate()
+    with store.provider_login_lock(refused.provider):
+        pass
+    with store.credential_guard(refused):
+        pass
+    files_before, directories_before = home_snapshot(tmp_path)
+    flows: list[str] = []
+
+    async def browser_login(provider, _pkce) -> None:
+        flows.append(provider.name)
+        await asyncio.to_thread(provider.credential_store.save, tokens())
+
+    with pytest.raises(AccountError) as refusal:
+        if step == "before_browser":
+            login_named_account(
+                tmp_path, refused.provider, refused.name, login=browser_login
+            )
+        else:
+            named_account_credentials(tmp_path, refused.provider, refused.name).save(
+                tokens()
+            )
+
+    files_after, directories_after = home_snapshot(tmp_path)
+    assert files_after == files_before
+    assert directories_after == directories_before
+    assert flows == []
+    assert str(refusal.value) == _REGISTRY_REFUSALS[registry_state]
+    (tmp_path / "accounts.json").write_bytes(registry)
+    store.migrate()
+    store.resolve_account(refused.provider)
+    assert not store.contains(refused)
+    assert store.contains(existing)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_state", ["missing", "broken"])
+async def test_tui_accounts_login_renders_the_registry_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registry_state: str
+) -> None:
+    home = tmp_path / "home"
+    existing = AccountId("codex", "work")
+    await asyncio.to_thread(
+        build_account_home, home, (existing,), available=(existing,)
+    )
+    flows: list[str] = []
+
+    def build_url(state: str, challenge: str, redirect: str) -> str:
+        flows.append(redirect)
+        raise OSError("browser flow started")
+
+    monkeypatch.setattr(
+        provider_login_module, "build_anthropic_authorization_url", build_url
+    )
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    # The session account resolves first; the registry breaks while it runs.
+    await asyncio.to_thread(_unload_registry, home, registry_state)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    running = asyncio.get_running_loop()
+    login_rendered = asyncio.Event()
+
+    class Output(StringIO):
+        def write(self, text: str) -> int:
+            written = super().write(text)
+            if "login failed" in self.getvalue():
+                running.call_soon_threadsafe(login_rendered.set)
+            return written
+
+    output = Output()
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=output, force_terminal=False, width=240),
+    )
+
+    try:
+        app._submissions.wake()
+        app._submissions.submit("/accounts login anthropic new", steer=False)
+        await asyncio.wait_for(login_rendered.wait(), 10)
+
+        rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
+        assert f"login failed: {_REGISTRY_REFUSALS[registry_state]}" in rendered
+        assert flows == []
+        assert not (home / "accounts" / "anthropic").exists()
+    finally:
+        await app._submissions.close()
+        await app.close()
+        opened.store.close()
+
+
+def test_cli_login_with_unreadable_registry_is_refused_before_the_browser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    existing = AccountId("codex", "work")
+    build_account_home(home, (existing,), available=(existing,))
+    _unload_registry(home, "broken")
+    accounts_before = home_snapshot(home / "accounts")
+    flows: list[str] = []
+
+    async def browser_login(provider, _pkce) -> None:
+        flows.append(provider.name)
+
+    monkeypatch.setattr(cli_main, "run_login", browser_login)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+
+    assert cli_main.main(["login", "codex", "--account", "new"]) == 1
+
+    assert flows == []
+    assert capsys.readouterr().err == f"login failed: {_BROKEN_REGISTRY_REFUSAL}\n"
+    assert home_snapshot(home / "accounts") == accounts_before
+    assert (home / "accounts.json").read_bytes() == b"{"
 
 
 def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> None:

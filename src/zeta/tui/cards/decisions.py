@@ -16,12 +16,15 @@ from collections.abc import Sequence
 from prompt_toolkit.utils import get_cwidth
 
 from ...attention_decisions import DecisionItem
+from ...attention_records import Broken
 from .. import overlay, theme
 from .shared import wrap_by_cells
 
 # The popup settles near, but not beyond, the shared overlay cap so the text
 # screenshots stay stable regardless of the live terminal size.
 CONTENT_WIDTH = 68
+# A long custom answer is cut in the row; the staged reply keeps the full text.
+_STAGED_REPLY_WIDTH = 16
 
 Fragment = tuple[str, str]
 FragmentLine = list[Fragment]
@@ -70,14 +73,19 @@ class DecisionsPanel:
 
     def __init__(self) -> None:
         self._items: tuple[DecisionItem, ...] = ()
+        self._staged: dict[str, str] = {}
         self._selected_id: str | None = None
         self._mode: str = "list"
         self._answer: str = ""
 
     # -- snapshot ingestion -------------------------------------------------
 
-    def set_items(self, items: Sequence[DecisionItem]) -> None:
+    def set_items(
+        self, items: Sequence[DecisionItem], staged: dict[str, str] | None = None
+    ) -> None:
+        """Show ``items``; ``staged`` maps an item id to its staged reply."""
         self._items = tuple(items)
+        self._staged = dict(staged or {})
         ids = [item.record.id for item in self._items]
         if self._selected_id not in ids:
             self._selected_id = ids[0] if ids else None
@@ -115,14 +123,19 @@ class DecisionsPanel:
         """Return the 1-based offered option for the selection, or ``None``."""
 
         item = self.selected
-        if item is None or number < 1 or number > len(item.record.options):
+        if (
+            item is None
+            or isinstance(item.record, Broken)
+            or number < 1
+            or number > len(item.record.options)
+        ):
             return None
         return item.record.options[number - 1]
 
     # -- answer field -------------------------------------------------------
 
     def enter_answer(self) -> bool:
-        if self.selected is None:
+        if self.selected is None or isinstance(self.selected.record, Broken):
             return False
         self._mode = "answer"
         self._answer = ""
@@ -153,7 +166,11 @@ class DecisionsPanel:
         selection = self.selected
         if selection is not None:
             lines.extend(self._detail(selection))
-        if selection is not None and selection.record.kind != "decision":
+        if (
+            selection is not None
+            and not isinstance(selection.record, Broken)
+            and selection.record.kind != "decision"
+        ):
             lines.append(overlay.hint("d dismiss"))
         if self._mode == "answer":
             lines.append(self._answer_line())
@@ -162,22 +179,38 @@ class DecisionsPanel:
 
     def _list_row(self, item: DecisionItem) -> FragmentLine:
         selected = item.record.id == self._selected_id
-        label = f"{item.record.kind} · {item.project_name} · {item.session_id[:8]}"
+        if isinstance(item.record, Broken):
+            label = f"broken · {item.record.id}"
+            title = f"{item.record.path}: {item.record.reason}"
+            return overlay.row([(theme.ERROR, title)], selected=selected)
+        staged = self._staged.get(item.record.id)
+        if staged is not None and _cells(staged) > _STAGED_REPLY_WIDTH:
+            staged = _truncate_text(staged, _STAGED_REPLY_WIDTH)
+        staged_label = "" if staged is None else f"staged: {staged} · "
+        tail = f"{item.project_name} · {item.session_id[:8]}"
+        label = f"{item.record.kind} · {staged_label}{tail}"
         title = item.record.title
-        available = CONTENT_WIDTH - len(label) - 4
+        available = CONTENT_WIDTH - _cells(label) - 4
         if _cells(title) > available:
             title = _truncate_text(title, available)
         label_style = theme.ACCENT if item.record.kind == "decision" else theme.DIM
-        return overlay.row(
-            [
-                (theme.BODY, title),
-                (label_style, f"  {label}"),
-            ],
-            selected=selected,
-        )
+        fragments = [(theme.BODY, title), (label_style, f"  {item.record.kind} · ")]
+        if staged_label:
+            fragments.append((theme.SUCCESS, staged_label))
+        fragments.append((label_style, tail))
+        return overlay.row(fragments, selected=selected)
 
     def _detail(self, item: DecisionItem) -> list[FragmentLine]:
         width = CONTENT_WIDTH - 2
+        if isinstance(item.record, Broken):
+            return [
+                overlay.blank(),
+                *_labelled_text("State", "broken attention record", width, theme.ERROR),
+                *_labelled_text("Id", item.record.id, width, theme.DIM),
+                *_labelled_text("Path", item.record.path, width, theme.DIM),
+                *_labelled_text("Reason", item.record.reason, width, theme.ERROR),
+                overlay.rule(),
+            ]
         lines: list[FragmentLine] = [overlay.blank()]
         lines.extend(
             _labelled_text(

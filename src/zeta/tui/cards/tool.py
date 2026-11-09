@@ -7,7 +7,7 @@ from collections.abc import Callable
 from difflib import unified_diff
 from typing import Any
 
-from rich.console import Group, RenderableType
+from rich.console import ConsoleOptions, Group, RenderableType
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -15,6 +15,7 @@ from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
 from .. import theme
 from .base import (
     header_with_status,
+    safe_text,
     strip_terminal_controls,
     tool_body,
     tool_card,
@@ -25,6 +26,7 @@ from .base import (
 from .shared import (
     MAX_CARD_COLUMNS,
     MAX_CARD_LINES,
+    hard_wrap_by_cells,
     infer_language,
 )
 
@@ -451,6 +453,66 @@ def todo_tool_card(event: StreamEvent, running: bool) -> RenderableType:
         else None
     )
     return tool_panel(call, body, header=header)
+
+
+class _BoundedDetail:
+    def __init__(self, fields: list[tuple[str, str]]) -> None:
+        self.fields = fields
+
+    def __rich_console__(self, _console: Any, options: ConsoleOptions):
+        width = max(1, options.max_width)
+        rendered: list[str] = []
+        for label, value in self.fields:
+            prefix = f"{label}: " if label else ""
+            lines = hard_wrap_by_cells(value, max(1, width - len(prefix)))
+            lines = lines or [""]
+            visible = lines[:MAX_CARD_LINES]
+            rendered.append(prefix + visible[0])
+            rendered.extend(" " * len(prefix) + line for line in visible[1:])
+            omitted = len(lines) - len(visible)
+            if omitted:
+                rendered.append(f"… +{omitted} lines")
+        yield safe_text("\n".join(rendered), style=theme.BODY, wrap=False)
+
+
+def _wrapped_detail_card(
+    call: ToolCall,
+    fields: list[tuple[str, str]],
+    *,
+    header: RenderableType | None = None,
+) -> RenderableType:
+    return tool_panel(call, Group(_BoundedDetail(fields)), header=header)
+
+
+@register_tool_card("finish")
+def finish_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None or running or event.tool_result is None:
+        return tool_card(event, running=running)
+    structured = event.tool_result.structured_content
+    if not isinstance(structured, dict):
+        return tool_card(event)
+    fields = [
+        (key, value)
+        for key in ("status", "summary", "verdict", "head_sha")
+        if isinstance(value := structured.get(key), str)
+    ]
+    if not fields:
+        return tool_card(event)
+    return _wrapped_detail_card(call, fields)
+
+
+@register_tool_card("agent_handoff")
+def agent_handoff_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None or running or event.tool_result is None:
+        return tool_card(event, running=running)
+    detail = tool_content(event)
+    if not detail:
+        return tool_card(event)
+    return _wrapped_detail_card(call, [("", detail)])
+
+
 
 
 @register_tool_card("skill")
