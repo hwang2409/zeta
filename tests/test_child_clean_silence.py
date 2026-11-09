@@ -277,6 +277,11 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             what=f"parent starts {ending} child",
         )
         handle = next(iter(store.agent_children()))
+        flow = (
+            loop._background_owner.conversation_channel._delivery_targets[handle].flow
+            if ending == "low_capacity"
+            else None
+        )
         await await_or_fail(child_backend.work_started.wait(), what="live child work")
         if ending != "non_explicit":
             await await_or_fail(initial_idle.wait(), what="child initial idle")
@@ -321,9 +326,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             if ending == "thinking_only":
                 assert child_backend.notification_called.is_set()
             else:
-                flow = loop._background_owner.conversation_channel._delivery_targets[
-                    handle
-                ].flow
+                assert flow is not None
                 assert flow._low_capacity_notifications is True
         rows = _read_agent_status(
             store,
