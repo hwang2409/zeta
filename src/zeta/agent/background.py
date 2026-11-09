@@ -253,6 +253,13 @@ class BackgroundAgentOwner:
 
         self._stores.append(store)
 
+    def finish_store(self, instance_id: str, store: ConversationStore) -> None:
+        """Schedule a finished child store while its watcher remains owned."""
+
+        self._active_stores.pop(instance_id, None)
+        self.mark_store_finished(store)
+        self.release_unused_stores()
+
     def mark_store_finished(self, store: ConversationStore) -> None:
         self._pending_stores.add(store)
 

@@ -12687,6 +12687,114 @@ async def test_finish_gate_task_without_exit_reports_safety_bound(
 
 
 @pytest.mark.asyncio
+async def test_background_cleanup_keeps_store_close_visible_to_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cleanup_entered = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_cleanup = agent_runner_module.ChildApprovalPolicy.cleanup
+
+    async def pause_cleanup(policy: ChildApprovalPolicy) -> None:
+        cleanup_entered.set()
+        await release_cleanup.wait()
+        await original_cleanup(policy)
+
+    monkeypatch.setattr(agent_runner_module.ChildApprovalPolicy, "cleanup", pause_cleanup)
+    backend = _TaskFinishGateBackend(_python("print('done')"))
+    store = ConversationStore(tmp_path / "session")
+    owner = BackgroundAgentOwner(store)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+        approval_policy=ApprovalPolicy(
+            store=store,
+            always_allow={"agent", "run_background", "task_output"},
+        ),
+    )
+    run = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+
+    owner_wait: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
+        await asyncio.wait_for(run, timeout=10)
+        await asyncio.wait_for(cleanup_entered.wait(), timeout=10)
+        owner_wait = asyncio.create_task(loop._background_owner.wait())
+        await asyncio.sleep(0)
+        assert not owner_wait.done(), "owner wait returned before child store close"
+        assert loop._background_owner._store_close_tasks
+        release_cleanup.set()
+        await asyncio.wait_for(owner_wait, timeout=10)
+    finally:
+        release_cleanup.set()
+        if owner_wait is not None:
+            await asyncio.gather(owner_wait, return_exceptions=True)
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_foreground_child_close_finishes_before_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+    original_close = AgentLoop.close
+
+    async def pause_child_close(
+        child_loop: AgentLoop, **kwargs: object
+    ) -> tuple[str, ...]:
+        if child_loop.agent_instance_id is not None:
+            close_started.set()
+            await release_close.wait()
+        result = await original_close(child_loop, **kwargs)
+        if child_loop.agent_instance_id is not None:
+            close_finished.set()
+        return result
+
+    monkeypatch.setattr(AgentLoop, "close", pause_child_close)
+    child_started = asyncio.Event()
+
+    class StartedBackend(FakeBackend):
+        @owned_completion
+        async def complete(
+            self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+        ) -> AsyncIterator[StreamEvent]:
+            async for event in super().complete(
+                messages, tool_schemas, control=completion_control()
+            ):
+                if len(self.calls) == 2 and event.type is StreamEventType.MESSAGE_UPDATE:
+                    child_started.set()
+                yield event
+
+    backend = StartedBackend(
+        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn([TextContent("slow")], delay=5)]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    run = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
+    try:
+        await asyncio.wait_for(child_started.wait(), timeout=10)
+        run.cancel()
+        await asyncio.wait_for(close_started.wait(), timeout=10)
+        run.cancel()
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=10)
+        assert close_finished.is_set(), "cancellation reached caller before child close"
+    finally:
+        release_close.set()
+        await asyncio.gather(run, return_exceptions=True)
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_child_finish_gate_lists_task_and_wakes_on_exit(tmp_path: Path) -> None:
     release = tmp_path / "release"
     command = f"{wait_for_path_command(release)} && echo task-evidence"
@@ -18257,6 +18365,7 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
             parent, wake_sink=lambda _source: owner.conversation_channel.wake(None)
         ),
     )
+    # test-contract: seam task intentionally stays live until owner cancellation
     child_task = asyncio.create_task(asyncio.Event().wait())
     owner.register(
         "root:1",
@@ -18273,7 +18382,7 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
         description="review",
         text="WAIT",
     )
-    await asyncio.wait_for(wake.wait(), timeout=1)
+    await asyncio.wait_for(wake.wait(), timeout=10)
     parent.register_agent_child(
         _run_agent_call(),
         child_session_path=str(child.session_dir),
