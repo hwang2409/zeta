@@ -514,28 +514,6 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
     return requested
 
 
-LOADED_SESSION_MUTATIONS = frozenset(
-    {
-        "abort",
-        "approve",
-        "clear_steering",
-        "deny",
-        "fork_message",
-        "rename_session",
-        "repair_transcript",
-        "revoke_session_grants",
-        "send",
-        "send_images",
-        "set_compaction",
-        "set_settings",
-        "set_turn_context",
-        "slash_run",
-        "steer",
-        "switch_branch",
-    }
-)
-
-
 def protocol_error(descriptor: MethodDescriptor) -> ProtocolError:
     message = {
         **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),

@@ -137,10 +137,6 @@ async def test_every_observer_request_has_transport_parity(
             "hello",
             {"protocol_version": "1.2", "features": features},
         )
-        created = await controller.request(
-            "controller-new-session", "new_session", {"provider": "codex"}
-        )
-        session_id = created["result"]["session"]["session_id"]
         observer = await contract.connect("observer")
         await observer.request(
             "observer-hello",
@@ -151,6 +147,21 @@ async def test_every_observer_request_has_transport_parity(
                 "features": features,
             },
         )
+        idle_status = await observer.request("observer-idle-status", "status")
+        assert idle_status["result"] == {
+            "session": None,
+            "state": "idle",
+            "explicit_finish": False,
+            "max_agent_depth": 3,
+            "pending_approvals": [],
+            "usage": {},
+            "compaction_markers": 0,
+            "project_context_health": "healthy",
+        }
+        created = await controller.request(
+            "controller-new-session", "new_session", {"provider": "codex"}
+        )
+        session_id = created["result"]["session"]["session_id"]
 
         listing = await observer.request("observer-list", "list_sessions")
         controller_listing = await controller.request(

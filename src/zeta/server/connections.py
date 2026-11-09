@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from . import content
-from .handlers import history, lifecycle, session, settings, validation
+from .handlers import history, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -21,20 +21,6 @@ from .protocol import (
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
-OBSERVER_REQUESTS = frozenset(
-    {
-        "list_sessions",
-        "status",
-        "session_tree",
-        "session_history",
-        "content_read",
-        "model_catalog",
-        "session_settings",
-        "ping",
-        "delivery_status",
-        "session_grants",
-    }
-)
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
@@ -829,14 +815,6 @@ class ConnectionRegistry:
             session_id=session_id,
         )
 
-    async def run_observer_read(
-        self, connection: Any, callable: Callable[[], Any]
-    ) -> Any:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            raise RuntimeError("observer is not connected")
-        return await self.run_blocking(callable)
-
     def _read_worker(self) -> None:
         while True:
             with self._read_condition:
@@ -886,81 +864,6 @@ class ConnectionRegistry:
         self._connections.clear()
         self._observers.clear()
         self._controller = None
-
-
-def _active_status_parts(
-    client: Any, loop: Any, fallback_config: Any
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    runtime = client.server.runtime
-    transcript_index_failure = (
-        loop.transcript_index_failure(runtime.session_id)
-        if client.protocol_version != "1.0" and loop is not None
-        else None
-    )
-    project_context_health = (
-        (
-            loop.project_context_health.summary
-            if loop is not None and loop.project_context_health is not None
-            else "healthy"
-        )
-        if client.protocol_version != "1.0"
-        else None
-    )
-    status = {
-        "session": lifecycle.session_snapshot(client),
-        "state": (
-            "idle"
-            if client.server.control.unhealthy() or runtime.state is None
-            else runtime.state.status
-        ),
-        "explicit_finish": (
-            loop.explicit_finish
-            if loop is not None
-            else fallback_config.agents_explicit_finish
-        ),
-    }
-    suffix = {
-        "pending_approvals": [],
-        "usage": dict(runtime.usage),
-        **(
-            {"transcript_index_failure": transcript_index_failure}
-            if transcript_index_failure is not None
-            else {}
-        ),
-        **(
-            {"project_context_health": project_context_health}
-            if project_context_health is not None
-            else {}
-        ),
-        "store": runtime.opened.store,
-    }
-    return status, suffix
-
-
-def _capture_status(client: Any, fallback_config: Any) -> tuple[str | None, object]:
-    runtime = client.server.runtime
-    loop = runtime.loop
-    if loop is None and fallback_config is None:
-        raise RuntimeError("status fallback config was not resolved")
-    if runtime.opened is None:
-        status = {"session": None, "state": "idle", "explicit_finish": False}
-        suffix = {
-            "pending_approvals": [],
-            "usage": {},
-            "compaction_markers": 0,
-        }
-        session_id = None
-    else:
-        status, suffix = _active_status_parts(client, loop, fallback_config)
-        session_id = runtime.session_id
-    if client.protocol_version != "1.0":
-        status["max_agent_depth"] = (
-            loop.max_agent_depth
-            if loop is not None
-            else fallback_config.agents_max_depth
-        )
-    status.update(suffix)
-    return session_id, status
 
 
 

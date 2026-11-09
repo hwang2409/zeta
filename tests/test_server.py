@@ -4851,8 +4851,13 @@ async def _ready_extensions(server):
 
 @pytest.mark.asyncio
 async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
-    from zeta.server.handlers.history import EXTENSION_REQUESTS
+    from zeta.server.protocol import MethodDescriptor
 
+    extension_requests = tuple(
+        descriptor.wire
+        for descriptor in MethodDescriptor
+        if descriptor.since is not None
+    )
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
@@ -4860,8 +4865,8 @@ async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.0"
-        assert not set(EXTENSION_REQUESTS) & set(hello["capabilities"]["requests"])
-        for method in EXTENSION_REQUESTS:
+        assert not set(extension_requests) & set(hello["capabilities"]["requests"])
+        for method in extension_requests:
             assert (await _request(reader, writer, method, method))[-1]["error"][
                 "code"
             ] == -32601

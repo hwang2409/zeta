@@ -14,13 +14,6 @@ from ..providers.factory import build_backend
 from .protocol import ErrorDescriptor, ProtocolError
 from .runtime import ServerRuntime
 
-REQUEST_METHODS = {
-    "account_list",
-    "account_logout",
-    "account_refresh",
-    "account_switch",
-}
-
 
 async def run_owned_switch(owner: Any, operation: Awaitable[object]) -> object:
     task = asyncio.create_task(operation)

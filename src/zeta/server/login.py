@@ -20,7 +20,6 @@ from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from .protocol import ErrorDescriptor, ProtocolError
 
-REQUESTS = ["login_start", "login_status", "login_cancel", "login_providers"]
 LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
 
 

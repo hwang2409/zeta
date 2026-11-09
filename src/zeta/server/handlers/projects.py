@@ -41,12 +41,6 @@ PROJECT_REQUEST_EXCEPTIONS = (
     ProjectRegistryError,
     InboxError,
 )
-PROJECT_REQUESTS = (
-    "list_projects",
-    "project_show",
-    "project_memory_log",
-    "project_inbox",
-)
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 1_000
 MAX_DIFF_BYTES = 64 * 1024
@@ -903,7 +897,6 @@ def _truncate_utf8(value: str, maximum: int) -> tuple[str, bool]:
 
 
 __all__ = [
-    "PROJECT_REQUESTS",
     "PROJECT_REQUEST_EXCEPTIONS",
     "ProjectRequests",
     "project_request_error",
