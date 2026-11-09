@@ -46,8 +46,8 @@ from pathlib import Path
 from time import monotonic as _monotonic
 
 from ..memory.entry_store import utc_now
-from ..project_memory_history import MemoryContextEntry
 from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
+from ..project_memory_history import MemoryContextEntry
 from ..project_context.projection import (
     ProjectContextHealth,
     ProjectContextProjection,

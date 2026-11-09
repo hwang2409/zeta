@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import json
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
