@@ -47,19 +47,25 @@ class ReplayClient:
             return self.buffered.popleft()
         return await self._read_wire()
 
-    async def _read_wire(self) -> dict[str, Any]:
-        frame = await self._read_or_eof()
+    async def _read_wire(self, *, what: str = "replay frame") -> dict[str, Any]:
+        frame = await self._read_or_eof(what=what)
         assert frame is not None, "server closed replay connection"
         return frame
 
-    async def _read_or_eof(self) -> dict[str, Any] | None:
+    async def _read_or_eof(self, *, what: str = "replay frame") -> dict[str, Any] | None:
         # a write to a connection the server closed surfaces on the next read
         try:
             if not self.websocket:
                 # test-contract: transport replay transport reads unix and websocket serve frames
-                line = await await_or_fail(self.reader.readline(), what="unix replay frame")
+                line = await await_or_fail(
+                    self.reader.readline(),
+                    what=f"{what}; received={list(self.buffered)!r}",
+                )
                 return json.loads(line) if line else None
-            first, second = await await_or_fail(self.reader.readexactly(2), what="websocket replay header")
+            first, second = await await_or_fail(
+                self.reader.readexactly(2),
+                what=f"{what}; received={list(self.buffered)!r}",
+            )
         except (asyncio.IncompleteReadError, ConnectionError):
             return None
         if first & 0x0F == 8:
@@ -87,7 +93,9 @@ class ReplayClient:
         skipped: list[dict[str, Any]] = []
         try:
             while True:
-                frame = await self._read_wire()
+                frame = await self._read_wire(
+                    what=f"response id {request_id}; received={list(self.buffered)!r}"
+                )
                 if frame.get("id") == request_id:
                     return frame
                 skipped.append(frame)
@@ -111,7 +119,11 @@ class ReplayClient:
                 return frame["params"]
         skipped: list[dict[str, Any]] = []
         try:
-            while not matches(frame := await self._read_wire()):
+            while not matches(
+                frame := await self._read_wire(
+                    what=f"event {name or '<any>'}; received={list(self.buffered)!r}"
+                )
+            ):
                 skipped.append(frame)
             return frame["params"]
         finally:
