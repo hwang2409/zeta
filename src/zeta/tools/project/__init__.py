@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from ...project_registry import ProjectRegistry, ProjectRegistryError
@@ -27,7 +28,7 @@ def _project(registry: ToolRegistry, store: ProjectRegistry):
     return project
 
 
-async def _inspect_project(
+def _inspect_project_sync(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
@@ -67,6 +68,12 @@ async def _inspect_project(
         )
     except (ProjectRegistryError, OSError, TypeError, ValueError) as exc:
         return _error(str(exc))
+
+
+async def _inspect_project(
+    registry: ToolRegistry, arguments: dict[str, Any]
+) -> StructuredToolResult:
+    return await asyncio.to_thread(_inspect_project_sync, registry, arguments)
 
 
 def register(registry: ToolRegistry) -> None:

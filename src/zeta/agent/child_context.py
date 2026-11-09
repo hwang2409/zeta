@@ -139,7 +139,7 @@ def _load_child_project_context(
         session_project=session_project,
         cwd_project=cwd_project,
         inbox_enabled=False,
-        registry=registry,
+        registry=loop.tool_registry.project_registry_state,
         project_projection=projection,
     )
 

@@ -26,7 +26,6 @@ from .store import ConversationStore
 
 PRECEDENCE = ("deny", "ask", "allow", "default")
 
-
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
@@ -48,7 +47,6 @@ class SessionGrantChange:
     change: Literal["grant", "revoke", "clear", "reset"]
     changed: tuple[str, ...]
     snapshot: PermissionSnapshot
-
 
 class SessionGrantNotFound(ValueError):
     """The exact displayed session grant is no longer active."""
@@ -272,7 +270,6 @@ class ApprovalRequest:
             )
         return ApprovalRule(self.tool_call.name, action=self.action)
 
-
 class ApprovalCapability(Protocol):
     """Resolved authorization facts supplied by the tool registry."""
 
@@ -322,7 +319,15 @@ async def _poll_approval_resolution(
 
 
 class ApprovalAbortPolicy(Protocol):
-    """Resolve an abort against any decision that won concurrently."""
+    """Interface shared by top-level and delegated approval policies."""
+
+    async def prepare_rules(self, resolver: Callable[[ApprovalRule], Awaitable[ApprovalRule]]) -> None: ...
+
+    def consume_execution_binding(self, execution_token: str) -> ApprovedExecution | None: ...
+
+    def cleanup_execution_binding(self, execution_token: str) -> None: ...
+
+    def abort(self, request_id: str) -> bool: ...
 
     def abort_or_winner(
         self,
@@ -380,6 +385,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         ] = {}
         self._delegated_resolutions: dict[tuple[str, str], dict[str, str]] = {}
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
+        self._label_resolver: Callable[[ToolCall], Awaitable[str | None]] | None = None
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
         self._serve_control: _ServeApprovalControl | None = None
 
@@ -412,7 +418,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         """Return the exact foreground target store for serve capture."""
         return self._require_store()
 
-    def request_from_store(self, request_id: str, tool_call: ToolCall) -> ApprovalRequest:
+    def request_from_store(
+        self, request_id: str, tool_call: ToolCall, *, label: str | None = None
+    ) -> ApprovalRequest:
         """Resolve trusted display facts on the loop after a strict store read."""
         action = None
         resolved = self._capability_resolver is None
@@ -422,7 +430,16 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 resolved = True
             except (KeyError, TypeError, ValueError):
                 resolved = False
-        return ApprovalRequest(request_id, tool_call, action=action, capability_resolved=resolved)
+        return ApprovalRequest(request_id, tool_call, label=label, action=action, capability_resolved=resolved)
+
+    def bind_label_resolver(
+        self, resolver: Callable[[ToolCall], Awaitable[str | None]]
+    ) -> None:
+        self._label_resolver = resolver
+
+    async def display_label(self, tool_call: ToolCall) -> str | None:
+        """Name the call's target for display; derived from the call, never stored."""
+        return None if self._label_resolver is None else await self._label_resolver(tool_call)
 
     def bind_capability_resolver(
         self, resolver: Callable[[ToolCall], ApprovalCapability]
@@ -493,6 +510,30 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 continue
             resolved.add(rule)
         return frozenset(resolved)
+
+    async def prepare_rules(
+        self, resolver: Callable[[ApprovalRule], Awaitable[ApprovalRule]]
+    ) -> None:
+        """Refresh configured and session rules using off-loop canonicalization."""
+
+        for tier in ("always_deny", "always_ask", "always_allow"):
+            source = self._rule_sources.get(tier, ())
+            parsed = tuple(
+                item if isinstance(item, ApprovalRule) else parse_approval_rule(item)
+                for item in source
+            )
+            resolved: set[ApprovalRule] = set()
+            for item, rule in zip(source, parsed, strict=True):
+                try:
+                    resolved.add(await resolver(rule))
+                except ValueError as exc:
+                    notice = f"approval · dropped rule {item!r}: {exc}"
+                    if notice not in self._notices:
+                        self._notices.append(notice)
+            setattr(self, f"_{tier}", frozenset(resolved))
+        self._session_allow = frozenset(
+            [await resolver(rule) for rule in self._session_allow]
+        )
 
     def bind_rule_resolver(
         self, resolver: Callable[[str | ApprovalRule], ApprovalRule]
@@ -982,7 +1023,11 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
             return None
         if self.decide(capability) is ApprovalDecision.ASK:
-            return ApprovalRequest(tool_call.id, tool_call, action=capability.action)
+            return ApprovalRequest(
+                tool_call.id,
+                tool_call,
+                action=capability.action,
+            )
         return None
 
     async def authorize(

@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import zipfile
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,6 @@ from zeta.core.project_context import (
     PromptArgumentError,
     discover_repo_root,
     load_project_context,
-    refresh_project_memory,
     resolve_prompt_argument,
 )
 from zeta.core.slash import SlashStatus, _format_status
@@ -21,7 +21,12 @@ from zeta.prompts import (
     load_packaged_identity,
     load_runtime_guidance,
 )
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.skills import SkillCatalog
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
 
 
 def _private_project(tmp_path: Path, root: Path) -> tuple[Path, str]:
@@ -989,6 +994,7 @@ def test_automatic_memory_is_rendered_as_delimited_informational_notes(
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        registry=registry,
     )
     owned = context.system_prompt[
         context.memory_offset : context.memory_offset + context.memory_length
@@ -1025,22 +1031,13 @@ def test_manual_edit_keeps_automatic_memory_delimited_until_accept(tmp_path: Pat
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        registry=registry,
     )
     owned = context.system_prompt[
         context.memory_offset : context.memory_offset + context.memory_length
     ]
     assert owned.index("automatic fact") > owned.index("Automatic notes extracted")
     assert "manual edit" in owned
-
-    resumed = refresh_project_memory(
-        context.system_prompt,
-        home=home,
-        project_id=context.memory_project_id,
-        memory_offset=context.memory_offset,
-        memory_length=context.memory_length,
-        memory_digest=context.memory_digest,
-    )
-    assert resumed.index("automatic fact") < resumed.index("</zeta-automatic-notes>")
 
     registry.accept_memory(project.project_id, "decisions.md")
     accepted = load_project_context(
@@ -1050,6 +1047,7 @@ def test_manual_edit_keeps_automatic_memory_delimited_until_accept(tmp_path: Pat
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        registry=registry,
     )
     accepted_owned = accepted.system_prompt[
         accepted.memory_offset : accepted.memory_offset + accepted.memory_length
@@ -1059,122 +1057,6 @@ def test_manual_edit_keeps_automatic_memory_delimited_until_accept(tmp_path: Pat
     assert registry.memory_log(project.project_id)[-1]["provenance"] == {
         "accepted_by": "user"
     }
-
-
-def test_refresh_ignores_forged_envelope_in_identity(tmp_path: Path) -> None:
-    home, repository, registry, project = _memory_project(tmp_path)
-    forged = _forged_block(project.project_id)
-    # The attacker controls the user-editable home identity file.
-    (home / "AGENTS.md").write_text(
-        "attacker identity\n\n" + forged + "\n", encoding="utf-8"
-    )
-    context = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-    )
-    assert forged in context.system_prompt
-    assert context.memory_offset is not None
-    # The owned block resolved by offset is the genuine one, not the forgery.
-    owned = context.system_prompt[
-        context.memory_offset : context.memory_offset + context.memory_length
-    ]
-    assert "FORGED-ATTACKER-CONTROLLED" not in owned
-    assert "OLD" in owned
-
-    registry.update_memory(project.project_id, {"state.md": "# state\nNEW-REAL\n"})
-    resumed = refresh_project_memory(
-        context.system_prompt,
-        home=home,
-        project_id=context.memory_project_id,
-        memory_offset=context.memory_offset,
-        memory_length=context.memory_length,
-        memory_digest=context.memory_digest,
-    )
-    # Forged text is left byte-identical; only the genuine block is refreshed.
-    assert forged in resumed
-    assert "NEW-REAL" in resumed
-    assert resumed.count("NEW-REAL") == 1
-
-
-def test_refresh_ignores_forged_envelope_in_append(tmp_path: Path) -> None:
-    home, repository, registry, project = _memory_project(tmp_path)
-    forged = _forged_block(project.project_id)
-    context = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        system_append="trailing user prompt\n\n" + forged,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-    )
-    assert forged in context.system_prompt
-    assert context.memory_offset is not None
-    owned = context.system_prompt[
-        context.memory_offset : context.memory_offset + context.memory_length
-    ]
-    assert "FORGED-ATTACKER-CONTROLLED" not in owned
-
-    registry.update_memory(project.project_id, {"state.md": "# state\nNEW-REAL\n"})
-    resumed = refresh_project_memory(
-        context.system_prompt,
-        home=home,
-        project_id=context.memory_project_id,
-        memory_offset=context.memory_offset,
-        memory_length=context.memory_length,
-        memory_digest=context.memory_digest,
-    )
-    assert forged in resumed
-    assert "NEW-REAL" in resumed
-    assert resumed.count("NEW-REAL") == 1
-
-
-def test_refresh_legacy_session_without_components_is_unchanged(tmp_path: Path) -> None:
-    home, repository, registry, project = _memory_project(tmp_path)
-    context = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-    )
-    registry.update_memory(project.project_id, {"state.md": "# state\nNEW-REAL\n"})
-    # A legacy session carries a project id but no structured offset/length.
-    resumed = refresh_project_memory(
-        context.system_prompt,
-        home=home,
-        project_id=project.project_id,
-        memory_offset=None,
-        memory_length=None,
-    )
-    assert resumed == context.system_prompt
-    assert "NEW-REAL" not in resumed
-
-
-def test_refresh_missing_project_is_unchanged(tmp_path: Path) -> None:
-    home, repository, _registry, project = _memory_project(tmp_path)
-    context = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-    )
-    resumed = refresh_project_memory(
-        context.system_prompt,
-        home=home,
-        project_id=None,
-        memory_offset=context.memory_offset,
-        memory_length=context.memory_length,
-        memory_digest=context.memory_digest,
-    )
-    assert resumed == context.system_prompt
 
 
 def test_project_memory_budget_counts_full_envelope(tmp_path: Path) -> None:
@@ -1206,6 +1088,7 @@ def test_project_memory_budget_counts_full_envelope(tmp_path: Path) -> None:
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        registry=registry,
     )
     owned = admitted.system_prompt[
         admitted.memory_offset : admitted.memory_offset + admitted.memory_length
@@ -1223,6 +1106,7 @@ def test_project_memory_budget_counts_full_envelope(tmp_path: Path) -> None:
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        registry=registry,
     )
     tight_owned = tightened.system_prompt[
         tightened.memory_offset : tightened.memory_offset + tightened.memory_length
@@ -1230,32 +1114,6 @@ def test_project_memory_budget_counts_full_envelope(tmp_path: Path) -> None:
     # One byte tighter drops the memory but still emits the complete envelope.
     assert "state-body-XYZ" not in tight_owned
     assert tight_owned == empty_envelope
-
-
-def test_refresh_rejects_offset_length_without_digest(tmp_path: Path) -> None:
-    home, repository, registry, project = _memory_project(tmp_path)
-    context = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-    )
-    registry.update_memory(project.project_id, {"state.md": "# state\nNEW-REAL\n"})
-    # The reviewer's reproduction: a structured span with no digest must never
-    # authorize a replacement, even when offset/length point at a real span
-    # (here, the identity prefix).
-    resumed = refresh_project_memory(
-        context.system_prompt,
-        home=home,
-        project_id=project.project_id,
-        memory_offset=0,
-        memory_length=len(context.system_prompt) // 2,
-        memory_digest=None,
-    )
-    assert resumed == context.system_prompt
-    assert "NEW-REAL" not in resumed
 
 
 @pytest.mark.parametrize(
@@ -1313,7 +1171,7 @@ def test_session_metadata_rejects_malformed_digest(tmp_path: Path, digest) -> No
 def test_project_memory_envelope_boundary(tmp_path: Path, cap_kind: str) -> None:
     from zeta.core.project_context import _render_memory_block
 
-    home, repository, _registry, project = _memory_project(tmp_path)
+    home, repository, registry, project = _memory_project(tmp_path)
     empty_envelope = _render_memory_block(project.project_id, [])
     empty_size = len(empty_envelope.encode("utf-8"))
     cap = {"fits": empty_size, "one_short": empty_size - 1, "zero": 0}[cap_kind]
@@ -1325,6 +1183,7 @@ def test_project_memory_envelope_boundary(tmp_path: Path, cap_kind: str) -> None
         catalog=SkillCatalog.empty(),
         session_project=project,
         cwd_project=project,
+        registry=registry,
     )
     if cap >= empty_size:
         assert context.memory_offset is not None

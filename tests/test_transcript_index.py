@@ -23,6 +23,7 @@ import zeta.transcript_search.refresh as refresh_module
 from tests.support.processes import reap_process
 from zeta.cli.main import build_parser
 from zeta.cli.project import run as run_project
+from zeta.core.session import SessionManager
 from zeta.project_registry import ProjectRegistry
 from zeta.transcript_search.index import (
     SANITIZER_VERSION,
@@ -1283,21 +1284,21 @@ def test_operator_cli_rebuild_status_and_search(
     monkeypatch.setenv("ZETA_HOME", str(home))
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("demo", "demo", str(tmp_path))
-    source = _source(
-        home / "sessions",
-        "one",
+    opened = SessionManager(home).create(
+        provider="codex",
+        model="test",
+        cwd=tmp_path,
+        project_id=project.project_id,
+        auto_project=False,
+    )
+    source = TranscriptSource(opened.metadata.session_id, opened.store.session_dir)
+    opened.store.close()
+    _write_rows(
+        source,
         [
             _row(1, "user", "operator canary"),
             _row(2, "assistant", "answer", state="completed"),
         ],
-    )
-    (source.session_dir / "meta.json").write_text(
-        json.dumps({"project_id": project.project_id}), encoding="utf-8"
-    )
-    registry.record_session(
-        project.project_id,
-        session_id=source.session_id,
-        transcript_path=str(source.session_dir),
     )
     for arguments in (
         ["project", "index", "demo", "rebuild"],
