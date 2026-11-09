@@ -10,15 +10,18 @@ from typing import Any
 import pytest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.styles import Style
+from rich.padding import Padding
 from rich.text import Text
 
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
+from zeta.tui.theme import RICH_THEME
 from zeta.tui.transcript import FinderControl, TranscriptWidget, transcript_finder
 from zeta.tui.transcript.history_finder import HistoryFinder
 from zeta.tui.transcript.message_finder import Role
+from zeta.tui.transcript.transcript_search import find_matches
 
 
 async def _open_finder_async(transcript: TranscriptWidget) -> None:
@@ -184,6 +187,67 @@ async def test_newest_candidates_publish_before_older_render_finishes() -> None:
     state = transcript.finder_state()
     assert state is not None and state.complete
     assert [row.candidate.text for row in state.rows] == ["new candidate 39"]
+
+
+def test_rendered_padding_search_text_matches_ansi_oracle() -> None:
+    shapes = (
+        Text("plain"),
+        Text("bold and plain", style="bold"),
+        Text.from_ansi("\x1b[31mred\x1b[0m"),
+        Text("tabs\tand\twide界"),
+        Text("trailing spaces   \n"),
+        Text("line one\nline two\n"),
+        Text(""),
+    )
+    for text in shapes:
+        renderable = Padding(text, (1, 2, 3, 4), expand=False)
+        transcript = TranscriptWidget()
+        unit = transcript.append(renderable)
+        for width in (12, 40):
+            expected = Text.from_ansi(
+                transcript._search_rendered(unit, width)
+            ).plain
+            actual = transcript._render_search_snapshot(renderable, width, RICH_THEME)
+            assert actual == expected
+            for query in ("plain", "red", "wide", "missing"):
+                actual_matches = find_matches(actual.splitlines(), query)
+                expected_matches = find_matches(expected.splitlines(), query)
+                assert [match.ranges for match in actual_matches] == [
+                    match.ranges for match in expected_matches
+                ]
+
+
+def test_rendered_padding_search_avoids_ansi_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = Text.from_ansi
+
+    def count(value: str, *args: Any, **kwargs: Any) -> Text:
+        nonlocal calls
+        calls += 1
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(Text, "from_ansi", staticmethod(count))
+    TranscriptWidget._render_search_snapshot(
+        Padding(Text("styled", style="bold"), (1, 1, 1, 1)),
+        40,
+        RICH_THEME,
+    )
+    assert calls == 0
+
+
+def test_rendered_padding_search_cache_invalidates_width_and_update() -> None:
+    transcript = TranscriptWidget()
+    transcript._content_width = 8
+    unit = transcript.append(Padding(Text("abcdefghij"), (0, 0, 0, 0)))
+    narrow = transcript._searchable_text(unit)
+    transcript._content_width = 40
+    wide = transcript._searchable_text(unit)
+    assert narrow != wide
+
+    transcript.replace(unit, Padding(Text("updated"), (0, 0, 0, 0)))
+    assert transcript._searchable_text(unit) == "updated"
 
 
 def test_open_finder_lists_messages_with_roles() -> None:
