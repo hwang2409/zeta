@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -990,21 +991,74 @@ def test_diff_blocks_matches_exact_matcher_on_generated_inputs() -> None:
         assert merge_resolution._diff_blocks(base, side) == expected
 
 
-def test_large_repeated_diff_trims_before_exact_matching(monkeypatch: pytest.MonkeyPatch) -> None:
-    sizes: list[tuple[int, int]] = []
-    original = merge_resolution.difflib.SequenceMatcher
+def test_pr_line_candidates_indexes_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    accesses = 0
 
-    def matcher(*args, **kwargs):
-        sizes.append((len(args[1]), len(args[2])))
-        return original(*args, **kwargs)
+    class CountingItem:
+        @property
+        def line(self) -> int:
+            nonlocal accesses
+            accesses += 1
+            return self.number
 
-    monkeypatch.setattr(merge_resolution.difflib, "SequenceMatcher", matcher)
-    merge_resolution._diff_blocks(
-        ["same"] * 6_000 + ["left"] + ["same"] * 6_000,
-        ["same"] * 6_000 + ["right"] + ["same"] * 6_000,
+        def __init__(self, number: int) -> None:
+            self.number = number
+
+    items = [CountingItem(number) for number in range(1, 2_001)]
+    # test-contract: seam
+    monkeypatch.setattr(merge_resolution, "_line_items", lambda *args: items)
+    monkeypatch.setattr(
+        merge_resolution, "_diff_blocks", lambda base, side: [(0, 0, 0, 2_000)]
     )
-    assert sizes == [(1, 1)]
+    candidates = merge_resolution._pr_line_candidates(
+        "x.py", ["base"], ["branch"] * 2_000, {}
+    )
+    assert len(candidates) == 2_000
+    # test-contract: complexity
+    assert accesses == 2_000
 
+
+def test_pr_line_findings_match_exact_reference_on_large_repeats() -> None:
+    def old_candidates(path, base, branch, owners):
+        branch_items = merge_resolution._line_items(path, "\n".join(branch), owners)
+        return [
+            (item, (old_start, old_end))
+            for old_start, old_end, new_start, new_end in merge_resolution._diff_blocks(base, branch)
+            for line in range(new_start + 1, new_end + 1)
+            for item in branch_items
+            if item.line == line
+        ]
+
+    def old_findings(base_text, branch_text, main_text, merge_text):
+        base, branch, main = (text.splitlines() for text in (base_text, branch_text, main_text))
+        candidates = old_candidates("x.py", base, branch, {})
+        main_blocks = merge_resolution._diff_blocks(base, main)
+        items = [
+            merge_resolution._line_items("x.py", text, {})
+            for text in (base_text, branch_text, main_text, merge_text)
+        ]
+        counts = [Counter(item_key(item) for item in group) for group in items]
+        additions = Counter(item_key(item) for item, _ in candidates)
+        result = []
+        for item, (start, end) in candidates:
+            if merge_resolution._main_overlaps(start, end, main_blocks):
+                continue
+            key = item_key(item)
+            required = max(0, counts[1][key] + counts[2][key] - counts[0][key])
+            lost = min(additions[key], max(0, required - counts[3][key]))
+            if lost and sum(item_key(candidate) == key for candidate in result) < lost:
+                result.append(item)
+        return result
+
+    repeated = "x = 0\n" * 1_001
+    cases = [
+        (repeated, "x = 0\n" * 1_000 + "y = 1\n", "y = 1\n" + "x = 0\n" * 1_000),
+        ("x = 0\n" * 1_001, "x = 0\n" * 500 + "y = 1\n" + "x = 0\n" * 500, "x = 0\n" * 1_001),
+    ]
+    for base, branch, main in cases:
+        expected = old_findings(base, branch, main, main)
+        actual = merge_resolution._pr_line_items("x.py", base, branch, main, main)
+        assert actual == expected
 
 def test_pr_line_count_subtracts_base_and_main_copies(tmp_path: Path) -> None:
     r = repo(tmp_path)

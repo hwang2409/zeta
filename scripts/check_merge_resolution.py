@@ -286,21 +286,9 @@ def _owners_by_line(tree: ast.Module, count: int) -> list[str]:
 
 
 def _diff_blocks(base: list[str], side: list[str]) -> list[tuple[int, int, int, int]]:
-    prefix = suffix = 0
-    if len(base) + len(side) > 1_000:
-        while prefix < len(base) and prefix < len(side) and base[prefix] == side[prefix]:
-            prefix += 1
-        while (
-            suffix < len(base) - prefix
-            and suffix < len(side) - prefix
-            and base[-suffix - 1] == side[-suffix - 1]
-        ):
-            suffix += 1
-    middle_base = base[prefix : len(base) - suffix if suffix else None]
-    middle_side = side[prefix : len(side) - suffix if suffix else None]
-    matcher = difflib.SequenceMatcher(None, middle_base, middle_side, autojunk=False)
+    matcher = difflib.SequenceMatcher(None, base, side, autojunk=False)
     return [
-        (old_start + prefix, old_end + prefix, new_start + prefix, new_end + prefix)
+        (old_start, old_end, new_start, new_end)
         for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes()
         if tag != "equal"
     ]
@@ -383,13 +371,15 @@ def _pr_line_candidates(
     path: str, base: list[str], branch: list[str], owners: dict[str, str]
 ) -> list[tuple[Item, tuple[int, int]]]:
     branch_items = _line_items(path, "\n".join(branch), owners)
+    items_by_line: dict[int, list[Item]] = {}
+    for item in branch_items:
+        items_by_line.setdefault(item.line, []).append(item)
     candidates = []
     for old_start, old_end, new_start, new_end in _diff_blocks(base, branch):
         for line in range(new_start + 1, new_end + 1):
             candidates.extend(
                 (item, (old_start, old_end))
-                for item in branch_items
-                if item.line == line
+                for item in items_by_line.get(line, ())
             )
     return candidates
 
@@ -414,14 +404,16 @@ def _pr_line_items(
               (base_items, branch_items, main_items, merge_items)]
     additions = Counter(item_key(item) for item, _interval in candidates)
     result = []
+    result_counts: Counter[tuple[str, str, str, str, str]] = Counter()
     for item, (start, end) in candidates:
         if _main_overlaps(start, end, main_blocks):
             continue
         key = item_key(item)
         required = max(0, counts[1][key] + counts[2][key] - counts[0][key])
         lost = min(additions[key], max(0, required - counts[3][key]))
-        if lost and sum(item_key(candidate) == key for candidate in result) < lost:
+        if lost and result_counts[key] < lost:
             result.append(item)
+            result_counts[key] += 1
     return result
 
 
