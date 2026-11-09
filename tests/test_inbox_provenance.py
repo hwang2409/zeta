@@ -9,8 +9,8 @@ import pytest
 
 from tests.test_project_inbox import _projects
 from zeta.core.project_inbox_notifications import project_inbox_notification
-from zeta.project_registry import ProjectRegistry
 from zeta.project_inbox import ProjectInbox
+from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import StreamEvent, StreamEventType
 from zeta.server.control import NotificationPresentation
 from zeta.server.slash_commands import ServerSlashSession

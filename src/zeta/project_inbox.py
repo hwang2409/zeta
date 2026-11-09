@@ -31,11 +31,11 @@ from .session_liveness import session_is_live
 from .storage_format import (
     CLOSED_VARIANTS,
     FEATURE_EPOCHS,
+    StorageFeature,
     feature_enabled,
     mapping_mutations,
-    require_closed_variant,
-    StorageFeature,
     open_writer,
+    require_closed_variant,
 )
 
 SCHEMA_VERSION = 1
