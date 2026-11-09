@@ -417,8 +417,12 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
     request_task: asyncio.Task[None] | None = None
     entered = threading.Event()
     release = threading.Event()
-    worker_finished = threading.Event()
+    scanner_finished = threading.Event()
+    scanner_before_request = threading.Event()
+    handler_finished = threading.Event()
     scanner_observed_cancel = threading.Event()
+    drain_entered = asyncio.Event()
+    drain_waiting = asyncio.Event()
     path_module = None
     original_scandir = None
     original_complete_paths = None
@@ -427,7 +431,6 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
         if not isinstance(path, int) and Path(path) == workspace:
             entered.set()
             assert release.wait(10), "path scan gate was not released"
-            worker_finished.set()
         assert original_scandir is not None
         return original_scandir(path)
 
@@ -456,16 +459,35 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
         original_complete_paths = handler_module.complete_paths
 
         def tracked_complete_paths(*args, **kwargs):
-            result = original_complete_paths(*args, **kwargs)
-            cancel_event = kwargs.get("cancel_event")
-            if cancel_event is not None and cancel_event.is_set():
-                scanner_observed_cancel.set()
-            worker_finished.set()
-            return result
+            try:
+                result = original_complete_paths(*args, **kwargs)
+                cancel_event = kwargs.get("cancel_event")
+                if cancel_event is not None and cancel_event.is_set():
+                    scanner_observed_cancel.set()
+                return result
+            finally:
+                scanner_finished.set()
+
+        async def tracked_drain(scan, cancel_event):
+            drain_entered.set()
+            asyncio.get_running_loop().call_soon(drain_waiting.set)
+            await original_drain(scan, cancel_event)
+
+        original_drain = handler_module._drain_scan
+        original_handler = handler_module.complete
+
+        async def tracked_handler(*args, **kwargs):
+            try:
+                return await original_handler(*args, **kwargs)
+            finally:
+                handler_finished.set()
 
         # test-contract: seam blocks the actual synchronous path scanner thread.
         monkeypatch.setattr(path_module.os, "scandir", gated_scandir)
         monkeypatch.setattr(handler_module, "complete_paths", tracked_complete_paths)
+        # test-contract: seam exposes the handler's cancellation drain turn.
+        monkeypatch.setattr(handler_module, "_drain_scan", tracked_drain)
+        monkeypatch.setattr(handler_module, "complete", tracked_handler)
         observer_reader, observer_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
         )
@@ -511,20 +533,25 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
             if task is not asyncio.current_task()
             and any(frame.f_locals.get("client") is client for frame in task.get_stack())
         )
+        request_task.add_done_callback(
+            lambda _: scanner_before_request.set() if scanner_finished.is_set() else None
+        )
         request_task.cancel()
-        loop_turn = asyncio.get_running_loop().create_future()
-        loop_turn.add_done_callback(lambda _: None)
-        asyncio.get_running_loop().call_soon(loop_turn.set_result, None)
-        await await_or_fail(loop_turn, what="path cancellation gate")
+        await await_or_fail(drain_entered.wait(), what="path cancellation drain")
+        await await_or_fail(drain_waiting.wait(), what="path cancellation drain wait")
+        request_task.cancel()
+        await await_or_fail(drain_entered.wait(), what="second path cancellation turn")
         assert not request_task.done()
-        request_task.cancel()
+        assert not handler_finished.is_set()
         release.set()
-        with suppress(asyncio.CancelledError):
-            await await_or_fail(request_task, what="cancelled path request")
         assert await await_or_fail(
-            asyncio.to_thread(worker_finished.wait, 10), what="path scanner drain"
+            asyncio.to_thread(scanner_finished.wait, 10), what="path scanner drain"
         )
         assert scanner_observed_cancel.is_set()
+        assert handler_finished.is_set()
+        with suppress(asyncio.CancelledError):
+            await await_or_fail(request_task, what="cancelled path request completion")
+        assert scanner_before_request.is_set()
 
         frames = await _frames_until_eof(reader)
         assert not any(

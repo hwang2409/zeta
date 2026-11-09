@@ -22,6 +22,28 @@ RunBlocking = Callable[
 ]
 
 
+async def _drain_scan(
+    scan: asyncio.Task[tuple[list[PathCompletion], bool]],
+    cancel_event: threading.Event,
+) -> None:
+    cancel_event.set()
+    deadline = asyncio.get_running_loop().time() + _SCAN_DRAIN_TIMEOUT
+    while not scan.done():
+        try:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                _LOGGER.warning("path completion scanner did not drain before timeout")
+                break
+            await asyncio.wait_for(asyncio.shield(scan), remaining)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except TimeoutError:
+            _LOGGER.warning("path completion scanner did not drain before timeout")
+            break
+
+
 async def complete(
     params: dict[str, Any],
     *,
@@ -57,22 +79,7 @@ async def complete(
     try:
         rows, truncated = await asyncio.shield(scan)
     except asyncio.CancelledError:
-        cancel_event.set()
-        deadline = asyncio.get_running_loop().time() + _SCAN_DRAIN_TIMEOUT
-        while not scan.done():
-            try:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    _LOGGER.warning("path completion scanner did not drain before timeout")
-                    break
-                await asyncio.wait_for(asyncio.shield(scan), remaining)
-            except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None:
-                    current.uncancel()
-            except TimeoutError:
-                _LOGGER.warning("path completion scanner did not drain before timeout")
-                break
+        await _drain_scan(scan, cancel_event)
         raise
     return {
         "entries": [
