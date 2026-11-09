@@ -532,6 +532,7 @@ async def test_install_and_publish_run_in_one_loop_step(
         loop.call_soon(record_at_install_callback)
         return result
 
+    # test-contract: seam observes the real resident-install section
     monkeypatch.setattr(store, "_install_committed_delta", install_and_schedule)
 
     try:
