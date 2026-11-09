@@ -13,14 +13,15 @@ import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..attention_decisions import DecisionItem, open_decisions
+from ..attention_records import Broken
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
-from ..core.project_context import discover_repo_root, project_command_view
+from ..core.project_context import project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     SlashCommandRegistry,
@@ -116,52 +117,126 @@ class ServerSlashSession:
     # --- runnable server-side ---
 
     async def slash_decisions(self, args: str) -> str:
-        from ..attention_decisions import open_decisions
-        from ..attention_forks import deliver_attention_decision
-        from ..attention_records import AttentionStore
-
-        loop = self._runtime.loop
-        opened = self._runtime.opened
-        if loop is None or opened is None:
-            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
-        parts = args.split(maxsplit=2)
+        _loop, opened = self._active_loop_and_session()
+        command, _, remainder = args.strip().partition(" ")
         registry_state = self._runtime.manager.project_registry_state
+        if command == "batch":
+            return await self._slash_decisions_batch(
+                remainder, opened.metadata.session_id
+            )
+        if command in {"dismiss", "reply"}:
+            items = await asyncio.to_thread(
+                open_decisions,
+                self._runtime.home,
+                opened.metadata.session_id,
+                registry_state,
+            )
+            return await self._slash_decisions_action(
+                command, remainder, items, opened.metadata.session_id
+            )
+        await self._run_attention_operation(
+            self._attention_replies(opened.metadata.session_id).recover
+        )
         items = await asyncio.to_thread(
             open_decisions,
             self._runtime.home,
             opened.metadata.session_id,
             registry_state,
         )
-        if parts and parts[0] in {"dismiss", "reply"}:
-            if len(parts) < 2:
-                return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
-            item = next((item for item in items if item.record.id == parts[1]), None)
-            if item is None:
-                return "attention item not found"
-            store = AttentionStore(self._runtime.home / "sessions" / item.session_id)
-            if parts[0] == "dismiss":
-                await asyncio.to_thread(
-                    store.dismiss, item.record.id, session_id=item.session_id
-                )
-                return f"dismissed {item.record.id}"
-            if len(parts) < 3 or not parts[2].strip():
-                return "reply text must be nonempty"
-            await asyncio.to_thread(
-                deliver_attention_decision,
-                self._runtime.home,
-                item.record,
-                parts[2],
-                from_session=opened.metadata.session_id,
-                registry_state=registry_state,
-            )
-            return f"replied to {item.record.id}"
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
-            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            (
+                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
+                if isinstance(item.record, Broken)
+                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            )
             for item in items
         )
 
+    def _active_loop_and_session(self):
+        loop = self._runtime.loop
+        opened = self._runtime.opened
+        if loop is None or opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        return loop, opened
+
+    def _attention_replies(self, session_id: str):
+        from ..attention_replies import AttentionReplies
+
+        loop, _opened = self._active_loop_and_session()
+        on_visible = (
+            loop.notify_project_inbox_publication
+            if session_id == loop.store.session_id
+            else None
+        )
+        return AttentionReplies(
+            self._runtime.home,
+            session_id,
+            registry_state=self._runtime.manager.project_registry_state,
+            on_inbox_visible=on_visible,
+        )
+
+    async def _run_attention_operation(self, operation, *args):
+        return await asyncio.to_thread(operation, *args)
+
+    async def _slash_decisions_batch(self, payload: str, from_session: str) -> str:
+        if not payload:
+            return "usage: /decisions batch <json array>"
+        try:
+            submitted = json.loads(payload)
+            if not isinstance(submitted, list):
+                raise TypeError
+            batch = [(item["id"], item["reply"]) for item in submitted]
+            if any(
+                not isinstance(item_id, str) or not isinstance(reply, str)
+                for item_id, reply in batch
+            ) or len({item_id for item_id, _ in batch}) != len(batch):
+                raise TypeError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return "batch must be a JSON array of objects with id and reply"
+        return await self._run_decisions_batch(batch, from_session)
+
+    async def _run_decisions_batch(
+        self, batch: list[tuple[str, str]], from_session: str
+    ) -> str:
+        outcome = await self._run_attention_operation(
+            self._attention_replies(from_session).stage_and_flush,
+            batch,
+            from_session,
+        )
+        refusals = [item.detail for item in outcome.items if item.status == "broken"]
+        replied = len(outcome.items) - len(refusals)
+        lines = [f"replied to {replied} attention item(s)"] if replied else []
+        return "\n".join([*lines, *refusals])
+
+    async def _slash_decisions_action(
+        self,
+        command: str,
+        remainder: str,
+        items: tuple[DecisionItem, ...],
+        from_session: str,
+    ) -> str:
+        attention_id, separator, reply = remainder.partition(" ")
+        if not attention_id:
+            return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
+        item = next((item for item in items if item.record.id == attention_id), None)
+        if item is None:
+            return "attention item not found"
+        if isinstance(item.record, Broken):
+            return f"attention record {item.record.id} is broken ({item.record.reason}); repair {item.record.path} before replying"
+        replies = self._attention_replies(item.session_id)
+        if command == "dismiss":
+            await self._run_attention_operation(replies.dismiss, item.record.id)
+            text = f"dismissed {item.record.id}"
+        else:
+            if not separator or not reply.strip():
+                return "reply text must be nonempty"
+            await self._run_attention_operation(
+                replies.reply, item.record.id, reply, from_session
+            )
+            text = f"replied to {item.record.id}"
+        return text
     @property
     def plan_mode(self) -> bool:
         return self._runtime.loop.plan_mode if self._runtime.loop is not None else False
@@ -457,14 +532,21 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
     if loop is None:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     catalog = loop.tool_registry.skill_catalog
-    project_dir = discover_repo_root(Path(opened.metadata.cwd or runtime.cwd))
     return create_slash_registry(
         zeta_home=runtime.home,
-        project_dir=project_dir,
+        project_dir=runtime.repo_root,
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
         surface=SlashSurface.SERVE,
     )
+
+
+async def registry_for_request(runtime: ServerRuntime) -> SlashCommandRegistry:
+    """Refresh live skills and build one registry for a serve request."""
+
+    if runtime.loop is not None:
+        await runtime.loop.refresh_skills()
+    return await asyncio.to_thread(build_registry, runtime)
 
 
 READ_REQUESTS = {"slash_list", *accounts.REQUEST_METHODS}
@@ -496,9 +578,7 @@ async def list_commands(
 ) -> dict[str, object]:
     """Enumerate runnable commands, with an optional complete catalog."""
 
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
+    registry = await registry_for_request(runtime)
     repair_available = transcript_repair_available(runtime.manager)
     entries = [
         entry
@@ -513,7 +593,7 @@ async def list_commands(
     }
 
 
-async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
+def can_run_while_busy(registry: SlashCommandRegistry, text: str) -> bool:
     """Return whether slash_run can resolve without starting model work."""
 
     first_line = text.split("\n", 1)[0]
@@ -522,9 +602,6 @@ async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
         return False
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
     command = registry.command_for(name)
     if command is not None:
         if not registry.available(command):
@@ -549,6 +626,7 @@ async def run_command(
     approval_control: _ApprovalProjection | None = None,
     run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
     busy: bool = False,
+    registry: SlashCommandRegistry | None = None,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
@@ -560,9 +638,8 @@ async def run_command(
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
+    if registry is None:
+        registry = await registry_for_request(runtime)
     command = registry.command_for(name)
     if command is not None and not registry.available(command):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
@@ -705,5 +782,6 @@ __all__ = [
     "build_registry",
     "can_run_while_busy",
     "list_commands",
+    "registry_for_request",
     "run_command",
 ]

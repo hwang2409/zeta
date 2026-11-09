@@ -80,7 +80,7 @@ async def consume_child(
     child_turns: Callable[[], int],
     update_turns: Callable[[int], None],
     update_step: Callable[[str], None],
-    update_tool_calls: Callable[[int], None],
+    record_tool_call: Callable[[], None],
     finish_lifecycle: Callable[[str, str], dict[str, object]],
     publish_lifecycle: Callable[..., None],
     child_result: Callable[..., dict[str, object]],
@@ -95,7 +95,7 @@ async def consume_child(
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
     failure_message: str | None = None
-    tool_calls = 0
+    failure_error: tuple[str, str] | None = None
     explicit_report: dict[str, object] | None = None
 
     def terminal_result(
@@ -118,7 +118,7 @@ async def consume_child(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
     ) -> None:
-        nonlocal failure_message, final_message, tool_calls, explicit_report
+        nonlocal failure_error, failure_message, final_message, explicit_report
         final_message = None
         async for event in events:
             if event.type is StreamEventType.TURN_START:
@@ -142,8 +142,7 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TOOL_EXECUTION_START:
-                tool_calls += 1
-                update_tool_calls(tool_calls)
+                record_tool_call()
                 name = event.tool_call.name if event.tool_call is not None else "tool"
                 arguments = (
                     event.tool_call.arguments if event.tool_call is not None else {}
@@ -180,6 +179,7 @@ async def consume_child(
                 if gate_control is not None and gate_control.turn_ended():
                     return
             elif event.type is StreamEventType.ERROR and event.error is not None:
+                failure_error = (event.error.code, event.error.message)
                 failure_message = event.error.message
 
     def owned_children() -> tuple[tuple[str, str], ...]:
@@ -280,6 +280,20 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
+        if failure_error is not None and failure_error[0] in {"account_lock_timeout", "no_progress_loop"}:
+            result = terminal_result(
+                state="idle",
+                text=f"agent error: {failure_message}",
+                error=False,
+                status="running",
+            )
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                structured["recoverable_error"] = {
+                    "code": failure_error[0],
+                    "message": failure_error[1],
+                }
+            return result
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
@@ -972,8 +986,8 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
 
-    def update_tool_calls(tool_calls: int) -> None:
-        child_store.update_agent_lifecycle(tool_calls=tool_calls)
+    def record_tool_call() -> None:
+        child_store.update_agent_lifecycle(tool_calls=1)
 
     consume = consume_run if follow_up_loop else consume_child
     loop._background_owner.causal_episodes.associate_new_member(
@@ -1015,7 +1029,7 @@ async def run_agent_tool(
             publish=publish,
             child_turns=child_turns,
             update_turns=update_turns,
-            update_tool_calls=update_tool_calls,
+            record_tool_call=record_tool_call,
             update_step=update_step,
             finish_lifecycle=finish_lifecycle,
             publish_lifecycle=publish_lifecycle,

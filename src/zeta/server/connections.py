@@ -14,6 +14,7 @@ from .protocol import (
     EventDescriptor,
     FrameCodec,
     FrameWriteCancelled,
+    MethodDescriptor,
     ProtocolError,
     _Frame,
 )
@@ -175,10 +176,6 @@ class ConnectionRegistry:
                 "another client is already connected",
             ) from exc
         connection.role = role
-        if role == "controller":
-            connection.server.runtime.set_post_stream_provider_retry(
-                "assistant_reset" in features
-            )
         return role
 
     def _claim(
@@ -278,7 +275,7 @@ class ConnectionRegistry:
         self._enqueue(
             output,
             _OutputFrame(frame),
-            wake=True,
+            wake=self._phase_allows_writes(output),
         )
         return outcome
 
@@ -307,7 +304,7 @@ class ConnectionRegistry:
             self._enqueue(
                 output,
                 _OutputFrame(frame),
-                wake=output.phase == "flushing",
+                wake=self._phase_allows_writes(output),
             )
             return True
         return await self._send_frame(output, frame)
@@ -441,6 +438,10 @@ class ConnectionRegistry:
         output.pending_callers -= 1
         if output.pending_callers == 0:
             output.callers_settled.set()
+
+    @staticmethod
+    def _phase_allows_writes(output: _OutputState) -> bool:
+        return output.phase in {"flushing", "ready"}
 
     def _enqueue(
         self, output: _OutputState, frame: _OutputFrame, *, wake: bool = True
@@ -798,14 +799,6 @@ class ConnectionRegistry:
             session_id=session_id,
         )
 
-    async def run_observer_read(
-        self, connection: Any, callable: Callable[[], Any]
-    ) -> Any:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            raise RuntimeError("observer is not connected")
-        return await self.run_blocking(callable)
-
     def _read_worker(self) -> None:
         while True:
             with self._read_condition:
@@ -839,12 +832,6 @@ class ConnectionRegistry:
         else:
             future.set_exception(error)
 
-    @staticmethod
-    def requests_for_role(role: str, requests: list[str]) -> list[str]:
-        if role == "observer":
-            return sorted(OBSERVER_REQUESTS.intersection(requests))
-        return requests
-
     async def route_request(
         self,
         connection: Any,
@@ -855,9 +842,10 @@ class ConnectionRegistry:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
             return False, None
-        if method not in OBSERVER_REQUESTS or (
-            method == "list_sessions" and "project_id" in params
-        ):
+        descriptor = MethodDescriptor.for_wire(method)
+        if descriptor is None or descriptor.access.value != "read":
+            return False, None
+        if method == "list_sessions" and "project_id" in params:
             raise ProtocolError(
                 ErrorDescriptor.OBSERVER_READ_ONLY,
                 "method is unavailable to read-only observers",

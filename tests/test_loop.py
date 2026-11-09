@@ -1,3 +1,4 @@
+
 import asyncio
 import base64
 import json
@@ -16,8 +17,11 @@ import pytest
 import zeta.agent.runner as agent_runner_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
-import zeta.providers.retry_policy as retry_policy_module
+import zeta.providers.completion as completion_module
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
+from zeta.accounts import AccountCredentialLockTimeoutError
 from zeta.agent.finish_gate import finish_gate_message
 from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
@@ -40,10 +44,9 @@ from zeta.protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
-from zeta.providers.retry_policy import current_retry_budget
-from zeta.providers.transport import retry_provider_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.empty_turn import (
@@ -247,6 +250,7 @@ class AttemptBackend(CompletionBackend):
         self.attempts = list(attempts)
         self.calls = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -268,6 +272,7 @@ class AttemptBackend(CompletionBackend):
 
 
 class ParallelChildFailureBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -445,8 +450,8 @@ async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Pat
         request_serializer=anthropic_request_bytes,
     )
     same_request = [Message(MessageRole.USER, [TextContent("same")])]
-    await collect(baseline_backend.complete(same_request, []))
-    baseline_events = await collect(baseline_backend.complete(same_request, []))
+    await collect(baseline_backend.complete(same_request, [], control=completion_control()))
+    baseline_events = await collect(baseline_backend.complete(same_request, [], control=completion_control()))
     baseline_read = baseline_events[-1].data["usage"]["cache_read_input_tokens"]
 
     mutated_backend = FakeBackend(
@@ -471,8 +476,8 @@ async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Pat
         return anthropic_module.serialize_request_payload(payload)
 
     mutated_backend.request_serializer = mutate_first_request
-    await collect(mutated_backend.complete(same_request, []))
-    changed_events = await collect(mutated_backend.complete(same_request, []))
+    await collect(mutated_backend.complete(same_request, [], control=completion_control()))
+    changed_events = await collect(mutated_backend.complete(same_request, [], control=completion_control()))
 
     assert (
         changed_events[-1].data["usage"]["cache_read_input_tokens"]
@@ -992,7 +997,9 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
     loop_thread_id = threading.get_ident()
     original_sleep = time.sleep
     nonblocking_updates = 0
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn(content=[TextContent("done")])]
+    )
     original_put_nowait = asyncio.Queue.put_nowait
 
     def put_nowait(queue: asyncio.Queue[object], item: object) -> None:
@@ -1523,6 +1530,7 @@ async def test_plain_async_iterator_completes_without_aclose(tmp_path: Path) -> 
             return event
 
     class PlainBackend(CompletionBackend):
+        @owned_completion
         def complete(
             self,
             messages: Sequence[Message],
@@ -1571,6 +1579,7 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
         def __init__(self) -> None:
             self.update_seen = asyncio.Event()
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1582,12 +1591,12 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
                 content=TextContent("partial"),
             )
             self.update_seen.set()
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
 
     backend = WaitingBackend()
     store = ConversationStore(tmp_path)
     task = asyncio.create_task(collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)))
-    await backend.update_seen.wait()
+    await await_or_fail(backend.update_seen.wait(), what="backend.update_seen.wait()")
 
     with patch.object(
         store,
@@ -1597,7 +1606,7 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
         warnings.simplefilter("error")
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await await_or_fail(task, what="task")
 
 
 @pytest.mark.asyncio
@@ -1642,6 +1651,7 @@ async def test_max_turns_stops(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_truncated_stream_persists_stop_reason_metadata(tmp_path: Path) -> None:
     class TruncatedBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1674,54 +1684,6 @@ async def test_truncated_stream_persists_stop_reason_metadata(tmp_path: Path) ->
     assert partial.metadata["turn_failed"] is True
 
 
-@pytest.mark.asyncio
-async def test_cancel_during_retry_backoff_does_not_persist_discarded_partial(
-    tmp_path: Path,
-) -> None:
-    retry_seen = asyncio.Event()
-
-    class WaitingRetryBackend(CompletionBackend):
-        async def complete(
-            self,
-            messages: Sequence[Message],
-            tool_schemas: Sequence[ToolSchema],
-        ) -> AsyncIterator[StreamEvent]:
-            del messages, tool_schemas
-            yield StreamEvent(StreamEventType.MESSAGE_START)
-            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
-            yield StreamEvent(
-                StreamEventType.RETRY,
-                data={"text": "retrying"},
-            )
-            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
-            await asyncio.Event().wait()
-
-    store = ConversationStore(tmp_path)
-    events: list[StreamEvent] = []
-
-    async def consume() -> None:
-        async for event in AgentLoop(
-            WaitingRetryBackend(), store, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start", origin=MessageOrigin.USER):
-            events.append(event)
-            if event.type is StreamEventType.RETRY:
-                retry_seen.set()
-
-    task = asyncio.create_task(consume())
-    await asyncio.wait_for(retry_seen.wait(), timeout=10)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert not any(
-        event.type is StreamEventType.MESSAGE_END
-        and event.message is not None
-        and event.message.content == [TextContent("discard me")]
-        for event in events
-    )
-    assert all(
-        message.content != [TextContent("discard me")] for message in store.messages()
-    )
 
 
 @pytest.mark.asyncio
@@ -1729,6 +1691,7 @@ async def test_discarded_partial_is_not_finalized_when_stream_then_ends(
     tmp_path: Path,
 ) -> None:
     class PartialOnlyRetryBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1764,6 +1727,7 @@ async def test_discarded_partial_is_not_finalized_when_stream_then_ends(
 @pytest.mark.asyncio
 async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> None:
     class WaitingAfterMetadataBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1779,7 +1743,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
                     "usage": {"output_tokens": 23},
                 },
             )
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
 
     store = ConversationStore(tmp_path)
     metadata_seen = asyncio.Event()
@@ -1795,7 +1759,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
     await asyncio.wait_for(metadata_seen.wait(), timeout=10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="task")
 
     partial = store.messages()[-1]
     assert partial.content == [TextContent("partial")]
@@ -1807,6 +1771,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path) -> None:
     class BrokenBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1845,7 +1810,7 @@ async def test_slow_context_assembly_does_not_exhaust_retry_budget(
 
     assembler.assemble = slow_assemble  # type: ignore[method-assign]
     with patch(
-        "zeta.providers.retry_policy.time.monotonic", side_effect=lambda: now[0]
+        "zeta.providers.must_complete_close.time.monotonic", side_effect=lambda: now[0]
     ):
         events = await collect(
             AgentLoop(
@@ -1860,216 +1825,8 @@ async def test_slow_context_assembly_does_not_exhaust_retry_budget(
     assert not any(event.type is StreamEventType.ERROR for event in events)
 
 
-@pytest.mark.asyncio
-async def test_loop_owned_stall_retry_starts_after_real_90s_silence(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = 0.0
-    budget = None
-    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
-
-    async def advance(delay: float, _abort_signal=None, _source=None) -> bool:
-        nonlocal now
-        now += delay
-        return True
-
-    monkeypatch.setattr("zeta.runtime.loop.agent.wait_for_provider_retry", advance)
-
-    class StallError(RetryableProviderFailure):
-        is_stall = True
-        stall_seconds = 90.0
-
-    class AlternatingStallBackend(CompletionBackend):
-        def __init__(self) -> None:
-            self.stream_calls = 0
-
-        async def complete(self, messages, tool_schemas):
-            nonlocal budget
-            del messages, tool_schemas
-            budget = current_retry_budget()
-
-            async def stream() -> AsyncIterator[StreamEvent]:
-                nonlocal now
-                self.stream_calls += 1
-                if self.stream_calls == 1:
-                    yield StreamEvent(StreamEventType.MESSAGE_START)
-                    yield StreamEvent(
-                        StreamEventType.MESSAGE_UPDATE,
-                        content=TextContent("discarded"),
-                    )
-                now += 90.0
-                raise StallError("terminal stall", retry_after=30.0)
-
-            async def retry(_token: str) -> AsyncIterator[StreamEvent]:
-                async for event in stream():
-                    yield event
-
-            async def refresh() -> str:
-                raise AssertionError("auth refresh is unreachable")
-
-            async for event in retry_provider_completion(
-                stream,
-                retry,
-                refresh,
-                lambda _error: False,
-                lambda error: error,
-                lambda number, delay, _error: StreamEvent(
-                    StreamEventType.RETRY,
-                    data={"retry": number, "delay": delay},
-                ),
-                lambda _error, _retries: None,
-                is_stall=lambda error: getattr(error, "is_stall", False),
-                stall_notice=lambda number, delay, _error: StreamEvent(
-                    StreamEventType.RETRY,
-                    data={
-                        "retry": number,
-                        "delay": delay,
-                        "is_stall": True,
-                    },
-                ),
-                max_stall_retries=2,
-                sleep=advance,
-            ):
-                yield event
-
-    backend = AlternatingStallBackend()
-    store = ConversationStore(tmp_path)
-    events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
-    )
-
-    retries = [event for event in events if event.type is StreamEventType.RETRY]
-    assert backend.stream_calls == 3
-    assert len(retries) == 2
-    assert budget is not None
-    assert budget.stall_retries == 2
-    # The window starts at the first stall (t=90); later stalls are excluded.
-    assert budget.started_at == 90.0
-    assert budget.excluded_stall_seconds == 180.0
-    assert now - budget.started_at - budget.excluded_stall_seconds == 60.0
-    assert now == 3 * 90.0 + 2 * 30.0
-    assert now <= 330.0
-    assert events[-2].type is StreamEventType.ERROR
-    assert events[-2].error is not None
-    assert events[-2].error.message == "terminal stall"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "metadata_event",
-    [
-        pytest.param(
-            StreamEvent(
-                StreamEventType.MESSAGE_UPDATE,
-                data={"index": (0, "raw", 0)},
-            ),
-            id="codex-raw-reasoning",
-        ),
-        pytest.param(
-            StreamEvent(
-                StreamEventType.MESSAGE_UPDATE,
-                data={"thinking_signature_delta": "signature", "index": 0},
-            ),
-            id="anthropic-signature",
-        ),
-        pytest.param(
-            StreamEvent(StreamEventType.MESSAGE_START),
-            id="generic-message-start",
-        ),
-    ],
-)
-async def test_metadata_only_provider_events_are_retry_safe(
-    tmp_path: Path,
-    metadata_event: StreamEvent,
-) -> None:
-    class StallError(RetryableProviderFailure):
-        is_stall = True
-        stall_seconds = 90.0
-
-    class MetadataThenStallBackend(CompletionBackend):
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def complete(self, messages, tool_schemas):
-            del messages, tool_schemas
-
-            async def stream() -> AsyncIterator[StreamEvent]:
-                self.calls += 1
-                if self.calls == 1:
-                    yield metadata_event
-                    raise StallError("stalled", retry_after=0.0)
-                yield StreamEvent(StreamEventType.MESSAGE_START)
-                yield StreamEvent(
-                    StreamEventType.MESSAGE_END,
-                    message=Message(
-                        MessageRole.ASSISTANT,
-                        [TextContent("final")],
-                    ),
-                )
-
-            async def retry(_token: str) -> AsyncIterator[StreamEvent]:
-                async for event in stream():
-                    yield event
-
-            async def refresh() -> str:
-                raise AssertionError("auth refresh is unreachable")
-
-            async for event in retry_provider_completion(
-                stream,
-                retry,
-                refresh,
-                lambda _error: False,
-                lambda error: error,
-                lambda number, delay, _error: StreamEvent(
-                    StreamEventType.RETRY,
-                    data={"retry": number, "delay": delay},
-                ),
-                lambda _error, _retries: None,
-                is_stall=lambda error: getattr(error, "is_stall", False),
-                stall_notice=lambda number, delay, _error: StreamEvent(
-                    StreamEventType.RETRY,
-                    data={
-                        "retry": number,
-                        "delay": delay,
-                        "is_stall": True,
-                    },
-                ),
-                max_stall_retries=1,
-                sleep=lambda _delay: asyncio.sleep(0),
-            ):
-                yield event
-
-    backend = MetadataThenStallBackend()
-    store = ConversationStore(tmp_path)
-    events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)
-    )
-
-    assert backend.calls == 2
-    assert sum(event.type is StreamEventType.RETRY for event in events) == 1
-    assistant_messages = [
-        message for message in store.messages() if message.role is MessageRole.ASSISTANT
-    ]
-    assert len(assistant_messages) == 1
-    assert assistant_messages[0].content == [TextContent("final")]
-    assert (
-        sum(
-            event.type is StreamEventType.MESSAGE_END and event.message is not None
-            for event in events
-        )
-        == 1
-    )
-    assert not any(
-        event.type is StreamEventType.MESSAGE_UPDATE
-        and (event.content is not None or event.delta is not None)
-        for event in events
-    )
-    assert not any(
-        isinstance(block, ThinkingContent)
-        for message in assistant_messages
-        for block in message.content
-    )
 
 
 @pytest.mark.asyncio
@@ -2228,18 +1985,24 @@ async def test_server_error_after_completed_tool_call_is_not_retried(tmp_path: P
     class Backend(CompletionBackend):
         calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
             yield StreamEvent(StreamEventType.MESSAGE_START)
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [ToolUseContent(ToolCall("tool-1", "echo", {}))],
+                    ),
+                )
+                raise failure
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
-                message=Message(
-                    MessageRole.ASSISTANT,
-                    [ToolUseContent(ToolCall("tool-1", "echo", {}))],
-                ),
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
             )
-            raise failure
 
     backend = Backend()
     store = ConversationStore(tmp_path)
@@ -2248,7 +2011,7 @@ async def test_server_error_after_completed_tool_call_is_not_retried(tmp_path: P
             "start", origin=MessageOrigin.USER
         )
     )
-    assert backend.calls == 1
+    assert backend.calls == 2
     assert not any(event.type is StreamEventType.RETRY for event in events)
 
 
@@ -2324,6 +2087,7 @@ async def test_retry_after_codex_stream_error_retryable(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -2354,7 +2118,7 @@ async def test_stall_after_partial_tool_call_delta_is_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = 0.0
-    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
 
     class StallError(RetryableProviderFailure):
         is_stall = True
@@ -2364,6 +2128,7 @@ async def test_stall_after_partial_tool_call_delta_is_retried(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             nonlocal now
             del messages, tool_schemas
@@ -2412,7 +2177,7 @@ async def test_stall_after_text_delta_is_retried_with_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = 0.0
-    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
 
     class StallError(RetryableProviderFailure):
         is_stall = True
@@ -2422,6 +2187,7 @@ async def test_stall_after_text_delta_is_retried_with_reset(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             nonlocal now
             del messages, tool_schemas
@@ -2563,7 +2329,11 @@ async def test_stall_after_two_partial_parallel_calls_is_retried(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_stall_after_dispatched_tool_call_is_not_retried(tmp_path: Path) -> None:
+async def test_failure_after_dispatched_tool_call_retries_without_reexecuting(
+    tmp_path: Path,
+) -> None:
+    # the completion after a committed tool call is a new logical completion
+    # with a fresh retry budget; retrying it never repeats the committed tool.
     call = ToolCall("echo-1", "echo", {"value": "once"})
     backend = AttemptBackend(
         [
@@ -2577,24 +2347,30 @@ async def test_stall_after_dispatched_tool_call_is_not_retried(tmp_path: Path) -
                 )
             ],
             RetryableProviderFailure(),
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+                )
+            ],
         ]
     )
     executions: list[str] = []
+    store = ConversationStore(tmp_path)
 
     events = await collect(
         AgentLoop(
             backend,
-            ConversationStore(tmp_path),
+            store,
             tools={"echo": lambda arguments: executions.append(arguments["value"]) or "ok"},
             skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     assert executions == ["once"]
-    assert backend.calls == 2
-    assert not any(event.type is StreamEventType.RETRY for event in events)
-    assert events[-2].error is not None
-    assert events[-2].error.message == "request failed"
+    assert backend.calls == 3
+    assert [event.type for event in events].count(StreamEventType.RETRY) == 1
+    assert store.messages()[-1].content == [TextContent("done")]
 
 
 @pytest.mark.asyncio
@@ -2645,6 +2421,7 @@ async def test_no_retry_after_user_abort(tmp_path: Path) -> None:
     class AbortingBackend(CompletionBackend):
         calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -2667,17 +2444,12 @@ async def test_no_retry_after_user_abort(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_abort_during_backoff_keeps_ui_and_store_consistent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    original_sleep = asyncio.sleep
-
     async def blocked_sleep(delay: float) -> None:
-        if delay == 0:
-            await original_sleep(0)
-            return
-        await asyncio.Event().wait()
+        del delay
+        await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
 
-    monkeypatch.setattr("zeta.runtime.loop._completion.asyncio.sleep", blocked_sleep)
     signal = AbortSignal()
     retry_seen = asyncio.Event()
     backend = AttemptBackend(
@@ -2694,6 +2466,7 @@ async def test_abort_during_backoff_keeps_ui_and_store_consistent(
             ],
         ]
     )
+    backend._completion_wait = blocked_sleep
     store = ConversationStore(tmp_path)
     events: list[StreamEvent] = []
 
@@ -2708,14 +2481,14 @@ async def test_abort_during_backoff_keeps_ui_and_store_consistent(
     task = asyncio.create_task(consume())
     await asyncio.wait_for(retry_seen.wait(), timeout=10)
     signal.abort()
-    await asyncio.wait_for(task, timeout=10)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=10)
 
     retry = next(event for event in events if event.type is StreamEventType.RETRY)
     assert retry.data.get("discard_partial") is not True
-    assert not any(event.type.value == "assistant_reset" for event in events)
+    assert any(event.type.value == "assistant_reset" for event in events)
     assert backend.calls == 1
-    assert store.messages()[-1].content == [TextContent("keep me")]
-    assert store.messages()[-1].metadata["turn_failed"] is True
+    assert [message.role for message in store.messages()] == [MessageRole.USER]
 
 
 @pytest.mark.asyncio
@@ -2754,6 +2527,46 @@ async def test_retry_budget_exhausted_fails_with_original_error(tmp_path: Path) 
     assert events[-2].error is not None
     assert events[-2].error.message == "first failure"
     assert store.messages()[-1].metadata["turn_error"]["message"] == "first failure"
+
+
+@pytest.mark.asyncio
+async def test_account_lock_exhaustion_is_recoverable_on_next_turn(
+    tmp_path: Path,
+) -> None:
+    backend = AttemptBackend(
+        [
+            *[AccountCredentialLockTimeoutError() for _ in range(5)],
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("still alive")],
+                    ),
+                )
+            ],
+        ]
+    )
+
+    async def no_wait(_delay: float) -> None:
+        return None
+
+    backend._completion_wait = no_wait
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    failed = await collect(loop.run_turn("first", origin=MessageOrigin.USER))
+    recovered = await collect(loop.run_turn("second", origin=MessageOrigin.USER))
+
+    assert backend.calls == 6
+    assert sum(event.type is StreamEventType.RETRY for event in failed) == 4
+    assert failed[-2].error is not None
+    assert failed[-2].error.code == "account_lock_timeout"
+    assert not any(event.type is StreamEventType.ERROR for event in recovered)
+    assert recovered[-2].message is not None
+    assert recovered[-2].message.content == [TextContent("still alive")]
 
 
 @pytest.mark.asyncio
@@ -2801,6 +2614,7 @@ async def test_child_agent_survives_transient_provider_error(tmp_path: Path) -> 
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -2843,77 +2657,6 @@ async def test_child_agent_survives_transient_provider_error(tmp_path: Path) -> 
     assert child_store.messages()[-1].metadata["provider_retries"][0]["attempt"] == 2
 
 
-@pytest.mark.asyncio
-async def test_child_retries_post_stream_even_when_root_serve_client_not_negotiated(
-    tmp_path: Path,
-) -> None:
-    call = ToolCall(
-        "child-1",
-        "agent",
-        {"prompt": "child work", "description": "retrying child"},
-    )
-
-    class PostStreamRetryChildBackend(CompletionBackend):
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def complete(self, messages, tool_schemas):
-            self.calls += 1
-            is_child = any(
-                message.role is MessageRole.USER
-                and any(
-                    block.text == "child work"
-                    for block in message.content
-                    if isinstance(block, TextContent)
-                )
-                for message in messages
-            )
-            del tool_schemas
-            if self.calls == 1:
-                yield StreamEvent(
-                    StreamEventType.MESSAGE_END,
-                    message=Message(
-                        MessageRole.ASSISTANT,
-                        [ToolUseContent(call)],
-                    ),
-                )
-                return
-            if self.calls == 2:
-                yield StreamEvent(StreamEventType.MESSAGE_START)
-                yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="child partial")
-                raise RetryableProviderFailure()
-            if self.calls == 3 and is_child:
-                yield StreamEvent(
-                    StreamEventType.MESSAGE_END,
-                    message=Message(
-                        MessageRole.ASSISTANT,
-                        [TextContent("child survived")],
-                    ),
-                )
-                return
-            yield StreamEvent(
-                StreamEventType.MESSAGE_END,
-                message=Message(MessageRole.ASSISTANT, [TextContent("parent done")]),
-            )
-
-    backend = PostStreamRetryChildBackend()
-    store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
-    loop.post_stream_provider_retry = False
-
-    events = await collect(loop.run_turn("start", origin=MessageOrigin.USER))
-
-    assert backend.calls == 4
-    result = next(
-        message.tool_result
-        for message in store.messages()
-        if message.tool_result is not None
-    )
-    assert result is not None and result.is_error is False
-    assert result.content.startswith("child survived")
-    assert not any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
-    assert not any(event.delta == "child partial" for event in events)
-    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -2921,6 +2664,7 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
     tmp_path: Path,
 ) -> None:
     class ErrorEventBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -2955,12 +2699,13 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
 async def test_clean_stream_exit_retries_without_duplicate_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(retry_policy_module, "retry_wait_seconds", lambda *_args: 0.0)
+    monkeypatch.setattr(completion_module, "retry_wait_seconds", lambda *_args: 0.0)
 
     class IncompleteBackend(CompletionBackend):
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -3006,6 +2751,7 @@ async def test_clean_stream_exit_after_completed_tool_call_is_not_retried(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -3041,12 +2787,13 @@ async def test_clean_stream_exit_after_completed_tool_call_is_not_retried(
 async def test_clean_stream_exit_exhausts_normal_retry_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(retry_policy_module, "retry_wait_seconds", lambda *_args: 0.0)
+    monkeypatch.setattr(completion_module, "retry_wait_seconds", lambda *_args: 0.0)
 
     class IncompleteBackend(CompletionBackend):
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -3077,6 +2824,7 @@ async def test_clean_stream_exit_exhausts_normal_retry_budget(
 @pytest.mark.asyncio
 async def test_no_output_failure_closes_turn_and_persists_marker(tmp_path: Path) -> None:
     class BrokenBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],

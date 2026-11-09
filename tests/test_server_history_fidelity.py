@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import event, request
 from tests.support.sockets import short_socket_path as _socket_path
@@ -27,6 +28,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -67,8 +69,6 @@ async def _open(
     return server, reader, writer, session_id
 
 
-
-
 async def _history(reader, writer, session_id: str):
     return (
         await request(reader, writer, 90, "session_history", {"session_id": session_id})
@@ -79,6 +79,7 @@ class _BlockingBackend(CompletionBackend):
     def __init__(self) -> None:
         self.started = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -92,6 +93,7 @@ class _BlockingBackend(CompletionBackend):
 
 
 class _FailingBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -260,12 +262,13 @@ async def test_session_history_fidelity_projects_tool_image_stubs_over_socket(
 async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
     tmp_path: Path,
 ) -> None:
-    call = ToolCall("read-1", "read", {"path": str(tmp_path / "missing")})
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    # the steer arrives while the provider streams, so it waits for the next
+    # tool boundary; the abort ends the turn first and drops it.
+    backend = _BlockingBackend()
     server, reader, writer, session_id = await _open(tmp_path, backend)
     try:
         await request(reader, writer, 3, "send", {"text": "read"})
-        await event(reader, "approval_request")
+        await await_or_fail(backend.started.wait(), what="provider start")
         await request(reader, writer, 4, "steer", {"text": "also inspect tests"})
         await request(reader, writer, 5, "abort")
         live = await event(reader, "delivery_status")
@@ -570,24 +573,25 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
         tmp_path, backend, features=["served_turn_end"]
     )
     store = server.runtime.opened.store
-    original_durable_write = type(store)._run_durable_write
+    original_durable_write = type(store)._run_committed_mutation
     committed = threading.Event()
     release = threading.Event()
 
-    def gate_after_commit(self, method_name, args, kwargs):
-        result = original_durable_write(self, method_name, args, kwargs)
+    def gate_after_commit(self, command, expected_generation, cancelled_before_write):
+        result = original_durable_write(
+            self, command, expected_generation, cancelled_before_write
+        )
         if (
-            method_name == "_append_row"
-            and args[0] == "turn_end"
-            and args[1].get("reason") == "completed"
-            and isinstance(args[1].get("turn_id"), str)
+            type(command).__name__ == "_AppendTurnEndCommand"
+            and command.data.get("reason") == "completed"
+            and isinstance(command.data.get("turn_id"), str)
         ):
             committed.set()
             assert release.wait(timeout=5)
         return result
 
     # test-contract: durability pauses after commit to prove publication ordering
-    monkeypatch.setattr(type(store), "_run_durable_write", gate_after_commit)
+    monkeypatch.setattr(type(store), "_run_committed_mutation", gate_after_commit)
     announcement: asyncio.Task[dict] | None = None
     try:
         writer.close()
@@ -627,7 +631,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
         assert not announcement.done()
 
         release.set()
-        await asyncio.wait_for(announcement, 10)
+        await await_or_fail(announcement, what="test await")
         rows = await _history(reader, writer, session_id)
         assert [
             row["data"]["reason"]

@@ -13,8 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
-
 if TYPE_CHECKING:
     from .store import AccountId, AccountStore
 
@@ -200,15 +198,11 @@ def read_usage(store: AccountStore, account: AccountId, *, now: datetime | None 
 @asynccontextmanager
 async def _refresh_guard(
     store: AccountStore, account: AccountId
-) -> AsyncIterator[int]:
+) -> AsyncIterator[None]:
     stack = ExitStack()
     try:
-        home_fd = await asyncio.to_thread(
-            stack.enter_context,
-            store.lifecycle_guard(account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS),
-        )
         await asyncio.to_thread(stack.enter_context, store.usage_guard(account))
-        yield home_fd
+        yield
     finally:
         await asyncio.shield(asyncio.to_thread(stack.close))
 
@@ -262,7 +256,9 @@ class AccountUsage:
         now: datetime,
         client: httpx.AsyncClient,
     ) -> UsageState | None:
-        async with _refresh_guard(self.store, account) as home_fd:
+        from .store import AccountCredentialLockTimeoutError
+
+        async with _refresh_guard(self.store, account):
             state = read_usage(self.store, account, now=now)
             if state.freshness == "now" or (
                 state.last_attempt_at is not None
@@ -273,7 +269,7 @@ class AccountUsage:
             error: str | None = None
             try:
                 response = await asyncio.wait_for(
-                    self._request(account, home_fd, client), REQUEST_TIMEOUT_SECONDS
+                    self._request(account, client), REQUEST_TIMEOUT_SECONDS
                 )
                 if response.status_code in {401, 403}:
                     error = "authentication failed; log in again"
@@ -297,6 +293,8 @@ class AccountUsage:
                 raise
             except (httpx.HTTPError, TimeoutError):
                 error = "network error; check your connection and retry"
+            except AccountCredentialLockTimeoutError:
+                raise
             except RuntimeError as exc:
                 from ..codex import CodexAuthError
                 from ..providers.anthropic_errors import AnthropicAuthError
@@ -312,11 +310,11 @@ class AccountUsage:
             return UsageState(state.snapshot, usage_freshness(state.snapshot, now), error, now)
 
     async def _request(
-        self, account: AccountId, home_fd: int, client: httpx.AsyncClient
+        self, account: AccountId, client: httpx.AsyncClient
     ) -> httpx.Response:
         from ..codex import CodexCredentialDriver
         from ..providers.anthropic import AnthropicCredentialDriver
-        from .store import AccountCredentials
+        from .store import AccountCredentials, credential_wait_timeout_seconds
 
         driver = (
             AnthropicCredentialDriver()
@@ -324,7 +322,9 @@ class AccountUsage:
             else CodexCredentialDriver()
         )
         credentials = AccountCredentials(self.store, account, driver)
-        token = await credentials._access_token_locked(home_fd, client)
+        token = await credentials.access_token(
+            client, lock_timeout=credential_wait_timeout_seconds()
+        )
         headers = credentials.auth_headers(token)
         headers["accept"] = "application/json"
         if account.provider == "anthropic":

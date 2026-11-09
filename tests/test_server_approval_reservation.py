@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 import zeta.core.session as session_module
+import zeta.core.store._async_writes as async_writes_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
@@ -24,6 +25,7 @@ from tests.test_server import (
     TIMEOUT,
     _connect,
     _frames_until_event,
+    _named_events,
     _read_raw,
     _request,
 )
@@ -36,11 +38,11 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
 )
 from zeta.server import ZetaServer
 from zeta.server.protocol import EventDescriptor, ProtocolError
-from zeta.server.server import LOADED_SESSION_MUTATIONS
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
 
@@ -121,6 +123,104 @@ def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> 
     assert not violations, (
         "approval state writes outside lifecycle swap seam: " + ", ".join(violations)
     )
+
+
+@pytest.mark.asyncio
+async def test_delegated_tool_end_survives_approval_history_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, _foreground = await _approval_server(tmp_path)
+    child_store = ConversationStore(tmp_path / "child")
+    call = ToolCall("child-call", "read", {"path": "/tmp/input"})
+    child_store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+    )
+    policy = server.runtime.policy
+    assert policy is not None
+    request = ApprovalRequest(call.id, call, child_instance_id="child")
+    policy.register_delegated(request, child_store, child_instance_id="child")
+    history_started = asyncio.Event()
+    release_history = asyncio.Event()
+    resolving: asyncio.Task[dict[str, object]] | None = None
+    try:
+        await await_or_fail(
+            server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_APPROVAL_START,
+                    tool_call=call,
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            ),
+            what="delegated approval start",
+        )
+        await await_or_fail(
+            _frames_until_event(reader, "approval_request"), what="approval request"
+        )
+        wire_id = server.control._approvals.wire_id(request.key)
+        original_append = server.control._approvals._append_delegated_history
+
+        async def hold_history(
+            record: object, payload: dict[str, object] | None
+        ) -> object:
+            history_started.set()
+            await await_or_fail(
+                release_history.wait(), what="release approval history"
+            )
+            return await original_append(record, payload)
+
+        # test-contract: seam gates delegated history to force the stale-record order
+        monkeypatch.setattr(
+            server.control._approvals, "_append_delegated_history", hold_history
+        )
+        resolving = asyncio.create_task(
+            server.control.resolve_approval("deny", wire_id)
+        )
+        await await_or_fail(history_started.wait(), what="approval history start")
+        await await_or_fail(
+            server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=call,
+                    tool_result=ToolResult(call.id, "child result"),
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            ),
+            what="child tool end",
+        )
+        release_history.set()
+        await await_or_fail(resolving, what="approval resolution")
+
+        async def read_until_tool_end() -> list[dict[str, object]]:
+            frames: list[dict[str, object]] = []
+            while True:
+                try:
+                    raw = await asyncio.wait_for(_read_raw(reader), 10)
+                except TimeoutError:
+                    return frames
+                frame = json.loads(raw)
+                frames.append(frame)
+                if frame.get("params", {}).get("event") == "tool_end":
+                    return frames
+
+        frames = await await_or_fail(
+            read_until_tool_end(), timeout=20, what="child tool_end publication"
+        )
+        assert len(_named_events(frames, "tool_end")) == 1
+    finally:
+        release_history.set()
+        if resolving is not None and not resolving.done():
+            resolving.cancel()
+        if resolving is not None:
+            await await_or_fail(
+                asyncio.gather(resolving, return_exceptions=True),
+                what="approval resolution cleanup",
+            )
+        await close_serve(server, writer)
+        child_store.close()
 
 
 @pytest.mark.asyncio
@@ -399,25 +499,17 @@ async def test_cancelled_handler_before_durable_commit_does_not_cancel_owner(
     try:
         await server.control._event(_start_event(call))
         store = server.runtime.opened.store
-        entered_helper = asyncio.Event()
-        original_durable = store._to_thread_durable
+        joined_queue = asyncio.Event()
 
-        async def observe_durable(*args: object, **kwargs: object) -> object:
-            # Signal real-helper entry without blocking, so cancellation lands
-            # inside the real durable helper (parked on the held write lock).
-            entered_helper.set()
-            return await original_durable(*args, **kwargs)
-
-        # test-contract: seam observe the real durable helper without replacing it
-        monkeypatch.setattr(store, "_to_thread_durable", observe_durable)
+        # test-contract: seam observes queue admission before durable submission
+        monkeypatch.setattr(store, "_async_write_queued", joined_queue.set)
         # Hold the write lock so the settlement parks before it can commit.
         await store._async_write_lock.acquire()
         settlement = asyncio.create_task(
             server.control.resolve_approval("approve", call.id)
         )
         try:
-            async with asyncio.timeout(10):
-                await entered_helper.wait()
+            await await_or_fail(joined_queue.wait(), what="approval queue admission")
             settlement.cancel()
         finally:
             store._async_write_lock.release()
@@ -547,11 +639,14 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         )
         # the async durable-writer seam does not expose the old registry-thread gate;
         # cleanup may overlap the off-loop history append without publishing a ghost.
-        while ("child", call.id) not in server.control._approvals.state.records:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while ("child", call.id) not in server.control._approvals.state.records:
+                await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
-        await asyncio.wait_for(asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10)
+        await asyncio.wait_for(
+            asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10
+        )
         await server.control.wait_for_approval_settlement()
 
         history = [
@@ -618,13 +713,14 @@ async def test_serve_bound_approval_writes_only_through_settlement(
             )
 
         writers: list[tuple[str, ...]] = []
-        original_resolve = store.resolve_approval
+        original_commit = store.resolve_approval_async
 
-        def record_writer(*args: object, **kwargs: object) -> bool:
+        async def record_writer(*args: object, **kwargs: object) -> object:
             writers.append(tuple(frame.function for frame in inspect.stack()))
-            return original_resolve(*args, **kwargs)
+            return await original_commit(*args, **kwargs)
 
-        monkeypatch.setattr(store, "resolve_approval", record_writer)
+        # test-contract: seam records the settlement-owned durable write
+        monkeypatch.setattr(store, "resolve_approval_async", record_writer)
         assert abort() is None
         await asyncio.sleep(0)
         await server.control.wait_for_approval_settlement()
@@ -683,8 +779,9 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             authorizer.authorize(call, signal, capability=capability)
         )
         if path == "delegated":
-            while key not in server.control._approvals.state.records:
-                await asyncio.sleep(0)
+            async with asyncio.timeout(10):
+                while key not in server.control._approvals.state.records:
+                    await asyncio.sleep(0)
         await server.control._event(
             StreamEvent(
                 StreamEventType.TOOL_APPROVAL_START,
@@ -695,17 +792,24 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             background=path == "delegated",
         )
 
-        original_resolve = store.resolve_approval
+        original_mutation = async_writes_module.execute_mutation
         writes = 0
 
-        def fail_twice_then_recover(*args: object, **kwargs: object) -> bool:
+        def fail_twice_then_recover(
+            writer: ConversationStore,
+            command: object,
+            expected_generation: int,
+        ) -> object:
             nonlocal writes
-            writes += 1
-            if writes <= 2:
-                raise OSError("injected settlement failure")
-            return original_resolve(*args, **kwargs)
+            if type(command).__name__ == "_ResolveApprovalCommand":
+                writes += 1
+                if writes <= 2:
+                    raise OSError("injected settlement failure")
+            return original_mutation(writer, command, expected_generation)
 
-        monkeypatch.setattr(store, "resolve_approval", fail_twice_then_recover)
+        monkeypatch.setattr(
+            async_writes_module, "execute_mutation", fail_twice_then_recover
+        )
         monkeypatch.setattr(server.runtime.loop, "abort", signal.set)
         request_id = server.control._approvals.wire_id(key)
         with pytest.raises(ProtocolError) as error:
@@ -747,9 +851,8 @@ async def _make_unhealthy(
     server: ZetaServer, call: ToolCall, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await server.control._event(_start_event(call))
-    store = server.runtime.opened.store
     monkeypatch.setattr(
-        store,
+        ConversationStore,
         "resolve_approval",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
     )
@@ -1016,11 +1119,10 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             "steer": {"text": "blocked"},
             "switch_branch": {"session_id": session_id, "head_id": "missing"},
         }
-        assert params_by_method.keys() == LOADED_SESSION_MUTATIONS
         old_state = server.runtime.state
         old_metadata = server.runtime.metadata.to_dict()
         old_entries = tuple(server.runtime.opened.store.entries)
-        for request_id, method in enumerate(LOADED_SESSION_MUTATIONS, 20):
+        for request_id, method in enumerate(params_by_method, 20):
             response = (
                 await _request(
                     reader, writer, request_id, method, params_by_method[method]
@@ -1274,9 +1376,8 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
             "abort",
             lambda **kwargs: aborted.append(True),
         )
-        store = server.runtime.opened.store
         monkeypatch.setattr(
-            store,
+            ConversationStore,
             "resolve_approval",
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
         )
@@ -1347,7 +1448,7 @@ async def test_persistent_failure_removes_many_live_child_approvals(
                 background=True,
             )
             monkeypatch.setattr(
-                store,
+                ConversationStore,
                 "resolve_approval",
                 lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
             )
@@ -1640,7 +1741,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         if competing_event != "none":
             original_resolve(call.id, "abort", reason=reasons[competing_event])
         release.set()
-        frames = await asyncio.wait_for(rpc, 10)
+        frames = await await_or_fail(rpc, what="test await")
         await server.control.wait_for_approval_settlement()
 
         resolution = store.approval_resolution_data(call.id)
@@ -1658,7 +1759,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         key = call.id if path == "foreground" else ("child", call.id)
         assert key not in server.control._approvals.state.records
         assert writer_paths
-        assert all("_run_durable_write" in caller for caller in writer_paths)
+        assert all("_run_committed_mutation" in caller for caller in writer_paths)
         if path == "delegated":
             history = [
                 entry.data
@@ -1822,11 +1923,14 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
                 background=True,
             )
         )
-        while ("child", call.id) not in server.control._approvals.state.records:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while ("child", call.id) not in server.control._approvals.state.records:
+                await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
-        await asyncio.wait_for(asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10)
+        await asyncio.wait_for(
+            asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10
+        )
 
         assert child.approval_resolution_data(call.id) == {
             "request_id": call.id,
@@ -1928,6 +2032,69 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
 
 
 @pytest.mark.asyncio
+async def test_reconnect_approval_end_waits_for_hello_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    replacement: asyncio.StreamWriter | None = None
+    hello_held = asyncio.Event()
+    release_hello = asyncio.Event()
+    try:
+        await server.control._event(_start_event(call))
+        writer.close()
+        await await_or_fail(writer.wait_closed(), what="old controller close")
+        await _wait_controller_release(server)
+
+        assert server.connections is not None
+        original_send = server.connections.send
+
+        async def hold_hello(connection: object, payload: bytes) -> bool:
+            if json.loads(payload).get("id") == 10:
+                hello_held.set()
+                await await_or_fail(release_hello.wait(), what="hello response release")
+            return await original_send(connection, payload)
+
+        # test-contract: seam holds the claimed controller before its real hello write
+        monkeypatch.setattr(server.connections, "send", hold_hello)
+        replacement_reader, replacement = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        hello_request = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "hello",
+            "params": {
+                "protocol_version": "1.2",
+                "features": ["approval_reconnect"],
+            },
+        }
+        replacement.write((json.dumps(hello_request) + "\n").encode())
+        await await_or_fail(replacement.drain(), what="hello request write")
+        await await_or_fail(hello_held.wait(), what="held hello response")
+
+        await await_or_fail(
+            server.control.resolve_approval("deny", call.id),
+            what="approval terminal admission",
+        )
+        release_hello.set()
+        first = json.loads(
+            await await_or_fail(_read_raw(replacement_reader), what="first frame")
+        )
+        second = json.loads(
+            await await_or_fail(_read_raw(replacement_reader), what="second frame")
+        )
+
+        assert first.get("id") == 10, f"hello was not first: {first}"
+        assert second["params"]["event"] == "approval_end"
+        assert second["params"]["request_id"] == call.id
+    finally:
+        release_hello.set()
+        await close_serve(server, replacement or writer)
+
+
+@pytest.mark.asyncio
 async def test_approval_reconnect_legacy_claim_during_grace_gets_hello_first_and_no_end_event(
     tmp_path: Path,
 ) -> None:
@@ -1987,9 +2154,11 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         grace = server.control._grace_task
         assert grace is not None
         grace.cancel()
-        await asyncio.wait_for(asyncio.gather(grace, return_exceptions=True), 10)
+        await await_or_fail(
+            asyncio.gather(grace, return_exceptions=True), what="test await"
+        )
         server.approval_reconnect_grace = 0
-        monkeypatch.setattr(server.runtime.opened.store, gate.method, gate.call)
+        gate.install(monkeypatch)
         server.control._grace_task = asyncio.create_task(server.control._expire_grace())
         await _wait_thread_gate(gate)
 
@@ -2010,7 +2179,7 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         gate.release.set()
 
         hello = json.loads(await _read_raw(replacement_reader))
-        assert hello["id"] == 10
+        assert hello.get("id") == 10, hello
     finally:
         gate.release.set()
         await close_serve(server, replacement or writer)
@@ -2026,9 +2195,7 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
     events: list[tuple[str, str | None]] = []
     original_admit = server.control._admit_controller
 
-    def record(
-        event: str, session_id: str | None = None, **fields: object
-    ) -> object:
+    def record(event: str, session_id: str | None = None, **fields: object) -> object:
         request_id = fields.get("request_id")
         events.append((event, request_id if isinstance(request_id, str) else None))
         return original_admit(event, session_id, **fields)

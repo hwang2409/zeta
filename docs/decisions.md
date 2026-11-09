@@ -23,14 +23,19 @@ The popup is a finder-style overlay. It lists one row per open decision with
 the asking session's project and id, the title, a short `why`, and any offered
 options. Move with `↑/↓` (or `j/k`). For the selected decision:
 
-- Press a number `1`–`9` to send one of the offered options.
-- Press `a` to type one short line, then Enter to send it.
+- Press a number `1`–`9` to stage one of the offered options.
+- Press `a` to type one short line, then Enter to stage it.
 - Press `Enter` to discuss the decision (see below).
 - Press `Esc` to close the popup. This never switches sessions.
 
-A quick answer (an option or a typed line) is delivered to the asking
-orchestrator's inbox exactly like a discussion-fork decision, and the item
-closes. Quick answers work for decisions from any live session. If you answer an orchestrator's pending decision in the main chat, the orchestrator can call `resolve_attention` with the attention id and answer to close its own item without sending an inbox message.
+A quick answer (an option or a typed line) is staged while the popup stays open.
+The TUI delivers all staged answers in one inbox message when you answer the
+last item or close the popup, then closes those items. This reduces lag and lets
+the asking orchestrator process the answers in one turn. Quick answers work for
+decisions from any live session. If you answer an orchestrator's pending
+decision in the main chat, the orchestrator can call `resolve_attention` with
+the attention id and answer to close its own item without sending an inbox
+message.
 
 ## Discussing a decision
 

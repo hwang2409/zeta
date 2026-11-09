@@ -31,6 +31,7 @@ from ..checkpoints import (
     _now,
     load_session_json,
 )
+from ..checkpoints.entry_types import sent_message_receipts
 from ..session_files import open_session_file
 from ..transcript_recovery import (
     TRANSCRIPT_REPAIR_EPOCH,
@@ -39,7 +40,6 @@ from ..transcript_recovery import (
     reconcile_pending,
     repair_transcript,
 )
-from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
@@ -231,6 +231,9 @@ class _FullLoadValidator:
         self.store = store
         self.raw = raw
         self.stat = stat
+        # The resident rows stay a prefix only if the digest at their count matches.
+        self.baseline = (len(store._entries), store._entry_prefix_digest)
+        self._digest_at_baseline: bytes | None = b"" if not store._entries else None
         self.state = copy.copy(store)
         self.state._entries = []
         self.state._entry_prefix_digest = b""
@@ -344,6 +347,8 @@ class _FullLoadValidator:
         self.rows_by_id[entry.id] = row
         self.state._entry_ids.add(entry.id)
         self.state._record_entry_prefix(entry)
+        if len(self.state._entries) == self.baseline[0]:
+            self._digest_at_baseline = self.state._entry_prefix_digest
         self.state._sent_message_receipts.extend(sent_message_receipts(entry))
         if (
             entry.type == "notification"
@@ -437,8 +442,15 @@ class _FullLoadValidator:
         if self.state._entries:
             self._select_branch(self.state._entries[-1])
         self.state._rebuild_client_deliveries(self.state._entries)
+        if self.resets_resident_rows:
+            self.store._reset_generation += 1
         for attribute in self._STATE_ATTRIBUTES:
             setattr(self.store, attribute, getattr(self.state, attribute))
+
+    @property
+    def resets_resident_rows(self) -> bool:
+        """True when the loaded log is not an extension of the resident rows."""
+        return self._digest_at_baseline != self.baseline[1]
 
 
 class ConversationLogMixin:
@@ -600,25 +612,6 @@ class ConversationLogMixin:
             return
         self._publish_prepared_entries_installed(self._owned_installed_delta(delta))
 
-    @classmethod
-    def _installed_delta_from_baseline(
-        cls,
-        entries: list[ConversationEntry],
-        baseline: tuple[int, bytes],
-    ) -> InstalledEntriesDelta:
-        """Prepare an owned suffix, or reset when the old log is not a prefix."""
-        count, expected_digest = baseline
-        if count > len(entries):
-            return "reset"
-        digest = b""
-        for index in range(count):
-            digest = cls._next_entry_prefix_digest(
-                digest, cls._encoded_entry_line(entries[index])
-            )
-        if digest != expected_digest:
-            return "reset"
-        return cls._owned_installed_delta(tuple(entries[count:]))
-
     def _install_log_state(
         self: ConversationStore, state: _DetachedLogState
     ) -> _DetachedLogState:
@@ -754,6 +747,8 @@ class ConversationLogMixin:
             self._sent_message_receipts = []
             self._reset_incremental_validation_state()
             self._rebuild_client_deliveries(self._entries)
+            if had_entries:
+                self._reset_generation += 1
             header = {
                 "schema": SCHEMA,
                 "session_id": self.session_id,
@@ -952,7 +947,7 @@ class ConversationLogMixin:
             yield _PhysicalRow(row_number, row_offset, value)
 
     def _repair_explicit_load_error(
-        self: ConversationStore, error: TranscriptLoadError
+        self: ConversationStore, error: TranscriptLoadError, since: tuple[int, int]
     ) -> bool:
         if not self._repair_explicit or error._source_facts is None:
             return False
@@ -966,7 +961,7 @@ class ConversationLogMixin:
             memory_review_required=self._repair_target.child_run_id is None,
         )
         self._repair_explicit = False
-        self._load_full()
+        self._load_full(since)
         return True
 
     def _repair_torn_row(
@@ -975,14 +970,14 @@ class ConversationLogMixin:
         validator: _FullLoadValidator,
         stat: os.stat_result,
         raw: bytes,
-        delta: tuple[ConversationEntry, ...],
+        since: tuple[int, int],
     ) -> bool:
         if torn_offset is None:
             return False
         if self._storage_lease.observed_epoch != WRITER_EPOCH:
             self._repair_torn_tail_legacy(torn_offset)
             self._log_offset = torn_offset
-            self._publish_entries_installed(delta)
+            self._publish_reload(since)
             self._append_torn_warning_legacy()
             return True
         prefix = validator.validated_prefix(torn_offset)
@@ -1009,10 +1004,27 @@ class ConversationLogMixin:
             RuntimeWarning,
             stacklevel=2,
         )
-        self._load_full()
+        self._load_full(since)
         return True
 
-    def _load_full(self: ConversationStore) -> None:
+    def _publish_reload(self: ConversationStore, since: tuple[int, int]) -> None:
+        """Publish one reload: a reset if any install in it bumped the generation."""
+        if self.on_entries_installed is None:
+            return
+        generation, count = since
+        self._publish_entries_installed(
+            "reset"
+            if self._reset_generation != generation
+            else tuple(self._entries[count:])
+        )
+
+    def _load_full(
+        self: ConversationStore, since: tuple[int, int] | None = None
+    ) -> None:
+        # Nested reloads (repairs) receive the outer reload's start, so the
+        # whole operation publishes once against the rows resident before it.
+        if since is None:
+            since = (self._reset_generation, len(self._entries))
         self._full_reload_count += 1
         if not self._read_only and self._storage_lease.observed_epoch == WRITER_EPOCH:
             reconcile_pending(
@@ -1020,7 +1032,6 @@ class ConversationLogMixin:
                 self._repair_target,
                 strict_reopen=self._strict_reopen_repaired_transcript,
             )
-        baseline = (len(self._entries), self._entry_prefix_digest)
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
             stat = os.fstat(fd)
@@ -1040,23 +1051,17 @@ class ConversationLogMixin:
                 validator.accept(physical_row)
             validator.finish()
         except TranscriptLoadError as error:
-            if self._repair_explicit_load_error(error):
+            if self._repair_explicit_load_error(error, since):
                 return
             raise
 
-        delta = (
-            self._installed_delta_from_baseline(self._entries, baseline)
-            if self.on_entries_installed is not None
-            else ()
-        )
-        if self._repair_torn_row(torn_offset, validator, stat, raw, delta):
+        if self._repair_torn_row(torn_offset, validator, stat, raw, since):
             return
         if not self._read_only and not raw.endswith(b"\n"):
             self._write_bytes(b"\n")
-            self._publish_entries_installed(delta)
         else:
             self._set_log_stat(stat)
-            self._publish_entries_installed(delta)
+        self._publish_reload(since)
 
     def _validate_header(self: ConversationStore, header: dict[str, Any]) -> None:
         header_data = header.get("data")

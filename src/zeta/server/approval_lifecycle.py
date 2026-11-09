@@ -21,7 +21,7 @@ from .approval_settlement.approval_grants import (
     finish_grant,
 )
 from .connections import Admission
-from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
+from .protocol import ApprovalDecision, ErrorDescriptor, EventDescriptor, ProtocolError
 
 Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
@@ -63,7 +63,7 @@ class Start:
 
 @dataclass(frozen=True, slots=True)
 class Decide:
-    method: str
+    method: ApprovalDecision
     request_id: str
     scope: str = "once"
 
@@ -661,7 +661,7 @@ class ApprovalLifecycle:
                     ErrorDescriptor.INVALID_PARAMS,
                     f"cannot always allow approval request: {exc}",
                 ) from exc
-        decision = "allow" if method == "approve" else "deny"
+        decision = "allow" if method is ApprovalDecision.APPROVE else "deny"
         record = self._reserve(record, decision)
         if record is None:
             raise ProtocolError(
@@ -980,6 +980,9 @@ class ApprovalLifecycle:
         history_outcome: OSError | asyncio.CancelledError | None = None
         try:
             history_outcome = await self._append_delegated_history(record, payload)
+            current = self._state.records.get(record.target.key)
+            if current is not None and current.token == record.token:
+                record = current
             if payload is not None and record.published:
                 if isinstance(record.target.key, tuple):
                     terminal = record.terminal

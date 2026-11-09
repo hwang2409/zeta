@@ -7,7 +7,7 @@ import time
 
 from ...protocol.types import Message, ToolResult, ToolUseContent
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
-from ._startup_facts import sent_message_receipts
+from ..checkpoints.entry_types import sent_message_receipts
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     TASK_EXITED_NOTIFICATION_KIND,

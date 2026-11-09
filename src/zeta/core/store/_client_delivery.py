@@ -20,6 +20,11 @@ from ...protocol.types import (
     require_new_message_origin,
 )
 from ...storage_format import reject_unknown_keys
+from ._async_writes import (
+    _AppendClientDeliveryCommand,
+    _DeliverClientSteeringCommand,
+    _DropClientSteeringCommand,
+)
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
@@ -32,7 +37,9 @@ DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 DeliveryMethod = Literal["send", "steer"]
 DeliveryStatus = Literal["queued", "delivered", "dropped"]
-DeliveryDropReason = Literal["restart", "abort", "clear", "disconnect", "turn_end", "failed"]
+DeliveryDropReason = Literal[
+    "restart", "abort", "clear", "disconnect", "turn_end", "failed"
+]
 
 _OUTCOME_BYTES: dict[DeliveryStatus, bytes] = {
     "queued": b"q",
@@ -75,9 +82,7 @@ def valid_client_delivery_id(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and DELIVERY_ID_PATTERN.fullmatch(value) is not None
 
 
-def validate_client_delivery_data(
-    data: Mapping[str, object], session_id: str
-) -> None:
+def validate_client_delivery_data(data: Mapping[str, object], session_id: str) -> None:
     """Validate one acceptance or terminal transition record."""
 
     delivery_id = data.get("delivery_id")
@@ -92,10 +97,15 @@ def validate_client_delivery_data(
             reject_unknown_keys(data, "client_delivery_send_acceptance")
             if isinstance(outcome, Mapping):
                 reject_unknown_keys(outcome, "client_delivery_accepted_outcome")
-            valid_acceptance = status == "delivered" and outcome == {"accepted": True, "session_id": session_id}
+            valid_acceptance = (
+                status == "delivered"
+                and outcome == {"accepted": True, "session_id": session_id}
+            )
         else:
             if "accepted_message" in data:
-                reject_unknown_keys(data, "client_delivery_queued_steer_acceptance_message")
+                reject_unknown_keys(
+                    data, "client_delivery_queued_steer_acceptance_message"
+                )
             else:
                 reject_unknown_keys(data, "client_delivery_steer_acceptance")
             if isinstance(outcome, Mapping):
@@ -118,7 +128,12 @@ def validate_client_delivery_data(
         valid_transition = method == "steer" and reason is None
     else:
         reject_unknown_keys(data, "client_delivery_dropped_transition")
-        valid_transition = method == "steer" and status == "dropped" and reason in {"restart", "abort", "clear", "disconnect", "turn_end", "failed"}
+        valid_transition = (
+            method == "steer"
+            and status == "dropped"
+            and reason
+            in {"restart", "abort", "clear", "disconnect", "turn_end", "failed"}
+        )
     if not valid_transition:
         raise ValueError("invalid client delivery")
 
@@ -213,7 +228,9 @@ class ClientDeliveryMixin:
                 )
         return len(ids)
 
-    def client_delivery(self: ConversationStore, delivery_id: str) -> ClientDelivery | None:
+    def client_delivery(
+        self: ConversationStore, delivery_id: str
+    ) -> ClientDelivery | None:
         """Return one detail-retained delivery without reading the conversation log."""
 
         return self._client_deliveries.get(delivery_id)
@@ -271,7 +288,11 @@ class ClientDeliveryMixin:
                 rows.append(
                     (
                         "message",
-                        {"message": tag_client_delivery(message, delivery_id).to_dict()},
+                        {
+                            "message": tag_client_delivery(
+                                message, delivery_id
+                            ).to_dict()
+                        },
                     )
                 )
             self._append_many_unlocked(rows)
@@ -292,15 +313,16 @@ class ClientDeliveryMixin:
     ) -> ClientDelivery:
         """Append off-loop, then run the effect callback after publication."""
 
-        return await self._to_thread_durable(
-            self.append_client_delivery,
-            delivery_id,
-            method,
-            status,
-            outcome,
-            message=message,
-            accepted_message=accepted_message,
-            _on_persisted=on_persisted,
+        return await self._commit_storage_command(
+            _AppendClientDeliveryCommand(
+                delivery_id=delivery_id,
+                method=method,
+                status=status,
+                outcome=outcome,
+                message=message,
+                accepted_message=accepted_message,
+                callback=on_persisted,
+            )
         )
 
     def queue_client_steering(
@@ -331,7 +353,9 @@ class ClientDeliveryMixin:
     ) -> None:
         """Publish a dispatched steering batch as one durable append."""
 
-        await self._to_thread_durable(self._deliver_client_steering, batch)
+        await self._commit_storage_command(
+            _DeliverClientSteeringCommand(batch=batch)
+        )
         for expected in batch._queued:
             if not self._client_steering or self._client_steering[0] != expected:
                 raise RuntimeError("client steering queue changed during delivery")
@@ -366,7 +390,9 @@ class ClientDeliveryMixin:
             if rows:
                 self._append_many_unlocked(rows)
 
-    def drop_client_steering(self: ConversationStore, reason: DeliveryDropReason) -> int:
+    def drop_client_steering(
+        self: ConversationStore, reason: DeliveryDropReason
+    ) -> int:
         """Durably drop every queued delivery before releasing queue ownership."""
 
         queued = tuple(self._client_steering)
@@ -403,8 +429,8 @@ class ClientDeliveryMixin:
         """Commit queued drops off-loop, then release their queue ownership."""
 
         queued = tuple(self._client_steering)
-        entries = await self._to_thread_durable(
-            self._drop_client_steering, queued, reason
+        entries = await self._commit_storage_command(
+            _DropClientSteeringCommand(queued=queued, reason=reason)
         )
         messages = {
             item.delivery_id: without_client_delivery_marker(item.message)
@@ -418,9 +444,7 @@ class ClientDeliveryMixin:
         return tuple((entry, messages[entry.data["delivery_id"]]) for entry in entries)
 
 
-def image_payload_digest(
-    text: str, images: list[tuple[str, str, bytes]]
-) -> str:
+def image_payload_digest(text: str, images: list[tuple[str, str, bytes]]) -> str:
     """Fingerprint the semantic payload of one ``send_images`` request."""
 
     digest = hashlib.sha256()
