@@ -86,8 +86,13 @@ class MemoryTransactions:
                     return HealthyMemoryProjection(
                         project_id, 2, snapshot.version, snapshot.digest, snapshot, memory
                     )
-                snapshot = registry._snapshot_locked(directory_fd)
-                contents = snapshot.contents
+                pointer = registry._pointer(directory_fd)
+                if pointer is None:
+                    contents = dict(registry._legacy_contents(directory_fd))
+                    snapshot = MemorySnapshot(contents, registry._memory_digest_value(contents))
+                else:
+                    snapshot = registry._snapshot_locked(directory_fd)
+                    contents = snapshot.contents
                 try:
                     automatic = registry._automatic_files_from_records(
                         registry._records_locked(directory_fd)
