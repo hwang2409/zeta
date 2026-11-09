@@ -904,7 +904,7 @@ class ConnectionRegistry(ReplayOutput):
         )
 
     async def read_session(
-        self, connection: Any, method: str, params: dict[str, Any]
+        self, connection: Any, method: MethodDescriptor, params: dict[str, Any]
     ) -> object:
         target = capture_read(connection, method, params)
         features = history_features(self._connections[connection].features)
@@ -953,43 +953,43 @@ class ConnectionRegistry(ReplayOutput):
         descriptor = MethodDescriptor.for_wire(method)
         if descriptor is None or descriptor.access.value != "read":
             return False, None
-        if method == "list_sessions" and "project_id" in params:
+        if descriptor is MethodDescriptor.LIST_SESSIONS and "project_id" in params:
             raise ProtocolError(
                 ErrorDescriptor.OBSERVER_READ_ONLY,
                 "method is unavailable to read-only observers",
                 {"method": method},
             )
         if method not in {
-            "list_sessions",
-            "status",
-            "session_tree",
-            "session_history",
-            "model_catalog",
-            "session_settings",
-            "content_read",
+            MethodDescriptor.LIST_SESSIONS.wire,
+            MethodDescriptor.STATUS.wire,
+            MethodDescriptor.SESSION_TREE.wire,
+            MethodDescriptor.SESSION_HISTORY.wire,
+            MethodDescriptor.MODEL_CATALOG.wire,
+            MethodDescriptor.SESSION_SETTINGS.wire,
+            MethodDescriptor.CONTENT_READ.wire,
         }:
             return False, None
-        if method in {"session_tree", "session_history"}:
-            return True, await self.read_session(connection, method, params)
-        if method == "content_read":
+        if method in {MethodDescriptor.SESSION_TREE, MethodDescriptor.SESSION_HISTORY}:
+            return True, await self.read_session(connection, descriptor, params)
+        if method is MethodDescriptor.CONTENT_READ:
             if "content_read" not in state.features:
                 raise ProtocolError(
                     ErrorDescriptor.METHOD_NOT_FOUND,
                     "content_read requires the negotiated content_read feature",
                 )
-            target = capture_read(connection, method, params)
+            target = capture_read(connection, descriptor, params)
             return True, await self.run_read(
                 connection,
-                lambda: perform_read(method, target, params),
+                lambda: perform_read(descriptor, target, params),
                 session_id=target[0],
             )
-        if method == "list_sessions":
+        if descriptor is MethodDescriptor.LIST_SESSIONS:
             result, _ = await self.run_read(
                 connection, lambda: lifecycle.list_sessions(connection, request_id, params)
             )
             return True, result
         fallback_config = None
-        if method == "status" and connection.server.runtime.loop is None:
+        if descriptor is MethodDescriptor.STATUS and connection.server.runtime.loop is None:
             fallback_config = await self.run_blocking(
                 lambda: connection.server.runtime._config(None, None)
             )
@@ -1107,13 +1107,13 @@ def _capture_status(client: Any, fallback_config: Any) -> tuple[str | None, obje
 
 def capture_read(
     client: Any,
-    method: str,
+    method: MethodDescriptor,
     params: dict[str, Any],
     *,
     fallback_config: Any = None,
 ) -> tuple[str | None, object]:
     runtime = client.server.runtime
-    if method == "content_read":
+    if method is MethodDescriptor.CONTENT_READ:
         if set(params) - {"handle", "offset", "limit"}:
             raise ProtocolError(
                 ErrorDescriptor.INVALID_CONTENT_READ,
@@ -1124,14 +1124,14 @@ def capture_read(
                 ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
             )
         return runtime.session_id, runtime.opened.store
-    if method in {"session_tree", "session_history"}:
+    if method in {MethodDescriptor.SESSION_TREE, MethodDescriptor.SESSION_HISTORY}:
         store = validation.active(runtime, params)
         return runtime.session_id, store
-    if method == "status":
+    if method is MethodDescriptor.STATUS:
         return _capture_status(client, fallback_config)
-    if method == "model_catalog":
+    if method is MethodDescriptor.MODEL_CATALOG:
         return None, settings.catalog(runtime)
-    if method == "session_settings":
+    if method is MethodDescriptor.SESSION_SETTINGS:
         return runtime.session_id, settings.settings(runtime)
     raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
 
@@ -1155,7 +1155,7 @@ def project_status(target: object, *, served_turn_end: bool = False) -> dict[str
 
 
 def perform_read(
-    method: str,
+    method: MethodDescriptor,
     target: tuple[str | None, object],
     params: dict[str, Any],
     *,
@@ -1165,18 +1165,18 @@ def perform_read(
     content_read: bool = False,
     served_turn_end: bool = False,
 ) -> object:
-    if method == "status":
+    if method is MethodDescriptor.STATUS:
         return project_status(target[1], served_turn_end=served_turn_end)
 
-    if method in {"model_catalog", "session_settings"}:
+    if method in {MethodDescriptor.MODEL_CATALOG, MethodDescriptor.SESSION_SETTINGS}:
         return target[1]
     store = target[1]
     runtime = type(
         "ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()}
     )()
-    if method == "session_tree":
+    if method is MethodDescriptor.SESSION_TREE:
         return session.tree(runtime)
-    if method == "session_history":
+    if method is MethodDescriptor.SESSION_HISTORY:
         return history.history(
             runtime,
             params,
@@ -1186,7 +1186,7 @@ def perform_read(
             content_read=content_read,
             served_turn_end=served_turn_end,
         )
-    if method == "content_read":
+    if method is MethodDescriptor.CONTENT_READ:
         return content.read(
             store,
             params.get("handle"),
