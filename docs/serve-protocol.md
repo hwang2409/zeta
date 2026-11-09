@@ -183,6 +183,8 @@ feature. Observer connections receive only methods with `read` access.
 | `delivery_status` | `1.0` | `delivery_id` | `read` |
 | `session_grants` | `1.1` | `session_grants` | `read` |
 | `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
+| `child_run_list` | `1.0` | `child_runs` | `controller_read` |
+| `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 
 ## common JSON-RPC shapes
 
@@ -748,6 +750,27 @@ while pending or already authorized calls are unchanged. A controller handoff
 or observer reconnect gets no replay: the client reads `session_grants` for
 the current state.
 
+### child runs (`child_runs` feature)
+
+`child_run_list` lets the controller inspect child runs owned by the active
+session. Params are `session_id` plus optional nonnegative `offset` and `limit`
+from 1 to 100. The result is `runs` and, when more rows remain, `next_offset`.
+Each row contains `run_id`, the top-level `session_id`, nullable
+`parent_run_id`, `description`, `agent_type`, `status`, `accepts_follow_ups`,
+`turns_used`, `tool_count`, `current_step`, `started_at`, optional or null
+`finished_at`, and `elapsed_seconds`. `tool_count` is the total for the whole
+child run, cumulative across its follow-up segments, and never decreases. The
+public `run_id` is the existing child
+instance id. Child-local store ids and the agent tool's `handle` name are not
+exposed.
+
+`child_run_send` queues one message at the child's existing safe delivery
+point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
+`{"accepted":true,"run_id":"..."}`. A missing or terminal child returns
+`-32005`. Both methods return `-32601` unless `child_runs` was negotiated, and
+observers cannot call either method. This feature emits no event; clients call
+`child_run_list` again to read changes.
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`
@@ -819,6 +842,12 @@ The result contains `session` (full metadata or `null`), `state` (`idle`,
 `delegated`. Delegated approvals also have `agent_instance_id`, the child agent
 instance that owns the approval. An approval may also carry `label`, an optional
 display-only string naming the call's target; it is absent when there is none.
+
+`state` is `"running"` whenever `send` would refuse with `-32004`
+(`a turn is already running`) because `turn_busy()` is true. If the server is
+unhealthy because approval persistence failed, `state` remains `"idle"` and
+`send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
+separate error and does not change the unhealthy status behavior.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
@@ -1695,6 +1724,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
+| `child_runs` | adds controller-only `child_run_list` and `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to

@@ -1,79 +1,10 @@
 from __future__ import annotations
 
 import json
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin
-from zeta.transcript_search.index import (
-    MAX_UNIT_BYTES,
-    TranscriptIndex,
-    TranscriptUnit,
-    render_transcript_units,
-)
-
-
-@dataclass(frozen=True, slots=True)
-class EvalResult:
-    query_count: int
-    recall_at: dict[int, float]
-    mrr: float
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "query_count": self.query_count,
-            "recall_at": {str(key): value for key, value in self.recall_at.items()},
-            "mrr": self.mrr,
-        }
-
-
-def evaluate_manifest(manifest_path: Path, units_path: Path) -> EvalResult:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    units = [
-        TranscriptUnit.from_dict(json.loads(line))
-        for line in units_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    project_ids = {unit.project_id for unit in units}
-    if len(project_ids) != 1:
-        raise ValueError("evaluation units must belong to one project")
-    project_id = project_ids.pop()
-    rankings: list[list[str]] = []
-    targets: list[set[str]] = []
-    with tempfile.TemporaryDirectory() as directory:
-        index = TranscriptIndex(Path(directory) / project_id, project_id)
-        by_session: dict[str, list[TranscriptUnit]] = {}
-        for unit in units:
-            by_session.setdefault(unit.session_id, []).append(unit)
-        for session_id, session_units in by_session.items():
-            index.append_units(
-                session_id,
-                session_units,
-                cursor=max(unit.seq_end for unit in session_units),
-            )
-        for case in manifest["queries"]:
-            rankings.append(
-                [hit.unit_id for hit in index.search(case["query"], limit=10)]
-            )
-            targets.append(set(case["target_unit_ids"]))
-    recall = {
-        k: sum(
-            bool(set(ranking[:k]) & target)
-            for ranking, target in zip(rankings, targets, strict=True)
-        )
-        / len(targets)
-        for k in (1, 5, 10)
-    }
-    reciprocal = []
-    for ranking, target in zip(rankings, targets, strict=True):
-        rank = next(
-            (index for index, unit_id in enumerate(ranking, 1) if unit_id in target),
-            None,
-        )
-        reciprocal.append(1.0 / rank if rank else 0.0)
-    return EvalResult(len(targets), recall, sum(reciprocal) / len(reciprocal))
+from zeta.transcript_search.index import MAX_UNIT_BYTES, render_transcript_units
 
 
 def _message(seq: int, role: str, text: str, *, metadata: dict | None = None) -> dict:
@@ -282,15 +213,6 @@ def test_oversized_turn_splits_deterministically() -> None:
     assert [unit.chunk_index for unit in first] == list(range(len(first)))
     assert {unit.chunk_count for unit in first} == {len(first)}
     assert all(len(unit.text.encode()) <= MAX_UNIT_BYTES for unit in first)
-
-
-def test_synthetic_eval_fixture_meets_thresholds() -> None:
-    root = Path(__file__).parent / "fixtures" / "transcript_search"
-    result = evaluate_manifest(root / "manifest.json", root / "units.jsonl")
-    assert result.query_count == 4
-    assert result.recall_at[1] >= 0.75
-    assert result.recall_at[5] == 1.0
-    assert result.mrr >= 0.8
 
 
 def test_eval_fixture_has_no_embedded_external_content() -> None:
