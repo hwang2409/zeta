@@ -988,18 +988,34 @@ def load_project_context(
                             )
                     else:
                         try:
-                            context_entries = (
-                                project_projection.memory
-                                if project_projection is not None
-                                else available_registry.memory_transactions.read(
+                            memory_projection = (
+                                available_registry.memory_transactions.read(
                                     project.project_id
-                                ).memory
+                                )
+                                if project_projection is None
+                                else None
+                            )
+                            if (
+                                memory_projection is not None and memory_projection.format == 2
+                            ) or (
+                                project_projection is not None
+                                and project_projection.entry_memory is not None
+                            ):
+                                raise UnsupportedMemoryFormatError
+                            context_entries = (
+                                    project_projection.memory
+                                    if project_projection is not None
+                                else memory_projection.memory
                             )
                         except UnsupportedMemoryFormatError:
                             assert available_registry is not None
-                            snapshot = available_registry.memory_transactions.read(
-                                project.project_id
-                            ).snapshot
+                            snapshot = (
+                                project_projection.entry_memory
+                                if project_projection is not None
+                                else available_registry.memory_transactions.read(
+                                    project.project_id
+                                ).snapshot
+                            )
                             entry_projection = render_entry_memory(
                                 snapshot.state,
                                 now=utc_now(),
