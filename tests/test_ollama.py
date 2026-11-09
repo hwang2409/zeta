@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from functools import partial
 from pathlib import Path
 
 import httpx
 import pytest
 
-from tests.support.completion import completion_control
+from tests.support.completion import ManualDeadlineClock, completion_control
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent.durable import durable_message
@@ -28,6 +29,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.providers.completion import TRANSPORT_IDLE_SECONDS
 from zeta.providers.factory import build_backend
 from zeta.providers.ollama import DEFAULT_OLLAMA_MODEL, OllamaBackend, OllamaError
 from zeta.runtime.cleanup import close_session
@@ -1557,10 +1559,112 @@ async def test_ollama_stall_zero_allows_progressing_real_transport(
         assert transport.closed_streams == 1
 
 
-@pytest.mark.asyncio
+class _ReadTrackingTransport(_LoopbackAsyncHTTPTransport):
+    """Mark when the client has headers and when it has read a body chunk."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.headers_received = asyncio.Event()
+        self.chunk_read = asyncio.Event()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await super().handle_async_request(request)
+        inner = response.stream
+        chunk_read = self.chunk_read
+
+        class _Tracking(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                async for chunk in inner:
+                    chunk_read.set()
+                    yield chunk
+
+            async def aclose(self) -> None:
+                await inner.aclose()
+
+        response.stream = _Tracking()
+        self.headers_received.set()
+        return response
 
 
-@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["error_body", "headers_then_silence"])
+async def test_owner_stall_retries_real_ollama_stream_once_and_closes_it(
+    tcp_http_server: _TCPHTTPServer, phase: str
+) -> None:
+    """The owner deadline covers every read of a real Ollama response.
+
+    The first response stalls on the real loopback socket: either after an HTTP
+    500 and part of its error body, or after 200 headers and before any frame.
+    Production idle constants run on a manual clock; nothing sleeps.
+    """
+    never = asyncio.Event()
+    if phase == "error_body":
+        stalled = partial(
+            _response, body_chunks=[b"error prefix", b" delayed suffix"], status=500, wait=never
+        )
+        second = partial(_response, body_chunks=[b"final error"], status=400)
+    else:
+        stalled = partial(
+            _response, body_chunks=[b'{"message":{"content":"late"}}\n'], wait_before=never
+        )
+        second = partial(
+            _response, body_chunks=[b'{"message":{"content":"ok"},"done":true}\n']
+        )
+    tcp_http_server.scripts.extend([stalled, second])
+    transport = _ReadTrackingTransport()
+    clock = ManualDeadlineClock()
+    events: list = []
+    async with httpx.AsyncClient(transport=transport) as client:
+        backend = OllamaBackend(client=client, base_url=tcp_http_server.url)
+        backend._completion_clock = clock
+        backend._completion_wait = _no_retry_wait
+
+        async def collect() -> None:
+            async for event in backend.complete([], [], control=completion_control()):
+                events.append(event)
+
+        task = asyncio.create_task(collect())
+        passed = False
+        try:
+            gate = (
+                transport.chunk_read
+                if phase == "error_body"
+                else transport.headers_received
+            )
+            await await_or_fail(gate.wait(), what="first response read")
+            await clock.expire_next()
+            outcome = (
+                await await_or_fail(
+                    asyncio.gather(task, return_exceptions=True), what="completion"
+                )
+            )[0]
+            retries = [event for event in events if event.type is StreamEventType.RETRY]
+            assert [event.data.get("is_stall") for event in retries] == [True]
+            if phase == "error_body":
+                assert isinstance(outcome, OllamaError)
+                assert str(outcome) == "Ollama HTTP 400: final error"
+            else:
+                assert outcome is None
+                assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
+            assert tcp_http_server.calls == 2
+            # the stall fired at the production transport idle bound (90 s), not a shrunk one
+            assert clock.current == TRANSPORT_IDLE_SECONDS
+            assert transport.closed_streams == 2
+            passed = True
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+            try:
+                await asyncio.wait_for(backend.aclose(), 10)
+            except TimeoutError:
+                # an unclosed attempt keeps its client lease; keep the failed
+                # behavior assertion as the reported cause.
+                if passed:
+                    raise
+
+
+async def _no_retry_wait(_delay: float) -> None:
+    return None
 
 
 async def test_ollama_rejects_images() -> None:
