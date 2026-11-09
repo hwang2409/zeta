@@ -1343,22 +1343,25 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
             settlement: asyncio.Task[object] | None = None
             gate_owner: asyncio.Task[object] | None = None
             if case in {"cancel_settle", "external_end"}:
-                original_durable = ConversationStore._to_thread_durable
+                original_commit = ConversationStore._commit_storage_command
 
-                async def gated_durable(*args: object, **kwargs: object) -> object:
+                async def gated_commit(
+                    store: ConversationStore, command: object
+                ) -> object:
                     nonlocal gate_owner
-                    gate_owner = asyncio.current_task()
-                    record = server.control._approvals.state.records["call-1"]
-                    assert gate_owner is record.settlement
-                    result = await original_durable(*args, **kwargs)
-                    # test-contract: seam gate the named production await
-                    entered.set()
-                    await await_or_fail(release.wait(), what="durable settlement")
+                    result = await original_commit(store, command)
+                    if type(command).__name__ == "_ResolveApprovalCommand":
+                        gate_owner = asyncio.current_task()
+                        record = server.control._approvals.state.records["call-1"]
+                        assert gate_owner is record.settlement
+                        # test-contract: seam gate the named production await
+                        entered.set()
+                        await await_or_fail(release.wait(), what="durable settlement")
                     return result
 
-                # test-contract: seam gate the real durable await without a production seam
+                # test-contract: seam gate the typed durable write owner
                 monkeypatch.setattr(
-                    ConversationStore, "_to_thread_durable", gated_durable
+                    ConversationStore, "_commit_storage_command", gated_commit
                 )
             elif case == "cancel_finish" and GrantPublication is not None:
                 original_finish_grant = approval_lifecycle.finish_grant

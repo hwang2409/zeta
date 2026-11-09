@@ -8,6 +8,7 @@ from typing import Any
 from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
 from ._approval_display import validated_approval_display
+from ._async_writes import _AppendApprovalHistoryCommand
 from ._incremental_validation import APPROVAL_RESOLUTION_REASONS
 
 
@@ -87,7 +88,9 @@ class ApprovalHistoryStoreMixin:
         self, payload: Mapping[str, Any]
     ) -> ConversationEntry:
         """Append delegated history through the store's durable writer."""
-        return await self._to_thread_durable(self.append_approval_history, payload)
+        return await self._commit_storage_command(
+            _AppendApprovalHistoryCommand(payload=payload)
+        )
 
     def approval_resolution_data(self, request_id: str) -> dict[str, str] | None:
         """Read a published approval resolution without touching the log."""
