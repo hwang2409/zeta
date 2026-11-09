@@ -12,14 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from ..core.session_files import child_directory, write_session_file
-from ..core.store._client_delivery import (
+from ...core.session_files import child_directory, write_session_file
+from ...core.store._client_delivery import (
     image_payload_digest as _semantic_image_payload_digest,
 )
-from ..media.image_normalization import normalize_image_bytes
-from ..media.image_policy import image_policy_for_provider
-from ..media.images import image_signature_matches
-from ..protocol.types import (
+from ...media.image_normalization import normalize_image_bytes
+from ...media.image_policy import image_policy_for_provider
+from ...media.images import image_signature_matches
+from ...protocol.types import (
     ImageContent,
     Message,
     MessageOrigin,
@@ -27,8 +27,8 @@ from ..protocol.types import (
     TextContent,
     with_message_origin,
 )
-from .protocol import ErrorDescriptor, ProtocolError
-from .runtime import ServerRuntime
+from ..protocol import ErrorDescriptor, ProtocolError
+from ..runtime import ServerRuntime
 
 MAX_IMAGE_BYTES = 512 * 1024
 IMAGE_EXTENSIONS = {

@@ -212,6 +212,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         ] = OrderedDict()
         self._anchor: tuple[_TranscriptUnit | None, int] | None = None
         self._user_units: list[_TranscriptUnit] = []
+        self._unit_set: set[_TranscriptUnit] = set()
+        self._user_unit_set: set[_TranscriptUnit] = set()
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
@@ -285,6 +287,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def _append_unit(self, value: RenderableType | _ToolUnit | None) -> _TranscriptUnit:
         unit = _TranscriptUnit(self._next_key, value)
         self._units.append(unit)
+        self._unit_set.add(unit)
         self._next_key += 1
         self._bump_revision()
         self._prime_search_unit(unit)
@@ -293,8 +296,13 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def mark_user(self, unit: _TranscriptUnit | None) -> None:
         """Mark an existing full-screen unit as a user message."""
 
-        if unit is not None and unit in self._units and unit not in self._user_units:
+        if (
+            unit is not None
+            and unit in self._unit_set
+            and unit not in self._user_unit_set
+        ):
             self._user_units.append(unit)
+            self._user_unit_set.add(unit)
 
     def append(self, renderable: RenderableType) -> _TranscriptUnit:
         return self._append_unit(renderable)
@@ -302,7 +310,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def replace(
         self, unit: _TranscriptUnit, renderable: RenderableType
     ) -> _TranscriptUnit:
-        if unit not in self._units:
+        if unit not in self._unit_set:
             return self._append_unit(renderable)
         unit.value = renderable
         self._render_cache.pop(unit.key, None)
@@ -318,7 +326,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._prime_search_unit(unit)
 
     def remove(self, unit: _TranscriptUnit, *, leading_blank: bool = False) -> None:
-        if unit not in self._units:
+        if unit not in self._unit_set:
             return
         if leading_blank:
             index = self._units.index(unit)
@@ -326,10 +334,14 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             if previous is not None and previous.value is None:
                 self.remove(previous)
         self._units.remove(unit)
+        if unit not in self._units:
+            self._unit_set.remove(unit)
         if self._anchor is not None and self._anchor[0] is unit:
             self._anchor = None
-        if unit in self._user_units:
+        if unit in self._user_unit_set:
             self._user_units.remove(unit)
+            if unit not in self._user_units:
+                self._user_unit_set.remove(unit)
         self._render_cache.pop(unit.key, None)
         self._unit_lines_cache.pop(unit.key, None)
         self._unit_locations_cache.pop(unit.key, None)
@@ -346,6 +358,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         for unit in self._card_units.values():
             unit.card.release_transcript_source()
         self._units.clear()
+        self._unit_set.clear()
         self._tools.clear()
         self._background_tools.clear()
         self._card_units.clear()
@@ -360,6 +373,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._locations_cache.clear()
         self._anchor = None
         self._user_units.clear()
+        self._user_unit_set.clear()
         self._search_cache.clear()
         self._highlight_cache = None
         self._scroll_offset = 0
@@ -514,9 +528,11 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
                 or id(unit.value) not in active_ids
             )
         ]
-        self._user_units[:] = [unit for unit in self._user_units if unit in self._units]
+        self._unit_set.intersection_update(unit for unit in self._units if unit is not None)
+        self._user_units[:] = [unit for unit in self._user_units if unit in self._unit_set]
+        self._user_unit_set.intersection_update(self._unit_set)
         self._height_indexes.clear()
-        if self._anchor is not None and self._anchor[0] not in self._units:
+        if self._anchor is not None and self._anchor[0] not in self._unit_set:
             self._anchor = None
         for key in removed_keys:
             self._render_cache.pop(key, None)
@@ -556,7 +572,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def restore_scroll_anchor(self, unit: _TranscriptUnit, text_offset: int) -> None:
         """Restore a non-tail viewport anchor after transcript reconstruction."""
 
-        if unit not in self._units:
+        if unit not in self._unit_set:
             return
         self._follow_tail = False
         self._anchor = (unit, max(0, text_offset))
@@ -734,7 +750,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
                 self._parsed_cache.clear()
                 return
             location = self._locations(self._content_width)[line : line + 1]
-            parsed[line] = mark_bands(updated, location, self._user_units)[0]
+            parsed[line] = mark_bands(updated, location, self._user_unit_set)[0]
 
     def next_search_match(self) -> bool:
         matches = self._search_matches()
@@ -783,7 +799,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         if self._locations_revision != self._revision:
             self._line_locations = self._locations(self._content_width)
             self._locations_revision = self._revision
-        user_units = set(self._user_units)
+        user_units = self._user_unit_set
         seen: set[_TranscriptUnit] = set()
         targets: list[int] = []
         for index, (unit, _offset) in enumerate(self._line_locations):
@@ -898,7 +914,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         lines = (
             list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else [[]]
         )
-        if unit in self._user_units:
+        if unit in self._user_unit_set:
             lines = [mark_band(line) for line in lines]
         self._unit_lines_cache[unit.key] = (rendered, lines)
         return lines
@@ -936,7 +952,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             # Search highlights restyle matched lines across the whole render.
             fragments = to_formatted_text(ANSI(self.render(width)))
             lines = list(split_lines(fragments)) or [[]]
-            lines = mark_bands(lines, self._locations(width), self._user_units)
+            lines = mark_bands(lines, self._locations(width), self._user_unit_set)
         else:
             lines = self._assembled_lines(width)
         self._parsed_cache[width] = lines

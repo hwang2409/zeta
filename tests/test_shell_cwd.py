@@ -141,12 +141,13 @@ async def test_bind_shell_cwd_cancellation_drains_and_does_not_commit(
     async def observed_thread_call(
         acquire: Callable[[], tuple[str, int, tuple[str, str] | None]],
         close: Callable[[tuple[str, int, tuple[str, str] | None]], None],
+        **kwargs: bool,
     ) -> tuple[str, int, tuple[str, str] | None]:
         def observed_close(result: tuple[str, int, tuple[str, str] | None]) -> None:
             close(result)
             close_done.set()
 
-        return await original_thread_call(acquire, observed_close)
+        return await original_thread_call(acquire, observed_close, **kwargs)
 
     # test-contract: seam hold the worker to prove cancellation drains its fd.
     monkeypatch.setattr(module, "_bind_shell_cwd", blocked)

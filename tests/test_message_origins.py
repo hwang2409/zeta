@@ -24,6 +24,7 @@ from tests.test_agent import (
 )
 from tests.test_server import _connect, _frames_until_event, _request
 from tests.test_steering import SteerToolBackend
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.mcp import MCPPrompt, MCPPromptArgument
@@ -125,7 +126,7 @@ def test_skill_expansion_is_not_labeled_user(tmp_path: Path) -> None:
         skill_catalog=discover_session_skills(project_dir=tmp_path),
     )
 
-    expansion = registry.dispatch(object(), "$review this")
+    expansion = registry.dispatch(SimpleNamespace(slash_lock=SlashLock()), "$review this")
 
     assert isinstance(expansion, ModelInputEnvelope)
     message = Message(
@@ -156,7 +157,7 @@ def test_slash_skill_preserves_user_authored_input(tmp_path: Path) -> None:
         skill_catalog=discover_session_skills(project_dir=tmp_path),
     )
 
-    expansion = registry.dispatch(object(), "/review this branch")
+    expansion = registry.dispatch(SimpleNamespace(slash_lock=SlashLock()), "/review this branch")
 
     assert isinstance(expansion, ModelInputEnvelope)
     message = Message(
@@ -237,6 +238,8 @@ async def test_mcp_prompt_preserves_exact_typed_input_as_nested_user_evidence() 
     )
 
     class Session:
+        slash_lock = SlashLock()
+
         async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
             return f"resolved {name} {arguments['topic']}"
 
