@@ -17,6 +17,7 @@ from contextlib import (
     asynccontextmanager,
     contextmanager,
 )
+from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -29,6 +30,7 @@ from ..core.session_files import (
     require_off_loop_lock,
 )
 from ..oauth import (
+    ACCOUNT_LOCK_TURN_WAIT_SECONDS,
     OAUTH_REFRESH_TIMEOUT_SECONDS,
     OAuthRefreshFailure,
     OAuthTokens,
@@ -43,9 +45,6 @@ from ..storage_format import (
 from . import availability
 from .files import (
     exists as _exists,
-)
-from .files import (
-    file_mtime_ns as _file_mtime_ns,
 )
 from .files import fsync_directory as _fsync_directory
 from .files import mkdir_child_durable as _mkdir_child_durable
@@ -71,6 +70,13 @@ from .registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def credential_wait_timeout_seconds() -> float:
+    # Leave one refresh-sized interval for durable publication and lock release.
+    return OAUTH_REFRESH_TIMEOUT_SECONDS * 2
+
+
 class AccountCredentialLockTimeoutError(AccountError):
     """An account operation could not acquire its lifecycle lock in time."""
 
@@ -226,9 +232,10 @@ class AccountStore(_AccountRegistry):
             value = self._read_registry(home_fd)["defaults"].get(provider)
             return AccountId(*value.split(":", 1)) if value else None
 
-    def contains(self, account: AccountId) -> bool:
+    def contains(self, account: AccountId, *, timeout: float | None = None) -> bool:
         with self.credential_guard(
-            account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            account,
+            timeout=credential_wait_timeout_seconds() if timeout is None else timeout,
         ) as home_fd:
             return str(account) in self._read_registry(home_fd)["accounts"]
 
@@ -337,7 +344,7 @@ class AccountStore(_AccountRegistry):
             raise ValueError("account provider does not match")
         resolved = account or self.default(provider) or AccountId(provider, "default")
         with self.credential_guard(
-            resolved, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            resolved, timeout=credential_wait_timeout_seconds()
         ) as home_fd:
             self._recover_account(home_fd, resolved)
         return resolved
@@ -481,11 +488,14 @@ class AccountStore(_AccountRegistry):
                         or self._has_unregistered_account_directories(home_fd, set())
                     ):
                         warnings.append(_UNSAFE_REGISTRY_WARNINGS[state])
-                        logger.warning("%s", warnings[-1])
                     if state is _Registry.BROKEN:
+                        # Not logged: every later registry read raises this
+                        # same line, so the CLI would print it twice.
                         return tuple(warnings)
+                    if state is _Registry.MISSING and warnings:
+                        logger.warning("%s", warnings[-1])
                 for provider in ("anthropic", "codex"):
-                    self._migrate_provider(home_fd, provider)
+                    self._migrate_provider(home_fd, provider, warnings)
         return tuple(warnings)
 
     def refuse_orphaning_registration(self, account: AccountId) -> None:
@@ -494,7 +504,9 @@ class AccountStore(_AccountRegistry):
         with self._home() as home_fd:
             self._refuse_orphaning_registration(home_fd, account)
 
-    def _migrate_provider(self, home_fd: int, provider: str) -> None:
+    def _migrate_provider(
+        self, home_fd: int, provider: str, warnings: list[str]
+    ) -> None:
         account = AccountId(provider, "default")
         legacy_name = f"{provider}-oauth.json"
         legacy_path = self.home / legacy_name
@@ -505,28 +517,35 @@ class AccountStore(_AccountRegistry):
         ):
             if self._registering_would_orphan(home_fd, account):
                 return
-            value = self._read_registry(home_fd)
-            registered = str(account) in value["accounts"]
-            legacy_exists = _exists_regular(home_fd, legacy_name)
-            staged = self._recover_account(home_fd, account)
-            if registered or staged is not None:
-                if legacy_exists:
-                    with _account_directory(home_fd, account) as account_fd:
-                        if staged is None or _file_mtime_ns(
-                            home_fd, legacy_name
-                        ) > _file_mtime_ns(account_fd, "oauth.json"):
-                            tokens = _read_tokens(home_fd, legacy_name)
-                            self._stage_account_tokens(account_fd, account, tokens)
-                            _delete_publication_pending(account_fd)
-                    _unlink_legacy(home_fd, legacy_name)
+            if not _exists_regular(home_fd, legacy_name):
+                self._recover_account(home_fd, account)
                 return
-            if not legacy_exists:
+            try:
+                self._recover_account(home_fd, account)
+            except AccountError:
+                pass  # an unreadable account file: _keep_token keeps it
+            try:
+                with _open_account_directory(home_fd, account) as account_fd:
+                    account_tokens = _tokens_or_unreadable(account_fd, "oauth.json")
+            except FileNotFoundError:
+                account_tokens = None
+            keep = _keep_token(
+                account_tokens, _tokens_or_unreadable(home_fd, legacy_name)
+            )
+            if keep is _Keep.BOTH:
+                warnings.append(
+                    f"kept {self.credential_path(account)} and {legacy_path}: "
+                    "could not tell which login is newer; delete the one you "
+                    "do not want, then restart zeta"
+                )
+                logger.warning("%s", warnings[-1])
                 return
-            tokens = _read_tokens(home_fd, legacy_name)
             with _account_directory(home_fd, account) as account_fd:
-                self._stage_account_tokens(account_fd, account, tokens)
-            self._register_account(home_fd, account, value)
-            with _open_account_directory(home_fd, account) as account_fd:
+                if keep is _Keep.LEGACY:
+                    tokens = _read_tokens(home_fd, legacy_name)
+                    self._stage_account_tokens(account_fd, account, tokens)
+                if str(account) not in self._read_registry(home_fd)["accounts"]:
+                    self._register_account(home_fd, account)
                 _delete_publication_pending(account_fd)
             _unlink_legacy(home_fd, legacy_name)
 
@@ -554,7 +573,9 @@ class AccountStore(_AccountRegistry):
         try:
             _registry_reference_index(value)
         except (KeyError, TypeError, ValueError) as exc:
-            raise AccountError("accounts.json is invalid; use /accounts") from exc
+            raise AccountError(
+                "account registry change is invalid; accounts.json was not changed"
+            ) from exc
         raw = _read_optional(home_fd, "accounts.json")
         current = json.loads(raw) if raw is not None else {}
         mutations = [
@@ -638,7 +659,7 @@ class AccountCredentials:
     def read(self, *, lock_timeout: float | None = None) -> OAuthTokens | None:
         with self.store.lifecycle_guard(
             self.account,
-            timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            timeout=credential_wait_timeout_seconds()
             if lock_timeout is None
             else lock_timeout,
         ) as home_fd:
@@ -657,7 +678,7 @@ class AccountCredentials:
 
     def bootstrap(self) -> OAuthTokens | None:
         with self.store.credential_guard(
-            self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            self.account, timeout=credential_wait_timeout_seconds()
         ) as home_fd:
             tokens = self.store._recover_account(home_fd, self.account)
             if tokens is not None:
@@ -667,11 +688,19 @@ class AccountCredentials:
                 self._publish(home_fd, tokens)
             return tokens
 
-    async def access_token(self, client: httpx.AsyncClient) -> str:
+    async def access_token(
+        self, client: httpx.AsyncClient, *, lock_timeout: float | None = None
+    ) -> str:
+        """Return a valid access token, refreshing it under the account lock.
+
+        Each lock wait defaults to the model-turn bound; callers outside a
+        turn's retry loop pass ``credential_wait_timeout_seconds()``.
+        """
+        timeout = ACCOUNT_LOCK_TURN_WAIT_SECONDS if lock_timeout is None else lock_timeout
         async with self._async_lock:
-            if not await asyncio.to_thread(self.store.contains, self.account):
-                return await self._bootstrap_access_token(client)
-            async with self._async_guard(registry=False) as home_fd:
+            if not await self._contains(timeout):
+                return await self._bootstrap_access_token(client, timeout)
+            async with self._async_guard(registry=False, timeout=timeout) as home_fd:
                 tokens = _read_account_tokens(home_fd, self.account)
                 if tokens is None:
                     raise self.login_required_error()
@@ -679,29 +708,27 @@ class AccountCredentials:
                     return tokens.access_token
                 return await self._refresh_locked(home_fd, tokens, client)
 
-    async def _access_token_locked(
-        self, home_fd: int, client: httpx.AsyncClient
-    ) -> str:
-        tokens = _read_account_tokens(home_fd, self.account)
-        if tokens is None:
-            raise self.login_required_error()
-        if tokens.is_valid():
-            return tokens.access_token
-        return await self._refresh_locked(home_fd, tokens, client)
-
     async def refresh_token(self, client: httpx.AsyncClient) -> str:
+        timeout = ACCOUNT_LOCK_TURN_WAIT_SECONDS
         async with self._async_lock:
-            if not await asyncio.to_thread(self.store.contains, self.account):
-                return await self._bootstrap_access_token(client, refresh=True)
-            return await self._refresh_existing_token(client)
+            if not await self._contains(timeout):
+                return await self._bootstrap_access_token(client, timeout, refresh=True)
+            return await self._refresh_existing_token(client, timeout)
 
     async def refresh_existing_token(self, client: httpx.AsyncClient) -> str:
         """Refresh a catalog account without registry lookup or bootstrap."""
         async with self._async_lock:
-            return await self._refresh_existing_token(client)
+            return await self._refresh_existing_token(
+                client, credential_wait_timeout_seconds()
+            )
 
-    async def _refresh_existing_token(self, client: httpx.AsyncClient) -> str:
-        async with self._async_guard(registry=False) as home_fd:
+    async def _contains(self, timeout: float) -> bool:
+        return await asyncio.to_thread(self.store.contains, self.account, timeout=timeout)
+
+    async def _refresh_existing_token(
+        self, client: httpx.AsyncClient, timeout: float
+    ) -> str:
+        async with self._async_guard(registry=False, timeout=timeout) as home_fd:
             tokens = _read_account_tokens(home_fd, self.account)
             if tokens is None:
                 raise self.login_required_error()
@@ -736,9 +763,13 @@ class AccountCredentials:
         return refreshed.access_token
 
     async def _bootstrap_access_token(
-        self, client: httpx.AsyncClient, *, refresh: bool = False
+        self,
+        client: httpx.AsyncClient,
+        timeout: float,
+        *,
+        refresh: bool = False,
     ) -> str:
-        async with self._async_guard(registry=True) as home_fd:
+        async with self._async_guard(registry=True, timeout=timeout) as home_fd:
             tokens = self.store._recover_account(home_fd, self.account)
             if tokens is None:
                 tokens = self._driver.bootstrap()
@@ -747,7 +778,7 @@ class AccountCredentials:
                 self._publish(home_fd, tokens)
             if not refresh and tokens.is_valid():
                 return tokens.access_token
-        async with self._async_guard(registry=False) as home_fd:
+        async with self._async_guard(registry=False, timeout=timeout) as home_fd:
             tokens = _read_account_tokens(home_fd, self.account)
             if tokens is None:
                 raise self.login_required_error()
@@ -787,16 +818,12 @@ class AccountCredentials:
         )
 
     @asynccontextmanager
-    async def _async_guard(self, *, registry: bool) -> Iterator[int]:
+    async def _async_guard(self, *, registry: bool, timeout: float) -> Iterator[int]:
         stack = ExitStack()
         guard = (
-            self.store.credential_guard(
-                self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
-            )
+            self.store.credential_guard(self.account, timeout=timeout)
             if registry
-            else self.store.lifecycle_guard(
-                self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
-            )
+            else self.store.lifecycle_guard(self.account, timeout=timeout)
         )
         home_fd = await asyncio.to_thread(stack.enter_context, guard)
         try:
@@ -988,6 +1015,56 @@ def _read_tokens(directory_fd: int, name: str) -> OAuthTokens:
         raise
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise AccountError("OAuth credentials are invalid; login required") from exc
+
+
+class _Unreadable(Enum):
+    TOKENS = "unreadable"
+
+
+class _Keep(Enum):
+    """Which login migration keeps when legacy and account credentials meet."""
+
+    LEGACY = "legacy"
+    ACCOUNT = "account"
+    BOTH = "both"
+
+
+def _tokens_or_unreadable(
+    directory_fd: int, name: str
+) -> OAuthTokens | None | _Unreadable:
+    try:
+        credential = _read_optional_bytes(directory_fd, name)
+        return None if credential is None else _tokens_from_bytes(credential)
+    except (AccountError, OSError):
+        return _Unreadable.TOKENS
+
+
+def _keep_token(
+    account: OAuthTokens | None | _Unreadable, legacy: OAuthTokens | None | _Unreadable
+) -> _Keep:
+    """Choose between accounts/<p>/default/oauth.json and a legacy <p>-oauth.json.
+
+    The newer login has the later expires_at: every refresh moves it forward.
+    mtime is not used because copying or restoring a home resets mtimes, so an
+    older token can carry the newer mtime. A missing account file lets the
+    legacy login win; anything that cannot prove which is newer (a tie, an
+    unreadable file, a missing expires_at, which reads as 0) keeps both files.
+    """
+
+    if account is None:
+        return _Keep.LEGACY
+    # compare parsed tokens only: two unreadable files are equal sentinels
+    if not isinstance(account, OAuthTokens) or not isinstance(legacy, OAuthTokens):
+        return _Keep.BOTH
+    if account == legacy:
+        return _Keep.ACCOUNT
+    if not min(account.expires_at, legacy.expires_at) > 0:
+        return _Keep.BOTH
+    if legacy.expires_at > account.expires_at:
+        return _Keep.LEGACY
+    if account.expires_at > legacy.expires_at:
+        return _Keep.ACCOUNT
+    return _Keep.BOTH
 
 
 def _read_optional_tokens(directory_fd: int) -> OAuthTokens | None:

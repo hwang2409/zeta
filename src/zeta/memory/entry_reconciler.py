@@ -68,7 +68,7 @@ _MAX_RESPONSE_BYTES = 32 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_REASON_BYTES = 1024
 _COMPLETION_KINDS = frozenset({"state", "backlog", "threads", "commitments"})
-_CODE_LITERAL = re.compile(r"`([^`\\n]{1,256})`")
+_CODE_LITERAL = re.compile(r"`([^`\n]{1,256})`")
 _DURABLE_LITERAL_CUES = (
     "validated",
     "established",
@@ -436,13 +436,14 @@ def _cited_code_literals(
             or not any(start <= seq <= end for start, end in ranges)
         ):
             continue
-        encoded = json.dumps(row, ensure_ascii=False)
-        literals.extend(
-            literal
-            for literal in _CODE_LITERAL.findall(encoded)
-            if not contains_secret(literal)
-        )
+        literals.extend(_code_literals(_message_text(row)))
     return tuple(dict.fromkeys(literals))
+
+
+def _code_literals(text: str) -> tuple[str, ...]:
+    return tuple(
+        literal for literal in _CODE_LITERAL.findall(text) if not contains_secret(literal)
+    )
 
 
 def _parse(
@@ -491,17 +492,13 @@ def _parse(
             errors.extend(exc.errors)
     if not parsed:
         for row in transcript.rows:
-            encoded = json.dumps(row, ensure_ascii=False)
-            lowered = encoded.lower()
+            text = _message_text(row)
+            lowered = text.lower()
             if not _is_user_authored_row(row) or not any(
                 cue in lowered for cue in _DURABLE_LITERAL_CUES
             ):
                 continue
-            literals = tuple(
-                literal
-                for literal in _CODE_LITERAL.findall(encoded)
-                if not contains_secret(literal)
-            )
+            literals = _code_literals(text)
             if literals:
                 errors.append(
                     "operations omits durable exact code literal(s): "

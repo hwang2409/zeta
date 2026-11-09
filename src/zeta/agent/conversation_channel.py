@@ -11,6 +11,7 @@ from ..core.checkpoints import ConversationEntry
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 
 if TYPE_CHECKING:
+    from ..runtime.loop import AgentLoop
     from .background import BackgroundAgentOwner
     from .pending_delivery import DeliveryInput, ProducerResult, StepDeliveryFlow
 
@@ -249,6 +250,35 @@ class ConversationChannel:
             NotificationInput("child_idle", data),
         )
         return result.entries[0] if result.entries else None
+
+    async def publish_not_delivered(self, child_loop: AgentLoop, text: str) -> None:
+        """Show input a stop held back on the root transcript; it wakes no agent."""
+
+        from ..protocol.types import StreamEvent, StreamEventType
+        from .pending_delivery import NotificationInput
+
+        store = child_loop.store
+        child_instance_id = child_loop.agent_instance_id or ""
+        lifecycle = store.agent_lifecycle() or {}
+        data: dict[str, Any] = {
+            "origin": "notification",
+            "kind": "child_idle",
+            "child_instance_id": child_instance_id,
+            "child_session_path": str(store.session_dir),
+            "description": str(lifecycle.get("description") or child_instance_id),
+            "status": "child_idle",
+            "text": text[-MAX_AGENT_NOTIFICATION_TEXT:],
+            # display-only: a waking notice would re-trigger the stop it reports.
+            "display_only": True,
+        }
+        result = await self.produce_to(None, NotificationInput("child_idle", data))
+        for entry in result.entries:
+            child_loop._publish_background_event(
+                StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={"notification_id": entry.id, **entry.data},
+                )
+            )
 
     async def publish_completion(
         self,

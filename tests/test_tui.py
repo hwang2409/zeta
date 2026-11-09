@@ -69,9 +69,10 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
+from tests.test_agent import CancelledBeforeAnswerBackend, _collect
 from zeta.accounts import (
     AccountId,
     AccountStore,
@@ -92,6 +93,7 @@ from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.project_context.projection import ProjectContextHealth
+from zeta.project_registry import ProjectRegistry
 from zeta.providers.anthropic import (
     AnthropicBackend,
     AnthropicCredentialDriver,
@@ -168,6 +170,7 @@ from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
 from zeta.tui.cards.decisions import DecisionsPanel
+from zeta.tui.cards.shared import MAX_CARD_LINES
 from zeta.tui.cards.tasks_panel import BackgroundTasksPanel
 from zeta.tui.cards.tool import TOOL_CARD_REGISTRY
 from zeta.tui.layout import (
@@ -659,7 +662,7 @@ async def test_request_exit_wakes_active_full_screen_prompt(tmp_path: Path) -> N
         finally:
             if session.app.future is not None and not session.app.future.done():
                 session.app.exit(exception=EOFError())
-            await running
+            await await_or_fail(running, what="full-screen prompt exit")
 
 
 @pytest.mark.asyncio
@@ -853,19 +856,26 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
 async def test_background_completion_is_rendered_when_exit_overtakes_acknowledgement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_durable_write = ConversationStore._run_durable_write
+    original_durable_write = ConversationStore._run_committed_mutation
     ack_committed = threading.Event()
     release_ack = threading.Event()
     apps: list[TUIApp] = []
 
-    def pause_after_ack_commit(self, method_name, args, kwargs):
-        result = original_durable_write(self, method_name, args, kwargs)
-        if method_name == "_acknowledge_staged_delivery":
+    def pause_after_ack_commit(
+        self, command, expected_generation, cancelled_before_write
+    ):
+        result = original_durable_write(
+            self, command, expected_generation, cancelled_before_write
+        )
+        if type(command).__name__ == "_AcknowledgeStagedDeliveryCommand":
             ack_committed.set()
             assert release_ack.wait(timeout=5)
         return result
 
-    monkeypatch.setattr(ConversationStore, "_run_durable_write", pause_after_ack_commit)
+    # test-contract: seam pauses after durable acknowledgement commit
+    monkeypatch.setattr(
+        ConversationStore, "_run_committed_mutation", pause_after_ack_commit
+    )
     transcript = asyncio.create_task(
         _background_event_transcript_count(
             tmp_path,
@@ -879,7 +889,7 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         assert len(apps) == 1
         apps[0].request_exit()
         release_ack.set()
-        count, rendered = await transcript
+        count, rendered = await await_or_fail(transcript, what="test await")
         assert count == 1, rendered
         markers = {entry.type for entry in apps[0].loop.store.tui_replay_entries()}
         assert "notification_tui_presented" in markers
@@ -887,7 +897,9 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         release_ack.set()
         if not transcript.done():
             transcript.cancel()
-            await asyncio.gather(transcript, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(transcript, return_exceptions=True), what="test await"
+            )
 
 
 @pytest.mark.asyncio
@@ -1837,7 +1849,11 @@ async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
 ) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     try:
-        assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {"exec"}
+        assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {
+            "exec",
+            "finish",
+            "agent_handoff",
+        }
     finally:
         await registry.close()
 
@@ -4300,6 +4316,23 @@ def test_render_event_error_is_visible() -> None:
     assert "reason: provider stopped" in renderable_plain(rendered)
 
 
+def test_no_progress_loop_renders_as_named_non_retryable_error() -> None:
+    message = (
+        "the model was called 2 times with the same request and nothing new was "
+        "saved; stopped to avoid repeat spend. Input not delivered: it is held "
+        "and goes with the next message."
+    )
+    rendered = render_event(
+        StreamEvent(StreamEventType.ERROR, error=ErrorInfo("no_progress_loop", message))
+    )
+
+    assert isinstance(rendered, Panel)
+    plain = renderable_plain(rendered)
+    assert "model loop stopped · no_progress_loop" in plain
+    assert "goes with the next message." in plain
+    assert "retry: ctrl+y" not in plain
+
+
 def test_account_lock_timeout_renders_as_retryable_error() -> None:
     message = (
         "cannot access codex:work: another process holds the account lock; "
@@ -5303,6 +5336,65 @@ def test_nested_stalled_idle_background_event_renders_last_message(
     rendered = output.getvalue()
     assert "nested verifier" in rendered
     assert "nested verifier is waiting for review" in rendered
+
+
+@pytest.mark.asyncio
+async def test_held_input_notice_renders_on_root_transcript(tmp_path: Path) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path / "root"), output)
+    child_store = ConversationStore(tmp_path / "child")
+    child_store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="stopped worker",
+    )
+    child_store.append_agent_notification(
+        "root:notice",
+        child_session_path=str(child_store.session_dir),
+        description="held input",
+        status="completed",
+        text="held input",
+    )
+    backend = CancelledBeforeAnswerBackend()
+    child_loop = AgentLoop(
+        backend,
+        child_store,
+        skill_catalog=SkillCatalog.empty(),
+        background_owner=app.loop._background_owner,
+        agent_instance_id="root:1",
+        agent_depth=1,
+    )
+    child_loop.set_background_event_sink(app.loop._publish_background_event)
+    try:
+        flow = await await_or_fail(
+            child_loop._ensure_step_delivery(), what="child flow"
+        )
+        flow.initialize_resident_edges()
+        assert child_store.agent_notifications()
+        assert flow.has_pending_edge
+        for _ in range(2):
+            run = asyncio.create_task(
+                _collect(child_loop.run_notification_turn())
+            )
+            await await_or_fail(backend.started.wait(), what="provider call started")
+            run.cancel()
+            await await_or_fail(
+                asyncio.gather(run, return_exceptions=True),
+                what="cancelled notification turn",
+            )
+            backend.started.clear()
+        [event async for event in child_loop.run_notification_turn()]
+
+        rendered = output.getvalue()
+        assert "stopped worker" in rendered
+        assert "Input not delivered" in rendered
+        assert backend.calls == 2
+    finally:
+        await await_or_fail(child_loop.close(), what="child loop close")
+        child_store.close()
+        await await_or_fail(app.close(), what="tui app close")
 
 
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
@@ -6913,6 +7005,22 @@ def test_truncated_response_notice_is_dim() -> None:
     escaped = output.getvalue()
     assert escaped.count(rendered.plain) == 1
     assert not _contains_background_sgr(escaped)
+
+
+def test_turn_end_completion_classification_is_visible() -> None:
+    for completion, expected in (
+        ("refusal", "model refused to answer"),
+        ("content_filter", "model response blocked by content filter"),
+    ):
+        rendered = render_event(
+            StreamEvent(StreamEventType.TURN_END, data={"completion": completion})
+        )
+        assert rendered is not None
+        assert expected in rendered.plain
+    assert (
+        render_event(StreamEvent(StreamEventType.TURN_END, data={"completion": "empty"}))
+        is None
+    )
 
 
 def test_retry_notice_is_dim() -> None:
@@ -11192,7 +11300,7 @@ async def test_control_command_does_not_reject_rapid_follow_up(
         assert store.checkpoint_count() == 1
     else:
         assert expected in output.getvalue()
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -12078,9 +12186,7 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
             await finish_transcript_cleanup(
                 tasks, close, deadline=deadline, label=label
             )
-            transcript_cleanup_tasks.update(
-                agent_shutdown._LATE_CLEANUP_TASKS - before
-            )
+            transcript_cleanup_tasks.update(agent_shutdown._LATE_CLEANUP_TASKS - before)
         finally:
             transcript_handed_off.set()
 
@@ -12847,17 +12953,19 @@ async def test_dup_failure_is_reported_not_success(
     loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
     try:
         persistence.schedule("first")
-        await asyncio.sleep(0)
         with pytest.raises(OSError, match="Too many open files"):
             await persistence.flush_pending()
         assert DraftPersistence(tmp_path / "draft").load() == ""
         assert persistence.pending_text == "first"
         fail_dup = False
         await persistence.flush_pending()
+        persistence.schedule("first")
     finally:
-        os.close(directory_fd)
-        await persistence.shutdown_pending()
-        storage_lease.close()
+        try:
+            await persistence.shutdown_pending()
+        finally:
+            os.close(directory_fd)
+            storage_lease.close()
 
     assert exceptions == []
     assert (
@@ -13998,6 +14106,7 @@ async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
     await app._consume_turn("", notification=True)
 
     rendered = Text.from_ansi(output.getvalue()).plain
+    assert "model returned an empty response" not in rendered
     assert "no response" not in rendered
 
 
@@ -14020,7 +14129,8 @@ async def test_user_turn_still_shows_no_response_after_failed_nudge(
     # The nudge ran a second completion and still came back empty.
     assert len(backend.calls) == 2
     rendered = Text.from_ansi(output.getvalue()).plain
-    assert "no response" in rendered
+    assert "model returned an empty response" not in rendered
+    assert rendered.count("no response") == 1
 
 
 @pytest.mark.asyncio
@@ -14620,11 +14730,11 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait(1)
+            release.wait(10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
-    assert locked.wait(1)
+    assert locked.wait(10)
     publisher_waiting = threading.Event()
     original_lifecycle_guard = AccountStore._lifecycle_guard
 
@@ -14635,22 +14745,43 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
             yield
 
     monkeypatch.setattr(AccountStore, "_lifecycle_guard", waiting_lifecycle_guard)
-    publisher = threading.Thread(
-        target=lambda: named_account_credentials(home, "codex", "work").save(
-            OAuthTokens("new-access", "new-refresh", 9_999_999_999)
-        )
+    publisher_errors: list[BaseException] = []
+    published_tokens = OAuthTokens(
+        "new-access", "new-refresh", 9_999_999_999, email="henry@example.com"
     )
+
+    def publish_credentials() -> None:
+        try:
+            # separate product bug: save merges email before verifying tokens.
+            named_account_credentials(home, "codex", "work").save(
+                published_tokens
+            )
+        except BaseException as exc:  # noqa: BLE001 - assert the thread outcome below
+            publisher_errors.append(exc)
+
+    publisher = threading.Thread(target=publish_credentials)
     publisher.start()
-    assert publisher_waiting.wait(1)
+    assert publisher_waiting.wait(10)
     try:
         assert await app.slash_accounts("") == ""
         assert app._accounts_picker is not None
         assert publisher.is_alive()
     finally:
         release.set()
-        holder.join()
-        publisher.join()
+        await asyncio.to_thread(holder.join, 10)
+        await asyncio.to_thread(publisher.join, 10)
         opened.store.close()
+
+    assert not holder.is_alive()
+    assert not publisher.is_alive()
+    assert publisher_errors == []
+    assert (
+        await asyncio.wait_for(
+            asyncio.to_thread(named_account_credentials(home, "codex", "work").read),
+            10,
+        )
+        == published_tokens
+    )
 
 
 def test_accounts_panel_labels_codex_primary_as_seven_day() -> None:
@@ -14782,14 +14913,14 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
             refresh_rendered.set()
 
     app._repaint_accounts_picker = repaint_and_signal
-    monkeypatch.setattr("zeta.accounts.usage.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("zeta.accounts.store.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
     locked = threading.Event()
     release = threading.Event()
 
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait()
+            release.wait(10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
@@ -14797,7 +14928,9 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        await refresh_rendered.wait()
+        await await_or_fail(
+            refresh_rendered.wait(), what="busy account refresh render"
+        )
         assert app._accounts_picker is not None
         assert app._accounts_picker.usages is not None
         assert app._accounts_picker.usages[account].error == (
@@ -14809,7 +14942,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
         assert "refresh failed: account busy" in plain
     finally:
         release.set()
-        holder.join()
+        holder.join(10)
         opened.store.close()
 
 
@@ -15350,3 +15483,148 @@ async def test_history_finder_does_not_cross_session_boundaries(
     assert len(batches) == 1
     assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()
+
+
+@pytest.mark.asyncio
+async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
+    tmp_path: Path,
+) -> None:
+    writer = await asyncio.to_thread(open_writer, tmp_path)
+    projects = ProjectRegistry(tmp_path / "projects")
+    project = projects.create_project("alpha", "alpha")
+    store = ConversationStore(
+        tmp_path / "sessions", session_id="a" * 32, cwd=tmp_path
+    )
+    ledger = store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=projects,
+        inbox_enabled=True,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    try:
+        activation_error = None
+        try:
+            await loop.activate()
+        except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
+            activation_error = exc
+        assert activation_error is None
+        app = TUIApp(loop, provider="codex", model="offline")
+        async with owned_app(app):
+            app._full_screen_active = lambda: True
+            app._rebuild_transcript()
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "sent history is incomplete (invalid_json)" in rendered
+            assert "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project-inbox-sent.json" in rendered
+            assert "file was not changed" in rendered
+            assert "unless the repaired ledger includes their IDs" in rendered
+    finally:
+        await loop.close()
+        store.close()
+        await asyncio.to_thread(writer.close)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "content", "structured_content"),
+    [
+        (
+            "finish",
+            "finish accepted",
+            {
+                "status": "done",
+                "summary": "summary paragraph. " * 200,
+                "verdict": "pass",
+                "head_sha": "abcdef1234567",
+            },
+        ),
+        (
+            "agent_handoff",
+            "background child agents handed off; reason: " + "reason paragraph. " * 200,
+            None,
+        ),
+    ],
+)
+def test_finish_and_handoff_cards_cap_long_detail(
+    tool_name: str, content: str, structured_content: dict[str, str] | None
+) -> None:
+    call = ToolCall(f"{tool_name}-detail", tool_name, {})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, content, structured_content=structured_content),
+    )
+    rendered = render_event(event)
+    assert rendered is not None
+
+    output = StringIO()
+    _test_console(output, width=38).print(rendered)
+    snapshot = Text.from_ansi(output.getvalue()).plain.rstrip()
+    body = [line[2:-2] for line in snapshot.splitlines()[2:-1]]
+    if tool_name == "finish":
+        assert any(line.startswith("summary: ") for line in body)
+        start = next(index for index, line in enumerate(body) if line.startswith("summary: "))
+        end = next(
+            (index for index in range(start + 1, len(body)) if body[index].strip().startswith(("verdict:", "head_sha:"))),
+            len(body),
+        )
+        body = body[start:end]
+    visible = [line for line in body if "… +" not in line]
+    assert len(visible) == MAX_CARD_LINES
+    assert len([line for line in body if "… +" in line]) == 1
+    expected_omitted = 185 if tool_name == "finish" else 120
+    assert f"… +{expected_omitted} lines" in snapshot
+
+
+def test_finish_and_handoff_cards_handle_fallback_detail() -> None:
+    cases = (
+        ("finish", "finish fallback", None),
+        ("finish", "finish malformed", {"summary": object()}),
+        ("agent_handoff", "handoff fallback", {"unexpected": "field"}),
+    )
+    for tool_name, content, structured in cases:
+        call = ToolCall(f"{tool_name}-fallback", tool_name, {})
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, content, structured_content=structured),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        _test_console(output, width=38).print(rendered)
+        snapshot = Text.from_ansi(output.getvalue()).plain
+        assert content in snapshot
+        assert "object at 0x" not in snapshot
+
+
+def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
+    for tool_name, content, structured in (
+        ("finish", "finish accepted", {"summary": "short summary"}),
+        ("agent_handoff", "short reason", None),
+    ):
+        call = ToolCall(f"{tool_name}-short", tool_name, {})
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(
+                    call.id, content, structured_content=structured
+                ),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        _test_console(output, width=100).print(rendered)
+        snapshot = Text.from_ansi(output.getvalue()).plain
+        assert "… +" not in snapshot
+        assert "short summary" in snapshot or "short reason" in snapshot

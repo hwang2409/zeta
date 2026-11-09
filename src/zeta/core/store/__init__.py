@@ -1,5 +1,18 @@
 """Conversation store public API."""
 
+from ..checkpoints.mutation import (
+    AppendConversationRows,
+    CommittedDelta,
+    CommittedLogCursor,
+    ConversationAddress,
+    ConversationDedupeConflict,
+    ConversationDedupeKey,
+    ConversationGenerationConflict,
+    ConversationMutation,
+    ConversationRow,
+    ConversationTargetOwned,
+    commit_conversation_async,
+)
 from ._log import SCHEMA, InstalledEntriesDelta, PersistedAppend, TranscriptLoadError
 from ._store import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -55,10 +68,20 @@ __all__ = [
     "TASK_EXITED_NOTIFICATION_KIND",
     "AgentStateMixin",
     "Any",
+    "AppendConversationRows",
     "CheckpointForkMixin",
+    "CommittedDelta",
+    "CommittedLogCursor",
+    "ConversationAddress",
+    "ConversationDedupeConflict",
+    "ConversationDedupeKey",
     "ConversationEntry",
+    "ConversationGenerationConflict",
     "ConversationIntegrityError",
+    "ConversationMutation",
+    "ConversationRow",
     "ConversationStore",
+    "ConversationTargetOwned",
     "ExitStack",
     "InstalledEntriesDelta",
     "Iterable",
@@ -77,6 +100,7 @@ __all__ = [
     "ToolUseContent",
     "TranscriptLoadError",
     "child_directory",
+    "commit_conversation_async",
     "contextmanager",
     "copy",
     "encode_json",

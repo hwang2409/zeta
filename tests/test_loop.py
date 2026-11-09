@@ -61,6 +61,76 @@ from zeta.tools import ToolRegistry, ToolStreamPublisher
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["refusal", "content_filter", "end_turn"])
+async def test_empty_completion_ends_with_classification(
+    tmp_path: Path, stop_reason: str
+) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(stop_reason=stop_reason)]),
+        store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        events = await collect(
+            loop.run_turn("hello", origin=MessageOrigin.USER)
+        )
+    finally:
+        await loop.close()
+        store.close()
+
+    turn_end = next(event for event in events if event.type is StreamEventType.TURN_END)
+    assert turn_end.data["completion"] == (
+        stop_reason if stop_reason in {"refusal", "content_filter"} else "empty"
+    )
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    if stop_reason == "end_turn":
+        assert nudges
+    else:
+        assert not nudges
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turns",
+    [
+        [ScriptedTurn([TextContent("visible refusal")], stop_reason="refusal")],
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("call-1", "echo", {"text": "visible"})],
+                stop_reason="refusal",
+            ),
+            ScriptedTurn([TextContent("visible result")]),
+        ],
+    ],
+)
+async def test_refusal_with_visible_output_is_not_classified_as_empty(
+    tmp_path: Path, turns: list[ScriptedTurn]
+) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        FakeBackend(turns),
+        store,
+        tools={"echo": lambda arguments: str(arguments["text"])},
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        events = await collect(
+            loop.run_turn("hello", origin=MessageOrigin.USER)
+        )
+
+        turn_end = next(event for event in events if event.type is StreamEventType.TURN_END)
+        assert "completion" not in turn_end.data
+    finally:
+        await loop.close()
+        store.close()
+
+
 def test_empty_turn_tool_error_reports_success_state() -> None:
     error = empty_turn_tool_error(
         ToolCall("ping-call", "ping", {}), ToolResult("ping-call", "pong")
@@ -2959,6 +3029,39 @@ async def test_thinking_only_nudge_runs_even_at_max_turns(tmp_path: Path) -> Non
     assert len(still_empty.calls) == 2
     assert empty_events[-1].type is StreamEventType.AGENT_END
     assert empty_store.turn_in_flight() is False
+
+
+@pytest.mark.asyncio
+async def test_receipt_echo_reply_is_nudged_like_an_empty_reply(tmp_path: Path) -> None:
+    from zeta.context_eviction.receipt_constructors import ASSISTANT_RECEIPT
+
+    echo = ASSISTANT_RECEIPT.format(kind="assistant text", seq=5)
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent(echo)], stop_reason="end_turn"),
+            ScriptedTurn([TextContent("here is the answer")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    try:
+        events = await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
+        messages = store.messages()
+        nudges = [
+            index
+            for index, message in enumerate(messages)
+            if message.metadata.get("zeta_event") == "empty_turn_nudge"
+        ]
+        assert len(nudges) == 1, "a receipt-only reply must be nudged like an empty one"
+        # The echo stays persisted as written, so the TUI still shows it.
+        assert messages[nudges[0] - 1].content == [TextContent(echo)]
+        assert len(backend.calls) == 2
+        turn_ends = [e for e in events if e.type is StreamEventType.TURN_END]
+        assert turn_ends[-1].message is not None
+        assert turn_ends[-1].message.content == [TextContent("here is the answer")]
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio

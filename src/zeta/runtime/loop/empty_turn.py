@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ...context_eviction.receipt_constructors import is_receipt_echo
 from ...protocol.types import (
     ErrorInfo,
     Message,
@@ -80,10 +81,17 @@ async def complete_empty_turn(
             ),
             True,
         )
+    data: dict[str, Any] = {"turn": turn_number, "tool_calls": 0}
+    classification = completion_classification(
+        assistant_message,
+        stop_reason=assistant_message.metadata.get("stop_reason"),
+    )
+    if classification is not None:
+        data["completion"] = classification
     turn_end = StreamEvent(
         StreamEventType.TURN_END,
         message=assistant_message,
-        data={"turn": turn_number, "tool_calls": 0},
+        data=data,
     )
     if transition.continue_turn:
         return (turn_end,), False
@@ -95,9 +103,23 @@ def _bounded_detail(value: str) -> str:
     return value[:MAX_EMPTY_TURN_DETAIL_CHARS]
 
 
+def completion_classification(
+    message: Message, *, stop_reason: str | None
+) -> str | None:
+    """Classify a terminal no-tool completion for frontends."""
+
+    if has_visible_output(message):
+        return None
+    if stop_reason in {"refusal", "content_filter"}:
+        return stop_reason
+    return "empty"
+
+
 def has_visible_output(message: Message) -> bool:
     """True when the assistant produced text or a tool call the user can act on."""
 
+    if is_receipt_echo(message):
+        return False
     for block in message.content:
         if isinstance(block, ToolUseContent):
             return True
@@ -141,6 +163,81 @@ def annotate_turn_metadata(
         message.content,
         tool_result=message.tool_result,
         metadata=metadata,
+    )
+
+
+# One identical re-dispatch is legitimate: a gate deadline can cancel a turn
+# before the provider acknowledges its delivery, and the next call repeats it.
+# A second identical call means the same cancel route fired again; stop there.
+MAX_REPEATED_DISPATCHES = 1
+NO_PROGRESS_LOOP_CODE = "no_progress_loop"
+
+
+class DispatchProgress:
+    """Bound provider calls that repeat a request with nothing new committed."""
+
+    def __init__(self) -> None:
+        self._mark: tuple[object, ...] | None = None
+        self._repeats = 0
+
+    def reset(self) -> None:
+        self._mark = None
+        self._repeats = 0
+
+    def admit(
+        self,
+        store: Any,
+        prepared: Any,
+        flow: Any,
+        retrying_context: bool,
+        *,
+        waits_for_input: bool,
+    ) -> str | ErrorInfo:
+        """Return "dispatch", or stop with a typed error and keep the input pending."""
+
+        mark = (
+            store.active_branch_head_sequence(),
+            prepared.prompt_id,
+            prepared.notification_ids,
+        )
+        if retrying_context or prepared.steering is not None or mark != self._mark:
+            self._mark = mark
+            self._repeats = 0
+            return "dispatch"
+        self._repeats += 1
+        if self._repeats <= MAX_REPEATED_DISPATCHES:
+            return "dispatch"
+        self.reset()
+        flow.release_active()
+        # keep the input durable but stop it from waking the model again; the
+        # next new input carries it into the following request.
+        stopped = prepared.notification_ids + (
+            () if prepared.prompt_id is None else (prepared.prompt_id,)
+        )
+        flow.suppress_pending(stopped)
+        return ErrorInfo(
+            NO_PROGRESS_LOOP_CODE,
+            not_delivered_text(
+                f"the model was called {MAX_REPEATED_DISPATCHES + 1} times with "
+                "the same request and nothing new was saved; stopped to avoid "
+                "repeat spend",
+                waits_for_input=waits_for_input,
+            ),
+        )
+
+
+def not_delivered_text(reason: str, *, waits_for_input: bool) -> str:
+    """Word every stop that holds input back (repeat bound, causal budget) alike.
+
+    Only a loop that waits for more input (top level, or an explicit-finish
+    child) is sure to send the held input on; any other child may end first.
+    """
+
+    if waits_for_input:
+        return f"{reason}. Input not delivered: it is held and goes with the next message."
+    return (
+        f"{reason}. Input not delivered: it is held for the next message to this "
+        "agent and is lost if the agent ends first."
     )
 
 
@@ -195,7 +292,7 @@ def should_nudge_empty_turn(
         not notification_turn
         and not already_nudged
         and nudge_count < max_nudges
-        and stop_reason != "max_tokens"
+        and stop_reason not in {"max_tokens", "refusal", "content_filter"}
         and not has_visible_output(message)
     )
 
