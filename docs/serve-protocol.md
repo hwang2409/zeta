@@ -838,6 +838,12 @@ The result contains `session` (full metadata or `null`), `state` (`idle`,
 instance that owns the approval. An approval may also carry `label`, an optional
 display-only string naming the call's target; it is absent when there is none.
 
+`state` is `"running"` whenever `send` would refuse with `-32004`
+(`a turn is already running`) because `turn_busy()` is true. If the server is
+unhealthy because approval persistence failed, `state` remains `"idle"` and
+`send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
+separate error and does not change the unhealthy status behavior.
+
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being

@@ -2400,12 +2400,31 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     )
                     snapshot_frames = await request(11, "session_grants", {})
                     assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
-                    original_status = (await request(12, "status", {}))[-1]
-                    assert original_status["result"]["state"] == "idle", (
-                        "cancel_write replacement controller did not observe the "
-                        "original turn reaching idle"
+                    # Force the real busy predicate to remain active while the
+                    # replacement controller queries status and sends.
+                    release_handoff = asyncio.Event()
+                    handoff = asyncio.create_task(
+                        await_or_fail(
+                            release_handoff.wait(),
+                            timeout=10,
+                            what="replacement turn handoff gate",
+                        )
                     )
-                    send_frames = await request(13, "send", {"text": "ask again"})
+                    server.control._turn_handoff_task = handoff
+                    try:
+                        busy_status = (await request(12, "status", {}))[-1]
+                        assert busy_status["result"]["state"] == "running"
+                        busy_send = await request(13, "send", {"text": "ask again"})
+                        assert busy_send[-1]["error"]["code"] == -32004
+                    finally:
+                        release_handoff.set()
+                        await await_or_fail(
+                            handoff, timeout=10, what="replacement turn handoff"
+                        )
+
+                    idle_status = (await request(14, "status", {}))[-1]
+                    assert idle_status["result"]["state"] == "idle"
+                    send_frames = await request(15, "send", {"text": "ask again"})
                     assert send_frames[-1].get("result", {}).get("accepted") is True, (
                         "cancel_write replacement send was not accepted: "
                         f"{send_frames[-1]!r}"
