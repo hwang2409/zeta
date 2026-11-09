@@ -88,6 +88,8 @@ async def status(client, request_id, params):
             else None
         )
         snapshot = await lifecycle.status(client, fallback_config=fallback_config)
+        if runtime.opened is None:
+            snapshot.pop("project_context_health", None)
     else:
         snapshot = await lifecycle.status(
             client,

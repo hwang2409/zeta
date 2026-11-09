@@ -156,7 +156,6 @@ async def test_every_observer_request_has_transport_parity(
             "pending_approvals": [],
             "usage": {},
             "compaction_markers": 0,
-            "project_context_health": "healthy",
         }
         created = await controller.request(
             "controller-new-session", "new_session", {"provider": "codex"}
