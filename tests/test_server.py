@@ -955,10 +955,13 @@ def test_approval_wire_payload_includes_live_display_label(tmp_path: Path) -> No
         ToolCall("approval", "inbox", {"action": "send", "project": "p_beta"}),
         label="beta (p_beta)",
     )
+    approvals = _bare_approval_lifecycle(tmp_path)
 
-    payload = _bare_approval_lifecycle(tmp_path).observe(request)
-
-    assert payload["label"] == "beta (p_beta)"
+    try:
+        payload = approvals.observe(request)
+        assert payload["label"] == "beta (p_beta)"
+    finally:
+        approvals._policy().store.close()
 
 
 def test_delegated_approval_payload_includes_execution_context() -> None:
