@@ -2371,6 +2371,7 @@ async def test_resume_ambiguous_prefix_has_dedicated_error(
         assert failed[-1]["error"]["data"] == {
             "code": "session_id_ambiguous",
             "session_id": "abcd",
+            "candidates": ["abcd1111", "abcd2222"],
         }
         assert "abcd1111" in failed[-1]["error"]["message"]
         assert "abcd2222" in failed[-1]["error"]["message"]

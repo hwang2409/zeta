@@ -828,12 +828,14 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 f"session id prefix must be at least {min_prefix_length} characters"
             )
         if len(matches) > 1:
-            shown = ", ".join(match[:8] for match in matches[:8])
+            candidates = tuple(match[:8] for match in matches[:8])
+            shown = ", ".join(candidates)
             if len(matches) > 8:
                 shown += ", …"
             raise SessionIdAmbiguousError(
                 f"session id {session_id!r} is ambiguous; matches: {shown}; "
-                "please provide more characters"
+                "please provide more characters",
+                candidates,
             )
         return matches[0]
 

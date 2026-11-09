@@ -1087,8 +1087,8 @@ STRUCTURED_ERROR_FIXTURES = (
     (
         ErrorDescriptor.SESSION_ID_AMBIGUOUS,
         "session id 'abcd' is ambiguous; matches: abcd1111, abcd2222; please provide more characters",
-        {"session_id": "abcd"},
-        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session id \'abcd\' is ambiguous; matches: abcd1111, abcd2222; please provide more characters","data":{"code":"session_id_ambiguous","session_id":"abcd"}}}\n',
+        {"session_id": "abcd", "candidates": ["abcd1111", "abcd2222"]},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session id \'abcd\' is ambiguous; matches: abcd1111, abcd2222; please provide more characters","data":{"code":"session_id_ambiguous","session_id":"abcd","candidates":["abcd1111","abcd2222"]}}}\n',
     ),
     (
         ErrorDescriptor.SESSION_MISMATCH,

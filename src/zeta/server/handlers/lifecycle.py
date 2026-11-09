@@ -72,7 +72,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 raise ProtocolError(
                     ErrorDescriptor.SESSION_ID_AMBIGUOUS,
                     str(exc),
-                    {"session_id": session_id},
+                    {"session_id": session_id, "candidates": list(exc.candidates)},
                 ) from exc
             except SessionNotFoundError as exc:
                 raise ProtocolError(

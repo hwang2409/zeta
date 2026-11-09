@@ -409,7 +409,12 @@ the runtime.
 If the session does not exist, `resume` returns `-32602` with structured error
 data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
-recovery.
+recovery. A session id prefix must contain at least 4 characters.
+
+If the prefix matches more than one session, `resume` returns `-32602` with
+`data` shaped as `{"code":"session_id_ambiguous","session_id":"<requested id>","candidates":["<short id>", ...]}`.
+`candidates` contains the same bounded list of at most 8 short ids shown in the
+unchanged human-readable message.
 
 If the transcript is corrupt or uses a newer conversation format, `resume`
 returns `-32000` with bounded data:
