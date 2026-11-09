@@ -117,6 +117,25 @@ class _DecisionsScanOwner:
         self._generation += 1
         return self._generation
 
+    def _start_scan(
+        self, app: object, generation: int
+    ) -> tuple[asyncio.Future[tuple], int]:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        threading.Thread(
+            target=_scan_decisions,
+            args=(
+                app._home,
+                app._decisions_session_id,
+                _registry_state(app),
+                loop,
+                future,
+            ),
+            name="zeta-decisions-scan",
+            daemon=True,
+        ).start()
+        return future, generation
+
     async def read(
         self,
         app: object,
@@ -131,22 +150,8 @@ class _DecisionsScanOwner:
             if work is None or work[0].done():
                 if work is not None and work[0].done() and not work[0].cancelled():
                     work[0].exception()
-                loop = asyncio.get_running_loop()
-                future = loop.create_future()
-                work = (future, requested)
+                work = self._start_scan(app, requested)
                 self._work = work
-                threading.Thread(
-                    target=_scan_decisions,
-                    args=(
-                        app._home,
-                        app._decisions_session_id,
-                        _registry_state(app),
-                        loop,
-                        future,
-                    ),
-                    name="zeta-decisions-scan",
-                    daemon=True,
-                ).start()
             future, work_generation = work
             try:
                 result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
