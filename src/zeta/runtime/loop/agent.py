@@ -98,7 +98,9 @@ from ._completion import (
 from ._store_writes import StoreWriteMixin
 from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
+    NO_PROGRESS_LOOP_CODE,
     OUTPUT_LIMIT_ERROR_MESSAGE,
+    DispatchProgress,
     EmptyTurnRecoveryState,
     build_nudge_message,
     build_tool_limit_recovery_message,
@@ -283,6 +285,7 @@ class AgentLoop(
             tool_schemas if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
+        self._dispatch_progress = DispatchProgress()
         if system_prompt is None:
             system_prompt = load_identity(catalog=self.tool_registry.skill_catalog)
         self.context_assembler = context_assembler or ContextAssembler(
@@ -899,6 +902,8 @@ class AgentLoop(
                     notification_turn=notification_turn,
                     notice_sink=self._mcp_notice_sink,
                 )
+                if disposition == "dispatch":
+                    disposition = self._dispatch_progress.admit(self.store, prepared_delivery, step_delivery, retrying_context, waits_for_input=self.agent_instance_id is None or self.explicit_finish)
                 if disposition == "deferred":
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
@@ -906,6 +911,8 @@ class AgentLoop(
                     self._persist_partial_with_cancelled_tools(
                         [], None, failure=disposition
                     )
+                    if disposition.code == NO_PROGRESS_LOOP_CODE and self.agent_instance_id is not None:
+                        await self._background_owner.conversation_channel.publish_not_delivered(self, disposition.message)
                     yield StreamEvent(StreamEventType.ERROR, error=disposition)
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
@@ -1077,6 +1084,7 @@ class AgentLoop(
                             original,
                             provider_error=getattr(original, "provider_error", True),
                         )
+                self._dispatch_progress.reset()
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )
