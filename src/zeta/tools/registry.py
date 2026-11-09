@@ -875,6 +875,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         if policy is not None:
             policy.bind_rule_resolver(self.resolve_approval_rule)
             policy.bind_capability_resolver(self.resolve_tool_call_capability)
+            policy.bind_label_resolver(self.approval_label)
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
@@ -1074,7 +1075,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         finally:
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
-            self.forget_approval_labels((tool_call,))
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
@@ -1146,7 +1146,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         """Abort an unresolved approval without replacing a concurrent decision."""
         if self.approval_policy is None:
             return None
-        self.approval_policy.forget_display_label(tool_call.id)
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
         except (KeyError, UnknownToolAction, InvalidActionArguments, TypeError, ValueError):

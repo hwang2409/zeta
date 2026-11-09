@@ -65,6 +65,7 @@ class RuntimeCloseMixin:
             if prepare_ui_session_change is not None:
                 await attempt_async(prepare_ui_session_change)
             await attempt_async(self._close_finder_workers)
+            await attempt_async(self._close_approval_labels)
             pending = attempt(
                 lambda: (
                     {entry.id for entry in self.loop.store.agent_notifications()}

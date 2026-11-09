@@ -323,10 +323,6 @@ class ApprovalAbortPolicy(Protocol):
 
     async def prepare_rules(self, resolver: Callable[[ApprovalRule], Awaitable[ApprovalRule]]) -> None: ...
 
-    def set_display_label(self, request_id: str, label: str) -> None: ...
-
-    def forget_display_label(self, request_id: str) -> None: ...
-
     def consume_execution_binding(self, execution_token: str) -> ApprovedExecution | None: ...
 
     def cleanup_execution_binding(self, execution_token: str) -> None: ...
@@ -389,7 +385,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         ] = {}
         self._delegated_resolutions: dict[tuple[str, str], dict[str, str]] = {}
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
-        self._display_labels: dict[str, str] = {}
+        self._label_resolver: Callable[[ToolCall], Awaitable[str | None]] | None = None
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
         self._serve_control: _ServeApprovalControl | None = None
 
@@ -422,7 +418,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         """Return the exact foreground target store for serve capture."""
         return self._require_store()
 
-    def request_from_store(self, request_id: str, tool_call: ToolCall) -> ApprovalRequest:
+    def request_from_store(
+        self, request_id: str, tool_call: ToolCall, *, label: str | None = None
+    ) -> ApprovalRequest:
         """Resolve trusted display facts on the loop after a strict store read."""
         action = None
         resolved = self._capability_resolver is None
@@ -432,14 +430,16 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 resolved = True
             except (KeyError, TypeError, ValueError):
                 resolved = False
-        label = self._display_labels.get(request_id)
         return ApprovalRequest(request_id, tool_call, label=label, action=action, capability_resolved=resolved)
 
-    def set_display_label(self, request_id: str, label: str) -> None:
-        self._display_labels[request_id] = label
+    def bind_label_resolver(
+        self, resolver: Callable[[ToolCall], Awaitable[str | None]]
+    ) -> None:
+        self._label_resolver = resolver
 
-    def forget_display_label(self, request_id: str) -> None:
-        self._display_labels.pop(request_id, None)
+    async def display_label(self, tool_call: ToolCall) -> str | None:
+        """Name the call's target for display; derived from the call, never stored."""
+        return None if self._label_resolver is None else await self._label_resolver(tool_call)
 
     def bind_capability_resolver(
         self, resolver: Callable[[ToolCall], ApprovalCapability]
@@ -1023,8 +1023,11 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
             return None
         if self.decide(capability) is ApprovalDecision.ASK:
-            label = self._display_labels.get(tool_call.id)
-            return ApprovalRequest(tool_call.id, tool_call, label=label, action=capability.action)
+            return ApprovalRequest(
+                tool_call.id,
+                tool_call,
+                action=capability.action,
+            )
         return None
 
     async def authorize(

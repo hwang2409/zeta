@@ -539,7 +539,9 @@ class ApprovalLifecycle:
             for target in delegated
         }
         requests = [
-            policy.request_from_store(request_id, tool_call)
+            policy.request_from_store(
+                request_id, tool_call, label=await policy.display_label(tool_call)
+            )
             for request_id, (tool_call, decision) in foreground_states.items()
             if decision is None
         ]
@@ -733,6 +735,7 @@ class ApprovalLifecycle:
         token = record.token
         generation = record.generation
         state = record.target.store.approval_states_snapshot().get(core_key)
+        label = None if state is None else await policy.display_label(state[0])
         current = self._state.records.get(core_key)
         if (
             current is None
@@ -748,7 +751,7 @@ class ApprovalLifecycle:
             record = self._reserve_record(record, record.disposition)
             await self._settle_record(record, "abort", record.disposition)
             return None
-        request = policy.request_from_store(core_key, state[0])
+        request = policy.request_from_store(core_key, state[0], label=label)
         record = self._change(record, request=request)
         record = self._mark_pending(record)
         record = self._change(record, published=True)
@@ -1075,6 +1078,8 @@ class ApprovalLifecycle:
         durable_state = target.store.approval_states_snapshot().get(
             target.store_request_id
         )
+        # Look the label up before the ownership check, so a stale record is dropped.
+        label = None if durable_state is None else await policy.display_label(durable_state[0])
         current = self._state.records.get(key)
         if (
             current is None
@@ -1085,6 +1090,7 @@ class ApprovalLifecycle:
         await self._complete_approval_start(
             current,
             durable_state,
+            label,
             policy,
             token,
             generation,
@@ -1096,6 +1102,7 @@ class ApprovalLifecycle:
         self,
         record: ApprovalRecord,
         durable_state: tuple[ToolCall, str | None] | None,
+        label: str | None,
         policy: ApprovalPolicy,
         token: int,
         generation: int,
@@ -1119,7 +1126,7 @@ class ApprovalLifecycle:
             self._remove(target.key)
             return
         request = target.request or policy.request_from_store(
-            target.store_request_id, durable_state[0]
+            target.store_request_id, durable_state[0], label=label
         )
         record = self._change(record, request=request)
         payload = self.observe(request, fields=approval_display_fields(request))

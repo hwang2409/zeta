@@ -87,11 +87,9 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
     ) -> None:
         await self.parent.prepare_rules(resolver)
 
-    def set_display_label(self, request_id: str, label: str) -> None:
-        self.parent.set_display_label(request_id, label)
-
-    def forget_display_label(self, request_id: str) -> None:
-        self.parent.forget_display_label(request_id)
+    def bind_label_resolver(self, resolver: Any) -> None:
+        # Children never get inbox, and the parent keeps its own registry's resolver.
+        del resolver
 
     def bind_rule_resolver(self, resolver: Any) -> None:
         self.parent.bind_rule_resolver(resolver)
