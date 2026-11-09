@@ -1496,7 +1496,7 @@ async def test_terminal_note_writer_table(
                 held = asyncio.Event()
 
                 async def held_output(*args: object, **kwargs: object) -> None:
-                    await held.wait()
+                    await asyncio.wait_for(held.wait(), 10)
 
                 # test-contract: seam keep task output open so close must cut it off
                 monkeypatch.setattr(tasks, "_read_output", held_output)
