@@ -67,7 +67,7 @@ def _no_op_proposal(_prompt: str, budget=None) -> str:
 async def test_blocked_scanner_status_renders_blocked_text_through_tui_and_serve(
     tmp_path: Path,
 ) -> None:
-    runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(_runner, tmp_path, transcript_count=0)
     runner.session_dir.joinpath("conversation.jsonl").write_bytes(
         b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
         b"{not json}\n"
@@ -121,7 +121,8 @@ async def test_scheduled_retry_waits_for_scanner_recovery(tmp_path: Path) -> Non
         calls += 1
         return _proposal(prompt)
 
-    runner, _registry, _project_id, _notices = _runner(
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0, retry_backoff_seconds=0
     )
     path = runner.session_dir / "conversation.jsonl"
@@ -157,7 +158,7 @@ async def test_scheduled_retry_waits_for_scanner_recovery(tmp_path: Path) -> Non
 async def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
     tmp_path: Path,
 ) -> None:
-    runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(_runner, tmp_path, transcript_count=0)
     target = runner.session_dir / "conversation.jsonl"
     target.unlink()
     backend = StopThenFailBackend()
@@ -201,7 +202,7 @@ async def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
 async def test_reconciliation_cursor_survives_short_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner, registry, project_id, notices = _runner(tmp_path, transcript_count=1)
+    runner, registry, project_id, notices = await asyncio.to_thread(_runner, tmp_path, transcript_count=1)
     real_write = os.write
 
     def short_write(fd: int, payload: bytes) -> int:
@@ -252,7 +253,8 @@ def test_transcript_scanner_stops_at_corrupt_rows(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_corrupt_transcript_stays_blocked_after_scheduled_retries(tmp_path: Path) -> None:
-    runner, _registry, _project_id, notices = _runner(
+    runner, _registry, _project_id, notices = await asyncio.to_thread(
+        _runner,
         tmp_path, transcript_count=0, retry_backoff_seconds=0
     )
     path = runner.session_dir / "conversation.jsonl"
@@ -277,7 +279,7 @@ async def test_corrupt_transcript_stays_blocked_after_scheduled_retries(tmp_path
 async def test_auto_memory_failure_log_survives_short_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(_runner, tmp_path, transcript_count=0)
     runner.session_dir.joinpath("conversation.jsonl").write_bytes(b"{not json}\n")
     real_write = os.write
 
@@ -298,7 +300,7 @@ async def test_auto_memory_failure_log_survives_short_writes(
 
 @pytest.mark.asyncio
 async def test_corrupt_transcript_publishes_one_bounded_failure(tmp_path: Path) -> None:
-    runner, _registry, _project_id, notices = _runner(tmp_path, transcript_count=0)
+    runner, _registry, _project_id, notices = await asyncio.to_thread(_runner, tmp_path, transcript_count=0)
     path = runner.session_dir / "conversation.jsonl"
     path.write_bytes(
         b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
@@ -319,7 +321,7 @@ async def test_corrupt_transcript_publishes_one_bounded_failure(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_unsupported_transcript_row_keeps_its_cause(tmp_path: Path) -> None:
-    runner, _registry, _project_id, notices = _runner(tmp_path, transcript_count=0)
+    runner, _registry, _project_id, notices = await asyncio.to_thread(_runner, tmp_path, transcript_count=0)
     (runner.session_dir / "conversation.jsonl").write_text(
         '{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
         '{"seq": 2, "id": "m2", "parent_id": null, "type": "future", "data": {}}\n'
@@ -466,7 +468,8 @@ async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_adva
             await driver.refresh("expired-refresh", client)
         raise AssertionError("unreachable")
 
-    runner, _registry, _project_id, notices = _runner(
+    runner, _registry, _project_id, notices = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=2,
@@ -525,7 +528,8 @@ async def test_non_login_provider_failure_keeps_retrying(tmp_path: Path) -> None
             raise RuntimeError("provider temporarily unavailable")
         return _proposal(prompt)
 
-    runner, _registry, _project_id, _notices = _runner(
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=1,
@@ -555,7 +559,8 @@ async def test_rejected_only_entry_update_writes_bounded_diagnostic(tmp_path: Pa
     import zeta.memory.auto as auto_module
 
     monkeypatch.setattr(auto_module, "reconcile_entry_range", rejected_only)
-    runner, _registry, _project_id, notices = _runner(
+    runner, _registry, _project_id, notices = await asyncio.to_thread(
+        _runner,
         tmp_path, entry_format=True, transcript_count=1, minimum_interval=0
     )
     runner.before_eviction(1, 1)
@@ -582,7 +587,8 @@ async def test_successful_entry_update_writes_no_diagnostic(tmp_path: Path, monk
     import zeta.memory.auto as auto_module
 
     monkeypatch.setattr(auto_module, "reconcile_entry_range", successful)
-    runner, _registry, _project_id, _notices = _runner(
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path, entry_format=True, transcript_count=1, minimum_interval=0
     )
     runner.before_eviction(1, 1)
@@ -629,15 +635,15 @@ def test_zeta_completed_user_turn_does_not_schedule_early_update(
 async def test_no_op_reconciliation_advances_cursor_without_publishing_or_retrying(
     tmp_path: Path,
 ) -> None:
-    runner, registry, project_id, _ = _runner(tmp_path, _no_op_proposal)
+    runner, registry, project_id, _ = await asyncio.to_thread(_runner, tmp_path, _no_op_proposal)
     runner.before_eviction(1, 2)
     await runner.drain()
 
     assert runner.last_reconciled_seq == 2
-    assert registry.memory_log(project_id) == []
+    assert (await asyncio.to_thread(registry.memory_log, project_id)) == []
     runner.activity(2)
     await runner.drain()
-    assert registry.memory_log(project_id) == []
+    assert (await asyncio.to_thread(registry.memory_log, project_id)) == []
 
 
 @pytest.mark.asyncio
@@ -663,12 +669,13 @@ async def test_rejected_entry_reconciliation_advances_without_publishing_or_retr
             }
         )
 
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, rejected_proposal, entry_format=True
     )
     pointer_path = registry.root / project_id / "memory-current.json"
     before_pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    before_mirrors = registry._entry_memory_mirrors(project_id)
+    before_mirrors = await asyncio.to_thread(registry._entry_memory_mirrors, project_id)
 
     runner.before_eviction(1, 2)
     await runner.drain()
@@ -676,7 +683,7 @@ async def test_rejected_entry_reconciliation_advances_without_publishing_or_retr
     assert runner.last_reconciled_seq == 2
     assert calls == 1
     assert json.loads(pointer_path.read_text(encoding="utf-8")) == before_pointer
-    assert registry._entry_memory_mirrors(project_id) == before_mirrors
+    assert (await asyncio.to_thread(registry._entry_memory_mirrors, project_id)) == before_mirrors
 
     runner.activity(2)
     await runner.drain()
@@ -691,14 +698,14 @@ async def test_before_eviction_reconciles_exact_range(tmp_path: Path) -> None:
         seen.append(prompt)
         return _proposal(prompt)
 
-    runner, registry, project_id, notices = _runner(tmp_path, invoke)
+    runner, registry, project_id, notices = await asyncio.to_thread(_runner, tmp_path, invoke)
     runner.before_eviction(2, 3)
     await runner.drain()
 
     assert '"seq": 1' not in seen[0]
     assert '"seq": 2' in seen[0] and '"seq": 3' in seen[0]
     assert '"seq": 4' not in seen[0]
-    assert dict(registry.load_memory(project_id))["decisions.md"].endswith("range 2-3\n")
+    assert dict(await asyncio.to_thread(registry.load_memory, project_id))["decisions.md"].endswith("range 2-3\n")
     assert notices == []
 
 
@@ -707,7 +714,8 @@ async def test_before_eviction_reconciles_exact_range(tmp_path: Path) -> None:
 async def test_token_growth_uses_text_estimate_not_utf8_bytes(
     tmp_path: Path, text: str
 ) -> None:
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, token_threshold=500, transcript_count=1
     )
     row = {"seq": 1, "type": "message", "data": {"text": text}}
@@ -718,19 +726,20 @@ async def test_token_growth_uses_text_estimate_not_utf8_bytes(
     runner.activity(1)
     await runner.drain()
 
-    assert not registry.memory_log(project_id)
+    assert not (await asyncio.to_thread(registry.memory_log, project_id))
 
 
 @pytest.mark.asyncio
 async def test_token_growth_position_is_durable_and_ignores_provider_usage(
     tmp_path: Path,
 ) -> None:
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, token_threshold=50, transcript_count=1
     )
     runner.activity()
     await runner.drain()
-    assert not registry.memory_log(project_id)
+    assert not (await asyncio.to_thread(registry.memory_log, project_id))
 
     _write_transcript(runner.session_dir, 4)
     runner.activity(4)
@@ -747,7 +756,7 @@ async def test_token_growth_position_is_durable_and_ignores_provider_usage(
         config=runner.config,
     )
     assert replacement._last_reconciled_tokens == position["transcript_tokens"]
-    assert len(registry.memory_log(project_id)) == 1
+    assert len(await asyncio.to_thread(registry.memory_log, project_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -759,7 +768,8 @@ async def test_idle_trigger(tmp_path: Path) -> None:
         reconciliation_started.set()
         return _proposal(prompt)
 
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         idle_seconds=10,
@@ -772,13 +782,13 @@ async def test_idle_trigger(tmp_path: Path) -> None:
     runner.activity(4)
     await idle_clock.advance(10)
     await _wait_until(idle_clock.waiting, "idle clock to re-arm")
-    assert not registry.memory_log(project_id)
+    assert not (await asyncio.to_thread(registry.memory_log, project_id))
     await idle_clock.advance(10)
     await _wait_until(
         reconciliation_started, "idle-triggered reconciliation to start"
     )
     await runner.drain()
-    assert len(registry.memory_log(project_id)) == 1
+    assert len(await asyncio.to_thread(registry.memory_log, project_id)) == 1
 
     # Idle is re-armed by later durable activity after a completed reconciliation.
     _write_transcript(runner.session_dir, 5)
@@ -791,12 +801,12 @@ async def test_idle_trigger(tmp_path: Path) -> None:
         reconciliation_started, "re-armed idle-triggered reconciliation to start"
     )
     await runner.drain()
-    assert len(registry.memory_log(project_id)) == 2
+    assert len(await asyncio.to_thread(registry.memory_log, project_id)) == 2
 
 
 @pytest.mark.asyncio
 async def test_crash_resume_has_no_duplicate_history(tmp_path: Path) -> None:
-    runner, registry, project_id, _ = _runner(tmp_path)
+    runner, registry, project_id, _ = await asyncio.to_thread(_runner, tmp_path)
     runner.before_eviction(1, 2)
     await runner.drain()
     # Simulate a crash after apply but before the position publication.
@@ -813,7 +823,7 @@ async def test_crash_resume_has_no_duplicate_history(tmp_path: Path) -> None:
     replacement.before_eviction(1, 2)
     await replacement.drain()
 
-    assert len(registry.memory_log(project_id)) == 1
+    assert len(await asyncio.to_thread(registry.memory_log, project_id)) == 1
     assert replacement.last_reconciled_seq == 2
     diagnostics = registry.root.parent / "logs" / "memory-reconciliation.jsonl"
     records = [json.loads(line) for line in diagnostics.read_text().splitlines()]
@@ -830,7 +840,8 @@ async def test_crash_resume_has_no_duplicate_history(tmp_path: Path) -> None:
 async def test_cas_exhaustion_keeps_pending_range_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, cas_retries=3, minimum_interval=0
     )
     original = registry.compare_and_swap_memory
@@ -851,7 +862,7 @@ async def test_cas_exhaustion_keeps_pending_range_and_retries(
 
     assert calls == 4
     assert runner.last_reconciled_seq == 2
-    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+    assert (await asyncio.to_thread(registry.memory_snapshot, project_id)).contents["decisions.md"].endswith(
         "range 1-2\n"
     )
 
@@ -860,7 +871,8 @@ async def test_cas_exhaustion_keeps_pending_range_and_retries(
 async def test_close_stops_retrying_persistent_cas_conflicts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner, registry, _project_id, _ = _runner(
+    runner, registry, _project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, cas_retries=1, minimum_interval=0
     )
     attempts = 0
@@ -875,7 +887,7 @@ async def test_close_stops_retrying_persistent_cas_conflicts(
     monkeypatch.setattr(registry, "compare_and_swap_memory", always_conflicts)
     runner.before_eviction(1, 2)
     while attempts == 0:
-        await asyncio.sleep(0)
+        await await_or_fail(asyncio.sleep(0), what="CAS conflict attempt")
 
     await asyncio.wait_for(runner.close(), timeout=0.2)
 
@@ -893,14 +905,18 @@ async def test_concurrent_edit_retries_without_clobber(tmp_path: Path) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
-            registry_ref.update_memory(project_ref, {"brief.md": "# Brief\n\nHuman edit.\n"})
+            await asyncio.to_thread(
+                registry_ref.update_memory,
+                project_ref,
+                {"brief.md": "# Brief\n\nHuman edit.\n"},
+            )
         return _proposal(prompt)
 
-    runner, registry_ref, project_ref, _ = _runner(tmp_path, invoke)
+    runner, registry_ref, project_ref, _ = await asyncio.to_thread(_runner, tmp_path, invoke)
     runner.before_eviction(1, 2)
     await runner.drain()
 
-    memory = dict(registry_ref.load_memory(project_ref))
+    memory = dict(await asyncio.to_thread(registry_ref.load_memory, project_ref))
     assert calls == 2
     assert memory["brief.md"].endswith("Human edit.\n")
     assert memory["decisions.md"].endswith("range 1-2\n")
@@ -916,7 +932,7 @@ async def test_background_reconcile_does_not_block_event_loop(tmp_path: Path) ->
         await await_or_fail(release.wait(), what="release.wait()")
         return _proposal(prompt)
 
-    runner, _, _, _ = _runner(tmp_path, invoke)
+    runner, _, _, _ = await asyncio.to_thread(_runner, tmp_path, invoke)
     ticks = 0
 
     async def ticker() -> None:
@@ -935,7 +951,7 @@ async def test_background_reconcile_does_not_block_event_loop(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_close_is_deterministic_before_worker_first_runs(tmp_path: Path) -> None:
-    runner, _, _, _ = _runner(tmp_path)
+    runner, _, _, _ = await asyncio.to_thread(_runner, tmp_path)
     runner.activity(1)
 
     await asyncio.wait_for(runner.close(), timeout=1)
@@ -950,7 +966,7 @@ async def test_disabled_setting_never_invokes(tmp_path: Path) -> None:
         calls += 1
         return _proposal(prompt)
 
-    runner, _, _, _ = _runner(tmp_path, invoke, enabled=False, idle_seconds=0.01)
+    runner, _, _, _ = await asyncio.to_thread(_runner, tmp_path, invoke, enabled=False, idle_seconds=0.01)
     runner.activity(4)
     runner.before_eviction(1, 3)
     await runner.drain()
@@ -968,7 +984,8 @@ async def test_oversized_row_is_bounded_once_and_preserves_tail_evidence(
         prompts.append(prompt)
         return _proposal(prompt)
 
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
     row = {
@@ -988,7 +1005,7 @@ async def test_oversized_row_is_bounded_once_and_preserves_tail_evidence(
     assert fact in prompts[0]
     assert "content omitted for automatic memory request size" in prompts[0]
     assert runner.last_reconciled_seq == 1
-    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+    assert (await asyncio.to_thread(registry.memory_snapshot, project_id)).contents["decisions.md"].endswith(
         "range 1-1\n"
     )
 
@@ -1003,7 +1020,8 @@ async def test_oversized_user_row_gets_terminal_receipt_without_publication(
         prompts.append(prompt)
         return _proposal(prompt)
 
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, invoke, transcript_count=2, minimum_interval=0
     )
     oversized = {
@@ -1038,7 +1056,7 @@ async def test_oversized_user_row_gets_terminal_receipt_without_publication(
 
     assert len(prompts) == 1
     assert '"seq": 1' not in prompts[0]
-    assert registry.memory_log(project_id)[-1]["provenance"]["seq_start"] == 2
+    assert (await asyncio.to_thread(registry.memory_log, project_id))[-1]["provenance"]["seq_start"] == 2
     receipt = runner.terminal_receipts()[0]
     assert (receipt.seq_start, receipt.seq_end) == (1, 1)
     assert receipt.validation_summary == "user row exceeds the request limit"
@@ -1055,7 +1073,8 @@ async def test_fitting_user_row_preserves_middle_fact(tmp_path: Path) -> None:
         prompts.append(prompt)
         return '{"changes":[]}'
 
-    runner, _, _, _ = _runner(
+    runner, _, _, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
     row = {
@@ -1097,7 +1116,8 @@ async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Pat
             await await_or_fail(release.wait(), what="release.wait()")
         return _proposal(prompt)
 
-    runner, _, _, _ = _runner(
+    runner, _, _, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, invoke, transcript_count=2, token_threshold=1, minimum_interval=0
     )
     runner.activity(2)
@@ -1365,7 +1385,8 @@ async def test_failed_range_waits_for_retry_while_later_range_continues(
         return _proposal(prompt)
 
     retry_now = [1_000.0]
-    runner, registry, project_id, notices = _runner(
+    runner, registry, project_id, notices = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=2,
@@ -1393,7 +1414,7 @@ async def test_failed_range_waits_for_retry_while_later_range_continues(
 
     assert calls == [1, 1, 2]
     assert runner.last_reconciled_seq == 0
-    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+    assert (await asyncio.to_thread(registry.memory_snapshot, project_id)).contents["decisions.md"].endswith(
         "range 2-2\n"
     )
     position = json.loads(runner.position_path.read_text(encoding="utf-8"))
@@ -1462,7 +1483,8 @@ async def test_provider_failure_records_exact_unit_and_prior_usage(tmp_path: Pat
             return ReconciliationResponse("not json", {"input_tokens": 7})
         raise RuntimeError("provider unavailable")
 
-    runner, _, _, _ = _runner(
+    runner, _, _, _ = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=2,
@@ -1529,7 +1551,8 @@ async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
             return ReconciliationResponse(_proposal(prompt), {"input_tokens": 1})
         return ReconciliationResponse("not json", {"input_tokens": 2})
 
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=1,
@@ -1542,10 +1565,10 @@ async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
     state = json.loads(runner.position_path.read_text(encoding="utf-8"))
     assert state["terminal_receipts"][0]["usage"] == {"input_tokens": 12}
 
-    listing = run_memory_command(registry, project_id, "retry", runner)
+    listing = await asyncio.to_thread(run_memory_command, registry, project_id, "retry", runner)
     assert receipt.key in listing
     valid = True
-    queued = run_memory_command(
+    queued = await asyncio.to_thread(run_memory_command,
         registry,
         project_id,
         f"retry {receipt.key[:12]}",
@@ -1558,7 +1581,7 @@ async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
     assert runner.terminal_receipts() == ()
     state = json.loads(runner.position_path.read_text(encoding="utf-8"))
     assert state["completed_ranges"] == []
-    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+    assert (await asyncio.to_thread(registry.memory_snapshot, project_id)).contents["decisions.md"].endswith(
         "range 1-1\n"
     )
 
@@ -1576,13 +1599,14 @@ async def test_repair_aggregates_usage_into_committed_provenance(tmp_path: Path)
             _proposal(prompt), {"input_tokens": 5, "output_tokens": 7}
         )
 
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
     runner.before_eviction(1, 1)
     await runner.drain()
 
-    provenance = registry.memory_log(project_id)[-1]["provenance"]
+    provenance = (await asyncio.to_thread(registry.memory_log, project_id))[-1]["provenance"]
     assert provenance["usage"] == {"input_tokens": 8, "output_tokens": 9}
 
 
@@ -1597,7 +1621,8 @@ async def test_entry_repair_login_required_pauses_without_retry(tmp_path: Path) 
             return ReconciliationResponse("not json", {})
         raise ProviderLoginRequiredError("login required")
 
-    runner, _registry, _project_id, _notices = _runner(
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         entry_format=True,
@@ -1638,7 +1663,8 @@ async def test_entry_repair_request_too_large_is_terminal(tmp_path: Path) -> Non
             return ReconciliationResponse("not json", {})
         raise RequestTooLargeError("request too large")
 
-    runner, _registry, _project_id, _notices = _runner(
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         entry_format=True,
@@ -1666,7 +1692,8 @@ async def test_first_call_request_too_large_is_terminal_not_repaired(
         calls += 1
         raise RequestTooLargeError("request too large")
 
-    runner, _registry, _project_id, _notices = _runner(
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=1,
@@ -1688,7 +1715,8 @@ async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
             _proposal(prompt), {"input_tokens": 7, "output_tokens": 3}
         )
 
-    runner, _registry, project_id, _notices = _runner(
+    runner, _registry, project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
     runner.before_eviction(1, 1)
@@ -1718,7 +1746,8 @@ async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
             _no_op_proposal(_prompt), {"input_tokens": 4, "output_tokens": 1}
         )
 
-    runner, _registry, _project_id, _notices = _runner(
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
     runner.before_eviction(1, 1)
@@ -1740,7 +1769,8 @@ async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
 async def test_commit_failure_writes_no_success_diagnostic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner, registry, project_id, _notices = _runner(
+    runner, registry, project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path, transcript_count=1, minimum_interval=0, cas_retries=1
     )
 
@@ -1767,7 +1797,7 @@ async def test_commit_failure_writes_no_success_diagnostic(
         }
     ]
     assert runner.last_reconciled_seq == 0
-    assert registry.memory_snapshot(project_id).contents["decisions.md"] == "# Decisions\n"
+    assert (await asyncio.to_thread(registry.memory_snapshot, project_id)).contents["decisions.md"] == "# Decisions\n"
 
 
 @pytest.mark.asyncio
@@ -1779,7 +1809,8 @@ async def test_failure_writes_persistent_file_log_without_stderr(
             "not json", {"input_tokens": 2, "output_tokens": 1}
         )
 
-    runner, _, _, _ = _runner(
+    runner, _, _, _ = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=1,
@@ -1821,7 +1852,8 @@ async def test_health_log_never_contains_transcript_or_model_text(
             output = json.dumps(proposal)
         return ReconciliationResponse(output, {"input_tokens": 2, "output_tokens": 1})
 
-    runner, _registry, _project_id, _notices = _runner(
+    runner, _registry, _project_id, _notices = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=1,
@@ -1855,7 +1887,8 @@ async def test_close_with_pending_range_makes_no_backend_call(
         calls += 1
         return '{"changes":[]}'
 
-    runner, _, _, _ = _runner(
+    runner, _, _, _ = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         minimum_interval=0,
@@ -1885,7 +1918,8 @@ async def test_close_cancels_inflight_request_quietly(
             cancelled.set()
             raise
 
-    runner, _, _, notices = _runner(
+    runner, _, _, notices = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         minimum_interval=0,
@@ -1906,7 +1940,8 @@ async def test_close_cancels_inflight_request_quietly(
 async def test_resume_catches_up_from_durable_cursor(
     tmp_path: Path,
 ) -> None:
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path, minimum_interval=0, shutdown_grace_seconds=0
     )
     runner.before_eviction(1, 4)
@@ -1925,7 +1960,7 @@ async def test_resume_catches_up_from_durable_cursor(
     await resumed.drain()
 
     assert resumed.last_reconciled_seq == 4
-    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+    assert (await asyncio.to_thread(registry.memory_snapshot, project_id)).contents["decisions.md"].endswith(
         "range 1-4\n"
     )
 
@@ -1945,7 +1980,8 @@ async def test_repartitioned_retry_replaces_original_failure(
             raise RuntimeError("retry failed")
         return _proposal(prompt)
 
-    runner, registry, project_id, _ = _runner(
+    runner, registry, project_id, _ = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=3,
@@ -1988,7 +2024,7 @@ async def test_repartitioned_retry_replaces_original_failure(
         end_offset=0,
         end_tokens=0,
     )
-    registry.update_memory(project_id, {"brief.md": "# Brief\n\n" + "m" * 30_000})
+    await asyncio.to_thread(registry.update_memory, project_id, {"brief.md": "# Brief\n\n" + "m" * 30_000})
 
     retry_now[0] = 1_010
     await asyncio.wait_for(runner.drain(), timeout=2)
@@ -2018,7 +2054,8 @@ async def test_drain_bounds_attempts_when_retry_key_stays_due(
         calls += 1
         return _proposal(prompt)
 
-    runner, _, _, _ = _runner(
+    runner, _, _, _ = await asyncio.to_thread(
+        _runner,
         tmp_path,
         invoke,
         transcript_count=1,
@@ -2265,7 +2302,7 @@ async def test_delivery_only_range_advances_cursor_without_provider(tmp_path: Pa
         calls += 1
         raise AssertionError(prompt)
 
-    runner, registry, project_id, _ = _runner(tmp_path, invoke, transcript_count=0)
+    runner, registry, project_id, _ = await asyncio.to_thread(_runner, tmp_path, invoke, transcript_count=0)
     path = runner.session_dir / "conversation.jsonl"
     rows = [
         {"seq": 1, "type": "message", "data": {"text": "user turn"}},

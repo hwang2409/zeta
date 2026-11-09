@@ -12,7 +12,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -29,7 +29,6 @@ from ...agent.pending_delivery import (
     SHUTDOWN_DELIVERY_TIMEOUT_SECONDS,
     NotificationInput,
     ProducerResult,
-    StepDeliveryFlow,
     complete_notification_context_staging,
     delivery_disposition,
 )
@@ -41,6 +40,7 @@ from ...agent.plan_mode import (
 from ...agent.result_payload import ChildResultPayloadMixin
 from ...agent.runner import run_agent_tool
 from ...agent.tool_results import validated_tool_result as _validated_tool_result
+from ...agent.turn_limit import ChildTurnControl
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import BudgetExceeded, ContextAssembler
@@ -104,13 +104,11 @@ from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
     DispatchProgress,
     EmptyTurnRecoveryState,
-    build_nudge_message,
     build_tool_limit_recovery_message,
     complete_empty_turn,
-    empty_turn_recovery_error,
     output_limit_error,
     read_turn_metadata,
-    should_nudge_empty_turn,
+    toolless_transition,
 )
 from .live_config import LiveConfigMixin
 from .mcp_session import MCPSession
@@ -121,15 +119,6 @@ from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
 TaskResult = TypeVar("TaskResult")
-
-
-@dataclass(frozen=True, slots=True)
-class _ToollessTransition:
-    continue_turn: bool
-    consuming_notifications: bool
-    nudge_turn_pending: bool
-    recovery_state: EmptyTurnRecoveryState
-    error: ErrorInfo | None = None
 
 
 class AgentLoop(
@@ -178,6 +167,7 @@ class AgentLoop(
         live_config_home: Path | None = None,
         live_config_project_dir: Path | None = None,
         freeze_live_config: bool = False,
+        child_turn_control: ChildTurnControl | None = None,
     ) -> None:
         if type(max_agent_depth) is not int or not (
             0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
@@ -196,6 +186,7 @@ class AgentLoop(
         self.agent_depth = agent_depth
         self.max_agent_depth = max_agent_depth
         self.agent_instance_id = agent_instance_id
+        self.child_turn_control = child_turn_control
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
         # Nested loops publish lineage through the root session directory.
@@ -366,7 +357,6 @@ class AgentLoop(
             self.backend.set_token_budget(token_budget)
     def admit_abort(self) -> None:
         self._abort_admitted = True
-
     def abort(
         self,
         *,
@@ -379,7 +369,6 @@ class AgentLoop(
             self._background_owner.cancel_all()
             if steering_drop_reason is not None:
                 self.store.drop_client_steering(steering_drop_reason)
-
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
         The running ``_run_turn`` drains this queue before the next provider
@@ -387,11 +376,9 @@ class AgentLoop(
         tool_result. Callers must pass a durable USER-role message.
         """
         self.store.queue_client_steering(message)
-
     @property
     def has_pending_steering(self) -> bool:
         return self.store.has_pending_client_steering
-
     def clear_pending_steering(
         self,
         reason: Literal["clear", "turn_end"] = "clear",
@@ -672,51 +659,6 @@ class AgentLoop(
         return self._finalize_tool_results([tool_call], [None])[0]
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         return self.store.tool_result(tool_call_id)
-    async def _toolless_transition(
-        self,
-        step_delivery: StepDeliveryFlow,
-        assistant_message: Message,
-        *,
-        iteration_consuming_notifications: bool,
-        notification_turn: bool,
-        recovery_state: EmptyTurnRecoveryState,
-    ) -> _ToollessTransition:
-        should_nudge = (
-            not iteration_consuming_notifications
-            and should_nudge_empty_turn(
-                assistant_message,
-                stop_reason=self._turn_stop_reason,
-                notification_turn=notification_turn,
-                already_nudged=(
-                    recovery_state.nudge_episode
-                    == recovery_state.tool_result_episode
-                ),
-                nudge_count=recovery_state.nudge_count,
-            )
-        )
-        consume_pending = step_delivery.has_pending_edge and not notification_turn
-        error = empty_turn_recovery_error(
-            assistant_message,
-            notification_turn=notification_turn,
-            consuming_notifications=consume_pending,
-            should_nudge=should_nudge,
-            recovery_state=recovery_state,
-        )
-        if should_nudge:
-            await step_delivery.admit_terminal("nudge")
-            await self._append_turn_message(build_nudge_message())
-        elif not step_delivery.has_pending_edge and self.agent_instance_id is None:
-            await step_delivery.admit_terminal("foreground_end")
-        if should_nudge:
-            recovery_state.nudge_count += 1
-            recovery_state.nudge_episode = recovery_state.tool_result_episode
-        return _ToollessTransition(
-            continue_turn=consume_pending or should_nudge,
-            consuming_notifications=consume_pending,
-            nudge_turn_pending=should_nudge,
-            recovery_state=recovery_state,
-            error=error,
-        )
     async def _run_turn_impl(
         self,
         user_text: str,
@@ -810,6 +752,14 @@ class AgentLoop(
             if not retrying_context:
                 if self._abort_admitted:
                     return
+                if self.child_turn_control is not None:
+                    warning = self.child_turn_control.begin_completion()
+                    if not self.child_turn_control.reserved:
+                        break
+                    if warning is not None:
+                        await self._append_turn_message(warning)
+                provider_retry_budget = None
+                self._turn_provider_retry_records = []
                 iteration_consuming_notifications = consuming_notifications
                 consuming_notifications = False
                 turn_number += 1
@@ -839,18 +789,13 @@ class AgentLoop(
                 ):
                     yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
                     await account_context.ensure_account_state(self)
-                if retrying_context or (
-                    self.context_assembler.needs_compaction()
-                    if not host_instruction
-                    else self.context_assembler.needs_compaction(
-                        system_append=host_instruction
-                    )
-                ):
-                    yield StreamEvent(
-                        StreamEventType.COMPACTION_START,
-                        data={"turn": turn_number},
-                    )
                 try:
+                    should_compact = await self.context_assembler.prepare_context(
+                        force=retrying_context,
+                        system_append=host_instruction,
+                    )
+                    if should_compact:
+                        yield StreamEvent(StreamEventType.COMPACTION_START, data={"turn": turn_number})
                     context_messages = await self.context_assembler.assemble(
                         backend=self.backend,
                         force=retrying_context,
@@ -866,6 +811,9 @@ class AgentLoop(
                         emergency=True,
                         system_append=host_instruction,
                     )
+                finally:
+                    # cancellation must not retain the prepared message graph.
+                    self.context_assembler.discard_prepared_context()
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
                 context_messages = self._account_safe_context(context_messages)
@@ -1147,9 +1095,12 @@ class AgentLoop(
                 if isinstance(block, ToolUseContent)
             ]
             _validate_unique_tool_call_ids(calls)
+            assistant_message, calls, preparation_errors = (
+                await self.tool_registry.prepare_tool_calls(assistant_message)
+            )
             approval_requests: list[ApprovalAuditRequest] = []
             for tool_call in calls:
-                if not self.plan_mode_allows(tool_call):
+                if tool_call.id in preparation_errors or not self.plan_mode_allows(tool_call):
                     continue
                 request = self.tool_registry.prepare_approval(tool_call)
                 if request is not None:
@@ -1189,11 +1140,19 @@ class AgentLoop(
                         ),
                     },
                 )
+                exhausted = (
+                    self.child_turn_control.finish_completion()
+                    if self.child_turn_control is not None
+                    else False
+                )
                 yield StreamEvent(
                     StreamEventType.TURN_END,
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
+                if exhausted:
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
                 recovering_tool_limit = True
                 continue
             recovering_tool_limit = False
@@ -1204,7 +1163,8 @@ class AgentLoop(
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             if not calls:
-                transition = await self._toolless_transition(
+                transition = await toolless_transition(
+                    self,
                     step_delivery,
                     assistant_message,
                     iteration_consuming_notifications=(
@@ -1223,8 +1183,19 @@ class AgentLoop(
                     admit_terminal=step_delivery.admit_terminal,
                     schedule_index=self._schedule_transcript_index,
                 )
+                hard_limit_reached = False
                 for event in events:
+                    if (
+                        event.type is StreamEventType.TURN_END
+                        and self.child_turn_control is not None
+                    ):
+                        hard_limit_reached = (
+                            self.child_turn_control.finish_completion()
+                        )
                     yield event
+                if hard_limit_reached:
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
                 consuming_notifications = transition.consuming_notifications
                 if done:
                     return
@@ -1251,6 +1222,8 @@ class AgentLoop(
                 await dispatch.aclose()
                 await self._background_owner.wait_for_store_closes()
             if self._explicit_finish_report is not None:
+                if self.child_turn_control is not None:
+                    self.child_turn_control.finish_completion()
                 yield StreamEvent(
                     StreamEventType.TURN_END,
                     message=assistant_message,
@@ -1260,11 +1233,16 @@ class AgentLoop(
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             await self._check_project_inbox()
+            if self.child_turn_control is not None:
+                self.child_turn_control.finish_completion()
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,
                 data={"turn": turn_number, "tool_calls": len(calls)},
             )
+        if self.child_turn_control is not None and self.child_turn_control.exhausted:
+            yield StreamEvent(StreamEventType.AGENT_END)
+            return
         yield StreamEvent(
             StreamEventType.ERROR,
             error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),

@@ -422,7 +422,7 @@ def _create_app_with_root(
             system_append=system_prompt_append,
             context_loader=_app.load_project_context,
             project_features_enabled=registry is not None,
-            registry=registry,
+            registry=manager.project_registry_state,
             project_projection=projection,
         )
         project_context = resumed_prompt.context
@@ -445,7 +445,7 @@ def _create_app_with_root(
             session_project=session_project,
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
-            registry=registry,
+            registry=manager.project_registry_state,
             project_projection=projection,
         )
     recency: _SessionRecency | None = None

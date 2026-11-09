@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ...locking import execution_lock
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
 from ...storage_format import reject_unknown_keys
@@ -148,31 +149,37 @@ class PromptCompositionMixin:
             raise SessionError("prompt execution lease does not match session metadata")
         store.assert_execution_owner()
         with (
+            execution_lock(),
             store.execution_lease.serialize_mutation(),
-            self._metadata_lock(metadata.session_id) as directory_fd,
+            store.prompt_resume_lease() as should_compose,
         ):
-            current = self._read(metadata.session_id, directory_fd=directory_fd)
-            with store.prompt_resume_lease() as should_compose:
+            while True:
+                with self._metadata_lock(metadata.session_id) as directory_fd:
+                    current = self._read(metadata.session_id, directory_fd=directory_fd)
                 if not should_compose:
                     composition = _composition_from_metadata(current)
                     self._copy_metadata(metadata, current)
                     return composition
                 composition = compose(current)
-            if _persisted_fields(composition) != _persisted_fields(
-                _composition_from_metadata(current)
-            ):
-                current.system_prompt = composition.system_prompt
-                current.context_files = list(composition.context_files)
-                current.skill_catalog = composition.skill_catalog.to_snapshot()
-                current.agent_catalog = composition.agent_catalog.to_snapshot()
-                current.prompt_recipe = composition.prompt_recipe
-                current.prompt_components = {
-                    key: dict(component)
-                    for key, component in composition.prompt_components.items()
-                }
-                current.project_memory_offset = composition.project_memory_offset
-                current.project_memory_length = composition.project_memory_length
-                current.project_memory_digest = composition.project_memory_digest
-                self._write_unlocked(current, directory_fd=directory_fd)
-            self._copy_metadata(metadata, current)
-            return composition
+                with self._metadata_lock(metadata.session_id) as directory_fd:
+                    latest = self._read(metadata.session_id, directory_fd=directory_fd)
+                    if latest != current:
+                        continue
+                    if _persisted_fields(composition) != _persisted_fields(
+                        _composition_from_metadata(latest)
+                    ):
+                        latest.system_prompt = composition.system_prompt
+                        latest.context_files = list(composition.context_files)
+                        latest.skill_catalog = composition.skill_catalog.to_snapshot()
+                        latest.agent_catalog = composition.agent_catalog.to_snapshot()
+                        latest.prompt_recipe = composition.prompt_recipe
+                        latest.prompt_components = {
+                            key: dict(component)
+                            for key, component in composition.prompt_components.items()
+                        }
+                        latest.project_memory_offset = composition.project_memory_offset
+                        latest.project_memory_length = composition.project_memory_length
+                        latest.project_memory_digest = composition.project_memory_digest
+                        self._write_unlocked(latest, directory_fd=directory_fd)
+                    self._copy_metadata(metadata, latest)
+                    return composition

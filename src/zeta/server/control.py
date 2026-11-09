@@ -263,8 +263,11 @@ class ServeControl:
     def session_replaced(self) -> None:
         self._approvals.session_replaced()
 
-    async def wait_for_approval_settlement(self) -> None:
-        await self._approvals.wait_for_approval_settlement()
+    async def wait_for_approval_settlement(self, timeout: float | None = None) -> None:
+        if timeout is None:
+            await self._approvals.wait_for_approval_settlement()
+        else:
+            await self._approvals.wait_for_approval_settlement(timeout)
 
     def begin_controller_release(
         self, *, reconnect: bool = False

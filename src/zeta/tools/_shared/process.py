@@ -828,13 +828,12 @@ class BackgroundTaskRegistry:
             if log_handle is not None:
                 try:
                     await self._archive_record(record, log_handle)
+                except asyncio.CancelledError as exc:
+                    archive_error = exc
                 except BaseException as exc:
                     archive_error = exc
-                    record.note = "background output archive failed; recovery will retry the retained log"
-                    logger.exception(
-                        "failed to archive background task output for %s",
-                        record.task_id,
-                    )
+                    if record.note is None: record.note = "background output archive failed; recovery will retry the retained log"
+                    logger.exception("failed to archive background task output for %s", record.task_id)
             await self._commit_terminal(record, process.returncode)
             if archive_error is not None:
                 raise archive_error
@@ -1027,7 +1026,7 @@ class BackgroundTaskRegistry:
                 monitor_result, asyncio.CancelledError
             ):
                 raise monitor_result
-        if monitor_cutoff:
+        if monitor_cutoff and record.log_fd is not None:
             record.note = f"{record.note}; {OUTPUT_CUTOFF_NOTE}"
         await self._commit_terminal(record, process.returncode)
 

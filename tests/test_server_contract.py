@@ -300,12 +300,17 @@ async def test_controller_and_observer_roles_match(
         {
             "protocol_version": "1.2",
             "role": "observer",
-            "features": ["serve_observers", "session_grants"],
+            "features": ["serve_observers", "session_grants", "child_runs"],
         },
     )
 
     observed = await observer.request("observer-list", "list_sessions")
     rejected = await observer.request("observer-new", "new_session")
+    rejected_child_send = await observer.request(
+        "observer-child-send",
+        "child_run_send",
+        {"session_id": "unused", "run_id": "unused:1", "text": "no"},
+    )
     created = await controller.request("controller-new", "new_session")
     for index in range(7):
         extra = await serve_contract.connect("observer")
@@ -339,6 +344,11 @@ async def test_controller_and_observer_roles_match(
     assert rejected["error"]["data"] == {
         "code": "observer_read_only",
         "method": "new_session",
+    }
+    assert rejected_child_send["error"] == {
+        "code": -32008,
+        "message": "method is unavailable to read-only observers",
+        "data": {"code": "observer_read_only", "method": "child_run_send"},
     }
     assert created["result"]["session"]["session_id"]
     assert capacity["error"]["code"] == -32001

@@ -56,8 +56,7 @@ class RuntimeCloseMixin:
                     first_error = exc
 
         try:
-            attempt(self.stop_decisions_poll)
-            attempt(self._stop_decisions_refresh)
+            await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
             prepare_ui_session_change = getattr(
                 self, "_prepare_ui_session_change", None
@@ -65,6 +64,7 @@ class RuntimeCloseMixin:
             if prepare_ui_session_change is not None:
                 await attempt_async(prepare_ui_session_change)
             await attempt_async(self._close_finder_workers)
+            await attempt_async(self._close_approval_labels)
             pending = attempt(
                 lambda: (
                     {entry.id for entry in self.loop.store.agent_notifications()}
