@@ -759,12 +759,14 @@ async def test_generation_overcount_keeps_row_backed_frame_on_stream(
 
     def pause_before_write() -> None:
         entered.set()
+        # test-contract: seam holds the real async store write before its public install
         assert release.wait(10)
 
     try:
         _tool_rows(serve.store, "frontier-call")
         await serve.join(serve.observer)
         _tool_rows(serve.store, "covered-call")
+        # test-contract: seam pauses the real async store write before its public install
         monkeypatch.setattr(serve.store, "_before_committed_mutation", pause_before_write)
         pending = asyncio.create_task(
             serve.store.append_message_async(Message(MessageRole.ASSISTANT, [TextContent("trigger")]))
