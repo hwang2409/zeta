@@ -942,6 +942,7 @@ class AgentLoop(
                         budget=provider_retry_budget,
                         task_deadline=task_deadline,
                         account_generation=account_generation(self),
+                        account_limit=getattr(getattr(self, "account_context", None), "subscription_limit_event", None),
                     ),
                 )
                 has_active_delivery = prepared_delivery.has_active_delivery

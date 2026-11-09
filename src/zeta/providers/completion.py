@@ -33,9 +33,11 @@ from .must_complete_close import (
 from .rate_limit_hold import (
     RATE_LIMIT_CREDENTIAL_POLL_SECONDS,
     RATE_LIMIT_PROBE_SECONDS,
+    credential_fingerprint,
     is_rate_limit_hold,
     rate_limit_hold_text,
     retry_after_seconds,
+    subscription_limit_wait,
 )
 
 MAX_PROVIDER_ATTEMPTS = 5
@@ -143,6 +145,7 @@ class RetryPlan:
     is_account_lock: bool = False
     is_rate_limit_hold: bool = False
     retry_after: float | None = None
+    subscription_limit: Any = None
 
 
 @dataclass(slots=True)
@@ -202,6 +205,17 @@ class CompletionRetryBudget:
         first_failure = self.original_error is None
         if first_failure:
             self.original_error = source
+        limit = getattr(source, "subscription_limit", None)
+        if limit is not None and not self.exhausted:
+            wait = subscription_limit_wait(limit.resets_at.timestamp(), time.time())
+            return RetryPlan(
+                attempt=self.attempts,
+                reason="subscription_limit",
+                delay=wait,
+                is_rate_limit_hold=True,
+                retry_after=wait,
+                subscription_limit=limit,
+            )
         if self.exhausted or not retryable_provider_error(source, event_data):
             return None
         is_account_lock = getattr(source, "code", None) == "account_lock_timeout"
@@ -314,6 +328,8 @@ class CompletionControl:
     task_deadline: float | None
     # the session's account identity; a change ends a rate-limit hold at once
     account_generation: Callable[[], object] | None = None
+    # records a subscription limit and returns the user's recovery suggestion, if any
+    account_limit: Callable[[object], Awaitable[dict[str, object] | None]] | None = None
 
 
 class ProviderAttempt(Protocol):
@@ -876,6 +892,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         if self._emitted:
             self._pending.append(StreamEvent(StreamEventType.ASSISTANT_RESET))
             self._emitted = False
+        if plan.subscription_limit is not None and self._control.account_limit is not None:
+            # a suggestion only: the runtime never switches accounts by itself
+            suggestion = await self._control.account_limit(error)
+            if suggestion is not None:
+                self._pending.append(StreamEvent(StreamEventType.ACCOUNT_LIMIT, data=suggestion))
         self._pending_retry = plan
         self._rate_limit_hold = plan.is_rate_limit_hold
         if plan.is_rate_limit_hold:
@@ -883,10 +904,9 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         return True
 
     def _hold_generation(self) -> tuple[object, object]:
-        state = getattr(self._adapter, "rate_limit_state", None)
         account = self._control.account_generation
         return (
-            state() if callable(state) else None,
+            credential_fingerprint(getattr(self._adapter, "token_store", None)),
             account() if account is not None else None,
         )
 
@@ -981,8 +1001,10 @@ class CompletionRun(AsyncIterator[StreamEvent]):
     def _retry_notice(self, plan: RetryPlan, error: object) -> StreamEvent:
         if plan.is_rate_limit_hold:
             assert plan.retry_after is not None
+            limit = plan.subscription_limit
             data: dict[str, Any] = {
                 "kind": "provider_rate_limit_hold",
+                "limit": "rate" if limit is None else "subscription",
                 "delay": plan.delay,
                 "retry_after": plan.retry_after,
                 "until": time.time() + plan.retry_after,
@@ -990,6 +1012,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 "attempt": plan.attempt,
                 "reason": plan.reason,
             }
+            if limit is not None:
+                data["until"] = limit.resets_at.timestamp()
+                data["account"] = str(limit.account)
+                data["text"] = f"{limit.account} {rate_limit_hold_text(data)}"
+                return StreamEvent(StreamEventType.RETRY, data=data)
             data["text"] = (
                 f"{self._adapter.provider} {rate_limit_hold_text(data)} "
                 "(log in again or switch account to resume sooner)"
