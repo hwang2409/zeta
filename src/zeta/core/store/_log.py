@@ -452,9 +452,6 @@ class _FullLoadValidator:
                 setattr(self.store, attribute, getattr(self.state, attribute))
 
 
-from ._observer import sync_observer_snapshot
-
-
 class ConversationLogMixin:
     """Load a log once, then synchronize only bytes appended by other writers."""
 
@@ -749,9 +746,6 @@ class ConversationLogMixin:
                 # A writer can expose a new size before releasing the lock. A
                 # later query synchronizes the append after the writer exits.
                 return
-
-    def _sync_observer_snapshot(self: ConversationStore, *, retry_source_change: bool = True) -> None:
-        sync_observer_snapshot(self, retry_source_change=retry_source_change)
 
     def _load(self: ConversationStore) -> None:
         """Synchronize in-memory state with the durable log.

@@ -90,6 +90,7 @@ from ._incremental_validation import (
 from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
 from ._notifications import NotificationStateMixin
+from ._observer import ObserverSnapshotMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,
     PendingPromptCommitTimeoutError,  # noqa: F401 - re-exported by store facade
@@ -119,6 +120,7 @@ class ConversationStore(
     ClientDeliveryMixin,
     StartupFactsMixin,
     ConversationLogMixin,
+    ObserverSnapshotMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
     session_execution.StoreRuntimeLeaseMixin,
@@ -345,7 +347,6 @@ class ConversationStore(
 
     def set_todo_items(self, items: object) -> None:
         """Replace the session todo list in one atomic state-file update."""
-
         normalized = parse_todo_items(items)
         with self._append_lock():
             self._todo_items = [dict(item) for item in normalized]

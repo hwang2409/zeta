@@ -22,11 +22,6 @@ class StoreLifecycleMixin:
             self.directory_fd = -1
             release_now(self._release_lease)
 
-    def _observer_append_active(self) -> bool:
-        from ._observer import observer_append_active
-
-        return observer_append_active(self)
-
     def refresh(self) -> None:
         """Reload durable state without acquiring ownership of the session."""
         if self._closed:
