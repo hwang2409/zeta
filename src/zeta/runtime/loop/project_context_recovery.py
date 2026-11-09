@@ -17,6 +17,7 @@ from ...project_registry import ProjectRegistry
 from ..offload import await_joined_offload
 from ..project_registry_state import ProjectRegistryState
 from ..prompt import (
+    PromptFragment,
     RuntimePrompt,
     owned_fragment,
     replace_owned_fragment,
@@ -77,10 +78,16 @@ class ProjectContextRecoveryMixin:
                 base, context.system_prompt, context.prompt_components
             )
         else:
+            replacement = (
+                owned_fragment(prepared, self._project_context_replace_component)
+                if self._project_context_replace_component
+                in prepared.prompt_components
+                else PromptFragment("", {})
+            )
             prompt = replace_owned_fragment(
                 base,
                 self._project_context_replace_component,
-                owned_fragment(prepared, self._project_context_replace_component),
+                replacement,
             )
         return _PreparedProjectContext(generation, base, prompt, context)
 
