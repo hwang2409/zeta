@@ -9436,11 +9436,11 @@ async def test_child_turn_retries_after_credential_lock_timeout(
         parent, ConversationStore(tmp_path / "parent"), skill_catalog=SkillCatalog.empty()
     )
     monkeypatch.setattr(
-        "zeta.agent.runner.credential_store",
+        "zeta.agent.child_context.credential_store",
         lambda provider, **kwargs: LockedCredentials(None),
     )
     monkeypatch.setattr(
-        "zeta.agent.runner.build_backend",
+        "zeta.agent.child_context.build_backend",
         lambda provider, model, **kwargs: (child, model),
     )
 
