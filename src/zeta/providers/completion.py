@@ -363,10 +363,10 @@ class MustCompleteClose:
     """Own one bounded cleanup task that every caller waits for.
 
     A caller's cancellation never stops the cleanup. ``abort()`` and the
-    bound both cancel the cleanup at its current await, so it finishes its
-    remaining steps in a cancelling task, where transport closes do not
-    wait. Only an expired bound is a failure: ``<name> close did not finish
-    within <bound> s``, unless the cleanup raised a more precise error.
+    bound both cancel the cleanup at its current await; it then finishes its
+    remaining steps in a cancelling task, where transport closes do not wait.
+    An abort is not a failure. An expired bound is: ``<name> close did not
+    finish within <bound> s``, unless the cleanup raised a more precise error.
     """
 
     def __init__(self, name: str, bound: float) -> None:
@@ -375,6 +375,7 @@ class MustCompleteClose:
         self._bound = bound
         self._scope: asyncio.Timeout | None = None
         self._aborted = False
+        self._outcome: asyncio.CancelledError | None = None
         self._waiters = 0
 
     def start(self, close: Callable[[], Awaitable[None]]) -> None:
@@ -401,15 +402,20 @@ class MustCompleteClose:
                 self._scope = scope
                 if self._aborted:
                     self._expire()
-                await close()
-        except TimeoutError:
-            if not scope.expired():
-                raise
-            if not bound.done():
-                return  # aborted: the cleanup ran its steps without waiting
-            raise RuntimeError(
-                f"{self._name} close did not finish within {self._bound:g} s"
-            ) from None
+                try:
+                    await close()
+                except asyncio.CancelledError as error:
+                    task = asyncio.current_task()
+                    assert task is not None
+                    if task.cancelling() > int(scope.expired()):
+                        raise  # this task itself is cancelled (loop shutdown)
+                    if error.__cause__ is not None or not scope.expired():
+                        # a cancelled source carrying its own outcome
+                        self._outcome = error
+            if bound.done():
+                raise RuntimeError(
+                    f"{self._name} close did not finish within {self._bound:g} s"
+                ) from self._outcome
         finally:
             self._scope = None
             bound.cancel()
@@ -435,6 +441,8 @@ class MustCompleteClose:
             await asyncio.shield(self.task)
         finally:
             self._waiters -= 1
+        if self._outcome is not None:
+            raise self._outcome
 
 
 class IteratorProviderAttempt:
@@ -510,35 +518,35 @@ class IteratorProviderAttempt:
 
     async def _close_source(self) -> None:
         producer = self._producer
-        try:
-            if producer is not None and not producer.done():
-                producer.cancel()
+        if producer is not None and not producer.done():
+            producer.cancel()
+            try:
                 # test-contract: seam producer cancellation must drain fully
                 await asyncio.gather(producer, return_exceptions=True)
-                # this close cancelled the producer; a bare cancellation is not a
-                # source outcome (a chained one still carries the source error).
-                if (
-                    isinstance(self._producer_error, asyncio.CancelledError)
-                    and self._producer_error.__cause__ is None
-                ):
-                    self._producer_error = None
-            elif producer is not None:
-                # test-contract: seam producer completion must drain fully
-                await asyncio.gather(producer, return_exceptions=True)
-        finally:
-            if producer is not None and not producer.done():
-                # the owner stopped the drain: the cancelled producer still
-                # unwinds the source, and this task no longer waits on slow closes.
+            except asyncio.CancelledError:
+                # the owner stopped waiting: this task is now cancelling, so the
+                # source close below does not wait. the cancelled producer still
+                # unwinds the source the same way.
                 # test-contract: seam producer cancellation must drain fully
                 await asyncio.gather(producer, return_exceptions=True)
-            close = getattr(self._source, "aclose", None)
-            if close is not None:
-                try:
-                    await close()
-                except asyncio.CancelledError as error:
-                    if self._producer_error is not None:
-                        raise error from self._producer_error
-                    raise
+            # this close cancelled the producer; a bare cancellation is not a
+            # source outcome (a chained one still carries the source error).
+            if (
+                isinstance(self._producer_error, asyncio.CancelledError)
+                and self._producer_error.__cause__ is None
+            ):
+                self._producer_error = None
+        elif producer is not None:
+            # test-contract: seam producer completion must drain fully
+            await asyncio.gather(producer, return_exceptions=True)
+        close = getattr(self._source, "aclose", None)
+        if close is not None:
+            try:
+                await close()
+            except asyncio.CancelledError as error:
+                if self._producer_error is not None:
+                    raise error from self._producer_error
+                raise
         if (
             self._producer_error is not None
             and not self._error_delivered
