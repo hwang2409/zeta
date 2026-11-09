@@ -9,6 +9,7 @@ from typing import ClassVar
 import httpx
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.mcp.config import MCPServerConfig
 from zeta.mcp.http import StreamableHTTPMCPClient
 
@@ -19,6 +20,7 @@ class _ResumableNotificationHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     scenario = "replay"
     get_headers: ClassVar[list[str | None]] = []
+    raw_get_headers: ClassVar[list[bytes | None]] = []
     second_stream_open = threading.Event()
     close_second_stream = threading.Event()
 
@@ -41,6 +43,10 @@ class _ResumableNotificationHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         type(self).get_headers.append(self.headers.get("last-event-id"))
+        raw_header = self.headers.get("last-event-id")
+        type(self).raw_get_headers.append(
+            raw_header.encode("latin-1") if raw_header is not None else None
+        )
         get_number = len(type(self).get_headers)
         if type(self).scenario == "replay":
             bodies = {
@@ -49,6 +55,15 @@ class _ResumableNotificationHandler(BaseHTTPRequestHandler):
                 + self._event("event-2", "notifications/second"),
             }
             self._stream_or_stop(bodies.get(get_number))
+            return
+        if type(self).scenario == "non-ascii-id":
+            if get_number == 1:
+                self._stream_or_stop(self._event("café", "notifications/first"))
+            elif get_number == 2:
+                type(self).second_stream_open.set()
+                self._stream_or_stop(self._event("event-2", "notifications/second"))
+            else:
+                self._stream_or_stop(None)
             return
         if type(self).scenario == "invalid-ids":
             bodies = {
@@ -70,7 +85,7 @@ class _ResumableNotificationHandler(BaseHTTPRequestHandler):
             self.wfile.write(self._event("event-1", "notifications/first"))
             self.wfile.flush()
             type(self).second_stream_open.set()
-            type(self).close_second_stream.wait()
+            type(self).close_second_stream.wait(timeout=10)
             return
         self._stream_or_stop(
             self._event("event-2", "notifications/second") if get_number == 3 else None
@@ -125,6 +140,7 @@ def resumable_notification_server(monkeypatch: pytest.MonkeyPatch):
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ResumableNotificationHandler)
     _ResumableNotificationHandler.get_headers = []
+    _ResumableNotificationHandler.raw_get_headers = []
     _ResumableNotificationHandler.second_stream_open = threading.Event()
     _ResumableNotificationHandler.close_second_stream = threading.Event()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -135,7 +151,7 @@ def resumable_notification_server(monkeypatch: pytest.MonkeyPatch):
         _ResumableNotificationHandler.close_second_stream.set()
         server.shutdown()
         server.server_close()
-        thread.join()
+        thread.join(timeout=10)
 
 
 async def _notification_methods(url: str, expected: int) -> list[str]:
@@ -169,6 +185,39 @@ async def test_http_notification_resume_deduplicates_replayed_event(
 
     assert methods == ["notifications/first", "notifications/second"]
     assert _ResumableNotificationHandler.get_headers[:2] == [None, "event-1"]
+
+
+@pytest.mark.asyncio
+async def test_http_notification_resume_preserves_non_ascii_event_id(
+    resumable_notification_server: str,
+) -> None:
+    _ResumableNotificationHandler.scenario = "non-ascii-id"
+    methods: list[str] = []
+    complete = asyncio.Event()
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig("resumable", "streamable-http", url=resumable_notification_server)
+    )
+
+    def receive(method: str) -> None:
+        methods.append(method)
+        if len(methods) == 2:
+            complete.set()
+
+    client.set_notification_sink(receive)
+    try:
+        await client.connect()
+        assert await asyncio.to_thread(
+            _ResumableNotificationHandler.second_stream_open.wait, 2
+        )
+        await await_or_fail(complete.wait(), what="second notification")
+    finally:
+        await client.close()
+
+    assert methods == ["notifications/first", "notifications/second"]
+    assert _ResumableNotificationHandler.raw_get_headers[:2] == [
+        None,
+        b"caf\xc3\xa9",
+    ]
 
 
 @pytest.mark.asyncio
