@@ -139,7 +139,7 @@ async def test_direct_tick_discards_scan_delivered_before_resolution(
     import zeta.tui.slash_handlers.decisions_panel as panel_module
 
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
     record = await asyncio.to_thread(
         _request, current, project.project_id, "Current", "This one."
@@ -299,7 +299,7 @@ async def test_resolve_attention_event_refreshes_rendered_count_immediately(
     tmp_path: Path,
 ) -> None:
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
     record = await asyncio.to_thread(
         _request, current, project.project_id, "Current", "This one."
@@ -338,7 +338,7 @@ async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
     import zeta.tui.slash_handlers.decisions_panel as panel_module
 
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
     record = await asyncio.to_thread(
         _request, current, project.project_id, "Current", "This one."
@@ -407,7 +407,7 @@ async def test_decisions_refresh_table_renders_current_counts(
     import zeta.tui.slash_handlers.decisions_panel as panel_module
 
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
     records = [
         await asyncio.to_thread(
@@ -538,7 +538,7 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
     import zeta.tui.slash_handlers.decisions_panel as panel_module
 
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
     await asyncio.to_thread(_request, current, project.project_id, "Current", "This one.")
     app = _decisions_app(tmp_path, current)
@@ -612,7 +612,7 @@ async def test_stopping_decisions_scan_drains_owner_without_error(
     import zeta.attention_decisions as decisions_module
 
     manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
     app = _decisions_app(tmp_path, current)
     entered = asyncio.Event()
