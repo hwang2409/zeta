@@ -817,8 +817,8 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
     phase_started = asyncio.Event()
     release_phase = asyncio.Event()
     handoff_exists_at_publish = False
-    original_child_write = child_store._to_thread_agent_state
-    original_parent_write = parent_store._to_thread_agent_state
+    original_child_write = child_store._commit_storage_command
+    original_parent_write = parent_store._commit_storage_command
     original_publish = owner.conversation_channel.publish_completion
 
     async def gate(phase: str) -> None:
@@ -827,19 +827,19 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
         phase_started.set()
         await asyncio.wait_for(release_phase.wait(), timeout=10)
 
-    async def child_write(operation, *args, **kwargs):
+    async def child_write(command, *args, **kwargs):
         phases = {
-            "ensure_turn_limit_handoff": "handoff_write",
-            "finish_agent_child": "descendant_finish",
-            "finish_agent_lifecycle": "lifecycle_commit",
+            "_EnsureTurnLimitHandoffCommand": "handoff_write",
+            "_FinishAgentChildCommand": "descendant_finish",
+            "_FinishAgentLifecycleCommand": "lifecycle_commit",
         }
-        await gate(phases.get(operation.__name__, ""))
-        return await original_child_write(operation, *args, **kwargs)
+        await gate(phases.get(type(command).__name__, ""))
+        return await original_child_write(command, *args, **kwargs)
 
-    async def parent_write(operation, *args, **kwargs):
-        if operation.__name__ == "register_agent_child":
+    async def parent_write(command, *args, **kwargs):
+        if type(command).__name__ == "_RegisterAgentChildCommand":
             await gate("descendant_register")
-        return await original_parent_write(operation, *args, **kwargs)
+        return await original_parent_write(command, *args, **kwargs)
 
     async def pause_publish(**kwargs):
         nonlocal handoff_exists_at_publish
@@ -850,9 +850,9 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
         return await original_publish(**kwargs)
 
     # test-contract: seam force cancellation at each durable write await.
-    monkeypatch.setattr(child_store, "_to_thread_agent_state", child_write)
+    monkeypatch.setattr(child_store, "_commit_storage_command", child_write)
     # test-contract: seam force cancellation at the descendant registration await.
-    monkeypatch.setattr(parent_store, "_to_thread_agent_state", parent_write)
+    monkeypatch.setattr(parent_store, "_commit_storage_command", parent_write)
     monkeypatch.setattr(owner.conversation_channel, "publish_completion", pause_publish)
 
     async def close_child(_cause: str) -> tuple[()]:
