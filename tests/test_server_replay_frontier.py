@@ -204,17 +204,7 @@ def _history_rows_for(
 
 
 async def _wait_event(client: ReplayClient, name: str, **match: Any) -> dict[str, Any]:
-    while True:
-        params = await client.event(name)
-        if all(_lookup(params, key) == value for key, value in match.items()):
-            return params
-
-
-def _lookup(params: dict[str, Any], dotted: str) -> Any:
-    value: Any = params
-    for part in dotted.split("."):
-        value = value.get(part) if isinstance(value, dict) else None
-    return value
+    return await client.event(name, match=match)
 
 
 # --- scenarios: each drives one real serve flow with the observer already joined ---

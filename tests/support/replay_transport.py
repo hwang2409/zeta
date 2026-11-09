@@ -21,6 +21,13 @@ from zeta.server import ZetaServer
 Transport = Literal["unix", "websocket"]
 
 
+def _lookup(params: dict[str, Any], dotted: str) -> Any:
+    value: Any = params
+    for part in dotted.split("."):
+        value = value.get(part) if isinstance(value, dict) else None
+    return value
+
+
 def classify(frame: dict[str, Any]) -> tuple[str, object]:
     """Classify a wire frame by response id or replay stream."""
     if "id" in frame:
@@ -52,7 +59,14 @@ class ReplayClient:
         assert frame is not None, "server closed replay connection"
         return frame
 
-    async def _read_or_eof(self, *, what: str = "replay frame") -> dict[str, Any] | None:
+    async def _read_or_eof(
+        self,
+        *,
+        what: str = "replay frame",
+        received: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        received = list(self.buffered) if received is None else received
+        describe = lambda: f"{what}; received={received!r}"
         # a write to a connection the server closed surfaces on the next read
         try:
             if not self.websocket:
@@ -61,12 +75,12 @@ class ReplayClient:
                 line = await await_or_fail(
                     # test-contract: transport raw unix replay frame reader, not newline JSON-RPC client.
                     self.reader.readline(),
-                    what=f"{what}; received={list(self.buffered)!r}",
+                    what=describe,
                 )
                 return json.loads(line) if line else None
             first, second = await await_or_fail(
                 self.reader.readexactly(2),
-                what=f"{what}; received={list(self.buffered)!r}",
+                what=describe,
             )
         except (asyncio.IncompleteReadError, ConnectionError):
             return None
@@ -93,14 +107,17 @@ class ReplayClient:
 
     async def response(self, request_id: int) -> dict[str, Any]:
         skipped: list[dict[str, Any]] = []
+        received = list(self.buffered)
         try:
             while True:
-                frame = await self._read_wire(
-                    what=f"response id {request_id}; received={list(self.buffered)!r}"
+                frame = await self._read_or_eof(
+                    what=f"response id {request_id}", received=received
                 )
+                assert frame is not None, "server closed replay connection"
                 if frame.get("id") == request_id:
                     return frame
                 skipped.append(frame)
+                received.append(frame)
         finally:
             self.buffered.extend(skipped)
 
@@ -108,11 +125,15 @@ class ReplayClient:
         await self.send(request_id, method, params)
         return await self.response(request_id)
 
-    async def event(self, name: str | None = None) -> dict[str, Any]:
+    async def event(
+        self, name: str | None = None, match: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """The first matching event in arrival order; other frames stay buffered in order."""
         def matches(frame: dict[str, Any]) -> bool:
             params = frame.get("params")
-            return isinstance(params, dict) and (name is None or params.get("event") == name)
+            if not isinstance(params, dict) or (name is not None and params.get("event") != name):
+                return False
+            return all(_lookup(params, key) == value for key, value in (match or {}).items())
 
         # a match may sit behind other buffered frames (two events can arrive in either order)
         for index, frame in enumerate(self.buffered):
@@ -120,13 +141,15 @@ class ReplayClient:
                 del self.buffered[index]
                 return frame["params"]
         skipped: list[dict[str, Any]] = []
+        received = list(self.buffered)
         try:
             while not matches(
-                frame := await self._read_wire(
-                    what=f"event {name or '<any>'}; received={list(self.buffered)!r}"
+                frame := await self._read_or_eof(
+                    what=f"event {name or '<any>'}", received=received
                 )
             ):
                 skipped.append(frame)
+                received.append(frame)
             return frame["params"]
         finally:
             self.buffered.extend(skipped)
