@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING, Any
 from ...agent.receipt import valid_killed_task_fields
 from ...protocol.types import Message, MessageOrigin, ToolUseContent
 from ..checkpoints import ConversationEntry
+from ._async_writes import (
+    _PresentNotificationsCommand,
+    _RecordNotificationDeliveryCommand,
+)
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     CHILD_IDLE_NOTIFICATION_KIND,
@@ -542,11 +546,12 @@ class NotificationStateMixin:
         acknowledged: bool = False,
     ) -> None:
         """Persist delivery state off the event loop and in async call order."""
-        await self._to_thread_durable(
-            self.record_agent_notification_delivery,
-            notification_id,
-            presented=presented,
-            acknowledged=acknowledged,
+        await self._commit_storage_command(
+            _RecordNotificationDeliveryCommand(
+                notification_id=notification_id,
+                presented=presented,
+                acknowledged=acknowledged,
+            )
         )
 
     def mark_agent_notifications_presented_to_tui(
@@ -585,8 +590,8 @@ class NotificationStateMixin:
     ) -> None:
         """Persist a presentation batch off the event loop."""
 
-        await self._to_thread_durable(
-            self.mark_agent_notifications_presented_to_tui, notification_ids
+        await self._commit_storage_command(
+            _PresentNotificationsCommand(notification_ids=notification_ids)
         )
 
     def mark_agent_notification_presented_to_tui(
@@ -626,15 +631,10 @@ class NotificationStateMixin:
             ]
             if rows:
                 self._append_many_unlocked(rows)
-
-    async def acknowledge_agent_notifications_async(
-        self: ConversationStore, notification_ids: list[str]
-    ) -> None:
-        """Consume one claimed notification batch off the event loop."""
-
-        await self._to_thread_durable(
-            self.acknowledge_agent_notifications, notification_ids
-        )
+                writer = self._durable_writer
+                if writer is not None and writer is not self:
+                    writer.close()
+                    self._durable_writer = None
 
     def acknowledge_agent_notification(
         self: ConversationStore, notification_id: str
