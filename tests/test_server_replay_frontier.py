@@ -25,7 +25,7 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
-from zeta.core.store import _row_history
+from zeta.core.store import ConversationStore, _row_history
 from zeta.model_input import ModelInputEnvelope
 from zeta.protocol.types import (
     Message,
@@ -586,6 +586,52 @@ async def test_premise_frame_without_history_row_covers_none(
         records = serve.records(route)
         assert records, f"{scenario} published no {route} frame"
         assert [covers for _fields, _facts, covers in records] == [None] * len(records)
+    finally:
+        await _close(serve)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_child_tool_end_held_during_approval_end_write_reaches_observer(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child's tool_end held while its approval_end history write runs goes out after the end."""
+    serve = await _serve(tmp_path, transport, _background_backend(tmp_path))
+    try:
+        approvals = serve.server.control._approvals
+        held = asyncio.Event()
+        hold = approvals.release_or_hold_terminal
+
+        def recorded_hold(key: Any, session_id: str | None, fields: dict[str, object]) -> bool:
+            owned = hold(key, session_id, fields)
+            if owned:
+                held.set()
+            return owned
+
+        # test-contract: seam observe the moment the child's terminal is held for its approval end
+        monkeypatch.setattr(approvals, "release_or_hold_terminal", recorded_hold)
+        write = ConversationStore.append_approval_history_async
+
+        async def gated(store: ConversationStore, payload: Any) -> Any:
+            # forced order: the child's tool_end is held before the approval_end row installs
+            if payload.get("event") == "approval_end":
+                await await_or_fail(held.wait(), what="child tool_end held")
+            return await write(store, payload)
+
+        monkeypatch.setattr(ConversationStore, "append_approval_history_async", gated)
+        await serve.join(serve.observer)
+        await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
+        request = await _wait_event(serve.observer, "approval_request", delegated=True)
+        await serve.approve(request["request_id"])
+        # the end and its held terminal are admitted together, so both are read once the end is
+        frames: list[dict[str, Any]] = []
+        while not any(frame.get("event") == "approval_end" for frame in frames):
+            frames += await serve.live(serve.observer)
+        child_ends = [
+            frame for frame in frames
+            if frame.get("event") == "tool_end" and _lookup(frame, "tool_call.id") == "call-child"
+        ]
+        assert len(child_ends) == 1, "the held child tool_end was lost after its approval end"
     finally:
         await _close(serve)
 
