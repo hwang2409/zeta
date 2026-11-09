@@ -554,7 +554,8 @@ class ApprovalLifecycle:
                 break
             done, pending = await asyncio.wait(tasks, timeout=remaining)
             for task in done:
-                task.result()
+                if task in self._settlement_tasks:
+                    self._settlement_finished(task)
             if pending:
                 break
         if not self._settlement_tasks:
@@ -583,10 +584,11 @@ class ApprovalLifecycle:
             )
 
     def _start_settlement(
-        self, record: ApprovalRecord, operation: Awaitable[object]
+        self, record: ApprovalRecord | ApprovalKey, operation: Awaitable[object]
     ) -> asyncio.Task[object]:
+        key = record.target.key if isinstance(record, ApprovalRecord) else record
         task = asyncio.create_task(operation)
-        self._settlement_tasks[task] = record.target.key
+        self._settlement_tasks[task] = key
         task.add_done_callback(self._settlement_finished)
         return task
 
@@ -808,7 +810,9 @@ class ApprovalLifecycle:
                     "decision": "abort",
                     "reason": reason or "turn_canceled",
                 }
-                finish = asyncio.create_task(self._finish_record(record, synthetic))
+                finish = self._start_settlement(
+                    record, self._finish_record(record, synthetic)
+                )
                 try:
                     await approval_settlement.finish_despite_cancellation(
                         lambda: asyncio.shield(finish)
@@ -859,7 +863,7 @@ class ApprovalLifecycle:
             return admitted
         settlement = self.transition(Cancel(request_id, child_instance_id, reason))
         assert not isinstance(settlement, _Completed)
-        return asyncio.create_task(settlement)
+        return self._start_settlement(key, settlement)
 
     def _release_gate(
         self,
@@ -983,6 +987,7 @@ class ApprovalLifecycle:
             terminal=(EventDescriptor.TOOL_END, session_id, fields),
         )
         if record.terminal_watchdog is None:
+            # terminal watchdogs are owned by their record and awaited by terminal transitions.
             task = asyncio.create_task(self._terminal_bound(key, record.token))
             self._change(record, terminal_watchdog=task)
         return True
@@ -1181,8 +1186,8 @@ class ApprovalLifecycle:
             return
         if record.disposition != "active":
             record = self._reserve_record(record, record.disposition)
-            settlement = asyncio.create_task(
-                self._settle_record(record, "abort", record.disposition)
+            settlement = self._start_settlement(
+                record, self._settle_record(record, "abort", record.disposition)
             )
             self._change(record, settlement=settlement)
             await settlement
@@ -1244,9 +1249,9 @@ class ApprovalLifecycle:
                 continue
             if record.publication_owner is not None:
                 if not record.publication_owner.done():
-                    asyncio.create_task(self._finish_record(record, resolution))
+                    self._start_settlement(record, self._finish_record(record, resolution))
                 continue
-            owner = asyncio.create_task(self._finish_record(record, resolution))
+            owner = self._start_settlement(record, self._finish_record(record, resolution))
             self._change(record, publication_owner=owner)
 
     async def _terminate_approval_records(

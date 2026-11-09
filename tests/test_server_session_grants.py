@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
 import json
@@ -1319,6 +1320,33 @@ async def _first_child_bash_two_fact(
         await asyncio.gather(wire, hook, return_exceptions=True)
 
 
+def test_approval_task_creation_has_one_owner() -> None:
+    allowed = {
+        ("src/zeta/server/approval_lifecycle.py", "_start_settlement"),
+        ("src/zeta/server/approval_lifecycle.py", "release_or_hold_terminal"),
+        ("src/zeta/server/approval_settlement/approval_grants.py", "finish_grant"),
+    }
+    root = Path(__file__).parents[1]
+    violations: list[tuple[str, str, int]] = []
+    for relative in (
+        "src/zeta/server/approval_lifecycle.py",
+        "src/zeta/server/approval_settlement/approval_grants.py",
+    ):
+        tree = ast.parse((root / relative).read_text())
+        for parent in ast.walk(tree):
+            if not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(parent):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "create_task"
+                    and (relative, parent.name) not in allowed
+                ):
+                    violations.append((relative, parent.name, node.lineno))
+    assert not violations, f"unowned approval task creation: {violations!r}"
+
+
 @pytest.mark.asyncio
 async def test_server_close_bounds_stuck_approval_settlement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -1341,7 +1369,7 @@ async def test_server_close_bounds_stuck_approval_settlement(
 
     async def stuck_persist(*args: object, **kwargs: object) -> object:
         entered.set()
-        await release.wait()
+        await await_or_fail(release.wait(), what="stuck approval release")
         return await original_persist(*args, **kwargs)
 
     monkeypatch.setattr(approval_settlement, "persist_durably", stuck_persist)
@@ -1354,7 +1382,7 @@ async def test_server_close_bounds_stuck_approval_settlement(
             _request(reader, writer, 4, "approve", {"request_id": "call-1"})
         )
         await await_or_fail(entered.wait(), what="stuck approval settlement")
-        await server.close()
+        await server.close(approval_settlement_timeout=0.05)
         assert any(
             record.message == "approval settlement tasks stuck during close"
             and record.approval_keys == ["call-1"]
@@ -1364,7 +1392,10 @@ async def test_server_close_bounds_stuck_approval_settlement(
         release.set()
         if approve is not None:
             approve.cancel()
-            await asyncio.gather(approve, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(approve, return_exceptions=True),
+                what="approval request cleanup",
+            )
         writer.close()
         await writer.wait_closed()
         await server.close()
