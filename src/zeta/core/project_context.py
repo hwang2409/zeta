@@ -391,8 +391,11 @@ def project_command_view(
         return ProjectCommandView(
             None, "unassociated (run /project init to associate this directory)"
         )
-    projection = registry.memory_transactions.read(project.project_id)
-    memory = ", ".join(projection.mirror_files()) or "none"
+    transactions = getattr(registry, "memory_transactions", None)
+    if transactions is None:
+        memory = ", ".join(name for name, _ in registry.load_memory(project.project_id)) or "none"
+    else:
+        memory = ", ".join(transactions.read(project.project_id).mirror_files()) or "none"
     return ProjectCommandView(
         project,
         f"project: {project.name} ({project.project_id})\n"
