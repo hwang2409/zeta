@@ -109,9 +109,14 @@ def _approval_presentation_event(
 # test-contract: seam no public event reports submission-consumer completion.
 async def _drain_submission_consumer(app: TUIApp) -> None:
     pipeline = app._submissions
-    while (consumer := pipeline._consumer) is not None or pipeline._slash_tasks:
-        pending = [consumer] if consumer is not None else list(pipeline._slash_tasks.values())
-        await asyncio.wait_for(asyncio.gather(*map(asyncio.shield, pending)), timeout=10)
+    try:
+        await asyncio.wait_for(asyncio.shield(pipeline._idle.wait()), timeout=10)
+    except TimeoutError as exc:
+        raise AssertionError(
+            "submission pipeline did not become idle; "
+            f"consumer={pipeline._consumer!r}, "
+            f"slash_tasks={tuple(pipeline._slash_tasks)!r}"
+        ) from exc
 
 
 # test-contract: seam no public event reports active provider-turn completion.
@@ -705,6 +710,37 @@ async def test_input_loop_control_commands_exclude_their_own_submission(
         await _drain_submission_consumer(app)
         assert expected in output.getvalue(), f"{value} did not dispatch"
         assert "unavailable while a turn is running" not in output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_slash_task_registered_after_consumer_yields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    dispatch_async = app._slash_commands.dispatch_async
+
+    async def delayed_dispatch(session: object, value: str) -> str | None:
+        started.set()
+        await asyncio.wait_for(release.wait(), timeout=10)
+        return await dispatch_async(session, value)
+
+    monkeypatch.setattr(app._slash_commands, "dispatch_async", delayed_dispatch)
+    async with owned_app(app):
+        app._input_loop_active = True
+        await app._handle_prompt_value("/checkpoint test")
+        await asyncio.wait_for(started.wait(), timeout=10)
+        drain = asyncio.create_task(_drain_submission_consumer(app))
+        await asyncio.sleep(0)
+        assert not drain.done()
+        release.set()
+        await asyncio.wait_for(drain, timeout=10)
 
 
 @pytest.mark.asyncio

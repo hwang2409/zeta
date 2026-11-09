@@ -71,6 +71,8 @@ class SubmissionPipeline:
         self._next_id = count(1)
         self._messages: asyncio.Queue[_Message] = asyncio.Queue()
         self._consumer: asyncio.Task[None] | None = None
+        self._idle = asyncio.Event()
+        self._idle.set()
         self._entries: dict[int, _Entry] = {}
         self._approval_owners: dict[str | tuple[str, str], Submission] = {}
         self._preprocessing_waiters: dict[int, asyncio.Task[None]] = {}
@@ -355,6 +357,7 @@ class SubmissionPipeline:
     def _send(self, message: _Message) -> None:
         if self._closed:
             return
+        self._idle.clear()
         self._ensure_consumer()
         self._messages.put_nowait(message)
 
@@ -399,6 +402,8 @@ class SubmissionPipeline:
                     self._consumer = None
                 if not self._messages.empty() and not self._shutting_down:
                     self._ensure_consumer()
+                elif not self._slash_tasks:
+                    self._idle.set()
                 return
             try:
                 if message is None:
