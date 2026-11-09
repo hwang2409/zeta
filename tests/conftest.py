@@ -24,6 +24,8 @@ import httpx
 import pytest
 from rich.console import Console
 
+from zeta.server.approval_settlement.owner import TaskOwner
+
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
@@ -1073,6 +1075,31 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
             await registry_close(loop.tool_registry)
         if not loop.store._closed:
             loop.store.close()
+
+
+@pytest.fixture(autouse=True)
+def approval_settlement_tasks_do_not_leak(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tasks: list[asyncio.Task[object]] = []
+    original_start = TaskOwner.start
+
+    def track_start(
+        owner: TaskOwner, key: object, operation: object, kind: str
+    ) -> asyncio.Task[object]:
+        task = original_start(owner, key, operation, kind)  # type: ignore[arg-type]
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(TaskOwner, "start", track_start)
+    yield
+    unfinished = [task for task in tasks if not task.done()]
+    assert not unfinished, f"approval settlement tasks outlived the test: {unfinished!r}"
+    unretrieved = [task for task in tasks if not task.cancelled() and task._log_traceback]
+    assert not unretrieved, (
+        "approval settlement tasks ended with unretrieved exceptions: "
+        f"{unretrieved!r}"
+    )
 
 
 @pytest.fixture(autouse=True)
