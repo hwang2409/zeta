@@ -58,6 +58,8 @@ BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
 BACKGROUND_OUTPUT_DRAIN_TIMEOUT = 0.25
 OUTPUT_CUTOFF_NOTE = "background output was cut off because a process outside the task still held its output"
+_NOTE_PRIORITY_ARCHIVE = 1
+_NOTE_PRIORITY_CAUSE = 2
 
 
 class BackgroundTaskRegistry:
@@ -662,7 +664,9 @@ class BackgroundTaskRegistry:
                 pending = set(monitors) if monitor_result is None else monitor_result[1]
                 for record in records:
                     if record.monitor in pending:
-                        record.note = f"{record.note}; {OUTPUT_CUTOFF_NOTE}"
+                        self._set_terminal_note(
+                            record, OUTPUT_CUTOFF_NOTE, _NOTE_PRIORITY_ARCHIVE
+                        )
                 for monitor in pending:
                     monitor.cancel()
                 if pending:
@@ -712,7 +716,11 @@ class BackgroundTaskRegistry:
                 record.receipt_pending = record.notify_on_exit
                 record.notify_on_exit = False
                 record.terminal_phase = "task_kill"
-                record.note = self._shutdown_cause or "background task registry closed"
+                self._set_terminal_note(
+                    record,
+                    self._shutdown_cause or "background task registry closed",
+                    _NOTE_PRIORITY_CAUSE,
+                )
             await self._commit_notice(None)
 
     def _close_storage(self) -> None:
@@ -823,7 +831,11 @@ class BackgroundTaskRegistry:
                     await self._archive_record(record, log_handle)
                 except BaseException as exc:
                     archive_error = exc
-                    record.note = "background output archive failed; recovery will retry the retained log"
+                    self._set_terminal_note(
+                        record,
+                        "background output archive failed; recovery will retry the retained log",
+                        _NOTE_PRIORITY_ARCHIVE,
+                    )
                     logger.exception(
                         "failed to archive background task output for %s",
                         record.task_id,
@@ -984,14 +996,24 @@ class BackgroundTaskRegistry:
             process = record.process
             if process is None or not record.running:
                 return
-            previous = record.terminal_phase, record.note, record.tui_presented
-            record.terminal_phase, record.note, record.tui_presented = (
-                phase, reason, tui_presented
+            previous = (
+                record.terminal_phase,
+                record.note,
+                record.note_priority,
+                record.tui_presented,
             )
+            record.terminal_phase = phase
+            self._set_terminal_note(record, reason, _NOTE_PRIORITY_CAUSE)
+            record.tui_presented = tui_presented
             try:
                 await self._commit_notice(None)
             except Exception:
-                record.terminal_phase, record.note, record.tui_presented = previous
+                (
+                    record.terminal_phase,
+                    record.note,
+                    record.note_priority,
+                    record.tui_presented,
+                ) = previous
                 raise
         await _terminate_process(
             process, self.term_grace, close_stdin=lambda: self._close_stdin(record)
@@ -1012,7 +1034,7 @@ class BackgroundTaskRegistry:
             ):
                 raise monitor_result
         if monitor_cutoff:
-            record.note = f"{record.note}; {OUTPUT_CUTOFF_NOTE}"
+            self._set_terminal_note(record, OUTPUT_CUTOFF_NOTE, _NOTE_PRIORITY_ARCHIVE)
         await self._commit_terminal(record, process.returncode)
 
     async def _close_stdin(self, record: _BackgroundRecord) -> None:
@@ -1041,6 +1063,20 @@ class BackgroundTaskRegistry:
                 trim += 1
             del record.output[:trim]
             record.base_cursor += trim
+
+    @staticmethod
+    def _set_terminal_note(record: _BackgroundRecord, note: str, priority: int) -> None:
+        if record.note is None:
+            record.note = note
+            record.note_priority = priority
+            return
+        if note in record.note:
+            return
+        if priority > record.note_priority:
+            record.note = f"{note}; {record.note}"
+        else:
+            record.note = f"{record.note}; {note}"
+        record.note_priority = max(record.note_priority, priority)
 
     def _record(self, task_id: str) -> _BackgroundRecord:
         if type(task_id) is not str or not task_id:

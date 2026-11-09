@@ -526,7 +526,7 @@ async def test_task_kill_tool_records_agent_as_cause(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_task_exit_recovers_original_receipt_after_store_closes(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tests.support.fake_backend import FakeBackend
 
@@ -540,11 +540,18 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
     )
     task_id, _ = await tools.background_tasks.start("sleep 30", tmp_path)
     cause = "test closed-store kill cause"
+
+    async def fail_archive(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("forced archive failure")
+
+    # test-contract: force the real archive seam to fail without timing.
+    monkeypatch.setattr(tools.background_tasks, "_archive_record", fail_archive)
     try:
         store.close()
-        await tools.background_tasks.kill(
-            task_id, cause=cause, tui_presented=True
-        )
+        with pytest.raises(RuntimeError, match="forced archive failure"):
+            await tools.background_tasks.kill(
+                task_id, cause=cause, tui_presented=True
+            )
     finally:
         await asyncio.wait_for(tools.close(), 10)
 
@@ -570,11 +577,13 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
         ]
         assert len(receipts) == 1
         assert archived_rows[0]["receipt_pending"] is True
-        assert archived_rows[0]["note"] == cause
+        assert archived_rows[0]["note"].startswith(cause + "; ")
+        assert "background output archive failed; recovery will retry the retained log" in archived_rows[0]["note"]
         assert archived_rows[0]["terminal_phase"] == "task_kill"
         assert archived_rows[0]["tui_presented"] is True
         assert receipts[0].data["task_id"] == task_id
-        assert receipts[0].data["note"] == cause
+        assert receipts[0].data["note"].startswith(cause + "; ")
+        assert "background output archive failed; recovery will retry the retained log" in receipts[0].data["note"]
         assert receipts[0].data["background_phase"] == "task_kill"
         assert resumed_store.is_agent_notification_presented_to_tui(receipts[0].id)
         rows = json.loads(
@@ -584,6 +593,34 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
     finally:
         await loop.close()
         resumed_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["kill", "archive", "shutdown"])
+async def test_terminal_note_writer_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writer: str
+) -> None:
+    registry = BackgroundTaskRegistry()
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    try:
+        if writer == "kill":
+            await registry.kill(task_id, cause="table kill cause")
+            expected = "table kill cause"
+        elif writer == "archive":
+            async def fail_archive(*args: object, **kwargs: object) -> None:
+                raise RuntimeError("table archive failure")
+
+            monkeypatch.setattr(registry, "_archive_record", fail_archive)
+            with pytest.raises(RuntimeError, match="table archive failure"):
+                await registry.wait(task_id)
+            expected = "background output archive failed; recovery will retry the retained log"
+        else:
+            registry.begin_shutdown("table shutdown cause")
+            await registry.close()
+            expected = "table shutdown cause"
+        assert registry.snapshot()[0].note == expected
+    finally:
+        await asyncio.wait_for(registry.close(), 10)
 
 
 def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
