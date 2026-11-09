@@ -15642,7 +15642,7 @@ async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
 ) -> None:
     writer = await asyncio.to_thread(open_writer, tmp_path)
     projects = ProjectRegistry(tmp_path / "projects")
-    project = projects.create_project("alpha", "alpha")
+    project = await asyncio.to_thread(projects.create_project, "alpha", "alpha")
     store = ConversationStore(
         tmp_path / "sessions", session_id="a" * 32, cwd=tmp_path
     )

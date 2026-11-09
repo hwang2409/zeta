@@ -331,7 +331,7 @@ def compose_runtime(
                 session_project=projection.session_project,
                 cwd_project=cwd_project,
                 inbox_enabled=config.inbox_enabled,
-                registry=project_registry,
+                registry=manager.project_registry_state,
                 project_projection=projection,
             )
 

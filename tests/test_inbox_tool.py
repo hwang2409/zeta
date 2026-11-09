@@ -29,6 +29,7 @@ from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
+from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tools.inbox import _inbox, _model_visible, _validate_action
 from zeta.tools.registry import ToolRegistry
 
@@ -86,11 +87,148 @@ def _provider_text(provider: str, result: dict) -> str:
 
 
 @pytest.mark.asyncio
-async def test_inbox_publications_are_off_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    registry, store = _registry(tmp_path)
+async def test_inbox_execution_canonicalizes_approval_subjects(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
+    other = await asyncio.to_thread(projects.create_project, "other", "other")
+    async def send(project: str, *, skip_approval: bool = False) -> dict[str, object]:
+        return await registry.execute(
+            ToolCall(
+                "send-" + project,
+                "inbox",
+                {
+                    "action": "send",
+                    "project": project,
+                    "kind": "info",
+                    "title": "title",
+                    "body": "body",
+                },
+            ),
+            _skip_approval=skip_approval,
+        )
+
+    try:
+        registry.set_approval_policy(
+            ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny", store=store)
+        )
+        for project in ("beta", beta.project_id):
+            assert (await send(project)).get("isError") is not True, project
+        registry.set_approval_policy(
+            ApprovalPolicy(
+                always_allow={f"inbox(send {beta.project_id})"},
+                default="deny",
+                store=store,
+            )
+        )
+        assert (await send("beta")).get("isError") is not True
+        assert (await send(other.project_id)).get("isError") is True
+        registry.set_approval_policy(ApprovalPolicy(default="allow", store=store))
+        unknown = await send("missing", skip_approval=True)
+        assert unknown.get("isError") is True
+        assert "unknown inbox target project" in str(unknown)
+    finally:
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_name_rule_refreshes_after_project_creation(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    registry.set_approval_policy(
+        ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny", store=store)
+    )
+    try:
+        beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
+        result = await registry.execute(
+            ToolCall(
+                "late-beta",
+                "inbox",
+                {
+                    "action": "send",
+                    "project": "beta",
+                    "kind": "info",
+                    "title": "title",
+                    "body": "body",
+                },
+            )
+        )
+        assert result.get("isError") is not True
+        assert beta.project_id != "beta"
+    finally:
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_preparation_forwards_through_nested_child_policies(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    child_store = ConversationStore(tmp_path / "children", session_id="c" * 32)
+    nested_store = ConversationStore(tmp_path / "nested", session_id="n" * 32)
+    try:
+        projects = registry.project_registry
+        assert projects is not None
+        beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
+        parent = ApprovalPolicy(default="ask", store=store)
+        child = ChildApprovalPolicy(parent, child_store, "worker", "worker")
+        nested = ChildApprovalPolicy(child, nested_store, "nested", "nested")
+        registry.set_approval_policy(nested)
+        raw = ToolCall(
+            "nested-approval",
+            "inbox",
+            {"action": "send", "project": "beta", "kind": "info", "title": "t", "body": "b"},
+        )
+        prepared = await registry.prepare_tool_call(raw)
+        assert prepared.arguments["project"] == beta.project_id
+        request = registry.prepare_approval(prepared)
+        assert request is not None
+    finally:
+        await registry.close()
+        nested_store.close()
+        child_store.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_approval_subject_keeps_canonical_project_ids(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    try:
+        project_id = registry.project_id
+        assert project_id is not None
+        capability = registry.resolve_call(
+            "inbox",
+            {
+                "action": "send",
+                "project": project_id,
+                "kind": "question",
+                "title": "title",
+                "body": "body",
+            },
+        )
+        assert capability.subject_value == project_id
+        assert capability.arguments["project"] == project_id
+    finally:
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_publications_are_off_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     beta_store = ConversationStore(
         projects.root.parent / "sessions", session_id="b" * 32, cwd=tmp_path
     )
@@ -142,12 +280,13 @@ async def test_inbox_publications_are_off_event_loop(tmp_path: Path, monkeypatch
 async def test_local_inbox_requests_are_framed_as_user_assigned_tasks(
     tmp_path: Path, provider: str
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta scope")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta scope")
     inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(
+        inbox.send,
         from_project=registry.project_id or "",
         from_session=store.session_id,
         to_project=beta.project_id,
@@ -197,12 +336,13 @@ async def test_local_inbox_requests_are_framed_as_user_assigned_tasks(
 async def test_list_reports_invalid_messages_without_hiding_valid_messages(
     tmp_path: Path,
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    sender = projects.create_project("sender", "sender")
+    sender = await asyncio.to_thread(projects.create_project, "sender", "sender")
     inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
-    valid_id = inbox.send(
+    valid_id = await asyncio.to_thread(
+        inbox.send,
         from_project=sender.project_id,
         from_session="b" * 32,
         to_project=registry.project_id or "",
@@ -288,7 +428,7 @@ def test_each_action_has_precise_validation(
 
 @pytest.mark.asyncio
 async def test_tool_policy_can_deny_whole_inbox_tool(tmp_path: Path) -> None:
-    registry, store = _registry(tmp_path, deny=("inbox",))
+    registry, store = await asyncio.to_thread(_registry, tmp_path, deny=("inbox",))
     try:
         assert "inbox" not in registry.registered_names
         result = await registry.execute(ToolCall("call", "inbox", {"action": "projects"}))
@@ -328,44 +468,6 @@ def test_approval_subject_includes_action_and_target_project(tmp_path: Path) -> 
             policy.decide(_send_capability(registry, "other"))
             is not ApprovalDecision.ALLOW
         )
-    finally:
-        asyncio.run(registry.close())
-        store.close()
-
-
-def test_inbox_name_rule_allows_send_by_name_and_id(tmp_path: Path) -> None:
-    registry, store = _registry(tmp_path)
-    projects = registry.project_registry
-    assert projects is not None
-    beta = projects.create_project("beta", "beta")
-    try:
-        policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
-        registry.set_approval_policy(policy)
-        for project in ("beta", beta.project_id):
-            assert (
-                policy.decide(_send_capability(registry, project))
-                is ApprovalDecision.ALLOW
-            )
-    finally:
-        asyncio.run(registry.close())
-        store.close()
-
-
-def test_inbox_id_rule_allows_send_by_name_and_id(tmp_path: Path) -> None:
-    registry, store = _registry(tmp_path)
-    projects = registry.project_registry
-    assert projects is not None
-    beta = projects.create_project("beta", "beta")
-    try:
-        policy = ApprovalPolicy(
-            always_allow={f"inbox(send {beta.project_id})"}, default="deny"
-        )
-        registry.set_approval_policy(policy)
-        for project in ("beta", beta.project_id):
-            assert (
-                policy.decide(_send_capability(registry, project))
-                is ApprovalDecision.ALLOW
-            )
     finally:
         asyncio.run(registry.close())
         store.close()
@@ -413,7 +515,7 @@ def test_inbox_wildcard_rule_skips_project_lookup(
         assert (
             policy.decide(_send_capability(registry, "beta")) is ApprovalDecision.ALLOW
         )
-        assert references == ["beta"]
+        assert references == []
     finally:
         asyncio.run(registry.close())
         store.close()
@@ -429,12 +531,13 @@ def test_feature_switch_off_removes_inbox_tool(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
-    new_id = inbox.send(
+    new_id = await asyncio.to_thread(
+        inbox.send,
         from_project=registry.project_id or "",
         from_session=store.session_id,
         to_project=beta.project_id,
@@ -442,7 +545,8 @@ async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
         title="new",
         body="body",
     )
-    claimed_id = inbox.send(
+    claimed_id = await asyncio.to_thread(
+        inbox.send,
         from_project=registry.project_id or "",
         from_session=store.session_id,
         to_project=beta.project_id,
@@ -450,7 +554,8 @@ async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
         title="claimed",
         body="body",
     )
-    done_id = inbox.send(
+    done_id = await asyncio.to_thread(
+        inbox.send,
         from_project=registry.project_id or "",
         from_session=store.session_id,
         to_project=beta.project_id,
@@ -459,9 +564,9 @@ async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
         body="body",
     )
     claimer = "b" * 32
-    assert inbox.claim(beta.project_id, claimed_id, claimer) is not None
-    assert inbox.claim(beta.project_id, done_id, claimer) is not None
-    inbox.done(beta.project_id, done_id, claimer, "complete")
+    assert await asyncio.to_thread(inbox.claim, beta.project_id, claimed_id, claimer) is not None
+    assert await asyncio.to_thread(inbox.claim, beta.project_id, done_id, claimer) is not None
+    await asyncio.to_thread(inbox.done, beta.project_id, done_id, claimer, "complete")
 
     try:
         result = await _inbox(registry, {"action": "sent", "offset": 0, "limit": 2})
@@ -495,10 +600,10 @@ async def test_inbox_sent_reports_states(tmp_path: Path) -> None:
 async def _exercise_repair_after_guarded_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     bound = await _inbox(registry, {"action": "projects"})
     assert bound.get("isError") is not True
     ledger = store.session_dir / "project-inbox-sent.json"
@@ -578,10 +683,10 @@ async def _exercise_repair_after_guarded_failure(
 async def _exercise_concurrent_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     bound = await _inbox(registry, {"action": "projects"})
     assert bound.get("isError") is not True
     ledger = store.session_dir / "project-inbox-sent.json"
@@ -661,10 +766,10 @@ async def test_guarded_sent_operation_table(
     if scenario == "record-cancel":
         await _exercise_cancelled_send(tmp_path, monkeypatch)
         return
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     message_id = "d" * 32
     arguments = {
         "action": "send",
@@ -679,9 +784,14 @@ async def test_guarded_sent_operation_table(
         sent = await _inbox(registry, arguments)
         assert sent.get("isError") is not True
     if scenario == "mark-ledger":
-        ProjectInbox(
-            projects, sessions_root=projects.root.parent / "sessions"
-        ).claim(beta.project_id, message_id, "b" * 32)
+        await asyncio.to_thread(
+            ProjectInbox(
+                projects, sessions_root=projects.root.parent / "sessions"
+            ).claim,
+            beta.project_id,
+            message_id,
+            "b" * 32,
+        )
         assert registry.sent_message_tracker is not None
         scanner = ProjectInboxScanner(
             projects,
@@ -750,10 +860,10 @@ async def test_guarded_sent_operation_table(
 async def _exercise_cancelled_send(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     bound = await _inbox(registry, {"action": "projects"})
     assert bound.get("isError") is not True
     ledger = store.session_dir / "project-inbox-sent.json"
@@ -814,9 +924,12 @@ async def _exercise_cancelled_send(
         assert await asyncio.wait_for(
             asyncio.to_thread(tracker_read.wait, 10), 11
         )
-        listed = ProjectInbox(
-            projects, sessions_root=projects.root.parent / "sessions"
-        ).list(beta.project_id)
+        listed = await asyncio.to_thread(
+            ProjectInbox(
+                projects, sessions_root=projects.root.parent / "sessions"
+            ).list,
+            beta.project_id,
+        )
         assert [item["id"] for item in listed["new"]] == [message_id]
         sent = await _inbox(registry, {"action": "sent"})
         assert sent.get("isError") is not True
@@ -839,12 +952,13 @@ async def _exercise_cancelled_send(
 async def test_corrupt_sent_ledger_keeps_every_model_inbox_action_available(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, store = _registry(tmp_path)
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
     projects = registry.project_registry
     assert projects is not None
-    beta = projects.create_project("beta", "beta")
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
     inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
-    incoming_id = inbox.send(
+    incoming_id = await asyncio.to_thread(
+        inbox.send,
         from_project=beta.project_id,
         from_session="b" * 32,
         to_project=registry.project_id or "",
