@@ -1,23 +1,18 @@
+"""Controller-only `path_complete` request body."""
+
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from pathlib import Path
+from typing import Any
 
-from ..core.path_completion import PathCompletion, complete_paths
-from .protocol import ErrorDescriptor, ProtocolError
+from ...core.path_completion import complete_paths
+from ..protocol import ErrorDescriptor, ProtocolError
+from . import validation
 
 MAX_TEXT_BEFORE_CURSOR_BYTES = 4096
 
 
-async def request(
-    params: dict[str, object],
-    *,
-    base_dir: Path,
-    run_blocking: Callable[
-        [Callable[[], tuple[list[PathCompletion], bool]]],
-        Awaitable[tuple[list[PathCompletion], bool]],
-    ],
-) -> dict[str, object]:
+async def path_complete(client, request_id, params: dict[str, Any]) -> dict[str, object]:
+    store = validation.active(client.server.runtime, params)
     text = params.get("text_before_cursor")
     if not isinstance(text, str):
         raise ProtocolError(
@@ -36,7 +31,10 @@ async def request(
             ErrorDescriptor.INVALID_PARAMS,
             "text_before_cursor must be at most 4096 UTF-8 bytes",
         )
-    rows, truncated = await run_blocking(lambda: complete_paths(text, base_dir))
+    base_dir = store.cwd
+    rows, truncated = await client.server.control._run_blocking(
+        lambda: complete_paths(text, base_dir)
+    )
     return {
         "entries": [
             {
@@ -49,6 +47,3 @@ async def request(
         ],
         "truncated": truncated,
     }
-
-
-__all__ = ["request"]

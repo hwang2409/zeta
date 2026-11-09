@@ -444,6 +444,8 @@ def render_agent_notification_message(
         return _render_child_question_withdrawn(event, identities)
     if kind == "child_idle":
         return _render_child_idle(event, identities)
+    if kind == "child_hold":
+        return _render_child_hold(event, identities)
     if kind == "agent_completion":
         return _render_child_completion(event, identities)
     return None
@@ -531,6 +533,26 @@ def _render_child_idle(
         agent_header("idle", "←", identity, state="idle"),
         body=report,
         state="idle",
+    )
+
+
+def _render_child_hold(
+    event: StreamEvent,
+    identities: AgentIdentityIndex,
+) -> Panel | Text:
+    identity = _notification_identity(event, identities)
+    reason = event.data.get("reason")
+    until = event.data.get("until")
+    report = event.data.get("text")
+    if identity is None or not all(
+        isinstance(value, str) for value in (reason, until, report)
+    ):
+        return _unavailable_notification()
+    return render_agent_message(
+        agent_header("hold", "←", identity, state="held"),
+        body=report,
+        result=f"{reason.replace('_', ' ')} until {until}",
+        state="held",
     )
 
 

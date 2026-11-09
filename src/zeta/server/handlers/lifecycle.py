@@ -156,7 +156,10 @@ def session_snapshot(self) -> dict[str, object] | None:
 
 
 async def status(
-    self, *, include_connection_setup_counts: bool = False
+    self,
+    *,
+    include_connection_setup_counts: bool = False,
+    fallback_config: object | None = None,
 ) -> dict[str, object]:
     runtime = self.server.runtime
     session = session_snapshot(self)
@@ -173,11 +176,8 @@ async def status(
         )
         truncated = False
     loop = runtime.loop
-    fallback_config = (
-        await asyncio.to_thread(runtime._config, None, None)
-        if loop is None
-        else None
-    )
+    if loop is None and fallback_config is None:
+        fallback_config = await asyncio.to_thread(runtime._config, None, None)
     project_context_health = (
         (
             loop.project_context_health.summary
@@ -202,14 +202,14 @@ async def status(
         "explicit_finish": (
             loop.explicit_finish
             if loop is not None
-            else fallback_config.agents_explicit_finish
+            else fallback_config.agents_explicit_finish  # type: ignore[union-attr]
         ),
     }
     if self.protocol_version != "1.0":
         status["max_agent_depth"] = (
             loop.max_agent_depth
             if loop is not None
-            else fallback_config.agents_max_depth
+            else fallback_config.agents_max_depth  # type: ignore[union-attr]
         )
     suffix = {
         "pending_approvals": pending,
