@@ -37,7 +37,7 @@ from tests.support.completion import ManualDeadlineClock
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.owned import await_or_fail
 from zeta.oauth import OAuthTokens
-from zeta.providers import completion, transport
+from zeta.providers import completion, must_complete_close, transport
 from zeta.providers.anthropic import AnthropicBackend
 from zeta.providers.codex import CodexBackend
 from zeta.providers.ollama import OllamaBackend
@@ -804,7 +804,7 @@ async def test_close_site_releases_its_borrow_and_returns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = ManualDeadlineClock()
-    monkeypatch.setattr(completion, "CLOSE_CLOCK", clock, raising=False)
+    monkeypatch.setattr(must_complete_close, "CLOSE_CLOCK", clock)
     site = _site(site_name, tmp_path, monkeypatch, owned=site_name == "lease")
     # test-contract: seam observe the lease close parked at its drain wait
     site.backend._lease._drained = _WatchedEvent()

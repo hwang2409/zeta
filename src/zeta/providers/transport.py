@@ -16,12 +16,11 @@ from typing import Any, ClassVar, TypeVar
 import httpx
 
 from .completion import (
-    MustCompleteClose,
     is_control_exception,
     merge_exception,
     report_transport_activity,
-    task_is_cancelling,
 )
+from .must_complete_close import MustCompleteClose, task_is_cancelling
 from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)

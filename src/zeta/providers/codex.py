@@ -38,8 +38,8 @@ from .completion import (
     complete as own_completion,
     is_completion_sentinel,
     report_provider_record,
-    task_is_cancelling,
 )
+from .must_complete_close import task_is_cancelling
 from .codex_payload import (
     _cache_affinity_json,
     build_responses_payload,

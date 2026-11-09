@@ -48,8 +48,8 @@ from .completion import (
     complete as own_completion,
     is_completion_sentinel,
     report_provider_record,
-    task_is_cancelling,
 )
+from .must_complete_close import task_is_cancelling
 from .stream_diagnostics import Cause, StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
