@@ -816,10 +816,17 @@ class ProjectInbox:
             if lock:
                 fcntl.flock(inbox_fd, fcntl.LOCK_EX)
                 stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
-            fds = tuple(
-                stack.enter_context(child_directory(inbox_fd, name, create=create))
-                for name in ("new", "claimed", "done", "bodies", "wake")
-            )
+            try:
+                fds = tuple(
+                    stack.enter_context(
+                        child_directory(inbox_fd, name, create=create)
+                    )
+                    for name in ("new", "claimed", "done", "bodies", "wake")
+                )
+            except FileNotFoundError as exc:
+                if create:
+                    raise
+                raise _InboxNotFound from exc
             yield fds  # type: ignore[misc]
 
     @contextmanager
