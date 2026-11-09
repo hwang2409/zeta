@@ -50,7 +50,7 @@ from zeta.tui.cards.decisions import DecisionsPanel
 from zeta.tui.layout import status_toolbar
 from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import format_status
-from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin
+from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin, _DecisionsScanOwner
 
 
 def _plain(lines: list[list[tuple[str, str]]]) -> str:
@@ -132,10 +132,11 @@ def _resolved_event(*, child: bool = False) -> StreamEvent:
 
 
 @pytest.mark.asyncio
-async def test_direct_tick_discards_scan_started_before_resolution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("mutation", ["dismiss", "recover_open"])
+async def test_direct_tick_discards_scan_delivered_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
-    import zeta.attention_decisions as decisions_module
+    import zeta.tui.slash_handlers.decisions_panel as panel_module
 
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
@@ -144,51 +145,71 @@ async def test_direct_tick_discards_scan_started_before_resolution(
         _request, current, project.project_id, "Current", "This one."
     )
     app = _decisions_app(tmp_path, current)
-    entered = asyncio.Event()
+    scan_ready = asyncio.Event()
     direct_started = asyncio.Event()
-    release = ThreadEvent()
-    real_open = decisions_module.open_decisions
-    calls = 0
+    held_delivery = []
+    hold_delivery = True
     read_calls = 0
     loop = asyncio.get_running_loop()
+    real_call_soon_threadsafe = loop.call_soon_threadsafe
+    real_read = app._read_decisions
+
+    async def wrapped_read(*args, **kwargs):
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 2:
+            direct_started.set()
+        return await real_read(*args, **kwargs)
+
+    async def release_delivery() -> None:
+        nonlocal hold_delivery
+        hold_delivery = False
+        callback, args = held_delivery.pop()
+        real_call_soon_threadsafe(callback, *args)
+
+    app._read_decisions = wrapped_read
+
+    def hold_first_delivery(callback, *args):
+        if callback is panel_module._deliver_decisions_scan and hold_delivery:
+            held_delivery.append((callback, args))
+            real_call_soon_threadsafe(scan_ready.set)
+            return
+        real_call_soon_threadsafe(callback, *args)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", hold_first_delivery)
     try:
-        real_read = app._read_decisions
+        app.start_decisions_poll()
+        await await_or_fail(scan_ready.wait(), what="completed old decision scan")
+        if mutation == "dismiss":
+            await asyncio.to_thread(
+                AttentionReplies(tmp_path, current.store.session_id).resolve_local,
+                record.id,
+                "done",
+            )
+            direct_tick = asyncio.create_task(app._decisions_tick())
+        else:
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
 
-        async def wrapped_read(*args, **kwargs):
-            nonlocal read_calls
-            read_calls += 1
-            if read_calls == 2:
-                direct_started.set()
-            return await real_read(*args, **kwargs)
+            def prepare_recovery() -> None:
+                replies = AttentionReplies(tmp_path, current.store.session_id)
+                with replies._operation():
+                    replies._prepare_locked(
+                        [(record.id, "done")],
+                        from_session=current.store.session_id,
+                    )
 
-        app._read_decisions = wrapped_read
-
-        def blocked_open(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            result = real_open(*args, **kwargs)
-            if calls == 1:
-                loop.call_soon_threadsafe(entered.set)
-                release.wait(timeout=10)
-            return result
-
-        monkeypatch.setattr(decisions_module, "open_decisions", blocked_open)
-        old_scan = asyncio.create_task(app._read_decisions(timeout=None))
-        await await_or_fail(entered.wait(), what="old decision scan")
-        await asyncio.to_thread(
-            AttentionReplies(tmp_path, current.store.session_id).resolve_local,
-            record.id,
-            "done",
-        )
-        direct_tick = asyncio.create_task(app._decisions_tick())
+            await asyncio.to_thread(prepare_recovery)
+            direct_tick = asyncio.create_task(app._open_decisions_panel())
         await await_or_fail(direct_started.wait(), what="direct decision tick")
-        release.set()
+        await release_delivery()
         await await_or_fail(direct_tick, what="direct decision refresh")
-        old_scan.cancel()
-        await asyncio.wait_for(asyncio.gather(old_scan, return_exceptions=True), 10)
         assert app.decisions_count == 0
+        assert "● " not in _rendered_decisions_status(app)
     finally:
-        release.set()
+        if held_delivery:
+            await release_delivery()
         await _stop_decisions(app)
         await app.close()
         current.store.close()
@@ -405,7 +426,7 @@ async def test_decisions_refresh_table_renders_current_counts(
             loop = asyncio.get_running_loop()
             work = loop.create_future()
             work.set_result(real_open(tmp_path, current.store.session_id))
-            app._decisions_scan_work = work
+            app._decisions_scan_owner._work = (work, 1)
             app.request_decisions_refresh()
             task = app._decisions_scan_task
             assert task is not None
@@ -451,21 +472,39 @@ async def test_decisions_refresh_table_renders_current_counts(
         else:
             loop_thread = threading.current_thread()
             loop_fs_calls = []
+            decisions_dir = current.store.session_dir / "attention"
             real_iterdir = Path.iterdir
             real_stat = Path.stat
 
+            def is_decisions_path(path):
+                return path == decisions_dir or decisions_dir in path.parents
+
             def loop_safe_iterdir(path):
-                if threading.current_thread() is loop_thread:
+                if threading.current_thread() is loop_thread and is_decisions_path(path):
                     loop_fs_calls.append("iterdir")
                 return real_iterdir(path)
 
             def loop_safe_stat(path, *args, **kwargs):
-                if threading.current_thread() is loop_thread:
+                if threading.current_thread() is loop_thread and is_decisions_path(path):
                     loop_fs_calls.append("stat")
                 return real_stat(path, *args, **kwargs)
 
             monkeypatch.setattr(Path, "iterdir", loop_safe_iterdir)
             monkeypatch.setattr(Path, "stat", loop_safe_stat)
+            scan_threads = []
+            staged_threads = []
+            real_staged = AttentionReplies.staged
+
+            def record_scan_thread(*args, **kwargs):
+                scan_threads.append(threading.current_thread())
+                return real_open(*args, **kwargs)
+
+            def record_staged_thread(self):
+                staged_threads.append(threading.current_thread())
+                return real_staged(self)
+
+            monkeypatch.setattr(decisions_module, "open_decisions", record_scan_thread)
+            monkeypatch.setattr(AttentionReplies, "staged", record_staged_thread)
             expected = (2, 2, "● 0 open, 2 staged")
 
         if case != "stop_during_scan":
@@ -478,7 +517,9 @@ async def test_decisions_refresh_table_renders_current_counts(
                 await app._decisions_tick()
         if case == "success":
             # test-contract: this assertion is the loop-filesystem guard.
-            assert loop_fs_calls == []
+            assert loop_fs_calls == [], loop_fs_calls
+            assert scan_threads and all(thread is not loop_thread for thread in scan_threads)
+            assert staged_threads and all(thread is not loop_thread for thread in staged_threads)
         assert (app.decisions_count, app.decisions_staged_count) == expected[:2]
         assert expected[2] in _rendered_decisions_status(app)
     finally:
@@ -694,13 +735,12 @@ async def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> Non
     app = SimpleNamespace(
         _home=tmp_path,
         _decisions_session_id=current.store.session_id,
+        _decisions_scan_owner=_DecisionsScanOwner(),
         loop=current,
         _run_attention_operation=lambda operation, *args: asyncio.to_thread(
             operation, *args
         ),
         _attention_replies=lambda session_id: AttentionReplies(tmp_path, session_id),
-            _decisions_scan_generation=0,
-            _advance_decisions_generation=lambda: 0,
     )
     output = await DecisionsMixin.slash_decisions(app, "")
     assert "Current" in output
