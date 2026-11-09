@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, fields, replace
 from enum import StrEnum
+from functools import partial
 from pathlib import PurePath
 from types import FunctionType, MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -146,35 +146,42 @@ class SlashLock:
 _SCALARS = (type(None), bool, int, float, str, bytes, PurePath)
 
 
-def _check_frozen(value: object, name: str) -> None:
+def _is_frozen_leaf(value: object) -> bool:
     if isinstance(value, _SCALARS):
-        return
-    if type(value) is tuple:
-        for item in value:
-            _check_frozen(item, name)
-        return
-    if type(value) is MappingProxyType:
-        for key, item in value.items():
-            _check_frozen(key, name)
-            _check_frozen(item, name)
-        return
+        return True
     if isinstance(value, ConversationEntry):
-        return  # resident append-only transcript rows, shared with workers on main
-    if (
+        return True  # resident append-only transcript rows, shared with workers on main
+    # A plain module-level function: no bound state, closure, or lambda.
+    return (
         isinstance(value, FunctionType)
         and value.__closure__ is None
         and "<" not in value.__qualname__
-    ):
-        return  # a plain module-level function: no bound state, closure, or lambda
+    )
+
+
+def _frozen_children(value: object) -> Iterable[object] | None:
+    """Return the items of an immutable container, or None for anything else."""
+    if type(value) is tuple:
+        return value
+    if type(value) is MappingProxyType:
+        return (item for pair in value.items() for item in pair)
     params = getattr(type(value), "__dataclass_params__", None)
     if params is not None and params.frozen:
-        for field in fields(value):  # type: ignore[arg-type]
-            _check_frozen(getattr(value, field.name), name)
+        return (getattr(value, field.name) for field in fields(value))  # type: ignore[arg-type]
+    return None
+
+
+def _check_frozen(value: object, name: str) -> None:
+    if _is_frozen_leaf(value):
         return
-    raise TypeError(
-        f"/{name} prepare returned unsupported/live state {type(value).__name__}; "
-        "copy immutable inputs instead"
-    )
+    children = _frozen_children(value)
+    if children is None:
+        raise TypeError(
+            f"/{name} prepare returned unsupported/live state {type(value).__name__}; "
+            "copy immutable inputs instead"
+        )
+    for child in children:
+        _check_frozen(child, name)
 
 
 def _standard_prepare(_session: SlashSession, args: str) -> str:
@@ -266,37 +273,41 @@ class SlashCommand:
                     )
                 return await result
             return result
-        inputs = policy.prepare(session, args)
-        _check_frozen(inputs, self.name)
-        returned = threading.Event()
+        return await _run_worker(self.name, policy, session, args, lock)
 
-        def run_worker() -> object:
-            try:
-                return policy.run(inputs)
-            finally:
-                returned.set()
 
-        worker = asyncio.ensure_future(lock.offload(run_worker))
-        cancelled = False
-        while True:
-            try:
-                output = await asyncio.shield(worker)
-                break
-            except asyncio.CancelledError:
-                if worker.done() and worker.cancelled():
-                    raise
-                if returned.is_set() and not worker.done():
-                    # The worker already returned, so it writes nothing more; its
-                    # result may never reach this loop (shutdown), so do not wait.
-                    raise
-                if not cancelled:
-                    cancelled = True
-                    lock.defer_cancellation()
-        result = policy.publish(session, output)
-        if cancelled:
-            lock.late_output(result)
-            raise asyncio.CancelledError
-        return result
+async def _run_worker(
+    name: str, policy: _Worker, session: SlashSession, args: str, lock: SlashLock
+) -> str | ModelInputEnvelope | SlashPromptError:
+    inputs = policy.prepare(session, args)
+    _check_frozen(inputs, name)
+    worker = asyncio.ensure_future(lock.offload(partial(policy.run, inputs)))
+    output, cancelled_after_start = await _await_worker(worker, lock)
+    result = policy.publish(session, output)
+    if cancelled_after_start:
+        lock.late_output(result)
+        raise asyncio.CancelledError
+    return result
+
+
+async def _await_worker(
+    worker: asyncio.Future[object], lock: SlashLock
+) -> tuple[object, bool]:
+    """Wait for a started worker; return its output and whether the caller cancelled.
+
+    A caller cancel waits for the worker so its output is still published. If
+    the worker itself is cancelled (its reader shut down), this re-raises.
+    """
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(worker), cancelled
+        except asyncio.CancelledError:
+            if worker.cancelled():
+                raise
+            if not cancelled:
+                cancelled = True
+                lock.defer_cancellation()
 
 
 class SlashCommandRegistry:
