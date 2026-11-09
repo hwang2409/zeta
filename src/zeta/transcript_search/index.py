@@ -539,7 +539,7 @@ class TranscriptIndex:
             try:
                 self._rebuild_locked(sources)
             finally:
-                self.building_path.unlink(missing_ok=True)
+                self._clear_building_path()
 
     def rebuild(self, sources: Iterable[TranscriptSource]) -> IndexStatus:
         """Build a fresh generation and atomically publish it."""
@@ -675,11 +675,14 @@ class TranscriptIndex:
             os.close(fd)
             return True
         try:
-            self.building_path.unlink(missing_ok=True)
+            self._clear_building_path()
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
         return False
+
+    def _clear_building_path(self) -> None:
+        self.building_path.unlink(missing_ok=True)
 
     def _building_status(self) -> IndexStatus:
         return IndexStatus(
@@ -1111,7 +1114,15 @@ def linked_transcript_sources(
 def open_project_index(
     registry: ProjectRegistry, project_id: str
 ) -> TranscriptIndex:
-    """Open the current index, backfilling a missing or empty version once."""
+    """Open the current index, backfilling a missing or empty version once.
+
+    The backfill source list is read from the registry only when the version
+    file is missing or is ready but empty, so the common ready path stays off
+    the registry. A project with no registry entry has nothing to backfill, so
+    we return a plain index whose empty file exists for the caller to append to.
+    """
+
+    from zeta.project_errors import ProjectRegistryError
 
     project_dir = registry.root / project_id
     project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1122,7 +1133,11 @@ def open_project_index(
         status = index.status()
         if not (status.ready and status.session_count == 0):
             return index
-    index._backfill_if_empty(linked_transcript_sources(registry, project_id))
+    try:
+        sources = linked_transcript_sources(registry, project_id)
+    except ProjectRegistryError:
+        return TranscriptIndex(project_dir, project_id)
+    index._backfill_if_empty(sources)
     return index
 
 

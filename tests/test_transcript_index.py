@@ -936,7 +936,7 @@ def test_first_version_backfill_reports_building_and_keeps_concurrent_append(
         def append() -> None:
             try:
                 refresh_module._refresh_sources(
-                    projects_root, project.project_id, (active,)
+                    registry, project.project_id, (active,)
                 )
             except BaseException as exc:  # noqa: BLE001 - assert thread failure
                 errors.append(exc)
@@ -1323,6 +1323,7 @@ print(index.path.name)
 async def test_refreshes_coalesce_per_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
     source = _source(
         tmp_path / "sessions",
         "one",
@@ -1347,7 +1348,7 @@ async def test_refreshes_coalesce_per_project(
         asyncio.gather(
             *(
                 refresh_transcript_index(
-                    tmp_path / "projects",
+                    registry,
                     PROJECT_A,
                     source.session_id,
                     source.session_dir,
@@ -1372,7 +1373,7 @@ async def test_refresh_sqlite_failure_is_reported(
     monkeypatch.setattr(refresh_module, "_refresh_sources", fail)
     with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
         await refresh_transcript_index(
-            tmp_path / "projects", PROJECT_A, "one", tmp_path / "missing"
+            ProjectRegistry(tmp_path / "projects"), PROJECT_A, "one", tmp_path / "missing"
         )
     assert "could not refresh transcript index" in caplog.text
 
@@ -1381,6 +1382,7 @@ async def test_refresh_sqlite_failure_is_reported(
 async def test_transient_refresh_failure_retries_pending_session_on_next_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
     first = _source(
         tmp_path / "sessions",
         "one",
@@ -1415,10 +1417,10 @@ async def test_transient_refresh_failure_retries_pending_session_on_next_refresh
     monkeypatch.setattr(refresh_module, "_refresh_sources", fail_once)
     with pytest.raises(index_module.TranscriptIndexError, match="database is locked"):
         await refresh_transcript_index(
-            tmp_path / "projects", PROJECT_A, first.session_id, first.session_dir
+            registry, PROJECT_A, first.session_id, first.session_dir
         )
     await refresh_transcript_index(
-        tmp_path / "projects", PROJECT_A, second.session_id, second.session_dir
+        registry, PROJECT_A, second.session_id, second.session_dir
     )
 
     index = TranscriptIndex(tmp_path / "projects" / PROJECT_A, PROJECT_A)
@@ -1448,7 +1450,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     store.append_message(message(MessageRole.USER, "first indexed question"))
     store.append_message(message(MessageRole.ASSISTANT, "first indexed answer"))
     await refresh_transcript_index(
-        projects_root,
+        ProjectRegistry(projects_root),
         PROJECT_A,
         store.session_id,
         store.session_dir,
@@ -1474,7 +1476,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     monkeypatch.setattr(refresh_module, "_refresh_sources", fail_once)
     with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
         await refresh_transcript_index(
-            projects_root,
+            ProjectRegistry(projects_root),
             PROJECT_A,
             store.session_id,
             store.session_dir,
@@ -1497,7 +1499,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     )
 
     await refresh_transcript_index(
-        projects_root,
+        ProjectRegistry(projects_root),
         PROJECT_A,
         store.session_id,
         store.session_dir,
@@ -1519,6 +1521,7 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
     from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS
 
     projects_root = tmp_path / "projects"
+    registry = ProjectRegistry(projects_root)
     source = _source(
         tmp_path / "sessions",
         "one",
@@ -1551,7 +1554,7 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
         )
         with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
             await refresh_transcript_index(
-                projects_root,
+                registry,
                 PROJECT_A,
                 source.session_id,
                 source.session_dir,
@@ -1565,7 +1568,7 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
     # test-contract: seam inject the refresh worker boundary
     monkeypatch.setattr(refresh_module, "_refresh_sources", original_refresh)
     await refresh_transcript_index(
-        projects_root,
+        registry,
         PROJECT_A,
         source.session_id,
         source.session_dir,
@@ -1580,6 +1583,7 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
 async def test_append_runs_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
     source = _source(
         tmp_path / "sessions",
         "one",
@@ -1599,7 +1603,7 @@ async def test_append_runs_off_event_loop(
     # test-contract: seam inject the refresh worker boundary
     monkeypatch.setattr(refresh_module, "_refresh_sources", observed_refresh)
     await refresh_transcript_index(
-        tmp_path / "projects", PROJECT_A, source.session_id, source.session_dir
+        registry, PROJECT_A, source.session_id, source.session_dir
     )
 
     assert refresh_threads
