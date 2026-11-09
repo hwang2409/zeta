@@ -197,11 +197,6 @@ class SentMessageTracker:
             self._refresh()
             return tuple(dict(record) for record in reversed(self._records))
 
-    def pending_records(self) -> tuple[dict[str, Any], ...]:
-        with self._lock:
-            self._refresh()
-            return tuple(dict(r) for r in self._records if r["id"] in self._pending)
-
     def sent_view(
         self,
         inbox: ProjectInbox,
