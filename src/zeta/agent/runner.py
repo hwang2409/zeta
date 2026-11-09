@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from ..accounts import AccountCredentialLockTimeoutError
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
 from ..core.project_context import ProjectContext
@@ -364,10 +365,15 @@ def resolve_child_backend(
     account_kwargs = context.backend_kwargs(provider) if context is not None else {}
     store = credential_store(provider, **account_kwargs)
     if store is not None:
-        tokens = store.read() or store.bootstrap()
-        if tokens is None:
-            message = f"agent error: not logged in to {provider}; "
-            return None, message + f"run zeta login --provider {provider}"
+        try:
+            tokens = store.read() or store.bootstrap()
+        except AccountCredentialLockTimeoutError:
+            # credential acquisition belongs to the provider retry loop below
+            pass
+        else:
+            if tokens is None:
+                message = f"agent error: not logged in to {provider}; "
+                return None, message + f"run zeta login --provider {provider}"
     try:
         child_budget = effective_budget_for_model(
             provider, model, loop.context_assembler.token_budget
