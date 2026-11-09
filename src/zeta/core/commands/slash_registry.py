@@ -14,6 +14,7 @@ from ...mcp.prompt_commands import MCPPromptCommands, SlashPromptError, dispatch
 from ...model_input import ModelInputEnvelope, skill_model_input
 from ...protocol.types import MessageOrigin
 from ...skills import SkillCatalog, SkillMeta, is_slash_safe_name, load_skill_prompt
+from ...skills.catalog import LiveSkillProjection, prepare_slash_projection
 from ...skills.invocation import dollar_skill_mentions
 from .custom_commands import (
     CustomCommand,
@@ -36,23 +37,45 @@ type SlashResult = (
 type SlashHandler = Callable[[SlashSession, str], SlashResult]
 
 
-def _never(_args: str) -> bool:
+def never(_args: str) -> bool:
+    """Argument predicate that holds for no form; busy policy reads it by identity."""
+
     return False
 
 
-def _always(_args: str) -> bool:
+def always(_args: str) -> bool:
+    """Argument predicate that holds for every form; busy policy reads it by identity."""
+
     return True
+
+
+class BusyPolicy(StrEnum):
+    """Which forms of a command run while a turn is running."""
+
+    ALWAYS = "always"
+    NEVER = "never"
+    READ_FORMS = "read_forms"
 
 
 @dataclass(frozen=True, slots=True)
 class ServeSlash:
     """Serve-specific policy for one shared slash command."""
 
-    mutates: Callable[[str], bool] = _always
-    runs_while_busy: Callable[[str], bool] = _never
+    mutates: Callable[[str], bool] = always
+    runs_while_busy: Callable[[str], bool] = never
 
     def can_run_while_busy(self, args: str) -> bool:
         return self.runs_while_busy(args) and not self.mutates(args)
+
+    @property
+    def busy_policy(self) -> BusyPolicy:
+        """Classify ``can_run_while_busy`` from the same two predicates."""
+
+        if self.runs_while_busy is never or self.mutates is always:
+            return BusyPolicy.NEVER
+        if self.runs_while_busy is always and self.mutates is never:
+            return BusyPolicy.ALWAYS
+        return BusyPolicy.READ_FORMS
 
 
 class SlashSurface(StrEnum):
@@ -81,6 +104,8 @@ class SlashCommandRegistry:
         self._commands: dict[str, SlashCommand] = {}
         self._custom_commands: dict[str, CustomCommand] = {}
         self._skills: dict[str, SkillMeta] = {}
+        self._skill_notices: tuple[str, ...] = ()
+        self._skill_warning_notices: frozenset[str] = frozenset()
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
         self._mcp_prompts = MCPPromptCommands(self._notices, self._warning_notices)
@@ -122,13 +147,13 @@ class SlashCommandRegistry:
     def notices(self) -> tuple[str, ...]:
         """Return non-fatal load notices for the session-start display."""
 
-        return tuple(self._notices)
+        return (*self._notices, *self._skill_notices)
 
     @property
     def warning_notices(self) -> frozenset[str]:
         """Return notices that need prominent display."""
 
-        return frozenset(self._warning_notices)
+        return self._skill_warning_notices.union(self._warning_notices)
 
     def command_for(self, name: str) -> SlashCommand | None:
         """Return the shared builtin named ``name``, if it exists."""
@@ -187,26 +212,26 @@ class SlashCommandRegistry:
             return
         self._custom_commands[command.name] = command
 
+    def prepare_live_config(
+        self, catalog: SkillCatalog, _agents: object
+    ) -> LiveSkillProjection:
+        return prepare_slash_projection(
+            catalog, self._commands, self._custom_commands
+        )
+
+    def commit_live_config(self, prepared: object) -> None:
+        """Commit one worker-prepared slash projection by reference."""
+
+        if not isinstance(prepared, LiveSkillProjection):
+            raise TypeError("expected a live skill projection")
+        self._skills = prepared.skills
+        self._skill_notices = prepared.notices
+        self._skill_warning_notices = prepared.warning_notices
+
     def register_skills(self, catalog: SkillCatalog) -> None:
         """Replace skills after built-ins and custom commands."""
 
-        self._skills.clear()
-        self._notices.extend(
-            notice for notice in catalog.notices if notice not in self._notices
-        )
-        self._warning_notices.update(catalog.notices)
-        for skill in catalog.skills:
-            if skill.name in self._commands:
-                notice = f"ignored skill {skill.path}: shadows built-in /{skill.name}"
-            elif skill.name in self._custom_commands:
-                notice = (
-                    f"ignored skill {skill.path}: shadows custom command /{skill.name}"
-                )
-            else:
-                self._skills[skill.name] = skill
-                continue
-            self._notices.append(notice)
-            self._warning_notices.add(notice)
+        self.commit_live_config(self.prepare_live_config(catalog, None))
 
     def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command or expand registered dollar-skill mentions."""

@@ -1872,6 +1872,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             entered = asyncio.Event()
             release = asyncio.Event()
             settlement: asyncio.Task[object] | None = None
+            gate_owner: asyncio.Task[object] | None = None
             all_frames: list[dict[str, Any]] = []
             failed_write = asyncio.Event()
             failed_payloads: list[bytes] = []
@@ -1907,13 +1908,22 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 original_commit = ConversationStore._commit_storage_command
 
                 async def gated_commit(store: ConversationStore, command: object) -> object:
+                    nonlocal gate_owner
                     is_resolution = type(command).__name__ == "_ResolveApprovalCommand"
                     if case == "cancel_settle" and is_resolution:
+                        # test-contract: prove the settlement task owns the gated await
+                        gate_owner = asyncio.current_task()
+                        record = server.control._approvals.state.records["call-1"]
+                        assert gate_owner is record.settlement
                         # test-contract: cancel before the real durable operation begins
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")
                     result = await original_commit(store, command)
                     if case == "external_end" and is_resolution:
+                        # test-contract: prove the settlement task owns the gated await
+                        gate_owner = asyncio.current_task()
+                        record = server.control._approvals.state.records["call-1"]
+                        assert gate_owner is record.settlement
                         # test-contract: gate after the real durable operation commits
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")
@@ -1924,46 +1934,128 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     ConversationStore, "_commit_storage_command", gated_commit
                 )
             elif case == "cancel_finish" and GrantPublication is not None:
-                original_finish = GrantPublication.finish
+                original_finish_grant = approval_lifecycle.finish_grant
 
-                async def gated_finish(
-                    publication: GrantPublication,
-                    request: Any,
-                    committed: bool,
-                    event_published: bool,
-                ) -> tuple[bool, bool]:
-                    # test-contract: seam gate the named production await
+                async def gated_finish_grant(
+                    *args: object, **kwargs: object
+                ) -> tuple[bool, bool, bool]:
+                    nonlocal gate_owner
+                    gate_owner = asyncio.current_task()
+                    record = server.control._approvals.state.records["call-1"]
+                    assert gate_owner is record.settlement
                     entered.set()
-                    await await_or_fail(release.wait(), what="grant finish")
-                    return await original_finish(
-                        publication, request, committed, event_published
-                    )
+                    try:
+                        await await_or_fail(release.wait(), what="grant finish")
+                    except asyncio.CancelledError:
+                        committed, published, _ = await original_finish_grant(
+                            *args, **kwargs
+                        )
+                        return committed, published, True
+                    return await original_finish_grant(*args, **kwargs)
 
-                monkeypatch.setattr(GrantPublication, "finish", gated_finish)
+                monkeypatch.setattr(
+                    approval_lifecycle, "finish_grant", gated_finish_grant
+                )
             elif case == "cancel_publish" and GrantPublication is not None:
+                original_finish_grant = approval_lifecycle.finish_grant
                 original_publish = GrantPublication.publish
+                publish_entered = asyncio.Event()
+                release_publish = asyncio.Event()
 
                 async def gated_publish(
                     publication: GrantPublication, rule: str
                 ) -> None:
-                    # test-contract: seam gate the named production await
-                    entered.set()
-                    await await_or_fail(release.wait(), what="grant publication")
+                    publish_entered.set()
+                    await await_or_fail(
+                        release_publish.wait(), what="grant publication"
+                    )
                     await original_publish(publication, rule)
 
+                async def gated_publishing_finish(
+                    *args: object, **kwargs: object
+                ) -> tuple[bool, bool, bool]:
+                    nonlocal gate_owner
+                    operation = asyncio.create_task(
+                        original_finish_grant(*args, **kwargs)
+                    )
+                    await await_or_fail(
+                        publish_entered.wait(), what="grant publish entered"
+                    )
+                    gate_owner = asyncio.current_task()
+                    record = server.control._approvals.state.records["call-1"]
+                    assert gate_owner is record.settlement
+                    entered.set()
+                    try:
+                        await await_or_fail(release.wait(), what="grant publish owner")
+                    except asyncio.CancelledError:
+                        release_publish.set()
+                        committed, published, _ = await await_or_fail(
+                            operation, what="canceled grant publication"
+                        )
+                        return committed, published, True
+                    release_publish.set()
+                    return await await_or_fail(
+                        operation, what="completed grant publication"
+                    )
+
                 monkeypatch.setattr(GrantPublication, "publish", gated_publish)
+                monkeypatch.setattr(
+                    approval_lifecycle, "finish_grant", gated_publishing_finish
+                )
             elif case == "cancel_history":
                 original_history = ConversationStore.append_approval_history_async
+                original_persist = approval_settlement.persist_durably
+                original_finish = server.control._approvals._finish_record
+                committed = asyncio.Event()
+                release_persist = asyncio.Event()
+                competing_entered = asyncio.Event()
+                release_competing = asyncio.Event()
+
+                async def gated_persist(*args: object, **kwargs: object) -> object:
+                    result = await original_persist(*args, **kwargs)
+                    committed.set()
+                    await await_or_fail(
+                        release_persist.wait(), what="approval settlement commit"
+                    )
+                    return result
+
+                async def gated_finish(
+                    record: Any, resolution: dict[str, str]
+                ) -> None:
+                    if record.target.key == "call-1":
+                        owner = asyncio.current_task()
+                        current = server.control._approvals.state.records["call-1"]
+                        if current.settlement is not owner:
+                            competing_entered.set()
+                            await await_or_fail(
+                                release_competing.wait(),
+                                what="competing approval publication",
+                            )
+                    await original_finish(record, resolution)
 
                 async def gated_history(
                     store: ConversationStore, payload: dict[str, object]
                 ) -> object:
-                    result = await original_history(store, payload)
-                    # test-contract: seam gate the named production await
+                    nonlocal gate_owner
+                    record = server.control._approvals.state.records["call-1"]
+                    # test-contract: seam prove the settlement task owns this await
+                    gate_owner = asyncio.current_task()
+                    assert gate_owner is record.settlement
                     entered.set()
-                    await await_or_fail(release.wait(), what="approval history")
-                    return result
+                    try:
+                        await await_or_fail(release.wait(), what="approval history")
+                    except asyncio.CancelledError:
+                        await original_history(store, payload)
+                        raise
+                    return await original_history(store, payload)
 
+                monkeypatch.setattr(
+                    approval_settlement, "persist_durably", gated_persist
+                )
+                # test-contract: seam force a competing publication owner order
+                monkeypatch.setattr(
+                    server.control._approvals, "_finish_record", gated_finish
+                )
                 monkeypatch.setattr(
                     ConversationStore,
                     "append_approval_history_async",
@@ -1980,11 +2072,12 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     decision: str,
                     reason: str | None = None,
                 ) -> dict[str, str]:
-                    nonlocal settlement
+                    nonlocal settlement, gate_owner
                     result = await original_settle_record(
                         lifecycle, record, decision, reason
                     )
                     settlement = asyncio.current_task()
+                    gate_owner = settlement
                     # test-contract: seam capture the lifecycle owner task
                     assert settlement is not None
                     # test-contract: seam gate owner exit after shared admission
@@ -2005,8 +2098,10 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 original_write = controller.connection._write_physical
 
                 async def gated_write(payload: bytes) -> bool:
+                    nonlocal gate_owner
                     if b"session_grants_changed" in payload:
-                        # test-contract: seam gate the named production await
+                        # test-contract: seam gate the real dead-peer write
+                        gate_owner = asyncio.current_task()
                         entered.set()
                         await await_or_fail(release.wait(), what="grant physical write")
                     return await original_write(payload)
@@ -2019,7 +2114,11 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 original_grant_publish = server.control.publish_session_grant_change
 
                 async def gated_grant_publish(change: Any) -> None:
+                    nonlocal gate_owner
                     # test-contract: seam gate the named production await
+                    gate_owner = asyncio.current_task()
+                    record = server.control._approvals.state.records["call-1"]
+                    assert gate_owner is record.settlement
                     entered.set()
                     await await_or_fail(release.wait(), what="grant publication")
                     await original_grant_publish(change)
@@ -2055,6 +2154,19 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 await await_or_fail(failed_write.wait(), what="approve response failure")
             else:
                 approve = asyncio.create_task(request(4, "approve", approve_params))
+            competing: asyncio.Task[object] | None = None
+            if case == "cancel_history":
+                await await_or_fail(committed.wait(), what="approval settlement commit")
+                record = server.control._approvals.state.records["call-1"]
+                resolution = record.target.store.approval_resolution_data("call-1")
+                assert resolution is not None
+                competing = asyncio.create_task(
+                    server.control._approvals._finish_record(record, resolution)
+                )
+                await await_or_fail(
+                    competing_entered.wait(), what="competing approval publication"
+                )
+                release_persist.set()
             if case == "external_end":
                 await await_or_fail(entered.wait(), what="durable settlement")
                 external_end = asyncio.create_task(
@@ -2065,21 +2177,92 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 release.set()
                 await await_or_fail(external_end, what="external approval end")
             if cancel:
-                assert approve is not None
                 await await_or_fail(entered.wait(), what=f"{case} gate")
                 record = server.control._approvals.state.records.get("call-1")
                 if record is not None:
                     settlement = record.settlement
                 original_turn = server.control._turn_task
                 assert original_turn is not None
-                cancel_target = settlement or approve
+                assert gate_owner is not None
+                assert not gate_owner.done()
+                if case == "cancel_write":
+                    # test-contract: cancel_write aborts the real controller transport
+                    assert (
+                        gate_owner.get_coro().__qualname__
+                        == "ConnectionRegistry._write_physical"
+                    )
+                    writer.transport.abort()
+                    release.set()
+                    await await_or_fail(
+                        asyncio.gather(original_turn, return_exceptions=True),
+                        what=f"{case} original turn task",
+                    )
+                    assert not server.control._approvals.state.records
+                    if transport == "unix":
+                        reader, writer = await asyncio.open_unix_connection(
+                            str(server.socket_path)
+                        )
+                    else:
+                        reader, writer, status, _headers = await _connect_websocket(
+                            server, token=None, protocol_token=server._websocket.token
+                        )
+                        assert status == 101
+                    pending.clear()
+                    await request(
+                        10,
+                        "hello",
+                        {
+                            "protocol_version": "1.2",
+                            "features": [*FEATURES, "approval_reconnect"],
+                        },
+                    )
+                    snapshot_frames = await request(11, "session_grants", {})
+                    assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
+                    original_status = (await request(12, "status", {}))[-1]
+                    assert original_status["result"]["state"] == "idle", (
+                        "cancel_write replacement controller did not observe the "
+                        "original turn reaching idle"
+                    )
+                    send_frames = await request(13, "send", {"text": "ask again"})
+                    assert send_frames[-1].get("result", {}).get("accepted") is True, (
+                        "cancel_write replacement send was not accepted: "
+                        f"{send_frames[-1]!r}"
+                    )
+                    next_turn = await frames_until("turn_end")
+                    assert not any(
+                        frame.get("params", {}).get("event") == "approval_request"
+                        for frame in next_turn
+                    ), "cancel_write replacement unexpectedly asked for approval"
+                    changed = [
+                        frame
+                        for frame in observed
+                        if frame.get("params", {}).get("event")
+                        == "session_grants_changed"
+                        and frame.get("params", {}).get("data", {}).get("change")
+                        == "grant"
+                    ]
+                    assert len(changed) == 0, (
+                        "cancel_write must publish no grant-change event to a dead "
+                        f"peer; observed {changed!r}"
+                    )
+                    assert not server.control._approvals.state.records
+                    return
+                assert approve is not None
+                if case in {"cancel_settle", "cancel_history"}:
+                    assert gate_owner is settlement
                 if settlement is not None:
                     assert not settlement.done()
-                cancel_target.cancel()
+                gate_owner.cancel()
                 release.set()
+                if case == "cancel_history":
+                    release_competing.set()
                 frames = await await_or_fail(approve, what=f"{case} approve response")
                 all_frames.extend(frames)
                 assert frames[-1]["result"]["decision"] == "approve"
+                if competing is not None:
+                    await await_or_fail(
+                        competing, what="competing approval publication"
+                    )
             elif case.startswith("fail_"):
                 if approve is not None:
                     frames = await await_or_fail(approve, what=f"{case} response")
@@ -2143,6 +2326,15 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 assert frames[-1]["result"]["decision"] == "approve"
 
             if cancel:
+                if case == "cancel_history":
+                    assert server.runtime.opened is not None
+                    history = [
+                        entry.data
+                        for entry in server.runtime.opened.store.replay()
+                        if entry.type == "approval_history"
+                    ]
+                    assert [row["event"] for row in history] == ["approval_end"]
+                    assert history[0]["request_id"] == "call-1"
                 published = [
                     frame
                     for frame in buffered()
@@ -2299,6 +2491,12 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert not server.control._approvals.state.records
     finally:
         release.set() if "release" in locals() else None
+        if "release_competing" in locals():
+            release_competing.set()
+        if "release_publish" in locals():
+            release_publish.set()
+        if "competing" in locals() and competing is not None and not competing.done():
+            await await_or_fail(competing, what="competing approval cleanup")
         await close_serve(
             server,
             writer,
