@@ -1233,9 +1233,19 @@ credential/account changes. This kind can include these fields:
 | `retry_after` | number, seconds | provider-requested rate-limit duration |
 | `provider` | string | provider name |
 | `attempt` | integer | provider attempt number |
-| `reason` | string | reason for the hold |
-| `until` | number, Unix timestamp in seconds | wall-clock time when the provider-requested hold ends, emitted as the numeric epoch value from `time.time()` |
+| `reason` | string | reason for the hold; `"subscription_limit"` for a subscription limit |
+| `limit` | string | `"rate"` for a provider Retry-After hold, `"subscription"` for a subscription limit |
+| `account` | string | `provider:name` of the limited account; only when `limit` is `"subscription"` |
+| `until` | number, Unix timestamp in seconds | wall-clock time when the provider-requested hold ends, emitted as the numeric epoch value from `time.time()`; for a subscription limit, the provider's reset time |
 | `text` | string | human-readable hold status |
+
+A subscription limit (Codex HTTP 429 with `error.type: "usage_limit_reached"`)
+uses the same kind with `limit: "subscription"`. The turn holds until the
+reset time instead of ending, and `text` reads `<account> subscription limit
+until <local reset>; switch account or log in to resume`. A re-login or a user
+account switch wakes the hold at once and probes again. The runtime never
+switches accounts by itself: an `account_limit` event with the recovery
+suggestion follows the `retry` event, and only the client or user acts on it.
 
 These fields are additive. Older clients can ignore them. Unknown provider
 keys remain allowed inside `data`.

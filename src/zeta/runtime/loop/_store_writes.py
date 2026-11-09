@@ -110,7 +110,7 @@ class StoreWriteMixin:
         receipts = self.store.take_persisted_appends()
         self._create_task(
             refresh_transcript_index(
-                registry.root,
+                registry,
                 self.root_project_id,
                 self.store.session_id,
                 self.store.session_dir,
