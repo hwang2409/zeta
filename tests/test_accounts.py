@@ -708,6 +708,15 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
     await asyncio.to_thread(credential.save, tokens())
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(account_store, "ACCOUNT_LOCK_TURN_WAIT_SECONDS", 0.05)
+    lock_waiting = threading.Event()
+    original_bounded_guard = account_store._bounded_guard
+
+    def observe_lock_wait(guard, timeout):
+        lock_waiting.set()
+        return original_bounded_guard(guard, timeout)
+
+    # test-contract: seam observes the worker-thread registry lock boundary.
+    monkeypatch.setattr(account_store, "_bounded_guard", observe_lock_wait)
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
     release = context.Event()
@@ -716,12 +725,52 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
         args=(str(tmp_path), ready, release),
     )
     holder.start()
+    operation: asyncio.Task[str] | None = None
+    progress_future: asyncio.Future[None] | None = None
     try:
         assert ready.wait(timeout=5)
         async with httpx.AsyncClient() as client:
+            operation = asyncio.create_task(credential.access_token(client))
+            assert await await_or_fail(
+                asyncio.to_thread(lock_waiting.wait, 10),
+                what="registry lock-wait signal",
+            )
+            loop = asyncio.get_running_loop()
+            progress_future = loop.create_future()
+
+            def mark_progress() -> None:
+                if (
+                    operation is not None
+                    and not operation.done()
+                    and not progress_future.done()
+                ):
+                    progress_future.set_result(None)
+
+            loop.call_soon(mark_progress)
+            done, _ = await await_or_fail(
+                asyncio.wait(
+                    (progress_future, operation),
+                    timeout=10,
+                    return_when=asyncio.FIRST_COMPLETED,
+                ),
+                what="event-loop progress during registry lock wait",
+            )
+            assert progress_future in done, (
+                "registry lock wait completed without event-loop progress"
+            )
+            assert not operation.done()
             with pytest.raises(AccountCredentialLockTimeoutError):
-                await asyncio.wait_for(credential.access_token(client), timeout=1)
+                await await_or_fail(operation, what="access token")
     finally:
+        if progress_future is not None and not progress_future.done():
+            progress_future.cancel()
+        if operation is not None and not operation.done():
+            operation.cancel()
+        if operation is not None:
+            await await_or_fail(
+                asyncio.gather(operation, return_exceptions=True),
+                what="access token operation",
+            )
         release.set()
         holder.join(timeout=5)
         if holder.is_alive():
@@ -775,7 +824,9 @@ async def test_registry_lock_timeout_reaches_tui_turn_error_card(
     holder.start()
     try:
         assert ready.wait(timeout=5)
-        await asyncio.wait_for(app._consume_turn("hello"), timeout=10)
+        await await_or_fail(
+            app._consume_turn("hello"), what="TUI account-lock timeout turn"
+        )
         output = StringIO()
         console = Console(file=output, force_terminal=False, width=100)
         for item in rendered:
