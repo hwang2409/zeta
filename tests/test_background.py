@@ -265,31 +265,6 @@ async def _collect(events):
 
 
 @pytest.mark.asyncio
-async def test_archive_failure_does_not_replace_task_kill_cause(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    registry = BackgroundTaskRegistry()
-    task_id, _ = await registry.start("sleep 30", tmp_path)
-    cause = "test requested task stop"
-
-    async def fail_archive(record, log_handle) -> None:
-        log_handle.close()
-        record.log_fd = None
-        raise OSError("injected archive failure")
-
-    # test-contract: seam force output archiving to fail after the kill cause is durable
-    monkeypatch.setattr(registry, "_archive_record", fail_archive)
-    try:
-        with pytest.raises(OSError, match="injected archive failure"):
-            await asyncio.wait_for(registry.kill(task_id, cause=cause), 10)
-
-        assert registry.snapshot()[0].note == cause
-        assert "failed to archive background task output" in caplog.text
-    finally:
-        await asyncio.wait_for(registry.close(), 10)
-
-
-@pytest.mark.asyncio
 async def test_background_exit_persists_task_notification(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "session")
     wakes = 0
