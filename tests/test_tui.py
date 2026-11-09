@@ -1887,6 +1887,23 @@ def test_every_stream_event_has_one_tui_owner() -> None:
     assert sum(len(owner) for owner in owners) == len(set(StreamEventType))
 
 
+def test_rate_limit_hold_renders_as_waiting_text() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.RETRY,
+            data={
+                "kind": "provider_rate_limit_hold",
+                "text": "claude rate-limited until 09:30 (provider asks 6d 1h 45m); checking again in 5m",
+            },
+        )
+    )
+    assert rendered is not None
+    assert rendered.plain == (
+        "claude rate-limited until 09:30 (provider asks 6d 1h 45m); checking again in 5m"
+    )
+    assert rendered.style == theme.DIM
+
+
 def test_scrollback_stream_events_render() -> None:
     call = ToolCall("contract-1", "future_tool", {"query": "sample"})
     fixtures = {
@@ -2827,6 +2844,135 @@ def test_transcript_search_stays_anchored_at_the_tail_until_closed() -> None:
 
     transcript.end_search()
     assert not transcript.follow_tail
+
+
+def test_transcript_membership_indexes_match_public_mutations() -> None:
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: transcript.append(renderable) if renderable else None,
+    )
+
+    def assert_indexes_match() -> None:
+        assert transcript._unit_set == {
+            unit for unit in transcript._units if unit is not None
+        }
+        assert transcript._user_unit_set == set(transcript._user_units)
+        assert set(transcript._user_units) <= transcript._unit_set
+
+    first = presenter.print_unit(Text("first"))
+    assert first is not None
+    assert_indexes_match()
+    presenter.append_blank()
+    assert_indexes_match()
+    transcript.mark_user(first)
+    transcript.mark_user(first)
+    transcript.mark_user(None)
+    assert_indexes_match()
+    transcript.replace(first, Text("replaced"))
+    assert_indexes_match()
+
+    missing = first
+    transcript.remove(first)
+    assert_indexes_match()
+    transcript.mark_user(missing)
+    transcript.replace(missing, Text("replacement for missing"))
+    assert_indexes_match()
+
+    leading_blank = transcript._units[0]
+    assert leading_blank is not None and leading_blank.value is None
+    replacement = transcript._units[-1]
+    assert replacement is not None
+    transcript.remove(replacement, leading_blank=True)
+    assert_indexes_match()
+
+    duplicate = transcript.append(Text("duplicate"))
+    transcript._units.append(duplicate)
+    assert_indexes_match()
+    transcript.remove(duplicate)
+    assert duplicate in transcript._unit_set
+    assert_indexes_match()
+    transcript.remove(duplicate)
+    assert_indexes_match()
+
+    transcript.append(Text("prose"))
+    active = ToolCall("active-index", "read", {})
+    background = ToolCall("background-index", "agent", {})
+    transcript.start_tool(active.id, active, Text("active"))
+    active_unit = transcript._units[-1]
+    assert active_unit is not None
+    transcript.mark_user(active_unit)
+    transcript.start_tool(background.id, background, Text("background"))
+    transcript.mark_tool_background(background.id)
+    assert_indexes_match()
+    transcript.discard_tools()
+    assert_indexes_match()
+    assert Text.from_ansi(transcript.render(80)).plain == "prose\nbackground"
+
+    surviving_user = transcript.append(Text("surviving user"))
+    transcript.mark_user(surviving_user)
+    assert_indexes_match()
+    transcript.clear()
+    assert_indexes_match()
+
+
+@pytest.mark.asyncio
+async def test_transcript_membership_indexes_match_replayed_app(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("persisted user")]),
+            MessageOrigin.USER,
+        )
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("persisted assistant")])
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    def assert_indexes_match() -> None:
+        transcript = app._transcript
+        assert transcript._unit_set == {
+            unit for unit in transcript._units if unit is not None
+        }
+        assert transcript._user_unit_set == set(transcript._user_units)
+        assert set(transcript._user_units) <= transcript._unit_set
+
+    try:
+        async with owned_app(app):
+            app._rebuild_transcript()
+            assert_indexes_match()
+            app._presenter.print_unit(Text("reloaded"))
+            assert_indexes_match()
+            app._rebuild_transcript()
+            assert_indexes_match()
+    finally:
+        await app.loop.close()
+        store.close()
+
+
+def test_transcript_mark_user_does_not_scan_units() -> None:
+    class MembershipProbe(list[object]):
+        contains_calls = 0
+
+        def __contains__(self, value: object) -> bool:
+            self.contains_calls += 1
+            return super().__contains__(value)
+
+    transcript = TranscriptWidget()
+    user = transcript.append(Text("user"))
+    transcript.append(Text("other"))
+    transcript._units = MembershipProbe(transcript._units)
+
+    transcript.mark_user(user)
+
+    assert transcript._units.contains_calls == 0
+    assert transcript._user_units == [user]
 
 
 def test_transcript_user_jumps_skip_non_user_units() -> None:
@@ -6789,7 +6935,7 @@ async def test_status_card_wraps_complete_project_context_health(
     )
 
     try:
-        app.slash_status_command("")
+        await asyncio.wait_for(app._slash_commands.dispatch_async(app, "/status"), 10)
         screen = render_full_screen(session, width, height=60)
         with set_app(session.app):
             screen.draw_all_floats()
@@ -6845,10 +6991,8 @@ async def test_status_card_wraps_long_path_at_separator(
         pending_approvals=(),
         context_files=(path,),
     )
-    monkeypatch.setattr(app, "slash_status", lambda: status)
-
     try:
-        app.slash_status_command("")
+        app.open_status_card(status)
         screen = render_full_screen(session, width, height=60)
         with set_app(session.app):
             screen.draw_all_floats()
