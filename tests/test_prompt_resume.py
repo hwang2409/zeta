@@ -8,22 +8,35 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.core.project_context import ProjectContext
+from zeta.core.project_context import ProjectContext, load_project_context
 from zeta.core.session import SessionManager
 from zeta.core.session_execution import SessionOwnedError
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
+from zeta.project_registry import Project, ProjectRegistry
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.runtime.prompt_resume import ResumedPrompt, resume_prompt
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
+from zeta.storage_format import advance
 from zeta.tools import ToolRegistry
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
+
+
+class _UnavailableRegistry(ProjectRegistryState):
+    def __bool__(self) -> bool:
+        return False
 
 
 def _manager_with_prompt(
@@ -91,6 +104,7 @@ def _resume(
             repo_root=cwd,
             inbox_enabled=False,
             context_loader=context_loader,
+            registry=manager.project_registry_state,
         )
     except BaseException:
         opened.store.close()
@@ -314,6 +328,7 @@ async def test_concurrent_resume_child_uses_one_fresh_profile_generation(
             home=home,
             repo_root=tmp_path,
             inbox_enabled=False,
+            registry=manager.project_registry_state,
         )
         assert first.agent_catalog.find("specialist").prompt_suffix == "v1 body"
 
@@ -331,6 +346,7 @@ async def test_concurrent_resume_child_uses_one_fresh_profile_generation(
             home=home,
             repo_root=tmp_path,
             inbox_enabled=False,
+            registry=manager.project_registry_state,
         )
         profile.unlink()
 
@@ -467,45 +483,6 @@ def test_staggered_recipe_less_empty_resumes_adopt_live_runtime(
     assert manager.read_metadata(session_id).prompt_recipe == "default"
 
 
-def test_staggered_memory_span_resumes_adopt_live_runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    prefix = "prefix "
-    memory = "old memory"
-    prompt = f"{prefix}{memory} suffix"
-    offset = len(prefix)
-    manager, session_id = _manager_with_prompt(
-        tmp_path / "home",
-        tmp_path,
-        system_prompt=prompt,
-        prompt_recipe=None,
-        project_memory_offset=offset,
-        project_memory_length=len(memory),
-        project_memory_digest=hashlib.sha256(memory.encode()).hexdigest(),
-    )
-    calls: list[int] = []
-
-    def refresh(stored_prompt: str, **kwargs: object) -> str:
-        del stored_prompt, kwargs
-        calls.append(len(calls) + 1)
-        return f"{prefix}new memory {calls[-1]} suffix"
-
-    monkeypatch.setattr("zeta.runtime.prompt_resume.refresh_project_memory", refresh)
-    results = _staggered_resumes(
-        manager,
-        session_id,
-        tmp_path / "home",
-        tmp_path,
-        context_loader=lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError(f"unexpected default rebuild: {kwargs}")
-        ),
-        monkeypatch=monkeypatch,
-    )
-
-    _assert_one_persisted_prompt(manager, session_id, results)
-    assert calls == [1]
-
-
 def test_custom_prompt_without_owned_skill_span_stays_unchanged_and_notices_restart(
     tmp_path: Path,
 ) -> None:
@@ -626,7 +603,7 @@ home = Path({str(home)!r})
 cwd = Path({str(cwd)!r})
 manager = SessionManager(home)
 opened = manager.open({session_id!r})
-resume_prompt(opened.metadata, manager=manager, store=opened.store, home=home, repo_root=cwd, inbox_enabled=False, context_loader=lambda **kwargs: ProjectContext("child runtime", (), prompt_recipe="default"))
+resume_prompt(opened.metadata, manager=manager, store=opened.store, home=home, repo_root=cwd, inbox_enabled=False, context_loader=lambda **kwargs: ProjectContext("child runtime", (), prompt_recipe="default"), registry=manager.project_registry_state)
 {close}
 Path({str(ready)!r}).write_text("ready")
 owner_pid = {os.getpid()}
@@ -755,3 +732,309 @@ def test_transfer_excludes_runtime_lease_and_destination_rebuilds(
     finally:
         for store in source_stores:
             store.close()
+
+
+def _project_session(
+    tmp_path: Path, recipe: str, memory: str
+) -> tuple[Path, Path, SessionManager, ProjectRegistry, Project, str]:
+    """Create a project-bound session whose prompt owns a ``memory`` span."""
+
+    home = tmp_path / "home"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    advance(home, expected_epoch=0)
+    manager = SessionManager(home)
+    registry = manager.project_registry
+    assert registry is not None
+    project = registry.create_project("demo", "scope", repository)
+    registry.initialize_memory(project.project_id)
+    initial = registry.memory_snapshot(project.project_id)
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=initial.digest,
+        updates={"brief.md": memory},
+    )
+    old_projection = registry.project_context_projection(project.project_id)
+    old_context = load_project_context(
+        cwd=repository,
+        repo_root=repository,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
+        registry=registry,
+        project_projection=old_projection,
+    )
+    prompt = old_context.system_prompt
+    offset = old_context.memory_offset
+    length = old_context.memory_length
+    digest = old_context.memory_digest
+    assert offset is not None and length is not None and digest is not None
+    components = {
+        "project_memory": {
+            "offset": offset,
+            "length": length,
+            "digest": digest,
+        }
+    }
+    if recipe == "custom":
+        prefix = "unknown-prefix\n"
+        suffix = "\nunknown-suffix"
+        prompt = prefix + prompt + suffix
+        offset += len(prefix)
+        components["project_memory"]["offset"] = offset
+    opened = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=repository,
+        project_id=project.project_id,
+        system_prompt=prompt,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        project_memory_offset=offset,
+        project_memory_length=length,
+        project_memory_digest=digest,
+        prompt_recipe=recipe,
+        prompt_components=components,
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    return home, repository, manager, registry, project, session_id
+
+
+@pytest.mark.parametrize("recipe", ["custom", "default"])
+def test_resume_uses_project_snapshot_captured_before_execution(
+    tmp_path: Path, recipe: str
+) -> None:
+    home, repository, manager, registry, project, session_id = _project_session(
+        tmp_path, recipe, "old memory"
+    )
+    before_update = registry.memory_snapshot(project.project_id)
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=before_update.digest,
+        updates={"brief.md": "current memory"},
+    )
+    projection = registry.project_context_projection(project.project_id)
+    expected = load_project_context(
+        cwd=repository,
+        repo_root=repository,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
+        registry=registry,
+        project_projection=projection,
+    )
+
+    resume_registry = registry if recipe == "custom" else _UnavailableRegistry(None)
+    resumed = manager.open(session_id)
+    result: ResumedPrompt | None = None
+    failure: BaseException | None = None
+    try:
+        result = resume_prompt(
+            resumed.metadata,
+            manager=manager,
+            store=resumed.store,
+            home=home,
+            repo_root=repository,
+            inbox_enabled=True,
+            session_project=project,
+            cwd_project=project,
+            registry=resume_registry,
+            project_projection=projection,
+        )
+    except BaseException as exc:  # noqa: BLE001 - asserted below
+        failure = exc
+    finally:
+        resumed.store.close()
+
+    assert failure is None, f"{recipe} resume did not succeed: {failure}"
+    assert result is not None
+    assert "current memory" in result.context.system_prompt
+    assert "old memory" not in result.context.system_prompt
+    if recipe == "custom":
+        assert result.context.system_prompt.startswith("unknown-prefix\n")
+        assert result.context.system_prompt.endswith("\nunknown-suffix")
+    else:
+        assert result.context.system_prompt == expected.system_prompt
+
+
+def _set_memory(registry: ProjectRegistry, project_id: str, text: str) -> None:
+    snapshot = registry.memory_snapshot(project_id)
+    registry.compare_and_swap_memory(
+        project_id, expected_digest=snapshot.digest, updates={"brief.md": text}
+    )
+
+
+def _hold_memory(registry: ProjectRegistry, project_id: str):
+    """Hold the real project memory authority (the root lock before p06)."""
+
+    if not hasattr(registry, "_project_lock"):
+        return registry._locked(write=True)
+    return registry._project_lock(project_id, "memory", exclusive=True)
+
+
+def _start_public_resume(
+    manager: SessionManager,
+    registry: ProjectRegistry,
+    project: Project,
+    session_id: str,
+    *,
+    home: Path,
+    repo_root: Path,
+) -> tuple[threading.Event, threading.Event, list[object], threading.Thread]:
+    """Run the serve/TUI writable resume sequence: open, capture, then resume."""
+
+    captured = threading.Event()
+    go = threading.Event()
+    outcome: list[object] = []
+
+    def public_resume() -> None:
+        try:
+            opened = manager.open(session_id)
+            try:
+                projection = registry.project_context_projection(project.project_id)
+                captured.set()
+                assert go.wait(10), "test did not release the resume"
+                outcome.append(
+                    resume_prompt(
+                        opened.metadata,
+                        manager=manager,
+                        store=opened.store,
+                        home=home,
+                        repo_root=repo_root,
+                        inbox_enabled=True,
+                        session_project=projection.session_project,
+                        cwd_project=projection.session_project,
+                        registry=registry,
+                        project_projection=projection,
+                    ).context.system_prompt
+                )
+            finally:
+                opened.store.close()
+        except BaseException as exc:  # noqa: BLE001 - asserted by the test
+            outcome.append(exc)
+
+    resume = threading.Thread(target=public_resume)
+    resume.start()
+    return captured, go, outcome, resume
+
+
+def _assert_resumed_with(
+    manager: SessionManager, session_id: str, outcome: list[object]
+) -> None:
+    assert len(outcome) == 1 and isinstance(outcome[0], str), outcome
+    persisted = manager.read_metadata(session_id).system_prompt
+    for prompt in (outcome[0], persisted):
+        assert "current memory" in prompt and "old memory" not in prompt, (
+            "resume adopted a stale composition after its memory input changed"
+        )
+
+
+def test_p06_7_writable_resume_reads_memory_before_shape_commit(
+    tmp_path: Path,
+) -> None:
+    home, repository, manager, registry, project, session_id = _project_session(
+        tmp_path, "default", "original memory"
+    )
+    _set_memory(registry, project.project_id, "old memory")
+    captured, go, outcome, resume = _start_public_resume(
+        manager, registry, project, session_id, home=home, repo_root=repository
+    )
+    try:
+        assert captured.wait(10), "resume did not capture project context"
+        _set_memory(registry, project.project_id, "current memory")
+        with _hold_memory(registry, project.project_id):
+            go.set()
+            persisted = manager.read_metadata(session_id, lock_timeout=10)
+            assert not outcome and "old memory" not in persisted.system_prompt, (
+                "resume persisted a stale composition before re-reading memory"
+            )
+    finally:
+        go.set()
+        resume.join(10)
+    assert not resume.is_alive()
+    _assert_resumed_with(manager, session_id, outcome)
+
+
+_MEMORY_HOLDER = """
+import sys
+import time
+from pathlib import Path
+from zeta.core.session import SessionManager
+from zeta.project_registry import ProjectRegistry
+
+home, project_id, session_id, signals = sys.argv[1:5]
+signals = Path(signals)
+manager = SessionManager(Path(home))
+registry = ProjectRegistry(Path(home) / "projects")
+held = (
+    registry._project_lock(project_id, "memory", exclusive=True)
+    if hasattr(registry, "_project_lock")
+    else registry._locked(write=True)
+)
+
+
+def wait(name):
+    deadline = time.monotonic() + 30
+    while not (signals / name).exists():
+        assert time.monotonic() < deadline, name
+        time.sleep(0.01)
+
+
+with held:
+    (signals / "held").write_text("held")
+    wait("metadata")
+    try:
+        manager.read_metadata(session_id, lock_timeout=10)
+    except Exception as exc:
+        (signals / "metadata-done").write_text(f"refused: {exc}")
+    else:
+        (signals / "metadata-done").write_text("read")
+    wait("release")
+"""
+
+
+def test_p06_8_prompt_resume_process_progress(tmp_path: Path) -> None:
+    home, repository, manager, registry, project, session_id = _project_session(
+        tmp_path, "default", "original memory"
+    )
+    _set_memory(registry, project.project_id, "old memory")
+    signals = tmp_path / "signals"
+    signals.mkdir()
+    captured, go, outcome, resume = _start_public_resume(
+        manager, registry, project, session_id, home=home, repo_root=repository
+    )
+    holder: subprocess.Popen[bytes] | None = None
+    try:
+        assert captured.wait(10), "resume did not capture project context"
+        _set_memory(registry, project.project_id, "current memory")
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _MEMORY_HOLDER,
+                str(home),
+                project.project_id,
+                session_id,
+                str(signals),
+            ]
+        )
+        _wait_for(signals / "held")
+        go.set()
+        (signals / "metadata").write_text("go")
+        _wait_for(signals / "metadata-done")
+        assert (signals / "metadata-done").read_text() == "read", (
+            "public metadata operation did not finish while memory was held"
+        )
+        assert not outcome, "resume adopted a composition without the memory authority"
+    finally:
+        go.set()
+        (signals / "release").write_text("release")
+        resume.join(10)
+        if holder is not None:
+            holder.wait(10)
+    assert not resume.is_alive()
+    assert holder.returncode == 0
+    _assert_resumed_with(manager, session_id, outcome)

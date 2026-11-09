@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import io
 import json
 from pathlib import Path
@@ -10,7 +11,6 @@ from unittest.mock import patch
 import pytest
 
 from zeta.cli import project as project_cli
-from zeta.core.project_context import refresh_project_memory
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_store import MemoryKind, MemorySchema
 from zeta.memory.user_authorization import MemoryMutationAuthorization
@@ -70,16 +70,10 @@ def test_all_format_one_registry_paths_fail_closed_without_writes(tmp_path: Path
     )
 
     def refresh_mirror() -> None:
-        with registry._locked(write=True) as root_fd:
-            directory_fd = registry._project_dir(root_fd, project_id)
-            try:
-                registry._refresh_memory_mirror(
-                    directory_fd, {}, mirror_path=project_root / "memory"
-                )
-            finally:
-                import os
-
-                os.close(directory_fd)
+        with registry._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            registry._refresh_memory_mirror(
+                project_fd, {}, mirror_path=project_root / "memory"
+            )
 
     calls = {
         "snapshot": lambda: registry.memory_snapshot(project_id),
@@ -200,19 +194,6 @@ def test_format_two_views_are_available_after_per_project_activation(
     assert synced.conflicts == ()
     before = _snapshot(project_root)
 
-    prompt = "prefix<zeta-project-memory></zeta-project-memory>suffix"
-    block = "<zeta-project-memory></zeta-project-memory>"
-    refreshed = refresh_project_memory(
-        prompt,
-        home=home,
-        project_id=project_id,
-        memory_offset=len("prefix"),
-        memory_length=len(block),
-        memory_digest=__import__("hashlib").sha256(block.encode()).hexdigest(),
-    )
-    assert refreshed.startswith("prefix<zeta-project-memory>")
-    assert refreshed.endswith("</zeta-project-memory>suffix")
-
     assert _snapshot(project_root) == before
 
 
@@ -220,7 +201,9 @@ def test_format_two_views_are_available_after_per_project_activation(
 async def test_private_format_two_fixture_reaches_dormant_updater(
     tmp_path: Path,
 ) -> None:
-    home, registry, project_id, _ = _format_two_project(tmp_path)
+    home, registry, project_id, _ = await asyncio.to_thread(
+        _format_two_project, tmp_path
+    )
     session_dir = home / "sessions" / SESSION_ID
     session_dir.mkdir(parents=True)
     (session_dir / "conversation.jsonl").write_text(

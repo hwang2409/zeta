@@ -12067,12 +12067,12 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
         child_instance_id="sess:worker",
     )
 
-    assert "worker" in commands.slash_runs("")
+    assert await commands.slash_runs("") == "no live runs"
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
 
-    listing = commands.slash_runs("")
+    listing = await commands.slash_runs("")
     assert "long horizon run" in listing
     assert "[run]" in listing
     assert "explore" not in listing
@@ -14936,6 +14936,7 @@ def test_child_startup_runs_one_git_discovery_in_repo_subdirectory(
 ) -> None:
     from zeta.core import project_context
     from zeta.project_registry import ProjectRegistry
+    from zeta.runtime.project_registry_state import ProjectRegistryState
 
     home = tmp_path / "zeta-home"
     root = tmp_path / "repo"
@@ -14956,7 +14957,10 @@ def test_child_startup_runs_one_git_discovery_in_repo_subdirectory(
         store=SimpleNamespace(cwd=root),
         context_assembler=SimpleNamespace(system_prompt="parent"),
         active_home=str(home),
-        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        tool_registry=SimpleNamespace(
+            skill_catalog=SkillCatalog.empty(),
+            project_registry_state=ProjectRegistryState(registry),
+        ),
         root_project_id=project.project_id,
         project_registry=registry,
     )
@@ -14979,9 +14983,13 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
     child_cwd = tmp_path / "project-b"
     parent_cwd.mkdir()
     child_cwd.mkdir()
-    registry = ProjectRegistry(home / "projects")
-    parent_project = registry.create_project("project-a", "test", parent_cwd)
-    child_project = registry.create_project("project-b", "test", child_cwd)
+    registry = await asyncio.to_thread(ProjectRegistry, home / "projects")
+    parent_project = await asyncio.to_thread(
+        registry.create_project, "project-a", "test", parent_cwd
+    )
+    child_project = await asyncio.to_thread(
+        registry.create_project, "project-b", "test", child_cwd
+    )
     (home / "projects" / parent_project.project_id / "AGENTS.md").write_text(
         "PARENT-PRIVATE-MARKER", encoding="utf-8"
     )
@@ -15003,16 +15011,16 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
             )
         )
         record["repo_agents"] = "include"
-        (home / "projects" / project.project_id / "project.json").write_text(
-            json.dumps(record) + "\n", encoding="utf-8"
-        )
+        record_path = home / "projects" / project.project_id / "project.json"
+        record_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        record_path.chmod(0o600)
     record = json.loads(
         (home / "projects" / ignored_id / "project.json").read_text(encoding="utf-8")
     )
     record["repo_agents"] = "ignore"
-    (home / "projects" / ignored_id / "project.json").write_text(
-        json.dumps(record) + "\n", encoding="utf-8"
-    )
+    ignored_record = home / "projects" / ignored_id / "project.json"
+    ignored_record.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    ignored_record.chmod(0o600)
     store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     tools = ToolRegistry(
         parent_cwd,
@@ -15082,14 +15090,19 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
     assert "PARENT-PRIVATE-MARKER" not in system_text
     from zeta.core.project_context import load_project_context
 
-    context = load_project_context(
+    cwd_project = await asyncio.to_thread(
+        registry.show_project, child_project.project_id
+    )
+    context = await asyncio.to_thread(
+        load_project_context,
         cwd=child_cwd,
         repo_root=child_cwd,
         zeta_home=home,
         catalog=SkillCatalog.empty(),
         session_project=parent_project,
-        cwd_project=registry.show_project(child_project.project_id),
+        cwd_project=cwd_project,
         inbox_enabled=False,
+        registry=registry,
     )
     assert any("repository AGENTS.md" in notice for notice in context.notices) is (
         ignored_project == "project-b"
@@ -15108,10 +15121,13 @@ async def test_same_cwd_child_starts_with_owned_project_memory(
     home = tmp_path / "zeta-home"
     workspace = tmp_path / "project"
     workspace.mkdir()
-    registry = ProjectRegistry(home / "projects")
-    project = registry.find_or_create_for_directory(workspace)
-    registry._replace_entry_kind(project.project_id, "state", "PROJECT MEMORY")
-    context = load_project_context(
+    registry = await asyncio.to_thread(ProjectRegistry, home / "projects")
+    project = await asyncio.to_thread(registry.find_or_create_for_directory, workspace)
+    await asyncio.to_thread(
+        registry._replace_entry_kind, project.project_id, "state", "PROJECT MEMORY"
+    )
+    context = await asyncio.to_thread(
+        load_project_context,
         cwd=workspace,
         repo_root=workspace,
         zeta_home=home,
@@ -15119,6 +15135,7 @@ async def test_same_cwd_child_starts_with_owned_project_memory(
         session_project=project,
         cwd_project=project,
         inbox_enabled=False,
+        registry=registry,
     )
     assert "project_memory" in context.prompt_components
     store = ConversationStore(tmp_path / "sessions", cwd=workspace)
@@ -15180,17 +15197,32 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
     tmp_path: Path,
 ) -> None:
     from zeta.project_registry import ProjectRegistry
+    from zeta.runtime.project_registry_state import ProjectRegistryState
 
     parent_cwd = tmp_path / "project-a"
     child_cwd = tmp_path / "project-b"
     parent_cwd.mkdir()
     child_cwd.mkdir()
     home = tmp_path / "zeta-home"
-    registry = ProjectRegistry(home / "projects")
-    project_a = registry.find_or_create_for_directory(parent_cwd)
-    project_b = registry.find_or_create_for_directory(child_cwd)
-    registry._replace_entry_kind(project_a.project_id, "state", "PROJECT A MEMORY")
-    registry._replace_entry_kind(project_b.project_id, "state", "PROJECT B MEMORY")
+    registry = await asyncio.to_thread(ProjectRegistry, home / "projects")
+    project_a = await asyncio.to_thread(
+        registry.find_or_create_for_directory, parent_cwd
+    )
+    project_b = await asyncio.to_thread(
+        registry.find_or_create_for_directory, child_cwd
+    )
+    await asyncio.to_thread(
+        registry._replace_entry_kind,
+        project_a.project_id,
+        "state",
+        "PROJECT A MEMORY",
+    )
+    await asyncio.to_thread(
+        registry._replace_entry_kind,
+        project_b.project_id,
+        "state",
+        "PROJECT B MEMORY",
+    )
     (child_cwd / "AGENTS.md").write_text("CHILD CWD INSTRUCTIONS")
 
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
@@ -15200,6 +15232,7 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
         project_registry=registry,
         skill_catalog=SkillCatalog.empty(),
     )
+    parent_tools.project_registry_state = ProjectRegistryState(registry)
     child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
     child_tools = parent_tools.clone_for_session(child_store, cwd=child_cwd)
     loop = SimpleNamespace(
@@ -15211,7 +15244,10 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
         project_registry=registry,
     )
 
-    prompt = _child_base_system_prompt(loop, str(child_cwd), child_tools).system_prompt
+    child_context = await asyncio.to_thread(
+        _child_base_system_prompt, loop, str(child_cwd), child_tools
+    )
+    prompt = child_context.system_prompt
 
     assert "PROJECT A MEMORY" in prompt
     assert "PROJECT B MEMORY" not in prompt

@@ -132,6 +132,11 @@ async def consume_child(
             **result_options,
         )
 
+    def clean_no_output(text: str) -> dict[str, object]:
+        if child_loop.explicit_finish:
+            return terminal_result(state="idle", text="", status="running")
+        return terminal_result(state="failed", text=text)
+
     def lifecycle_depth(call: ToolCall | None) -> int:
         if call is not None and call.name.casefold() == "agent":
             return child_loop.agent_depth + 1
@@ -330,16 +335,15 @@ async def consume_child(
             return recoverable_error_result(terminal_result, failure_message, *failure_error)
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
-        text = "agent error: child ended without a final response"
-        return terminal_result(state="failed", text=text)
+        return clean_no_output("agent error: child ended without a final response")
     from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE, has_visible_output
     final_text = assistant_text(final_message)
     if not has_visible_output(final_message):  # empty or only eviction receipts
         if final_message.metadata.get("stop_reason") == "max_tokens":
             return terminal_result(state="completed", text=OUTPUT_LIMIT_ERROR_MESSAGE)
-        if child_loop.explicit_finish:  # wrote nothing: idle, not failed
-            return terminal_result(state="idle", text="", status="running")
-        return terminal_result(state="failed", text="agent error: child returned an empty final assistant message")
+        return clean_no_output(
+            "agent error: child returned an empty final assistant message"
+        )
     if record_report is not None:
         record_report(final_text)
     if child_loop.explicit_finish:

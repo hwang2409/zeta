@@ -13,8 +13,6 @@ import shutil
 import stat
 import tempfile
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,12 +28,13 @@ from ..memory.entry_sync import (
     select_resolution_choices,
 )
 from ..memory.entry_views import GENERATED_MIRROR_HEADER
-from ..project_errors import UnsupportedMemoryFormatError
+from ..project_errors import ProjectRegistryBusyError, UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from ..runtime.project_registry_state import project_registry
 from ..storage_format import reject_unknown_keys
 from .errors import RemoteSyncError
+from .pinned_project import copy_pinned_project_snapshot, pin_project_snapshot
 from .project_publish import (
     MAX_SYNC_STATE_SIZE,
     ProjectPublicationError,
@@ -390,16 +389,29 @@ def fetch_local_project(
     """Fetch one local-adapter snapshot under a non-blocking remote lease."""
 
     project = home / "projects" / project_id
-    with _registry_lock(home / "projects", blocking=False, peer=peer):
-        if not project.is_dir():
+    registry = project_registry(home / "projects")
+
+    try:
+        with registry._project_lock(project_id, "memory", exclusive=False):
+            if not project.is_dir():
+                return _MISSING
+            for name in MEMORY_FILES:
+                path = project / "memory" / name
+                if (
+                    path.is_file()
+                    and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE
+                ):
+                    raise RemoteSyncError(f"memory file {name} is too large")
+            pinned = pin_project_snapshot(project)
+    except ProjectRegistryBusyError as exc:
+        raise RemoteSyncError(f"project registry busy on {peer}; retry") from exc
+    except ProjectRegistryError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
             return _MISSING
-        for name in MEMORY_FILES:
-            path = project / "memory" / name
-            if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
-                raise RemoteSyncError(f"memory file {name} is too large")
-        digest = project_digest(project)
-        copy_project_snapshot(project, destination)
-        return digest
+        raise RemoteSyncError(f"invalid project on {peer}: {exc}") from exc
+
+    copy_pinned_project_snapshot(pinned, destination)
+    return project_digest(destination)
 
 
 def publish_local_project(
@@ -486,7 +498,7 @@ def _publish_memory_snapshot(
     changed_entry_ids: tuple[str, ...] | None = None,
     provenance: dict[str, str],
 ) -> None:
-    """Publish memory, conflicts, and sync state under one registry lock."""
+    """Publish memory, conflicts, and sync state under one memory lock."""
 
     project_id = project.name
     try:
@@ -496,15 +508,17 @@ def _publish_memory_snapshot(
     merged = _materialize_memory_export(snapshot, project_id)
     registry = project_registry(project.parent)
     try:
-        with registry._locked(write=True) as root_fd:
+        with registry._project_lock(
+            project_id, "memory", exclusive=True
+        ) as project_fd:
             if not project.is_dir():
                 raise RemoteSyncError(f"project {project_id} was not found")
-            if registry._memory_format_locked(root_fd, project_id) == 2:
+            if registry._memory_format_locked(project_fd, project_id) == 2:
                 current: MemorySyncExport = registry._export_entry_memory_locked(
-                    root_fd, project_id
+                    project_fd, project_id
                 )
             else:
-                current = registry._export_memory_locked(root_fd, project_id)
+                current = registry._export_memory_locked(project_fd, project_id)
             if (
                 type(current) is not type(expected_export)
                 or current.digest != expected_export.digest
@@ -530,7 +544,7 @@ def _publish_memory_snapshot(
                     )
             if isinstance(merged, EntryMemoryExport):
                 registry._import_entry_memory_locked(
-                    root_fd,
+                    project_fd,
                     project_id,
                     merged,
                     expected_digest=current.digest,
@@ -539,7 +553,7 @@ def _publish_memory_snapshot(
                 )
             else:
                 registry._import_memory_locked(
-                    root_fd,
+                    project_fd,
                     project_id,
                     merged,
                     expected_digest=current.digest,
@@ -1084,28 +1098,6 @@ def _update_digest_from_file(digest: _Digest, path: Path) -> None:
     with path.open("rb") as stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
-
-
-@contextmanager
-def _registry_lock(
-    projects: Path, *, blocking: bool = True, peer: str | None = None
-) -> Iterator[None]:
-    projects.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock = projects / ".lock"
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise RemoteSyncError("project registry lock is unsafe")
-        os.fchmod(fd, 0o600)
-        operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
-        try:
-            fcntl.flock(fd, operation)
-        except BlockingIOError as exc:
-            raise RemoteSyncError(f"project registry busy on {peer}; retry") from exc
-        yield
-    finally:
-        os.close(fd)
 
 
 def _fsync_directory(path: Path) -> None:

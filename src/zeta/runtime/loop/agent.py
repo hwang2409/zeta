@@ -357,7 +357,6 @@ class AgentLoop(
             self.backend.set_token_budget(token_budget)
     def admit_abort(self) -> None:
         self._abort_admitted = True
-
     def abort(
         self,
         *,
@@ -370,7 +369,6 @@ class AgentLoop(
             self._background_owner.cancel_all()
             if steering_drop_reason is not None:
                 self.store.drop_client_steering(steering_drop_reason)
-
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
         The running ``_run_turn`` drains this queue before the next provider
@@ -378,11 +376,9 @@ class AgentLoop(
         tool_result. Callers must pass a durable USER-role message.
         """
         self.store.queue_client_steering(message)
-
     @property
     def has_pending_steering(self) -> bool:
         return self.store.has_pending_client_steering
-
     def clear_pending_steering(
         self,
         reason: Literal["clear", "turn_end"] = "clear",
@@ -1101,9 +1097,12 @@ class AgentLoop(
                 if isinstance(block, ToolUseContent)
             ]
             _validate_unique_tool_call_ids(calls)
+            assistant_message, calls, preparation_errors = (
+                await self.tool_registry.prepare_tool_calls(assistant_message)
+            )
             approval_requests: list[ApprovalAuditRequest] = []
             for tool_call in calls:
-                if not self.plan_mode_allows(tool_call):
+                if tool_call.id in preparation_errors or not self.plan_mode_allows(tool_call):
                     continue
                 request = self.tool_registry.prepare_approval(tool_call)
                 if request is not None:
