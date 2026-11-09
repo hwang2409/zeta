@@ -2894,6 +2894,9 @@ def test_transcript_membership_indexes_match_public_mutations() -> None:
     assert_indexes_match()
     assert Text.from_ansi(transcript.render(80)).plain == "prose\nbackground"
 
+    surviving_user = transcript.append(Text("surviving user"))
+    transcript.mark_user(surviving_user)
+    assert_indexes_match()
     transcript.clear()
     assert_indexes_match()
 
@@ -2915,13 +2918,22 @@ async def test_transcript_membership_indexes_match_replayed_app(tmp_path: Path) 
         provider="codex",
         model="offline",
     )
+    def assert_indexes_match() -> None:
+        transcript = app._transcript
+        assert transcript._unit_set == {
+            unit for unit in transcript._units if unit is not None
+        }
+        assert transcript._user_unit_set == set(transcript._user_units)
+        assert set(transcript._user_units) <= transcript._unit_set
+
     try:
         async with owned_app(app):
             app._rebuild_transcript()
-            assert app._transcript._unit_set == set(app._transcript._units)
+            assert_indexes_match()
             app._presenter.print_unit(Text("reloaded"))
+            assert_indexes_match()
             app._rebuild_transcript()
-            assert app._transcript._unit_set == set(app._transcript._units)
+            assert_indexes_match()
     finally:
         await app.loop.close()
         store.close()
