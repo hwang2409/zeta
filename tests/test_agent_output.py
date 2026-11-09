@@ -1475,6 +1475,10 @@ async def test_root_reads_unadopted_grandchild_status_and_output(tmp_path: Path)
 
     assert status["structuredContent"]["children"][0]["handle"] == "root:1:1"
     assert "assistant: nested answer" in output["content"][0]["text"]
+    await loop.close()
+    grandchild.close()
+    child.close()
+    root.close()
 
 
 @pytest.mark.asyncio
@@ -1506,6 +1510,9 @@ async def test_subtree_reads_reject_exact_path_marker_without_parent_call(
     assert "unknown child handle" in status["content"][0]["text"]
     assert output["isError"] is True
     assert "unknown child handle" in output["content"][0]["text"]
+    await loop.close()
+    child.close()
+    root.close()
 
 
 @pytest.mark.asyncio
@@ -1568,6 +1575,9 @@ async def test_agent_output_reads_and_fits_off_event_loop(
         await asyncio.wait_for(
             asyncio.gather(task, return_exceptions=True), timeout=10
         )
+    await loop.close()
+    child.close()
+    root.close()
 
 
 @pytest.mark.asyncio
@@ -1622,6 +1632,9 @@ async def test_agent_status_projects_and_fits_off_event_loop(
         await asyncio.wait_for(
             asyncio.gather(task, return_exceptions=True), timeout=10
         )
+    await loop.close()
+    child.close()
+    root.close()
 
 
 def _create_nested_child_in_process(
@@ -1742,6 +1755,8 @@ async def test_nested_reader_rejects_outside_and_malformed_handles_before_file_o
     assert result["isError"] is True
     assert "unknown child handle" in result["content"][0]["text"]
     assert opens == 0
+    await loop.close()
+    child.close()
 
 
 @pytest.mark.asyncio
@@ -1796,3 +1811,8 @@ async def test_damaged_intermediate_is_unknown_and_healthy_sibling_survives(
     assert "root:1:1" not in rows
     assert output["isError"] is True
     assert "could not read child transcript" in output["content"][0]["text"]
+    await loop.close()
+    healthy.close()
+    hidden.close()
+    damaged.close()
+    root.close()
