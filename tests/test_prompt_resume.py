@@ -948,17 +948,14 @@ def test_p06_7_writable_resume_reads_memory_before_shape_commit(
         with _hold_memory(registry, project.project_id):
             go.set()
             persisted = manager.read_metadata(session_id, lock_timeout=10)
-            assert not outcome and "current memory" not in persisted.system_prompt, (
-                "resume reread memory after capturing its project projection"
+            assert not outcome and "old memory" not in persisted.system_prompt, (
+                "resume persisted a stale composition before re-reading memory"
             )
     finally:
         go.set()
         resume.join(10)
     assert not resume.is_alive()
-    assert len(outcome) == 1 and isinstance(outcome[0], str), outcome
-    assert "old memory" in outcome[0] and "current memory" not in outcome[0], (
-        "resume adopted memory written after its captured projection"
-    )
+    _assert_resumed_with(manager, session_id, outcome)
 
 
 _MEMORY_HOLDER = """
