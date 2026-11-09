@@ -30,26 +30,31 @@ def corpus() -> list[ConversationEntry]:
     values = {
         1: msg(MessageRole.ASSISTANT, "covered"),
         2: msg(MessageRole.ASSISTANT, "pending", {"zeta.pending_prompt_id": "pending-1"}),
-        3: failed,
-        4: Message(MessageRole.TOOL_RESULT, [], tool_result=ToolResult("failed-call", "result")),
-        5: msg(MessageRole.ASSISTANT, "compacted"),
-        6: msg(MessageRole.USER, "tail"),
-        7: msg(MessageRole.ASSISTANT, "uncovered"),
+        3: msg(MessageRole.ASSISTANT, "covered-third"),
+        4: failed,
+        5: Message(MessageRole.TOOL_RESULT, [], tool_result=ToolResult("failed-call", "result")),
+        6: msg(MessageRole.ASSISTANT, "pending-step", {"zeta.step_delivery": {"notification_ids": ["notice-1"]}}),
+        7: msg(MessageRole.USER, "tail"),
+        8: msg(MessageRole.ASSISTANT, "uncovered"),
     }
     entries = [
         ConversationEntry(seq=n, id=str(n), parent_id=None, lane="main", type="message", data={"message": value.to_dict()})
         for n, value in values.items()
     ]
     entries.append(ConversationEntry(
-        seq=8, id="marker", parent_id=None, lane="main", type="compaction",
-        data={"kind": "evict", "source_seq_start": 1, "source_seq_end": 5,
-              "view": [{"seq": 1, "message": values[1].to_dict()}, {"seq": 5, "message": values[5].to_dict()}]},
+        seq=9, id="old-marker", parent_id=None, lane="main", type="compaction",
+        data={"kind": "evict", "source_seq_start": 1, "source_seq_end": 3, "view": [{"seq": 1, "message": values[1].to_dict()}]},
     ))
+    entries.append(ConversationEntry(seq=10, id="marker", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 1, "source_seq_end": 3, "replaces": ["old-marker"], "view": [{"seq": 1, "message": values[1].to_dict()}, {"seq": 3, "message": values[3].to_dict()}]}))
+    entries.append(ConversationEntry(seq=11, id="overlap", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 3, "source_seq_end": 4, "view": [{"seq": 3, "message": values[3].to_dict()}, {"seq": 4, "message": values[4].to_dict()}]}))
+    entries.append(ConversationEntry(seq=12, id="invalid", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 20, "source_seq_end": 21, "view": [{"seq": 99, "message": values[1].to_dict()}]}))
     return entries
 
 
 def reference_items(assembler: ContextAssembler, entries: list[ConversationEntry]):
-    markers = [entry for entry in entries if entry.type == "compaction"]
+    all_markers = [entry for entry in entries if entry.type == "compaction"]
+    superseded = {replaced for marker in all_markers for replaced in marker.data.get("replaces", [])}
+    markers = [entry for entry in all_markers if entry.id not in superseded]
     active = {entry.seq for entry in entries if entry.type in {"message", "compaction"}}
     markers = [marker for marker in markers if marker.data.get("kind") != "evict" or valid_eviction_view(marker, active)]
     ranges = [(marker.data["source_seq_start"], marker.data["source_seq_end"]) for marker in markers]
@@ -92,6 +97,7 @@ def test_covered_decode_matches_reference_projection_and_tokens(tmp_path: Path) 
     store = ConversationStore(tmp_path / "sessions")
     try:
         store._active_pending_prompt_entries["pending-1"] = object()
+        store._active_notifications["notice-1"] = object()
         entries = corpus()
         projected, tokens = project(store, entries)
         reference_assembler = ContextAssembler(store, token_counter=lambda message: len(message.content))
@@ -105,10 +111,28 @@ def test_covered_decode_matches_reference_projection_and_tokens(tmp_path: Path) 
 def test_covered_decode_skips_ordinary_rows(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     try:
+        store._active_notifications["notice-1"] = object()
         entries = corpus()
         with patch.object(Message, "from_dict", wraps=Message.from_dict) as decode:
             project(store, entries)
         # test-contract: seam _visible_items is the narrow projection seam under test
-        assert decode.call_count == 5
+        assert decode.call_count == 9
+    finally:
+        store.close()
+
+
+def test_covered_odd_metadata_keeps_decoder_validation(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    try:
+        entry = ConversationEntry(seq=1, id="1", parent_id=None, lane="main", type="message", data={"message": msg(MessageRole.ASSISTANT, "odd").to_dict()})
+        entry.data["message"]["metadata"] = []
+        marker = ConversationEntry(seq=2, id="marker", parent_id=None, lane="main", type="compaction", data={"kind": "evict", "source_seq_start": 1, "source_seq_end": 1, "view": [{"seq": 1, "message": msg(MessageRole.ASSISTANT, "odd").to_dict()}]})
+        try:
+            ContextAssembler(store)._visible_items([entry, marker])
+        except ValueError as exc:
+            # test-contract: seam validates malformed persisted metadata
+            assert str(exc) == "message metadata must be an object"
+        else:
+            raise AssertionError("odd metadata must reach Message.from_dict")
     finally:
         store.close()
