@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from ..accounts.session import account_provider
 from ..core.checkpoints import ConversationEntry
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..protocol.types import StreamEvent, StreamEventType
+from ..providers.rate_limit_hold import LONG_HOLD_WAKE_SECONDS
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -125,6 +129,67 @@ def recover_orphaned_questions(
         store.close_child_questions(child_id, reason="canceled")
         for child_id in child_ids
     )
+
+
+class HoldWake:
+    """Wake the parent once per long provider hold of one background child.
+
+    A long hold is a stall with a known end. Re-probes that re-enter the hold
+    are the same hold; a response, turn end, or error ends it. A foreground
+    parent is blocked on the agent call, so foreground children get the inert
+    ``NO_HOLD_WAKE``, which only recognizes hold events.
+    """
+
+    def __init__(
+        self,
+        channel: ConversationChannel | None = None,
+        child_instance_id: str = "",
+        child_session_path: str = "",
+        description: str = "",
+        accounts: Mapping[str, object] | None = None,
+    ) -> None:
+        self._channel = channel
+        self._child = (child_instance_id, child_session_path, description)
+        self._accounts = accounts or {}
+        self._woken = False
+
+    async def observe(self, event: StreamEvent) -> bool:
+        """Return whether ``event`` is a provider hold; wake on the first long one."""
+
+        if event.type in _HOLD_ENDS:
+            self._woken = False
+        if (
+            event.type is not StreamEventType.RETRY
+            or event.data.get("kind") != "provider_rate_limit_hold"
+        ):
+            return False
+        hold = event.data
+        if (
+            self._channel is None
+            or self._woken
+            or hold["retry_after"] <= LONG_HOLD_WAKE_SECONDS
+        ):
+            return True
+        self._woken = True
+        # a subscription hold names its account; a rate limit uses the child's pin
+        pinned = self._accounts.get(account_provider(str(hold["provider"])) or "")
+        child_instance_id, child_session_path, description = self._child
+        # no live parent flow (the tree is closing) must not end the held child
+        with suppress(LookupError):
+            await self._channel.publish_hold(
+                child_instance_id=child_instance_id,
+                child_session_path=child_session_path,
+                description=description,
+                hold=hold,
+                account=hold.get("account") or (None if pinned is None else str(pinned)),
+            )
+        return True
+
+
+_HOLD_ENDS = frozenset(
+    {StreamEventType.MESSAGE_START, StreamEventType.TURN_END, StreamEventType.ERROR}
+)
+NO_HOLD_WAKE = HoldWake()
 
 
 class ConversationChannel:
@@ -293,7 +358,6 @@ class ConversationChannel:
     async def publish_not_delivered(self, child_loop: AgentLoop, text: str) -> None:
         """Show input a stop held back on the root transcript; it wakes no agent."""
 
-        from ..protocol.types import StreamEvent, StreamEventType
         from .pending_delivery import NotificationInput
 
         store = child_loop.store
