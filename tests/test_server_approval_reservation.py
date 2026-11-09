@@ -170,6 +170,7 @@ async def test_delegated_tool_end_survives_approval_history_race(
             )
             return await original_append(record, payload)
 
+        # test-contract: seam gates delegated history to force the stale-record order
         monkeypatch.setattr(
             server.control._approvals, "_append_delegated_history", hold_history
         )
