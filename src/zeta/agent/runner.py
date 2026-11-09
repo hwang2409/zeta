@@ -33,6 +33,7 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
+from ..providers.completion import rate_limit_hold_text
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
@@ -48,6 +49,7 @@ from .child_context import (
     _child_model_and_budget,
     _compose_child_project_context,
     _prepare_child_project_context,
+    consume_run,
     resolve_child_backend,
 )
 from .conversation_channel import has_follow_up_loop
@@ -67,7 +69,6 @@ from .receipt import (
     child_cleanup_details,
     recoverable_error_result,
 )
-from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence, persist_confirmed_cancel
 from .turn_limit import (
     ChildTurnControl,
@@ -143,6 +144,13 @@ async def consume_child(
         async for event in events:
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
+                update_step(status)
+                publish(status)
+            elif (
+                event.type is StreamEventType.RETRY
+                and event.data.get("kind") == "provider_rate_limit_hold"
+            ):
+                status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
                 publish(status)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -338,29 +346,6 @@ async def consume_child(
     if child_loop.explicit_finish:
         return terminal_result(state="idle", text=final_text, status="running")
     return terminal_result(state="completed", text=final_text)
-
-
-async def consume_run(
-    child_loop: AgentLoop,
-    prompt: str,
-    *,
-    child_store: ConversationStore,
-    tool_call_id: str = "",
-    max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
-    receipt_components: dict[str, str] | None = None,
-    **kwargs: Any,
-) -> dict[str, object]:
-    """Consume one child run through its follow-up and idle lifecycle."""
-    return await consume_follow_up_run(
-        consume_child,
-        child_loop,
-        prompt,
-        child_store=child_store,
-        tool_call_id=tool_call_id,
-        max_receipt_bytes=max_receipt_bytes,
-        receipt_components=receipt_components,
-        **kwargs,
-    )
 
 
 async def _build_child_loop(

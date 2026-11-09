@@ -99,7 +99,7 @@ def test_entrypoint_shutdown_releases_every_lease(
 
     async def prompt(app, session):
         if entry == "tui-new" and len(apps) == 1:
-            app._slash_commands.dispatch(app, "/new")
+            await app._slash_commands.dispatch(app, "/new")
 
     def delete_after_shutdown(session_id):
         assert all(app._closed for app in apps)

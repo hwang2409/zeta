@@ -14,7 +14,6 @@ from ..store import ConversationEntry
 class AssembledContext:
     messages: list[Message]
     token_count: int
-    digest: str
     compacted: bool = False
 
 

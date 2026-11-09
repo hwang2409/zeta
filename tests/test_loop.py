@@ -204,6 +204,138 @@ def test_harness_guidance_has_non_user_authorship(notice: Message) -> None:
     assert "user asked" not in notice.content[0].text.casefold()
 
 
+def test_finish_gate_message_caps_details_and_reports_omissions() -> None:
+    children = tuple((f"root:{i}", f"child-{i}") for i in range(25))
+    tasks = tuple((f"task-{i}", f"task-{i}") for i in range(24))
+
+    message = finish_gate_message(children, tasks)
+    text = message.content[0].text
+
+    assert "25 background sub-agents still running" in text
+    assert "24 background tasks still running" in text
+    assert "root:19: child-19" in text
+    assert "root:20: child-20" not in text
+    assert "task-19: task-19" in text
+    assert "task-20: task-20" not in text
+    assert "5 more sub-agents omitted; use agent_status" in text
+    assert "4 more tasks omitted; use task_list" in text
+    assert "cancel sub-agents with agent_cancel" in text
+    assert "stop tasks with task_kill" in text
+    assert "hand off with agent_handoff" in text
+
+    assert text == finish_gate_message(children, tasks).content[0].text
+
+
+@pytest.mark.parametrize(
+    "detail", ["x" * 100_000, "漢字🙂" * 25_000], ids=["ascii", "multibyte"]
+)
+def test_finish_gate_message_bounds_long_details_by_utf8_bytes(detail: str) -> None:
+    children = tuple((f"root:{i}", detail) for i in range(1_000))
+    tasks = tuple((f"task-{i}", detail) for i in range(1_000))
+
+    text = finish_gate_message(children, tasks).content[0].text
+
+    expected = detail.encode()[:64].decode("utf-8", "ignore")
+    assert len(text.encode()) < 5_000
+    assert "root:19: " + expected in text
+    assert "task-19: " + expected in text
+    assert "root:20: " not in text
+    assert "task-20: " not in text
+
+
+def test_finish_gate_message_bounds_1_000_children() -> None:
+    children = tuple((f"root:{i}", "x" * 46) for i in range(1_000))
+
+    text = finish_gate_message(children, ()).content[0].text
+
+    assert len(text.encode()) < 5_000
+    assert "root:19: " + "x" * 46 in text
+    assert "root:20: " not in text
+    assert "980 more sub-agents omitted; use agent_status" in text
+
+
+def test_finish_gate_message_bounds_deep_generated_handles() -> None:
+    handle = "root:" + ":".join(
+        f"child-{depth:08x}-0000-0000-0000-000000000000" for depth in range(100)
+    )
+    children = tuple((handle, "worker") for _ in range(20))
+
+    text = finish_gate_message(children, ()).content[0].text
+
+    assert len(text.encode()) < 5_000
+    assert handle in text
+
+
+@pytest.mark.parametrize(
+    ("children", "tasks", "expected"),
+    [
+        pytest.param((("root:1", "worker"),), (), "root:1: worker", id="child-only"),
+        pytest.param((), (("task-1", "headline"),), "task-1: headline", id="task-only"),
+        pytest.param(
+            (("root:1", "worker"),), (("task-1", "headline"),),
+            "root:1: worker; 1 background tasks",
+            id="combined",
+        ),
+        pytest.param(
+            (("root:" + "child:" * 1_000, "worker"),),
+            (), "1 more sub-agents omitted; use agent_status",
+            id="entry-too-large",
+        ),
+        pytest.param(
+            (("root:1", "漢字🙂" * 20),), (("task-1", "headline"),),
+            "task-1: headline",
+            id="multibyte-details",
+        ),
+    ],
+)
+def test_finish_gate_message_detail_budget_table(
+    children: tuple[tuple[str, str], ...],
+    tasks: tuple[tuple[str, str], ...],
+    expected: str,
+) -> None:
+    text = finish_gate_message(children, tasks).content[0].text
+
+    assert len(text.encode()) < 5_000
+    assert expected in text
+    assert text == finish_gate_message(children, tasks).content[0].text
+
+
+def test_finish_gate_message_small_output_is_byte_identical() -> None:
+    text = finish_gate_message(
+        (("root:1", "worker"),), (("task-1", "headline"),)
+    ).content[0].text
+
+    assert text == (
+        "[zeta] finish gate: You have 1 background sub-agents still running: "
+        "root:1: worker; 1 background tasks still running: task-1: headline. "
+        "You cannot finish yet. Choose one: (a) wait: reply WAIT and end this turn; "
+        "completions and task exits will wake you, with no polling; (b) cancel "
+        "sub-agents with agent_cancel and stop tasks with task_kill; (c) hand off "
+        "with agent_handoff, providing the reason and where the outputs will appear. "
+        "Sub-agents continue under the parent, but background tasks cannot be adopted "
+        "and will be killed when this agent completes; task output remains in this "
+        "child session's task archive. A finish-gate safety bound applies if a task "
+        "never exits."
+    )
+
+
+def test_finish_gate_message_exact_entry_boundary() -> None:
+    def message_for(handle: str) -> str:
+        return finish_gate_message(((handle, "worker"),), ()).content[0].text
+
+    fitting = "root:"
+    while fitting in message_for(fitting):
+        fitting += "x"
+    too_large = fitting
+    fitting = fitting[:-1]
+
+    assert len(message_for(fitting).encode()) < 5_000
+    assert fitting in message_for(fitting)
+    assert len(message_for(too_large).encode()) < 5_000
+    assert too_large not in message_for(too_large)
+    assert "1 more sub-agents omitted; use agent_status" in message_for(too_large)
+
+
 def _harness_notice_conversation() -> list[Message]:
     call = ToolCall("call-1", "read", {"path": "README.md"})
     return [

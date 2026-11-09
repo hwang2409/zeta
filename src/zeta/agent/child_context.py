@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ..core.project_context import (
     ProjectContext,
@@ -33,9 +33,37 @@ from ..runtime.prompt import (
 )
 from ..tools import ToolRegistry
 from .presets import AgentPreset, compose_system_prompt
+from .receipt import MAX_AGENT_RESULT_BYTES
+from .run_consumer import consume_run as consume_follow_up_run
 
 if TYPE_CHECKING:
+    from ..core.store import ConversationStore
     from ..runtime.loop import AgentLoop
+
+
+async def consume_run(
+    child_loop: AgentLoop,
+    prompt: str,
+    *,
+    child_store: ConversationStore,
+    tool_call_id: str = "",
+    max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
+    receipt_components: dict[str, str] | None = None,
+    **kwargs: Any,
+) -> dict[str, object]:
+    """Consume one child run through its follow-up and idle lifecycle."""
+    from .runner import consume_child
+
+    return await consume_follow_up_run(
+        consume_child,
+        child_loop,
+        prompt,
+        child_store=child_store,
+        tool_call_id=tool_call_id,
+        max_receipt_bytes=max_receipt_bytes,
+        receipt_components=receipt_components,
+        **kwargs,
+    )
 
 
 def resolve_child_backend(
