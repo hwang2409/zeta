@@ -17,6 +17,7 @@ _DURABILITY_CALLBACKS = {
     ("core/transcript_recovery/__init__.py", "resume_memory_review", "write_json_file"),
     ("session_retention.py", "write_retention_pin", "atomic_publish_file"),
     ("project_registry.py", "_publish", "atomic_publish_file"),
+    ("project_registry.py", "_update_sessions_locked", "atomic_publish_file"),
     ("project_inbox_sent/__init__.py", "publish", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
     (
@@ -87,6 +88,7 @@ _RAW_DELETION = {
     ("core/session_files.py", "copy_session_tree", "unlink"),
     ("core/session_files.py", "unlink_session_file", "unlink"),
     ("core/session_files.py", "write_session_file", "unlink"),
+    ("core/session_files.py", "write_session_file_if_absent", "unlink"),
     ("core/session_links.py", "_remove_entry", "unlink"),
     ("core/transcript_recovery/__init__.py", "_unlink_if_present", "unlink"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "unlink"),
@@ -136,12 +138,10 @@ _RAW_DELETION = {
 }
 
 _VARIANT_APPEND_SEAMS = {
-    ("project_registry.py", "record_session", "publish_append"),
-    ("project_registry.py", "record_sessions", "publish_append"),
+    ("project_registry.py", "_update_sessions_locked", "publish_append"),
 }
 
 _APPEND_PUBLICATION = {
-    ("project_registry.py", "_append_reference_blob", "append"),
     ("memory/reconciliation_state.py", "_append_receipt_archive", "append"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "append"),
     ("core/store/_log.py", "_write_bytes", "append"),

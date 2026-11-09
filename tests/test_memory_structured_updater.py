@@ -732,8 +732,8 @@ def test_bounded_index_reports_omitted_entries_and_is_deterministic(
 async def test_completion_makes_omitted_entry_visible_and_resolves_it(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
-    state, (target,) = _crowded_priority_state(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    state, (target,) = await asyncio.to_thread(_crowded_priority_state,
         registry,
         project_id,
         ("backlog", "PR #425 remains open pending final review."),
@@ -760,7 +760,7 @@ async def test_completion_makes_omitted_entry_visible_and_resolves_it(
     )
 
     assert result.changed_entry_ids == (target,)
-    resolved = registry._entry_memory_state(project_id).state.entries[target]
+    resolved = (await asyncio.to_thread(registry._entry_memory_state, project_id)).state.entries[target]
     assert isinstance(resolved, MemoryEntry)
     assert resolved.status == "resolved"
 
@@ -769,8 +769,8 @@ async def test_completion_makes_omitted_entry_visible_and_resolves_it(
 async def test_correction_makes_omitted_entry_visible_and_supersedes_it(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
-    state, (target,) = _crowded_priority_state(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    state, (target,) = await asyncio.to_thread(_crowded_priority_state,
         registry,
         project_id,
         ("state", "Service Atlas uses path /srv/atlas-old."),
@@ -801,7 +801,7 @@ async def test_correction_makes_omitted_entry_visible_and_supersedes_it(
     )
 
     assert target in result.changed_entry_ids
-    superseded = registry._entry_memory_state(project_id).state.entries[target]
+    superseded = (await asyncio.to_thread(registry._entry_memory_state, project_id)).state.entries[target]
     assert isinstance(superseded, MemoryEntry)
     assert superseded.status == "superseded"
 
@@ -1008,10 +1008,10 @@ def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
 async def test_operation_targeting_entry_omitted_from_request_is_rejected(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
-    current = registry._entry_memory_state(project_id)
-    state = _large_index_state(registry, project_id, count=300)
-    registry._replace_entry_state_for_test(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    current = await asyncio.to_thread(registry._entry_memory_state, project_id)
+    state = await asyncio.to_thread(_large_index_state, registry, project_id, count=300)
+    await asyncio.to_thread(registry._replace_entry_state_for_test,
         project_id, state, expected_digest=current.digest
     )
     transcript = _transcript(_row(1, "Correct one current entry."))
@@ -1050,8 +1050,8 @@ async def test_operation_targeting_entry_omitted_from_request_is_rejected(
 async def test_oversized_memory_indexes_every_active_entry_and_allows_targeting(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
-    current = registry._entry_memory_state(project_id)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    current = await asyncio.to_thread(registry._entry_memory_state, project_id)
     operations = tuple(
         AddOperation(
             "state",
@@ -1067,7 +1067,7 @@ async def test_oversized_memory_indexes_every_active_entry_and_allows_targeting(
         automatic=True,
         now=NOW,
     )
-    registry._replace_entry_state_for_test(
+    await asyncio.to_thread(registry._replace_entry_state_for_test,
         project_id, state, expected_digest=current.digest
     )
     transcript = _transcript(_row(1, "Correct one indexed entry."))
@@ -1110,7 +1110,7 @@ async def test_oversized_memory_indexes_every_active_entry_and_allows_targeting(
     )
 
     assert result.changed_entry_ids == (target,)
-    changed = registry._entry_memory_state(project_id).state.entries[target]
+    changed = (await asyncio.to_thread(registry._entry_memory_state, project_id)).state.entries[target]
     assert isinstance(changed, MemoryEntry)
     assert changed.text == "Corrected indexed entry."
 
@@ -1239,7 +1239,7 @@ def test_default_expiry_uses_seen_at_and_support_extends_only_default() -> None:
 
 @pytest.mark.asyncio
 async def test_repair_receives_indexed_validation_errors(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, prompts = await _run(
         registry,
         project_id,
@@ -1258,7 +1258,7 @@ async def test_repair_receives_indexed_validation_errors(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_repair_preserves_exact_cited_code_literals(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, prompts = await _run(
         registry,
         project_id,
@@ -1277,7 +1277,7 @@ async def test_repair_preserves_exact_cited_code_literals(tmp_path: Path) -> Non
     assert len(prompts) == 2
     assert "omits durable exact code literal" in prompts[1]
     assert result.changed_entry_ids
-    assert next(iter(_entries(registry, project_id))).text == (
+    assert next(iter(await asyncio.to_thread(_entries, registry, project_id))).text == (
         "The validated token is PROC-QUARTZ-8N3F."
     )
 
@@ -1286,7 +1286,7 @@ async def test_repair_preserves_exact_cited_code_literals(tmp_path: Path) -> Non
 async def test_exact_literal_validation_ignores_cited_tool_output(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     operation = _add(
         "decisions",
         "The validated token is PROC-QUARTZ-8N3F.",
@@ -1310,7 +1310,7 @@ async def test_exact_literal_validation_ignores_cited_tool_output(
 async def test_cited_code_literal_containing_letter_n_is_required(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, prompts = await _run(
         registry,
         project_id,
@@ -1327,14 +1327,15 @@ async def test_cited_code_literal_containing_letter_n_is_required(
     )
     assert len(prompts) == 2
     assert result.changed_entry_ids
-    assert next(iter(_entries(registry, project_id))).text == (
+    entries = await asyncio.to_thread(_entries, registry, project_id)
+    assert next(iter(entries)).text == (
         "Use `run_background` for long builds."
     )
 
 
 @pytest.mark.asyncio
 async def test_code_literal_does_not_span_lines(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, prompts = await _run(
         registry,
         project_id,
@@ -1350,7 +1351,7 @@ async def test_code_literal_does_not_span_lines(tmp_path: Path) -> None:
 async def test_repeated_opaque_fact_does_not_create_duplicate_entry(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     await _run(
         registry,
         project_id,
@@ -1375,12 +1376,12 @@ async def test_repeated_opaque_fact_does_not_create_duplicate_entry(
     )
     assert result.changed_entry_ids == ()
     assert result.rejected_groups == ("group[0]: add duplicates an existing active entry",)
-    assert len(_entries(registry, project_id)) == 1
+    assert len(await asyncio.to_thread(_entries, registry, project_id)) == 1
 
 
 @pytest.mark.asyncio
 async def test_one_proposal_cannot_add_duplicate_opaque_facts(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, _ = await _run(
         registry,
         project_id,
@@ -1397,14 +1398,14 @@ async def test_one_proposal_cannot_add_duplicate_opaque_facts(tmp_path: Path) ->
     assert result.rejected_groups == (
         "group[1]: add duplicates an existing active entry",
     )
-    assert len(_entries(registry, project_id)) == 1
+    assert len(await asyncio.to_thread(_entries, registry, project_id)) == 1
 
 
 @pytest.mark.asyncio
 async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
-    initial = registry._entry_memory_state(project_id)
-    added = registry._compare_and_swap_entries(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    initial = await asyncio.to_thread(registry._entry_memory_state, project_id)
+    added = await asyncio.to_thread(registry._compare_and_swap_entries,
         project_id,
         expected_digest=initial.digest,
         operations=(
@@ -1443,7 +1444,7 @@ async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -
             )
         ],
     )
-    entries = _entries(registry, project_id)
+    entries = await asyncio.to_thread(_entries, registry, project_id)
     assert any(entry.text == "The architecture note is durable." for entry in entries)
     assert next(entry for entry in entries if entry.id == target).status == "active"
     assert result.rejected_groups
@@ -1464,7 +1465,7 @@ async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -
 
 @pytest.mark.asyncio
 async def test_updater_response_bounds(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     oversized = "x" * (32 * 1024 + 1)
     with pytest.raises(
         EntryReconciliationFailure, match="response exceeds"
@@ -1479,16 +1480,16 @@ async def test_updater_response_bounds(tmp_path: Path) -> None:
             ],
         )
     assert raised.value.usage == {"input_tokens": 7}
-    assert not _entries(registry, project_id)
+    assert not (await asyncio.to_thread(_entries, registry, project_id))
 
 
 @pytest.mark.asyncio
 async def test_accepted_entry_requires_direct_user_evidence_to_supersede(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
-    initial = registry._entry_memory_state(project_id)
-    accepted = registry._compare_and_swap_entries(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    initial = await asyncio.to_thread(registry._entry_memory_state, project_id)
+    accepted = await asyncio.to_thread(registry._compare_and_swap_entries,
         project_id,
         expected_digest=initial.digest,
         operations=(
@@ -1523,7 +1524,7 @@ async def test_accepted_entry_requires_direct_user_evidence_to_supersede(
     assert not agent_result.changed_entry_ids
     assert (
         next(
-            entry for entry in _entries(registry, project_id) if entry.id == target
+            entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target
         ).status
         == "active"
     )
@@ -1538,7 +1539,7 @@ async def test_accepted_entry_requires_direct_user_evidence_to_supersede(
     assert user_result.changed_entry_ids
     assert (
         next(
-            entry for entry in _entries(registry, project_id) if entry.id == target
+            entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target
         ).status
         == "superseded"
     )
@@ -1546,8 +1547,8 @@ async def test_accepted_entry_requires_direct_user_evidence_to_supersede(
 
 @pytest.mark.asyncio
 async def test_agent_update_cannot_change_user_backed_entry(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
-    target = _seed_user_entry(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    target = await asyncio.to_thread(_seed_user_entry,
         registry, project_id, kind="decisions", text="Use Postgres."
     )
     result, _ = await _run(
@@ -1577,13 +1578,13 @@ async def test_agent_update_cannot_change_user_backed_entry(tmp_path: Path) -> N
     )
     assert not result.changed_entry_ids
     assert result.rejected_groups
-    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Use Postgres."
+    assert next(entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target).text == "Use Postgres."
 
 
 @pytest.mark.asyncio
 async def test_agent_cannot_resolve_user_backed_decision(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
-    target = _seed_user_entry(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    target = await asyncio.to_thread(_seed_user_entry,
         registry, project_id, kind="decisions", text="Use Postgres."
     )
     result, _ = await _run(
@@ -1612,14 +1613,14 @@ async def test_agent_cannot_resolve_user_backed_decision(tmp_path: Path) -> None
     )
     assert not result.changed_entry_ids
     assert result.rejected_groups
-    entry = next(entry for entry in _entries(registry, project_id) if entry.id == target)
+    entry = next(entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target)
     assert entry.status == "active"
 
 
 @pytest.mark.asyncio
 async def test_newer_user_evidence_can_update_user_backed_entry(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
-    target = _seed_user_entry(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    target = await asyncio.to_thread(_seed_user_entry,
         registry, project_id, kind="decisions", text="Use Postgres."
     )
     result, _ = await _run(
@@ -1640,13 +1641,13 @@ async def test_newer_user_evidence_can_update_user_backed_entry(tmp_path: Path) 
         key="newer-user-update",
     )
     assert result.changed_entry_ids == (target,)
-    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Use SQLite."
+    assert next(entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target).text == "Use SQLite."
 
 
 @pytest.mark.asyncio
 async def test_equal_rank_older_evidence_cannot_update_entry(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
-    target = _seed_user_entry(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    target = await asyncio.to_thread(_seed_user_entry,
         registry, project_id, kind="state", text="Deploy on Friday."
     )
     result, _ = await _run(
@@ -1674,13 +1675,13 @@ async def test_equal_rank_older_evidence_cannot_update_entry(tmp_path: Path) -> 
     )
     assert not result.changed_entry_ids
     assert result.rejected_groups
-    assert next(entry for entry in _entries(registry, project_id) if entry.id == target).text == "Deploy on Friday."
+    assert next(entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target).text == "Deploy on Friday."
 
 
 @pytest.mark.asyncio
 async def test_completion_resolves_backlog_entry(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
-    target = _seed_user_entry(
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
+    target = await asyncio.to_thread(_seed_user_entry,
         registry, project_id, kind="backlog", text="Publish the release."
     )
     result, _ = await _run(
@@ -1700,13 +1701,13 @@ async def test_completion_resolves_backlog_entry(tmp_path: Path) -> None:
         key="backlog-complete",
     )
     assert result.changed_entry_ids == (target,)
-    entry = next(entry for entry in _entries(registry, project_id) if entry.id == target)
+    entry = next(entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target)
     assert entry.status == "resolved"
 
 
 @pytest.mark.asyncio
 async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     _, _ = await _run(
         registry,
         project_id,
@@ -1715,7 +1716,7 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
         key="open",
     )
     opened = next(
-        entry for entry in _entries(registry, project_id) if entry.status == "active"
+        entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.status == "active"
     )
     assert opened.expires_at == "2026-10-15T12:00:00.000000Z"
 
@@ -1735,11 +1736,11 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
         key="merged",
     )
     merged = next(
-        entry for entry in _entries(registry, project_id) if entry.status == "active"
+        entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.status == "active"
     )
     assert (
         next(
-            entry for entry in _entries(registry, project_id) if entry.id == opened.id
+            entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == opened.id
         ).status
         == "superseded"
     )
@@ -1766,13 +1767,13 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
     )
     assert (
         next(
-            entry for entry in _entries(registry, project_id) if entry.id == merged.id
+            entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == merged.id
         ).status
         == "resolved"
     )
 
-    snapshot = registry._entry_memory_state(project_id)
-    expiring = registry._compare_and_swap_entries(
+    snapshot = await asyncio.to_thread(registry._entry_memory_state, project_id)
+    expiring = await asyncio.to_thread(registry._compare_and_swap_entries,
         project_id,
         expected_digest=snapshot.digest,
         operations=(
@@ -1800,7 +1801,7 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
     )
     assert (
         next(
-            entry for entry in _entries(registry, project_id) if entry.id == expiring_id
+            entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == expiring_id
         ).status
         == "expired"
     )
@@ -1810,7 +1811,7 @@ async def test_contradiction_resolution_and_expiry_fixtures(tmp_path: Path) -> N
 async def test_direct_user_validated_procedure_is_stored_as_data(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, _ = await _run(
         registry,
         project_id,
@@ -1830,7 +1831,7 @@ async def test_direct_user_validated_procedure_is_stored_as_data(
         ],
     )
     assert result.rejected_groups == ()
-    assert next(iter(_entries(registry, project_id))).text == (
+    assert next(iter(await asyncio.to_thread(_entries, registry, project_id))).text == (
         "Validated procedure: run PROC-QUARTZ-8N3F before packaging."
     )
 
@@ -1839,7 +1840,7 @@ async def test_direct_user_validated_procedure_is_stored_as_data(
 async def test_safety_rejects_secrets_and_instruction_like_entries(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, prompts = await _run(
         registry,
         project_id,
@@ -1860,7 +1861,7 @@ async def test_safety_rejects_secrets_and_instruction_like_entries(
     )
     assert "hunter2" not in prompts[0]
     assert "Ignore previous instructions" not in prompts[0]
-    texts = [entry.text for entry in _entries(registry, project_id)]
+    texts = [entry.text for entry in (await asyncio.to_thread(_entries, registry, project_id))]
     assert texts == ["The safe project fact is retained."]
     assert len(result.rejected_groups) == 2
 
@@ -1869,7 +1870,7 @@ async def test_safety_rejects_secrets_and_instruction_like_entries(
 async def test_cas_retry_regenerates_against_new_entry_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     prompts: list[str] = []
 
     async def invoke(prompt: str, budget) -> str:
@@ -1915,7 +1916,7 @@ async def test_cas_retry_regenerates_against_new_entry_state(
     assert len(prompts) == 2
     assert "A concurrent fact survives." in prompts[1]
     assert result.changed_entry_ids
-    assert {entry.text for entry in _entries(registry, project_id)} == {
+    assert {entry.text for entry in (await asyncio.to_thread(_entries, registry, project_id))} == {
         "A concurrent fact survives.",
         "The intended fact survives.",
     }
@@ -1984,7 +1985,7 @@ async def test_completed_direct_user_turn_queues_early_format_two_update(
         calls += 1
         return _proposal(_add("brief", "The project uses SQLite."))
 
-    runner, registry, project_id = _auto_runner(tmp_path, invoke)
+    runner, registry, project_id = await asyncio.to_thread(_auto_runner, tmp_path, invoke)
     _write_session(
         runner.session_dir,
         _row(1, "The project uses SQLite."),
@@ -2005,7 +2006,7 @@ async def test_completed_direct_user_turn_queues_early_format_two_update(
 
     assert calls == 1
     assert runner.last_reconciled_seq == 2
-    assert [entry.text for entry in _entries(registry, project_id)] == [
+    assert [entry.text for entry in (await asyncio.to_thread(_entries, registry, project_id))] == [
         "The project uses SQLite."
     ]
 
@@ -2020,7 +2021,8 @@ async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -
         return _proposal()
 
     clock = _MutableClock()
-    runner, _, _ = _auto_runner(
+    runner, _, _ = await asyncio.to_thread(
+        _auto_runner,
         tmp_path, invoke, clock=clock, debounce_seconds=0.05
     )
 
@@ -2030,7 +2032,7 @@ async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -
             or runner._early_pending_end != seq
             or clock.waits == previous_waits
         ):
-            await asyncio.sleep(0)
+            await await_or_fail(asyncio.sleep(0), what="debounce observation")
 
     rows: list[dict[str, object]] = []
     for turn in range(5):
@@ -2068,7 +2070,8 @@ async def test_user_turns_ninety_seconds_apart_make_two_requests(tmp_path: Path)
         return _proposal()
 
     clock = _MutableClock()
-    runner, _, _ = _auto_runner(
+    runner, _, _ = await asyncio.to_thread(
+        _auto_runner,
         tmp_path, invoke, clock=clock, debounce_seconds=0
     )
     first = (_row(1, "First fact."), _completed_assistant(2))
@@ -2096,7 +2099,7 @@ async def test_notification_does_not_retrigger_consumed_user_turn(tmp_path: Path
         calls += 1
         return _proposal()
 
-    runner, _, _ = _auto_runner(tmp_path, invoke, debounce_seconds=0)
+    runner, _, _ = await asyncio.to_thread(_auto_runner, tmp_path, invoke, debounce_seconds=0)
     completed = (_row(1, "A fact."), _completed_assistant(2))
     _write_session(runner.session_dir, *completed)
     runner.activity(2)
@@ -2123,7 +2126,8 @@ async def test_restart_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> 
         calls += 1
         return _proposal()
 
-    runner, registry, project_id = _auto_runner(
+    runner, registry, project_id = await asyncio.to_thread(
+        _auto_runner,
         tmp_path, invoke, debounce_seconds=60
     )
     _write_session(runner.session_dir, _row(1, "A fact."), _completed_assistant(2))
@@ -2131,7 +2135,7 @@ async def test_restart_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> 
     while not runner.position_path.exists() or json.loads(
         runner.position_path.read_text()
     ).get("early_trigger_seq") != 2:
-        await asyncio.sleep(0)
+        await await_or_fail(asyncio.sleep(0), what="early trigger persistence")
     await runner.close()
 
     replacement = AutoMemoryReconciler(
@@ -2160,7 +2164,7 @@ async def test_repeated_validation_failure_advances_only_after_terminal_receipt(
         calls += 1
         return ReconciliationResponse("{}", {"input_tokens": 1})
 
-    runner, registry, project_id = _auto_runner(tmp_path, invoke)
+    runner, registry, project_id = await asyncio.to_thread(_auto_runner, tmp_path, invoke)
     runner.before_eviction(1, 1)
     await runner.drain()
     await runner.close()
@@ -2172,7 +2176,7 @@ async def test_repeated_validation_failure_advances_only_after_terminal_receipt(
     assert receipt.seq_start == receipt.seq_end == 1
     ledger = json.loads(runner.position_path.read_text())
     assert ledger["terminal_receipts"][0]["usage"] == {"input_tokens": 6}
-    assert not _entries(registry, project_id)
+    assert not (await asyncio.to_thread(_entries, registry, project_id))
 
 
 @pytest.mark.asyncio
@@ -2187,7 +2191,7 @@ async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
         database = "SQLite" if calls == 1 else "Postgres"
         return _proposal(_add("brief", f"The project uses {database}."))
 
-    runner, registry, project_id = _auto_runner(tmp_path, invoke)
+    runner, registry, project_id = await asyncio.to_thread(_auto_runner, tmp_path, invoke)
     runner.before_eviction(1, 1)
     await runner.drain()
     history_after_commit = json.loads(
@@ -2211,7 +2215,7 @@ async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
     history_after_retry = json.loads(
         (registry.root / project_id / "memory-current.json").read_text()
     )["history"]
-    assert len(_entries(registry, project_id)) == 1
+    assert len(await asyncio.to_thread(_entries, registry, project_id)) == 1
     assert history_after_retry == history_after_commit
     assert replacement.last_reconciled_seq == 1
     diagnostics = registry.root.parent / "logs" / "memory-reconciliation.jsonl"
@@ -2229,7 +2233,7 @@ async def test_reconciliation_retry_is_idempotent_after_cursor_crash(
 async def test_stored_correction_rejects_newer_ordinary_user_statement(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     added, _ = await _run(
         registry,
         project_id,
@@ -2265,7 +2269,7 @@ async def test_stored_correction_rejects_newer_ordinary_user_statement(
     assert not result.changed_entry_ids
     assert result.rejected_groups
     stored = next(
-        entry for entry in _entries(registry, project_id) if entry.id == target
+        entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target
     )
     assert stored.text == "Use Postgres."
 
@@ -2274,7 +2278,7 @@ async def test_stored_correction_rejects_newer_ordinary_user_statement(
 async def test_agent_correction_language_cannot_inflate_ordinary_user_evidence(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     added, _ = await _run(
         registry,
         project_id,
@@ -2322,14 +2326,14 @@ async def test_agent_correction_language_cannot_inflate_ordinary_user_evidence(
     assert not result.changed_entry_ids
     assert result.rejected_groups
     stored = next(
-        entry for entry in _entries(registry, project_id) if entry.id == target
+        entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target
     )
     assert stored.text == "Use Postgres."
 
 
 @pytest.mark.asyncio
 async def test_each_source_range_keeps_its_own_code_derived_rank(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, _ = await _run(
         registry,
         project_id,
@@ -2356,7 +2360,7 @@ async def test_each_source_range_keeps_its_own_code_derived_rank(tmp_path: Path)
 
     entry = next(
         entry
-        for entry in _entries(registry, project_id)
+        for entry in (await asyncio.to_thread(_entries, registry, project_id))
         if entry.id == result.changed_entry_ids[0]
     )
     assert [source.evidence_rank for source in entry.sources] == [1, 5]
@@ -2364,7 +2368,7 @@ async def test_each_source_range_keeps_its_own_code_derived_rank(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_agent_correction_language_remains_agent_evidence(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, _ = await _run(
         registry,
         project_id,
@@ -2382,7 +2386,7 @@ async def test_agent_correction_language_remains_agent_evidence(tmp_path: Path) 
 
     entry = next(
         entry
-        for entry in _entries(registry, project_id)
+        for entry in (await asyncio.to_thread(_entries, registry, project_id))
         if entry.id == result.changed_entry_ids[0]
     )
     assert entry.sources[0].evidence_rank == 5
@@ -2390,7 +2394,7 @@ async def test_agent_correction_language_remains_agent_evidence(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_newer_correction_can_replace_older_correction(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     added, _ = await _run(
         registry,
         project_id,
@@ -2425,7 +2429,7 @@ async def test_newer_correction_can_replace_older_correction(tmp_path: Path) -> 
     )
     assert result.changed_entry_ids == (target,)
     stored = next(
-        entry for entry in _entries(registry, project_id) if entry.id == target
+        entry for entry in (await asyncio.to_thread(_entries, registry, project_id)) if entry.id == target
     )
     assert stored.text == "Use SQLite."
 
@@ -2434,7 +2438,7 @@ async def test_newer_correction_can_replace_older_correction(tmp_path: Path) -> 
 async def test_entry_state_round_trip_preserves_computed_evidence_rank(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     await _run(
         registry,
         project_id,
@@ -2442,7 +2446,7 @@ async def test_entry_state_round_trip_preserves_computed_evidence_rank(
         [_proposal(_add("decisions", "Use Postgres."))],
         key="round-trip-rank",
     )
-    state = registry._entry_memory_state(project_id).state
+    state = (await asyncio.to_thread(registry._entry_memory_state, project_id)).state
     restored = state_from_bytes(canonical_state_bytes(state))
     entry = next(
         value for value in restored.entries.values() if isinstance(value, MemoryEntry)
@@ -2461,7 +2465,8 @@ async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
         fired_at.append(clock.now)
         return _proposal()
 
-    runner, _, _ = _auto_runner(
+    runner, _, _ = await asyncio.to_thread(
+        _auto_runner,
         tmp_path, invoke, clock=clock, debounce_seconds=60
     )
     rows: list[dict[str, object]] = []
@@ -2471,13 +2476,13 @@ async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
         _write_session(runner.session_dir, *rows)
         runner.activity(seq + 1)
         while runner.state.early_trigger_seq < seq + 1:
-            await asyncio.sleep(0)
+            await await_or_fail(asyncio.sleep(0), what="early trigger update")
         while runner._seen_activity_generation < runner._activity_generation:
-            await asyncio.sleep(0)
+            await await_or_fail(asyncio.sleep(0), what="activity generation update")
         await await_or_fail(runner._drained.wait(), what="runner._drained.wait()")
         clock.now += 30
     for _ in range(10):
-        await asyncio.sleep(0)
+        await await_or_fail(asyncio.sleep(0), what="reconciliation settle")
     try:
         assert fired_at == [300, 600]
     finally:
