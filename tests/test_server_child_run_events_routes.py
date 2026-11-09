@@ -690,7 +690,12 @@ async def test_delegated_child_approval_round_trip_on_parent_and_child_streams(
             backend.release["child-work"].set()
             await await_or_fail(backend.entered["grand-work"].wait(), what="nested child started")
         child = await serve.observer()
-        child_stream = (await serve.join(child, target))["replay"]["stream_id"]
+        joined = await child.request(
+            serve.request_id(), "child_run_events", {"session_id": session_id, "run_id": target}
+        )
+        # a nested run is joinable by its run id, with its own current row
+        assert joined.get("result", {}).get("child", {}).get("run_id") == target, joined
+        child_stream = joined["result"]["replay"]["stream_id"]
         backend.release_all()
 
         parent_events = await _until(parent, "approval_request")
