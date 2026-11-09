@@ -925,40 +925,28 @@ class ToolRegistry:
             policy.bind_capability_resolver(self.resolve_tool_call_capability)
 
     async def prepare_tool_call(self, tool_call: ToolCall) -> ToolCall:
-        """Prepare one call once before approval, persistence, and execution."""
-
+        """Prepare one call before approval, persistence, and execution."""
         definition = self._tools.get(tool_call.name)
         if definition is None:
             return tool_call
         prepare_rules = getattr(self.approval_policy, "prepare_rules", None)
         if prepare_rules is not None:
-            await prepare_rules(lambda rule: self._prepare_approval_rule(rule))
+            await prepare_rules(self._prepare_approval_rule)
         if definition.call_preparer is None:
             return tool_call
         return await definition.call_preparer(tool_call)
 
     async def _prepare_approval_rule(self, rule: ApprovalRule) -> ApprovalRule:
         resolved = self.resolve_approval_rule(rule)
-        if resolved.tool != "inbox" or resolved.subject_pattern is None:
-            return resolved
-        definition = self._tools.get("inbox")
-        if definition is None:
-            return resolved
-        action = resolved.action
         subject = resolved.subject_pattern
-        if action != "send" or not isinstance(subject, str):
+        if resolved.tool != "inbox" or resolved.action != "send" or not isinstance(subject, str):
             return resolved
         from ..project_registry import resolve_project_ref
         from ..project_schema import PROJECT_ID_PATTERN
-
         if PROJECT_ID_PATTERN.fullmatch(subject) or self.project_registry is None:
             return resolved
-        project_id = await asyncio.to_thread(
-            resolve_project_ref, self.project_registry, subject
-        )
-        if project_id is None:
-            return resolved
-        return replace(resolved, subject_pattern=project_id)
+        project_id = await asyncio.to_thread(resolve_project_ref, self.project_registry, subject)
+        return resolved if project_id is None else replace(resolved, subject_pattern=project_id)
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
