@@ -929,7 +929,10 @@ class ConnectionRegistry(ReplayOutput):
         return await self.run_read(connection, lambda: settings.catalog(connection.server.runtime))
 
     async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
-        return await self.run_read(connection, lambda: settings.settings(connection.server.runtime))
+        runtime = connection.server.runtime
+        if runtime.opened is None:
+            raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
+        return await self.run_read(connection, lambda: settings.settings(runtime))
 
     async def read_status(self, connection: Any, status: dict[str, Any], session_id: str | None) -> object:
         features = self._connections[connection].features
