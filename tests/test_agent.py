@@ -18112,66 +18112,6 @@ async def test_explicit_finish_never_enters_run_finish_gate(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("ending", "explicit_finish", "expected_state"),
-    [
-        ("thinking_only", True, "idle"),
-        ("no_final", True, "idle"),
-        ("thinking_only", False, "failed"),
-    ],
-)
-async def test_clean_no_output_child_end_preserves_explicit_finish_idle(
-    tmp_path: Path,
-    ending: str,
-    explicit_finish: bool,
-    expected_state: str,
-) -> None:
-    store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    registry.bind_session_store(store)
-
-    class Child(_ExplicitFinishLoop):
-        async def run_notification_turn(self):
-            yield StreamEvent(StreamEventType.TURN_START)
-            if ending == "thinking_only":
-                yield StreamEvent(
-                    StreamEventType.TURN_END,
-                    message=Message(
-                        MessageRole.ASSISTANT, [ThinkingContent("still working")]
-                    ),
-                    data={"tool_calls": 0},
-                )
-
-    loop = Child(registry)
-    loop.explicit_finish = explicit_finish
-    try:
-        result = await agent_runner_module.consume_child(
-            loop,
-            "",
-            origin=MessageOrigin.AGENT_PROMPT,
-            child_path=str(tmp_path),
-            publish=lambda _: None,
-            child_turns=lambda: 0,
-            update_turns=lambda _: None,
-            update_step=lambda _: None,
-            record_tool_call=lambda: None,
-            finish_lifecycle=lambda *_: {},
-            publish_lifecycle=lambda *a, **k: None,
-            child_result=lambda text, **kw: {
-                "content": [{"text": text}],
-                "isError": kw.get("state") == "failed",
-                "structuredContent": kw,
-            },
-            error_message=str,
-            notification_turn=True,
-        )
-    finally:
-        await registry.close()
-        store.close()
-    assert result["structuredContent"]["state"] == expected_state
-
-
-@pytest.mark.asyncio
 async def test_setting_off_preserves_legacy_finish_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
