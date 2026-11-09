@@ -816,6 +816,9 @@ class ConnectionRegistry:
             except RuntimeError:
                 if not self.loop.is_closed():
                     raise
+                # The loop cannot receive the result now. Cancel the awaiter
+                # directly so shutdown does not retain this read forever.
+                future.cancel()
 
     @staticmethod
     def _read_done(
