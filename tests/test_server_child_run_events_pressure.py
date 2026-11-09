@@ -26,10 +26,12 @@ from tests.support.replay_transport import (
 )
 from zeta.core import agent_progress
 from zeta.core.agent_progress import publish_child_ended, remove_live_agent_lifecycle
+from zeta.core.child_run_row import project_child_run_row
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolResult
 from zeta.server import ZetaServer
-from zeta.server.protocol import EventDescriptor
+from zeta.server.child_history import BASELINE_ROW_RESERVE
+from zeta.server.protocol import MAX_FRAME_BYTES, EventDescriptor
 from zeta.server.server import _Client
 from zeta.server.session_replay import (
     REPLAY_SCOPE_MAX_BYTES,
@@ -754,3 +756,35 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
         for store in restarted:
             store.close()
         await second.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_join_of_a_full_newest_page_with_63_busy_children_fits_one_frame(
+    tmp_path: Path, transport: Transport
+) -> None:
+    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
+        assert server.connections is not None
+        _push_older(server.runtime.opened.store)
+        runs = [f"{session_id}:{n}" for n in range(1, BUSY_CHILDREN + 1)]
+        for run_id in runs:
+            _start_child(server, stores, run_id).update_agent_lifecycle(current_step="busy")
+        await _lifecycle_applied(server)
+        joined = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})
+        assert joined.get("error") is None, "the snapshot rows overflowed the join response"
+        assert _wire_size(joined) <= MAX_FRAME_BYTES
+        messages = joined["result"]["messages"]
+        assert joined["result"]["next_before"] is not None, "the page was not full"
+        assert _rows(messages, "child_started") == runs
+        snapshot = [row for row in messages if row.get("event") == "child_progress"]
+        assert [row["run_id"] for row in snapshot] == runs
+        # each reserve covers the largest snapshot row a start can add
+        projection = server.connections.child_runs
+        run_id = f"{session_id}:" + "9" * (255 - len(session_id))
+        projection.sink("progress", run_id, project_child_run_row(
+            _maximal_lifecycle(run_id), accepts_follow_ups=True
+        ), 2**63 - 1)
+        await _lifecycle_applied(server)
+        start = {"event": "child_started", "session_id": session_id, "run_id": run_id, "sequence": 2**63 - 1}
+        largest = projection.with_baseline({"messages": [start]})["messages"][1]
+        assert _wire_size(largest) <= BASELINE_ROW_RESERVE

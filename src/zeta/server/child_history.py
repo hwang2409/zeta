@@ -12,7 +12,15 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ..core.child_run_row import child_run_row, started_child_run_row
+from ..core.child_run_row import (
+    MAX_CHILD_RUN_ROW_BYTES,
+    child_run_row,
+    started_child_run_row,
+)
+
+# the most a live join's snapshot adds after one start row: its event-shaped
+# child_progress row (the bounded row plus routing ids, sequence, and revision) and a comma
+BASELINE_ROW_RESERVE = MAX_CHILD_RUN_ROW_BYTES + 1_024
 
 
 def started_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any:
@@ -87,3 +95,8 @@ def history_rows(entry: Any) -> list[dict[str, object]]:
             "child": row,
         }
     ]
+
+
+def baseline_reserve(group: tuple[dict[str, object], ...]) -> int:
+    """Page bytes to keep free so a join can add each start row's snapshot row."""
+    return BASELINE_ROW_RESERVE * sum(row.get("event") == "child_started" for row in group)
