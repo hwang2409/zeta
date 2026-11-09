@@ -11887,10 +11887,6 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
         assert server._client is not None and server.runtime.loop is not None
         first_client = server._client
         second_client = _Client(server, asyncio.StreamReader(), writer)
-        second_client.handshaken = True
-        second_client.role = first_client.role
-        second_client.protocol_version = first_client.protocol_version
-        second_client.features = first_client.features
         original_commit = account_session_module.SessionAccountContext._commit_locked
         event_loop = asyncio.get_running_loop()
         rename_tasks: list[asyncio.Task[object]] = []
