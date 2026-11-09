@@ -170,6 +170,44 @@ def write_session_file(
             pass
 
 
+def write_session_file_if_absent(
+    directory_fd: int, name: str, data: bytes
+) -> bool:
+    """Atomically publish bytes only when the destination does not exist."""
+    _component(name)
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    fd = open_session_file(
+        directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    )
+    try:
+        try:
+            stream = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            return False
+        os.fsync(directory_fd)
+        return True
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
 def write_json_file(
     directory_fd: int, name: str, value: object, *, sync: bool = True
 ) -> None:

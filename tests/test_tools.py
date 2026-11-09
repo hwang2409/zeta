@@ -2016,7 +2016,11 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
     real_wait = bash_module.asyncio.wait
 
-    async def forced_tie(tasks, *, return_when):
+    async def forced_tie(tasks, *, return_when, **kwargs):
+        # bash_module.asyncio is the shared module: the handler owner's own wait
+        # (it passes timeout=, bash does not) must stay real.
+        if kwargs:
+            return await real_wait(tasks, return_when=return_when, **kwargs)
         await asyncio.sleep(0.1)
         abort_signal.abort()
         await asyncio.sleep(0)

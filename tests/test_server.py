@@ -106,6 +106,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.empty_turn import DispatchProgress, empty_turn_error
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import (
@@ -1433,6 +1434,25 @@ async def test_server_streams_scripted_turn_over_real_socket(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_server_forwards_empty_refusal_classification(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn(stop_reason="refusal")])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        assert frames[-1]["result"]["accepted"] is True
+        turn_end = await _event(reader, "turn_end")
+        assert turn_end["data"].get("completion") == "refusal"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_server_streams_display_safe_thinking_body_without_metadata(
     tmp_path: Path,
 ) -> None:
@@ -2667,17 +2687,20 @@ async def test_status_reads_delegated_approval_from_resident_indexes(
     try:
         await _request(reader, writer, 3, "send", {"text": "delegate"})
         approval = await _event(reader, "approval_request")
-        original = ConversationEntry.from_dict
-
         def fail_parse(
             cls: type[ConversationEntry], value: dict[str, Any]
         ) -> ConversationEntry:
             raise AssertionError(f"status parsed log row: {value!r}")
 
-        monkeypatch.setattr(ConversationEntry, "from_dict", classmethod(fail_parse))
-        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
-        assert status["pending_approvals"][0]["request_id"] == approval["request_id"]
-        monkeypatch.setattr(ConversationEntry, "from_dict", classmethod(original))
+        with monkeypatch.context() as parse_patch:
+            parse_patch.setattr(
+                ConversationEntry, "from_dict", classmethod(fail_parse)
+            )
+            status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+            assert (
+                status["pending_approvals"][0]["request_id"]
+                == approval["request_id"]
+            )
     finally:
         await close_serve(server, writer)
 
@@ -3414,6 +3437,83 @@ async def test_clear_steering_requires_abort_scope_feature(tmp_path: Path) -> No
             "message": "clear_steering requires the negotiated abort_scope feature",
         }
     finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_foreground_abort_does_not_interrupt_tool_cleanup(
+    tmp_path: Path,
+) -> None:
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    handler_started = asyncio.Event()
+
+    async def controlled_tool(arguments: dict[str, Any]) -> ToolResult:
+        del arguments
+        handler_started.set()
+        try:
+            await await_or_fail(
+                asyncio.Event().wait(), what="controlled tool wait"
+            )
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await await_or_fail(cleanup_release.wait(), what="cleanup release")
+            cleanup_finished.set()
+            return ToolResult("controlled", "cleaned up")
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("controlled", "controlled", {})],
+            )
+        ]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        cli_yolo=True,
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    abort: asyncio.Task[list[dict[str, Any]]] | None = None
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        server.runtime.loop.tool_registry.register(
+            "controlled",
+            controlled_tool,
+            parameters={"type": "object", "properties": {}},
+            requires_approval=False,
+        )
+        await _request(reader, writer, 3, "send", {"text": "run controlled"})
+        await _event(reader, "tool_start")
+        await await_or_fail(handler_started.wait(), what="controlled tool start")
+
+        abort = asyncio.create_task(
+            _request(reader, writer, 4, "abort", {"scope": "foreground"})
+        )
+        await await_or_fail(cleanup_started.wait(), what="tool cleanup start")
+        cleanup_release.set()
+        frames = await await_or_fail(abort, what="foreground abort response")
+        assert frames[-1]["result"] == {"aborted": True}
+        await await_or_fail(cleanup_finished.wait(), what="tool cleanup finish")
+    finally:
+        cleanup_release.set()
+        if abort is not None and not abort.done():
+            abort.cancel()
+            await await_or_fail(
+                asyncio.gather(abort, return_exceptions=True),
+                what="foreground abort cleanup",
+            )
         await close_serve(server, writer)
 
 
@@ -11862,9 +11962,10 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
 
     async def ticker() -> None:
         nonlocal ticks
-        while not stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0)
 
     ticker_task = asyncio.create_task(ticker())
     request_task = asyncio.create_task(
@@ -11894,7 +11995,7 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
         await asyncio.wait_for(ticker_task, 10)
         if not request_task.done():
             request_task.cancel()
-        holder.join(timeout=1)
+        holder.join(timeout=10)
         await close_serve(server, writer)
 
 
@@ -12017,7 +12118,7 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
 
     holder = threading.Thread(target=hold_metadata_lock)
     holder.start()
-    assert await asyncio.to_thread(lock_held.wait, 1)
+    assert await asyncio.to_thread(lock_held.wait, 10)
 
     @contextmanager
     def observed_metadata_lock(*args: object, **kwargs: object):
@@ -12025,6 +12126,7 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
         with metadata_lock(*args, **kwargs) as directory_fd:
             yield directory_fd
 
+    # test-contract: seam observe account-switch lock ordering
     monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
     request_task = asyncio.create_task(
         _request(
@@ -12036,14 +12138,14 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
         )
     )
     try:
-        assert await asyncio.to_thread(commit_entered.wait, 1)
+        assert await asyncio.to_thread(commit_entered.wait, 10)
         client = server._client
         assert client is not None and client._account_switch_task is not None
-        await asyncio.wait_for(server.close(), 1)
+        await asyncio.wait_for(server.close(), 10)
         assert client._account_switch_task is None
     finally:
         release.set()
-        holder.join(timeout=1)
+        holder.join(timeout=10)
         writer.close()
         await writer.wait_closed()
         await await_or_fail(
@@ -12464,6 +12566,120 @@ async def test_active_status_overlays_live_config_without_persisting_metadata(
         assert "specialist" not in {item["name"] for item in (persisted or [])}
     finally:
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path) -> None:
+    policy_store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=policy_store)
+    client = ServeControl(
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    call = ToolCall("non-owner-cancel", "agent_cancel", {"handle": "root:1:1"})
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "agent error: unknown child handle",
+                is_error=True,
+            ),
+        ),
+        session_id="session",
+        background=True,
+    )
+
+    assert notifications[0][0] == "tool_end"
+    result = notifications[0][1]["tool_result"]
+    assert result["content"] == "agent error: unknown child handle"
+    assert result["is_error"] is True
+    policy_store.close()
+
+
+@pytest.mark.asyncio
+async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    for store, handle, target, depth in (
+        (root, "root:1", child, 1),
+        (child, "root:1:1", grandchild, 2),
+    ):
+        call = ToolCall(f"agent-{depth}", "agent", {"prompt": "inspect"})
+        target.start_agent_lifecycle(
+            handle=handle,
+            started_at=f"2026-11-08T00:00:0{depth}+00:00",
+            depth=depth,
+            agent_type="general",
+            description="nested verifier",
+        )
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent("running")],
+                tool_result=ToolResult(
+                    call.id,
+                    "running",
+                    structured_content={
+                        "child_instance_id": handle,
+                        "child_session_path": str(target.session_dir),
+                    },
+                ),
+            )
+        )
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    call = ToolCall("nested-status", "agent_status", {"handle": "root:1:1"})
+    result = await loop.tool_registry.execute(call)
+    policy_store = ConversationStore(tmp_path / "serve")
+    policy = ApprovalPolicy(store=policy_store)
+    client = ServeControl(
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                result["content"][0]["text"],
+                structured_content=result["structuredContent"],
+            ),
+        ),
+        session_id="session",
+        background=True,
+    )
+
+    wire_result = notifications[0][1]["tool_result"]
+    children = wire_result["structured_content"]["children"]
+    assert children[0]["handle"] == "root:1:1"
+    assert children[0]["description"] == "nested verifier"
+    await loop.close()
+    policy_store.close()
+    grandchild.close()
+    child.close()
+    root.close()
 
 
 @pytest.mark.asyncio

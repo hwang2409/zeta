@@ -1127,6 +1127,78 @@ def test_inflight_refresh_cannot_repopulate_unbound_project(
     assert index.search("binding canary") == ()
 
 
+def test_unbound_only_project_backfills_once_then_stays_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "demo", str(tmp_path))
+    # a linked session whose dir has no meta.json is indexable (no
+    # attention_fork.json) but unbound, so the rebuild publishes zero cursors
+    # and the index stays ready-but-empty.
+    session_dir = home / "sessions" / "ghost"
+    session_dir.mkdir(parents=True)
+    (session_dir / "conversation.jsonl").write_text(
+        json.dumps(_row(1, "user", "ghost canary")) + "\n", encoding="utf-8"
+    )
+    registry.record_session(
+        project.project_id,
+        session_id="ghost",
+        transcript_path=str(session_dir),
+    )
+
+    first = index_module.open_project_index(registry, project.project_id)
+    assert first.status().session_count == 0
+    assert first.status().generation == 1
+
+    second = index_module.open_project_index(registry, project.project_id)
+    assert second.status().session_count == 0
+    # on base 545bd02a the ready-but-empty re-trigger rebuilds on every open,
+    # so generation would be 2 here; the generation-0 gate keeps it at 1.
+    assert second.status().generation == 1
+
+
+def test_legacy_generation_zero_empty_file_backfills_bound_source_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "demo", str(tmp_path))
+    project_dir = registry.root / project.project_id
+    # a legacy #1123 build left an empty v5 file at generation 0.
+    TranscriptIndex(project_dir, project.project_id)
+
+    session_dir = home / "sessions" / "bound"
+    session_dir.mkdir(parents=True)
+    (session_dir / "conversation.jsonl").write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                _row(1, "user", "bound canary"),
+                _row(2, "assistant", "answer", state="completed"),
+            )
+        ),
+        encoding="utf-8",
+    )
+    (session_dir / "meta.json").write_text(
+        json.dumps({"project_id": project.project_id}), encoding="utf-8"
+    )
+    registry.record_session(
+        project.project_id,
+        session_id="bound",
+        transcript_path=str(session_dir),
+    )
+
+    first = index_module.open_project_index(registry, project.project_id)
+    assert first.search("bound canary")
+    assert first.status().generation == 1
+
+    second = index_module.open_project_index(registry, project.project_id)
+    assert second.status().generation == 1
+
+
 def test_version_mismatch_refuses_old_rows_and_rebuild_restores(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
