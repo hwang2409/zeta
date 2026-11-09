@@ -57,10 +57,10 @@ class SessionReferenceGate:
 
     @contextmanager
     def _locked(self, *, exclusive: bool):
-        require_off_loop_lock("session reference authority", SessionError)
         if not self._enabled():
             yield self
             return
+        require_off_loop_lock("session reference authority", SessionError)
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         with domain_authority(
             self.home, RETENTION_HOME_ID, "references", exclusive=exclusive
@@ -101,9 +101,15 @@ class SessionReferenceGate:
             return 0
         path = self.home / _SESSION_REFERENCE_GENERATION
         try:
-            value = int(path.read_text(encoding="ascii"))
-        except (FileNotFoundError, ValueError):
+            raw = path.read_text(encoding="ascii")
+        except FileNotFoundError:
             value = 0
+        else:
+            if not raw.endswith("\n") or not raw[:-1].isdigit():
+                raise SessionError("session reference generation is malformed")
+            value = int(raw[:-1])
+            if value > 2**63 - 2:
+                raise SessionError("session reference generation is out of range")
         value += 1
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
