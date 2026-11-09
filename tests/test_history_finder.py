@@ -123,7 +123,7 @@ def test_runtime_guard_rejects_finder_attribute_probes() -> None:
 
 
 def _finder(history: SessionPromptHistory, path: str, *, on_accept=None) -> HistoryFinder:
-    return HistoryFinder(lambda: None, lambda: history.snapshot(path), on_accept=on_accept)
+    return HistoryFinder(lambda: history.snapshot(path), on_accept=on_accept)
 
 
 async def _open(finder: HistoryFinder, buffer: Buffer) -> None:
