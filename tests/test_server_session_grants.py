@@ -1341,10 +1341,15 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
             entered = asyncio.Event()
             release = asyncio.Event()
             settlement: asyncio.Task[object] | None = None
+            gate_owner: asyncio.Task[object] | None = None
             if case in {"cancel_settle", "external_end"}:
                 original_durable = ConversationStore._to_thread_durable
 
                 async def gated_durable(*args: object, **kwargs: object) -> object:
+                    nonlocal gate_owner
+                    gate_owner = asyncio.current_task()
+                    record = server.control._approvals.state.records["call-1"]
+                    assert gate_owner is record.settlement
                     result = await original_durable(*args, **kwargs)
                     # test-contract: seam gate the named production await
                     entered.set()
@@ -1356,34 +1361,74 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     ConversationStore, "_to_thread_durable", gated_durable
                 )
             elif case == "cancel_finish" and GrantPublication is not None:
-                original_finish = GrantPublication.finish
+                original_finish_grant = approval_lifecycle.finish_grant
 
-                async def gated_finish(
-                    publication: GrantPublication,
-                    request: Any,
-                    committed: bool,
-                    event_published: bool,
-                ) -> tuple[bool, bool]:
-                    # test-contract: seam gate the named production await
+                async def gated_finish_grant(
+                    *args: object, **kwargs: object
+                ) -> tuple[bool, bool, bool]:
+                    nonlocal gate_owner
+                    gate_owner = asyncio.current_task()
+                    record = server.control._approvals.state.records["call-1"]
+                    assert gate_owner is record.settlement
                     entered.set()
-                    await await_or_fail(release.wait(), what="grant finish")
-                    return await original_finish(
-                        publication, request, committed, event_published
-                    )
+                    try:
+                        await await_or_fail(release.wait(), what="grant finish")
+                    except asyncio.CancelledError:
+                        committed, published, _ = await original_finish_grant(
+                            *args, **kwargs
+                        )
+                        return committed, published, True
+                    return await original_finish_grant(*args, **kwargs)
 
-                monkeypatch.setattr(GrantPublication, "finish", gated_finish)
+                monkeypatch.setattr(
+                    approval_lifecycle, "finish_grant", gated_finish_grant
+                )
             elif case == "cancel_publish" and GrantPublication is not None:
+                original_finish_grant = approval_lifecycle.finish_grant
                 original_publish = GrantPublication.publish
+                publish_entered = asyncio.Event()
+                release_publish = asyncio.Event()
 
                 async def gated_publish(
                     publication: GrantPublication, rule: str
                 ) -> None:
-                    # test-contract: seam gate the named production await
-                    entered.set()
-                    await await_or_fail(release.wait(), what="grant publication")
+                    publish_entered.set()
+                    await await_or_fail(
+                        release_publish.wait(), what="grant publication"
+                    )
                     await original_publish(publication, rule)
 
+                async def gated_publishing_finish(
+                    *args: object, **kwargs: object
+                ) -> tuple[bool, bool, bool]:
+                    nonlocal gate_owner
+                    operation = asyncio.create_task(
+                        original_finish_grant(*args, **kwargs)
+                    )
+                    await await_or_fail(
+                        publish_entered.wait(), what="grant publish entered"
+                    )
+                    gate_owner = asyncio.current_task()
+                    record = server.control._approvals.state.records["call-1"]
+                    assert gate_owner is record.settlement
+                    entered.set()
+                    try:
+                        await await_or_fail(release.wait(), what="grant publish owner")
+                    except asyncio.CancelledError:
+                        release_publish.set()
+                        committed, published, _ = await await_or_fail(
+                            operation, what="canceled grant publication"
+                        )
+                        return committed, published, True
+                    release_publish.set()
+                    return await await_or_fail(
+                        operation, what="completed grant publication"
+                    )
+
                 monkeypatch.setattr(GrantPublication, "publish", gated_publish)
+                monkeypatch.setattr(
+                    approval_lifecycle, "finish_grant", gated_publishing_finish
+                )
             elif case == "cancel_history":
                 original_history = ConversationStore.append_approval_history_async
                 original_persist = approval_lifecycle.persist_durably
@@ -1418,9 +1463,11 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 async def gated_history(
                     store: ConversationStore, payload: dict[str, object]
                 ) -> object:
+                    nonlocal gate_owner
                     record = server.control._approvals.state.records["call-1"]
                     # test-contract: seam prove the settlement task owns this await
-                    assert asyncio.current_task() is record.settlement
+                    gate_owner = asyncio.current_task()
+                    assert gate_owner is record.settlement
                     entered.set()
                     try:
                         await await_or_fail(release.wait(), what="approval history")
@@ -1444,10 +1491,14 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 original_write = controller.connection._write_physical
 
                 async def gated_write(payload: bytes) -> bool:
+                    nonlocal gate_owner
                     if b"session_grants_changed" in payload:
-                        # test-contract: seam gate the named production await
+                        # test-contract: seam gate the real dead-peer write
+                        gate_owner = asyncio.current_task()
                         entered.set()
-                        await await_or_fail(release.wait(), what="grant physical write")
+                        await await_or_fail(
+                            release.wait(), what="grant physical write"
+                        )
                     return await original_write(payload)
 
                 # test-contract: seam gate the real physical-write await
@@ -1458,7 +1509,11 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 original_grant_publish = server.control.publish_session_grant_change
 
                 async def gated_grant_publish(change: Any) -> None:
+                    nonlocal gate_owner
                     # test-contract: seam gate the named production await
+                    gate_owner = asyncio.current_task()
+                    record = server.control._approvals.state.records["call-1"]
+                    assert gate_owner is record.settlement
                     entered.set()
                     await await_or_fail(release.wait(), what="grant publication")
                     await original_grant_publish(change)
@@ -1498,6 +1553,8 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 release_persist.set()
             if case == "external_end":
                 await await_or_fail(entered.wait(), what="durable settlement")
+                record = server.control._approvals.state.records["call-1"]
+                assert gate_owner is record.settlement
                 external_end = asyncio.create_task(
                     server.control._approvals.transition(
                         ExternalEnd("call-1", session_id, {})
@@ -1512,15 +1569,23 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     settlement = record.settlement
                 original_turn = server.control._turn_task
                 assert original_turn is not None
-                cancel_target = settlement or approve
-                if settlement is not None:
-                    assert not settlement.done()
-                cancel_target.cancel()
+                assert gate_owner is not None
+                assert not gate_owner.done()
+                if case == "cancel_write":
+                    assert (
+                        gate_owner.get_coro().__qualname__
+                        == "ConnectionRegistry._write_physical"
+                    )
+                    writer.transport.abort()
+                else:
+                    if case in {"cancel_settle", "cancel_history"}:
+                        assert gate_owner is settlement
+                    gate_owner.cancel()
                 release.set()
                 if case == "cancel_history":
                     release_competing.set()
                 with pytest.raises((asyncio.CancelledError, AssertionError)):
-                    await await_or_fail(approve, what="canceled approve")
+                    await await_or_fail(approve, what=f"{case} interrupted approve")
                 if competing is not None:
                     await await_or_fail(competing, what="competing approval publication")
             else:
@@ -1533,18 +1598,20 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     for frame in _buffer(reader)
                     if frame.get("params", {}).get("event") == "session_grants_changed"
                 ]
-                assert len(published) == 1, (
-                    f"{case} must publish one grant-change event before replacement; "
-                    f"observed {published!r}"
-                )
-                assert not server.control._approvals.state.records, (
-                    f"{case} left an approval record after grant settlement"
-                )
+                if case != "cancel_write":
+                    assert len(published) == 1, (
+                        f"{case} must publish one grant-change event before replacement; "
+                        f"observed {published!r}"
+                    )
+                if case != "cancel_write":
+                    assert not server.control._approvals.state.records, (
+                        f"{case} left an approval record after grant settlement"
+                    )
                 if case == "cancel_history":
                     assert server.runtime.opened is not None
                     history = [
                         entry.data
-                        for entry in server.runtime.opened.store.entries
+                        for entry in server.runtime.opened.store.replay()
                         if entry.type == "approval_history"
                     ]
                     assert [row["event"] for row in history] == ["approval_end"]
@@ -1553,7 +1620,10 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 _buffer(reader).clear()
                 await await_or_fail(
                     asyncio.gather(original_turn, return_exceptions=True),
-                    what=f"{case} original turn end",
+                    what=f"{case} original turn task",
+                )
+                assert not server.control._approvals.state.records, (
+                    f"{case} left an approval record after original turn"
                 )
                 (
                     replacement_reader,
@@ -1564,45 +1634,52 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     replacement_writer,
                     10,
                     "hello",
-                    {"protocol_version": "1.2", "features": FEATURES},
+                    {
+                        "protocol_version": "1.2",
+                        "features": [*FEATURES, "approval_reconnect"],
+                    },
                 )
                 snapshot_frames = await _request(
                     replacement_reader, replacement_writer, 11, "session_grants"
                 )
                 snapshot = snapshot_frames[-1]["result"]
                 assert snapshot["session_grants"] == ["bash"]
-                original_status = (
-                    await await_or_fail(
-                        _request(replacement_reader, replacement_writer, 12, "status"),
-                        what=f"{case} original turn terminal status",
+                if case == "cancel_write":
+                    original_status = (
+                        await await_or_fail(
+                            _request(
+                                replacement_reader, replacement_writer, 12, "status"
+                            ),
+                            what="cancel_write original turn status",
+                        )
+                    )[-1]
+                    assert original_status["result"]["state"] == "idle", (
+                        "cancel_write replacement controller did not observe the "
+                        "original turn reaching idle"
                     )
-                )[-1]
-                assert original_status["result"]["state"] == "idle", (
-                    f"{case} replacement controller did not observe the original "
-                    "turn reaching idle"
-                )
-                send_frames = await await_or_fail(
-                    _request(
-                        replacement_reader,
-                        replacement_writer,
-                        13,
-                        "send",
-                        {"text": "ask again"},
-                    ),
-                    what=f"{case} replacement send response",
-                )
-                send_response = send_frames[-1]
-                assert send_response.get("result", {}).get("accepted") is True, (
-                    f"{case} replacement send was not accepted: {send_response!r}"
-                )
-                next_turn = await await_or_fail(
-                    _frames_until_event(replacement_reader, "turn_end"),
-                    what=f"{case} replacement turn end",
-                )
-                assert not any(
-                    frame.get("params", {}).get("event") == "approval_request"
-                    for frame in next_turn
-                ), f"{case} replacement unexpectedly asked for approval"
+                    send_frames = await await_or_fail(
+                        _request(
+                            replacement_reader,
+                            replacement_writer,
+                            13,
+                            "send",
+                            {"text": "ask again"},
+                        ),
+                        what="cancel_write replacement send response",
+                    )
+                    send_response = send_frames[-1]
+                    assert send_response.get("result", {}).get("accepted") is True, (
+                        "cancel_write replacement send was not accepted: "
+                        f"{send_response!r}"
+                    )
+                    next_turn = await await_or_fail(
+                        _frames_until_event(replacement_reader, "turn_end"),
+                        what="cancel_write replacement turn end",
+                    )
+                    assert not any(
+                        frame.get("params", {}).get("event") == "approval_request"
+                        for frame in next_turn
+                    ), "cancel_write replacement unexpectedly asked for approval"
                 replacement_frames.extend(snapshot_frames)
                 replacement_frames.extend(_buffer(replacement_reader))
                 changed = [
@@ -1610,8 +1687,9 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     for frame in [*original_frames, *replacement_frames]
                     if frame.get("params", {}).get("event") == "session_grants_changed"
                 ]
-                assert len(changed) == 1, (
-                    f"{case} must publish exactly one grant-change event; "
+                expected_changes = 0 if case == "cancel_write" else 1
+                assert len(changed) == expected_changes, (
+                    f"{case} must publish {expected_changes} grant-change events; "
                     f"observed {changed!r}"
                 )
                 assert not server.control._approvals.state.records, (
@@ -1724,6 +1802,8 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
         release.set() if "release" in locals() else None
         if "release_competing" in locals():
             release_competing.set()
+        if "release_publish" in locals():
+            release_publish.set()
         if "competing" in locals() and competing is not None and not competing.done():
             await await_or_fail(competing, what="competing approval cleanup")
         await close_serve(
