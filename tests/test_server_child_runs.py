@@ -18,6 +18,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.providers.completion import owned_completion
 from zeta.server.server import ZetaServer
 
 
@@ -26,6 +27,7 @@ class _ObservedChildBackend(PerActorFakeBackend):
         super().__init__(*args, **kwargs)
         self.follow_up_started = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         if any(
             isinstance(block, TextContent) and block.text == "continue"
@@ -33,7 +35,10 @@ class _ObservedChildBackend(PerActorFakeBackend):
             for block in message.content
         ):
             self.follow_up_started.set()
-        async for event in super().complete(messages, tool_schemas):
+        stream = PerActorFakeBackend.complete.__wrapped__(
+            self, messages, tool_schemas
+        )
+        async for event in stream:
             yield event
 
 
@@ -120,6 +125,60 @@ def test_child_run_rows_keep_top_level_and_parent_identity(tmp_path: Path) -> No
     finally:
         nested.close()
         direct.close()
+        root.close()
+
+
+def test_child_run_tool_count_is_cumulative_across_follow_up_segments(
+    tmp_path: Path,
+) -> None:
+    from zeta.core.child_runs import child_run_rows
+
+    root = ConversationStore(tmp_path / "sessions", session_id="top")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="top:1",
+        started_at="2026-11-08T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="worker",
+    )
+    call = ToolCall(
+        "call-top:1",
+        "agent",
+        {"prompt": "inspect", "description": "worker", "background": True},
+    )
+    root.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    root.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("ok")],
+            tool_result=ToolResult(
+                "call-top:1",
+                "ok",
+                structured_content={
+                    "child_session_path": str(child.session_dir),
+                    "child_instance_id": "top:1",
+                },
+            ),
+        )
+    )
+    running = frozenset({"top:1"})
+    try:
+        child.update_agent_lifecycle(
+            turns_used=1, tool_calls=2, current_step="first", state="running"
+        )
+        [first] = child_run_rows(root, running_handles=running)
+        assert first["tool_count"] == 2
+        # a follow-up segment adds more tool calls; the whole-run total is
+        # cumulative and must never decrease across the segment boundary.
+        child.update_agent_lifecycle(
+            turns_used=2, tool_calls=3, current_step="second", state="running"
+        )
+        [second] = child_run_rows(root, running_handles=running)
+        assert second["tool_count"] == 5
+        assert second["tool_count"] >= first["tool_count"]
+    finally:
+        child.close()
         root.close()
 
 
@@ -256,6 +315,7 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
         [after] = listed_again["result"]["runs"]
         assert after["run_id"] == run_id
         assert after["turns_used"] > before["turns_used"]
+        assert after["tool_count"] >= before["tool_count"]
     finally:
         backend.release_children.set()
         await client.close()
