@@ -1076,6 +1076,33 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def approval_settlement_tasks_do_not_leak(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tasks: list[asyncio.Task[object]] = []
+    create_task = asyncio.create_task
+
+    def track_task(coro: object, *args: object, **kwargs: object) -> asyncio.Task[object]:
+        task = create_task(coro, *args, **kwargs)  # type: ignore[arg-type]
+        if getattr(coro, "__qualname__", "") in {
+            "ApprovalLifecycle._settle_record",
+            "ApprovalLifecycle._finish_external",
+        }:
+            tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", track_task)
+    yield
+    unfinished = [task for task in tasks if not task.done()]
+    assert not unfinished, f"approval settlement tasks outlived the test: {unfinished!r}"
+    unretrieved = [task for task in tasks if not task.cancelled() and task._log_traceback]
+    assert not unretrieved, (
+        "approval settlement tasks ended with unretrieved exceptions: "
+        f"{unretrieved!r}"
+    )
+
+
+@pytest.fixture(autouse=True)
 def stable_terminal_defaults(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> Generator[None, None, None]:

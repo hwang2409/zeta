@@ -21,12 +21,20 @@ from .approval_settlement.approval_grants import (
     finish_grant,
 )
 from .connections import Admission
-from .protocol import ApprovalDecision, ErrorDescriptor, EventDescriptor, ProtocolError
+from .protocol import (
+    FRAME_CANCEL_GRACE,
+    ApprovalDecision,
+    ErrorDescriptor,
+    EventDescriptor,
+    ProtocolError,
+)
 
 Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
 
 logger = logging.getLogger(__name__)
+
+APPROVAL_SETTLEMENT_CLOSE_TIMEOUT = FRAME_CANCEL_GRACE
 
 
 ApprovalKey = str | tuple[str, str]
@@ -189,7 +197,7 @@ class ApprovalLifecycle:
         self._is_closing = is_closing
         self._grant_published = grant_published
         self._state = ApprovalMachineState()
-        self._settlement_tasks: set[asyncio.Task[object]] = set()
+        self._settlement_tasks: dict[asyncio.Task[object], ApprovalKey] = {}
 
     @property
     def state(self) -> ApprovalMachineState:
@@ -534,24 +542,52 @@ class ApprovalLifecycle:
     def session_replaced(self) -> None:
         self.transition(Replace())
 
-    async def wait_for_approval_settlement(self) -> None:
-        while tasks := [
-            *self._settlement_tasks,
-            *(
-                record.settlement
-                for record in self._state.records.values()
-                if record.settlement is not None and not record.settlement.done()
-            ),
-        ]:
-            unique_tasks = set(tasks)
-            await asyncio.gather(*unique_tasks, return_exceptions=True)
-            self._settlement_tasks.difference_update(
-                task for task in unique_tasks if task.done()
+    async def wait_for_approval_settlement(
+        self, timeout: float = APPROVAL_SETTLEMENT_CLOSE_TIMEOUT
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self._settlement_tasks:
+            tasks = tuple(self._settlement_tasks)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(tasks, timeout=remaining)
+            for task in done:
+                task.result()
+            if pending:
+                break
+        if not self._settlement_tasks:
+            return
+        stuck = tuple(self._settlement_tasks)
+        logger.error(
+            "approval settlement tasks stuck during close",
+            extra={"approval_keys": [self._settlement_tasks[task] for task in stuck]},
+        )
+        for task in stuck:
+            task.cancel()
+        remaining = max(0.0, deadline - loop.time())
+        if remaining:
+            await asyncio.wait(stuck, timeout=remaining)
+
+    def _settlement_finished(self, task: asyncio.Task[object]) -> None:
+        key = self._settlement_tasks.pop(task, None)
+        if key is None or task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "approval settlement task failed",
+                extra={"approval_key": key, "cause": repr(error)},
+                exc_info=(type(error), error, error.__traceback__),
             )
 
-    def _start_settlement(self, operation: Awaitable[object]) -> asyncio.Task[object]:
+    def _start_settlement(
+        self, record: ApprovalRecord, operation: Awaitable[object]
+    ) -> asyncio.Task[object]:
         task = asyncio.create_task(operation)
-        self._settlement_tasks.add(task)
+        self._settlement_tasks[task] = record.target.key
+        task.add_done_callback(self._settlement_finished)
         return task
 
     def _new_record(self, target: _ApprovalTarget) -> ApprovalRecord:
@@ -602,14 +638,14 @@ class ApprovalLifecycle:
         else:
             return
         if record.disposition == "external":
-            task = self._start_settlement(self._finish_external(record))
+            task = self._start_settlement(record, self._finish_external(record))
             self._change(record, settlement=task)
         elif record.disposition != "active" or self._is_closing():
             reason = (
                 "turn_canceled" if record.disposition == "abort" else record.disposition
             )
             record = self._reserve_record(record, reason)
-            task = self._start_settlement(self._settle_record(record, "abort", reason))
+            task = self._start_settlement(record, self._settle_record(record, "abort", reason))
             self._change(record, settlement=task)
 
     def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
@@ -628,7 +664,7 @@ class ApprovalLifecycle:
                         settlements.append(reserved.settlement)
                     continue
                 task = self._start_settlement(
-                    self._settle_record(reserved, "abort", "child_cleanup")
+                    reserved, self._settle_record(reserved, "abort", "child_cleanup")
                 )
                 self._change(reserved, settlement=task)
                 settlements.append(task)
@@ -684,7 +720,7 @@ class ApprovalLifecycle:
         record = (
             self._change(record, grant=pending) if scope == "always_tool" else record
         )
-        settlement = self._start_settlement(self._settle_record(record, decision))
+        settlement = self._start_settlement(record, self._settle_record(record, decision))
         self._change(record, settlement=settlement)
         try:
             resolution = await approval_settlement.settlement_outcome(record.admitted, settlement)
@@ -858,7 +894,7 @@ class ApprovalLifecycle:
             record = reserved
         if record.phase == "starting":
             return record.admitted
-        settlement = self._start_settlement(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         return record.admitted
 
@@ -1166,7 +1202,7 @@ class ApprovalLifecycle:
             else "turn_canceled"
         )
         record = self._reserve_record(record, reason)
-        settlement = self._start_settlement(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         await settlement
 
@@ -1242,6 +1278,6 @@ class ApprovalLifecycle:
         record = self._reserve(record, reason)
         if record is None or record.phase == "starting":
             return None
-        settlement = self._start_settlement(self._settle_record(record, "abort", reason))
+        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         return settlement

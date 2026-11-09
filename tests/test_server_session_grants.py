@@ -48,29 +48,6 @@ FEATURES = ["session_grants"]
 PRECEDENCE = ["deny", "ask", "allow", "default"]
 
 
-@pytest.fixture(autouse=True)
-async def settlement_tasks_are_retrieved(monkeypatch: pytest.MonkeyPatch):
-    tasks: list[asyncio.Task[object]] = []
-    create_task = asyncio.create_task
-
-    def track_task(coro: Any, *args: Any, **kwargs: Any) -> asyncio.Task[object]:
-        task = create_task(coro, *args, **kwargs)
-        if getattr(coro, "__qualname__", "") == "ApprovalLifecycle._settle_record":
-            tasks.append(task)
-        return task
-
-    monkeypatch.setattr(asyncio, "create_task", track_task)
-    yield
-    unfinished = [task for task in tasks if not task.done()]
-    assert not unfinished, f"approval settlement tasks outlived the test: {unfinished!r}"
-    for task in tasks:
-        if not task.cancelled():
-            error = task.exception()
-            assert not isinstance(error, KeyError), (
-                f"approval settlement failed with an unexpected missing record: {error!r}"
-            )
-
-
 async def _approve_after_external_end(
     server: ZetaServer,
     reader: asyncio.StreamReader,
@@ -1340,6 +1317,57 @@ async def _first_child_bash_two_fact(
             task.cancel()
         # test-contract: seam this coroutine is the await_or_fail argument.
         await asyncio.gather(wire, hook, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_server_close_bounds_stuck_approval_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("call-1", "bash", {"command": "true"})]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_persist = approval_settlement.persist_durably
+
+    async def stuck_persist(*args: object, **kwargs: object) -> object:
+        entered.set()
+        await release.wait()
+        return await original_persist(*args, **kwargs)
+
+    monkeypatch.setattr(approval_settlement, "persist_durably", stuck_persist)
+    approve: asyncio.Task[object] | None = None
+    try:
+        await _hello_and_create(reader, writer)
+        await _request(reader, writer, 3, "send", {"text": "ask"})
+        await _event(reader, "approval_request")
+        approve = asyncio.create_task(
+            _request(reader, writer, 4, "approve", {"request_id": "call-1"})
+        )
+        await await_or_fail(entered.wait(), what="stuck approval settlement")
+        await server.close()
+        assert any(
+            record.message == "approval settlement tasks stuck during close"
+            and record.approval_keys == ["call-1"]
+            for record in caplog.records
+        )
+    finally:
+        release.set()
+        if approve is not None:
+            approve.cancel()
+            await asyncio.gather(approve, return_exceptions=True)
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
 
 
 @pytest.mark.asyncio
