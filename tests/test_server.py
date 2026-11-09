@@ -12081,7 +12081,8 @@ async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path) -> None:
-    policy = ApprovalPolicy(store=ConversationStore(tmp_path))
+    policy_store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
         SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
     )
@@ -12113,6 +12114,7 @@ async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path
     result = notifications[0][1]["tool_result"]
     assert result["content"] == "agent error: unknown child handle"
     assert result["is_error"] is True
+    policy_store.close()
 
 
 @pytest.mark.asyncio
@@ -12152,7 +12154,8 @@ async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> 
     )
     call = ToolCall("nested-status", "agent_status", {"handle": "root:1:1"})
     result = await loop.tool_registry.execute(call)
-    policy = ApprovalPolicy(store=ConversationStore(tmp_path / "serve"))
+    policy_store = ConversationStore(tmp_path / "serve")
+    policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
         SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
     )
@@ -12183,6 +12186,11 @@ async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> 
     children = wire_result["structured_content"]["children"]
     assert children[0]["handle"] == "root:1:1"
     assert children[0]["description"] == "nested verifier"
+    await loop.close()
+    policy_store.close()
+    grandchild.close()
+    child.close()
+    root.close()
 
 
 @pytest.mark.asyncio
