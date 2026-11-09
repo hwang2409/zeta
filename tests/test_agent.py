@@ -12895,7 +12895,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
         await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
         for _ in range(3):
             barrier = asyncio.get_running_loop().create_future()
-            barrier.set_result(None)
+            asyncio.get_running_loop().call_soon(barrier.set_result, None)
             await await_or_fail(barrier, what="test await")
         assert not completion_published.is_set()
     finally:
@@ -13360,7 +13360,10 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
         if entry.data.get("kind") == "task_exited"
     )
     assert task_exit.data["background_phase"] == "session_shutdown"
-    assert task_exit.data["note"] == "finish-gate task safety bound expired after 0.05 seconds"
+    assert (
+        task_exit.data["note"]
+        == "finish-gate task safety bound expired after 0.05 seconds"
+    )
     child_store.close()
     await loop.close()
 

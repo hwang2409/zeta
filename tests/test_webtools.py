@@ -441,7 +441,7 @@ async def test_registry_reuses_codex_search_connection(
         websearch.codex, "CODEX_API_URL", f"http://codex.test:{server.port}/responses"
     )
 
-    async def access_token(_store, _client):
+    async def access_token(_store, _client, **_kwargs):
         return "current-token"
 
     monkeypatch.setattr(
