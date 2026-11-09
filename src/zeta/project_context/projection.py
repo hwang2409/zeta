@@ -71,12 +71,12 @@ def _health(
 
 
 class ProjectContextProjectionMixin:
-    """Read safe prompt inputs under one registry-lock acquisition."""
+    """Read project identities, then selected memory under its domain lock."""
 
     def _read_context_projection(self, operation: Callable[[int], _T]) -> _T:
-        """Own the lock seam that p06 can replace in one place."""
+        """Read the identity projection under identity authority."""
 
-        return self._read(operation)
+        return self._identity_read(operation)
 
     def _read_project_identities(
         self, root_fd: int, names: list[str]
@@ -103,7 +103,7 @@ class ProjectContextProjectionMixin:
         return projects, malformed
 
     def _read_selected_memory(
-        self, root_fd: int, selected: Project | None
+        self, project_fd: int, selected: Project | None
     ) -> tuple[
         list[MemoryContextEntry],
         EntryMemorySnapshot | None,
@@ -114,7 +114,7 @@ class ProjectContextProjectionMixin:
         memory_health: ProjectContextHealth | None = None
         if selected is None:
             return memory, entry_memory, memory_health
-        directory_fd = self._project_dir(root_fd, selected.project_id)
+        directory_fd = os.dup(project_fd)
         try:
             pointer: dict[str, object] | None = None
             try:
@@ -170,7 +170,9 @@ class ProjectContextProjectionMixin:
     ) -> ProjectContextProjection:
         """Read safe context while omitting only damaged project-owned data."""
 
-        def read(root_fd: int) -> ProjectContextProjection:
+        def read_identities(
+            root_fd: int,
+        ) -> tuple[list[Project], list[ProjectContextHealth], Project | None]:
             names = sorted(
                 name
                 for name in os.listdir(root_fd)
@@ -183,9 +185,21 @@ class ProjectContextProjectionMixin:
                 (item for item in projects if item.project_id == session_project_id),
                 None,
             )
-            memory, entry_memory, memory_health = self._read_selected_memory(
-                root_fd, selected
+            return projects, malformed, selected
+
+        try:
+            projects, malformed, selected = self._read_context_projection(
+                read_identities
             )
+            if selected is None:
+                memory, entry_memory, memory_health = [], None, None
+            else:
+                with self._project_lock(
+                    selected.project_id, "memory", exclusive=False
+                ) as project_fd:
+                    memory, entry_memory, memory_health = self._read_selected_memory(
+                        project_fd, selected
+                    )
 
             if session_project_id is not None and selected is None:
                 finding = next(
@@ -210,8 +224,6 @@ class ProjectContextProjectionMixin:
                 health=finding,
             )
 
-        try:
-            return self._read_context_projection(read)
         except (OSError, ProjectRegistryError):
             return ProjectContextProjection(
                 session_project=None,

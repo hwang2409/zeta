@@ -9,10 +9,12 @@ import io
 import json
 import multiprocessing
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import uuid
 from contextlib import contextmanager
@@ -62,6 +64,7 @@ from zeta.remote_sync.project_publish import (
 )
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
+from zeta.storage_format import GATED_HOME_PATHS, StorageFormatError, open_writer
 from zeta.tools import ToolRegistry
 from zeta.tools import session_push as session_push_tool
 from zeta.tools.session_push import register as register_session_push
@@ -793,9 +796,9 @@ def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
         real_atomic_write(payload, destination)
 
     def acquire_fetch_lock(file: object, operation: int) -> object:
-        if threading.current_thread() is main_thread and operation & fcntl.LOCK_EX:
+        if threading.current_thread() is main_thread and operation & fcntl.LOCK_NB:
             try:
-                return real_flock(file, operation | fcntl.LOCK_NB)
+                return real_flock(file, operation)
             except BlockingIOError:
                 release_sync_copy.set()
         return real_flock(file, operation)
@@ -864,21 +867,29 @@ def test_oversized_side_file_is_rejected_before_target_lock(
     conflict.parent.mkdir(exist_ok=True)
     conflict.write_bytes(b"x" * (MAX_MEMORY_FILE_SIZE + 1))
     original = list(project_path.rglob("*"))
+    expected_export = memory_module._materialize_memory_export(
+        project_path, project.project_id
+    )
 
     @contextmanager
-    def target_lock(_registry: ProjectRegistry, *, write: bool):
+    def target_lock(
+        _registry: ProjectRegistry,
+        project_id: str,
+        domain: str,
+        *,
+        exclusive: bool,
+    ):
         raise AssertionError("target lock was acquired before size validation")
         yield
 
-    monkeypatch.setattr(ProjectRegistry, "_locked", target_lock)
+    # test-contract: seam reject target locking before public validation finishes
+    monkeypatch.setattr(ProjectRegistry, "_project_lock", target_lock)
 
     with pytest.raises(RemoteSyncError, match="side file is too large"):
         memory_module._publish_memory_snapshot(
             project_path,
             publication,
-            expected_export=memory_module._materialize_memory_export(
-                project_path, project.project_id
-            ),
+            expected_export=expected_export,
             provenance={"source": "test"},
         )
 
@@ -1055,7 +1066,7 @@ def _legacy_project_digest(root: Path) -> str:
         if (
             not path.is_file()
             or path.is_symlink()
-            or path.name in {".lock", ".spill.lock"}
+            or path.name in {".lock", ".memory.lock", ".sessions.lock", ".spill.lock"}
             or has_version_store
             and path.parent == root / "memory"
             and path.name in memory_module.MEMORY_FILES
@@ -1374,6 +1385,16 @@ def _pointerless_project_snapshot(tmp_path: Path) -> tuple[Path, str]:
     return source / "projects" / project.project_id, project.project_id
 
 
+def _two_format_two_projects(tmp_path: Path) -> tuple[Path, str, str]:
+    source = initialize_storage_home(tmp_path / "source")
+    registry = ProjectRegistry(source / "projects")
+    first = registry.create_project("first", "test")
+    second = registry.create_project("second", "test")
+    for project in (first, second):
+        registry._create_entry_memory_for_test(project.project_id, memory_profile("zeta"))
+    return source, first.project_id, second.project_id
+
+
 def _format_two_project_snapshot(
     tmp_path: Path, *, invalid: bool = False
 ) -> tuple[Path, str]:
@@ -1403,6 +1424,296 @@ def _format_two_project_snapshot(
                 manifest[field] = new_digest
         manifest_path.write_text(json.dumps(manifest, sort_keys=True))
     return snapshot, project.project_id
+
+
+def test_p06_3_generated_project_programs_match_fresh_home_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_home = tmp_path / "local-home"
+    lease = open_writer(local_home)
+    try:
+        expected_epoch = lease.observed_epoch
+    finally:
+        lease.close()
+
+    fetch_home = tmp_path / "fetch-home"
+    fetch = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            ssh_module._PROJECT_FETCH_SCRIPT,
+            str(fetch_home),
+            "missing-project",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert fetch.returncode == 44
+    assert json.loads((fetch_home / "storage-format.json").read_text()) == {
+        "writer_epoch": expected_epoch
+    }
+
+    snapshot, project_id = _format_two_project_snapshot(tmp_path)
+    install_home = tmp_path / "install-home"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    SshTransport("fake", str(install_home), name="cloud").publish_project(
+        project_id, snapshot, expected_digest="missing"
+    )
+
+    assert json.loads((install_home / "storage-format.json").read_text()) == {
+        "writer_epoch": expected_epoch
+    }
+    assert project_digest(install_home / "projects" / project_id) == project_digest(
+        snapshot
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern", [pattern for pattern, _owner in GATED_HOME_PATHS]
+)
+def test_p06_3_generated_project_programs_refuse_manifestless_state_like_local(
+    tmp_path: Path, pattern: str
+) -> None:
+    def seed(home: Path) -> None:
+        home.mkdir()
+        if pattern.endswith("/*"):
+            (home / pattern[:-2]).mkdir()
+            (home / pattern[:-2] / "existing").write_text("state\n")
+        else:
+            (home / pattern).write_text("state\n")
+
+    local_home = tmp_path / "local-home"
+    seed(local_home)
+    with pytest.raises(StorageFormatError, match="manifest is missing"):
+        open_writer(local_home).close()
+
+    remote_home = tmp_path / "remote-home"
+    seed(remote_home)
+    fetch = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            ssh_module._PROJECT_FETCH_SCRIPT,
+            str(remote_home),
+            "missing-project",
+        ],
+        check=False,
+        capture_output=True,
+    )
+
+    assert fetch.returncode == 53, "generated program wrote over gated state"
+    assert not (remote_home / "storage-format.json").exists()
+    assert not (local_home / "storage-format.json").exists()
+
+
+def test_p06_3_generated_project_program_retains_stored_format_lease(
+    tmp_path: Path,
+) -> None:
+    source, project_id = _format_two_project_snapshot(tmp_path)
+    remote = initialize_storage_home(tmp_path / "remote")
+    shutil.copytree(source, remote / "projects" / project_id)
+    payload = remote / "projects" / project_id / "sync" / "payload.bin"
+    payload.parent.mkdir()
+    # Incompressible and larger than a pipe buffer: the program cannot finish
+    # while the test leaves its output undrained.
+    payload.write_bytes(os.urandom(4 << 20))
+    fetch = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            ssh_module._PROJECT_FETCH_SCRIPT,
+            str(remote),
+            project_id,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    lock_fd = os.open(remote / ".storage-format.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        assert fetch.stdout is not None
+        # Output starts only inside project authority, after the lease is taken.
+        first = fetch.stdout.read(1)
+        assert first, fetch.stderr.read() if fetch.stderr else ""
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            advanced = True
+        except BlockingIOError:
+            advanced = False
+        assert not advanced, "generated program did not retain the stored-format lease"
+        rest = fetch.stdout.read()
+        assert fetch.wait(timeout=30) == 0
+        assert len(first + rest) > 4 << 20
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(lock_fd)
+        if fetch.poll() is None:
+            fetch.kill()
+        fetch.communicate(timeout=10)
+
+
+def test_p06_3_generated_project_fetch_uses_one_memory_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, held_project_id, fetched_project_id = _two_format_two_projects(tmp_path)
+    remote = initialize_storage_home(tmp_path / "remote")
+    for project_id in (held_project_id, fetched_project_id):
+        shutil.copytree(
+            source / "projects" / project_id,
+            remote / "projects" / project_id,
+        )
+    (remote / "storage-format.json").write_text('{"writer_epoch":6}\n')
+    _install_ssh_shim(tmp_path, monkeypatch)
+    destination = tmp_path / "fetched"
+
+    held_lock = remote / "projects" / held_project_id / ".memory.lock"
+    legacy_root_lock = remote / "projects" / ".lock"
+    held_lock.touch(mode=0o600)
+    legacy_root_lock.touch(mode=0o600)
+    with held_lock.open("r+b") as handle, legacy_root_lock.open("r+b") as root_handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        fcntl.flock(root_handle, fcntl.LOCK_EX)
+        try:
+            SshTransport("fake", str(remote), name="cloud").fetch_project(
+                fetched_project_id, destination
+            )
+            outcome = "fetched"
+        except RemoteSyncError as exc:
+            outcome = str(exc)
+
+    assert outcome == "fetched", "generated project fetch did not use project memory authority"
+    assert project_digest(destination) == project_digest(
+        source / "projects" / fetched_project_id
+    )
+
+    (remote / "storage-format.json").write_text('{"writer_epoch":5}\n')
+    with legacy_root_lock.open("r+b") as root_handle:
+        fcntl.flock(root_handle, fcntl.LOCK_EX)
+        with pytest.raises(RemoteSyncError, match="project registry busy"):
+            SshTransport("fake", str(remote), name="cloud").fetch_project(
+                fetched_project_id, tmp_path / "legacy-fetch"
+            )
+
+
+def test_p06_3_generated_project_install_uses_one_project_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, held_project_id, installed_project_id = _two_format_two_projects(tmp_path)
+    remote = initialize_storage_home(tmp_path / "remote")
+    for project_id in (held_project_id, installed_project_id):
+        shutil.copytree(
+            source / "projects" / project_id,
+            remote / "projects" / project_id,
+        )
+    sync_file = source / "projects" / installed_project_id / "sync" / "new.json"
+    sync_file.parent.mkdir()
+    sync_file.write_text("{}\n")
+    expected = project_digest(remote / "projects" / installed_project_id)
+    (remote / "storage-format.json").write_text('{"writer_epoch":6}\n')
+    _install_ssh_shim(tmp_path, monkeypatch)
+    transport = SshTransport("fake", str(remote), name="cloud")
+
+    def publish() -> str:
+        try:
+            transport.publish_project(
+                installed_project_id,
+                source / "projects" / installed_project_id,
+                expected_digest=expected,
+            )
+            return "installed"
+        except RemoteSyncError as exc:
+            return str(exc)
+
+    held_lock = remote / "projects" / held_project_id / ".memory.lock"
+    legacy_root_lock = remote / "projects" / ".lock"
+    held_lock.touch(mode=0o600)
+    legacy_root_lock.touch(mode=0o600)
+    handle = held_lock.open("r+b")
+    root_handle = legacy_root_lock.open("r+b")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        fcntl.flock(root_handle, fcntl.LOCK_EX)
+        future = executor.submit(publish)
+        try:
+            outcome = future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
+            outcome = "blocked by unrelated project authority"
+    finally:
+        fcntl.flock(root_handle, fcntl.LOCK_UN)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        root_handle.close()
+        handle.close()
+        if future is not None:
+            future.result(timeout=10)
+        executor.shutdown(wait=True)
+
+    assert outcome == "installed", "generated project install did not use one project authority"
+    assert (remote / "projects" / installed_project_id / "sync" / "new.json").read_text() == "{}\n"
+
+
+
+def test_p06_remote_memory_snapshot_and_publication_are_coherent(
+    tmp_path: Path,
+) -> None:
+    # Local half of the stable one-authority protocol; the ssh half is the
+    # p06-3 generated-program tests above.
+    source, held_project_id, target_id = _two_format_two_projects(tmp_path)
+    remote = initialize_storage_home(tmp_path / "remote")
+    for project_id in (held_project_id, target_id):
+        shutil.copytree(
+            source / "projects" / project_id, remote / "projects" / project_id
+        )
+    (remote / "projects").chmod(0o700)
+    before = project_digest(remote / "projects" / target_id)
+    sync_file = source / "projects" / target_id / "sync" / "new.json"
+    sync_file.parent.mkdir()
+    sync_file.write_text("{}\n")
+    transport = LocalTransport(remote)
+    fetched = tmp_path / "fetched"
+
+    def fetch_then_publish() -> str:
+        try:
+            digest = transport.fetch_project(target_id, fetched)
+            transport.publish_project(
+                target_id, source / "projects" / target_id, expected_digest=digest
+            )
+            return digest
+        except RemoteSyncError as exc:
+            return str(exc)
+
+    held_lock = remote / "projects" / held_project_id / ".memory.lock"
+    legacy_root_lock = remote / "projects" / ".lock"
+    held_lock.touch(mode=0o600)
+    legacy_root_lock.touch(mode=0o600)
+    handle = held_lock.open("r+b")
+    root_handle = legacy_root_lock.open("r+b")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        fcntl.flock(root_handle, fcntl.LOCK_EX)
+        future = executor.submit(fetch_then_publish)
+        try:
+            outcome = future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
+            outcome = "blocked by unrelated project authority"
+    finally:
+        fcntl.flock(root_handle, fcntl.LOCK_UN)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        root_handle.close()
+        handle.close()
+        if future is not None:
+            future.result(timeout=10)
+        executor.shutdown(wait=True)
+
+    assert outcome == before, "local project sync did not use one project authority"
+    assert project_digest(fetched) == before
+    assert (remote / "projects" / target_id / "sync" / "new.json").read_text() == "{}\n"
+    reopened = ProjectRegistry(remote / "projects").project_context_projection(
+        target_id
+    )
+    assert reopened.health is None and reopened.session_project is not None
 
 
 def _publish_initial_project(
@@ -1751,7 +2062,7 @@ def test_ssh_pull_rejects_semantically_invalid_initial_format_two_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     snapshot, project_id = _format_two_project_snapshot(tmp_path, invalid=True)
-    remote = tmp_path / "remote"
+    remote = initialize_storage_home(tmp_path / "remote")
     projects = remote / "projects"
     projects.mkdir(parents=True)
     snapshot.rename(projects / project_id)
@@ -1789,10 +2100,16 @@ def test_initial_pointerless_project_snapshot_is_validated_and_published(
     monkeypatch: pytest.MonkeyPatch,
     kind: str,
 ) -> None:
+    # A fresh system temp dir, as on CI: transfer validation must neither depend
+    # on nor write a stored-format manifest there.
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(system_temp))
     snapshot, project_id = _pointerless_project_snapshot(tmp_path)
     remote = tmp_path / "remote"
     _publish_initial_project(kind, remote, snapshot, project_id, tmp_path, monkeypatch)
 
+    assert not (system_temp / "storage-format.json").exists()
     registry = ProjectRegistry(remote / "projects")
     assert registry.show_project(project_id).project_id == project_id
     assert set(dict(registry.load_memory(project_id))) == {

@@ -15,6 +15,7 @@ from typing import Any
 from ..core.session import SessionError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
+from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
 from ..storage_format import drain_releases, pending_releases
 from . import (
@@ -91,7 +92,8 @@ class _UnixSocketListener:
         )
         try:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with socket_lock():
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise RuntimeError(f"a server is already listening on {path}") from exc
             cls._prepare_path(path)

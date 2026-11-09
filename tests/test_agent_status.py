@@ -735,7 +735,7 @@ async def test_elapsed_uses_monotonic_time_when_wall_clock_moves(
     )
     child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
     _persist_finished_receipt(store, child, "agent-1", handle)
-    monkeypatch.setattr("zeta.tools.agent.time.monotonic", lambda: 105.0)
+    monkeypatch.setattr("zeta.core.child_runs.time.monotonic", lambda: 105.0)
 
     status_loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
