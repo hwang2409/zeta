@@ -2930,14 +2930,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert next_reply not in json.dumps(
             [message.to_dict() for message in history]
         )
-        writer.write(b'{"jsonrpc":"2.0","id":5,"method":"status","params":{}}\n')
-        await await_or_fail(writer.drain(), what="status request write")
-        frames += await await_or_fail(
-            read_until(
-                reader, lambda frame: frame.get("id") == 5, what="status response"
-            ),
-            what="status response frames",
-        )
+        frames += await _request(reader, writer, 5, "status", {})
         names = [frame.get("params", {}).get("event") for frame in frames]
         assert names.count("approval_end") == 1
         assert names.index("approval_end") < names.index("turn_aborted")
@@ -11831,6 +11824,7 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
         await asyncio.wait_for(writer.drain(), 10)
         frames: list[bytes] = []
         while True:
+            # test-contract: transport exact raw frames are required to compare byte-for-byte streams
             frame = await asyncio.wait_for(reader.readline(), 10)
             assert frame, f"server closed before the {method} response"
             frames.append(frame)
@@ -12213,6 +12207,7 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
+        # test-contract: transport raw request must remain pending while settlement gates are exercised
         writer.write(
             (
                 json.dumps(
@@ -12470,6 +12465,7 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
+        # test-contract: transport raw request must remain pending while settlement gates are exercised
         writer.write(
             (
                 json.dumps(

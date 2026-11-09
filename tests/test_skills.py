@@ -572,7 +572,7 @@ async def test_newer_live_config_generation_wins(
 
     async def newer_generation_started() -> None:
         while loop._live_config_generation < 2:
-            await asyncio.sleep(0)
+            await asyncio.wait_for(asyncio.sleep(0), 10)
 
     monkeypatch.setattr(live_module, "discover_session_skills", delayed_discovery)
     older = asyncio.create_task(loop.refresh_live_config())
