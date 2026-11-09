@@ -1903,23 +1903,24 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     controller.connection, "_write_physical", fail_named_publish
                 )
             if case in {"cancel_settle", "external_end"}:
-                original_durable = ConversationStore._to_thread_durable
+                original_commit = ConversationStore._commit_storage_command
 
-                async def gated_durable(*args: object, **kwargs: object) -> object:
-                    if case == "cancel_settle":
+                async def gated_commit(store: ConversationStore, command: object) -> object:
+                    is_resolution = type(command).__name__ == "_ResolveApprovalCommand"
+                    if case == "cancel_settle" and is_resolution:
                         # test-contract: cancel before the real durable operation begins
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")
-                    result = await original_durable(*args, **kwargs)
-                    if case == "external_end":
+                    result = await original_commit(store, command)
+                    if case == "external_end" and is_resolution:
                         # test-contract: gate after the real durable operation commits
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")
                     return result
 
-                # test-contract: seam gate the real durable await without a production seam
+                # test-contract: seam gate the typed durable write owner
                 monkeypatch.setattr(
-                    ConversationStore, "_to_thread_durable", gated_durable
+                    ConversationStore, "_commit_storage_command", gated_commit
                 )
             elif case == "cancel_finish" and GrantPublication is not None:
                 original_finish = GrantPublication.finish
