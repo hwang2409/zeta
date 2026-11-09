@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +12,8 @@ import pytest
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import event as _event
+from tests.support.server_client import read_until as _read_until
+from tests.support.server_client import send as _send
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.protocol.types import (
     Message,
@@ -62,17 +63,13 @@ async def _call(
     params: dict[str, object],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return the frames sent before the response, and the response."""
-    frame = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-    writer.write((json.dumps(frame) + "\n").encode())
-    await asyncio.wait_for(writer.drain(), 10)
-    before: list[dict[str, Any]] = []
-    while True:
-        line = await asyncio.wait_for(reader.readline(), 10)
-        assert line, "server closed the socket"
-        received = json.loads(line)
-        if received.get("id") == request_id:
-            return before, received
-        before.append(received)
+    await _send(reader, writer, request_id, method, params)
+    frames = await _read_until(
+        reader,
+        lambda frame: frame.get("id") == request_id,
+        what=f"response to {method}",
+    )
+    return frames[:-1], frames[-1]
 
 
 def _echoes(frames: list[dict[str, Any]]) -> list[str]:
