@@ -63,7 +63,6 @@ from ..session_files import (
     session_directory,
     session_root,
 )
-from ._approval_history import ApprovalHistoryStoreMixin
 from ..todo import TodoItem, parse_todo_items
 from ..transcript_recovery import (
     RepairResult,
@@ -71,6 +70,7 @@ from ..transcript_recovery import (
     repair_target_for_session_dir,
 )
 from ._approval_display import ApprovalAuditRequest, normalize_approval_requests
+from ._approval_history import ApprovalHistoryStoreMixin
 from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
