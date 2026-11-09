@@ -894,13 +894,13 @@ class ConnectionRegistry(ReplayOutput):
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
         runtime = connection.server.runtime
         store = validation.active(runtime, params)
-        features = self._connections[connection].features
+        features = history_features(self._connections[connection].features)
         return await self.run_read(
             connection,
             lambda: history.history(
                 _observer_runtime(store),
                 params,
-                include_delivery_id={"delivery_id", "user_message_event", "user_message_delivery_id"} <= history_features(features),
+                include_delivery_id={"delivery_id", "user_message_event", "user_message_delivery_id"} <= features,
                 backward_enabled="session_history_backward" in features,
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
