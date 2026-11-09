@@ -47,12 +47,12 @@ from time import monotonic as _monotonic
 
 from ..memory.entry_store import utc_now
 from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
-from ..project_memory_history import MemoryContextEntry
 from ..project_context.projection import (
     ProjectContextHealth,
     ProjectContextProjection,
 )
 from ..project_errors import UnsupportedMemoryFormatError
+from ..project_memory_history import MemoryContextEntry
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import (
     load_identity_fragment,
