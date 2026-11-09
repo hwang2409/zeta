@@ -2321,7 +2321,7 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     assert reopened_again.path.read_bytes() == reopened.path.read_bytes()
 
 
-@pytest.mark.parametrize("epoch", range(2, storage_format.WRITER_EPOCH))
+@pytest.mark.parametrize("epoch", range(2, 4))
 def test_lower_epoch_torn_tail_keeps_legacy_repair_without_recovery_files(
     tmp_path: Path, epoch: int
 ) -> None:
@@ -2388,6 +2388,7 @@ def test_fixed_epoch_repair_survives_a_newer_writer_epoch(
 
     assert list(store.session_dir.glob("conversation.quarantine.*"))
     assert reopened.entries[-1].data["kind"] == "transcript_recovery"
+    reopened.close()
 
 
 def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:
