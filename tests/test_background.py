@@ -545,7 +545,9 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
         raise RuntimeError("forced archive failure")
 
     # test-contract: force the real archive seam to fail without timing.
-    monkeypatch.setattr(tools.background_tasks, "_archive_record", fail_archive)
+    monkeypatch.setattr(  # test-contract: seam inject archive failure through the owner
+        tools.background_tasks, "_archive_record", fail_archive
+    )
     try:
         store.close()
         with pytest.raises(RuntimeError, match="forced archive failure"):
@@ -601,7 +603,8 @@ async def test_terminal_note_writer_table(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writer: str
 ) -> None:
     registry = BackgroundTaskRegistry()
-    task_id, _ = await registry.start("sleep 30", tmp_path)
+    command = "true" if writer == "archive" else "sleep 30"
+    task_id, _ = await registry.start(command, tmp_path)
     try:
         if writer == "kill":
             await registry.kill(task_id, cause="table kill cause")
@@ -610,9 +613,11 @@ async def test_terminal_note_writer_table(
             async def fail_archive(*args: object, **kwargs: object) -> None:
                 raise RuntimeError("table archive failure")
 
-            monkeypatch.setattr(registry, "_archive_record", fail_archive)
+            monkeypatch.setattr(  # test-contract: seam inject archive failure through the owner
+                registry, "_archive_record", fail_archive
+            )
             with pytest.raises(RuntimeError, match="table archive failure"):
-                await registry.wait(task_id)
+                await asyncio.wait_for(registry.wait(task_id), 10)
             expected = "background output archive failed; recovery will retry the retained log"
         else:
             registry.begin_shutdown("table shutdown cause")
