@@ -10,7 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .attention_records import AttentionRecord, AttentionStore, Broken
+from .attention_records import (
+    AttentionRecord,
+    AttentionStore,
+    Broken,
+    observed_epoch_for_session,
+)
 from .project_errors import ProjectRegistryError
 from .project_registry import ProjectRegistry
 from .runtime.project_registry_state import (
@@ -77,7 +82,7 @@ def open_decisions(
     names = _project_names(state.registry)
     items = (
         _decision_item(session_id, record, names)
-        for record in AttentionStore(session_dir).list()
+        for record in AttentionStore(session_dir, writer_epoch=observed_epoch_for_session(session_dir)).list()
         if isinstance(record, Broken) or record.status == "open"
     )
     return tuple(sorted(items, key=_decision_sort_key))

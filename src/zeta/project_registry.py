@@ -50,8 +50,9 @@ from .project_schema import (
     validate_project_text,
 )
 from .storage_format import (
-    WRITER_EPOCH,
+    StorageFeature,
     WriterLease,
+    feature_enabled,
     mapping_mutations,
     open_writer,
     reject_unknown_keys,
@@ -334,7 +335,9 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
         if not write:
             raise AssertionError("read operations must use _read")
         lease = open_writer(self.root.parent)
-        if lease.observed_epoch != WRITER_EPOCH:
+        if not feature_enabled(
+            lease.observed_epoch, StorageFeature.PROJECT_WRITES
+        ):
             lease.close()
             raise ProjectRegistryError("project writes are unavailable before the writer epoch")
         self._ensure_root()
