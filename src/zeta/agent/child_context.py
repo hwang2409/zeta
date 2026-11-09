@@ -219,6 +219,44 @@ def _compose_child_project_context(
     )
 
 
+def _child_model_and_budget(
+    loop: AgentLoop, child_backend: object, child_provider: object, model: object
+) -> tuple[str, int]:
+    child_model = getattr(child_backend, "model", None)
+    if type(child_model) is not str or not child_model:
+        child_model = model if type(model) is str and model else "unknown"
+    backend_budget = getattr(child_backend, "token_budget", None)
+    child_budget = loop.context_assembler.token_budget
+    if type(backend_budget) is int and backend_budget > 0:
+        child_budget = backend_budget
+    elif isinstance(child_provider, str):
+        child_budget = effective_budget_for_model(
+            child_provider, child_model, child_budget
+        )
+    return child_model, child_budget
+
+
+def _prepare_child_project_context(
+    loop: AgentLoop,
+    cwd_override: Path | None,
+    child_registry: ToolRegistry,
+    preset: AgentPreset,
+    explicit_finish: bool,
+    projection: ProjectContextProjection,
+) -> ProjectContext:
+    context = _load_child_project_context(
+        loop,
+        cwd_override,
+        child_registry,
+        projection=projection,
+    )
+    return _compose_child_project_context(
+        context,
+        preset,
+        explicit_finish=explicit_finish,
+    )
+
+
 def _compose_child_system_prompt(
     system_prompt: str | Message,
     preset: AgentPreset,

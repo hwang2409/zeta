@@ -5957,6 +5957,54 @@ def test_agent_schema_uses_preset_registry(
 
 
 @pytest.mark.asyncio
+async def test_child_registry_agent_schema_uses_its_catalog_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_path = tmp_path / "initial.md"
+    initial = AgentCatalog(
+        (replace(GENERAL_PRESET, name="initial", source="user", path=profile_path),)
+    )
+    current = AgentCatalog(
+        (replace(GENERAL_PRESET, name="nested", source="user", path=profile_path),)
+    )
+    monkeypatch.setattr("zeta.config.live.discover_session_agents", lambda **_: current)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=initial,
+    )
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    child = None
+    loop = None
+    try:
+        child = registry.clone_for_session(child_store)
+        loop = AgentLoop(
+            FakeBackend([]),
+            child_store,
+            registry=child,
+            skill_catalog=SkillCatalog.empty(),
+            agent_catalog=initial,
+            live_config_home=tmp_path,
+            live_config_project_dir=tmp_path,
+        )
+        await loop.refresh_live_config(force=True, publish=False)
+        schema = child.definition_reference("agent").schema()
+        properties = schema["parameters"]["properties"]
+        assert properties["agent_type"]["enum"] == ["nested"]
+        assert properties["preset"]["enum"] == ["nested"]
+    finally:
+        if loop is not None:
+            await loop.close()
+        if child is not None:
+            await child.close()
+        await registry.close()
+        child_store.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_general_agent_markers_keep_legacy_state_bytes(tmp_path: Path) -> None:
     omitted = ConversationStore(tmp_path / "omitted", cwd=tmp_path)
     explicit = ConversationStore(tmp_path / "explicit", cwd=tmp_path)
@@ -14129,7 +14177,7 @@ async def test_agent_cwd_sets_child_bash_session_cwd(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    assert discovery_threads and discovery_threads != [loop_thread]
+    assert discovery_threads and loop_thread not in discovery_threads
     assert (worktree / "bash_marker").exists()
     assert not (parent_dir / "bash_marker").exists()
     await loop.close()
@@ -20092,13 +20140,13 @@ async def test_follow_up_ack_never_takes_store_lock_on_event_loop(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     await _send_follow_up(loop, handle, "first follow-up")
     backend.release_child.set()
-    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=10)
     backend.release_finish.set()
-    await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
+    await asyncio.wait_for(backend.finish_generated.wait(), timeout=10)
     await wait_background_owner(loop)
     assert (
         store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"

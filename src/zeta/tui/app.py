@@ -311,7 +311,7 @@ class TUIApp(
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
         )
-        self.loop.add_skill_catalog_listener(self._slash_commands.register_skills)
+        self.loop.add_live_config_listener(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )

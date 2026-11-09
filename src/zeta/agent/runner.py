@@ -8,18 +8,17 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
-from ..core.project_context import ProjectContext
-from ..core.slash import effective_budget_for_model
+from ..core.session import env_home
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
 from ..path_identity import same_physical_path
-from ..project_context.projection import ProjectContextProjection
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
@@ -42,11 +41,13 @@ from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
+from . import child_context as _child_context
 from .background import CancellationRequest, finish_background_child
 from .child_context import (
     _child_base_system_prompt,
+    _child_model_and_budget,
     _compose_child_project_context,
-    _load_child_project_context,
+    _prepare_child_project_context,
     resolve_child_backend,
 )
 from .conversation_channel import has_follow_up_loop
@@ -76,6 +77,8 @@ from .turn_limit import (
     make_publish_child_lifecycle,
     turn_control_for,
 )
+
+_compose_child_system_prompt = _child_context._compose_child_system_prompt
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
@@ -443,17 +446,9 @@ async def _build_child_loop(
             child_registry.set_approval_policy(child_policy)
         from ..runtime.loop import AgentLoop
 
-        child_model = getattr(child_backend, "model", None)
-        if type(child_model) is not str or not child_model:
-            child_model = model if type(model) is str and model else "unknown"
-        backend_budget = getattr(child_backend, "token_budget", None)
-        child_budget = loop.context_assembler.token_budget
-        if type(backend_budget) is int and backend_budget > 0:
-            child_budget = backend_budget
-        elif isinstance(child_provider, str):
-            child_budget = effective_budget_for_model(
-                child_provider, child_model, child_budget
-            )
+        child_model, child_budget = _child_model_and_budget(
+            loop, child_backend, child_provider, model
+        )
 
         def record_child_usage(usage: Mapping[str, Any]) -> None:
             loop.context_assembler.record_descendant_usage(
@@ -462,6 +457,13 @@ async def _build_child_loop(
 
         child_context = await asyncio.to_thread(
             _child_base_system_prompt, loop, cwd_override, child_registry
+        )
+        child_scope = getattr(loop, "_live_config_scope", None)
+        child_home = Path(loop.active_home) if loop.active_home else env_home()
+        child_project_dir = (
+            child_scope.project_dir
+            if child_scope is not None
+            else Path(child_registry.cwd)
         )
         child_context = _compose_child_project_context(
             child_context,
@@ -493,22 +495,12 @@ async def _build_child_loop(
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
             child_turn_control=child_turn_control,
+            live_config_home=child_home,
+            live_config_project_dir=child_project_dir,
+            freeze_live_config=child_scope is None,
         )
 
-        def prepare_child_project_context(
-            projection: ProjectContextProjection,
-        ) -> ProjectContext:
-            context = _load_child_project_context(
-                loop,
-                cwd_override,
-                child_registry,
-                projection=projection,
-            )
-            return _compose_child_project_context(
-                context,
-                preset,
-                explicit_finish=explicit_finish,
-            )
+        await child_loop.refresh_live_config(publish=False)
 
         inherited_prompt = cwd_override is None or same_physical_path(
             cwd_override, loop.store.cwd
@@ -517,7 +509,10 @@ async def _build_child_loop(
             registry=loop.project_registry,
             project_id=loop.root_project_id,
             health=child_context.health,
-            prepare=prepare_child_project_context,
+            prepare=partial(
+                _prepare_child_project_context,
+                loop, cwd_override, child_registry, preset, explicit_finish,
+            ),
             replace_component=("project_memory" if inherited_prompt else None),
         )
         child_loop.explicit_finish = explicit_finish
