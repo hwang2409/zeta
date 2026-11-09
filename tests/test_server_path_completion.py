@@ -361,7 +361,7 @@ async def test_path_complete_marks_scan_cap_through_serve(
     for index in range(1000):
         (workspace / f"entry-{index:04}.txt").touch()
     (workspace / "zz-target.txt").touch()
-    path_module = importlib.import_module("zeta.core.path_completion")
+    path_module = importlib.import_module("zeta.core.commands.path_completion")
     original_scandir = path_module.os.scandir
 
     class SortedEntries:
@@ -453,7 +453,7 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
         )[-1]
         assert probe.get("result") == {"entries": [], "truncated": False}, probe
         assert "path_completion" in hello["result"]["capabilities"]["features"]
-        path_module = importlib.import_module("zeta.core.path_completion")
+        path_module = importlib.import_module("zeta.core.commands.path_completion")
         handler_module = importlib.import_module("zeta.server.handlers.path_completion")
         original_scandir = path_module.os.scandir
         original_complete_paths = handler_module.complete_paths

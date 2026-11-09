@@ -8,7 +8,7 @@ from pathlib import Path
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 
-from ..core.path_completion import complete_paths
+from ..core.commands.path_completion import complete_paths
 from ..core.slash import SlashCommandRegistry
 from ..skills.invocation import dollar_completion_prefix
 from .models import match_models

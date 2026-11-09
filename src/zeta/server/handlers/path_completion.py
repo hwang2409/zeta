@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from ...core.path_completion import PathCompletion, complete_paths
+from ...core.commands.path_completion import PathCompletion, complete_paths
 from ..protocol import ErrorDescriptor, ProtocolError
 
 MAX_TEXT_BEFORE_CURSOR_BYTES = 4096
