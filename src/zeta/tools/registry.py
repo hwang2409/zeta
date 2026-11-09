@@ -37,10 +37,12 @@ from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
 from ..media.image_policy import ANTHROPIC_IMAGE_POLICY, ImagePolicy
 from ..protocol.types import (
+    Message,
     StructuredToolResult,
     ToolCall,
     ToolResult,
     ToolSchema,
+    ToolUseContent,
 )
 from ..runtime.execution import (
     ToolExecutionContext,
@@ -271,6 +273,7 @@ class ToolRegistry:
         # rediscover it through ambient ZETA_HOME.
         self.project_registry = project_registry
         self.project_registry_state: ProjectRegistryState | None = None
+        self._approval_labels: dict[str, str] = {}
         self.inbox_enabled = inbox_enabled
         self.inbox_target_ids: frozenset[str] | None = None
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
@@ -920,6 +923,36 @@ class ToolRegistry:
             policy.bind_rule_resolver(self.resolve_approval_rule)
             policy.bind_capability_resolver(self.resolve_tool_call_capability)
 
+    async def prepare_tool_calls(
+        self, assistant_message: Message
+    ) -> tuple[Message, list[ToolCall], set[str]]:
+        calls = [
+            block.tool_call
+            for block in assistant_message.content
+            if isinstance(block, ToolUseContent)
+        ]
+        prepared_calls: list[ToolCall] = []
+        preparation_errors: set[str] = set()
+        for tool_call in calls:
+            try:
+                prepared = await self.prepare_tool_call(tool_call)
+            except (KeyError, TypeError, ValueError):
+                prepared = tool_call
+                preparation_errors.add(tool_call.id)
+            prepared_calls.append(prepared)
+        if prepared_calls != calls:
+            prepared_by_id = {call.id: call for call in prepared_calls}
+            assistant_message = replace(
+                assistant_message,
+                content=[
+                    ToolUseContent(prepared_by_id[block.tool_call.id])
+                    if isinstance(block, ToolUseContent)
+                    else block
+                    for block in assistant_message.content
+                ],
+            )
+        return assistant_message, prepared_calls, preparation_errors
+
     async def prepare_tool_call(self, tool_call: ToolCall) -> ToolCall:
         """Prepare one call before approval, persistence, and execution."""
         definition = self._tools.get(tool_call.name)
@@ -927,10 +960,19 @@ class ToolRegistry:
             return tool_call
         if definition.call_preparer is None:
             return tool_call
-        prepare_rules = getattr(self.approval_policy, "prepare_rules", None)
-        if prepare_rules is not None:
-            await prepare_rules(self._prepare_approval_rule)
-        return await definition.call_preparer(tool_call)
+        if self.approval_policy is not None:
+            await self.approval_policy.prepare_rules(self._prepare_approval_rule)
+        prepared = await definition.call_preparer(tool_call)
+        if (
+            tool_call.name == "inbox"
+            and tool_call.arguments.get("action") == "send"
+            and isinstance(tool_call.arguments.get("project"), str)
+            and prepared.arguments.get("project") != tool_call.arguments["project"]
+        ):
+            self._approval_labels[tool_call.id] = (
+                f"{tool_call.arguments['project']} ({prepared.arguments['project']})"
+            )
+        return prepared
 
     async def _prepare_approval_rule(self, rule: ApprovalRule) -> ApprovalRule:
         resolved = self.resolve_approval_rule(rule)
@@ -967,11 +1009,13 @@ class ToolRegistry:
             except (AttributeError, KeyError, TypeError, ValueError):
                 self.abort_approval(tool_call)
                 return None
-        request = self.approval_policy.prepare(
+        label = self._approval_labels.get(tool_call.id)
+        if label is not None:
+            self.approval_policy.set_display_label(tool_call.id, label)
+        return self.approval_policy.prepare(
             tool_call,
             capability=capability,
         )
-        return request
 
     async def execute(
         self,
@@ -1105,8 +1149,10 @@ class ToolRegistry:
             if abort_result is not None:
                 return await finalize(abort_result)
         execution_token = uuid.uuid4().hex
-        cleanup_binding = getattr(
-            self.approval_policy, "cleanup_execution_binding", None
+        cleanup_binding = (
+            self.approval_policy.cleanup_execution_binding
+            if self.approval_policy is not None
+            else None
         )
         try:
             gate_result, execution_signal = await self._approval_gate.run(
@@ -1128,11 +1174,9 @@ class ToolRegistry:
             )
             approved_execution = None
             if self.approval_policy is not None:
-                consume_binding = getattr(
-                    self.approval_policy, "consume_execution_binding", None
+                approved_execution = self.approval_policy.consume_execution_binding(
+                    execution_token
                 )
-                if callable(consume_binding):
-                    approved_execution = consume_binding(execution_token)
             if gate_result is not None:
                 if (
                     self.enforce_approvals
@@ -1141,7 +1185,7 @@ class ToolRegistry:
                     self.denied_tools.append(tool_call.name)
                 return await finalize(_legacy_result(gate_result))
         finally:
-            if callable(cleanup_binding):
+            if cleanup_binding is not None:
                 cleanup_binding(execution_token)
         if _scope_signal is not None:
             execution_signal = _scope_signal

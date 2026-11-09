@@ -322,7 +322,17 @@ async def _poll_approval_resolution(
 
 
 class ApprovalAbortPolicy(Protocol):
-    """Resolve an abort against any decision that won concurrently."""
+    """Interface shared by top-level and delegated approval policies."""
+
+    async def prepare_rules(self, resolver: Callable[[ApprovalRule], Awaitable[ApprovalRule]]) -> None: ...
+
+    def set_display_label(self, request_id: str, label: str) -> None: ...
+
+    def consume_execution_binding(self, execution_token: str) -> ApprovedExecution | None: ...
+
+    def cleanup_execution_binding(self, execution_token: str) -> None: ...
+
+    def abort(self, request_id: str) -> bool: ...
 
     def abort_or_winner(
         self,
@@ -380,6 +390,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         ] = {}
         self._delegated_resolutions: dict[tuple[str, str], dict[str, str]] = {}
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
+        self._display_labels: dict[str, str] = {}
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
         self._serve_control: _ServeApprovalControl | None = None
 
@@ -422,7 +433,16 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 resolved = True
             except (KeyError, TypeError, ValueError):
                 resolved = False
-        return ApprovalRequest(request_id, tool_call, action=action, capability_resolved=resolved)
+        return ApprovalRequest(
+            request_id,
+            tool_call,
+            label=self._display_labels.get(request_id),
+            action=action,
+            capability_resolved=resolved,
+        )
+
+    def set_display_label(self, request_id: str, label: str) -> None:
+        self._display_labels[request_id] = label
 
     def bind_capability_resolver(
         self, resolver: Callable[[ToolCall], ApprovalCapability]
@@ -1006,7 +1026,12 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
             return None
         if self.decide(capability) is ApprovalDecision.ASK:
-            return ApprovalRequest(tool_call.id, tool_call, action=capability.action)
+            return ApprovalRequest(
+                tool_call.id,
+                tool_call,
+                label=self._display_labels.get(tool_call.id),
+                action=capability.action,
+            )
         return None
 
     async def authorize(

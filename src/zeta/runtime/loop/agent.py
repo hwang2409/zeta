@@ -1130,26 +1130,9 @@ class AgentLoop(
                 if isinstance(block, ToolUseContent)
             ]
             _validate_unique_tool_call_ids(calls)
-            prepared_calls: list[ToolCall] = []
-            preparation_errors: set[str] = set()
-            for tool_call in calls:
-                try:
-                    prepared = await self.tool_registry.prepare_tool_call(tool_call)
-                except (KeyError, TypeError, ValueError):
-                    prepared = tool_call
-                    preparation_errors.add(tool_call.id)
-                prepared_calls.append(prepared)
-            if prepared_calls != calls:
-                prepared_by_id = {call.id: call for call in prepared_calls}
-                assistant_message = replace(
-                    assistant_message,
-                    content=[
-                        ToolUseContent(prepared_by_id[block.tool_call.id])
-                        if isinstance(block, ToolUseContent) else block
-                        for block in assistant_message.content
-                    ],
-                )
-                calls = prepared_calls
+            assistant_message, calls, preparation_errors = (
+                await self.tool_registry.prepare_tool_calls(assistant_message)
+            )
             approval_requests: list[ApprovalAuditRequest] = []
             for tool_call in calls:
                 if tool_call.id in preparation_errors or not self.plan_mode_allows(tool_call):

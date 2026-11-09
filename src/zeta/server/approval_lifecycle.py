@@ -392,6 +392,7 @@ class ApprovalLifecycle:
                 if request.child_instance_id is not None
                 else {}
             ),
+            **({"label": request.label} if request.label is not None else {}),
             **(fields or {}),
         }
 

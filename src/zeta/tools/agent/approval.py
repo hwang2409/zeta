@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +81,14 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         self, child_instance_id: str
     ) -> Awaitable[object] | None:
         return self.parent.cleanup_delegated(child_instance_id)
+
+    async def prepare_rules(
+        self, resolver: Callable[[Any], Awaitable[Any]]
+    ) -> None:
+        await self.parent.prepare_rules(resolver)
+
+    def set_display_label(self, request_id: str, label: str) -> None:
+        self.parent.set_display_label(request_id, label)
 
     def bind_rule_resolver(self, resolver: Any) -> None:
         self.parent.bind_rule_resolver(resolver)

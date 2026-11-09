@@ -949,6 +949,18 @@ def _controlled_terminal_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("COLORTERM", raising=False)
 
 
+def test_approval_wire_payload_includes_live_display_label(tmp_path: Path) -> None:
+    request = ApprovalRequest(
+        "approval",
+        ToolCall("approval", "inbox", {"action": "send", "project": "p_beta"}),
+        label="beta (p_beta)",
+    )
+
+    payload = _bare_approval_lifecycle(tmp_path).observe(request)
+
+    assert payload["label"] == "beta (p_beta)"
+
+
 def test_delegated_approval_payload_includes_execution_context() -> None:
     request = ApprovalRequest(
         "child-write",
