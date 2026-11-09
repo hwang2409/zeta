@@ -1054,43 +1054,6 @@ def project_status(target: object, *, served_turn_end: bool = False) -> dict[str
     return status
 
 
-def perform_read(
-    method: MethodDescriptor,
-    target: tuple[str | None, object],
-    params: dict[str, Any],
-    *,
-    include_delivery_id: bool = False,
-    backward_enabled: bool = False,
-    fidelity: bool = False,
-    content_read: bool = False,
-    served_turn_end: bool = False,
-) -> object:
-    if method is MethodDescriptor.STATUS:
-        return project_status(target[1], served_turn_end=served_turn_end)
 
-    if method in {MethodDescriptor.MODEL_CATALOG, MethodDescriptor.SESSION_SETTINGS}:
-        return target[1]
-    store = target[1]
-    runtime = type(
-        "ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()}
-    )()
-    if method is MethodDescriptor.SESSION_TREE:
-        return session.tree(runtime)
-    if method is MethodDescriptor.SESSION_HISTORY:
-        return history.history(
-            runtime,
-            params,
-            include_delivery_id=include_delivery_id,
-            backward_enabled=backward_enabled,
-            fidelity=fidelity,
-            content_read=content_read,
-            served_turn_end=served_turn_end,
-        )
-    if method is MethodDescriptor.CONTENT_READ:
-        return content.read(
-            store,
-            params.get("handle"),
-            offset=params.get("offset", 0),
-            limit=params.get("limit", content.MAX_CONTENT_READ),
-        )
-    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
+def _observer_runtime(store: object) -> object:
+    return type("ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()})()
