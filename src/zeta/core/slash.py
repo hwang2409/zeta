@@ -32,8 +32,6 @@ from .commands.slash_registry import (
     SlashCommandRegistry,
     SlashResult,
     SlashSurface,
-    always,
-    never,
 )
 from .project_context import (
     discover_project_root,
@@ -929,6 +927,10 @@ def _no_args(args: str) -> bool:
     return not args.strip()
 
 
+def _never_mutates(_args: str) -> bool:
+    return False
+
+
 def _memory_mutates(args: str) -> bool:
     action = args.strip()
     return action == "undo" or action.startswith(
@@ -991,7 +993,7 @@ def create_slash_registry(
             "status",
             _run_status,
             "show session status",
-            ServeSlash(mutates=never, runs_while_busy=_no_args),
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
         )
     )
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
@@ -1002,7 +1004,7 @@ def create_slash_registry(
             "show MCP server status",
             ServeSlash(
                 mutates=_mcp_mutates,
-                runs_while_busy=never,
+                runs_while_busy=_never_mutates,
             ),
         )
     )
@@ -1070,7 +1072,7 @@ def create_slash_registry(
             "compact",
             _run_compact,
             "compact the context",
-            ServeSlash(mutates=always),
+            ServeSlash(mutates=lambda _args: True),
         )
     )
     registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
@@ -1113,7 +1115,7 @@ def create_slash_registry(
             "inbox",
             _run_inbox,
             "list this project's inbox",
-            ServeSlash(mutates=never, runs_while_busy=_no_args),
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
         )
     )
     registry.register(
@@ -1129,7 +1131,7 @@ def create_slash_registry(
             "repair-transcript",
             _run_repair_transcript,
             "repair one corrupt transcript: /repair-transcript <session> confirm",
-            ServeSlash(mutates=always),
+            ServeSlash(mutates=lambda _args: True),
         )
     )
     registry.register(
@@ -1155,7 +1157,7 @@ def create_slash_registry(
             "help",
             lambda _session, _args: registry.help_text(),
             "list commands",
-            ServeSlash(mutates=never, runs_while_busy=_no_args),
+            ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
         )
     )
     registry.register(SlashCommand("approve", _run_approve, "/approve [key]"))

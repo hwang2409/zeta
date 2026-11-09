@@ -36,45 +36,23 @@ type SlashResult = (
 type SlashHandler = Callable[[SlashSession, str], SlashResult]
 
 
-def never(_args: str) -> bool:
-    """Argument predicate that holds for no form; busy policy reads it by identity."""
-
+def _never(_args: str) -> bool:
     return False
 
 
-def always(_args: str) -> bool:
-    """Argument predicate that holds for every form; busy policy reads it by identity."""
-
+def _always(_args: str) -> bool:
     return True
-
-
-class BusyPolicy(StrEnum):
-    """Which forms of a command run while a turn is running."""
-
-    ALWAYS = "always"
-    NEVER = "never"
-    READ_FORMS = "read_forms"
 
 
 @dataclass(frozen=True, slots=True)
 class ServeSlash:
     """Serve-specific policy for one shared slash command."""
 
-    mutates: Callable[[str], bool] = always
-    runs_while_busy: Callable[[str], bool] = never
+    mutates: Callable[[str], bool] = _always
+    runs_while_busy: Callable[[str], bool] = _never
 
     def can_run_while_busy(self, args: str) -> bool:
         return self.runs_while_busy(args) and not self.mutates(args)
-
-    @property
-    def busy_policy(self) -> BusyPolicy:
-        """Classify ``can_run_while_busy`` from the same two predicates."""
-
-        if self.runs_while_busy is never or self.mutates is always:
-            return BusyPolicy.NEVER
-        if self.runs_while_busy is always and self.mutates is never:
-            return BusyPolicy.ALWAYS
-        return BusyPolicy.READ_FORMS
 
 
 class SlashSurface(StrEnum):
