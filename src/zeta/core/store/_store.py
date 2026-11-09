@@ -51,6 +51,13 @@ from ..checkpoints import (
     active_branch,
     load_session_json,
 )
+from ..checkpoints.entry_types import validate_conversation_entry
+from ..checkpoints.mutation import (
+    AppendConversationRows,
+    ConversationGenerationConflict,
+    ConversationRow,
+    register_conversation_target,
+)
 from ..session_files import (
     child_directory,
     open_session_file,
@@ -70,7 +77,7 @@ from ._approval_display import (
     validated_approval_display,
 )
 from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_history_data
-from ._async_writes import AsyncDurableWritesMixin
+from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import (
     ChildRunStoreMixin,
     validate_child_run_started_data,
@@ -141,6 +148,7 @@ class ConversationStore(
         _execution_lease: session_execution.SessionExecutionLease | None = None,
         _owner_surface: session_execution.OwnerSurface = "tui",
         _recovery_owner: bool = False,
+        _mutation_target: bool = False,
         _repair_explicit: bool = False,
         _repair_target: RepairTarget | None = None,
     ) -> None:
@@ -173,6 +181,7 @@ class ConversationStore(
             self.session_dir = self.root_dir / self.session_id
             self._read_only = _read_only
             self._must_exist = _must_exist
+            self._mutation_target = _mutation_target
             self._repair_explicit = _repair_explicit
             self._repair_target = _repair_target or repair_target_for_session_dir(
                 self.session_dir, self.session_id
@@ -257,6 +266,8 @@ class ConversationStore(
                     self._storage_lease,
                 )
             storage_ownership.pop_all()
+        if not _read_only and not _mutation_target:
+            register_conversation_target(self)
 
     @property
     def last_repair_result(self) -> RepairResult | None:
@@ -522,6 +533,7 @@ class ConversationStore(
 
     def _validate_entry_payload(self, entry: ConversationEntry) -> None:
         try:
+            validate_conversation_entry(self, entry)
             if entry.type == "message":
                 message = entry.data.get("message")
                 if type(message) is not dict:
@@ -633,10 +645,16 @@ class ConversationStore(
         data: dict[str, Any],
         parent_id: str | None = None,
     ) -> ConversationEntry:
-        with self._append_lock():
-            return self._snapshot_entry(
-                self._append_row_unlocked(entry_type, data, parent_id)
-            )
+        command = AppendConversationRows(
+            (ConversationRow(entry_type, data, parent_id),)
+        )
+        for _attempt in range(3):
+            try:
+                delta = self.commit(command, self.conversation_generation)
+                return delta.committed_entries[0]
+            except ConversationGenerationConflict:
+                continue
+        raise ConversationIntegrityError("conversation kept changing during append")
 
     def append_many(
         self, rows: Iterable[tuple[str, dict[str, Any]]]
@@ -649,11 +667,18 @@ class ConversationStore(
         materialized = [(entry_type, dict(data)) for entry_type, data in rows]
         if not materialized:
             return []
-        with self._append_lock():
-            return [
-                self._snapshot_entry(entry)
-                for entry in self._append_many_unlocked(materialized)
-            ]
+        command = AppendConversationRows(
+            tuple(
+                ConversationRow(entry_type, data) for entry_type, data in materialized
+            )
+        )
+        for _attempt in range(3):
+            try:
+                delta = self.commit(command, self.conversation_generation)
+                return list(delta.committed_entries)
+            except ConversationGenerationConflict:
+                continue
+        raise ConversationIntegrityError("conversation kept changing during append")
 
     def _append_many_unlocked(
         self, rows: list[tuple[str, dict[str, Any]]]
@@ -789,9 +814,10 @@ class ConversationStore(
         on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         """Append off-loop and run ``on_persisted`` before deferred cancellation."""
-        kwargs = {"parent_id": parent_id} if parent_id is not None else {}
-        return await self._to_thread_durable(
-            self.append_message, message, _on_persisted=on_persisted, **kwargs
+        return await self._commit_storage_command(
+            _AppendMessageCommand(
+                message=message, parent_id=parent_id, callback=on_persisted
+            )
         )
 
     def append_compaction_marker(

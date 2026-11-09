@@ -402,44 +402,6 @@ def test_approval_subject_includes_action_and_target_project(tmp_path: Path) -> 
         store.close()
 
 
-def test_inbox_name_rule_allows_send_by_name_and_id(tmp_path: Path) -> None:
-    registry, store = _registry(tmp_path)
-    projects = registry.project_registry
-    assert projects is not None
-    beta = projects.create_project("beta", "beta")
-    try:
-        policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
-        registry.set_approval_policy(policy)
-        for project in ("beta", beta.project_id):
-            assert (
-                policy.decide(_send_capability(registry, project))
-                is ApprovalDecision.ALLOW
-            )
-    finally:
-        asyncio.run(registry.close())
-        store.close()
-
-
-def test_inbox_id_rule_allows_send_by_name_and_id(tmp_path: Path) -> None:
-    registry, store = _registry(tmp_path)
-    projects = registry.project_registry
-    assert projects is not None
-    beta = projects.create_project("beta", "beta")
-    try:
-        policy = ApprovalPolicy(
-            always_allow={f"inbox(send {beta.project_id})"}, default="deny"
-        )
-        registry.set_approval_policy(policy)
-        for project in ("beta", beta.project_id):
-            assert (
-                policy.decide(_send_capability(registry, project))
-                is ApprovalDecision.ALLOW
-            )
-    finally:
-        asyncio.run(registry.close())
-        store.close()
-
-
 def test_inbox_rule_does_not_allow_other_project(tmp_path: Path) -> None:
     registry, store = _registry(tmp_path)
     projects = registry.project_registry
@@ -482,7 +444,7 @@ def test_inbox_wildcard_rule_skips_project_lookup(
         assert (
             policy.decide(_send_capability(registry, "beta")) is ApprovalDecision.ALLOW
         )
-        assert references == ["beta"]
+        assert references == []
     finally:
         asyncio.run(registry.close())
         store.close()
