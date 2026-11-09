@@ -115,6 +115,7 @@ async def consume_child(
             **result_options,
         )
 
+    def clean_no_output(text: str) -> dict[str, object]: return terminal_result(state="idle", text="child is idle", status="running") if child_loop.explicit_finish else terminal_result(state="failed", text=text)
     def lifecycle_depth(call: ToolCall | None) -> int:
         if call is not None and call.name.casefold() == "agent":
             return child_loop.agent_depth + 1
@@ -306,20 +307,14 @@ async def consume_child(
             return result
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
-        if child_loop.explicit_finish:
-            return terminal_result(state="idle", text="child is idle", status="running")
-        text = "agent error: child ended without a final response"
-        return terminal_result(state="failed", text=text)
+        return clean_no_output("agent error: child ended without a final response")
     final_text = assistant_text(final_message)
     if not final_text.strip():
         if final_message.metadata.get("stop_reason") == "max_tokens":
             from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE
 
             return terminal_result(state="completed", text=OUTPUT_LIMIT_ERROR_MESSAGE)
-        if child_loop.explicit_finish:
-            return terminal_result(state="idle", text="child is idle", status="running")
-        text = "agent error: child returned an empty final assistant message"
-        return terminal_result(state="failed", text=text)
+        return clean_no_output("agent error: child returned an empty final assistant message")
     if record_report is not None:
         record_report(final_text)
     if child_loop.explicit_finish:
