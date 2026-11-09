@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -41,7 +41,6 @@ from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from ..project_registry import ProjectRegistryError
 from ..runtime.status import capture_slash_status
-from . import accounts
 from .handlers import validation
 from .model_selection import apply as apply_settings
 from .protocol import (
@@ -537,30 +536,6 @@ async def registry_for_request(runtime: ServerRuntime) -> SlashCommandRegistry:
     if runtime.loop is not None:
         await runtime.loop.refresh_live_config()
     return await asyncio.to_thread(build_registry, runtime)
-
-
-READ_REQUESTS = {"slash_list", *accounts.REQUEST_METHODS}
-
-
-async def read_request(
-    method: str,
-    runtime: ServerRuntime,
-    require_idle: Callable[[], Awaitable[None]],
-    params: dict[str, object],
-    owner: object,
-) -> dict[str, object]:
-    if method == "slash_list":
-        include_unavailable = params.get("include_unavailable", False)
-        if not isinstance(include_unavailable, bool):
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS,
-                "include_unavailable must be a boolean",
-            )
-        return await list_commands(runtime, include_unavailable=include_unavailable)
-    operation = accounts.request(method, runtime, require_idle, params)
-    if method == "account_switch":
-        return await accounts.run_owned_switch(owner, operation)
-    return await operation
 
 
 async def list_commands(

@@ -22,27 +22,6 @@ from .history_projection import (
 if TYPE_CHECKING:
     from ...core.store import ConversationStore
 
-EXTENSION_REQUESTS = [
-    "rename_session",
-    "delete_session",
-    "repair_transcript",
-    "session_tree",
-    "session_history",
-    "content_read",
-    "switch_branch",
-    "fork_message",
-    "model_catalog",
-    "session_settings",
-    "set_settings",
-    "set_compaction",
-    "send_images",
-    "slash_list",
-    "slash_run",
-    "account_list",
-    "account_logout",
-    "account_refresh",
-    "account_switch",
-]
 HISTORY_FIRST_PAGE_ENTRIES = 128
 
 
