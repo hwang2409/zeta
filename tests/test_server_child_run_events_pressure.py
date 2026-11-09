@@ -365,3 +365,55 @@ async def test_64_small_frames_join_and_65th_is_stale_while_child_scope_stays_ga
             )
         finally:
             await observer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_byte_pressure_invalidates_before_the_record_cap_at_exact_codec_bytes(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _serve(tmp_path, transport) as (server, client, session_id, _stores):
+        assert server.connections is not None and server._client is not None
+        replay = server.connections.replay
+        scope = ReplayScopeId.top(session_id)
+        codec = server._client.codec
+        encoded: list[int] = []
+        original = codec.notification
+
+        def record(event: EventDescriptor, *args: Any, **fields: Any) -> Any:
+            frame = original(event, *args, **fields)
+            if event is EventDescriptor.TURN_START and "stream_id" in fields:
+                encoded.append(len(frame))
+            return frame
+
+        # test-contract: seam observe the complete frames the real codec returned
+        monkeypatch.setattr(codec, "notification", record)
+        entered, release = _gate_history_read(server, monkeypatch)
+        await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
+        await await_or_fail(entered.wait(), what="join read held")
+        large = "x" * 200_000
+        charged: list[int] = []
+        while scope in replay._scopes or not charged:
+            await await_or_fail(
+                server.control._notify(
+                    EventDescriptor.TURN_START, session_id, data={"turn_id": large}
+                ),
+                what="publish large frame",
+            )
+            if scope in replay._scopes:
+                charged.append(replay._scopes[scope].bytes)
+        admitted = len(charged)
+        release.set()
+        stale = await client.response(3)
+        assert stale.get("error", {}).get("data") == {"code": "stale_event_sequence"}, (
+            "byte pressure did not invalidate the pending join"
+        )
+        assert [frame for frame in client.buffered if "seq" in frame.get("params", {})] == []
+        # every admitted frame was charged its complete codec bytes, below the cap
+        assert charged == [sum(encoded[: n + 1]) for n in range(admitted)]
+        assert charged[-1] <= REPLAY_SCOPE_MAX_BYTES < charged[-1] + encoded[admitted]
+        # bytes bound first: far below the record cap, and nothing kept a charge or seq
+        assert len(encoded) == admitted + 1 < SCOPE_RECORDS
+        assert scope not in replay._scopes
+        assert not replay.is_pending(server._client)
+        assert replay.stream_id(server._client) is None
