@@ -45,12 +45,12 @@ class PlanModeRuntimeMixin:
                 )
             else:
                 self._plan_mode_prior_prompt = assembler.system_prompt
-                assembler.system_prompt = plan_mode_prompt(assembler.system_prompt)
+                assembler.update_system_prompt(plan_mode_prompt(assembler.system_prompt))
         elif self._plan_mode_prior_prompt is not None:
             if runtime_prompt is not None:
                 self._set_runtime_prompt(self._plan_mode_prior_prompt)
             else:
-                assembler.system_prompt = self._plan_mode_prior_prompt
+                assembler.update_system_prompt(self._plan_mode_prior_prompt)
             self._plan_mode_prior_prompt = None
         self._plan_mode = enabled
         if self._on_plan_mode_change is not None:

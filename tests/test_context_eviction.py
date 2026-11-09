@@ -976,15 +976,18 @@ def test_project_recall_and_background_results_get_receipts() -> None:
 async def test_real_workflow_tool_results_get_eviction_receipts(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     projects = ProjectRegistry(home / "projects")
-    project = projects.create_project("zeta", "test project")
-    sender = projects.create_project("sender", "test sender")
-    projects.update_memory(project.project_id, {"state.md": "private state " * 500})
+    project = await asyncio.to_thread(projects.create_project, "zeta", "test project")
+    sender = await asyncio.to_thread(projects.create_project, "sender", "test sender")
+    await asyncio.to_thread(
+        projects.update_memory, project.project_id, {"state.md": "private state " * 500}
+    )
     store = ConversationStore(
         home / "sessions", session_id="a" * 32, cwd=tmp_path
     )
     hidden = store.append_message(text(MessageRole.USER, "hidden history " * 500))
     store.append_compaction_marker("evicted", hidden.seq, hidden.seq)
-    ProjectInbox(projects, sessions_root=home / "sessions").send(
+    await asyncio.to_thread(
+        ProjectInbox(projects, sessions_root=home / "sessions").send,
         from_project=sender.project_id,
         from_session="b" * 32,
         to_project=project.project_id,

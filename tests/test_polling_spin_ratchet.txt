@@ -8,14 +8,9 @@ tests/test_attachments.py::run_ctrl_v::a79607813bbe04a5::1
 tests/test_attachments.py::run_ctrl_v::cb8014d9ad19c14c::1
 tests/test_attachments.py::test_close_cancels_and_awaits_staging_paste::2560082da49342c3::1
 tests/test_attachments.py::test_session_switch_drops_staged_paste::2560082da49342c3::1
-tests/test_auto_memory.py::test_close_stops_retrying_persistent_cas_conflicts::87bdaa02b9f0efee::1
 tests/test_bash_cwd.py::test_delegated_shell_approval_uses_persisted_bash_cwd::bfbf4e9068bce0f2::1
 tests/test_child_run_events_slice1.py::run::b00ea5cb929e3bb8::1
 tests/test_mcp_envelope.py::heartbeat::e83f1ce061a3e2cb::1
-tests/test_memory_structured_updater.py::observed::ff070c5c489bd979::1
-tests/test_memory_structured_updater.py::test_continuous_turns_fire_by_default_max_wait_and_repeat::7ba757939eccb375::1
-tests/test_memory_structured_updater.py::test_continuous_turns_fire_by_default_max_wait_and_repeat::de2b667a986c6ff8::1
-tests/test_memory_structured_updater.py::test_restart_does_not_retrigger_consumed_user_turn::3da96cafa7f7d4d5::1
 tests/test_memory_structured_updater.py::wait::e1a9381f378dd05d::1
 tests/test_restart.py::run_prompt_toolkit::91dc2675bc0ac044::1
 tests/test_restart.py::run_prompt_toolkit::d1a58bb6f79c3aec::1

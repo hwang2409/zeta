@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from ...locking import shape_lock
 from ...storage_format import (
     WriterLease,
     mapping_mutations,
@@ -488,7 +489,11 @@ class WorkspaceSnapshotStore:
                 pass
             with ExitStack() as lease:
                 _, self.directory_fd = lease.enter_context(
-                    session_directory(self.session_dir.parent, self.session_dir.name)
+                    session_directory(
+                        self.session_dir.parent,
+                        self.session_dir.name,
+                        lifetime=True,
+                    )
                 )
                 self._load()
                 self._release_lease = weakref.finalize(
@@ -557,6 +562,8 @@ class WorkspaceSnapshotStore:
     def _shadow_workspace(self, *, write: bool = False):
         """Keep Git's path-based IO outside sessions; import/export via safe FDs."""
         lock_fd = open_session_file(self.directory_fd, ".workspace.lock", os.O_RDWR | os.O_CREAT)
+        rank = shape_lock()
+        rank.__enter__()
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             with tempfile.TemporaryDirectory(prefix="zeta-shadow-") as temporary:
@@ -572,6 +579,7 @@ class WorkspaceSnapshotStore:
                             self._publish_shadow(scratch)
         finally:
             os.close(lock_fd)
+            rank.__exit__(None, None, None)
 
     def _publish_shadow(self, scratch: Path) -> None:
         with session_root(scratch) as scratch_fd, child_directory(scratch_fd, SHADOW_REPO_DIRNAME) as source_fd, child_directory(self.directory_fd, SHADOW_REPO_DIRNAME, create=True) as destination_fd:

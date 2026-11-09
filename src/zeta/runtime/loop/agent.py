@@ -357,7 +357,6 @@ class AgentLoop(
             self.backend.set_token_budget(token_budget)
     def admit_abort(self) -> None:
         self._abort_admitted = True
-
     def abort(
         self,
         *,
@@ -370,7 +369,6 @@ class AgentLoop(
             self._background_owner.cancel_all()
             if steering_drop_reason is not None:
                 self.store.drop_client_steering(steering_drop_reason)
-
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
         The running ``_run_turn`` drains this queue before the next provider
@@ -378,11 +376,9 @@ class AgentLoop(
         tool_result. Callers must pass a durable USER-role message.
         """
         self.store.queue_client_steering(message)
-
     @property
     def has_pending_steering(self) -> bool:
         return self.store.has_pending_client_steering
-
     def clear_pending_steering(
         self,
         reason: Literal["clear", "turn_end"] = "clear",
@@ -793,18 +789,13 @@ class AgentLoop(
                 ):
                     yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
                     await account_context.ensure_account_state(self)
-                if retrying_context or (
-                    self.context_assembler.needs_compaction()
-                    if not host_instruction
-                    else self.context_assembler.needs_compaction(
-                        system_append=host_instruction
-                    )
-                ):
-                    yield StreamEvent(
-                        StreamEventType.COMPACTION_START,
-                        data={"turn": turn_number},
-                    )
                 try:
+                    should_compact = await self.context_assembler.prepare_context(
+                        force=retrying_context,
+                        system_append=host_instruction,
+                    )
+                    if should_compact:
+                        yield StreamEvent(StreamEventType.COMPACTION_START, data={"turn": turn_number})
                     context_messages = await self.context_assembler.assemble(
                         backend=self.backend,
                         force=retrying_context,
@@ -820,6 +811,9 @@ class AgentLoop(
                         emergency=True,
                         system_append=host_instruction,
                     )
+                finally:
+                    # cancellation must not retain the prepared message graph.
+                    self.context_assembler.discard_prepared_context()
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
                 context_messages = self._account_safe_context(context_messages)
@@ -1101,9 +1095,12 @@ class AgentLoop(
                 if isinstance(block, ToolUseContent)
             ]
             _validate_unique_tool_call_ids(calls)
+            assistant_message, calls, preparation_errors = (
+                await self.tool_registry.prepare_tool_calls(assistant_message)
+            )
             approval_requests: list[ApprovalAuditRequest] = []
             for tool_call in calls:
-                if not self.plan_mode_allows(tool_call):
+                if tool_call.id in preparation_errors or not self.plan_mode_allows(tool_call):
                     continue
                 request = self.tool_registry.prepare_approval(tool_call)
                 if request is not None:

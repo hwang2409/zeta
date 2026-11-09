@@ -647,14 +647,21 @@ async def test_tui_project_dispatch_reads_storage_off_loop(
     )
     loop_thread = threading.get_ident()
     read_threads: list[int] = []
-    original_read = registry._read
+    original_read = registry._identity_read
+    original_lock = registry._project_lock
 
     def recording_read(operation: object) -> object:
         read_threads.append(threading.get_ident())
         return original_read(operation)  # type: ignore[arg-type]
 
+    def recording_lock(*args: object, **kwargs: object) -> object:
+        read_threads.append(threading.get_ident())
+        return original_lock(*args, **kwargs)  # type: ignore[arg-type]
+
     # test-contract: seam records real registry transactions across TUI dispatch
-    monkeypatch.setattr(registry, "_read", recording_read)
+    monkeypatch.setattr(registry, "_identity_read", recording_read)
+    # test-contract: seam records real registry transactions across TUI dispatch
+    monkeypatch.setattr(registry, "_project_lock", recording_lock)
 
     class Tui(SlashHandlerMixin):
         pass
