@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
 from typing import Protocol
 
-from ..core.approval import ApprovalDecision, ApprovalRequest
+from rich.panel import Panel
+
+from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..tools._shared.shell import trusted_macro_display
 from .render import render_approval_card
 
@@ -68,6 +71,7 @@ class ForkRuntimeMixin:
     def _init_fork_runtime(self) -> None:
         self._fork_controller: ForkStackController | None = None
         self._approval_units: dict[str, tuple[object, bool]] = {}
+        self._approval_label_tasks: set[asyncio.Task[None]] = set()
         self._run_result = RuntimeResult.EXIT
 
     def set_fork_controller(self, controller: ForkStackController | None) -> None:
@@ -129,22 +133,52 @@ class ForkRuntimeMixin:
             if handle in self._approval_units:
                 continue
             unit = self._presenter.print_unit(
-                render_approval_card(
-                    request.tool_call.name,
-                    request.tool_call.arguments,
-                    label=request.label,
-                    key=item.handle or str(request.key),
-                    shortcut=shortcut,
-                    trusted_display=trusted_macro_display(request.tool_call.id),
-                    execution_display=(request.effective_cwd, request.resolved_path)
-                    if request.effective_cwd is not None
-                    or request.resolved_path is not None
-                    else None,
-                )
+                _approval_card(item, shortcut, request.label)
             )
             if unit is not None:
                 self._approval_units[handle] = (unit, shortcut)
+                if request.label is None and self._approval_policy is not None:
+                    task = asyncio.create_task(
+                        self._fill_approval_label(
+                            self._approval_policy, item, shortcut, unit
+                        )
+                    )
+                    self._approval_label_tasks.add(task)
+                    task.add_done_callback(self._approval_label_tasks.discard)
         self._invalidate_prompt()
+
+    async def _fill_approval_label(
+        self, policy: ApprovalPolicy, item: OwnedApproval, shortcut: bool, unit: object
+    ) -> None:
+        # The card shows the raw call first; a card replaced meanwhile drops the label.
+        label = await policy.display_label(item.request.tool_call)
+        handle = item.handle or str(item.request.key)
+        if label is None or self._approval_units.get(handle, (None,))[0] is not unit:
+            return
+        self._transcript.replace(unit, _approval_card(item, shortcut, label))
+        self._invalidate_prompt()
+
+    async def _close_approval_labels(self) -> None:
+        tasks = tuple(self._approval_label_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _approval_card(item: OwnedApproval, shortcut: bool, label: str | None) -> Panel:
+    request = item.request
+    return render_approval_card(
+        request.tool_call.name,
+        request.tool_call.arguments,
+        label=label,
+        key=item.handle or str(request.key),
+        shortcut=shortcut,
+        trusted_display=trusted_macro_display(request.tool_call.id),
+        execution_display=(request.effective_cwd, request.resolved_path)
+        if request.effective_cwd is not None
+        or request.resolved_path is not None
+        else None,
+    )
 
 
 class ForkStackController:

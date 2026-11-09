@@ -11139,7 +11139,10 @@ async def test_app_surfaces_compacting_state_before_provider_output(
         return messages
 
     assembler.assemble = compacted_assemble  # type: ignore[method-assign]
-    assembler.needs_compaction = lambda: True  # type: ignore[method-assign]
+    async def prepare_context(**kwargs: object) -> bool:
+        return True
+
+    assembler.prepare_context = prepare_context  # type: ignore[method-assign]
     app._invalidate_prompt = lambda: states.append(app._loop_state)
 
     await app._consume_turn("prompt")
@@ -15639,7 +15642,7 @@ async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
 ) -> None:
     writer = await asyncio.to_thread(open_writer, tmp_path)
     projects = ProjectRegistry(tmp_path / "projects")
-    project = projects.create_project("alpha", "alpha")
+    project = await asyncio.to_thread(projects.create_project, "alpha", "alpha")
     store = ConversationStore(
         tmp_path / "sessions", session_id="a" * 32, cwd=tmp_path
     )

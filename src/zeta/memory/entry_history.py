@@ -338,7 +338,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             manifest_reader=self._manifest,
             transaction_step=self._memory_transaction_step,
             prune_versions=self._prune_versions,
-            home=self.root.parent,
+            storage_lease=self._writer_lease(),
         )
         if not isinstance(published.snapshot, str):
             raise TypeError("format-2 publication returned a non-scalar snapshot")
@@ -355,15 +355,16 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
     def _export_entry_memory(self, project_id: str) -> EntryMemoryExport:
         """Export one format-2 fixture without exposing storage layout."""
 
-        def read(root_fd: int) -> EntryMemoryExport:
-            return self._export_entry_memory_locked(root_fd, project_id)
+        def read(project_fd: int) -> EntryMemoryExport:
+            return self._export_entry_memory_locked(project_fd, project_id)
 
-        return self._read(read)
+        with self._project_lock(project_id, "memory", exclusive=False) as project_fd:
+            return read(project_fd)
 
     def _export_entry_memory_locked(
-        self, root_fd: int, project_id: str
+        self, project_fd: int, project_id: str
     ) -> EntryMemoryExport:
-        directory_fd = self._project_dir(root_fd, project_id)
+        directory_fd = os.dup(project_fd)
         try:
             snapshot = self._entry_snapshot_locked(directory_fd)
             pointer = self._pointer(directory_fd)
@@ -410,9 +411,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         provenance: Mapping[str, object],
     ) -> EntryMemorySnapshot:
         """CAS-import one validated format-2 snapshot."""
-        with self._locked(write=True) as root_fd:
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             return self._import_entry_memory_locked(
-                root_fd,
+                project_fd,
                 project_id,
                 exported,
                 expected_digest=expected_digest,
@@ -422,7 +423,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
 
     def _import_entry_memory_locked(
         self,
-        root_fd: int,
+        project_fd: int,
         project_id: str,
         exported: EntryMemoryExport,
         *,
@@ -445,7 +446,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             not isinstance(record, dict) for record in exported.versions
         ):
             raise ProjectRegistryError("format-2 memory export history is too large")
-        directory_fd = self._project_dir(root_fd, project_id)
+        directory_fd = os.dup(project_fd)
         try:
             current = self._entry_snapshot_locked(directory_fd)
             if current.digest != expected_digest:
@@ -539,8 +540,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
     ) -> EntryMemorySnapshot:
         """Activate an empty real project when every format-2 consumer is ready."""
         self._ensure_entry_memory_capabilities()
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 return self._activate_entry_memory_locked(
                     directory_fd, project_id, profile
@@ -564,8 +565,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         mappings = dict(kind_mappings or {})
         if set(mappings) & set(resolve_kinds):
             raise ProjectRegistryError("a memory kind cannot be mapped and resolved")
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
                 source_state = current.state
@@ -656,8 +657,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
 
     def finalize_memory_migration(self, project_id: str) -> EntryMemorySnapshot:
         """End special rollback protection while retaining normal history."""
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
                 pointer = self._pointer(directory_fd)
@@ -697,8 +698,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         self, project_id: str, *, migrated_at: str
     ) -> MigrationPlan:
         """Run the dormant migration only through an explicit fixture seam."""
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 pointer = self._pointer(directory_fd)
                 if pointer is not None:
@@ -761,7 +762,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     manifest_reader=self._manifest,
                     transaction_step=self._memory_transaction_step,
                     prune_versions=self._prune_versions,
-                    home=self.root.parent,
+                            storage_lease=self._writer_lease(),
                 )
                 if published.value != plan.state:
                     raise AssertionError("migration publication changed its state")
@@ -776,8 +777,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
 
     def _rollback_memory_migration_for_test(self, project_id: str) -> None:
         """Restore the protected format-1 pointer for a fixture migration."""
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 pointer = self._pointer(directory_fd)
                 if pointer is None:
@@ -868,8 +869,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         expected_digest: str,
     ) -> EntryMemorySnapshot:
         """Publish a complete dormant fixture state through CAS."""
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
                 if current.digest != expected_digest:
@@ -889,8 +890,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
     ) -> EntryMemorySnapshot:
         """Create dormant format-2 state for isolated tests only."""
         state = empty_state(project_id, schema)
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 return self._publish_entry_version(
                     directory_fd,
@@ -927,8 +928,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             for reason in rejected_groups
         ):
             raise ProjectRegistryError("invalid rejected memory operation groups")
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 pointer = self._pointer(directory_fd)
                 if pointer is None:
@@ -1000,8 +1001,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                 os.close(directory_fd)
 
     def _accept_memory_entry(self, project_id: str, entry_id: str) -> EntryCASResult:
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
                 state, receipt = accept_entry(current.state, entry_id)
@@ -1029,8 +1030,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         *,
         reason: str = "resolved by user",
     ) -> EntryCASResult:
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
                 state, receipt = resolve_entries(
@@ -1057,8 +1058,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         self, project_id: str, kind: str, content: str
     ) -> EntryCASResult:
         """Replace one kind with an accepted legacy-document entry."""
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
                 active_ids = tuple(
@@ -1115,8 +1116,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         self, project_id: str, target_id: str | None = None
     ) -> EntryCASResult:
         """Undo the latest, entry-matching, or exact retained transaction."""
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
+        with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
+            directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
                 pointer = self._pointer(directory_fd)

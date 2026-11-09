@@ -533,7 +533,7 @@ async def test_project_instructions_does_not_block_status_on_registry_lock(
     home = tmp_path / "zeta-home"
     root = tmp_path / "project"
     root.mkdir()
-    _private_project(home, root, "")
+    await asyncio.to_thread(_private_project, home, root, "")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(root)
     app = await asyncio.to_thread(create_app, _args())
@@ -548,11 +548,11 @@ async def test_project_instructions_does_not_block_status_on_registry_lock(
         status = await app._slash_commands.dispatch_async(app, "/status")
         assert status
         progress = asyncio.create_task(asyncio.sleep(0))
-        await progress
+        await asyncio.wait_for(progress, 10)
         assert not operation.done()
         release.set()
         holder.join(2)
-        result = await operation
+        result = await asyncio.wait_for(operation, 10)
         assert result.startswith(f"opened {home / 'projects'}")
         assert result.endswith("/AGENTS.md")
     finally:
@@ -570,7 +570,7 @@ async def test_project_instructions_opens_editor_once_in_tui(
     home = tmp_path / "zeta-home"
     root = tmp_path / "project"
     root.mkdir()
-    _, private = _private_project(home, root, "")
+    _, private = await asyncio.to_thread(_private_project, home, root, "")
     editor = tmp_path / "editor"
     invocation = tmp_path / "invocation"
     editor.write_text(f'#!/bin/sh\nprintf "%s" "$1" > {invocation}\n')
@@ -612,7 +612,7 @@ async def test_project_instructions_editor_failure_prints_notice(
     home = tmp_path / "zeta-home"
     root = tmp_path / "project"
     root.mkdir()
-    _, private = _private_project(home, root, "")
+    _, private = await asyncio.to_thread(_private_project, home, root, "")
     if editor == "nonzero-editor":
         editor_path = tmp_path / editor
         editor_path.write_text("#!/bin/sh\nexit 9\n")
@@ -647,7 +647,7 @@ async def test_project_instructions_serve_does_not_start_editor(
     home = tmp_path / "zeta-home"
     root = tmp_path / "project"
     root.mkdir()
-    _, private = _private_project(home, root, "")
+    _, private = await asyncio.to_thread(_private_project, home, root, "")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(root)
     registry = create_slash_registry(

@@ -7,7 +7,6 @@ corruption or archive bugs before publication.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import io
 import json
@@ -30,6 +29,7 @@ from ..memory_migration_plan import (
     legacy_memory_digest,
     reachable_version_pruning_plan,
 )
+from ..project_registry import ProjectRegistry
 from ..storage_format import reject_unknown_keys
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
@@ -84,35 +84,54 @@ def prepare_project_transfer(project: Path) -> PreparedTransfer:
             with path.open("rb") as stream:
                 archive.addfile(member, stream)
     archive_bytes = output.getvalue()
-    with materialize_project_transfer(
-        PreparedTransfer(archive_bytes, ""), project.name, verify_digest=False
-    ) as extracted:
-        digest = transfer_digest(extracted)
+    with _unpacked_transfer(archive_bytes, project.name) as (snapshot, digest):
+        _validate_transfer(snapshot, project.name)
     return PreparedTransfer(archive_bytes, digest)
 
 
 @contextmanager
 def materialize_project_transfer(
-    prepared: PreparedTransfer,
-    project_id: str,
-    *,
-    verify_digest: bool = True,
+    prepared: PreparedTransfer, project_id: str
 ) -> Iterator[Path]:
     """Extract and validate one immutable prepared payload in a private directory."""
 
-    with tempfile.TemporaryDirectory(prefix="zeta-project-transfer-") as temporary:
-        snapshot = Path(temporary) / project_id
-        snapshot.mkdir(mode=0o700)
-        _extract_archive(prepared.archive_bytes, snapshot)
-        digest = transfer_digest(snapshot)
-        if verify_digest and digest != prepared.transfer_digest:
+    with _unpacked_transfer(prepared.archive_bytes, project_id) as (snapshot, digest):
+        if digest != prepared.transfer_digest:
             raise ProjectPublicationError("project transfer digest does not match")
-        _validate_snapshot(snapshot, project_id)
-        if __package__:
-            from .memory import _validate_project_snapshot
-
-            _validate_project_snapshot(snapshot, project_id)
+        _validate_transfer(snapshot, project_id)
         yield snapshot
+
+
+@contextmanager
+def _unpacked_transfer(
+    archive_bytes: bytes, project_id: str
+) -> Iterator[tuple[Path, str]]:
+    """Extract a payload and digest it before validation can add lock files.
+
+    The snapshot sits under its own ``projects`` directory so validation opens a
+    private zeta home, never the system temp directory.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="zeta-project-transfer-") as temporary:
+        if __package__:
+            from ..storage_format import open_writer
+
+            # Bootstrap the private home while it is still empty.
+            with open_writer(temporary):
+                pass
+        snapshot = Path(temporary) / "projects" / project_id
+        snapshot.parent.mkdir(mode=0o700)
+        snapshot.mkdir(mode=0o700)
+        _extract_archive(archive_bytes, snapshot)
+        yield snapshot, transfer_digest(snapshot)
+
+
+def _validate_transfer(snapshot: Path, project_id: str) -> None:
+    _validate_snapshot(snapshot, project_id)
+    if __package__:
+        from .memory import _validate_project_snapshot
+
+        _validate_project_snapshot(snapshot, project_id)
 
 
 def _extract_archive(archive_bytes: bytes, destination: Path) -> None:
@@ -156,12 +175,15 @@ def publish_local_project(
     _validate_snapshot(snapshot, project_id)
     side_file_payloads = validated_side_file_payloads(snapshot)
     projects = home / "projects"
+    registry = ProjectRegistry(projects)
     projects.mkdir(parents=True, exist_ok=True, mode=0o700)
     project = projects / project_id
-    lock_fd = os.open(projects / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    os.fchmod(lock_fd, 0o600)
-    with os.fdopen(lock_fd, "r+b") as registry_lock:
-        fcntl.flock(registry_lock.fileno(), fcntl.LOCK_EX)
+    authority = (
+        registry._identity_write()
+        if expected_digest == _MISSING
+        else registry._project_lock(project_id, "memory", exclusive=True)
+    )
+    with authority:
         _remove_incoming(projects, project_id)
         if project_digest(project) != expected_digest:
             raise ProjectPublicationError(
@@ -253,6 +275,7 @@ def atomic_publish_file(
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
+        temporary.chmod(0o600)
         os.replace(temporary, directory / name)
         if sync_directory:
             _fsync_directory(directory)

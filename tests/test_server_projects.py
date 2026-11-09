@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -114,8 +115,8 @@ async def test_new_session_promotes_healthy_cwd_project_after_malformed_finding(
     unrelated.mkdir()
     await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=cwd, check=True)
     registry = ProjectRegistry(home / "projects")
-    healthy = registry.create_project("healthy", "git", cwd)
-    malformed = registry.create_project("malformed", "git", unrelated)
+    healthy = await asyncio.to_thread(registry.create_project, "healthy", "git", cwd)
+    malformed = await asyncio.to_thread(registry.create_project, "malformed", "git", unrelated)
     (registry.root / malformed.project_id / "project.json").write_text(
         "{", encoding="utf-8"
     )
@@ -166,7 +167,7 @@ async def test_session_project_preparation_does_not_block_ping(
     root = server.runtime.cwd
     await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
     registry = ProjectRegistry(server.home / "projects")
-    registry.create_project("launch", "git", root)
+    await asyncio.to_thread(registry.create_project, "launch", "git", root)
     try:
         if method == "resume":
             first = await server.runtime.create_session()
@@ -183,11 +184,11 @@ async def test_session_project_preparation_does_not_block_ping(
             else server.runtime.resume_session(request["session_id"])
         )
         progress = asyncio.create_task(asyncio.sleep(0))
-        await progress
+        await asyncio.wait_for(progress, 10)
         assert not operation.done()
         release.set()
         holder.join(2)
-        await operation
+        await asyncio.wait_for(operation, 10)
     finally:
         if "release" in locals():
             release.set()
@@ -602,7 +603,7 @@ async def test_serve_project_instructions_does_not_block_loop_tick(
     root = server.runtime.cwd
     await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
     registry = ProjectRegistry(server.home / "projects")
-    registry.create_project("launch", "git", root)
+    await asyncio.to_thread(registry.create_project, "launch", "git", root)
     await server.runtime.create_session()
     try:
         _acquired, release, holder = _hold_registry_lock(
@@ -612,11 +613,11 @@ async def test_serve_project_instructions_does_not_block_loop_tick(
             run_command(server.runtime, "/project-instructions")
         )
         progress = asyncio.create_task(asyncio.sleep(0))
-        await progress
+        await asyncio.wait_for(progress, 10)
         assert not operation.done()
         release.set()
         holder.join(2)
-        result = await operation
+        result = await asyncio.wait_for(operation, 10)
         assert result["kind"] == "output"
     finally:
         if "release" in locals():
@@ -634,7 +635,7 @@ async def test_serve_blocking_git_does_not_block_ping(
     root = server.runtime.cwd
     await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
     registry = ProjectRegistry(server.home / "projects")
-    registry.create_project("launch", "git", root)
+    await asyncio.to_thread(registry.create_project, "launch", "git", root)
     first = await server.runtime.create_session()
     if method == "resume":
         await server.runtime.create_session()
@@ -716,7 +717,11 @@ async def test_serve_shutdown_with_registry_reader_held_exits_bounded(
     tmp_path: Path,
 ) -> None:
     server = _server(tmp_path)
-    ProjectRegistry(server.home / "projects").create_project("launch", "repo")
+    await asyncio.to_thread(
+        lambda: ProjectRegistry(server.home / "projects").create_project(
+            "launch", "repo"
+        )
+    )
     reader, writer = await _connect(server)
     await _hello(reader, writer, ["projects"])
     _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
@@ -728,7 +733,7 @@ async def test_serve_shutdown_with_registry_reader_held_exits_bounded(
     finally:
         release.set()
         holder.join(2)
-        await asyncio.gather(request, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
@@ -737,8 +742,8 @@ async def test_project_requests_run_registry_reads_off_event_loop(
 ) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    project = registry.create_project("alpha", "repo")
-    registry.update_memory(project.project_id, {"brief.md": "content\n"})
+    project = await asyncio.to_thread(registry.create_project, "alpha", "repo")
+    await asyncio.to_thread(registry.update_memory, project.project_id, {"brief.md": "content\n"})
     calls: list[tuple[str, int]] = []
     original_list = ProjectRegistry.list_projects
     original_memory_log = ProjectRegistry.memory_log
@@ -790,32 +795,37 @@ async def test_project_requests_do_not_modify_filesystem(tmp_path: Path) -> None
         await close_serve(empty_server, writer)
 
     server = _server(tmp_path / "populated")
-    registry = ProjectRegistry(server.home / "projects")
-    project = registry.create_project("alpha", "repo")
-    sender = registry.create_project("sender", "repo")
-    registry.update_memory(project.project_id, {"brief.md": "initial\n"})
-    state = registry.compare_and_swap_memory(
-        project.project_id,
-        expected_digest=registry.memory_digest(project.project_id),
-        updates={"brief.md": "authoritative\n"},
-        provenance={"session_id": "c" * 32, "seq_start": 1, "seq_end": 2},
-    )
-    mirror = server.home / "projects" / project.project_id / "memory" / "brief.md"
-    header = mirror.read_text().splitlines(keepends=True)[0]
-    mirror_mode = mirror.stat().st_mode
-    mirror.chmod(0o600)
-    mirror.write_text(header + "stale mirror\n")
-    mirror.chmod(mirror_mode)
-    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
-    message_id = inbox.send(
-        from_project=sender.project_id,
-        from_session="a" * 32,
-        to_project=project.project_id,
-        kind="info",
-        title="stale claim",
-        body="body",
-    )
-    assert inbox.claim(project.project_id, message_id, "b" * 32) is not None
+
+    def seed() -> tuple[Any, Any, Path, str, str]:
+        registry = ProjectRegistry(server.home / "projects")
+        project = registry.create_project("alpha", "repo")
+        sender = registry.create_project("sender", "repo")
+        registry.update_memory(project.project_id, {"brief.md": "initial\n"})
+        state = registry.compare_and_swap_memory(
+            project.project_id,
+            expected_digest=registry.memory_digest(project.project_id),
+            updates={"brief.md": "authoritative\n"},
+            provenance={"session_id": "c" * 32, "seq_start": 1, "seq_end": 2},
+        )
+        mirror = server.home / "projects" / project.project_id / "memory" / "brief.md"
+        header = mirror.read_text().splitlines(keepends=True)[0]
+        mirror_mode = mirror.stat().st_mode
+        mirror.chmod(0o600)
+        mirror.write_text(header + "stale mirror\n")
+        mirror.chmod(mirror_mode)
+        inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+        message_id = inbox.send(
+            from_project=sender.project_id,
+            from_session="a" * 32,
+            to_project=project.project_id,
+            kind="info",
+            title="stale claim",
+            body="body",
+        )
+        assert inbox.claim(project.project_id, message_id, "b" * 32) is not None
+        return project, state, mirror, header, message_id
+
+    project, state, mirror, header, message_id = await asyncio.to_thread(seed)
     registry_lock = server.home / "projects" / ".lock"
     registry_lock.unlink()
 
@@ -853,10 +863,11 @@ async def test_project_requests_do_not_modify_filesystem(tmp_path: Path) -> None
 async def test_project_request_error_classification(tmp_path: Path) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    project = registry.create_project("alpha", "repo")
-    sender = registry.create_project("sender", "repo")
-    registry.update_memory(project.project_id, {"brief.md": "content\n"})
-    ProjectInbox(registry, sessions_root=server.home / "sessions").send(
+    project = await asyncio.to_thread(registry.create_project, "alpha", "repo")
+    sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
+    await asyncio.to_thread(registry.update_memory, project.project_id, {"brief.md": "content\n"})
+    await asyncio.to_thread(
+        ProjectInbox(registry, sessions_root=server.home / "sessions").send,
         from_project=sender.project_id,
         from_session="d" * 32,
         to_project=project.project_id,
@@ -913,9 +924,10 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
 async def test_project_inbox_rejects_missing_required_directory(tmp_path: Path) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    project = registry.create_project("alpha", "repo")
-    sender = registry.create_project("sender", "repo")
-    ProjectInbox(registry, sessions_root=server.home / "sessions").send(
+    project = await asyncio.to_thread(registry.create_project, "alpha", "repo")
+    sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
+    await asyncio.to_thread(
+        ProjectInbox(registry, sessions_root=server.home / "sessions").send,
         from_project=sender.project_id,
         from_session="d" * 32,
         to_project=project.project_id,
@@ -979,19 +991,21 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(
     registry = ProjectRegistry(server.home / "projects")
     root = tmp_path / "alpha"
     root.mkdir()
-    alpha = registry.create_project("alpha", "repo", root)
-    beta = registry.create_project("beta", "service")
-    registry.update_memory(alpha.project_id, {"brief.md": "manual\n"})
-    registry.update_memory(beta.project_id, {"decisions.md": "remote\n"})
-    remote = registry.import_memory(
+    alpha = await asyncio.to_thread(registry.create_project, "alpha", "repo", root)
+    beta = await asyncio.to_thread(registry.create_project, "beta", "service")
+    await asyncio.to_thread(registry.update_memory, alpha.project_id, {"brief.md": "manual\n"})
+    await asyncio.to_thread(registry.update_memory, beta.project_id, {"decisions.md": "remote\n"})
+    remote = await asyncio.to_thread(
+        registry.import_memory,
         alpha.project_id,
-        registry.export_memory(beta.project_id),
-        expected_digest=registry.memory_digest(alpha.project_id),
+        await asyncio.to_thread(registry.export_memory, beta.project_id),
+        expected_digest=await asyncio.to_thread(registry.memory_digest, alpha.project_id),
         provenance={"source": "remote_sync", "peer": "machine-2"},
     )
-    automatic = registry.compare_and_swap_memory(
+    automatic = await asyncio.to_thread(
+        registry.compare_and_swap_memory,
         alpha.project_id,
-        expected_digest=registry.memory_digest(alpha.project_id),
+        expected_digest=await asyncio.to_thread(registry.memory_digest, alpha.project_id),
         updates={"state.md": "automatic\n", "backlog.md": "also automatic\n"},
         provenance={
             "session_id": "a" * 32,
@@ -1000,9 +1014,10 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(
             "model": "luna",
         },
     )
-    registry.accept_memory(alpha.project_id, "state.md")
+    await asyncio.to_thread(registry.accept_memory, alpha.project_id, "state.md")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(
+        inbox.send,
         from_project=beta.project_id,
         from_session="b" * 32,
         to_project=alpha.project_id,
@@ -1156,8 +1171,8 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(
 async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    project = registry.create_project("alpha", "repo")
-    other = registry.create_project("beta", "repo")
+    project = await asyncio.to_thread(registry.create_project, "alpha", "repo")
+    other = await asyncio.to_thread(registry.create_project, "beta", "repo")
     parent = await asyncio.to_thread(lambda: server.runtime.manager.create(
         provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
         project_role="orchestrator", name="parent", auto_project=False,
@@ -1211,14 +1226,15 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(
 ) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    project = registry.create_project("large", "repo")
-    sender = registry.create_project("sender", "repo")
+    project = await asyncio.to_thread(registry.create_project, "large", "repo")
+    sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     for index, name in enumerate(
         ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
     ):
         content = ("\x01" if index == 0 else str(index)) * (128 * 1024)
-        registry.update_memory(project.project_id, {name: content})
-    ProjectInbox(registry, sessions_root=server.home / "sessions").send(
+        await asyncio.to_thread(registry.update_memory, project.project_id, {name: content})
+    await asyncio.to_thread(
+        ProjectInbox(registry, sessions_root=server.home / "sessions").send,
         from_project=sender.project_id,
         from_session="c" * 32,
         to_project=project.project_id,
@@ -1278,10 +1294,11 @@ async def test_project_inbox_isolates_and_reports_invalid_messages(
 ) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    target = registry.create_project("target", "repo")
-    sender = registry.create_project("sender", "repo")
+    target = await asyncio.to_thread(registry.create_project, "target", "repo")
+    sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
-    valid_id = inbox.send(
+    valid_id = await asyncio.to_thread(
+        inbox.send,
         from_project=sender.project_id,
         from_session="a" * 32,
         to_project=target.project_id,
@@ -1321,10 +1338,11 @@ async def test_project_inbox_trust_is_derived_from_returned_page(
 ) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    target = registry.create_project("target", "repo")
-    sender = registry.create_project("sender", "repo")
+    target = await asyncio.to_thread(registry.create_project, "target", "repo")
+    sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
-    local_id = inbox.send(
+    local_id = await asyncio.to_thread(
+        inbox.send,
         from_project=sender.project_id,
         from_session="a" * 32,
         to_project=target.project_id,
@@ -1333,7 +1351,8 @@ async def test_project_inbox_trust_is_derived_from_returned_page(
         body="local body",
         message_id="0" * 32,
     )
-    external_id = inbox.send(
+    external_id = await asyncio.to_thread(
+        inbox.send,
         from_project=sender.project_id,
         from_session="b" * 32,
         to_project=target.project_id,
@@ -1427,11 +1446,12 @@ def test_project_inbox_omits_too_deep_unknown_field(tmp_path: Path) -> None:
 async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    project = registry.create_project("alpha", "repo")
-    sender = registry.create_project("sender", "repo")
+    project = await asyncio.to_thread(registry.create_project, "alpha", "repo")
+    sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
     valid_ids = {
-        inbox.send(
+        await asyncio.to_thread(
+            inbox.send,
             from_project=sender.project_id,
             from_session="d" * 32,
             to_project=project.project_id,
@@ -1480,14 +1500,14 @@ async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
             record["title"] = ["x" * (50_000 + rng.randrange(50_000))]
             path.write_text(json.dumps(record))
 
-    listed = inbox.list(project.project_id)
+    listed = await asyncio.to_thread(inbox.list, project.project_id)
     assert {item["id"] for item in listed["new"]} == valid_ids
     scanner = ProjectInboxScanner(
         registry, project.project_id, sessions_root=server.home / "sessions"
     )
-    assert set(scanner.scan() or ()) == valid_ids
+    assert set(await asyncio.to_thread(scanner.scan) or ()) == valid_ids
     for index in range(256):
-        assert inbox.claim(project.project_id, f"{index + 1024:032x}", "e" * 32) is None
+        assert await asyncio.to_thread(inbox.claim, project.project_id, f"{index + 1024:032x}", "e" * 32) is None
 
     reader, writer = await _connect(server)
     try:
@@ -1503,7 +1523,7 @@ async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
     finally:
         await close_serve(server, writer)
 
-    claimed = inbox.claim(project.project_id, next(iter(valid_ids)), "e" * 32)
+    claimed = await asyncio.to_thread(inbox.claim, project.project_id, next(iter(valid_ids)), "e" * 32)
     assert claimed is not None
 
 
@@ -1521,10 +1541,11 @@ async def test_project_inbox_omits_large_unknown_structured_fields(
 ) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
-    target = registry.create_project("target", "repo")
-    sender = registry.create_project("sender", "repo")
+    target = await asyncio.to_thread(registry.create_project, "target", "repo")
+    sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
-    message_id = inbox.send(
+    message_id = await asyncio.to_thread(
+        inbox.send,
         from_project=sender.project_id,
         from_session="a" * 32,
         to_project=target.project_id,

@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import os
 import threading
+from functools import partial
 from io import StringIO
 from pathlib import Path
 
@@ -25,10 +26,15 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, MessageRole, TextContent
 from zeta.runtime.composition import compose_runtime
 from zeta.runtime.loop import AgentLoop, RuntimePrompt
+from zeta.runtime.project_registry_state import ProjectRegistryState
 from zeta.runtime.prompt_resume import resume_prompt
 from zeta.server.server import ZetaServer
 from zeta.skills import SkillCatalog, discover_session_skills
 from zeta.tui.app import TUIApp
+
+load_project_context = partial(
+    load_project_context, registry=ProjectRegistryState(None)
+)
 
 
 def _owned_runtime_prompt(
@@ -122,6 +128,14 @@ def _install_live_skill(
     skill.parent.mkdir(parents=True, exist_ok=True)
     skill.write_text(
         f"---\nname: {name}\ndescription: {description}\n---\n\n{name} body\n",
+        encoding="utf-8",
+    )
+
+
+def _write_skill(path: Path, name: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: live prompt\n---\nlive body\n",
         encoding="utf-8",
     )
 
@@ -622,6 +636,7 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_live_config(
             context_loader=lambda **kwargs: (_ for _ in ()).throw(
                 AssertionError(f"unexpected default rebuild: {kwargs}")
             ),
+            registry=manager.project_registry_state,
         )
     )
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
@@ -743,11 +758,6 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
     await loop.close()
     opened.store.close()
 
-    refreshed_memory = "current project memory"
-    monkeypatch.setattr(
-        "zeta.runtime.prompt_resume.refresh_project_memory",
-        lambda value, **kwargs: value.replace(memory, refreshed_memory),
-    )
     resumed = manager.open(opened.metadata.session_id)
     try:
         result = await asyncio.to_thread(
@@ -761,6 +771,7 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
                 context_loader=lambda **kwargs: (_ for _ in ()).throw(
                     AssertionError(f"unexpected default rebuild: {kwargs}")
                 ),
+                registry=manager.project_registry_state,
             )
         )
         component = result.context.prompt_components["project_memory"]
@@ -768,10 +779,10 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
         length = int(component["length"])
         assert "live description" in result.context.system_prompt
         assert (
-            result.context.system_prompt[offset : offset + length] == refreshed_memory
+            result.context.system_prompt[offset : offset + length] == memory
         )
         assert (
-            component["digest"] == hashlib.sha256(refreshed_memory.encode()).hexdigest()
+            component["digest"] == hashlib.sha256(memory.encode()).hexdigest()
         )
         saved = manager.read_metadata(opened.metadata.session_id)
         assert saved.system_prompt == result.context.system_prompt
@@ -781,3 +792,43 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
         assert saved.skill_catalog[0]["name"] == "live"
     finally:
         resumed.store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_reload_between_turns_updates_next_provider_prompt(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    store = ConversationStore(tmp_path / "session", cwd=project)
+    old_skill = home / "skills" / "old-live-prompt.md"
+    _write_skill(old_skill, "old-live-prompt")
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("first")]), ScriptedTurn([TextContent("second")])]
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        skill_catalog=SkillCatalog.empty(),
+        live_config_home=home,
+        live_config_project_dir=project,
+    )
+    try:
+        await loop.refresh_live_config(force=True)
+        async for _ in loop.run_turn("first", origin=MessageOrigin.USER):
+            pass
+        old_skill.unlink()
+        _write_skill(home / "skills" / "new-live-prompt.md", "new-live-prompt")
+        await loop.refresh_live_config()
+        async for _ in loop.run_turn("second", origin=MessageOrigin.USER):
+            pass
+        prompt = "\n".join(
+            block.text
+            for message in backend.calls[1][0]
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        assert "new-live-prompt" in prompt
+    finally:
+        await loop.close()
+        store.close()

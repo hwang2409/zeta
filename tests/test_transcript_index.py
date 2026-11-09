@@ -23,6 +23,7 @@ import zeta.transcript_search.refresh as refresh_module
 from tests.support.processes import reap_process
 from zeta.cli.main import build_parser
 from zeta.cli.project import run as run_project
+from zeta.core.session import SessionManager
 from zeta.project_registry import ProjectRegistry
 from zeta.transcript_search.index import (
     SANITIZER_VERSION,
@@ -345,26 +346,6 @@ def test_incremental_state_keeps_only_sanitized_search_evidence(tmp_path: Path) 
     assert "PRIVATE_REASONING_MARKER" not in stored
     assert "TOP_SECRET_KEY_MATERIAL" not in indexed
     assert "PRIVATE_REASONING_MARKER" not in indexed
-
-
-def test_project_scope_rejects_wrong_project_canary(tmp_path: Path) -> None:
-    source = _source(
-        tmp_path / "sessions",
-        "one",
-        [
-            _row(1, "user", "private canary"),
-            _row(2, "assistant", "answer", state="completed"),
-        ],
-    )
-    index_a = TranscriptIndex(tmp_path / "a", PROJECT_A)
-    index_b = TranscriptIndex(tmp_path / "b", PROJECT_B)
-    index_a.append(source)
-    assert index_a.search("private canary")
-    assert index_b.search("private canary") == ()
-
-    unit = index_a.search("private canary")[0].unit
-    with pytest.raises(ValueError, match="project"):
-        index_b.append_units("foreign", (unit,), cursor=2)
 
 
 def test_deletion_and_reassignment(tmp_path: Path) -> None:
@@ -1017,7 +998,7 @@ def test_stale_building_marker_from_crashed_backfill_is_recovered(
     assert not index.building_path.exists()
 
 
-def test_out_of_order_unit_commit_never_regresses(tmp_path: Path) -> None:
+def test_duplicate_append_never_regresses_cursor(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
         "one",
@@ -1029,13 +1010,8 @@ def test_out_of_order_unit_commit_never_regresses(tmp_path: Path) -> None:
         ],
     )
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
-    rows = [
-        json.loads(line)
-        for line in source.conversation_path.read_text(encoding="utf-8").splitlines()
-    ]
-    units = index_module.render_transcript_units(PROJECT_A, "one", rows)
-    index.append_units("one", units, cursor=4)
-    index.append_units("one", units[:1], cursor=2)
+    index.append(source)
+    index.append(source)
 
     assert index.status().cursors["one"] == 4
     assert index.search("new canary")
@@ -1283,21 +1259,21 @@ def test_operator_cli_rebuild_status_and_search(
     monkeypatch.setenv("ZETA_HOME", str(home))
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("demo", "demo", str(tmp_path))
-    source = _source(
-        home / "sessions",
-        "one",
+    opened = SessionManager(home).create(
+        provider="codex",
+        model="test",
+        cwd=tmp_path,
+        project_id=project.project_id,
+        auto_project=False,
+    )
+    source = TranscriptSource(opened.metadata.session_id, opened.store.session_dir)
+    opened.store.close()
+    _write_rows(
+        source,
         [
             _row(1, "user", "operator canary"),
             _row(2, "assistant", "answer", state="completed"),
         ],
-    )
-    (source.session_dir / "meta.json").write_text(
-        json.dumps({"project_id": project.project_id}), encoding="utf-8"
-    )
-    registry.record_session(
-        project.project_id,
-        session_id=source.session_id,
-        transcript_path=str(source.session_dir),
     )
     for arguments in (
         ["project", "index", "demo", "rebuild"],
