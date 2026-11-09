@@ -39,13 +39,14 @@ import os
 import shlex
 import subprocess
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from html import escape
 from pathlib import Path
 from time import monotonic as _monotonic
 
 from ..memory.entry_store import utc_now
+from ..project_memory_history import MemoryContextEntry
 from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
 from ..project_context.projection import (
     ProjectContextHealth,
@@ -585,6 +586,29 @@ def _format_section(path: Path, content: str) -> str:
         f"{escape(content, quote=True)}\n"
         "</zeta-project-instructions>"
     )
+
+
+def budget_memory_block(
+    home: Path, project_id: str, entries: Iterable[MemoryContextEntry], budget: int
+) -> tuple[str, list[Path], list[str]]:
+    """Admit memory entries in order while the rendered block fits ``budget``."""
+    manual: list[str] = []
+    automatic: list[str] = []
+    admitted: list[Path] = []
+    skipped: list[str] = []
+    for entry in entries:
+        path = home / "projects" / project_id / "memory" / entry.name
+        candidate_manual = list(manual)
+        candidate_automatic = list(automatic)
+        target = candidate_automatic if entry.automatic else candidate_manual
+        target.append(_format_section(path, entry.content))
+        candidate = _render_memory_block(project_id, candidate_manual, candidate_automatic)
+        if len(candidate.encode("utf-8")) <= budget:
+            manual, automatic = candidate_manual, candidate_automatic
+            admitted.append(path)
+        else:
+            skipped.append(entry.name)
+    return _render_memory_block(project_id, manual, automatic), admitted, skipped
 
 
 def _default_stop_at(cwd: Path, home: Path) -> Path:

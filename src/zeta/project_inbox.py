@@ -35,6 +35,7 @@ from .storage_format import (
     mapping_mutations,
     require_closed_variant,
     StorageFeature,
+    open_writer,
 )
 
 SCHEMA_VERSION = 1
@@ -346,12 +347,15 @@ class ProjectInbox:
         return message_id
 
     def set_delegation(self, recipient: str, sender: str, kind: str, *, enabled: bool) -> None:
-        lease = self.registry._writer_lease()
-        if not feature_enabled(lease.observed_epoch, StorageFeature.INBOX_DELEGATION):
-            raise InboxError(
-                "inbox delegations require stored-format epoch "
-                f"{FEATURE_EPOCHS[StorageFeature.INBOX_DELEGATION]}"
-            )
+        with open_writer(self.registry.root.parent) as lease, self.registry._lease_context(lease):
+            if not feature_enabled(lease.observed_epoch, StorageFeature.INBOX_DELEGATION):
+                raise InboxError(
+                    "inbox delegations require stored-format epoch "
+                    f"{FEATURE_EPOCHS[StorageFeature.INBOX_DELEGATION]}"
+                )
+            return self._set_delegation(recipient, sender, kind, enabled=enabled)
+
+    def _set_delegation(self, recipient: str, sender: str, kind: str, *, enabled: bool) -> None:
         recipient_project = self._resolve_project(recipient).project_id
         sender_project = self._resolve_project(sender).project_id
         try:
