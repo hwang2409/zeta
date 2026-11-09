@@ -12987,7 +12987,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch, hold_child_bound=True)
     evidence_entered = asyncio.Event()
     allow_evidence = asyncio.Event()
     registries: list[background_process_module.BackgroundTaskRegistry] = []
