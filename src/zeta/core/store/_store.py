@@ -271,11 +271,6 @@ class ConversationStore(
             register_conversation_target(self)
 
     @property
-    def observed_storage_epoch(self) -> int:
-        """Return the home epoch held by this store's writer lease."""
-        return self._storage_lease.observed_epoch
-
-    @property
     def last_repair_result(self) -> RepairResult | None:
         return self._last_repair_result
 
