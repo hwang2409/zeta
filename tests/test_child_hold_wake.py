@@ -12,15 +12,19 @@ from types import SimpleNamespace
 import pytest
 
 from tests.support.fake_backend import (
+    FakeBackend,
     PerActorFakeBackend,
     ScriptedTurn,
     _public_input_prompt,
 )
+from tests.support.notification_fixtures import notification_payloads
 from tests.support.owned import await_or_fail
 from tests.test_accounts_exhaustion import _account_context
 from tests.test_rate_limit_hold import _collect
 from zeta.accounts.exhaustion import classify_subscription_limit
 from zeta.accounts.store import AccountId
+from zeta.core.store import ConversationStore
+from zeta.core.store._step_delivery import NotificationInput
 from zeta.protocol.types import (
     MessageOrigin,
     StreamEvent,
@@ -154,7 +158,9 @@ class HeldTree:
         # closing the root cancels a still-held child without running out its hold
         await self.loop.close()
         if self.child_ended is not None:
-            await asyncio.gather(self.child_ended, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(self.child_ended, return_exceptions=True), 10
+            )
         self.opened.store.close()
 
 
@@ -276,6 +282,46 @@ async def test_subscription_limit_days_away_wakes_parent_once(tmp_path: Path) ->
     finally:
         # the reset is days away; closing the tree cancels the held child
         await tree.close()
+
+
+@pytest.mark.asyncio
+async def test_hold_wake_survives_parent_resume_and_is_delivered_once(
+    tmp_path: Path,
+) -> None:
+    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    session_id = store.session_id
+    store._commit_delivery_input(
+        NotificationInput("child_hold", notification_payloads()["child_hold"])
+    )
+    store.close()
+
+    # the parent restarted before its next step: the resumed session still wakes
+    resumed = await asyncio.to_thread(
+        ConversationStore, tmp_path, session_id=session_id
+    )
+    backend = FakeBackend([ScriptedTurn([TextContent("noted")])])
+    loop = AgentLoop(backend, resumed, skill_catalog=SkillCatalog.empty())
+    try:
+        assert [entry.data["kind"] for entry in resumed.agent_notifications()] == [
+            "child_hold"
+        ]
+        events = await await_or_fail(
+            _collect(loop.run_notification_turn()), what="resumed wake turn"
+        )
+    finally:
+        await loop.close()
+        resumed.close()
+    assert [
+        event.data.get("kind")
+        for event in events
+        if event.type is StreamEventType.AGENT_NOTIFICATION
+    ] == ["child_hold"]
+
+    again = await asyncio.to_thread(ConversationStore, tmp_path, session_id=session_id)
+    try:
+        assert again.agent_notifications() == [], "a delivered hold is not sent again"
+    finally:
+        again.close()
 
 
 def _plain(renderable: object) -> str:
