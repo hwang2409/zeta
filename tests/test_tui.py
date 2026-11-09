@@ -69,7 +69,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import (
@@ -92,6 +92,7 @@ from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.project_context.projection import ProjectContextHealth
+from zeta.project_registry import ProjectRegistry
 from zeta.providers.anthropic import (
     AnthropicBackend,
     AnthropicCredentialDriver,
@@ -15378,6 +15379,54 @@ async def test_history_finder_does_not_cross_session_boundaries(
     assert len(batches) == 1
     assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()
+
+
+@pytest.mark.asyncio
+async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
+    tmp_path: Path,
+) -> None:
+    writer = await asyncio.to_thread(open_writer, tmp_path)
+    projects = ProjectRegistry(tmp_path / "projects")
+    project = projects.create_project("alpha", "alpha")
+    store = ConversationStore(
+        tmp_path / "sessions", session_id="a" * 32, cwd=tmp_path
+    )
+    ledger = store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=projects,
+        inbox_enabled=True,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    try:
+        activation_error = None
+        try:
+            await loop.activate()
+        except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
+            activation_error = exc
+        assert activation_error is None
+        app = TUIApp(loop, provider="codex", model="offline")
+        async with owned_app(app):
+            app._full_screen_active = lambda: True
+            app._rebuild_transcript()
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "sent history is incomplete (invalid_json)" in rendered
+            assert "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project-inbox-sent.json" in rendered
+            assert "file was not changed" in rendered
+            assert "unless the repaired ledger includes their IDs" in rendered
+    finally:
+        await loop.close()
+        store.close()
+        await asyncio.to_thread(writer.close)
 
 
 @pytest.mark.parametrize(
