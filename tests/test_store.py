@@ -2405,7 +2405,7 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     assert reopened_again.path.read_bytes() == reopened.path.read_bytes()
 
 
-@pytest.mark.parametrize("epoch", range(2, storage_format.WRITER_EPOCH))
+@pytest.mark.parametrize("epoch", range(2, 4))
 def test_lower_epoch_torn_tail_keeps_legacy_repair_without_recovery_files(
     tmp_path: Path, epoch: int
 ) -> None:
@@ -2446,6 +2446,33 @@ print(json.dumps({
     assert result["recovery"] == []
     assert result["quarantine"] == []
     assert epoch < storage_format.WRITER_EPOCH
+
+
+def test_fixed_epoch_repair_survives_a_newer_writer_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """a writer release must not disable repair for an epoch-5 home."""
+    import zeta.core.store._log as log_module
+
+    monkeypatch.setattr(log_module, "WRITER_EPOCH", 6, raising=False)
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="fixed-epoch-repair")
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
+    store.close()
+    path = sessions / store.session_id / "conversation.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b'{"seq": 3, "id": "torn"')
+    (store._storage_lease.home / "storage-format.json").write_text(
+        json.dumps({"writer_epoch": 5}) + "\n"
+    )
+
+    reopened = ConversationStore(sessions, session_id=store.session_id)
+
+    assert list(store.session_dir.glob("conversation.quarantine.*"))
+    assert reopened.entries[-1].data["kind"] == "transcript_recovery"
+    reopened.close()
 
 
 def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:

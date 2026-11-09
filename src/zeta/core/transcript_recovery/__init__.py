@@ -30,8 +30,6 @@ from .errors import (
     TranscriptLoadError as TranscriptLoadError,
 )
 
-TRANSCRIPT_REPAIR_EPOCH = 4
-
 _BUFFER_SIZE = 1024 * 1024
 _MAX_RECORD_BYTES = 64 * 1024
 _MAX_RECORDS = 1024
