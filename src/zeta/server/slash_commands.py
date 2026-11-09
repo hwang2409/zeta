@@ -13,15 +13,15 @@ import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
-from ..attention_decisions import DecisionItem
+from ..attention_decisions import DecisionItem, open_decisions
+from ..attention_records import Broken
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
-from ..core.project_context import discover_repo_root, project_command_view
+from ..core.project_context import project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     SlashCommandRegistry,
@@ -117,8 +117,6 @@ class ServerSlashSession:
     # --- runnable server-side ---
 
     async def slash_decisions(self, args: str) -> str:
-        from ..attention_decisions import open_decisions
-
         _loop, opened = self._active_loop_and_session()
         command, _, remainder = args.strip().partition(" ")
         registry_state = self._runtime.manager.project_registry_state
@@ -148,7 +146,11 @@ class ServerSlashSession:
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
-            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            (
+                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
+                if isinstance(item.record, Broken)
+                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            )
             for item in items
         )
 
@@ -198,12 +200,15 @@ class ServerSlashSession:
     async def _run_decisions_batch(
         self, batch: list[tuple[str, str]], from_session: str
     ) -> str:
-        await self._run_attention_operation(
+        outcome = await self._run_attention_operation(
             self._attention_replies(from_session).stage_and_flush,
             batch,
             from_session,
         )
-        return f"replied to {len(batch)} attention item(s)"
+        refusals = [item.detail for item in outcome.items if item.status == "broken"]
+        replied = len(outcome.items) - len(refusals)
+        lines = [f"replied to {replied} attention item(s)"] if replied else []
+        return "\n".join([*lines, *refusals])
 
     async def _slash_decisions_action(
         self,
@@ -218,6 +223,8 @@ class ServerSlashSession:
         item = next((item for item in items if item.record.id == attention_id), None)
         if item is None:
             return "attention item not found"
+        if isinstance(item.record, Broken):
+            return f"attention record {item.record.id} is broken ({item.record.reason}); repair {item.record.path} before replying"
         replies = self._attention_replies(item.session_id)
         if command == "dismiss":
             await self._run_attention_operation(replies.dismiss, item.record.id)
@@ -525,14 +532,21 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
     if loop is None:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     catalog = loop.tool_registry.skill_catalog
-    project_dir = discover_repo_root(Path(opened.metadata.cwd or runtime.cwd))
     return create_slash_registry(
         zeta_home=runtime.home,
-        project_dir=project_dir,
+        project_dir=runtime.repo_root,
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
         surface=SlashSurface.SERVE,
     )
+
+
+async def registry_for_request(runtime: ServerRuntime) -> SlashCommandRegistry:
+    """Refresh live skills and build one registry for a serve request."""
+
+    if runtime.loop is not None:
+        await runtime.loop.refresh_skills()
+    return await asyncio.to_thread(build_registry, runtime)
 
 
 READ_REQUESTS = {"slash_list", *accounts.REQUEST_METHODS}
@@ -564,9 +578,7 @@ async def list_commands(
 ) -> dict[str, object]:
     """Enumerate runnable commands, with an optional complete catalog."""
 
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
+    registry = await registry_for_request(runtime)
     repair_available = transcript_repair_available(runtime.manager)
     entries = [
         entry
@@ -581,7 +593,7 @@ async def list_commands(
     }
 
 
-async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
+def can_run_while_busy(registry: SlashCommandRegistry, text: str) -> bool:
     """Return whether slash_run can resolve without starting model work."""
 
     first_line = text.split("\n", 1)[0]
@@ -590,9 +602,6 @@ async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
         return False
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
     command = registry.command_for(name)
     if command is not None:
         if not registry.available(command):
@@ -617,6 +626,7 @@ async def run_command(
     approval_control: _ApprovalProjection | None = None,
     run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
     busy: bool = False,
+    registry: SlashCommandRegistry | None = None,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
@@ -628,9 +638,8 @@ async def run_command(
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
+    if registry is None:
+        registry = await registry_for_request(runtime)
     command = registry.command_for(name)
     if command is not None and not registry.available(command):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
@@ -773,5 +782,6 @@ __all__ = [
     "build_registry",
     "can_run_while_busy",
     "list_commands",
+    "registry_for_request",
     "run_command",
 ]

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import errno
 import fcntl
+import logging
 import os
 import socket
 import stat
@@ -19,6 +20,7 @@ from ..core.transcript_recovery.runtime import (
     repair_transcript_for_runtime,
 )
 from ..project_errors import ProjectRegistryBusyError
+from ..storage_format import drain_releases, pending_releases
 from . import (
     abort_scope,
     accounts,
@@ -45,11 +47,11 @@ from .protocol import (
     ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
+    FrameWriteOwner,
     MethodDescriptor,
     ProtocolError,
     _Frame,
     feature_error,
-    finish_frame_write,
     hello_result,
     negotiate_protocol_version,
     protocol_error,
@@ -59,6 +61,24 @@ from .runtime import BackendFactory, ServerRuntime
 from .session_replay import ReplayScopeId
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
+
+logger = logging.getLogger(__name__)
+
+# A GC finalizer only queues a lease release; an idle serve must still run it,
+# or another process stays refused the session until serve's next lease call.
+IDLE_DRAIN_INTERVAL = 1.0
+
+
+async def _drain_released_leases() -> None:
+    while True:
+        await asyncio.sleep(IDLE_DRAIN_INTERVAL)
+        if not pending_releases():
+            continue
+        try:
+            # a release may wait on a registry lock another thread holds
+            await asyncio.to_thread(drain_releases)
+        except Exception:  # a failed drain must not stop serve
+            logger.exception("draining released leases failed")
 
 
 class _UnixSocketListener:
@@ -230,6 +250,8 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
+        self._frame_writes = FrameWriteOwner()
+        self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
@@ -266,6 +288,7 @@ class ZetaServer:
             except BaseException:
                 await self.close()
                 raise
+        self._idle_drain = asyncio.create_task(_drain_released_leases())
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -275,6 +298,10 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self) -> None:
+        if self._idle_drain is not None:
+            self._idle_drain.cancel()
+            await asyncio.wait([self._idle_drain])
+            self._idle_drain = None
         try:
             if self._client is not None:
                 await self._client.close(graceful=True)
@@ -291,6 +318,7 @@ class ZetaServer:
                 if self.connections is not None:
                     await self.connections.aclose()
                     self.connections = None
+                await self._frame_writes.aclose()
                 try:
                     if self._websocket is not None:
                         await self._websocket.close()
@@ -971,9 +999,9 @@ class _Client:
             )
         if descriptor is MethodDescriptor.SLASH_RUN:
             text = _required_string(params, "text")
-            if (
-                self.server.control.turn_busy()
-                and not await slash_commands.can_run_while_busy(runtime, text)
+            registry = await slash_commands.registry_for_request(runtime)
+            if self.server.control.turn_busy() and not slash_commands.can_run_while_busy(
+                registry, text
             ):
                 await self.server.control.require_idle()
             register = self.server.control.model_input_registrar(self.features)
@@ -984,6 +1012,7 @@ class _Client:
                 approval_control=self.server.control,
                 run_blocking=self.server.control._run_blocking,
                 busy=self.server.control.turn_busy(),
+                registry=registry,
             )
         await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
@@ -1172,8 +1201,9 @@ class _Client:
         return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
-        async with self._write_lock:
-            return await finish_frame_write(self.codec, self.writer, payload)
+        return await self.server._frame_writes.write(
+            self.codec, self.writer, payload, self._write_lock
+        )
 
 
 def _home() -> Path:

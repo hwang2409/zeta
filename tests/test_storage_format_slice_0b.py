@@ -19,12 +19,8 @@ from zeta.core.session_files import atomic_publish_file
 from zeta.core.slash import create_slash_registry
 from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken, token_store_path
 from zeta.memory.reconciliation_state import ReconciliationState
-from zeta.project_inbox import (
-    SENT_HISTORY_LIMIT,
-    InboxError,
-    ProjectInbox,
-    SentMessageTracker,
-)
+from zeta.project_inbox import ProjectInbox
+from zeta.project_inbox_sent import SENT_HISTORY_LIMIT, SentMessageTracker
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
 from zeta.server.slash_commands import ServerSlashSession
@@ -160,10 +156,10 @@ def test_project_memory_prune_keeps_unknown_version_records(tmp_path: Path) -> N
 def test_sent_ledger_preserves_unknown_record_fields_and_prunes_by_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.project_inbox as inbox
+    import zeta.project_inbox_sent as sent_ledger
 
     assert SENT_HISTORY_LIMIT > 2
-    monkeypatch.setattr(inbox, "SENT_HISTORY_LIMIT", 2)
+    monkeypatch.setattr(sent_ledger, "SENT_HISTORY_LIMIT", 2)
     sessions = tmp_path / "sessions"
     session_id = "1" * 32
     messages = ("2" * 32, "3" * 32, "4" * 32)
@@ -798,8 +794,10 @@ def test_closed_variant_readers_reject_without_mutation(
         },
     )
     before = ledger.read_bytes()
-    with pytest.raises(InboxError):
-        SentMessageTracker(home / "sessions", "2" * 32)
+    tracker = SentMessageTracker(home / "sessions", "2" * 32)
+    health = tracker.health().health
+    assert health.state == "broken"
+    assert health.reason == "invalid_records"
     assert ledger.read_bytes() == before
 
     monkeypatch.setitem(

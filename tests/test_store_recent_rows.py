@@ -222,6 +222,7 @@ async def test_async_commit_counts_an_external_replacement(
 
     assert store.reset_generation() == start + 1
     assert store.row_id_at(first.seq) == "replacement-id" != first.id
+    store.close()
 
 
 def test_missing_log_with_resident_rows_counts_a_reset(

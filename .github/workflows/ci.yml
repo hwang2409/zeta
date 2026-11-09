@@ -70,6 +70,14 @@ jobs:
       - name: Run ruff
         run: uv run --frozen ruff check --output-format github
 
+      - name: Reject owner leak baseline growth
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          base=$(python scripts/lint_test_quality.py --base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF")
+          python scripts/check_owner_leak_baseline.py "$base"
+
       - name: Reject new low-signal test patterns
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
@@ -77,6 +85,7 @@ jobs:
         run: |
           base=$(python scripts/lint_test_quality.py --base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF")
           git diff --unified=0 "$base" HEAD -- ':(glob)**/*.py' | python scripts/lint_test_quality.py -
+          python scripts/lint_test_quality.py --polling-spins
 
   browser:
     name: browser

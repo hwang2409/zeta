@@ -305,7 +305,7 @@ class ConnectionRegistry(ReplayOutput):
         self._enqueue(
             output,
             _OutputFrame(frame),
-            wake=True,
+            wake=self._phase_allows_writes(output),
         )
         return outcome
 
@@ -357,7 +357,7 @@ class ConnectionRegistry(ReplayOutput):
             self._enqueue(
                 output,
                 _OutputFrame(frame),
-                wake=output.phase == "flushing",
+                wake=self._phase_allows_writes(output),
             )
             return True
         return await self._send_frame(output, frame)
@@ -497,6 +497,10 @@ class ConnectionRegistry(ReplayOutput):
         output.pending_callers -= 1
         if output.pending_callers == 0:
             output.callers_settled.set()
+
+    @staticmethod
+    def _phase_allows_writes(output: _OutputState) -> bool:
+        return output.phase in {"flushing", "ready"}
 
     def _enqueue(
         self, output: _OutputState, frame: _OutputFrame, *, wake: bool = True
@@ -858,14 +862,6 @@ class ConnectionRegistry(ReplayOutput):
             ),
             session_id=session_id,
         )
-
-    async def run_observer_read(
-        self, connection: Any, callable: Callable[[], Any]
-    ) -> Any:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            raise RuntimeError("observer is not connected")
-        return await self.run_blocking(callable)
 
     def _read_worker(self) -> None:
         while True:

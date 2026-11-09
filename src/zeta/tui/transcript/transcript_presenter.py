@@ -115,13 +115,6 @@ class TranscriptPresenter:
     def print_user(self, renderable: RenderableType | None) -> None:
         self.print_unit(renderable, user=True)
 
-    def print_assistant(self, renderable: RenderableType | None) -> bool:
-        if renderable is None:
-            return False
-        self.update_assistant(renderable)
-        plain = getattr(renderable, "plain", None)
-        return plain is None or bool(plain.strip())
-
     def _remember_assistant_region(self, unit_start: int) -> None:
         self._assistant_message_region.extend(self.transcript._units[unit_start:])
 

@@ -512,11 +512,6 @@ class ComposerAttachmentMixin:
         buffer = session.app.current_buffer if session is not None else None
         return await self._paste_runtime.paste(buffer)
 
-    async def paste_from_clipboard(self) -> str:
-        """Stage and register one clipboard image through the ordered paste module."""
-
-        return await self._paste_runtime.paste()
-
     def _paste_from_keybinding(self, event: Any | None = None) -> None:
         if self._reject_during_startup_replay("paste"):
             return

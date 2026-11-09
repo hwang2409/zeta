@@ -68,8 +68,9 @@ async def _notify(
         frames = await _frames_until_event(reader, "agent_end")
         if frames[-1]["params"]["session_id"] == session_id:
             break
-    while server.runtime.loop.notification_turn_state != "idle":
-        await asyncio.sleep(0)
+    async with asyncio.timeout(10):
+        while server.runtime.loop.notification_turn_state != "idle":
+            await asyncio.sleep(0)
 
 
 def _context_messages(backend: FakeBackend, call: int) -> list:
@@ -208,8 +209,9 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(turn_task, what="test await")
-        while server.runtime.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while server.runtime.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
 
         # test-contract: seam releases retry from the injected commit pause
         monkeypatch.setattr(
@@ -220,8 +222,9 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         else:
             await _request(reader, writer, 4, "send", {"text": "retry"})
         await _frames_until_event(reader, "agent_end")
-        while server.runtime.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while server.runtime.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
 
         assert len(backend.calls) == 1
         persisted = [
@@ -298,8 +301,9 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(turn_task, what="test await")
-        while server.runtime.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while server.runtime.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
 
         # test-contract: seam releases retry from the injected commit pause
         monkeypatch.setattr(
@@ -308,8 +312,9 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         await _request(reader, writer, 3, "set_turn_context", {"text": CONTEXT})
         server.control._schedule_background_wake(server.runtime.session_id)
         await _frames_until_event(reader, "agent_end")
-        while server.runtime.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while server.runtime.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
 
         assert len(backend.calls) == 1
         provider_notifications = _context_messages(backend, 0)
@@ -378,13 +383,15 @@ async def test_failed_persistence_releases_context_for_exactly_one_retry(
         assert (
             "injected persistence failure" in failure[-1]["params"]["error"]["message"]
         )
-        while server.runtime.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while server.runtime.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
 
         server.control._schedule_background_wake(server.runtime.session_id)
         await _frames_until_event(reader, "agent_end")
-        while server.runtime.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while server.runtime.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
 
         assert len(backend.calls) == 1
         assert CONTEXT in _context_messages(backend, 0)[0].content[0].text
@@ -439,8 +446,9 @@ async def test_reconnect_keeps_context_released_after_persistence_failure(
     )
     server.control._schedule_background_wake(session_id)
     await _frames_until_event(reader, "error")
-    while server.runtime.loop.notification_turn_state != "idle":
-        await asyncio.sleep(0)
+    async with asyncio.timeout(10):
+        while server.runtime.loop.notification_turn_state != "idle":
+            await asyncio.sleep(0)
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.05)
@@ -496,8 +504,9 @@ async def test_session_switch_keeps_pending_contexts_separate(
         )
         server.control._schedule_background_wake(first_session)
         await _frames_until_event(reader, "error")
-        while server.runtime.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while server.runtime.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
         # test-contract: seam restores delivery staging before the retry
         monkeypatch.setattr(
             type(first_store), "_stage_delivery_request", original_stage

@@ -542,8 +542,9 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         )
         # the async durable-writer seam does not expose the old registry-thread gate;
         # cleanup may overlap the off-loop history append without publishing a ghost.
-        while ("child", call.id) not in server.control._approvals.state.records:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while ("child", call.id) not in server.control._approvals.state.records:
+                await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
         await asyncio.wait_for(
@@ -681,8 +682,9 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             authorizer.authorize(call, signal, capability=capability)
         )
         if path == "delegated":
-            while key not in server.control._approvals.state.records:
-                await asyncio.sleep(0)
+            async with asyncio.timeout(10):
+                while key not in server.control._approvals.state.records:
+                    await asyncio.sleep(0)
         await server.control._event(
             StreamEvent(
                 StreamEventType.TOOL_APPROVAL_START,
@@ -1824,8 +1826,9 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
                 background=True,
             )
         )
-        while ("child", call.id) not in server.control._approvals.state.records:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while ("child", call.id) not in server.control._approvals.state.records:
+                await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
         await asyncio.wait_for(
@@ -1929,6 +1932,69 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         assert len(backend.calls) == 2
     finally:
         await close_serve(server, replay_writer or writer)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_approval_end_waits_for_hello_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    replacement: asyncio.StreamWriter | None = None
+    hello_held = asyncio.Event()
+    release_hello = asyncio.Event()
+    try:
+        await server.control._event(_start_event(call))
+        writer.close()
+        await await_or_fail(writer.wait_closed(), what="old controller close")
+        await _wait_controller_release(server)
+
+        assert server.connections is not None
+        original_send = server.connections.send
+
+        async def hold_hello(connection: object, payload: bytes) -> bool:
+            if json.loads(payload).get("id") == 10:
+                hello_held.set()
+                await await_or_fail(release_hello.wait(), what="hello response release")
+            return await original_send(connection, payload)
+
+        # test-contract: seam holds the claimed controller before its real hello write
+        monkeypatch.setattr(server.connections, "send", hold_hello)
+        replacement_reader, replacement = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        hello_request = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "hello",
+            "params": {
+                "protocol_version": "1.2",
+                "features": ["approval_reconnect"],
+            },
+        }
+        replacement.write((json.dumps(hello_request) + "\n").encode())
+        await await_or_fail(replacement.drain(), what="hello request write")
+        await await_or_fail(hello_held.wait(), what="held hello response")
+
+        await await_or_fail(
+            server.control.resolve_approval("deny", call.id),
+            what="approval terminal admission",
+        )
+        release_hello.set()
+        first = json.loads(
+            await await_or_fail(_read_raw(replacement_reader), what="first frame")
+        )
+        second = json.loads(
+            await await_or_fail(_read_raw(replacement_reader), what="second frame")
+        )
+
+        assert first.get("id") == 10, f"hello was not first: {first}"
+        assert second["params"]["event"] == "approval_end"
+        assert second["params"]["request_id"] == call.id
+    finally:
+        release_hello.set()
+        await close_serve(server, replacement or writer)
 
 
 @pytest.mark.asyncio

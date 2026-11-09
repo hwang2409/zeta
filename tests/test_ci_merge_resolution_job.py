@@ -6,6 +6,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).parents[1]
 JOB = ROOT / "scripts/ci_merge_resolution.sh"
 CHECKER = ROOT / "scripts/check_merge_resolution.py"
@@ -191,3 +193,122 @@ def test_title_only_edited_pull_request_still_runs_merge_resolution() -> None:
     assert "timeout-minutes: 15" in workflow
     assert "PR_BODY:" not in workflow
     assert "merge-resolution:" not in Path(ROOT / ".github/workflows/ci.yml").read_text()
+
+
+def test_stacked_pr_job_borrows_override_from_base_pr(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "test")
+    git(repo, "remote", "add", "origin", str(repo))
+    (repo / "src").mkdir()
+    (repo / "src/a.py").write_text("def lost(): pass\n")
+    commit(repo, "base")
+    git(repo, "checkout", "-qb", "branch")
+    (repo / "src/a.py").write_text("def branch(): pass\n")
+    commit(repo, "branch")
+    git(repo, "checkout", "-q", "main")
+    (repo / "src/a.py").write_text("def lost(): pass\ndef added(): pass\n")
+    commit(repo, "main")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=repo, check=False, timeout=10)
+    git(repo, "checkout", "branch", "--", "src/a.py")
+    commit(repo, "merge")
+    merge_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10).strip()
+
+    pulls = tmp_path / "pulls.json"
+    pulls.write_text(
+        '[{"number": 972, "body": "merge-resolution: src/a.py def added -> intentional",'
+        ' "user": {"login": "hwang2409"},'
+        ' "base": {"ref": "main", "repo": {"full_name": "hwang2409/zeta"}},'
+        ' "head": {"repo": {"full_name": "hwang2409/zeta"}}}]'
+    )
+    calls = tmp_path / "gh-calls"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        "#!/bin/sh\n"
+        f"echo \"$*\" >> {calls}\n"
+        f'if [ "$1" = api ]; then cat {pulls}; else echo "stacked on #972"; fi\n'
+    )
+    fake_gh.chmod(0o755)
+
+    result = subprocess.run(
+        _merge_resolution_command(tmp_path),
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "EVENT_NAME": "pull_request",
+            "HEAD_SHA": merge_sha,
+            "PR_NUMBER": "1056",
+            "PR_AUTHOR": "hwang2409",
+            "GITHUB_REPOSITORY": "hwang2409/zeta",
+            "FINAL_SHA": merge_sha,
+            "CHECK_MERGE_RESOLUTION_SCRIPT": str(CHECKER),
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert "borrowed overrides: override lines from #972" in result.stdout, result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"api repos/hwang2409/zeta/commits/{merge_sha}/pulls" in calls.read_text()
+
+
+@pytest.mark.parametrize(
+    ("head_ref", "train_head"),
+    [("train/gates-3", True), ("fix/train-parent", False), ("", False)],
+)
+def test_train_head_is_passed_only_for_train_head_refs(
+    tmp_path: Path, head_ref: str, train_head: bool
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "test")
+    git(repo, "remote", "add", "origin", str(repo))
+    (repo / "a").write_text("a\n")
+    commit(repo, "base")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "checkout", "-qb", "side")
+    (repo / "b").write_text("b\n")
+    commit(repo, "side")
+    git(repo, "checkout", "-qb", "train", "main")
+    (repo / "c").write_text("c\n")
+    commit(repo, "train change")
+    git(repo, "merge", "--no-ff", "--no-edit", "side")
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=10).strip()
+    checker = tmp_path / "checker.py"
+    checker.write_text("import sys\nprint('argv', sys.argv[1:])\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "gh").chmod(0o755)
+    result = subprocess.run(
+        _merge_resolution_command(tmp_path),
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "EVENT_NAME": "pull_request",
+            "HEAD_SHA": head,
+            "HEAD_REF": head_ref,
+            "PR_NUMBER": "1088",
+            "FINAL_SHA": head,
+            "CHECK_MERGE_RESOLUTION_SCRIPT": str(checker),
+        },
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"checking merge resolution: {head}" in result.stdout
+    assert ("'--train-head', '" + head + "'" in result.stdout) is train_head, result.stdout
+    if train_head:
+        assert "HEAD_REF: ${{ github.event.pull_request.head.ref }}" in WORKFLOW.read_text()

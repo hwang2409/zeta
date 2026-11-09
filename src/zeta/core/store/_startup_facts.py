@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ...protocol.types import Message, is_passive_harness_message
 from ..checkpoints import ConversationEntry
+
+_SENT_STATUS_EVENT = "project_inbox_sent_status"
+_MESSAGE_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +35,38 @@ class StartupFactsMixin:
             for entry in self._active_branch()
             if (record := context_calibration_record(entry)) is not None
         )
+
+
+def sent_message_receipts(entry: ConversationEntry) -> tuple[tuple[str, str], ...]:
+    """Return validated sent-status receipts from one physical entry."""
+
+    if entry.type != "message":
+        return ()
+    raw = entry.data.get("message")
+    if not isinstance(raw, dict) or not is_passive_harness_message(raw):
+        return ()
+    try:
+        message = Message.from_dict(raw)
+    except (KeyError, TypeError, ValueError):
+        return ()
+    if message.metadata.get("zeta_event") != _SENT_STATUS_EVENT:
+        return ()
+    raw_statuses = message.metadata.get("sent_statuses")
+    if not isinstance(raw_statuses, list):
+        return ()
+    receipts: list[tuple[str, str]] = []
+    for item in raw_statuses:
+        if not isinstance(item, dict):
+            continue
+        message_id = item.get("message_id")
+        status = item.get("status")
+        if (
+            isinstance(message_id, str)
+            and _MESSAGE_ID.fullmatch(message_id)
+            and status in {"claimed", "done"}
+        ):
+            receipts.append((message_id, status))
+    return tuple(receipts)
 
 
 def context_calibration_record(
