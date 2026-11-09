@@ -157,6 +157,7 @@ feature. Observer connections receive only methods with `read` access.
 | `session_history` | `1.1` | `none` | `read` |
 | `session_history_and_subscribe` | `1.1` | `session_replay_seq` | `read` |
 | `child_run_history` | `1.1` | `child_run_history` | `read` |
+| `child_run_events` | `1.1` | `child_run_events` | `read` |
 | `content_read` | `1.1` | `content_read` | `read` |
 | `switch_branch` | `1.1` | `none` | `session_mutation` |
 | `fork_message` | `1.1` | `none` | `session_mutation` |
@@ -1253,6 +1254,9 @@ Event fields are:
 | `tool_end` | `event`, `tool_call: ToolCall`, `tool_result: ToolResult or null`, `data: object` | `session_id` |
 | `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall`, `delegated: boolean` | `session_id`, `agent_instance_id: string` (delegated only), `label: string` (display-only) |
 | `approval_end` | `event`, `request_id: string`, `tool_call: ToolCall`, `data: object` | `session_id` |
+| `child_started` | `event`, `run_id: string`, `sequence: integer`, `child: ChildRun` | `session_id`, `stream_id`, `seq` |
+| `child_progress` | `event`, `run_id: string`, `sequence: integer`, `revision: integer`, `child: ChildRun` | `session_id`, `stream_id`, `seq` |
+| `child_ended` | `event`, `run_id: string`, `sequence: integer`, `child: ChildRun` | `session_id`, `stream_id`, `seq` |
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
 | `task_exit_notification` | `event`, `data: object` | `session_id` |
 | `project_inbox_notification` | `event`, `data: object` | `session_id` |
@@ -1482,6 +1486,7 @@ error code and message. Provider status and origin remain internal.
   events (one `assistant_message`, one echo). they count in these limits until pressure eviction, then remain bounded at two without being charged. Older pages continue to use
   `session_history` and do not change the live stream.
 - `child_run_history`: takes `session_id` for the active top-level session and a durable child `run_id`. It returns the same backward history projection as `session_history`: `messages`, `next_before`, and `history_validator`. Omit `before` or set it to null for the newest page; continuations supply `before` and the returned validator. The method requires the negotiated `child_run_history` feature, is available to observers, and returns `-32012` with `child_run_not_found` for a valid but absent child, `-32602` for malformed ids or parameters, and `-32009` with `stale_history_snapshot` for a changed snapshot.
+- `child_run_events`: takes exactly `{session_id, run_id}` for the active top-level session. It atomically returns the newest child history page plus `replay: {stream_id, history_seq: 0}`, `child`, and `revision`, then subscribes that connection to `child_started`, `child_progress`, and `child_ended` events for the child scope. Parent snapshot rows are event-shaped `child_progress` rows placed in `messages` immediately after their `child_started` row; these rows, and lifecycle rows, are sent only to `child_run_events` connections. Live events carry `stream_id` and consecutive `seq`; progress also carries `revision`. The shared child payload is the z5 child-run row. Malformed parameters use `-32602` (`invalid_params`), an absent child uses `-32012` (`child_run_not_found`), and an invalid join uses `-32009` (`stale_event_sequence`).
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns
@@ -1800,6 +1805,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
+| `child_run_events` | enables the atomic newest-page and live child lifecycle join; it requires `session_replay_seq`, `child_run_history`, and `child_runs` |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 | `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
