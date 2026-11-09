@@ -13,7 +13,6 @@ import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 from ..accounts.store import rename_account_command
@@ -22,7 +21,7 @@ from ..attention_decisions import DecisionItem, open_decisions
 from ..attention_records import Broken
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import BusyPolicy, SlashSurface
-from ..core.project_context import discover_repo_root, project_command_view
+from ..core.project_context import project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     SlashCommandRegistry,
@@ -536,14 +535,21 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
     if loop is None:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     catalog = loop.tool_registry.skill_catalog
-    project_dir = discover_repo_root(Path(opened.metadata.cwd or runtime.cwd))
     return create_slash_registry(
         zeta_home=runtime.home,
-        project_dir=project_dir,
+        project_dir=runtime.repo_root,
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
         surface=SlashSurface.SERVE,
     )
+
+
+async def registry_for_request(runtime: ServerRuntime) -> SlashCommandRegistry:
+    """Refresh live skills and build one registry for a serve request."""
+
+    if runtime.loop is not None:
+        await runtime.loop.refresh_skills()
+    return await asyncio.to_thread(build_registry, runtime)
 
 
 READ_REQUESTS = {"slash_list", *accounts.REQUEST_METHODS}
@@ -575,9 +581,7 @@ async def list_commands(
 ) -> dict[str, object]:
     """Enumerate runnable commands, with an optional complete catalog."""
 
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
+    registry = await registry_for_request(runtime)
     repair_available = transcript_repair_available(runtime.manager)
     entries = [
         entry
@@ -592,7 +596,7 @@ async def list_commands(
     }
 
 
-async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
+def can_run_while_busy(registry: SlashCommandRegistry, text: str) -> bool:
     """Return whether slash_run can resolve without starting model work."""
 
     first_line = text.split("\n", 1)[0]
@@ -601,9 +605,6 @@ async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
         return False
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
     policy = _busy_policy(registry, name, text)
     if policy is BusyPolicy.READ_FORMS:
         command = registry.command_for(name)
@@ -644,6 +645,7 @@ async def run_command(
     approval_control: _ApprovalProjection | None = None,
     run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
     busy: bool = False,
+    registry: SlashCommandRegistry | None = None,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
@@ -655,9 +657,8 @@ async def run_command(
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
+    if registry is None:
+        registry = await registry_for_request(runtime)
     command = registry.command_for(name)
     if command is not None and not registry.available(command):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
@@ -808,5 +809,6 @@ __all__ = [
     "build_registry",
     "can_run_while_busy",
     "list_commands",
+    "registry_for_request",
     "run_command",
 ]

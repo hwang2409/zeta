@@ -42,11 +42,11 @@ from .protocol import (
     ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
+    FrameWriteOwner,
     MethodDescriptor,
     ProtocolError,
     _Frame,
     feature_error,
-    finish_frame_write,
     hello_result,
     negotiate_protocol_version,
     protocol_error,
@@ -244,6 +244,7 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
+        self._frame_writes = FrameWriteOwner()
         self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
@@ -311,6 +312,7 @@ class ZetaServer:
                 if self.connections is not None:
                     await self.connections.aclose()
                     self.connections = None
+                await self._frame_writes.aclose()
                 try:
                     if self._websocket is not None:
                         await self._websocket.close()
@@ -825,9 +827,9 @@ class _Client:
             )
         if descriptor is MethodDescriptor.SLASH_RUN:
             text = validation.required_string(params, "text")
-            if (
-                self.server.control.turn_busy()
-                and not await slash_commands.can_run_while_busy(runtime, text)
+            registry = await slash_commands.registry_for_request(runtime)
+            if self.server.control.turn_busy() and not slash_commands.can_run_while_busy(
+                registry, text
             ):
                 await self.server.control.require_idle()
             register = self.server.control.model_input_registrar(self.features)
@@ -838,6 +840,7 @@ class _Client:
                 approval_control=self.server.control,
                 run_blocking=self.server.control._run_blocking,
                 busy=self.server.control.turn_busy(),
+                registry=registry,
             )
         await self.server.control.require_idle()
         validation.require_mutable(runtime, self.server.control.has_pending_approvals())
@@ -869,8 +872,9 @@ class _Client:
         return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
-        async with self._write_lock:
-            return await finish_frame_write(self.codec, self.writer, payload)
+        return await self.server._frame_writes.write(
+            self.codec, self.writer, payload, self._write_lock
+        )
 
 
 def _home() -> Path:

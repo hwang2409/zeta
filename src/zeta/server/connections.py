@@ -276,7 +276,7 @@ class ConnectionRegistry:
         self._enqueue(
             output,
             _OutputFrame(frame),
-            wake=True,
+            wake=self._phase_allows_writes(output),
         )
         return outcome
 
@@ -305,7 +305,7 @@ class ConnectionRegistry:
             self._enqueue(
                 output,
                 _OutputFrame(frame),
-                wake=output.phase == "flushing",
+                wake=self._phase_allows_writes(output),
             )
             return True
         return await self._send_frame(output, frame)
@@ -439,6 +439,10 @@ class ConnectionRegistry:
         output.pending_callers -= 1
         if output.pending_callers == 0:
             output.callers_settled.set()
+
+    @staticmethod
+    def _phase_allows_writes(output: _OutputState) -> bool:
+        return output.phase in {"flushing", "ready"}
 
     def _enqueue(
         self, output: _OutputState, frame: _OutputFrame, *, wake: bool = True
