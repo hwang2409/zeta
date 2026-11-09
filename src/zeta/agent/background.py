@@ -656,10 +656,12 @@ def _recover_nested_children(
                     notification_store.close_child_questions(
                         child_instance_id, reason=reason
                     )
+                # a root mirror without the parent receipt: the lifecycle is final
                 existing = _recover_completion_notification(
                     store,
                     notification_store,
                     child_instance_id,
+                    child_lifecycle=terminal,
                 )
                 if existing is None:
                     lifecycle = (
@@ -842,10 +844,12 @@ def _recover_agent_children(
                     notification_store.close_child_questions(
                         child_instance_id, reason=reason
                     )
+                # a root mirror without the parent receipt: the lifecycle is final
                 notification = _recover_completion_notification(
                     loop.store,
                     notification_store,
                     child_instance_id,
+                    child_lifecycle=terminal,
                 )
                 if notification is None:
                     lifecycle = (

@@ -24,11 +24,12 @@ from . import (
 logger = logging.getLogger(__name__)
 
 
-def _agent_id(fields: dict[str, object]) -> str | None:
-    """The run that owns an event: its data's or its own agent_instance_id."""
+def _agent_id(fields: dict[str, object], facts: rows.RowFacts | None) -> str | None:
+    """The run that owns an event: its data's or its own agent_instance_id, else the
+    publisher's fact."""
     data = fields.get("data")
     agent = data.get("agent_instance_id") if isinstance(data, dict) else None
-    agent = agent or fields.get("agent_instance_id")
+    agent = agent or fields.get("agent_instance_id") or (facts.agent if facts else None)
     return agent if type(agent) is str else None
 
 
@@ -327,7 +328,7 @@ class ReplayOutput:
             return False
         connection = state.connection
         if scope is None:
-            scope = self._member_scope(connection, session_id, fields)
+            scope = self._member_scope(connection, session_id, fields, facts)
             if scope is None:
                 return False
             if scope.kind == "child":
@@ -384,14 +385,18 @@ class ReplayOutput:
         return True
 
     def _member_scope(
-        self, connection: Any, session_id: str, fields: dict[str, object]
+        self,
+        connection: Any,
+        session_id: str,
+        fields: dict[str, object],
+        facts: rows.RowFacts | None,
     ) -> ReplayScopeId | None:
         scope = self.replay.scope_for(connection)
         if scope is None:
             return None
         if scope.kind == "top":
             return scope if scope.value == session_id else None
-        agent = _agent_id(fields)
+        agent = _agent_id(fields, facts)
         if agent is not None and (agent == scope.value or agent.startswith(scope.value + ":")):
             return scope
         return None

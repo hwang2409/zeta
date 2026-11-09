@@ -885,7 +885,11 @@ class ConnectionRegistry(ReplayOutput):
                 served_turn_end="served_turn_end" in features,
                 child_runs=True,
             )
-            row = child_run_row(Path(runtime.opened.store.session_dir), params["run_id"])
+            # the run's immediate parent store directory
+            parent_dir = Path(runtime.opened.store.session_dir)
+            for number in params["run_id"].split(":")[1:-1]:
+                parent_dir = parent_dir / "agents" / number
+            row = child_run_row(parent_dir, params["run_id"])
             if row is None:
                 raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
             return result[0], result[1], row

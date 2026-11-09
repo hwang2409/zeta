@@ -55,6 +55,8 @@ class RowFacts:
     delivery_id: str | None = None
     # the origin a send without delivery id passed to start_turn
     origin: MessageOrigin | None = None
+    # the run that owns the frame when its fields do not name it (a delegated end)
+    agent: str | None = None
 
 
 # a publisher whose history write failed: the effect is live-only

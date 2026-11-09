@@ -372,3 +372,363 @@ async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
         unregister()
         backend.release_all()
         await _close(serve)
+
+
+# --- recovered terminal routes ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RecoveredRoute:
+    background: bool
+    nested: bool
+    # canceled: the run was still running at the crash; completed: its lifecycle was
+    # final but the parent had no receipt; existing: the receipt was installed but the
+    # marker was not cleared, so recovery must find it and publish nothing; mirrored:
+    # a nested run's root display mirror was written but not its parent's receipt
+    state: str
+
+    @property
+    def name(self) -> str:
+        mode = "background" if self.background else "foreground"
+        return f"{mode}-{'nested' if self.nested else 'direct'}-recovered-{self.state}"
+
+    @property
+    def outcome(self) -> str:
+        return "canceled" if self.state == "canceled" else "completed"
+
+
+RECOVERED_ROUTES = [
+    RecoveredRoute(False, False, "canceled"),
+    RecoveredRoute(False, False, "completed"),
+    RecoveredRoute(False, False, "existing"),
+    RecoveredRoute(False, True, "canceled"),
+    RecoveredRoute(False, True, "completed"),
+    RecoveredRoute(True, False, "canceled"),
+    RecoveredRoute(True, False, "completed"),
+    RecoveredRoute(True, False, "existing"),
+    RecoveredRoute(True, True, "canceled"),
+    RecoveredRoute(True, True, "completed"),
+    RecoveredRoute(True, True, "mirrored"),
+]
+
+NOW = "2026-01-01T00:00:00+00:00"
+
+
+def _seed_child(
+    parent: Any, call_id: str, prompt: str, run_id: str, parent_run_id: str | None,
+    *, background: bool, depth: int,
+) -> Any:
+    """Durable state the runner writes before a child's first turn."""
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import ToolUseContent
+
+    call = _agent(call_id, prompt, background)
+    parent.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    number = parent.allocate_agent_index()
+    child = ConversationStore(parent.session_dir / "agents", session_id=str(number), cwd=parent.cwd)
+    child.mark_agent_parent(call_id, agent_type="general")
+    parent.register_agent_child(
+        call, child_session_path=str(child.session_dir), description=prompt,
+        agent_type="general", background=background, child_instance_id=run_id,
+    )
+    parent.append_child_run_started(run_id, parent_run_id, "general", prompt, NOW)
+    child.start_agent_lifecycle(
+        handle=run_id, started_at=NOW, depth=depth, agent_type="general", description=prompt,
+    )
+    return child
+
+
+def _install_receipt(parent: Any, child: Any, route: RecoveredRoute, run_id: str, call_id: str) -> None:
+    """The receipt a live run installed just before the process exited."""
+    from zeta.protocol.types import ToolResult
+
+    child.finish_agent_lifecycle("completed", final_result="target done")
+    if route.background:
+        parent.append_agent_notification(
+            run_id, child_session_path=str(child.session_dir), description="target",
+            status="completed", text="target done",
+        )
+        return
+    parent.append_message(
+        Message(
+            MessageRole.TOOL_RESULT, [TextContent("target done")],
+            tool_result=ToolResult(
+                call_id, "target done",
+                structured_content={"status": "completed", "child_instance_id": run_id},
+            ),
+        )
+    )
+
+
+def _seed_crashed_session(home: Path, route: RecoveredRoute) -> tuple[str, Path]:
+    from zeta.core.session import SessionManager
+
+    opened = SessionManager(home).create(provider="codex", model="offline", cwd=home)
+    top = opened.store
+    session_id = top.session_id
+    direct = f"{session_id}:1"
+    stores = [top]
+    try:
+        child = _seed_child(
+            top, "agent-1", "child-work", direct, None,
+            background=route.background and not route.nested, depth=1,
+        )
+        stores.append(child)
+        parent, target_store, target, call_id = top, child, direct, "agent-1"
+        if route.nested:
+            target = f"{direct}:1"
+            target_store = _seed_child(
+                child, "agent-2", "grand-work", target, direct,
+                background=route.background, depth=2,
+            )
+            stores.append(target_store)
+            parent, call_id = child, "agent-2"
+        if route.state == "completed":
+            target_store.finish_agent_lifecycle("completed", final_result="target done")
+        elif route.state == "existing":
+            _install_receipt(parent, target_store, route, target, call_id)
+        elif route.state == "mirrored":
+            target_store.finish_agent_lifecycle("completed", final_result="target done")
+            top.append_agent_notification(
+                target, child_session_path=str(target_store.session_dir), description="target",
+                status="completed", text="target done", display_only=True,
+            )
+    finally:
+        for store in reversed(stores):
+            store.close()
+    return session_id, top.session_dir
+
+
+def _receipts(store: Any, run_id: str) -> list[Any]:
+    found = []
+    for entry in store.entries:
+        if entry.type == "notification":
+            if entry.data.get("child_instance_id") == run_id and not entry.data.get("display_only"):
+                found.append(entry)
+        elif entry.type == "message":
+            result = entry.data["message"].get("tool_result")
+            structured = result.get("structured_content") if isinstance(result, dict) else None
+            if isinstance(structured, dict) and structured.get("child_instance_id") == run_id:
+                found.append(entry)
+    return found
+
+
+async def _resumed(tmp_path: Path, transport: Transport, session_id: str) -> Serve:
+    server = replay_server(tmp_path, transport, lambda provider, model, home: (FakeBackend([]), model or "offline"))
+    await server.start()
+    controller = await connect_replay(server, transport)
+    serve = Serve(server, transport, controller, session_id)
+    try:
+        await negotiate(controller, extra=FEATURES, protocol_version="1.2")
+        resumed = await controller.request(2, "resume", {"session_id": session_id})
+        assert "error" not in resumed, resumed
+    except BaseException:
+        await _close(serve)
+        raise
+    return serve
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize("route", RECOVERED_ROUTES, ids=[route.name for route in RECOVERED_ROUTES])
+async def test_recovered_terminal_route_presents_one_durable_child_ended(
+    tmp_path: Path, transport: Transport, route: RecoveredRoute
+) -> None:
+    session_id, session_dir = await asyncio.to_thread(_seed_crashed_session, tmp_path, route)
+    direct = f"{session_id}:1"
+    target = f"{direct}:1" if route.nested else direct
+    parent = direct if route.nested else None
+    probe = EndProbe(session_dir)
+    unregister = register_child_run_sink(probe.sink)
+    serve = None
+    try:
+        for attempt in range(2):
+            # the second resume is a second recovery process over the same home
+            serve = await _resumed(tmp_path, transport, session_id)
+            parent_store = serve.store
+            child_store = None
+            if route.nested:
+                from zeta.core.store import ConversationStore
+
+                child_store = ConversationStore(
+                    serve.store.session_dir / "agents", session_id="1",
+                    _storage_lease=serve.store._storage_lease,
+                )
+                parent_store = child_store
+            try:
+                receipts = _receipts(parent_store, target)
+            finally:
+                if child_store is not None:
+                    child_store.close()
+            assert len(receipts) == 1, receipts
+            receipt = receipts[0]
+            # a run recovery finishes publishes once, and only after its lifecycle is
+            # final on disk; an existing receipt and a later recovery publish nothing
+            published = probe.for_run(target)
+            expected = [] if route.state == "existing" or attempt else [receipt.seq]
+            assert [number for number, _durable in published] == expected, published
+            for _number, durable in published:
+                assert durable["state"] in TERMINAL and durable.get("finished_at"), durable
+            watcher = await serve.observer()
+            joined = await serve.join(watcher, parent)
+            history = joined["messages"]
+            assert len(_lifecycle(history, "child_started", target)) == 1, history
+            assert _reduced(history, "child_ended", target) == {(target, receipt.seq)}
+            [ended_row] = _lifecycle(history, "child_ended", target)
+            assert ended_row["id"] == f"{receipt.id}:child_ended"
+            assert ended_row["child"]["status"] == route.outcome, ended_row
+            assert "finished_at" in ended_row["child"]
+            assert joined["replay"]["history_seq"] == 0
+            live = await serve.drain(watcher)
+            assert _lifecycle(live, "child_ended", target) == []
+            if route.nested:
+                top_history = (await serve.join(watcher, None))["messages"]
+                assert _lifecycle(top_history, "child_ended", target) == []
+            await _close(serve)
+            serve = None
+            probe.ended.clear()
+    finally:
+        unregister()
+        if serve is not None:
+            await _close(serve)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize("nested", (False, True), ids=("direct", "nested"))
+async def test_recovery_that_loses_the_receipt_race_publishes_nothing(
+    tmp_path: Path, transport: Transport, nested: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second recovery process installs the receipt between this one's check and its
+    atomic append; the append reports not-created, so this process publishes nothing."""
+    from zeta.core.store import ConversationStore
+
+    route = RecoveredRoute(True, nested, "canceled")
+    session_id, session_dir = await asyncio.to_thread(_seed_crashed_session, tmp_path, route)
+    target = f"{session_id}:1:1" if nested else f"{session_id}:1"
+    raced: list[bool] = []
+    original = ConversationStore.append_agent_notification_if_absent
+
+    def racing(self: Any, child_instance_id: str, **kwargs: Any) -> Any:
+        if child_instance_id == target and not kwargs.get("display_only") and not raced:
+            # the other process's receipt commits first
+            self.append_agent_notification(child_instance_id, **kwargs)
+            entry, created = original(self, child_instance_id, **kwargs)
+            raced.append(created)
+            return entry, created
+        return original(self, child_instance_id, **kwargs)
+
+    # test-contract: seam force the other writer's commit inside the check-then-append window
+    monkeypatch.setattr(ConversationStore, "append_agent_notification_if_absent", racing)
+    probe = EndProbe(session_dir)
+    unregister = register_child_run_sink(probe.sink)
+    serve = None
+    try:
+        serve = await _resumed(tmp_path, transport, session_id)
+        assert raced == [False]
+        assert probe.for_run(target) == []
+        watcher = await serve.observer()
+        history = (await serve.join(watcher, f"{session_id}:1" if nested else None))["messages"]
+        ended = _lifecycle(history, "child_ended", target)
+        assert len(ended) == 1, history
+        assert ended[0]["child"]["status"] == "canceled"
+    finally:
+        unregister()
+        if serve is not None:
+            await _close(serve)
+
+
+# --- delegated child-view approval round trip -------------------------------------
+
+
+def _consecutive(events: list[dict[str, Any]], stream_id: str) -> None:
+    assert [event["stream_id"] for event in events] == [stream_id] * len(events), events
+    assert [event["seq"] for event in events] == list(range(1, len(events) + 1)), events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize("decision", ("approve", "deny"))
+@pytest.mark.parametrize("nested", (False, True), ids=("direct", "nested"))
+async def test_delegated_child_approval_round_trip_on_parent_and_child_streams(
+    tmp_path: Path, transport: Transport, decision: str, nested: bool
+) -> None:
+    target_file = tmp_path / "approved.txt"
+    write = ToolCall("call-write", "write", {"path": str(target_file), "content": "written"})
+    target_prompt = "grand-work" if nested else "child-work"
+    target_turns = [ScriptedTurn(tool_calls=[write]), _text("target done")]
+    if nested:
+        scripts = {
+            "delegate": [ScriptedTurn(tool_calls=[_agent("agent-1", "child-work", False)]), _text("parent done")],
+            "child-work": [ScriptedTurn(tool_calls=[_agent("agent-2", "grand-work", False)]), _text("child done")],
+            "grand-work": target_turns,
+        }
+    else:
+        scripts = {
+            "delegate": [ScriptedTurn(tool_calls=[_agent("agent-1", "child-work", False)]), _text("parent done")],
+            "child-work": target_turns,
+        }
+    backend = Actors(scripts, gate={"child-work", target_prompt})
+    serve = await _open(tmp_path, transport, backend)
+    try:
+        session_id = serve.session_id
+        direct = f"{session_id}:1"
+        target = f"{direct}:1" if nested else direct
+        top = await serve.observer()
+        top_stream = (await serve.join(top, None))["replay"]["stream_id"]
+        await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
+        await await_or_fail(backend.entered["child-work"].wait(), what="direct child started")
+        parent, parent_stream = top, top_stream
+        if nested:
+            parent = await serve.observer()
+            parent_stream = (await serve.join(parent, direct))["replay"]["stream_id"]
+            backend.release["child-work"].set()
+            await await_or_fail(backend.entered["grand-work"].wait(), what="nested child started")
+        child = await serve.observer()
+        child_stream = (await serve.join(child, target))["replay"]["stream_id"]
+        backend.release_all()
+
+        child_request = (await _until(child, "approval_request"))[-1]
+        parent_events = await _until(parent, "approval_request")
+        parent_request = parent_events[-1]
+        request_id = child_request["request_id"]
+        assert parent_request["request_id"] == request_id
+        assert (child_request["stream_id"], parent_request["stream_id"]) == (child_stream, parent_stream)
+        status = await serve.controller.request(serve.request_id(), "status", {})
+        assert [item["request_id"] for item in status["result"]["pending_approvals"]] == [request_id]
+        # observers can see both streams but cannot settle the approval
+        for method in ("approve", "deny"):
+            refused = await child.request(serve.request_id(), method, {"request_id": request_id})
+            assert refused["error"]["code"] == -32008, refused
+        settled = await serve.controller.request(serve.request_id(), decision, {"request_id": request_id})
+        assert "error" not in settled, settled
+
+        parent_events += await _until(parent, "child_ended", target)
+        await await_or_fail(top.event("agent_end"), what="session settles")
+        child_events = [child_request, *await serve.drain(child)]
+        parent_events += await serve.drain(parent)
+        status = await serve.controller.request(serve.request_id(), "status", {})
+        assert status["result"]["pending_approvals"] == []
+
+        for events, stream_id in ((child_events, child_stream), (parent_events, parent_stream)):
+            # 1/5: one request and one end on each stream, each with its own seq run
+            requests = [e for e in events if e["event"] == "approval_request" and e["request_id"] == request_id]
+            ends = [e for e in events if e["event"] == "approval_end" and e["request_id"] == request_id]
+            assert (len(requests), len(ends)) == (1, 1), events
+            assert requests[0]["seq"] < ends[0]["seq"]
+            _consecutive(events, stream_id)
+        # 3: approve runs the gated tool once; deny settles without running it
+        tool_ends = [
+            e for e in child_events
+            if e["event"] == "tool_end" and e["tool_result"]["tool_call_id"] == "call-write"
+        ]
+        assert len(tool_ends) == 1, child_events
+        if decision == "approve":
+            assert target_file.read_text() == "written"
+            assert tool_ends[0]["tool_result"]["is_error"] is False, tool_ends
+        else:
+            assert not target_file.exists()
+            assert tool_ends[0]["tool_result"]["is_error"] is True, tool_ends
+    finally:
+        backend.release_all()
+        await _close(serve)
