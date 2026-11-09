@@ -156,14 +156,19 @@ class HistoryIndex:
     def _starts_next_group(entry_type: str, data: Mapping[str, object]) -> bool:
         if entry_type == "message":
             message = data.get("message")
-            return not (
-                isinstance(message, dict)
-                and is_passive_harness_message(message)
+            return isinstance(message, dict) and not (
+                is_passive_harness_message(message)
                 and not is_visible_harness_notice(message)
             )
         return entry_type == "notification" or (
             entry_type == "warning" and data.get("kind") == "transcript_recovery"
         )
+
+    @staticmethod
+    def _belongs_in_history(entry_type: str, data: Mapping[str, object]) -> bool:
+        return HistoryIndex._starts_next_group(entry_type, data) or entry_type in {
+            "client_delivery", "approval_resolution", "approval_history", "turn_end"
+        }
 
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(
@@ -226,11 +231,14 @@ class HistoryIndex:
                 for entry in rows:
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
                     data = json.loads(encoded)
-                    if group < 0:
-                        group = 0
-                    elif self._starts_next_group(entry_type, data):
-                        group += 1
-                    history_group = group
+                    if self._belongs_in_history(entry_type, data):
+                        if group < 0:
+                            group = 0
+                        elif self._starts_next_group(entry_type, data):
+                            group += 1
+                        history_group = group
+                    else:
+                        history_group = None
                     connection.execute(
                         "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
                         "VALUES(?,?,?,?,?,?,?)",
@@ -309,11 +317,14 @@ class HistoryIndex:
                 projected: list[tuple[object, int | None]] = []
                 for entry in entries:
                     data = dict(entry.data)
-                    if current_group < 0:
-                        current_group = 0
-                    elif self._starts_next_group(entry.type, data):
-                        current_group += 1
-                    group = current_group
+                    if self._belongs_in_history(entry.type, data):
+                        if current_group < 0:
+                            current_group = 0
+                        elif self._starts_next_group(entry.type, data):
+                            current_group += 1
+                        group = current_group
+                    else:
+                        group = None
                     projected.append((entry, group))
                 with connection:
                     connection.executemany(
