@@ -26,7 +26,6 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.core.store._log as store_log_module
-import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
 import zeta.tui.cards.agent as agent_card_module
 from tests.support.agent_lifecycle import (
@@ -11438,79 +11437,6 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    parent_store = ConversationStore(tmp_path / "parent")
-    child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
-    call = _run_agent_call()
-    child_store.mark_agent_parent(call.id, agent_type="run")
-    parent_store.allocate_agent_index()
-    parent_store.register_agent_child(
-        call,
-        child_session_path=str(child_store.session_dir),
-        description="long horizon run",
-        agent_type="run",
-        background=True,
-        child_instance_id="parent:1",
-        accepts_follow_ups=True,
-    )
-
-    cleanup_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
-    original_gather = execution_module.asyncio.gather
-
-    async def blocked_cleanup(*args, **kwargs):
-        cleanup_started.set()
-        await await_or_fail(
-            release_cleanup.wait(), what="release cleanup"
-        )
-        return await original_gather(*args, **kwargs)
-
-    monkeypatch.setattr(execution_module.asyncio, "gather", blocked_cleanup)
-    registry = ToolRegistry(
-        tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
-    )
-    owner = BackgroundAgentOwner(parent_store)
-    owner.conversation_channel.register_delivery_flow(
-        "parent:1", pending_delivery_module.StepDeliveryFlow(child_store)
-    )
-    registry._agent_owner = owner
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "agent-send-cleanup-cancel",
-                "agent_send",
-                {"child_instance_id": "parent:1", "message": "follow up"},
-            )
-        )
-    )
-
-    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
-    task.cancel()
-    release_cleanup.set()
-    result = await await_or_fail(task, what="agent send cleanup cancellation")
-
-    assert result["isError"] is False
-    assert result["content"][0]["text"] == (
-        "queued a follow-up for parent:1; a running child receives it after its "
-        "current tool call, before its next model call; an idle child receives it "
-        "at its next turn"
-    )
-    assert registry.definitions_by_name["agent_send"].description == (
-        "Send a follow-up to an eligible child you started. A running child "
-        "receives it after its current tool call, before its next model call. An "
-        "idle child receives it at its next turn. When answering ask_parent, you "
-        "can reference its question id in the message."
-    )
-    assert [
-        entry.data["text"]
-        for entry in await asyncio.to_thread(child_store.pending_prompts)
-    ] == ["follow up"]
-
-
-@pytest.mark.asyncio
 async def test_agent_send_cancellation_reports_durable_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -18722,7 +18648,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         register_builtin=True,
     )
     owner = BackgroundAgentOwner(parent_store)
-    watcher = asyncio.create_task(asyncio.Event().wait())
+    watcher = asyncio.create_task(asyncio.wait_for(asyncio.Event().wait(), 60))
     release = asyncio.Event()
     wait_started = asyncio.Event()
     wait_gate = asyncio.Event()
@@ -18730,7 +18656,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     attempts = 0
 
     async def confirm() -> bool:
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return await fence.cancel()
 
     def cancel() -> CancellationRequest:
@@ -18745,13 +18671,17 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     first_wait = True
     confirm_timeouts: list[object] = []
 
-    async def controlled_wait(awaitables, *, timeout=None):
+    async def controlled_wait(awaitables, *, timeout=None, **kwargs):
         nonlocal first_wait
+        # agent_background_module.asyncio is the shared module: the handler
+        # owner's own wait (it passes return_when=) must stay real.
+        if kwargs:
+            return await original_wait(awaitables, timeout=timeout, **kwargs)
         if first_wait:
             first_wait = False
             confirm_timeouts.append(timeout)
             wait_started.set()
-            await wait_gate.wait()
+            await asyncio.wait_for(wait_gate.wait(), 10)
             return set(), set(awaitables)
         return await original_wait(awaitables, timeout=timeout)
 
@@ -18763,10 +18693,11 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     try:
         call = ToolCall("cancel-1", "agent_cancel", {"handle": "root:1"})
         pending = asyncio.create_task(registry.execute(call))
-        await wait_started.wait()
+        # wait_for: await_or_fail uses the patched asyncio.wait.
+        await asyncio.wait_for(wait_started.wait(), 10)
         assert confirm_timeouts == [1.0]
         wait_gate.set()
-        unconfirmed = await pending
+        unconfirmed = await asyncio.wait_for(pending, 10)
         assert unconfirmed["isError"] is True
         assert unconfirmed["structuredContent"]["status"] == "cancellation_unconfirmed"
         assert "not confirmed" in unconfirmed["content"][0]["text"]
@@ -18808,7 +18739,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         wait_gate.set()
         owner.unregister("root:1")
         watcher.cancel()
-        await asyncio.gather(watcher, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(watcher, return_exceptions=True), 10)
         await registry.close()
         child_store.close()
 
