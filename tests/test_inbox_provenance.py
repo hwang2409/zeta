@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 from tests.test_project_inbox import _projects
-from zeta.core.project_inbox_notifications import project_inbox_notification
 from zeta.project_inbox import ProjectInbox
+from zeta.project_inbox_sent.notifications import project_inbox_notification
+from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import StreamEvent, StreamEventType
 from zeta.server.control import NotificationPresentation
 from zeta.server.slash_commands import ServerSlashSession
@@ -124,8 +125,14 @@ def test_legacy_and_missing_origin_fail_closed(tmp_path: Path) -> None:
 async def test_epoch_five_refuses_delegation_through_tui_and_serve_slash_paths(
     tmp_path: Path,
 ) -> None:
-    home, registry, sender, recipient = await asyncio.to_thread(_projects, tmp_path)
+    home = tmp_path / ".zeta"
+    home.mkdir()
     (home / "storage-format.json").write_text('{"writer_epoch":5}\n')
+    def create_projects() -> tuple[ProjectRegistry, object, object]:
+        registry = ProjectRegistry(home / "projects")
+        return registry, registry.create_project("alpha", "alpha work"), registry.create_project("beta", "beta work")
+
+    registry, sender, recipient = await asyncio.to_thread(create_projects)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     message_id = await asyncio.to_thread(
         inbox.send,

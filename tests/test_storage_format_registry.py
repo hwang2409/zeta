@@ -67,6 +67,7 @@ from zeta.storage_format import (
     ACCEPTED_KEY_SETS,
     _read_manifest,
     compare_registry_dumps,
+    reject_unknown_keys,
 )
 from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
 
@@ -1189,6 +1190,15 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
             recovery_target_parser,
             recovery_target,
             frozenset(recovery_target),
+        ),
+        ShapeCase(
+            "inbox_delegation",
+            lambda value: (
+                reject_unknown_keys(value, "inbox_delegation"),
+                _exact_dict(value, {"from_project", "kind"}, "inbox_delegation"),
+            ),
+            {"from_project": "p_" + "a" * 32, "kind": "question"},
+            frozenset({"from_project", "kind"}),
         ),
     ]
 

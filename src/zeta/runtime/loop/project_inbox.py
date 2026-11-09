@@ -6,13 +6,13 @@ import asyncio
 from typing import Any
 
 from ...agent.pending_delivery import NotificationInput
-from ...core.project_inbox_notifications import NEUTRAL_INBOX_TEXT
 from ...project_inbox import (
     SENT_STATUS_EVENT,
     InboxError,
     ProjectInboxScanner,
 )
 from ...project_inbox_sent import SentMessageTracker
+from ...project_inbox_sent.notifications import NEUTRAL_INBOX_TEXT
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import Message, harness_notice
 

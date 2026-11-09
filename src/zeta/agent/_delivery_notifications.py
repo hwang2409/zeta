@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from ..core.checkpoints import ConversationEntry
-from ..core.project_inbox_notifications import project_inbox_notification
+from ..project_inbox_sent.notifications import project_inbox_notification
 from ..protocol.types import Message, harness_notice
 
 if TYPE_CHECKING:
