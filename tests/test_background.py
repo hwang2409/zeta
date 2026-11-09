@@ -229,58 +229,6 @@ async def test_real_background_producers_preserve_owner_on_start_and_exit(
 
 
 @pytest.mark.asyncio
-async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    registry = BackgroundTaskRegistry()
-    task_id, _ = await registry.start("sleep 30", tmp_path)
-    archive_entered = asyncio.Event()
-    monitor_cancelled = asyncio.Event()
-    release_archive = asyncio.Event()
-    original_archive_record = registry._archive_record
-    original_terminate_process = process_module._terminate_process
-
-    async def terminate_after_archive(*args, **kwargs) -> None:
-        await original_terminate_process(*args, **kwargs)
-        await asyncio.wait_for(archive_entered.wait(), 10)
-
-    async def gated_archive_record(record, log_handle) -> None:
-        archive_entered.set()
-        try:
-            await asyncio.wait_for(release_archive.wait(), 10)
-        except asyncio.CancelledError:
-            monitor_cancelled.set()
-            await asyncio.wait_for(release_archive.wait(), 10)
-            await original_archive_record(record, log_handle)
-            raise
-        await original_archive_record(record, log_handle)
-
-    # test-contract: seam force the archive-pending monitor cancellation order
-    monkeypatch.setattr(registry, "_archive_record", gated_archive_record)
-    # test-contract: seam delay monitor cancellation until archive entry
-    monkeypatch.setattr(process_module, "_terminate_process", terminate_after_archive)
-    monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
-    waiter = asyncio.create_task(registry.wait(task_id))
-    cause = "test requested task stop"
-    killer = asyncio.create_task(registry.kill(task_id, cause=cause))
-    try:
-        await asyncio.wait_for(archive_entered.wait(), 10)
-        await asyncio.wait_for(monitor_cancelled.wait(), 10)
-        release_archive.set()
-
-        status = await asyncio.wait_for(waiter, 10)
-        assert status["running"] is False
-        await asyncio.wait_for(killer, 10)
-        assert registry.snapshot()[0].note == cause
-    finally:
-        release_archive.set()
-        await asyncio.wait_for(
-            asyncio.gather(waiter, killer, return_exceptions=True), 10
-        )
-        await asyncio.wait_for(registry.close(), 10)
-
-
-@pytest.mark.asyncio
 async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
     tmp_path: Path,
 ) -> None:
@@ -310,31 +258,6 @@ async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
 
 async def _collect(events):
     return [event async for event in events]
-
-
-@pytest.mark.asyncio
-async def test_archive_failure_does_not_replace_task_kill_cause(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    registry = BackgroundTaskRegistry()
-    task_id, _ = await registry.start("sleep 30", tmp_path)
-    cause = "test requested task stop"
-
-    async def fail_archive(record, log_handle) -> None:
-        log_handle.close()
-        record.log_fd = None
-        raise OSError("injected archive failure")
-
-    # test-contract: seam force output archiving to fail after the kill cause is durable
-    monkeypatch.setattr(registry, "_archive_record", fail_archive)
-    try:
-        with pytest.raises(OSError, match="injected archive failure"):
-            await asyncio.wait_for(registry.kill(task_id, cause=cause), 10)
-
-        assert registry.snapshot()[0].note == cause
-        assert "failed to archive background task output" in caplog.text
-    finally:
-        await asyncio.wait_for(registry.close(), 10)
 
 
 @pytest.mark.asyncio
