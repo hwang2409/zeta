@@ -177,16 +177,14 @@ def test_format_two_views_are_available_after_per_project_activation(
     requests = ProjectRequests(
         home=home, runtime=runtime, codec=FrameCodec(), registry=registry
     )
-    for method in ("project_show", "project_memory_log"):
+    for operation, expected_key in (
+        (requests.show, "memory"),
+        (requests.memory_log, "versions"),
+    ):
         with pytest.raises(UnsupportedMemoryFormatError, match=UNSUPPORTED_FORMAT_2):
-            requests.dispatch(1, method, {"project_id": project_id})
-        result = requests.dispatch(
-            2,
-            method,
-            {"project_id": project_id},
-            features=frozenset({"projects-memory-v2"}),
-        )
-        assert "memory" in result if method == "project_show" else "versions" in result
+            operation(1, {"project_id": project_id}, entry_response=False)
+        result = operation(2, {"project_id": project_id}, entry_response=True)
+        assert expected_key in result
     descriptor, message, data = project_request_error(
         UnsupportedMemoryFormatError(UNSUPPORTED_FORMAT_2)
     )
