@@ -93,7 +93,7 @@ class MemoryTransactions:
                         try:
                             contents[name] = registry._read_memory_file(memory_fd, name)
                         except FileNotFoundError:
-                            contents[name] = ""
+                            continue
                 finally:
                     os.close(memory_fd)
                 snapshot = MemorySnapshot(contents, registry._memory_digest_value(contents))
