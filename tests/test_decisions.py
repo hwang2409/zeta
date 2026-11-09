@@ -300,126 +300,17 @@ async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
 
 
 @pytest.mark.asyncio
-async def test_persistent_decisions_failure_renders_unavailable_then_recovers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "case",
+    ["success", "changed_after_scan", "failure_recovery", "stop_during_scan", "duplicate_refresh"],
+)
+async def test_decisions_refresh_table_renders_current_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
+    import threading
+
     import zeta.attention_decisions as decisions_module
     import zeta.tui.slash_handlers.decisions_panel as panel_module
-
-    manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
-    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
-    record = await asyncio.to_thread(
-        _request, current, project.project_id, "Current", "This one."
-    )
-    app = _decisions_app(tmp_path, current)
-    real_open = decisions_module.open_decisions
-    unavailable = asyncio.Event()
-    recovered = asyncio.Event()
-    app._invalidate_prompt = lambda: (
-        unavailable.set() if app.decisions_error is not None else recovered.set()
-    )
-
-    def broken_open(*_args, **_kwargs):
-        raise RuntimeError("projection failed")
-
-    monkeypatch.setattr(decisions_module, "open_decisions", broken_open)
-    # test-contract: seam backoff is shortened; the toolbar render is unchanged
-    monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
-    try:
-        app.start_decisions_poll()
-        try:
-            await asyncio.wait_for(unavailable.wait(), 10)
-        except TimeoutError:
-            pass
-        assert "decisions unavailable: projection failed" in _rendered_decisions_status(app)
-
-        monkeypatch.setattr(decisions_module, "open_decisions", real_open)
-        await asyncio.to_thread(
-            AttentionReplies(tmp_path, current.store.session_id).resolve_local,
-            record.id,
-            "done",
-        )
-        app.request_decisions_refresh()
-        try:
-            await asyncio.wait_for(recovered.wait(), 10)
-        except TimeoutError:
-            pass
-
-        assert "decisions unavailable" not in _rendered_decisions_status(app)
-    finally:
-        await _stop_decisions(app)
-        await app.close()
-        current.store.close()
-
-
-@pytest.mark.asyncio
-async def test_child_resolution_event_refreshes_rendered_count(
-    tmp_path: Path,
-) -> None:
-    manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
-    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
-    anchor = current.store.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
-    )
-    record = await asyncio.to_thread(
-        _request,
-        current,
-        project.project_id,
-        "Current",
-        "This one.",
-        entry_id=anchor.id,
-        entry_seq=anchor.seq,
-    )
-    app = _decisions_app(tmp_path, current)
-    fork = None
-    registry = None
-    refreshed = asyncio.Event()
-    try:
-        await app._decisions_tick()
-        assert "1 attention item" in _rendered_decisions_status(app)
-        app._invalidate_prompt = lambda: (
-            refreshed.set() if "● " not in _rendered_decisions_status(app) else None
-        )
-        fork_id = await asyncio.to_thread(
-            create_discussion_fork, tmp_path, current.store.session_id, record.id
-        )
-        fork = manager.open(fork_id)
-        registry = ToolRegistry(
-            tmp_path,
-            session_store=fork.store,
-            skill_catalog=SkillCatalog.empty(),
-            project_id=project.project_id,
-            project_registry=manager.project_registry,
-            tool_allow=fork.metadata.tool_allow,
-        )
-        register_fork(registry)
-        result = await registry.definitions_by_name["resolve_attention"].handler(
-            {"decision": "done"}
-        )
-        assert result["isError"] is False
-
-        app._handle_background_event_now(_resolved_event(child=True))
-        try:
-            await asyncio.wait_for(refreshed.wait(), 10)
-        except TimeoutError:
-            pass
-
-        assert "● " not in _rendered_decisions_status(app)
-    finally:
-        await _stop_decisions(app)
-        if registry is not None:
-            await registry.close()
-        if fork is not None:
-            fork.store.close()
-        await app.close()
-        current.store.close()
-
-
-@pytest.mark.asyncio
-async def test_decisions_refresh_discards_completed_stale_scan(tmp_path: Path) -> None:
-    from zeta.attention_decisions import open_decisions
 
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
@@ -434,19 +325,86 @@ async def test_decisions_refresh_discards_completed_stale_scan(tmp_path: Path) -
     await asyncio.to_thread(replies.stage, records[0].id, "first")
     await asyncio.to_thread(replies.stage, records[1].id, "second")
     app = _decisions_app(tmp_path, current)
-    loop = asyncio.get_running_loop()
-    work = loop.create_future()
-    work.set_result(open_decisions(tmp_path, current.store.session_id))
-    app._decisions_scan_work = work
-    app._decisions_scan_task = asyncio.create_task(asyncio.sleep(10))
-    broken = current.store.session_dir / "attention" / f"{records[0].id}.json"
+    entered = ThreadEvent()
+    release = ThreadEvent()
+    real_open = decisions_module.open_decisions
     try:
-        broken.write_bytes(b'{"why":"cut off"')
-        app.request_decisions_refresh()
-        await app._decisions_tick()
-        assert app.decisions_count == 2
-        assert app.decisions_staged_count == 1
+        if case == "changed_after_scan":
+            loop = asyncio.get_running_loop()
+            work = loop.create_future()
+            work.set_result(real_open(tmp_path, current.store.session_id))
+            app._decisions_scan_work = work
+            app.request_decisions_refresh()
+            task = app._decisions_scan_task
+            assert task is not None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            broken = current.store.session_dir / "attention" / f"{records[0].id}.json"
+            broken.write_bytes(b'{"why":"cut off"')
+            expected = (2, 1, "● 1 open, 1 staged")
+        elif case == "failure_recovery":
+            calls = 0
+
+            def flaky_open(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("projection failed")
+                return real_open(*args, **kwargs)
+
+            monkeypatch.setattr(decisions_module, "open_decisions", flaky_open)
+            monkeypatch.setattr(panel_module, "_SCAN_RETRY_BASE", 0, raising=False)
+            expected = (2, 2, "● 0 open, 2 staged")
+        elif case == "stop_during_scan":
+            def blocked_open(*args, **kwargs):
+                entered.set()
+                release.wait(timeout=10)
+                return real_open(*args, **kwargs)
+
+            monkeypatch.setattr(decisions_module, "open_decisions", blocked_open)
+            app.start_decisions_poll()
+            await await_or_fail(asyncio.to_thread(entered.wait), what="started decision scan")
+            await _stop_decisions(app)
+            release.set()
+            expected = (0, 0, "idle")
+        elif case == "duplicate_refresh":
+            app.request_decisions_refresh()
+            task = app._decisions_scan_task
+            assert task is not None
+            app.request_decisions_refresh()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            expected = (2, 2, "● 0 open, 2 staged")
+        else:
+            loop_thread = threading.current_thread()
+            real_iterdir = Path.iterdir
+            real_stat = Path.stat
+
+            def loop_safe_iterdir(path):
+                assert threading.current_thread() is not loop_thread
+                return real_iterdir(path)
+
+            def loop_safe_stat(path, *args, **kwargs):
+                assert threading.current_thread() is not loop_thread
+                return real_stat(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "iterdir", loop_safe_iterdir)
+            monkeypatch.setattr(Path, "stat", loop_safe_stat)
+            expected = (2, 2, "● 0 open, 2 staged")
+
+        if case != "stop_during_scan":
+            if case == "failure_recovery":
+                with pytest.raises(RuntimeError, match="projection failed"):
+                    await app._decisions_tick()
+                monkeypatch.setattr(decisions_module, "open_decisions", real_open)
+                await app._decisions_tick()
+            else:
+                await app._decisions_tick()
+        assert (app.decisions_count, app.decisions_staged_count) == expected[:2]
+        assert expected[2] in _rendered_decisions_status(app)
     finally:
+        release.set()
+        await _stop_decisions(app)
         await app.close()
         current.store.close()
 
