@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from tests.support.owned import await_or_fail
+from tests.support.server_client import request
 from tests.support.sockets import short_socket_path
 from zeta.core.session import SessionManager
 from zeta.core.session_execution import RUNTIME_LEASE_NAME
@@ -113,19 +114,6 @@ def _reopen(home: Path, sid: str) -> None:
     SessionManager(home).open(sid).store.close()
 
 
-async def _request(reader, writer, ident: int, method: str, params: dict) -> dict:
-    line = {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
-    writer.write((json.dumps(line) + "\n").encode())
-    await writer.drain()
-    while True:
-        raw = await await_or_fail(reader.readline(), what=f"{method} reply")
-        assert raw, f"{method}: serve closed the connection"
-        frame = json.loads(raw)
-        if frame.get("id") == ident:
-            assert "result" in frame, frame
-            return frame["result"]
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client", ["connected", "disconnected_first"])
 @pytest.mark.parametrize("stream", [BlockedStream, BlockedOllama])
@@ -155,7 +143,7 @@ async def test_close_during_resume_wake_turn_ends_turn_and_releases_session(
             what="serve connect",
         )
         # The same hello and resume the bench serve probe sends.
-        await _request(
+        [hello] = await request(
             reader,
             writer,
             1,
@@ -165,7 +153,9 @@ async def test_close_during_resume_wake_turn_ends_turn_and_releases_session(
                 "features": ["session_history_fidelity", "session_host_commands"],
             },
         )
-        await _request(reader, writer, 2, "resume", {"session_id": sid})
+        assert "result" in hello, hello
+        [resume] = await request(reader, writer, 2, "resume", {"session_id": sid})
+        assert "result" in resume, resume
         assert await asyncio.to_thread(blocked.streaming.wait, 30), "no wake turn"
         if client == "disconnected_first":  # the bench order
             writer.close()
