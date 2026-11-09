@@ -42,7 +42,7 @@ async def _open(tmp_path: Path, features: list[str]):
 
 @pytest.mark.asyncio
 async def test_child_history_is_available_to_negotiated_observer(tmp_path: Path) -> None:
-    server, controller_reader, controller_writer, session_id = await _open(
+    server, _controller_reader, controller_writer, session_id = await _open(
         tmp_path, ["child_run_history"]
     )
     child = ConversationStore(
