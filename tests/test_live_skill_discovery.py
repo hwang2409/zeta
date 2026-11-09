@@ -387,7 +387,7 @@ async def test_tui_submit_discovers_new_skill_slash_before_parse(
 
     await app._handle_prompt_value("/live request")
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
 
     user_text = "\n".join(
         block.text
