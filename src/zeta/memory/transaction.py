@@ -86,13 +86,17 @@ class MemoryTransactions:
                     return HealthyMemoryProjection(
                         project_id, 2, snapshot.version, snapshot.digest, snapshot, memory
                     )
-                pointer = registry._pointer(directory_fd)
-                if pointer is None:
-                    contents = dict(registry._legacy_contents(directory_fd))
-                    snapshot = MemorySnapshot(contents, registry._memory_digest_value(contents))
-                else:
-                    snapshot = registry._snapshot_locked(directory_fd)
-                    contents = snapshot.contents
+                memory_fd = registry._memory_fd(directory_fd)
+                try:
+                    contents = {}
+                    for name in PROJECT_MEMORY_FILES:
+                        try:
+                            contents[name] = registry._read_memory_file(memory_fd, name)
+                        except FileNotFoundError:
+                            contents[name] = ""
+                finally:
+                    os.close(memory_fd)
+                snapshot = MemorySnapshot(contents, registry._memory_digest_value(contents))
                 try:
                     automatic = registry._automatic_files_from_records(
                         registry._records_locked(directory_fd)
