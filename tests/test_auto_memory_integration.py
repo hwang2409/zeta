@@ -580,7 +580,9 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
             "normalindexcanary", origin=MessageOrigin.USER
         ):
             pass
-        await asyncio.gather(*tuple(normal.loop._tracked_tasks))
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(normal.loop._tracked_tasks)), 10
+        )
     finally:
         await normal.loop.close()
 
@@ -593,7 +595,9 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
             "forkonlyindexcanary", origin=MessageOrigin.USER
         ):
             pass
-        await asyncio.gather(*tuple(discussion.loop._tracked_tasks))
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(discussion.loop._tracked_tasks)), 10
+        )
     finally:
         await discussion.loop.close()
 

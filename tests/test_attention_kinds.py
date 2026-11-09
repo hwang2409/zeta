@@ -7,16 +7,16 @@ from pathlib import Path
 import pytest
 
 from tests.test_attention import _session
-from zeta import attention_records, storage_format
+from zeta import storage_format
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
 from zeta.skills import SkillCatalog
 from zeta.storage_format import (
+    FEATURE_EPOCHS,
+    StorageFeature,
     StorageFormatError,
     advance,
     require_closed_variant,
-    FEATURE_EPOCHS,
-    StorageFeature,
 )
 from zeta.tools.registry import ToolRegistry
 
