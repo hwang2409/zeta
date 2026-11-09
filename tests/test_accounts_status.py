@@ -77,8 +77,9 @@ def test_accounts_status_reports_recovery_for_malformed_registry(
 
     assert _run_json(tmp_path, monkeypatch) == 1
     assert capsys.readouterr().err == (
-        "accounts.json is unreadable; kept it and every account directory; "
-        "repair or restore accounts.json, then restart zeta\n"
+        f"accounts.json is unreadable: {registry}; kept it and every account directory; "
+        "move it aside to a backup, then run login again or restore it from a backup, "
+        "then restart zeta\n"
     )
     assert registry.read_bytes() == original
 
