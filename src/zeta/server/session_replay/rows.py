@@ -139,10 +139,14 @@ def _tool_end(fields: Mapping[str, Any], facts: RowFacts, owner: str | None) -> 
 
 
 def _approval_request(fields: Mapping[str, Any], facts: RowFacts, owner: str | None) -> str:
+    if owner is not None and _child(fields, owner):
+        return "child"
     return "delegated" if fields.get("delegated") is True else "foreground"
 
 
 def _approval_end(fields: Mapping[str, Any], facts: RowFacts, owner: str | None) -> str:
+    if owner is not None and _child(fields, owner):
+        return "child"
     return facts.variant or "foreground"
 
 
@@ -213,6 +217,11 @@ ROUTES: dict[tuple[EventDescriptor, str], Source] = {
     # a background child's terminal card presents its completion notification row
     (EventDescriptor.TOOL_END, "background_terminal"): CARRIED,
     (EventDescriptor.TOOL_END, "child"): LIVE,
+    (EventDescriptor.APPROVAL_REQUEST, "child"): LIVE,
+    (EventDescriptor.APPROVAL_END, "child"): LIVE,
+    (EventDescriptor.CHILD_STARTED, ""): CARRIED,
+    (EventDescriptor.CHILD_PROGRESS, ""): LIVE,
+    (EventDescriptor.CHILD_ENDED, ""): CARRIED,
     (EventDescriptor.APPROVAL_REQUEST, "foreground"): lambda fields, facts: ApprovalRequest(
         str(fields.get("request_id"))
     ),

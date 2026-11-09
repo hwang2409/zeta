@@ -7,8 +7,11 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
+from ..core.agent_progress import register_child_run_sink
+from ..core.child_run_row import child_run_row
 from ..core.session_files import descend_directory
 from ..core.store import ConversationStore, ObserverSnapshotChanged
 from ..core.store._child_runs import (
@@ -32,6 +35,7 @@ from .session_replay import (
     SessionReplay,
     history_features,
 )
+from .session_replay.children import ChildRunProjection
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
 
@@ -125,6 +129,8 @@ class ConnectionRegistry(ReplayOutput):
         self._observers: list[_Connection] = []
         self._closed = False
         self.replay = SessionReplay()
+        self.child_runs = ChildRunProjection(loop, self)
+        self._unregister_child_run_sink = register_child_run_sink(self.child_runs.sink)
         self._read_condition = threading.Condition()
         self._read_jobs: deque[tuple[Callable[[], Any], asyncio.Future[Any]]] = deque()
         self._read_stopping = False
@@ -859,6 +865,32 @@ class ConnectionRegistry(ReplayOutput):
             session_id=target[0],
         )
 
+    async def read_child_run_events(
+        self, connection: Any, params: dict[str, Any]
+    ) -> tuple[dict[str, object], int, dict[str, object]]:
+        if set(params) != {"session_id", "run_id"} or type(params.get("session_id")) is not str or type(params.get("run_id")) is not str:
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id and run_id are required child event parameters")
+        runtime = connection.server.runtime
+        if runtime.opened is None or params["session_id"] != runtime.session_id:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        features = self._connections[connection].features
+        target = (runtime.session_id, runtime.opened.store)
+        def read() -> tuple[dict[str, object], int, dict[str, object]]:
+            child_runtime = child_reader_runtime(target, params["run_id"], self)
+            result = ergonomics.replay_history(
+                child_runtime,
+                include_delivery_id={"delivery_id", "user_message_event", "user_message_delivery_id"} <= history_features(features),
+                fidelity="session_history_fidelity" in features,
+                content_read="content_read" in features,
+                served_turn_end="served_turn_end" in features,
+                child_runs=True,
+            )
+            row = child_run_row(Path(runtime.opened.store.session_dir), params["run_id"])
+            if row is None:
+                raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
+            return result[0], result[1], row
+        return await self.run_read(connection, read, session_id=runtime.session_id)
+
     async def read_child_run_history(
         self, connection: Any, params: dict[str, Any]
     ) -> object:
@@ -1071,8 +1103,14 @@ class ConnectionRegistry(ReplayOutput):
         )
         return True, result
 
+    def replay_session_replaced(self) -> None:
+        super().replay_session_replaced()
+        self.child_runs.clear()
+
     async def aclose(self) -> None:
         self._closed = True
+        self._unregister_child_run_sink()
+        self.child_runs.clear()
         states = tuple(self._connections.values())
         await self.run_blocking(self.close_child_reader)
         with self._read_condition:

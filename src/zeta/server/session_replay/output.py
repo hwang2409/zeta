@@ -213,6 +213,9 @@ class ReplayOutput:
         scope = self.replay.scope_for(connection)
         if scope is not None and not self._frontier_holds(connection, scope):
             self.invalidate_replay_scope(scope, "session_replaced")
+        projection = getattr(self, "child_runs", None)
+        if projection is not None and connection.server.connections is self:
+            history = projection.with_baseline(history)
         return self.replay.finish_join(connection, history, frontier_seq)
 
     def _frontier_holds(self, connection: Any, scope: ReplayScopeId) -> bool:
@@ -524,6 +527,7 @@ class ReplayOutput:
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
+                child_runs="child_run_events" in features,
             ),
         )
         assert isinstance(result, tuple)

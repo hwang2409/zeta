@@ -452,7 +452,7 @@ class _Client:
                     )
                 else:
                     response = self.codec.response(request_id, result)
-                    if request["method"] == "session_history_and_subscribe":
+                    if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
                         written = await self.connections.admit_join_response(self, response)
                     else:
                         written = await self._write(response)
@@ -603,6 +603,30 @@ class _Client:
         if descriptor is MethodDescriptor.CHILD_RUN_HISTORY:
             assert self.server.connections is not None
             return await self.server.connections.read_child_run_history(self, params)
+        if descriptor is MethodDescriptor.CHILD_RUN_EVENTS:
+            assert self.server.connections is not None
+            try:
+                if self.server.runtime.opened is None:
+                    raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+                session_id = params.get("session_id")
+                run_id = params.get("run_id")
+                if set(params) != {"session_id", "run_id"} or type(session_id) is not str or type(run_id) is not str or not session_id or not run_id:
+                    raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id and run_id are required child event parameters")
+                if session_id != self.server.runtime.session_id:
+                    raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+                scope = ReplayScopeId.child(run_id)
+                self.server.connections.begin_replay_join(self, scope)
+                history, frontier, row = await self.server.connections.read_child_run_events(self, params)
+                result = self.server.connections.finish_replay_join(self, history, frontier)
+                current = self.server.connections.child_runs.current(run_id)
+                if current is not None:
+                    result = {**result, "child": current[0], "revision": current[1]}
+                else:
+                    result = {**result, "child": row, "revision": 0}
+                return result
+            except BaseException:
+                self.server.connections.invalidate_replay_connection(self, reason="rejoined")
+                raise
         if descriptor is MethodDescriptor.PING:
             if "ping" not in self.features:
                 raise ProtocolError(
