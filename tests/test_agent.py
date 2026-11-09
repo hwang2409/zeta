@@ -9423,7 +9423,7 @@ def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
 async def test_child_turn_retries_after_credential_lock_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.agent.runner import resolve_child_backend
+    from zeta.agent.child_context import resolve_child_backend
 
     class LockedCredentials(_FakeCredentials):
         def read(self) -> object | None:
@@ -9435,11 +9435,11 @@ async def test_child_turn_retries_after_credential_lock_timeout(
         parent, ConversationStore(tmp_path / "parent"), skill_catalog=SkillCatalog.empty()
     )
     monkeypatch.setattr(
-        "zeta.agent.runner.credential_store",
+        "zeta.agent.child_context.credential_store",
         lambda provider, **kwargs: LockedCredentials(None),
     )
     monkeypatch.setattr(
-        "zeta.agent.runner.build_backend",
+        "zeta.agent.child_context.build_backend",
         lambda provider, model, **kwargs: (child, model),
     )
 
