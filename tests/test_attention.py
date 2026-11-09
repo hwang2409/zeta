@@ -167,7 +167,7 @@ def test_parallel_attention_fork_copies_the_complete_tool_batch(tmp_path: Path) 
         opened.store.append_message(_tool_result(call, str(index)))
         for index, call in enumerate(calls)
     ]
-    attention_store = AttentionStore(opened.store.session_dir)
+    attention_store = AttentionStore(opened.store.session_dir, writer_epoch=5)
     attention = [
         attention_store.request(
             session_id=opened.store.session_id,
@@ -221,7 +221,7 @@ def test_attention_fork_cuts_before_an_incomplete_tool_batch(tmp_path: Path) -> 
         Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls])
     )
     first_result = opened.store.append_message(_tool_result(calls[0], "created"))
-    attention = AttentionStore(opened.store.session_dir).request(
+    attention = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
         project_id=None,
         entry_id=first_result.id,
@@ -254,7 +254,7 @@ def test_single_attention_call_fork_cut_is_unchanged(tmp_path: Path) -> None:
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
     )
     result = opened.store.append_message(_tool_result(call, "created"))
-    attention = AttentionStore(opened.store.session_dir).request(
+    attention = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
         project_id=None,
         entry_id=result.id,
@@ -306,7 +306,7 @@ def test_reused_fork_with_dangling_parallel_calls_is_safe_on_reopen(
     anchor = source.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("choose")])
     )
-    attention_store = AttentionStore(source.store.session_dir)
+    attention_store = AttentionStore(source.store.session_dir, writer_epoch=5)
     attention = attention_store.request(
         session_id=source.store.session_id,
         project_id=None,
@@ -362,7 +362,7 @@ def test_fork_copies_active_branch_through_anchor_without_modifying_source(
             metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.USER.value},
         )
     )
-    attention = AttentionStore(opened.store.session_dir).request(
+    attention = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
         project_id=None,
         entry_id=anchor.id,
@@ -459,7 +459,7 @@ async def test_attention_fork_preserves_prompt_composition_on_resume(
     anchor = source.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("choose")])
     )
-    attention = AttentionStore(source.store.session_dir).request(
+    attention = AttentionStore(source.store.session_dir, writer_epoch=5).request(
         session_id=source.store.session_id,
         project_id=None,
         entry_id=anchor.id,
@@ -498,7 +498,7 @@ def test_concurrent_fork_creators_reuse_one_usable_session(
     anchor = opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    attention = AttentionStore(opened.store.session_dir).request(
+    attention = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -550,7 +550,7 @@ def test_failed_fork_binding_removes_created_session(
     anchor = opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    attention = AttentionStore(opened.store.session_dir).request(
+    attention = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
         project_id=None,
         entry_id=anchor.id,

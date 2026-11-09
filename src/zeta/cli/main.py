@@ -17,7 +17,7 @@ from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
-from ..storage_format import WRITER_EPOCH, StorageFormatError, advance
+from ..storage_format import StorageFormatError, advance, writer_epoch
 
 if TYPE_CHECKING:
     import httpx
@@ -437,7 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     storage_format_advance = storage_format_commands.add_parser("advance")
     storage_format_advance.add_argument("--expected-epoch", type=int, required=True)
     storage_format_advance.add_argument(
-        "--target-epoch", type=int, default=WRITER_EPOCH
+        "--target-epoch", type=int, default=writer_epoch()
     )
     completion_parser = commands.add_parser(
         "completion",

@@ -14,13 +14,6 @@ from ..providers.factory import build_backend
 from .protocol import ErrorDescriptor, ProtocolError
 from .runtime import ServerRuntime
 
-REQUEST_METHODS = {
-    "account_list",
-    "account_logout",
-    "account_refresh",
-    "account_switch",
-}
-
 
 async def run_owned_switch(owner: Any, operation: Awaitable[object]) -> object:
     task = asyncio.create_task(operation)
@@ -71,34 +64,45 @@ async def list_accounts(
     }
 
 
-async def request(
-    method: str,
-    runtime: ServerRuntime,
-    require_idle: Callable[[], Awaitable[None]],
-    params: dict[str, object],
-) -> dict[str, object]:
-    if method == "account_list":
-        return await list_accounts(runtime)
-    await require_idle()
-    if method == "account_refresh":
-        return await refresh_accounts(runtime)
+async def refresh(runtime: ServerRuntime) -> dict[str, object]:
+    return await refresh_accounts(runtime)
+
+
+def _account(runtime: ServerRuntime, params: dict[str, object]) -> AccountId:
     raw = params.get("account")
     if not isinstance(raw, str) or ":" not in raw:
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "account must be provider:name"
         )
-    account = AccountId(*raw.split(":", 1))
+    return AccountId(*raw.split(":", 1))
+
+
+async def logout(
+    runtime: ServerRuntime,
+    require_idle: Callable[[], Awaitable[None]],
+    params: dict[str, object],
+) -> dict[str, object]:
+    await require_idle()
+    account = _account(runtime, params)
+    try:
+        message = await asyncio.to_thread(
+            runtime.loop.account_context.store.logout,
+            account,
+            sessions_root=runtime.home / "sessions",
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, str(exc)) from exc
+    return {"account": str(account), "message": message}
+
+
+async def switch(
+    runtime: ServerRuntime,
+    require_idle: Callable[[], Awaitable[None]],
+    params: dict[str, object],
+) -> dict[str, object]:
+    await require_idle()
+    account = _account(runtime, params)
     loop = runtime.loop
-    if method == "account_logout":
-        try:
-            message = await asyncio.to_thread(
-                loop.account_context.store.logout,
-                account,
-                sessions_root=runtime.home / "sessions",
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, str(exc)) from exc
-        return {"account": str(account), "message": message}
     context = loop.account_context
     provider = runtime.metadata.provider
     current_provider = account_provider(provider)
