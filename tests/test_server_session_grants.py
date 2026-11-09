@@ -1618,18 +1618,18 @@ async def test_abort_canceled_settlement_keeps_controller_connected(
     entered = asyncio.Event()
     release = asyncio.Event()
     gate_enabled = False
-    original_durable = ConversationStore._to_thread_durable
+    original_commit = ConversationStore._commit_storage_command
 
-    async def gated_durable(*args: object, **kwargs: object) -> object:
+    async def gated_commit(store: ConversationStore, command: object) -> object:
         nonlocal gate_enabled
-        result = await original_durable(*args, **kwargs)
-        if gate_enabled:
+        result = await original_commit(store, command)
+        if gate_enabled and type(command).__name__ == "_ResolveApprovalCommand":
             entered.set()
             await await_or_fail(release.wait(), what="abort settlement")
         return result
 
-    # test-contract: seam gate the settlement's real durable await
-    monkeypatch.setattr(ConversationStore, "_to_thread_durable", gated_durable)
+    # test-contract: seam gate the settlement's typed durable write owner
+    monkeypatch.setattr(ConversationStore, "_commit_storage_command", gated_commit)
     reader, writer = await _connect(server)
     try:
         await _hello_and_create(reader, writer)
@@ -1799,20 +1799,21 @@ async def test_session_grant_lifecycle_table_over_real_transports(
         if case in {"abort", "replacement"}:
             entered = asyncio.Event()
             release = asyncio.Event()
-            original_durable = ConversationStore._to_thread_durable
+            original_commit = ConversationStore._commit_storage_command
 
-            async def gated_replacement_durable(
-                *args: object, **kwargs: object
+            async def gated_replacement_commit(
+                store: ConversationStore, command: object
             ) -> object:
-                result = await original_durable(*args, **kwargs)
-                # test-contract: seam gate the replacement's real durable await
-                entered.set()
-                await await_or_fail(release.wait(), what="replacement settlement")
+                result = await original_commit(store, command)
+                if type(command).__name__ == "_ResolveApprovalCommand":
+                    # test-contract: seam gate the replacement's durable write owner
+                    entered.set()
+                    await await_or_fail(release.wait(), what="replacement settlement")
                 return result
 
             # test-contract: seam gate the replacement settlement await
             monkeypatch.setattr(
-                ConversationStore, "_to_thread_durable", gated_replacement_durable
+                ConversationStore, "_commit_storage_command", gated_replacement_commit
             )
             abort = asyncio.create_task(request(4, "abort", {}))
             await await_or_fail(entered.wait(), what="replacement settlement gate")
