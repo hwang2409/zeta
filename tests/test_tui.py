@@ -2827,25 +2827,100 @@ def test_transcript_search_stays_anchored_at_the_tail_until_closed() -> None:
 
 def test_transcript_membership_indexes_match_public_mutations() -> None:
     transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: transcript.append(renderable) if renderable else None,
+    )
 
     def assert_indexes_match() -> None:
-        assert transcript._unit_set == set(transcript._units)
+        assert transcript._unit_set == {
+            unit for unit in transcript._units if unit is not None
+        }
         assert transcript._user_unit_set == set(transcript._user_units)
         assert set(transcript._user_units) <= transcript._unit_set
 
-    first = transcript.append(Text("first"))
+    first = presenter.print_unit(Text("first"))
+    assert first is not None
+    assert_indexes_match()
+    presenter.append_blank()
     assert_indexes_match()
     transcript.mark_user(first)
+    transcript.mark_user(first)
+    transcript.mark_user(None)
     assert_indexes_match()
     transcript.replace(first, Text("replaced"))
     assert_indexes_match()
-    second = transcript.append(Text("second"))
-    transcript.mark_user(second)
-    assert_indexes_match()
+
+    missing = first
     transcript.remove(first)
     assert_indexes_match()
+    transcript.mark_user(missing)
+    transcript.replace(missing, Text("replacement for missing"))
+    assert_indexes_match()
+
+    leading_blank = transcript._units[0]
+    assert leading_blank is not None and leading_blank.value is None
+    replacement = transcript._units[-1]
+    assert replacement is not None
+    transcript.remove(replacement, leading_blank=True)
+    assert_indexes_match()
+
+    duplicate = transcript.append(Text("duplicate"))
+    transcript._units.append(duplicate)
+    assert_indexes_match()
+    transcript.remove(duplicate)
+    assert duplicate in transcript._unit_set
+    assert_indexes_match()
+    transcript.remove(duplicate)
+    assert_indexes_match()
+
+    transcript.append(Text("prose"))
+    active = ToolCall("active-index", "read", {})
+    background = ToolCall("background-index", "agent", {})
+    transcript.start_tool(active.id, active, Text("active"))
+    active_unit = transcript._units[-1]
+    assert active_unit is not None
+    transcript.mark_user(active_unit)
+    transcript.start_tool(background.id, background, Text("background"))
+    transcript.mark_tool_background(background.id)
+    assert_indexes_match()
+    transcript.discard_tools()
+    assert_indexes_match()
+    assert Text.from_ansi(transcript.render(80)).plain == "prose\nbackground"
+
     transcript.clear()
     assert_indexes_match()
+
+
+@pytest.mark.asyncio
+async def test_transcript_membership_indexes_match_replayed_app(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("persisted user")]),
+            MessageOrigin.USER,
+        )
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("persisted assistant")])
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    try:
+        async with owned_app(app):
+            app._rebuild_transcript()
+            assert app._transcript._unit_set == set(app._transcript._units)
+            app._presenter.print_unit(Text("reloaded"))
+            app._rebuild_transcript()
+            assert app._transcript._unit_set == set(app._transcript._units)
+    finally:
+        await app.loop.close()
+        store.close()
 
 
 def test_transcript_mark_user_does_not_scan_units() -> None:

@@ -334,12 +334,14 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             if previous is not None and previous.value is None:
                 self.remove(previous)
         self._units.remove(unit)
-        self._unit_set.remove(unit)
+        if unit not in self._units:
+            self._unit_set.remove(unit)
         if self._anchor is not None and self._anchor[0] is unit:
             self._anchor = None
         if unit in self._user_unit_set:
             self._user_units.remove(unit)
-            self._user_unit_set.remove(unit)
+            if unit not in self._user_units:
+                self._user_unit_set.remove(unit)
         self._render_cache.pop(unit.key, None)
         self._unit_lines_cache.pop(unit.key, None)
         self._unit_locations_cache.pop(unit.key, None)
