@@ -152,7 +152,7 @@ def _approval_resolution(_context: EntryValidationContext, entry: Any) -> None:
 
 
 def _approval_history(_context: EntryValidationContext, entry: Any) -> None:
-    from ..store._row_history import validate_approval_history_data
+    from ..store._approval_history import validate_approval_history_data
 
     validate_approval_history_data(entry.data)
 
