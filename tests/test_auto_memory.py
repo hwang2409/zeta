@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event as server_event
@@ -58,7 +59,7 @@ def _write_transcript(session_dir: Path, count: int = 4) -> None:
     )
 
 
-def _no_op_proposal(_prompt: str) -> str:
+def _no_op_proposal(_prompt: str, budget=None) -> str:
     return json.dumps({"changes": []})
 
 
@@ -100,8 +101,8 @@ async def test_blocked_scanner_status_renders_blocked_text_through_tui_and_serve
         ),
     )
     try:
-        tui = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
-        serve = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        tui = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
+        serve = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
             ServerSlashSession(runtime), "/status"
         )
         assert tui is not None and serve is not None
@@ -115,7 +116,7 @@ async def test_blocked_scanner_status_renders_blocked_text_through_tui_and_serve
 async def test_scheduled_retry_waits_for_scanner_recovery(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return _proposal(prompt)
@@ -349,7 +350,7 @@ def test_transcript_scanner_stops_at_unknown_type(tmp_path: Path) -> None:
     assert offset == len(json.dumps(rows[0]).encode()) + 1
 
 
-def _proposal(prompt: str) -> str:
+def _proposal(prompt: str, budget=None) -> str:
     marker = 'Completed transcript rows:'
     assert marker in prompt
     rows = json.loads(prompt.split(marker, 1)[1].strip())
@@ -452,7 +453,7 @@ async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_adva
     calls = 0
     driver = driver_type(token_url="https://refresh.test/token")
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         async with httpx.AsyncClient(
@@ -517,7 +518,7 @@ async def test_refresh_invalid_grant_pauses_session_without_retry_or_cursor_adva
 async def test_non_login_provider_failure_keeps_retrying(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -645,7 +646,7 @@ async def test_rejected_entry_reconciliation_advances_without_publishing_or_retr
 ) -> None:
     calls = 0
 
-    async def rejected_proposal(_prompt: str) -> str:
+    async def rejected_proposal(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return json.dumps(
@@ -686,7 +687,7 @@ async def test_rejected_entry_reconciliation_advances_without_publishing_or_retr
 async def test_before_eviction_reconciles_exact_range(tmp_path: Path) -> None:
     seen: list[str] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         seen.append(prompt)
         return _proposal(prompt)
 
@@ -754,7 +755,7 @@ async def test_idle_trigger(tmp_path: Path) -> None:
     idle_clock = _IdleClock(expiry_delay_ticks=101)
     reconciliation_started = asyncio.Event()
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         reconciliation_started.set()
         return _proposal(prompt)
 
@@ -888,7 +889,7 @@ async def test_concurrent_edit_retries_without_clobber(tmp_path: Path) -> None:
     registry_ref: ProjectRegistry
     project_ref: str
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -910,9 +911,9 @@ async def test_background_reconcile_does_not_block_event_loop(tmp_path: Path) ->
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         started.set()
-        await release.wait()
+        await await_or_fail(release.wait(), what="release.wait()")
         return _proposal(prompt)
 
     runner, _, _, _ = _runner(tmp_path, invoke)
@@ -925,7 +926,7 @@ async def test_background_reconcile_does_not_block_event_loop(tmp_path: Path) ->
             ticks += 1
 
     runner.before_eviction(1, 2)
-    await started.wait()
+    await await_or_fail(started.wait(), what="started.wait()")
     await ticker()
     assert ticks == 5
     release.set()
@@ -944,7 +945,7 @@ async def test_close_is_deterministic_before_worker_first_runs(tmp_path: Path) -
 async def test_disabled_setting_never_invokes(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return _proposal(prompt)
@@ -963,7 +964,7 @@ async def test_oversized_row_is_bounded_once_and_preserves_tail_evidence(
     fact = "durable-tail-fact-7Q"
     prompts: list[str] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         prompts.append(prompt)
         return _proposal(prompt)
 
@@ -998,7 +999,7 @@ async def test_oversized_user_row_gets_terminal_receipt_without_publication(
 ) -> None:
     prompts: list[str] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         prompts.append(prompt)
         return _proposal(prompt)
 
@@ -1050,7 +1051,7 @@ async def test_fitting_user_row_preserves_middle_fact(tmp_path: Path) -> None:
     fact = "middle-user-fact-9X"
     prompts: list[str] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         prompts.append(prompt)
         return '{"changes":[]}'
 
@@ -1089,18 +1090,18 @@ async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Pat
     release = asyncio.Event()
     prompts: list[str] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         prompts.append(prompt)
         if len(prompts) == 1:
             started.set()
-            await release.wait()
+            await await_or_fail(release.wait(), what="release.wait()")
         return _proposal(prompt)
 
     runner, _, _, _ = _runner(
         tmp_path, invoke, transcript_count=2, token_threshold=1, minimum_interval=0
     )
     runner.activity(2)
-    await started.wait()
+    await await_or_fail(started.wait(), what="started.wait()")
     _write_transcript(runner.session_dir, 8)
     runner.activity(5)
     runner.activity(8)
@@ -1339,7 +1340,7 @@ async def test_failed_range_waits_for_retry_while_later_range_continues(
 ) -> None:
     calls: list[int] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
         seq = rows[0]["seq"]
         calls.append(seq)
@@ -1451,7 +1452,7 @@ async def test_failed_range_waits_for_retry_while_later_range_continues(
 async def test_provider_failure_records_exact_unit_and_prior_usage(tmp_path: Path) -> None:
     calls: list[int] = []
 
-    async def invoke(prompt: str) -> ReconciliationResponse:
+    async def invoke(prompt: str, budget) -> ReconciliationResponse:
         rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
         seq = rows[0]["seq"]
         calls.append(seq)
@@ -1523,7 +1524,7 @@ def test_terminal_receipts_move_to_bounded_archive(tmp_path: Path) -> None:
 async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
     valid = False
 
-    async def invoke(prompt: str) -> ReconciliationResponse:
+    async def invoke(prompt: str, budget) -> ReconciliationResponse:
         if valid:
             return ReconciliationResponse(_proposal(prompt), {"input_tokens": 1})
         return ReconciliationResponse("not json", {"input_tokens": 2})
@@ -1566,7 +1567,7 @@ async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
 async def test_repair_aggregates_usage_into_committed_provenance(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(prompt: str) -> ReconciliationResponse:
+    async def invoke(prompt: str, budget) -> ReconciliationResponse:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1589,7 +1590,7 @@ async def test_repair_aggregates_usage_into_committed_provenance(tmp_path: Path)
 async def test_entry_repair_login_required_pauses_without_retry(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> ReconciliationResponse:
+    async def invoke(_prompt: str, budget) -> ReconciliationResponse:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1630,7 +1631,7 @@ async def test_entry_repair_login_required_pauses_without_retry(tmp_path: Path) 
 async def test_entry_repair_request_too_large_is_terminal(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> ReconciliationResponse:
+    async def invoke(_prompt: str, budget) -> ReconciliationResponse:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1660,7 +1661,7 @@ async def test_first_call_request_too_large_is_terminal_not_repaired(
 ) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> ReconciliationResponse:
+    async def invoke(_prompt: str, budget) -> ReconciliationResponse:
         nonlocal calls
         calls += 1
         raise RequestTooLargeError("request too large")
@@ -1682,7 +1683,7 @@ async def test_first_call_request_too_large_is_terminal_not_repaired(
 
 @pytest.mark.asyncio
 async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
-    async def invoke(prompt: str) -> ReconciliationResponse:
+    async def invoke(prompt: str, budget) -> ReconciliationResponse:
         return ReconciliationResponse(
             _proposal(prompt), {"input_tokens": 7, "output_tokens": 3}
         )
@@ -1712,7 +1713,7 @@ async def test_applied_pass_writes_success_diagnostic(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_no_change_pass_writes_success_diagnostic(tmp_path: Path) -> None:
-    async def invoke(_prompt: str) -> ReconciliationResponse:
+    async def invoke(_prompt: str, budget) -> ReconciliationResponse:
         return ReconciliationResponse(
             _no_op_proposal(_prompt), {"input_tokens": 4, "output_tokens": 1}
         )
@@ -1773,7 +1774,7 @@ async def test_commit_failure_writes_no_success_diagnostic(
 async def test_failure_writes_persistent_file_log_without_stderr(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    async def invoke(_prompt: str) -> ReconciliationResponse:
+    async def invoke(_prompt: str, budget) -> ReconciliationResponse:
         return ReconciliationResponse(
             "not json", {"input_tokens": 2, "output_tokens": 1}
         )
@@ -1811,7 +1812,7 @@ async def test_health_log_never_contains_transcript_or_model_text(
 ) -> None:
     private_literal = "PRIVATE_HEALTH_LOG_LITERAL_7db92"
 
-    async def invoke(prompt: str) -> ReconciliationResponse:
+    async def invoke(prompt: str, budget) -> ReconciliationResponse:
         if fails:
             output = json.dumps({"operations": [{"op": private_literal}]})
         else:
@@ -1849,7 +1850,7 @@ async def test_close_with_pending_range_makes_no_backend_call(
 ) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return '{"changes":[]}'
@@ -1876,10 +1877,10 @@ async def test_close_cancels_inflight_request_quietly(
     started = asyncio.Event()
     cancelled = asyncio.Event()
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         started.set()
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
         except asyncio.CancelledError:
             cancelled.set()
             raise
@@ -1891,7 +1892,7 @@ async def test_close_cancels_inflight_request_quietly(
         shutdown_grace_seconds=0.01,
     )
     runner.before_eviction(1, 4)
-    await started.wait()
+    await await_or_fail(started.wait(), what="started.wait()")
 
     await asyncio.wait_for(runner.close(), timeout=0.2)
     await asyncio.sleep(0)
@@ -1936,7 +1937,7 @@ async def test_repartitioned_retry_replaces_original_failure(
     retry_now = [1_000.0]
     calls: list[tuple[int, int]] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
         seq_range = (rows[0]["seq"], rows[-1]["seq"])
         calls.append(seq_range)
@@ -2012,7 +2013,7 @@ async def test_drain_bounds_attempts_when_retry_key_stays_due(
 ) -> None:
     calls = 0
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         return _proposal(prompt)
@@ -2259,7 +2260,7 @@ def test_transcript_chunk_skips_delivery_rows_but_advances_offset(tmp_path: Path
 async def test_delivery_only_range_advances_cursor_without_provider(tmp_path: Path) -> None:
     calls = 0
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str, budget) -> str:
         nonlocal calls
         calls += 1
         raise AssertionError(prompt)

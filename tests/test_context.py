@@ -1,6 +1,10 @@
+
+from tests.support.owned import await_or_fail
+from zeta.providers.completion import owned_completion
 from pathlib import Path
 import asyncio
 import base64
+import hashlib
 import json
 import threading
 from tempfile import TemporaryDirectory
@@ -17,10 +21,7 @@ from zeta.core.context import (
     SummaryCompletionError,
 )
 from zeta.context_eviction import EVICTION_KIND
-from zeta.context_accounting import (
-    compact_json_chunks,
-    compact_json_length,
-)
+from zeta.context_accounting import compact_json_length
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.providers.anthropic import build_messages_payload
@@ -69,7 +70,6 @@ def context_root() -> Path:
 def test_compact_json_length_matches_canonical_encoding(value: object) -> None:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
     assert compact_json_length(value) == len(encoded)
-    assert "".join(compact_json_chunks(value)) == encoded
 
 
 async def _append_during_preparation(
@@ -138,34 +138,30 @@ def test_needs_compaction_uses_resident_branch_without_replay(
 
 
 @pytest.mark.asyncio
-async def test_context_count_and_digest_run_off_event_loop(
+async def test_context_assembly_does_not_hash_messages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    loop_thread = threading.get_ident()
-    count_threads: set[int] = set()
-    digest_threads: set[int] = set()
-    real_digest = context_module._digest
+    hash_calls = 0
+    real_sha256 = hashlib.sha256
 
-    def token_count(_message: Message) -> int:
-        count_threads.add(threading.get_ident())
-        return 1
-
-    def observed_digest(messages: list[Message]) -> str:
-        digest_threads.add(threading.get_ident())
-        return real_digest(messages)
+    def observed_sha256(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal hash_calls
+        hash_calls += 1
+        return real_sha256(*args, **kwargs)
 
     store = ConversationStore(tmp_path)
     for index in range(100):
         store.append_message(text(MessageRole.USER, f"message {index} " * 1_000))
-    assembler = ContextAssembler(store, token_budget=10_000, token_counter=token_count)
-    monkeypatch.setattr(context_module, "_digest", observed_digest)
+    assembler = ContextAssembler(store, token_budget=10_000, token_counter=lambda _: 1)
+    monkeypatch.setattr(hashlib, "sha256", observed_sha256)
 
-    await assembler.assemble_context()
+    try:
+        assembled = await assembler.assemble_context()
+    finally:
+        store.close()
 
-    assert count_threads
-    assert digest_threads
-    assert loop_thread not in count_threads
-    assert loop_thread not in digest_threads
+    assert assembled.token_count == 100
+    assert hash_calls == 0
 
 
 @pytest.mark.asyncio
@@ -448,7 +444,6 @@ async def test_minimal_tool_tail_is_truncated_without_mutating_store(
     second = await assembler.assemble_context()
 
     assert first.messages == second.messages
-    assert first.digest == second.digest
     assembled_result = first.messages[-1].tool_result
     assert assembled_result is not None
     assert assembled_result.tool_call_id == call.id
@@ -839,7 +834,6 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
     )
     assert replayed[2] == text(MessageRole.USER, "current request")
     assert messages[-1] == replayed[-1]
-    assert assembler.digest is not None
 
 
 @pytest.mark.asyncio
@@ -1402,6 +1396,7 @@ async def test_stale_branch_discards_summary(context_root: Path) -> None:
     store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
 
     class RebranchingBackend:
+        @owned_completion
         async def complete(self, messages: object, tool_schemas: object):
             store.append_message(with_message_origin(text(MessageRole.USER, "rebranched"), MessageOrigin.USER))
             yield StreamEvent(
@@ -1562,10 +1557,11 @@ async def test_summary_stream_error_is_retried() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls += 1
             if self.calls == 1:
-                raise CodexStreamError("Codex output item completed with open blocks")
+                raise CodexStreamError("Codex output item completed with open blocks", retryable=True)
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=text(MessageRole.ASSISTANT, "summary"),
@@ -1600,6 +1596,7 @@ async def test_summary_aclose_error_propagates_after_success() -> None:
             raise RuntimeError("close failed")
 
     class Backend:
+        @owned_completion
         def complete(self, messages, tool_schemas):
             return ClosingStream()
 
@@ -1627,19 +1624,20 @@ async def test_summary_aclose_cancellation_propagates_after_success() -> None:
 
         async def aclose(self):
             close_started.set()
-            await release_close.wait()
+            await await_or_fail(release_close.wait(), what="release_close.wait()")
 
     class Backend:
+        @owned_completion
         def complete(self, messages, tool_schemas):
             return ClosingStream()
 
     task = asyncio.create_task(
         CompactionPolicy(Backend()).summarize_chunked([text(MessageRole.USER, "source")])
     )
-    await close_started.wait()
+    await await_or_fail(close_started.wait(), what="close_started.wait()")
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="task")
     release_close.set()
 
 
@@ -1659,6 +1657,7 @@ async def test_summary_provider_error_stays_primary_when_aclose_fails() -> None:
             raise RuntimeError("close failed")
 
     class Backend:
+        @owned_completion
         def complete(self, messages, tool_schemas):
             return ClosingStream()
 
@@ -1675,6 +1674,7 @@ async def test_chunked_compaction_maps_chunks_with_bounded_overlap_and_order() -
             self.maximum = 0
             self.sources: list[str] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             source = messages[-1].content[0].text.split("\n\n", 1)[1]
             self.sources.append(source)
@@ -1718,6 +1718,7 @@ async def test_chunked_compaction_cancellation_cleans_up_map_tasks() -> None:
     finalized: list[int] = []
 
     class CancelBackend(CompletionBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             index = len(started)
             started.append(index)
@@ -1737,7 +1738,7 @@ async def test_chunked_compaction_cancellation_cleans_up_map_tasks() -> None:
     await asyncio.sleep(0.02)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="task")
     assert set(finalized) == set(started)
     assert len(started) <= 3
 
@@ -1750,6 +1751,7 @@ async def test_chunked_error_closes_all_started_streams_and_does_not_start_queue
     closed: list[int] = []
 
     class ErrorBackend(CompletionBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             index = len(started)
             started.append(index)
@@ -1785,6 +1787,7 @@ async def test_chunked_telemetry_uses_provider_model_and_bounded_sanitized_usage
     telemetry: list[dict] = []
 
     class ProviderBackend(CompletionBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             yield StreamEvent(StreamEventType.MESSAGE_START, data={"model": "model-a"})
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="x")
@@ -1827,6 +1830,7 @@ async def test_chunked_compaction_counts_retry_events_in_telemetry() -> None:
     calls = 0
 
     class RetryBackend(CompletionBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             nonlocal calls
             call = calls
@@ -1849,19 +1853,45 @@ async def test_chunked_compaction_counts_retry_events_in_telemetry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compaction_discards_partial_output_before_provider_retry() -> None:
-    class RetryBackend(CompletionBackend):
-        async def complete(self, messages, tool_schemas):
-            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="stale")
-            yield StreamEvent(StreamEventType.RETRY)
-            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
-            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fresh")
+async def test_compaction_retries_only_before_no_reset_output() -> None:
+    class RetryBeforeOutputBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
 
-    summary = await CompactionPolicy(RetryBackend()).summarize_chunked(
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            self.calls += 1
+            if self.calls == 1:
+                raise CodexStreamError("Codex output item completed with open blocks", retryable=True)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "fresh"),
+            )
+
+    retry_backend = RetryBeforeOutputBackend()
+    summary = await CompactionPolicy(retry_backend).summarize_chunked(
         [text(MessageRole.USER, "source")]
     )
 
     assert summary == "fresh"
+    assert retry_backend.calls == 2
+
+    class FailAfterOutputBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="stale")
+            raise CodexStreamError("Codex output item completed with open blocks", retryable=True)
+
+    committed_backend = FailAfterOutputBackend()
+    with pytest.raises(SummaryCompletionError, match="open blocks"):
+        await CompactionPolicy(committed_backend).summarize_chunked(
+            [text(MessageRole.USER, "source")]
+        )
+    assert committed_backend.calls == 1
 
 
 @pytest.mark.asyncio
@@ -1888,6 +1918,7 @@ async def test_compaction_reduces_chunk_size_after_provider_context_error() -> N
         def __init__(self) -> None:
             self.sources: list[str] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             assert tool_schemas == []
             source = messages[-1].content[0].text.split("\n\n", 1)[1]
@@ -1922,6 +1953,7 @@ async def test_context_error_with_empty_split_summaries_uses_bounded_fallback() 
     telemetry: list[dict[str, object]] = []
 
     class ContextThenEmptyBackend(CompletionBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             nonlocal calls
             calls += 1
@@ -1953,6 +1985,7 @@ async def test_chunked_telemetry_counts_map_fallbacks_before_normal_reduce() -> 
     telemetry: list[dict[str, object]] = []
 
     class PartlyEmptyBackend(CompletionBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             source = messages[-1].content[0].text.split("\n\n", 1)[1]
             is_map_request = source.startswith('[{"')
@@ -2224,7 +2257,6 @@ async def test_token_cache_on_and_off_give_identical_turns_across_eviction(
         assert [m.to_dict() for m in cached_context.messages] == [
             m.to_dict() for m in uncached_context.messages
         ]
-        assert cached_context.digest == uncached_context.digest
         assert (
             cached_context.token_count
             == uncached_context.token_count

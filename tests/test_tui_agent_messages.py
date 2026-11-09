@@ -334,6 +334,87 @@ def test_completion_summary_is_bounded(width: int) -> None:
     assert "… +186 lines" in output
 
 
+@pytest.mark.parametrize(
+    ("elapsed", "expected_elapsed"),
+    [(1.0, "1.0s"), (60.0, "1m00s"), (3600.0, "1h00m")],
+)
+def test_completion_stats_match_scrollback_and_agent_card(elapsed: float, expected_elapsed: str) -> None:
+    payload = {
+        "description": "legacy worker",
+        "status": "completed",
+        "text": "done",
+        "stats": {"elapsed": elapsed, "turns_used": 1},
+    }
+    scrollback = render_event(
+        StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=payload)
+    )
+    card = _render(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={**payload, "kind": "agent_completion", "child_instance_id": HANDLE},
+        ),
+        120,
+        markers=_markers(),
+    )
+
+    assert scrollback is not None
+    expected_text = f"{expected_elapsed} · 1 turn"
+    assert scrollback.plain.count(expected_text) == 1
+    assert card.count(expected_text) == 1
+    assert "1 turns" not in scrollback.plain + card
+
+
+@pytest.mark.parametrize("status", [1, None])
+def test_completion_with_malformed_status_is_unavailable_in_both_paths(status: object) -> None:
+    payload = {
+        "description": "legacy worker",
+        "status": status,
+        "text": "done",
+        "stats": {"elapsed": 1.0, "turns_used": 1},
+    }
+    scrollback = render_event(
+        StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=payload)
+    )
+    card = _render(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={**payload, "kind": "agent_completion", "child_instance_id": HANDLE},
+        ),
+        120,
+        markers=_markers(),
+    )
+
+    assert scrollback is not None
+    assert scrollback.plain == "background agent notification unavailable"
+    assert "background agent notification unavailable" in card
+
+
+def test_completion_status_stat_conflict_fails_closed_in_both_paths() -> None:
+    payload = {
+        "description": "legacy worker",
+        "status": "completed",
+        "text": "done",
+        "stats": {"elapsed": 1.0, "turns_used": 1, "error": True, "canceled": False},
+    }
+    scrollback = render_event(
+        StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=payload)
+    )
+    card = _render(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={**payload, "kind": "agent_completion", "child_instance_id": HANDLE},
+        ),
+        120,
+        markers=_markers(),
+    )
+
+    assert scrollback is not None
+    assert "failed" in scrollback.plain
+    assert "conflicting completion" in scrollback.plain
+    assert "failed" in card
+    assert "conflicting completion state" in card
+
+
 @pytest.mark.parametrize("width", [80, 160])
 def test_completion_without_handle_uses_description(width: int) -> None:
     event = StreamEvent(

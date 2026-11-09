@@ -4,7 +4,10 @@ import argparse
 import asyncio
 import io
 import json
+import multiprocessing
+import multiprocessing.resource_tracker
 import os
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -15,9 +18,11 @@ import pytest
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import (
+    SENT_PAGE_LIMIT,
     InboxError,
     ProjectInbox,
     ProjectInboxScanner,
@@ -34,6 +39,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
+from zeta.tools.registry import ToolRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +49,26 @@ def _retain_async_test_writer(tmp_path: Path, request: pytest.FixtureRequest):
         return
     with open_writer(tmp_path / ".zeta"):
         yield
+
+
+def _stale_tracker_writer(
+    sessions_root: str,
+    session_id: str,
+    target_project: str,
+    connection,
+) -> None:
+    tracker = SentMessageTracker(Path(sessions_root), session_id)
+    connection.send("loaded")
+    connection.recv()
+    try:
+        tracker.record("d" * 32, target_project)
+        tracker.mark_reported((("a" * 32, "done"),))
+    except Exception as exc:  # noqa: BLE001 - process result is asserted by parent
+        connection.send(f"{type(exc).__name__}: {exc}")
+    else:
+        connection.send(tracker.health().health.state)
+    finally:
+        connection.close()
 
 
 def _projects(tmp_path: Path):
@@ -128,9 +154,7 @@ def test_inbox_receipt_index_ignores_lookalikes(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(_sent_status_message("not-an-id"))
     store.append_message(_sent_status_message("b" * 32, "unknown"))
-    store.append_message(
-        _sent_status_message("c" * 32, origin=MessageOrigin.USER)
-    )
+    store.append_message(_sent_status_message("c" * 32, origin=MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.USER,
@@ -277,7 +301,7 @@ def test_done_reply_failure_is_retryable_and_idempotent(
     )
     session_id = "c" * 32
     assert inbox.claim(project_b.project_id, message_id, session_id) is not None
-    real_send = inbox.send
+    real_send = inbox.send_with_outcome
     attempts = 0
 
     def flaky_send(**kwargs):
@@ -287,7 +311,7 @@ def test_done_reply_failure_is_retryable_and_idempotent(
             raise OSError("injected reply publication failure")
         return real_send(**kwargs)
 
-    monkeypatch.setattr(inbox, "send", flaky_send)
+    monkeypatch.setattr(inbox, "send_with_outcome", flaky_send)
     with pytest.raises(OSError, match="injected reply"):
         inbox.done(
             project_b.project_id,
@@ -343,7 +367,11 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
         assert claimed is not None
         assert claimed["body"] == body
         claimed_path = (
-            registry.root / project_b.project_id / "inbox" / "claimed" / f"{message_id}.json"
+            registry.root
+            / project_b.project_id
+            / "inbox"
+            / "claimed"
+            / f"{message_id}.json"
         )
         assert json.loads(claimed_path.read_text())["body"] == {
             "file": f"bodies/{message_id}.txt"
@@ -361,7 +389,9 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
 
     assert completed["outcome"] == "fixed in PR #12"
     assert completed["body"] == body
-    done_path = registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    done_path = (
+        registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    )
     assert json.loads(done_path.read_text())["body"] == {
         "file": f"bodies/{message_id}.txt"
     }
@@ -400,7 +430,9 @@ def _notice_loop(home, registry, project_id, session_id, wakes):
 
 
 @pytest.mark.asyncio
-async def test_one_message_wakes_exactly_one_of_two_peer_sessions(tmp_path: Path) -> None:
+async def test_one_message_wakes_exactly_one_of_two_peer_sessions(
+    tmp_path: Path,
+) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox.send(
@@ -511,7 +543,9 @@ async def test_active_turn_skips_periodic_inbox_scan(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Path) -> None:
+async def test_session_notices_new_message_at_idle_or_tool_boundary(
+    tmp_path: Path,
+) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     message_id = inbox.send(
@@ -593,7 +627,9 @@ def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
         title="newer writer",
         body="body",
     )
-    new_path = registry.root / project_b.project_id / "inbox" / "new" / f"{message_id}.json"
+    new_path = (
+        registry.root / project_b.project_id / "inbox" / "new" / f"{message_id}.json"
+    )
     record = json.loads(new_path.read_text())
     record["future_optional"] = {"needed": True}
     record["from"]["future_sender_metadata"] = "preserve me"
@@ -613,7 +649,9 @@ def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
     completed = inbox.done(project_b.project_id, message_id, session_id, "complete")
     assert completed["future_optional"] == {"needed": True}
     assert completed["from"]["future_sender_metadata"] == "preserve me"
-    done_path = registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    done_path = (
+        registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    )
     stored = json.loads(done_path.read_text())
     assert stored["future_optional"] == {"needed": True}
     assert stored["from"]["future_sender_metadata"] == "preserve me"
@@ -762,15 +800,21 @@ def test_invalid_message_is_logged_once_across_readers(
     home, registry, _project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox.list(project_b.project_id)
-    invalid = registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    invalid = (
+        registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    )
     invalid.write_text("{not json")
 
     with caplog.at_level("WARNING", logger="zeta.project_inbox"):
         inbox.list(project_b.project_id)
-        ProjectInbox(registry, sessions_root=home / "sessions").list(project_b.project_id)
+        ProjectInbox(registry, sessions_root=home / "sessions").list(
+            project_b.project_id
+        )
 
     messages = [record.message for record in caplog.records]
-    assert sum("Skipping invalid project inbox message" in item for item in messages) == 1
+    assert (
+        sum("Skipping invalid project inbox message" in item for item in messages) == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -778,7 +822,9 @@ async def test_inbox_watcher_ignores_stable_invalid_message(tmp_path: Path) -> N
     home, registry, _project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox.list(project_b.project_id)
-    invalid = registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    invalid = (
+        registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    )
     invalid.write_text("{not json")
     wakes: list[str] = []
     loop = _notice_loop(home, registry, project_b.project_id, "b" * 32, wakes)
@@ -876,6 +922,7 @@ def test_invalid_log_dedup_evicts_before_logging_new_files(
         inbox.list(project_b.project_id)
     assert any(new_name in record.message for record in caplog.records)
 
+
 async def _collect_turn(loop: AgentLoop, text: str) -> None:
     async for _event in loop.run_turn(text, origin=MessageOrigin.USER):
         pass
@@ -951,7 +998,9 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
 
 
 @pytest.mark.asyncio
-async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path) -> None:
+async def test_claim_note_not_redelivered_after_fork_before_note(
+    tmp_path: Path,
+) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     session_id = "a" * 32
     loop, backend, store = _sender_loop(
@@ -1188,8 +1237,9 @@ def test_idle_tracker_does_no_filesystem_io(
         raise AssertionError("idle sent tracker accessed the filesystem")
 
     monkeypatch.setattr(project_inbox_module.os, "listdir", unexpected_filesystem_call)
+    tracker_module = sys.modules[SentMessageTracker.__module__]
     monkeypatch.setattr(
-        project_inbox_module, "read_session_file", unexpected_filesystem_call
+        tracker_module, "read_session_file", unexpected_filesystem_call
     )
 
     assert scanner.scan_sent() == ()
@@ -1236,9 +1286,7 @@ def test_passive_scanner_io_is_bounded_by_sender_tracking(
     statuses = scanner.scan_sent()
 
     assert statuses is not None
-    assert [(item["id"], item["status"]) for item in statuses] == [
-        (message_id, "new")
-    ]
+    assert [(item["id"], item["status"]) for item in statuses] == [(message_id, "new")]
     assert reads == [(project_b.project_id, message_id)]
 
 
@@ -1254,8 +1302,10 @@ def test_newest_record_with_lowest_id_survives_pruning(
             "2026-01-01T00:00:00.000004Z",
         )
     )
-    monkeypatch.setattr(project_inbox_module, "SENT_HISTORY_LIMIT", 2)
-    monkeypatch.setattr(project_inbox_module, "_now", lambda: next(timestamps))
+    tracker_module = sys.modules[SentMessageTracker.__module__]
+    monkeypatch.setattr(tracker_module, "SENT_HISTORY_LIMIT", 2)
+    # test-contract: seam make pruning order deterministic
+    monkeypatch.setattr(tracker_module, "_now", lambda: next(timestamps))
     tracker = SentMessageTracker(home / "sessions", "a" * 32)
 
     tracker.record("f" * 32, project_b.project_id)
@@ -1289,13 +1339,19 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
     loop, backend, store = _sender_loop(
         home, registry, project_a.project_id, session_id, turns=1
     )
-    original_durable_write = store._run_durable_write
+    original_durable_write = store._run_committed_mutation
     append_committed = threading.Event()
     release_append = threading.Event()
 
-    def pause_after_status_commit(method_name, args, kwargs):
-        result = original_durable_write(method_name, args, kwargs)
-        message = args[0] if method_name == "append_message" else None
+    def pause_after_status_commit(command, expected_generation, cancelled_before_write):
+        result = original_durable_write(
+            command, expected_generation, cancelled_before_write
+        )
+        message = (
+            command.message
+            if type(command).__name__ == "_AppendMessageCommand"
+            else None
+        )
         if (
             message is not None
             and message.metadata.get("zeta_event") == "project_inbox_sent_status"
@@ -1304,7 +1360,8 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
             assert release_append.wait(timeout=5)
         return result
 
-    monkeypatch.setattr(store, "_run_durable_write", pause_after_status_commit)
+    # test-contract: seam pauses after durable inbox status commit
+    monkeypatch.setattr(store, "_run_committed_mutation", pause_after_status_commit)
     try:
         await loop._check_project_inbox()
         first_turn = asyncio.create_task(_collect_turn(loop, "first"))
@@ -1312,9 +1369,9 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
         first_turn.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
-            await first_turn
-
-        monkeypatch.setattr(store, "_run_durable_write", original_durable_write)
+            await await_or_fail(first_turn, what="test await")
+        # test-contract: seam releases the next turn from the injected pause
+        monkeypatch.setattr(store, "_run_committed_mutation", original_durable_write)
         await _collect_turn(loop, "second")
 
         persisted = [
@@ -1358,12 +1415,15 @@ async def test_crash_between_note_append_and_receipt_does_not_duplicate(
     monkeypatch.setattr(loop._inbox_scanner, "mark_reported", crash_before_receipt)
     with pytest.raises(RuntimeError, match="simulated crash"):
         await _collect_turn(loop, "first")
-    assert sum(
-        message.metadata.get("zeta_event") == "project_inbox_sent_status"
-        for message in store.entries
-        if message.type == "message"
-        for message in [Message.from_dict(message.data["message"])]
-    ) == 1
+    assert (
+        sum(
+            message.metadata.get("zeta_event") == "project_inbox_sent_status"
+            for message in store.entries
+            if message.type == "message"
+            for message in [Message.from_dict(message.data["message"])]
+        )
+        == 1
+    )
     await loop.close()
     store.close()
 
@@ -1413,5 +1473,296 @@ async def test_done_without_reply_injects_completed_status(tmp_path: Path) -> No
             in notes[0].content[0].text
         )
     finally:
+        await loop.close()
+        store.close()
+
+
+def test_broken_sent_ledger_projects_authoritative_delivery_without_writing(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    session_dir = home / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    ledger = session_dir / "project-inbox-sent.json"
+    original = b'{"schema_version":1,"records":[\n'
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    ledger.write_bytes(original)
+    inbox = ProjectInbox(
+        registry, sessions_root=home / "sessions", sent_tracker=tracker
+    )
+    try:
+        message_id = inbox.send(
+            from_project=project_a.project_id,
+            from_session=session_id,
+            to_project=project_b.project_id,
+            kind="bug_report",
+            title="broken ledger",
+            body="delivered",
+            message_id="f" * 32,
+        )
+    except InboxError:
+        message_id = None
+
+    assert message_id == "f" * 32
+    assert ledger.read_bytes() == original
+    result = inbox.sent(project_a.project_id, session_id=session_id)
+    assert result["history_complete"] is False
+    assert result["state"] == "broken"
+    assert [item["id"] for item in result["messages"]] == [message_id]
+    assert result["messages"][0]["reported"] == []
+
+
+def test_broken_projection_keeps_identity_when_spilled_body_is_undecodable(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    inbox = ProjectInbox(
+        registry,
+        sessions_root=home / "sessions",
+        sent_tracker=tracker,
+        receipts=(("0" * 32, "done"),),
+    )
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="bug_report",
+        title="body unavailable",
+        body="x" * 70_000,
+        message_id="1" * 32,
+    )
+    ledger = home / "sessions" / session_id / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    body = registry.root / project_b.project_id / "inbox" / "bodies" / f"{message_id}.txt"
+    body.write_bytes(b"\\xff")
+
+    result = inbox.sent(project_a.project_id, session_id=session_id)
+
+    assert [row["id"] for row in result["messages"]] == [message_id]
+    assert result["messages"][0]["reported"] == []
+    assert result["history_complete"] is False
+
+
+def test_broken_sent_projection_prunes_completed_row_with_both_receipts(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    session_dir = home / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    ledger = session_dir / "project-inbox-sent.json"
+    completed_id = f"{0:032x}"
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    inbox = ProjectInbox(
+        registry,
+        sessions_root=home / "sessions",
+        sent_tracker=tracker,
+    )
+    expected_ids = []
+    send_error = None
+    for index in range(513):
+        message_id = f"{index:032x}"
+        try:
+            inbox.send(
+                from_project=project_a.project_id,
+                from_session=session_id,
+                to_project=project_b.project_id,
+                kind="info",
+                title=f"message {index}",
+                body="body",
+                message_id=message_id,
+            )
+        except InboxError as exc:
+            send_error = exc
+            break
+        if message_id == completed_id:
+            tracker.mark_reported(
+                ((completed_id, "claimed"), (completed_id, "done"))
+            )
+        else:
+            expected_ids.append(message_id)
+
+    assert send_error is None
+    ledger.write_bytes(b"{")
+    projection_error = None
+    try:
+        broken_tracker = SentMessageTracker(home / "sessions", session_id)
+        broken_tracker.mark_reported(
+            ((completed_id, "claimed"), (completed_id, "done"))
+        )
+        inbox = ProjectInbox(
+            registry,
+            sessions_root=home / "sessions",
+            sent_tracker=broken_tracker,
+        )
+    except InboxError as exc:
+        projection_error = exc
+    assert projection_error is None
+    actual_ids = []
+    offset = 0
+    while True:
+        page = inbox.sent(
+            project_a.project_id,
+            session_id=session_id,
+            offset=offset,
+            limit=SENT_PAGE_LIMIT,
+        )
+        actual_ids.extend(item["id"] for item in page["messages"])
+        if page["next_offset"] is None:
+            break
+        offset = page["next_offset"]
+
+    assert page["total"] == 512
+    assert set(actual_ids) == set(expected_ids)
+    assert completed_id not in actual_ids
+    assert ledger.read_bytes() == b"{"
+
+
+def test_broken_sent_ledger_transitions_to_loaded_and_missing(tmp_path: Path) -> None:
+    home, _registry, project_a, _project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    ledger = home / "sessions" / session_id / "project-inbox-sent.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_bytes(b"{")
+    tracker = SentMessageTracker(home / "sessions", session_id)
+    assert "unless the repaired ledger includes their IDs" in tracker.health().warning
+    retained = "2" * 32
+    ledger.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "id": retained,
+                        "target_project": project_a.project_id,
+                        "created_at": "2026-01-01T00:00:00.000000Z",
+                        "reported": [],
+                    }
+                ],
+            }
+        )
+    )
+
+    assert tracker.health().health.state == "healthy"
+    assert tracker.records()[0]["id"] == retained
+
+    ledger.unlink()
+    assert tracker.health().health.state == "healthy"
+    assert tracker.records() == ()
+
+
+def test_stale_loaded_process_adopts_broken_ledger_without_republishing(
+    tmp_path: Path,
+) -> None:
+    home, _registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    ledger = home / "sessions" / session_id / "project-inbox-sent.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "id": "a" * 32,
+                        "target_project": project_a.project_id,
+                        "created_at": "2026-01-01T00:00:00.000000Z",
+                        "reported": [],
+                    }
+                ],
+            }
+        )
+    )
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(
+        target=_stale_tracker_writer,
+        args=(str(home / "sessions"), session_id, project_b.project_id, child),
+    )
+    process.start()
+    child.close()
+    corrupt = b'{"schema_version":1,"records":"broken"}'
+    try:
+        assert parent.poll(10), "stale writer did not load the healthy ledger"
+        assert parent.recv() == "loaded"
+        ledger.write_bytes(corrupt)
+        parent.send("write")
+        assert parent.poll(10), "stale writer did not finish"
+        result = parent.recv()
+        process.join(10)
+        assert process.exitcode == 0
+        assert result == "broken"
+        assert ledger.read_bytes() == corrupt
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(10)
+        parent.close()
+        process.close()
+        multiprocessing.resource_tracker._resource_tracker._stop()
+
+
+@pytest.mark.asyncio
+async def test_inbox_activation_reads_broken_ledger_off_owner_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, projects, project_a, _project_b = _projects(tmp_path)
+    store = ConversationStore(
+        home / "sessions", session_id="a" * 32, cwd=tmp_path
+    )
+    ledger = store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project_a.project_id,
+        project_registry=projects,
+        inbox_enabled=True,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    tracker_module = sys.modules[SentMessageTracker.__module__]
+    real_read = tracker_module.read_session_file
+    read_entered = threading.Event()
+    release_read = threading.Event()
+    owner_thread = threading.get_ident()
+
+    def gated_read(*args, **kwargs):
+        assert threading.get_ident() != owner_thread
+        read_entered.set()
+        assert release_read.wait(timeout=10)
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(tracker_module, "read_session_file", gated_read)
+
+    activation = asyncio.create_task(loop.activate())
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(read_entered.wait), 10)
+        assert not release_read.is_set()
+        owner_progress = asyncio.Event()
+        asyncio.get_running_loop().call_soon(owner_progress.set)
+        await asyncio.wait_for(owner_progress.wait(), 10)
+        assert owner_progress.is_set()
+        assert not release_read.is_set()
+        release_read.set()
+        await asyncio.wait_for(activation, 10)
+        assert loop._inbox_scanner is not None
+        health = await asyncio.to_thread(loop._inbox_scanner.tracker.health)
+        assert health.health.state == "broken"
+    finally:
+        release_read.set()
+        if not activation.done():
+            activation.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(activation, return_exceptions=True), 10
+            )
         await loop.close()
         store.close()

@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import threading
+from io import StringIO
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.styles import Style
+from rich.console import Console
+from rich.padding import Padding
 from rich.text import Text
 
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
+from zeta.tui.theme import RICH_THEME
 from zeta.tui.transcript import FinderControl, TranscriptWidget, transcript_finder
 from zeta.tui.transcript.history_finder import HistoryFinder
 from zeta.tui.transcript.message_finder import Role
+from zeta.tui.transcript.transcript_search import find_matches
 
 
 async def _open_finder_async(transcript: TranscriptWidget) -> None:
@@ -178,12 +184,136 @@ async def test_newest_candidates_publish_before_older_render_finishes() -> None:
     app._finder_input("candidate 39")
     release.set()
     safety_release.cancel()
-    await prepare_task
+    await asyncio.wait_for(prepare_task, 10)
     while app._finder_rank_task is not None:
-        await app._finder_rank_task
+        await asyncio.wait_for(app._finder_rank_task, 10)
     state = transcript.finder_state()
     assert state is not None and state.complete
     assert [row.candidate.text for row in state.rows] == ["new candidate 39"]
+
+
+def _ansi_search_oracle(renderable: Padding, width: int) -> str:
+    output = StringIO()
+    console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        no_color=False,
+        width=max(1, width),
+        theme=RICH_THEME,
+    )
+    console.print(renderable)
+    rendered = "\n".join(
+        line.rstrip(" ") for line in output.getvalue().splitlines()
+    )
+    return Text.from_ansi(rendered).plain
+
+
+def _assert_search_projection_matches(renderable: Padding, width: int) -> None:
+    expected = _ansi_search_oracle(renderable, width)
+    actual = TranscriptWidget._render_search_snapshot(renderable, width, RICH_THEME)
+    assert actual == expected
+    for query in ("a", "b", " ", "界", "e\u0301", "missing"):
+        actual_matches = find_matches(actual.splitlines(), query)
+        expected_matches = find_matches(expected.splitlines(), query)
+        assert [match.ranges for match in actual_matches] == [
+            match.ranges for match in expected_matches
+        ]
+
+
+def test_rendered_padding_search_text_matches_ansi_oracle() -> None:
+    separators = ("\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+    explicit = (
+        Text("a \x1cb", style="bold"),
+        Text.assemble(("a\r", "bold"), ("\nb", "italic")),
+    )
+    for text in explicit:
+        for width in (1, 2, 3, 40):
+            _assert_search_projection_matches(
+                Padding(text, (0, 0, 0, 0), expand=True), width
+            )
+
+    rng = random.Random(1113)
+    alphabet = (
+        "a",
+        "b",
+        " ",
+        "\t",
+        "界",
+        "e\u0301",
+        "\x00",
+        "\x07",
+        "\x08",
+        "\x1b",
+        "\ue000",
+        *separators,
+    )
+    styles = (None, "bold", "italic", "red", "bold underline")
+    for case in range(3_000):
+        separator = separators[case % len(separators)]
+        text = Text()
+        before = "".join(rng.choice(alphabet) for _ in range(rng.randrange(5)))
+        after = "".join(rng.choice(alphabet) for _ in range(rng.randrange(5)))
+        text.append(before + " ", rng.choice(styles))
+        if separator == "\r\n":
+            text.append("\r", rng.choice(styles))
+            text.append("\n", rng.choice(styles))
+        else:
+            text.append(separator, rng.choice(styles))
+        text.append(after, rng.choice(styles))
+        for _ in range(rng.randrange(4)):
+            text.append(rng.choice(alphabet), rng.choice(styles))
+
+        padding = (
+            (0, 0, 0, 0)
+            if case % 2 == 0
+            else tuple(rng.randrange(3) for _ in range(4))
+        )
+        wrap_width = max(1, len(before) + padding[1] + padding[3])
+        width = rng.choice((1, 2, 3, wrap_width, rng.randrange(4, 41)))
+        _assert_search_projection_matches(
+            Padding(text, padding, expand=bool(case % 3)), width
+        )
+
+
+def test_rendered_padding_search_avoids_ansi_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = Text.from_ansi
+
+    def count(value: str, *args: Any, **kwargs: Any) -> Text:
+        nonlocal calls
+        calls += 1
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(Text, "from_ansi", staticmethod(count))
+    normal_corpus = (
+        Text("plain"),
+        Text("styled", style="bold"),
+        Text.assemble(("a ", "bold"), ("b", "italic")),
+        Text("tabs\twide界 and combining e\u0301"),
+    )
+    for text in normal_corpus:
+        TranscriptWidget._render_search_snapshot(
+            Padding(text, (1, 1, 1, 1)),
+            40,
+            RICH_THEME,
+        )
+    assert calls == 0
+
+
+def test_rendered_padding_search_cache_invalidates_width_and_update() -> None:
+    transcript = TranscriptWidget()
+    transcript._content_width = 8
+    unit = transcript.append(Padding(Text("abcdefghij"), (0, 0, 0, 0)))
+    narrow = transcript._searchable_text(unit)
+    transcript._content_width = 40
+    wide = transcript._searchable_text(unit)
+    assert narrow != wide
+
+    transcript.replace(unit, Padding(Text("updated"), (0, 0, 0, 0)))
+    assert transcript._searchable_text(unit) == "updated"
 
 
 def test_open_finder_lists_messages_with_roles() -> None:

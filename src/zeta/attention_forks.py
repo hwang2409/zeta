@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 from collections.abc import Iterator
@@ -14,6 +13,7 @@ from pathlib import Path
 from .attention_records import (
     AttentionRecord,
     AttentionStore,
+    observed_epoch_for_session,
     read_bounded_session_json,
 )
 from .config.tool_policy import ToolPolicy
@@ -26,7 +26,6 @@ from .core.session_files import (
     write_session_file,
 )
 from .core.store.prompt_composition import clone_prompt_composition
-from .project_inbox import ProjectInbox
 from .protocol.types import Message, MessageRole, TextContent, ToolUseContent
 from .runtime.project_registry_state import (
     ProjectRegistryState,
@@ -104,7 +103,7 @@ def validate_attention_fork(
     if fork is None or current_project_id is None:
         raise ValueError("resolve_attention is available only in an attention fork")
     source_metadata = manager.read_metadata(fork.forked_from_session)
-    record = AttentionStore(manager.sessions_dir / fork.forked_from_session).get(
+    record = AttentionStore(manager.sessions_dir / fork.forked_from_session, writer_epoch=observed_epoch_for_session(manager.sessions_dir / fork.forked_from_session)).get(
         fork.attention_id
     )
     if (
@@ -116,62 +115,6 @@ def validate_attention_fork(
     ):
         raise ValueError("attention fork is not bound to this source record")
     return ValidatedAttentionFork(fork, record)
-
-
-def attention_decision_message_id(attention_id: str) -> str:
-    """Return the stable inbox identity for one attention reply."""
-    return hashlib.sha256(f"attention-decision:{attention_id}".encode()).hexdigest()[
-        :32
-    ]
-
-
-def deliver_attention_decision(
-    home: Path,
-    record: AttentionRecord,
-    decision: str,
-    *,
-    from_session: str,
-    registry_state: ProjectRegistryState | None = None,
-) -> tuple[str, AttentionRecord, bool]:
-    """Deliver and resolve one attention reply through the shared resolution seam."""
-    decision = decision.strip()
-    if not decision:
-        raise ValueError("decision must be nonempty")
-    message_id = attention_decision_message_id(record.id)
-    store = AttentionStore(Path(home) / "sessions" / record.session_id)
-    state = registry_state or available_project_registry(Path(home) / "projects")
-    registry = state.registry
-    if registry is None:
-        raise ValueError("project registry is unavailable")
-    inbox = ProjectInbox(registry, sessions_root=Path(home) / "sessions")
-
-    def send(current: AttentionRecord) -> None:
-        if current.project_id is None:
-            raise ValueError("attention record has no project")
-        label = "Decision" if current.kind == "decision" else "Reply"
-        body = (
-            f"User {label.lower()} relayed from session {from_session}. "
-            f"The question was asked at {current.created_at}; check whether the "
-            f"situation has changed before acting.\n\n{label}: {decision}"
-        )
-        inbox.send(
-            from_project=current.project_id,
-            from_session=from_session,
-            to_project=current.project_id,
-            to_session=current.session_id,
-            kind="reply",
-            title=f"{'Decision' if current.kind == 'decision' else 'Reply'}: {current.title}",
-            body=body,
-            message_id=message_id,
-        )
-
-    resolved, already_resolved = store.resolve(
-        record.id,
-        session_id=record.session_id,
-        decision=decision,
-        before_commit=send,
-    )
-    return message_id, resolved, already_resolved
 
 
 def release_discussion_fork(
@@ -192,7 +135,7 @@ def release_discussion_fork(
     fork = read_attention_fork(manager.sessions_dir / fork_session_id)
     if fork is None:
         raise ValueError("session is not a discussion fork")
-    store = AttentionStore(manager.sessions_dir / fork.forked_from_session)
+    store = AttentionStore(manager.sessions_dir / fork.forked_from_session, writer_epoch=observed_epoch_for_session(manager.sessions_dir / fork.forked_from_session))
     try:
         record = store.get(fork.attention_id)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -378,7 +321,7 @@ def create_discussion_fork(
     manager = SessionManager(home, project_registry_state=state)
     source = manager.open(source_session_id, _read_only=True)
     try:
-        attention_store = AttentionStore(source.store.session_dir)
+        attention_store = AttentionStore(source.store.session_dir, writer_epoch=observed_epoch_for_session(source.store.session_dir))
         with _fork_allocation_lock(attention_store):
             record = attention_store.get(attention_id)
             if record.session_id != source_session_id:

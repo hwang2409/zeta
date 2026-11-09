@@ -13,7 +13,6 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
-from ..agent.receipt import terminal_state
 from ..protocol.types import (
     ErrorInfo,
     RedactedThinkingContent,
@@ -28,10 +27,14 @@ from . import theme
 from .cards.agent import AgentCard
 from .cards.agent_message import (
     AgentIdentityIndex,
+    _notification_stats,
     answer_question_id,
     render_agent_message,
     render_agent_notification_message,
     render_agent_tool_message,
+)
+from .cards.agent_message import (
+    _completion_state as _notification_state,
 )
 from .cards.approval_card import render_approval_card as _render_approval_card
 from .cards.base import (
@@ -193,6 +196,8 @@ def render_error_card(event: StreamEvent) -> Panel:
     retryable = is_retryable_error(error)
     if code == "account_lock_timeout":
         title = "account busy"
+    elif code == "no_progress_loop":
+        title = "model loop stopped"
     elif code == "project_registry_busy":
         title = "project registry busy"
     elif code == "auth_error":
@@ -497,56 +502,18 @@ def _compact_notification_text(value: str, limit: int) -> str:
     return bounded.plain + "..."
 
 
-def _notification_state(data: dict[str, Any]) -> tuple[str, bool]:
-    status = data["status"]
-    state = terminal_state(status=status)
-    stats = data.get("stats")
-    if type(stats) is not dict or not ({"error", "canceled"} & stats.keys()):
-        return state, False
-
-    error = stats.get("error")
-    canceled = stats.get("canceled")
-    conflict = (
-        type(error) is not bool
-        or type(canceled) is not bool
-        or (error and canceled)
-        or error != (state == "failed")
-        or canceled != (state == "canceled")
-    )
-    return ("failed" if conflict else state), conflict
-
-
-def _notification_stats(data: dict[str, Any]) -> list[str]:
-    stats = data.get("stats")
-    if type(stats) is not dict:
-        return []
-    parts: list[str] = []
-    elapsed = stats.get("elapsed")
-    if type(elapsed) in {int, float} and elapsed >= 0:
-        seconds = round(float(elapsed), 1)
-        if seconds >= 3600:
-            parts.append(f"{int(seconds // 3600)}h{int(seconds // 60) % 60:02d}m")
-        elif seconds >= 60:
-            minutes, remainder = divmod(int(seconds), 60)
-            parts.append(f"{minutes}m{remainder:02d}s")
-        else:
-            parts.append(f"{seconds:.1f}s")
-    turns = stats.get("turns_used")
-    if type(turns) is int and turns >= 0:
-        parts.append(f"{turns} turns")
-    return parts
-
-
 # Every stream event is owned by scrollback, another TUI component, or is hidden
 # by design. Keep this exhaustive when adding a StreamEventType member.
 BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = frozenset({
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CONFIG_CHANGED,
     StreamEventType.CHILD_MESSAGE_DELIVERED,
 })
 STREAM_EVENTS_RENDERED = frozenset({
     StreamEventType.MESSAGE_END,
     StreamEventType.RETRY,
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CONFIG_CHANGED,
     StreamEventType.CHILD_MESSAGE_DELIVERED,
     StreamEventType.ACCOUNT_LIMIT,
     StreamEventType.ACCOUNT_STATE_UNKNOWN,
@@ -622,7 +589,7 @@ def render_agent_notification(
         return Text("background agent notification unavailable", style=theme.ERROR)
     try:
         state, state_conflict = _notification_state(event.data)
-    except ValueError:
+    except (TypeError, ValueError):
         return Text("background agent notification unavailable", style=theme.ERROR)
 
     stats_parts = _notification_stats(event.data)
@@ -684,6 +651,16 @@ def render_event(
         return Text(text if type(text) is str else "retrying", style=theme.DIM)
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         return render_agent_notification(event, identity_index)
+    if event.type is StreamEventType.CONFIG_CHANGED:
+        message = event.data.get("message")
+        if not isinstance(message, str) or not message:
+            return Text("live config changed", style=theme.NOTICE)
+        return Text(
+            message,
+            style=theme.NOTICE,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
     if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
         preview = event.data.get("preview", "")
         if not isinstance(preview, str):
@@ -793,6 +770,7 @@ def format_status(
     plan_state: str | None = None,
     background_count: int = 0,
     decisions_count: int = 0,
+    decisions_staged: int = 0,
     main_active: bool = False,
     undo_available: bool = False,
     transcript_search: str | None = None,
@@ -817,6 +795,13 @@ def format_status(
     else:
         value = str(context_tokens)
     context_text = f"{value} ({percent}%)"
+    decisions_marker = None
+    if decisions_staged > 0:
+        open_count = decisions_count - decisions_staged
+        decisions_marker = f"● {open_count} open, {decisions_staged} staged"
+    elif decisions_count > 0:
+        noun = "attention item" if decisions_count == 1 else "attention items"
+        decisions_marker = f"● {decisions_count} {noun}"
 
     state = (
         loop_state
@@ -873,9 +858,8 @@ def format_status(
         segments.append(state_segment)
         if background_count > 0:
             segments.append(f"bg {background_count}")
-        if decisions_count > 0:
-            noun = "attention item" if decisions_count == 1 else "attention items"
-            segments.append(f"● {decisions_count} {noun}")
+        if decisions_marker:
+            segments.append(decisions_marker)
         if main_active:
             segments.append("◆ main")
         if transcript_position:
@@ -1002,9 +986,8 @@ def format_status(
             value = fitted.plain.rstrip(" ·")
     rendered = Text(value, style=theme.CHROME)
     offset = 0
-    if decisions_count > 0:
-        noun = "attention item" if decisions_count == 1 else "attention items"
-        marker = f"● {decisions_count} {noun}"
+    if decisions_marker:
+        marker = decisions_marker
         marker_start = value.find(marker)
         if marker_start >= 0:
             rendered.stylize(

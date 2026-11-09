@@ -17,7 +17,7 @@ _DURABILITY_CALLBACKS = {
     ("core/transcript_recovery/__init__.py", "resume_memory_review", "write_json_file"),
     ("session_retention.py", "write_retention_pin", "atomic_publish_file"),
     ("project_registry.py", "_publish", "atomic_publish_file"),
-    ("project_inbox.py", "_persist", "atomic_publish_file"),
+    ("project_inbox_sent/__init__.py", "publish", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
     (
         "memory/entry_history.py",
@@ -39,7 +39,7 @@ _RAW_PUBLICATION = {
     ("storage_format.py", "_publish_manifest", "os.replace"),
     ("project_registry.py", "_rename_without_replacement", "os.rename"),
     ("project_inbox.py", "claim", "os.rename"),
-    ("project_inbox.py", "done", "os.rename"),
+    ("project_inbox.py", "done_with_outcome", "os.rename"),
     ("project_inbox.py", "_recover_stale", "os.rename"),
     ("project_memory_history.py", "_publish_mirror_file", "os.replace"),
     ("tools/_spill.py", "write_group", "os.replace"),
@@ -66,6 +66,9 @@ _RAW_PUBLICATION = {
     ("accounts/publication.py", "atomic_publish", "os.replace"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "os.replace"),
     ("transcript_search/index.py", "_publish", "os.replace"),
+    ("attention_replies.py", "stage", "os.replace"),
+    ("attention_replies.py", "_finish_journal_locked", "os.replace"),
+    ("attention_replies.py", "_prepare_locked", "os.replace"),
 }
 
 _RAW_DELETION = {
@@ -118,11 +121,16 @@ _RAW_DELETION = {
     ("tools/_atomic_replace.py", "atomic_create", "unlink"),
     ("tools/_atomic_replace.py", "atomic_replace", "unlink"),
     ("tools/_shared/background_output_archive.py", "_remove_generated_log", "unlink"),
+    ("attention_replies.py", "stage", "unlink"),
+    ("attention_replies.py", "_send_staged_locked", "unlink"),
+    ("attention_replies.py", "_recover_locked", "unlink"),
+    ("attention_replies.py", "_cleanup", "unlink"),
     ("tools/_spill.py", "_evict_before", "unlink"),
     ("tools/_spill.py", "temporary_file", "unlink"),
     ("tools/_spill.py", "write_group", "unlink"),
     ("transcript_search/index.py", "_remove_sqlite_sidecars", "unlink"),
     ("transcript_search/index.py", "_temporary_database", "unlink"),
+    ("transcript_search/index.py", "_clear_building_path", "unlink"),
     ("tui/paste_runtime/__init__.py", "_delete_staged", "unlink"),
 }
 

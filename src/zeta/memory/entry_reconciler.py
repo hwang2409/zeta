@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from zeta.oauth import ProviderLoginRequiredError
 from zeta.project_errors import ProjectRegistryError
-from zeta.providers.retry_policy import ProviderRetryBudget, use_retry_budget
+from zeta.providers.completion import CompletionRetryBudget
 
 from .entry_request import (
     _MAX_OPERATIONS,
@@ -59,14 +59,16 @@ if TYPE_CHECKING:
 
 
 EntryInvokeResult = str | ReconciliationResponse
-EntryInvoke = Callable[[str], EntryInvokeResult | Awaitable[EntryInvokeResult]]
+EntryInvoke = Callable[
+    [str, CompletionRetryBudget], EntryInvokeResult | Awaitable[EntryInvokeResult]
+]
 ReconciliationKey = str | Callable[[int, int], str]
 
 _MAX_RESPONSE_BYTES = 32 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_REASON_BYTES = 1024
 _COMPLETION_KINDS = frozenset({"state", "backlog", "threads", "commitments"})
-_CODE_LITERAL = re.compile(r"`([^`\\n]{1,256})`")
+_CODE_LITERAL = re.compile(r"`([^`\n]{1,256})`")
 _DURABLE_LITERAL_CUES = (
     "validated",
     "established",
@@ -434,13 +436,14 @@ def _cited_code_literals(
             or not any(start <= seq <= end for start, end in ranges)
         ):
             continue
-        encoded = json.dumps(row, ensure_ascii=False)
-        literals.extend(
-            literal
-            for literal in _CODE_LITERAL.findall(encoded)
-            if not contains_secret(literal)
-        )
+        literals.extend(_code_literals(_message_text(row)))
     return tuple(dict.fromkeys(literals))
+
+
+def _code_literals(text: str) -> tuple[str, ...]:
+    return tuple(
+        literal for literal in _CODE_LITERAL.findall(text) if not contains_secret(literal)
+    )
 
 
 def _parse(
@@ -489,17 +492,13 @@ def _parse(
             errors.extend(exc.errors)
     if not parsed:
         for row in transcript.rows:
-            encoded = json.dumps(row, ensure_ascii=False)
-            lowered = encoded.lower()
+            text = _message_text(row)
+            lowered = text.lower()
             if not _is_user_authored_row(row) or not any(
                 cue in lowered for cue in _DURABLE_LITERAL_CUES
             ):
                 continue
-            literals = tuple(
-                literal
-                for literal in _CODE_LITERAL.findall(encoded)
-                if not contains_secret(literal)
-            )
+            literals = _code_literals(text)
             if literals:
                 errors.append(
                     "operations omits durable exact code literal(s): "
@@ -713,11 +712,17 @@ def _repair_prompt(
 
 
 async def _invoke(
-    invoke: EntryInvoke, prompt: str, budget: ProviderRetryBudget
+    invoke: EntryInvoke, prompt: str, budget: CompletionRetryBudget
 ) -> tuple[str, dict[str, int], bool]:
-    with use_retry_budget(budget), use_response_byte_limit(_MAX_RESPONSE_BYTES):
-        response = invoke(prompt)
+    with use_response_byte_limit(_MAX_RESPONSE_BYTES):
+        try:
+            inspect.signature(invoke).bind(prompt, budget)
+        except TypeError:
+            response = invoke(prompt)  # type: ignore[call-arg]
+        else:
+            response = invoke(prompt, budget)
         if inspect.isawaitable(response):
+            # test-contract: seam provider completion owns its request deadlines
             response = await response
     if isinstance(response, ReconciliationResponse):
         return (
@@ -752,7 +757,7 @@ async def reconcile_entry_range(
 ) -> EntryReconciliationResult:
     """Reconcile one durable transcript fragment into format-2 state."""
     usage: dict[str, int] = {}
-    budget = ProviderRetryBudget()
+    budget = CompletionRetryBudget()
     for attempt in range(cas_retries):
         snapshot = await asyncio.to_thread(registry._entry_memory_state, project_id)
         request = _prepare_request(

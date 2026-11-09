@@ -50,9 +50,7 @@ class BrokenAgentLifecycle:
     preserved: bool = True
 
 
-AgentLifecycleRead = (
-    MissingAgentLifecycle | LoadedAgentLifecycle | BrokenAgentLifecycle
-)
+AgentLifecycleRead = MissingAgentLifecycle | LoadedAgentLifecycle | BrokenAgentLifecycle
 
 
 def _validate_status_lifecycle(value: object) -> dict[str, Any]:
@@ -240,9 +238,10 @@ def drop_invalid_killed_task_metadata(
             "killed_task_ids_truncated",
         ):
             lifecycle.pop(field, None)
-    if "final_result_is_receipt" in lifecycle and type(
-        lifecycle["final_result_is_receipt"]
-    ) is not bool:
+    if (
+        "final_result_is_receipt" in lifecycle
+        and type(lifecycle["final_result_is_receipt"]) is not bool
+    ):
         warnings.warn(
             "agent lifecycle has invalid receipt marker; "
             f"dropping it: {lifecycle_path}",
@@ -616,7 +615,7 @@ class AgentStateMixin:
         state: str | None = None,
         idle_since: str | None = None,
     ) -> None:
-        """Update a live child's process-local progress."""
+        """Update a live child's progress; ``tool_calls`` adds to its total."""
 
         if current_step is not None and not current_step:
             raise ValueError("agent lifecycle step must be nonempty")
@@ -635,7 +634,7 @@ class AgentStateMixin:
         if turns_used is not None:
             self._agent_lifecycle["turns_used"] = turns_used
         if tool_calls is not None:
-            self._agent_lifecycle["tool_calls"] = tool_calls
+            self._agent_lifecycle["tool_calls"] += tool_calls
         if state is not None:
             self._agent_lifecycle["state"] = state
         if idle_since is not None:
@@ -705,7 +704,9 @@ class AgentStateMixin:
             if killed_task_count is not None:
                 self._agent_lifecycle["killed_task_count"] = killed_task_count
             if killed_task_ids_truncated is not None:
-                self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
+                self._agent_lifecycle["killed_task_ids_truncated"] = (
+                    killed_task_ids_truncated
+                )
             self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
                 self._agent_lifecycle,
                 finished_at=resolved_finished_at,
@@ -767,7 +768,9 @@ class AgentStateMixin:
             if killed_task_count is not None:
                 self._agent_lifecycle["killed_task_count"] = killed_task_count
             if killed_task_ids_truncated is not None:
-                self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
+                self._agent_lifecycle["killed_task_ids_truncated"] = (
+                    killed_task_ids_truncated
+                )
             self._write_agent_lifecycle()
 
     async def finalize_background_agent(
@@ -784,35 +787,46 @@ class AgentStateMixin:
     ) -> tuple[str, ...]:
         """Transfer direct markers and durably publish one terminal lifecycle."""
 
+        from .store._async_writes import (
+            _FinishAgentChildCommand,
+            _FinishAgentLifecycleCommand,
+            _FinishAgentParentCommand,
+            _MarkAgentCanceledCommand,
+            _RegisterAgentChildCommand,
+        )
+
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
-            await self._to_thread_agent_state(
-                self.mark_agent_canceled, canceled_tool_call_id
+            await self._commit_storage_command(
+                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id)
             )
         else:
             for marker_key, marker in self.agent_children().items():
-                tool_call, registration_values = _agent_child_registration_values(marker)
-                await parent_store._to_thread_agent_state(
-                    parent_store.register_agent_child,
-                    tool_call,
-                    **registration_values,
+                tool_call, registration_values = _agent_child_registration_values(
+                    marker
                 )
-                await self._to_thread_agent_state(
-                    self.finish_agent_child, marker_key
+                await parent_store._commit_storage_command(
+                    _RegisterAgentChildCommand(
+                        tool_call=tool_call, **registration_values
+                    )
+                )
+                await self._commit_storage_command(
+                    _FinishAgentChildCommand(marker_key=marker_key)
                 )
                 child_instance_id = marker.get("child_instance_id")
                 if type(child_instance_id) is str:
                     transferred.append(child_instance_id)
-            await self._to_thread_agent_state(self.finish_agent_parent)
-        await self._to_thread_agent_state(
-            self.finish_agent_lifecycle,
-            terminal_state,
-            final_result=final_result,
-            turns_used=turns_used,
-            killed_task_ids=killed_task_ids,
-            killed_task_count=killed_task_count,
-            killed_task_ids_truncated=killed_task_ids_truncated,
-            canonical_receipt=True,
+            await self._commit_storage_command(_FinishAgentParentCommand())
+        await self._commit_storage_command(
+            _FinishAgentLifecycleCommand(
+                state=terminal_state,
+                final_result=final_result,
+                turns_used=turns_used,
+                killed_task_ids=killed_task_ids,
+                killed_task_count=killed_task_count,
+                killed_task_ids_truncated=killed_task_ids_truncated,
+                canonical_receipt=True,
+            )
         )
         return tuple(transferred)
 
