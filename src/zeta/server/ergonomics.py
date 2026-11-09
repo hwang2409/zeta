@@ -34,6 +34,7 @@ from .session_mutation import rename_session
 
 if TYPE_CHECKING:
     from ..core.store import ConversationStore
+    from ..runtime.loop import AgentLoop
 
 EXTENSION_REQUESTS = [
     "rename_session",
@@ -1165,3 +1166,29 @@ def catalog(runtime: ServerRuntime) -> dict:
             for model in models
         },
     }
+
+
+def _active_runtime_snapshot(
+    persisted: dict[str, object], loop: AgentLoop | None
+) -> dict[str, object]:
+    if loop is None:
+        return persisted
+    snapshot = dict(persisted)
+    prompt = loop._runtime_prompt.system_prompt
+    if isinstance(prompt, str):
+        snapshot["system_prompt"] = prompt
+    snapshot["prompt_components"] = {
+        key: dict(component)
+        for key, component in loop._runtime_prompt.prompt_components.items()
+    }
+    snapshot["skill_catalog"] = (
+        snapshot.get("skill_catalog")
+        if loop._live_skill_catalog_snapshot is None
+        else loop._live_skill_catalog_snapshot
+    )
+    snapshot["agent_catalog"] = (
+        snapshot.get("agent_catalog")
+        if loop._live_agent_catalog_snapshot is None
+        else loop._live_agent_catalog_snapshot
+    )
+    return snapshot
