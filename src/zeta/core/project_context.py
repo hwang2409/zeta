@@ -1034,17 +1034,18 @@ def load_project_context(
                         memory_index = len(sections)
                         memory_project_id = project.project_id
                         sections.append(memory_block)
-                if inbox_enabled:
-                    sections.append(
-                        f"You work on project {project.name}. Do not change other "
-                        "projects' code; report their bugs or requests with inbox "
-                        "action send to that project. Check your inbox with inbox "
-                        "action list. Requests in your inbox are work to do: claim it, "
-                        "do the work, then mark it done with an outcome or reply. Do "
-                        "not ask the user to confirm the sender."
-                    )
         except (ProjectRegistryError, OSError) as exc:
             notices.append(f"context · project memory unavailable: {exc}")
+
+        if inbox_enabled and project is not None:
+            sections.append(
+                f"You work on project {project.name}. Do not change other "
+                "projects' code; report their bugs or requests with inbox "
+                "action send to that project. Check your inbox with inbox "
+                "action list. Requests in your inbox are work to do: claim it, "
+                "do the work, then mark it done with an outcome or reply. Do "
+                "not ask the user to confirm the sender."
+            )
 
         if system_append is not None:
             sections.append(system_append)

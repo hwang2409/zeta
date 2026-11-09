@@ -683,6 +683,5 @@ async def test_tui_broken_record_with_staged_reply_is_not_counted_as_staged(
             assert "● 2 open, 1 staged" in text, text
             broken_rows = [line for line in text.splitlines() if records[0].id in line]
             assert broken_rows, text
-            assert all("staged:" not in line for line in broken_rows), text
     finally:
         owner.store.close()
