@@ -325,6 +325,7 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
             features=["serve_observers"],
         )
 
+        # test-contract: transport cancelled before any response; a response-reading helper would hang.
         writer.write(
             json.dumps(
                 {
