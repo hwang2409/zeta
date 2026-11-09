@@ -69,7 +69,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import (
@@ -13273,53 +13273,53 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaking_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, session = _agent_list_session(tmp_path, 0)
-    terminal_calls: list[str] = []
-    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
-    monkeypatch.setattr(
-        "prompt_toolkit.application.run_in_terminal",
-        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
-    )
-    monkeypatch.setattr(
-        "prompt_toolkit.application.in_terminal",
-        lambda: terminal_calls.append("in_terminal"),
-    )
-    monkeypatch.setattr(
-        "prompt_toolkit.patch_stdout.run_in_terminal",
-        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
-    )
-
-    async def run_async(**_kwargs: object) -> None:
-        async def fail() -> None:
-            raise RuntimeError("sk-test-SECRET123")
-
-        asyncio.create_task(fail())
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr(session.app, "run_async", run_async)
-    with patch_stdout(raw=True):
-        await app._run_full_screen(session)
-
-    assert not any("sk-test-SECRET123" in line for line in app._transcript_lines)
-    assert any("RuntimeError" in line for line in app._transcript_lines)
-    # The log path wraps inside the card on long tmp paths (macOS); compare
-    # the text without ANSI codes, card borders, and line breaks.
-    flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
-    assert "tui-errors.jsonl" in flat
-    assert terminal_calls == []
-    log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
-    deadline = time.monotonic() + 1
-    records: list[str] = []
-    while time.monotonic() < deadline:
-        if log_path.exists():
-            records = log_path.read_text().splitlines()
-            if records:
-                break
-        await asyncio.sleep(0.01)
-    assert len(records) == 1
-    assert "sk-test-SECRET123" in json.loads(records[0])["traceback"]
-    assert os.stat(log_path).st_mode & 0o777 == 0o600
-    assert os.stat(log_path.parent).st_mode & 0o777 == 0o700
-
+    async with owned_app(app):
+        terminal_calls: list[str] = []
+        monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+        monkeypatch.setattr(
+            "prompt_toolkit.application.run_in_terminal",
+            lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+        )
+        monkeypatch.setattr(
+            "prompt_toolkit.application.in_terminal",
+            lambda: terminal_calls.append("in_terminal"),
+        )
+        monkeypatch.setattr(
+            "prompt_toolkit.patch_stdout.run_in_terminal",
+            lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+        )
+    
+        async def run_async(**_kwargs: object) -> None:
+            async def fail() -> None:
+                raise RuntimeError("sk-test-SECRET123")
+    
+            asyncio.create_task(fail())
+            await asyncio.sleep(0)
+    
+        monkeypatch.setattr(session.app, "run_async", run_async)
+        with patch_stdout(raw=True):
+            await app._run_full_screen(session)
+    
+        assert not any("sk-test-SECRET123" in line for line in app._transcript_lines)
+        assert any("RuntimeError" in line for line in app._transcript_lines)
+        # The log path wraps inside the card on long tmp paths (macOS); compare
+        # the text without ANSI codes, card borders, and line breaks.
+        flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
+        assert "tui-errors.jsonl" in flat
+        assert terminal_calls == []
+        log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
+        deadline = time.monotonic() + 1
+        records: list[str] = []
+        while time.monotonic() < deadline:
+            if log_path.exists():
+                records = log_path.read_text().splitlines()
+                if records:
+                    break
+            await asyncio.sleep(0.01)
+        assert len(records) == 1
+        assert "sk-test-SECRET123" in json.loads(records[0])["traceback"]
+        assert os.stat(log_path).st_mode & 0o777 == 0o600
+        assert os.stat(log_path.parent).st_mode & 0o777 == 0o700
 
 def test_tui_diagnostic_record_is_not_visible_before_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -2031,13 +2031,16 @@ async def test_websearch_parser_failure_error_carries_status_and_body_preview(
 
     _mock_client(monkeypatch, handler)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    with pytest.raises(websearch.SearchParserError) as excinfo:
-        await websearch._ddg_search("zeta", 1, registry.web_clients)
+    try:
+        with pytest.raises(websearch.SearchParserError) as excinfo:
+            await websearch._ddg_search("zeta", 1, registry.web_clients)
 
-    message = str(excinfo.value)
-    assert "search backend failed" in message
-    assert "HTTP 200" in message
-    assert "temporarily blocked" in message
+        message = str(excinfo.value)
+        assert "search backend failed" in message
+        assert "HTTP 200" in message
+        assert "temporarily blocked" in message
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
