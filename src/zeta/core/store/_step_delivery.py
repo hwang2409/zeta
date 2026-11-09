@@ -193,6 +193,10 @@ def _existing_notification(
             return store._active_completion_notifications.get(child_id)
     if dedupe_key is None:
         return None
+    if kind == "task_exit":
+        task_id = data.get("task_id")
+        if type(task_id) is str:
+            return store.task_exit_notification(task_id)
     key_field = {
         "task_exit": "task_id",
         "inbox": "project_id",

@@ -21,7 +21,7 @@ from typing import (
 
 if TYPE_CHECKING:
     from ..providers.completion import CompletionControl, CompletionRun
-    from ..providers.transport import CloseFailureReporter, CloseOutcome
+    from ..runtime._async_close import CloseFailureReporter, CloseOutcome
 
 from ..media.images import (
     IMAGE_DEGRADATION_WARNING,
