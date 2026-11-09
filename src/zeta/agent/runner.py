@@ -33,7 +33,6 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
-from ..providers.factory import build_backend, child_credential_error, credential_store
 from ..providers.rate_limit_hold import rate_limit_hold_text
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
