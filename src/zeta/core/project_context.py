@@ -1014,12 +1014,7 @@ def load_project_context(
                             memory_block = entry_projection.block
                         else:
                             for entry in context_entries:
-                                path = (
-                                    available_registry.root
-                                    / project.project_id
-                                    / "memory"
-                                    / entry.name
-                                )
+                                path = Path(entry.name)
                                 section = _format_section(path, entry.content)
                                 candidate_manual = list(manual_memory_sections)
                                 candidate_automatic = list(automatic_memory_sections)
