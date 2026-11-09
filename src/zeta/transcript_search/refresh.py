@@ -63,7 +63,8 @@ async def refresh_transcript_index(
     """Coalesce project refreshes and perform every filesystem operation off-loop."""
 
     loop = asyncio.get_running_loop()
-    key = (Path(registry.root).resolve(), project_id)
+    projects_root = registry.root
+    key = (Path(projects_root).resolve(), project_id)
     states = _REFRESH_STATES.setdefault(loop, {})
     state = states.setdefault(key, _RefreshState())
     state.registry = registry
