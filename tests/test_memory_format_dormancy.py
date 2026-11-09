@@ -20,7 +20,7 @@ from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import MemoryExport
 from zeta.project_registry import ProjectRegistry
 from zeta.remote_sync import LocalTransport, push_project_memory
-from zeta.server.project_requests import ProjectRequests, project_request_error
+from zeta.server.handlers.projects import ProjectRequests, project_request_error
 from zeta.server.protocol import FrameCodec
 
 SESSION_ID = "a" * 32
