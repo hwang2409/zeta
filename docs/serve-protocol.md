@@ -958,7 +958,8 @@ with the matching known kind. `child_hold` is sent once per hold when a
 background child waits more than 15 minutes on a provider rate limit or a
 subscription limit; its data has `reason` (`rate_limit` or
 `subscription_limit`), `until` (ISO 8601), `provider`, `account` (string or
-null), and `retry_after` (seconds). The child stays running. `task_exit_notification.data.note` contains the task kill cause when
+null), and `retry_after` (seconds). The child stays running.
+`task_exit_notification.data.note` contains the task kill cause when
 the server stopped the task. `child_message_delivered` is emitted for the parent
 session after a running child starts answering a staged `agent_send`; its data
 contains the child label and the bounded one-line message preview.
