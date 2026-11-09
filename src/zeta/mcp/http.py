@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -413,6 +414,40 @@ class StreamableHTTPMCPClient(MCPClient):
             f"MCP OAuth token refresh failed ({exc}); {hint}",
         )
 
+    @contextlib.asynccontextmanager
+    async def _checked_stream(
+        self,
+        method: str,
+        oauth_token: MCPOAuthToken | None,
+        *,
+        accept: str,
+        content_type: str | None = None,
+        extra_headers: Mapping[str, str] = (),
+        json: object = None,
+    ) -> AsyncIterator[httpx.Response]:
+        headers = self._auth_headers(oauth_token)
+        headers["accept"] = accept
+        if content_type is not None:
+            headers["content-type"] = content_type
+        if self._session_id is not None:
+            headers["mcp-session-id"] = self._session_id
+        if self.protocol_version is not None:
+            headers["mcp-protocol-version"] = self.protocol_version
+        headers.update(extra_headers)
+        try:
+            async with self._client.stream(
+                method, self.config.url, headers=headers, json=json
+            ) as response:
+                if response.status_code == 401:
+                    detail = await _response_detail(response)
+                    raise MCPHTTPError(401, detail or "unauthorized")
+                if response.status_code >= 400:
+                    detail = await _response_detail(response)
+                    raise MCPHTTPError(response.status_code, detail or "request failed")
+                yield response
+        except httpx.HTTPError as exc:
+            raise MCPHTTPError(0, str(exc)) from exc
+
     async def _send(
         self,
         payload: Mapping[str, object],
@@ -420,32 +455,19 @@ class StreamableHTTPMCPClient(MCPClient):
         state: _ActiveRequest,
         oauth_token: MCPOAuthToken | None,
     ) -> dict[str, object]:
-        headers = self._auth_headers(oauth_token)
-        headers.update(
-            {
-                "accept": "application/json, text/event-stream",
-                "content-type": "application/json",
-            }
-        )
-        if self._session_id is not None:
-            headers["mcp-session-id"] = self._session_id
-        if self.protocol_version is not None:
-            headers["mcp-protocol-version"] = self.protocol_version
         try:
-            async with self._client.stream(
-                "POST", self.config.url, headers=headers, json=dict(payload)
+            async with self._checked_stream(
+                "POST",
+                oauth_token,
+                accept="application/json, text/event-stream",
+                content_type="application/json",
+                json=dict(payload),
             ) as response:
                 state.response = response
                 session_id = response.headers.get("mcp-session-id")
                 if session_id is not None and session_id != self._session_id:
                     self._session_id = session_id
                     self._notification_event_id = None
-                if response.status_code == 401:
-                    detail = await _response_detail(response)
-                    raise MCPHTTPError(401, detail or "unauthorized")
-                if response.status_code >= 400:
-                    detail = await _response_detail(response)
-                    raise MCPHTTPError(response.status_code, detail or "request failed")
                 if "text/event-stream" in response.headers.get("content-type", ""):
                     return await _read_sse_response(
                         response,
@@ -461,8 +483,6 @@ class StreamableHTTPMCPClient(MCPClient):
                 except ValueError as exc:
                     raise MCPProtocolError("MCP HTTP response was not JSON") from exc
                 return parse_rpc_response(value, request_id)
-        except httpx.HTTPError as exc:
-            raise MCPHTTPError(0, str(exc)) from exc
         finally:
             state.response = None
 
@@ -502,43 +522,33 @@ class StreamableHTTPMCPClient(MCPClient):
         if session_id is None:
             return False
         last_event_id = self._notification_event_id
-        headers = self._auth_headers(oauth_token)
-        headers["accept"] = "text/event-stream"
-        headers["mcp-session-id"] = session_id
-        if self.protocol_version is not None:
-            headers["mcp-protocol-version"] = self.protocol_version
-        request_headers = httpx.Headers(headers)
+        extra_headers = {"mcp-session-id": session_id}
         if last_event_id:
-            request_headers = httpx.Headers(
-                [*request_headers.raw, (b"last-event-id", last_event_id)]
+            extra_headers["last-event-id"] = last_event_id.decode("latin-1")
+        async with self._checked_stream(
+            "GET",
+            oauth_token,
+            accept="text/event-stream",
+            extra_headers=extra_headers,
+        ) as response:
+            started = asyncio.get_running_loop().time()
+            delivered = False
+            async for event in _iter_sse_event_records(
+                response, self._spill_store, self._limits
+            ):
+                if self._session_id != session_id:
+                    return delivered
+                if event.event_id and event.event_id == last_event_id:
+                    continue
+                delivered = True
+                if event.event_id is not None:
+                    last_event_id = event.event_id
+                    self._notification_event_id = event.event_id
+                _dispatch_sse_notification(event.value, self._notification_sink)
+            return delivered or (
+                asyncio.get_running_loop().time() - started
+                >= NOTIFICATION_STREAM_HEALTHY_SECONDS
             )
-        try:
-            async with self._client.stream(
-                "GET", self.config.url, headers=request_headers
-            ) as response:
-                if response.status_code >= 400:
-                    detail = await _response_detail(response)
-                    raise MCPHTTPError(response.status_code, detail or "request failed")
-                started = asyncio.get_running_loop().time()
-                delivered = False
-                async for event in _iter_sse_event_records(
-                    response, self._spill_store, self._limits
-                ):
-                    if self._session_id != session_id:
-                        return delivered
-                    if event.event_id and event.event_id == last_event_id:
-                        continue
-                    delivered = True
-                    if event.event_id is not None:
-                        last_event_id = event.event_id
-                        self._notification_event_id = event.event_id
-                    _dispatch_sse_notification(event.value, self._notification_sink)
-                return delivered or (
-                    asyncio.get_running_loop().time() - started
-                    >= NOTIFICATION_STREAM_HEALTHY_SECONDS
-                )
-        except httpx.HTTPError as exc:
-            raise MCPHTTPError(0, str(exc)) from exc
 
     async def _send_notification(
         self, method: str, params: Mapping[str, object]
@@ -553,30 +563,15 @@ class StreamableHTTPMCPClient(MCPClient):
         params: Mapping[str, object],
         oauth_token: MCPOAuthToken | None,
     ) -> None:
-        headers = self._auth_headers(oauth_token)
-        headers.update(
-            {
-                "accept": "application/json, text/event-stream",
-                "content-type": "application/json",
-            }
-        )
-        if self._session_id is not None:
-            headers["mcp-session-id"] = self._session_id
-        if self.protocol_version is not None:
-            headers["mcp-protocol-version"] = self.protocol_version
         payload = {"jsonrpc": "2.0", "method": method, "params": dict(params)}
-        try:
-            async with self._client.stream(
-                "POST", self.config.url, headers=headers, json=payload
-            ) as response:
-                if response.status_code == 401:
-                    detail = await _response_detail(response)
-                    raise MCPHTTPError(401, detail or "unauthorized")
-                if response.status_code >= 400:
-                    detail = await _response_detail(response)
-                    raise MCPHTTPError(response.status_code, detail or "request failed")
-        except httpx.HTTPError as exc:
-            raise MCPHTTPError(0, str(exc)) from exc
+        async with self._checked_stream(
+            "POST",
+            oauth_token,
+            accept="application/json, text/event-stream",
+            content_type="application/json",
+            json=payload,
+        ):
+            pass
 
     def _auth_headers(self, oauth_token: MCPOAuthToken | None) -> dict[str, str]:
         def resolve(value: str) -> str:
