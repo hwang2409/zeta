@@ -15,7 +15,7 @@ from ..protocol import (
     feature_error,
     protocol_error,
 )
-from . import lifecycle, path_complete, session, settings, validation
+from . import lifecycle, path_completion, session, settings, validation
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
@@ -191,6 +191,15 @@ async def send_images(client, request_id, params):
     return await client.server.control.deliveries.send_images(params, client.features)
 
 
+async def path_complete(client, request_id, params):
+    store = validation.active(client.server.runtime, params)
+    return await path_completion.complete(
+        params,
+        base_dir=store.cwd,
+        run_blocking=client.server.control._run_blocking,
+    )
+
+
 async def slash_list(client, request_id, params):
     validation.active(client.server.runtime, params)
     include_unavailable = params.get("include_unavailable", False)
@@ -358,7 +367,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.SET_SETTINGS: set_settings,
     MethodDescriptor.SET_COMPACTION: set_compaction,
     MethodDescriptor.SEND_IMAGES: send_images,
-    MethodDescriptor.PATH_COMPLETE: path_complete.path_complete,
+    MethodDescriptor.PATH_COMPLETE: path_complete,
     MethodDescriptor.SLASH_LIST: slash_list,
     MethodDescriptor.SLASH_RUN: slash_run,
     MethodDescriptor.ACCOUNT_LIST: account_list,
