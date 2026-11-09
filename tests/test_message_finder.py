@@ -16,7 +16,7 @@ def _finder(texts: list[str], **kwargs) -> MessageFinder:
 
 def _query(finder: MessageFinder, query: str) -> None:
     finder.set_query(query)
-    finder.rank_all()
+    finder.publish(finder.rank())
 
 
 def test_empty_query_lists_candidates_newest_first() -> None:
@@ -105,7 +105,7 @@ def test_stale_generation_is_never_published() -> None:
 
     assert not finder.publish(stale)
     assert finder.rows == ()
-    finder.rank_all()
+    finder.publish(finder.rank())
     assert [row.candidate.text for row in finder.rows] == ["beta only"]
 
 
@@ -116,7 +116,7 @@ def test_loading_candidates_invalidates_empty_collection_ranking() -> None:
     finder.load_candidates([_candidate(1, "run pytest")])
 
     assert not finder.publish(stale)
-    finder.rank_all()
+    finder.publish(finder.rank())
     assert [row.candidate.text for row in finder.rows] == ["run pytest"]
 
 
