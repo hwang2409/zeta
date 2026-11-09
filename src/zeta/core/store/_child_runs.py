@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from ...storage_format import reject_unknown_keys
+from ._async_writes import _AppendChildRunStartedCommand
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
@@ -61,8 +62,6 @@ def verify_child_run_directory(directory_fd: int, run_id: str) -> None:
 
 def validate_child_run_started_data(data: Mapping[str, Any]) -> None:
     """Validate the bounded internal start-row payload."""
-    reject_unknown_keys(data, "child_run")
-    reject_unknown_keys(data, "child_run")
     reject_unknown_keys(data, "child_run")
     run_id = data.get("run_id")
     parent_run_id = data.get("parent_run_id")
@@ -133,12 +132,13 @@ class ChildRunStoreMixin:
         on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         """Append the spawn row off-loop and publish it before returning."""
-        return await self._to_thread_durable(
-            self.append_child_run_started,
-            run_id,
-            parent_run_id,
-            name,
-            task,
-            started_at,
-            _on_persisted=on_persisted,
+        return await self._commit_storage_command(
+            _AppendChildRunStartedCommand(
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                name=name,
+                task=task,
+                started_at=started_at,
+                callback=on_persisted,
+            )
         )

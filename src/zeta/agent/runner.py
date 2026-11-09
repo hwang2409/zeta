@@ -282,7 +282,7 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
-        if failure_error is not None and failure_error[0] == "account_lock_timeout":
+        if failure_error is not None and failure_error[0] in {"account_lock_timeout", "no_progress_loop"}:
             result = terminal_result(
                 state="idle",
                 text=f"agent error: {failure_message}",

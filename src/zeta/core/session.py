@@ -20,7 +20,7 @@ from tempfile import TemporaryDirectory
 from typing import Mapping
 
 from ..skills import SkillCatalog
-from ..storage_format import advance, mapping_mutations, open_writer
+from ..storage_format import advance, mapping_mutations, open_writer, release_later
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
@@ -131,7 +131,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self.home = Path(home) if home is not None else env_home()
         self._owner_surface = owner_surface
         self._storage_lease = open_writer(self.home)
-        self._release_storage_lease = weakref.finalize(self, self._storage_lease.close)
+        self._release_storage_lease = weakref.finalize(
+            self, release_later, self._storage_lease.close
+        )
         self.user_home = (
             (Path(user_home) if user_home is not None else Path.home())
             .expanduser()
@@ -989,6 +991,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self, directory_fd: int, metadata: SessionMetadata, *, sync: bool = True
     ) -> None:
         value = metadata.to_storage_dict()
+        # Refuse a shape the reader would reject, so no writer leaves an
+        # unreadable meta.json behind.
+        SessionMetadata.from_dict(
+            value, path=self.sessions_dir / metadata.session_id / "meta.json"
+        )
         delete = () if "tool_allow_layers" in value else ("tool_allow_layers",)
         self._storage_lease.publish_json(
             directory_fd,

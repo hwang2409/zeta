@@ -7,7 +7,13 @@ from pathlib import Path
 
 import httpx
 
-from ..accounts import AccountCredentialLockTimeoutError, AccountStore
+from ..accounts import (
+    AccountCredentialLockTimeoutError,
+    AccountId,
+    AccountRegistryBrokenError,
+    AccountRegistryMissingError,
+    AccountStore,
+)
 from ..core.login_flow import (
     LoginError,
     LoginPortInUseError,
@@ -120,6 +126,13 @@ class Logins:
             return {"state": "cancelled"}
         return task.result() if task.done() else {"state": "pending"}
 
+    def _prepare(self, login_provider: str):
+        # Refuse before the browser opens; the publish step checks again under lock.
+        AccountStore(account_home(self.home)).refuse_orphaning_registration(
+            AccountId(login_provider, "default")
+        )
+        return build_login_provider(login_provider, self.home)
+
     async def _attempt(
         self,
         login_provider: str,
@@ -127,9 +140,7 @@ class Logins:
         operation: _LoginOperation,
     ) -> dict:
         try:
-            login = await asyncio.to_thread(
-                build_login_provider, login_provider, self.home
-            )
+            login = await asyncio.to_thread(self._prepare, login_provider)
             async with asyncio.timeout(self.timeout):
                 await run_login(
                     login,
@@ -148,7 +159,11 @@ class Logins:
                 "login_lock_timeout",
                 "Sign-in could not save credentials because the account is busy. Please try again.",
             )
-        except LoginPublicationError as exc:
+        except (
+            LoginPublicationError,
+            AccountRegistryBrokenError,
+            AccountRegistryMissingError,
+        ) as exc:
             return failure("login_save_failed", str(exc))
         except LoginPortInUseError as exc:
             provider_label = exc.provider.capitalize()

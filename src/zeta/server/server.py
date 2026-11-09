@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import errno
 import fcntl
+import logging
 import os
 import socket
 import stat
@@ -15,6 +16,7 @@ from ..core.session import SessionError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..project_errors import ProjectRegistryBusyError
+from ..storage_format import drain_releases, pending_releases
 from . import (
     accounts,
     login,
@@ -42,6 +44,24 @@ from .protocol import _dispatch as _dispatch_request
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
+
+logger = logging.getLogger(__name__)
+
+# A GC finalizer only queues a lease release; an idle serve must still run it,
+# or another process stays refused the session until serve's next lease call.
+IDLE_DRAIN_INTERVAL = 1.0
+
+
+async def _drain_released_leases() -> None:
+    while True:
+        await asyncio.sleep(IDLE_DRAIN_INTERVAL)
+        if not pending_releases():
+            continue
+        try:
+            # a release may wait on a registry lock another thread holds
+            await asyncio.to_thread(drain_releases)
+        except Exception:  # a failed drain must not stop serve
+            logger.exception("draining released leases failed")
 
 
 class _UnixSocketListener:
@@ -213,6 +233,7 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
+        self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
@@ -249,6 +270,7 @@ class ZetaServer:
             except BaseException:
                 await self.close()
                 raise
+        self._idle_drain = asyncio.create_task(_drain_released_leases())
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -258,6 +280,10 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self) -> None:
+        if self._idle_drain is not None:
+            self._idle_drain.cancel()
+            await asyncio.wait([self._idle_drain])
+            self._idle_drain = None
         try:
             if self._client is not None:
                 await self._client.close(graceful=True)

@@ -382,6 +382,23 @@ if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
 
 
+def _require_attached_session(runtime: Any, params: dict[str, Any]) -> None:
+    if "session_id" not in params:
+        return
+    session_id = params["session_id"]
+    if not isinstance(session_id, str) or not session_id:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
+        )
+    attached = runtime.session_id if runtime.opened is not None else None
+    if attached is not None and session_id != attached:
+        raise ProtocolError(
+            ErrorDescriptor.SESSION_MISMATCH,
+            "session is not active",
+            {"attached_session_id": attached, "session_id": session_id},
+        )
+
+
 async def dispatch(
     client: object,
     request_id: str | int,
@@ -412,4 +429,6 @@ async def dispatch(
         raise protocol_error(descriptor)
     if descriptor.feature is not None and descriptor.feature not in client.features:  # type: ignore[attr-defined]
         raise feature_error(descriptor)
+    if descriptor.access is Access.DELIVERY:
+        _require_attached_session(client.server.runtime, params)  # type: ignore[attr-defined]
     return await HANDLERS[descriptor](client, request_id, params)

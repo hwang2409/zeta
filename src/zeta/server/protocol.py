@@ -131,6 +131,11 @@ class ErrorDescriptor(Enum):
         "session_not_found",
         "the requested session does not exist",
     )
+    SESSION_MISMATCH = (
+        -32003,
+        "session_mismatch",
+        "the requested session is not the attached session",
+    )
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
@@ -235,6 +240,7 @@ FEATURES = (
     "served_turn_end",
     "content_read",
     "session_grants",
+    "delivery_session_guard",
 )
 
 
