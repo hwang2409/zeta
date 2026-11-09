@@ -23,6 +23,7 @@ from tempfile import TemporaryDirectory
 import httpx
 import pytest
 from rich.console import Console
+from zeta.server.approval_settlement.owner import TaskOwner
 
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
@@ -1079,8 +1080,6 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
 def approval_settlement_tasks_do_not_leak(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from zeta.server.approval_settlement.owner import TaskOwner
-
     tasks: list[asyncio.Task[object]] = []
     original_start = TaskOwner.start
 
