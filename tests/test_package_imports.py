@@ -32,6 +32,100 @@ def test_all_exports_resolve_and_cache() -> None:
         assert value is getattr(zeta, name)
 
 
+def test_stable_exports_keep_their_original_objects() -> None:
+    import zeta
+
+    modules = {
+        "core.approval": {
+            "ApprovalDecision",
+            "ApprovalPolicy",
+            "ApprovalRequest",
+        },
+        "core.context": {
+            "AssembledContext",
+            "BudgetExceeded",
+            "CompactionPolicy",
+            "ContextAssembler",
+            "StaleBranchError",
+            "SummaryCompletionError",
+            "SummaryInputTooLarge",
+        },
+        "core.session": {
+            "META_VERSION",
+            "OpenedSession",
+            "SessionError",
+            "SessionManager",
+            "SessionMetadata",
+            "env_home",
+            "find_most_recent",
+            "list_sessions",
+        },
+        "core.store": {
+            "ConversationEntry",
+            "ConversationIntegrityError",
+            "ConversationStore",
+        },
+        "protocol.types": {
+            "CompletionBackend",
+            "ContentBlock",
+            "ContentType",
+            "ErrorInfo",
+            "ImageContent",
+            "Message",
+            "MessageRole",
+            "RedactedThinkingContent",
+            "StreamEvent",
+            "StreamEventType",
+            "TextContent",
+            "ThinkingContent",
+            "ToolCall",
+            "ToolResult",
+            "ToolUseContent",
+        },
+        "tools": {"AbortSignal", "ToolAbortSignal", "ToolDefinition", "ToolRegistry"},
+        "providers.anthropic": {
+            "AnthropicAuthError",
+            "AnthropicBackend",
+            "AnthropicBackendError",
+            "AnthropicHTTPError",
+            "AnthropicStreamError",
+            "build_messages_payload",
+        },
+        "providers.codex": {"CodexBackend", "build_responses_payload"},
+        "codex": {
+            "DEFAULT_CODEX_MODEL",
+            "CodexAuthError",
+            "CodexBackendError",
+            "CodexHTTPError",
+            "CodexStreamError",
+            "build_authorization_url",
+            "exchange_authorization_code",
+            "extract_account_id",
+        },
+        "oauth": {"OAuthTokens"},
+        "runtime.loop": {"AgentLoop"},
+    }
+    expected = {
+        name: getattr(importlib.import_module(f"zeta.{module}"), name)
+        for module, names in modules.items()
+        for name in names
+    }
+    assert set(expected) == set(zeta.__all__)
+    assert all(getattr(zeta, name) is value for name, value in expected.items())
+
+    script = (
+        "import zeta; from zeta import *; "
+        + "; ".join(f"assert {name} is zeta.{name}" for name in expected)
+    )
+    check = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stderr or check.stdout
+
+
 def test_public_interface_preserves_star_import_and_protocol_surface() -> None:
     import zeta
 
