@@ -123,7 +123,7 @@ _RAW_DELETION = {
     ("tools/_atomic_replace.py", "atomic_replace", "unlink"),
     ("tools/_shared/background_output_archive.py", "_remove_generated_log", "unlink"),
     ("attention_replies.py", "stage", "unlink"),
-    ("attention_replies.py", "flush", "unlink"),
+    ("attention_replies.py", "_send_staged_locked", "unlink"),
     ("attention_replies.py", "_recover_locked", "unlink"),
     ("attention_replies.py", "_cleanup", "unlink"),
     ("tools/_spill.py", "_evict_before", "unlink"),
