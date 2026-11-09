@@ -26,6 +26,7 @@ from .config import (
     load_mcp_config_overlay,
     project_config_path,
 )
+from .fs import ensure_directory_below_existing_root
 from .oauth_store import (
     MCPCredentialStore,
     MCPCredentialStoreError,
@@ -257,6 +258,29 @@ class MCPManagementService:
             "project directory no longer exists; cannot write MCP config"
         )
 
+    def _ensure_nonproject_parent(self, path: Path) -> None:
+        home_root = home_config_path(self.home).parent.resolve()
+        try:
+            path.parent.relative_to(home_root)
+        except ValueError:
+            if not path.parent.is_dir():
+                raise MCPManagementError(
+                    f"MCP config directory does not exist: {path.parent}"
+                )
+            try:
+                ensure_directory_below_existing_root(path.parent, path.parent)
+            except FileNotFoundError as exc:
+                raise MCPManagementError(
+                    f"MCP config directory does not exist: {path.parent}"
+                ) from exc
+        else:
+            try:
+                ensure_directory_below_existing_root(home_root.parent, path.parent)
+            except FileNotFoundError as exc:
+                raise MCPManagementError(
+                    f"MCP config directory does not exist: {home_root.parent}"
+                ) from exc
+
     def _project_root_for_path(self, path: Path) -> Path | None:
         if self.project_dir is None:
             return None
@@ -278,7 +302,7 @@ class MCPManagementService:
             except FileNotFoundError as exc:
                 raise self._no_project_error() from exc
         else:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_nonproject_parent(path)
         self._ensure_open()
         fd, temporary = tempfile.mkstemp(
             prefix=".mcp-management.", dir=str(path.parent)
@@ -356,7 +380,7 @@ class MCPManagementService:
                         unavailable.add(path)
                         continue
                 else:
-                    path.parent.mkdir(parents=True, exist_ok=True)
+                    self._ensure_nonproject_parent(path)
                 lock_path = path.with_name(f".{path.name}.lock")
                 self._ensure_open()
                 try:
