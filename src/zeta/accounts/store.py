@@ -30,6 +30,7 @@ from ..core.session_files import (
     require_off_loop_lock,
 )
 from ..oauth import (
+    ACCOUNT_LOCK_TURN_WAIT_SECONDS,
     OAUTH_REFRESH_TIMEOUT_SECONDS,
     OAuthRefreshFailure,
     OAuthTokens,
@@ -69,6 +70,13 @@ from .registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def credential_wait_timeout_seconds() -> float:
+    # Leave one refresh-sized interval for durable publication and lock release.
+    return OAUTH_REFRESH_TIMEOUT_SECONDS * 2
+
+
 class AccountCredentialLockTimeoutError(AccountError):
     """An account operation could not acquire its lifecycle lock in time."""
 
@@ -224,9 +232,10 @@ class AccountStore(_AccountRegistry):
             value = self._read_registry(home_fd)["defaults"].get(provider)
             return AccountId(*value.split(":", 1)) if value else None
 
-    def contains(self, account: AccountId) -> bool:
+    def contains(self, account: AccountId, *, timeout: float | None = None) -> bool:
         with self.credential_guard(
-            account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            account,
+            timeout=credential_wait_timeout_seconds() if timeout is None else timeout,
         ) as home_fd:
             return str(account) in self._read_registry(home_fd)["accounts"]
 
@@ -335,7 +344,7 @@ class AccountStore(_AccountRegistry):
             raise ValueError("account provider does not match")
         resolved = account or self.default(provider) or AccountId(provider, "default")
         with self.credential_guard(
-            resolved, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            resolved, timeout=credential_wait_timeout_seconds()
         ) as home_fd:
             self._recover_account(home_fd, resolved)
         return resolved
@@ -650,7 +659,7 @@ class AccountCredentials:
     def read(self, *, lock_timeout: float | None = None) -> OAuthTokens | None:
         with self.store.lifecycle_guard(
             self.account,
-            timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            timeout=credential_wait_timeout_seconds()
             if lock_timeout is None
             else lock_timeout,
         ) as home_fd:
@@ -669,7 +678,7 @@ class AccountCredentials:
 
     def bootstrap(self) -> OAuthTokens | None:
         with self.store.credential_guard(
-            self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
+            self.account, timeout=credential_wait_timeout_seconds()
         ) as home_fd:
             tokens = self.store._recover_account(home_fd, self.account)
             if tokens is not None:
@@ -679,11 +688,19 @@ class AccountCredentials:
                 self._publish(home_fd, tokens)
             return tokens
 
-    async def access_token(self, client: httpx.AsyncClient) -> str:
+    async def access_token(
+        self, client: httpx.AsyncClient, *, lock_timeout: float | None = None
+    ) -> str:
+        """Return a valid access token, refreshing it under the account lock.
+
+        Each lock wait defaults to the model-turn bound; callers outside a
+        turn's retry loop pass ``credential_wait_timeout_seconds()``.
+        """
+        timeout = ACCOUNT_LOCK_TURN_WAIT_SECONDS if lock_timeout is None else lock_timeout
         async with self._async_lock:
-            if not await asyncio.to_thread(self.store.contains, self.account):
-                return await self._bootstrap_access_token(client)
-            async with self._async_guard(registry=False) as home_fd:
+            if not await self._contains(timeout):
+                return await self._bootstrap_access_token(client, timeout)
+            async with self._async_guard(registry=False, timeout=timeout) as home_fd:
                 tokens = _read_account_tokens(home_fd, self.account)
                 if tokens is None:
                     raise self.login_required_error()
@@ -691,29 +708,27 @@ class AccountCredentials:
                     return tokens.access_token
                 return await self._refresh_locked(home_fd, tokens, client)
 
-    async def _access_token_locked(
-        self, home_fd: int, client: httpx.AsyncClient
-    ) -> str:
-        tokens = _read_account_tokens(home_fd, self.account)
-        if tokens is None:
-            raise self.login_required_error()
-        if tokens.is_valid():
-            return tokens.access_token
-        return await self._refresh_locked(home_fd, tokens, client)
-
     async def refresh_token(self, client: httpx.AsyncClient) -> str:
+        timeout = ACCOUNT_LOCK_TURN_WAIT_SECONDS
         async with self._async_lock:
-            if not await asyncio.to_thread(self.store.contains, self.account):
-                return await self._bootstrap_access_token(client, refresh=True)
-            return await self._refresh_existing_token(client)
+            if not await self._contains(timeout):
+                return await self._bootstrap_access_token(client, timeout, refresh=True)
+            return await self._refresh_existing_token(client, timeout)
 
     async def refresh_existing_token(self, client: httpx.AsyncClient) -> str:
         """Refresh a catalog account without registry lookup or bootstrap."""
         async with self._async_lock:
-            return await self._refresh_existing_token(client)
+            return await self._refresh_existing_token(
+                client, credential_wait_timeout_seconds()
+            )
 
-    async def _refresh_existing_token(self, client: httpx.AsyncClient) -> str:
-        async with self._async_guard(registry=False) as home_fd:
+    async def _contains(self, timeout: float) -> bool:
+        return await asyncio.to_thread(self.store.contains, self.account, timeout=timeout)
+
+    async def _refresh_existing_token(
+        self, client: httpx.AsyncClient, timeout: float
+    ) -> str:
+        async with self._async_guard(registry=False, timeout=timeout) as home_fd:
             tokens = _read_account_tokens(home_fd, self.account)
             if tokens is None:
                 raise self.login_required_error()
@@ -748,9 +763,13 @@ class AccountCredentials:
         return refreshed.access_token
 
     async def _bootstrap_access_token(
-        self, client: httpx.AsyncClient, *, refresh: bool = False
+        self,
+        client: httpx.AsyncClient,
+        timeout: float,
+        *,
+        refresh: bool = False,
     ) -> str:
-        async with self._async_guard(registry=True) as home_fd:
+        async with self._async_guard(registry=True, timeout=timeout) as home_fd:
             tokens = self.store._recover_account(home_fd, self.account)
             if tokens is None:
                 tokens = self._driver.bootstrap()
@@ -759,7 +778,7 @@ class AccountCredentials:
                 self._publish(home_fd, tokens)
             if not refresh and tokens.is_valid():
                 return tokens.access_token
-        async with self._async_guard(registry=False) as home_fd:
+        async with self._async_guard(registry=False, timeout=timeout) as home_fd:
             tokens = _read_account_tokens(home_fd, self.account)
             if tokens is None:
                 raise self.login_required_error()
@@ -799,16 +818,12 @@ class AccountCredentials:
         )
 
     @asynccontextmanager
-    async def _async_guard(self, *, registry: bool) -> Iterator[int]:
+    async def _async_guard(self, *, registry: bool, timeout: float) -> Iterator[int]:
         stack = ExitStack()
         guard = (
-            self.store.credential_guard(
-                self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
-            )
+            self.store.credential_guard(self.account, timeout=timeout)
             if registry
-            else self.store.lifecycle_guard(
-                self.account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
-            )
+            else self.store.lifecycle_guard(self.account, timeout=timeout)
         )
         home_fd = await asyncio.to_thread(stack.enter_context, guard)
         try:

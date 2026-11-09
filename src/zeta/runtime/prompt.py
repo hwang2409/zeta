@@ -112,14 +112,21 @@ def replace_runtime_prompt(
     )
 
 
-def owned_fragment(prompt: RuntimePrompt, key: str) -> PromptFragment:
-    """Extract one validated owned span for reuse through the ownership seam."""
-
+def _validated_prompt_spans(
+    prompt: RuntimePrompt,
+) -> tuple[str, dict[str, OwnedSpan]]:
     text = _prompt_text(prompt.system_prompt)
     spans = {name: _span(value) for name, value in prompt.prompt_components.items()}
     for name, span in spans.items():
         _validate_span(text, name, span)
     _validate_relationships(spans)
+    return text, spans
+
+
+def owned_fragment(prompt: RuntimePrompt, key: str) -> PromptFragment:
+    """Extract one validated owned span for reuse through the ownership seam."""
+
+    text, spans = _validated_prompt_spans(prompt)
     target = spans[key]
     descendants = {
         name: OwnedSpan(
@@ -140,11 +147,7 @@ def replace_owned_fragment(
 ) -> RuntimePrompt:
     """Replace one validated owned span and preserve all nested ownership."""
 
-    text = _prompt_text(prompt.system_prompt)
-    spans = {name: _span(value) for name, value in prompt.prompt_components.items()}
-    for name, span in spans.items():
-        _validate_span(text, name, span)
-    _validate_relationships(spans)
+    text, spans = _validated_prompt_spans(prompt)
     if key not in spans:
         raise KeyError(key)
 
