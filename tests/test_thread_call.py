@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import gc
+import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -78,7 +82,10 @@ def test_owned_thread_call_closes_result_during_asyncio_run_shutdown(
         f"""
 import asyncio
 import errno
+import gc
+import logging
 import os
+import socket
 import threading
 
 from zeta.core.thread_call import run_owned_thread_call
@@ -116,7 +123,9 @@ async def main():
             coroutine, loop=loop, context=context
         )
     )
-    asyncio.create_task(run_owned_thread_call(acquire, adopt))
+    asyncio.create_task(
+        run_owned_thread_call(acquire, adopt, close_is_thread_safe=True)
+    )
     loop.set_task_factory(None)
     assert await asyncio.to_thread(started.wait, 10)
 
@@ -135,118 +144,259 @@ else:
     assert completed.returncode == 0, completed.stderr
 
 
-ROWS = (
-    "success",
-    "failure",
-    "loop_affine",
-    "cancel_before_start",
-    "cancel_running",
-    "cancel_running_failure",
-    "duplicate_cancel",
-    "cancel_result_ready",
-    "loop_closed_running",
-    "cancel_running_then_loop_closed",
-)
+class _Row:
+    """A real loop and a one-thread executor that each row can join."""
 
+    def __init__(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.loop.set_default_executor(self.executor)
+        self.loop_thread = threading.get_ident()
+        self.path = tmp_path / "owned"
+        self.caplog = caplog
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.fail = False
+        self.descriptors: list[int] = []
+        self.closes: list[int] = []  # thread ident of each close
+        self.sockets: list[socket.socket] = []
+        self.transport: asyncio.Transport | None = None
 
-@pytest.mark.parametrize("row", ROWS)
-def test_owned_thread_call_closes_untaken_result_once(row: str, tmp_path: Path) -> None:
-    """Each row drives a real loop and a one-thread executor it can join."""
-    loop = asyncio.new_event_loop()
-    executor = ThreadPoolExecutor(max_workers=1)
-    loop.set_default_executor(executor)
-    loop_thread = threading.get_ident()
-    started = threading.Event()
-    release = threading.Event()
-    unblock = threading.Event()
-    descriptors: list[int] = []
-    closes: list[int] = []  # thread ident of each close
-
-    def acquire() -> object:
-        started.set()
-        assert release.wait(10), "worker was not released"
-        if row in {"failure", "cancel_running_failure"}:
+    def acquire(self) -> object:
+        self.started.set()
+        assert self.release.wait(10), "worker was not released"
+        if self.fail:
             raise ValueError("acquire failed")
-        if row == "loop_affine":
-            return asyncio.Future(loop=loop)
-        descriptor = os.open(tmp_path / "owned", os.O_RDWR | os.O_CREAT, 0o600)
-        descriptors.append(descriptor)
+        if self.transport is not None:
+            return self.transport
+        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.descriptors.append(descriptor)
         return descriptor
 
-    def close(descriptor: object) -> None:
-        closes.append(threading.get_ident())
-        os.close(descriptor)  # type: ignore[arg-type]
+    def close(self, result: object) -> None:
+        self.closes.append(threading.get_ident())
+        if isinstance(result, asyncio.Transport):
+            result.close()
+        else:
+            os.close(result)  # type: ignore[arg-type]
 
-    def step() -> None:
-        loop.run_until_complete(asyncio.sleep(0))
+    def use_transport(self) -> asyncio.Transport:
+        """A real loop-affine closeable: closing it calls loop methods."""
+        self.sockets.extend(socket.socketpair())
+        transport, _ = self.loop.run_until_complete(
+            self.loop.connect_accepted_socket(asyncio.Protocol, self.sockets[0])
+        )
+        self.transport = transport  # type: ignore[assignment]
+        return transport  # type: ignore[return-value]
 
-    def assert_closed_once(*, on_loop: bool) -> None:
-        assert len(closes) == 1, f"close ran {len(closes)} times"
-        assert (closes[0] == loop_thread) is on_loop
+    def call(self) -> Any:
+        return run_owned_thread_call(
+            self.acquire, self.close, close_is_thread_safe=True
+        )
+
+    def start(self) -> asyncio.Task[Any]:
+        task = self.loop.create_task(self.call())
+        self.step()
+        assert self.started.wait(10)
+        return task
+
+    def step(self) -> None:
+        self.loop.run_until_complete(asyncio.sleep(0))
+
+    def cancel(self, task: asyncio.Task[Any]) -> None:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            self.loop.run_until_complete(task)
+
+    def finish_worker(self) -> None:
+        """Release the worker and wait until it handed back; the loop stays idle."""
+        self.release.set()
+        # The one worker runs this only after the call finished and handed back.
+        self.executor.submit(lambda: None).result(10)
+
+    def assert_closed_once(self, *, on_loop: bool) -> None:
+        assert len(self.closes) == 1, f"close ran {len(self.closes)} times"
+        assert (self.closes[0] == self.loop_thread) is on_loop
         with pytest.raises(OSError) as error:
-            os.fstat(descriptors[0])
+            os.fstat(self.descriptors[0])
         assert error.value.errno == errno.EBADF
 
-    try:
-        if row in {"success", "failure", "loop_affine"}:
-            release.set()
-            if row == "success":
-                assert loop.run_until_complete(
-                    run_owned_thread_call(acquire, close)
-                ) == descriptors[0]
-            else:
-                expected = ValueError if row == "failure" else TypeError
-                with pytest.raises(expected):
-                    loop.run_until_complete(run_owned_thread_call(acquire, close))
-            assert closes == []
-        elif row == "cancel_before_start":
-            executor.submit(unblock.wait, 10)  # occupy the only worker
-            task = loop.create_task(run_owned_thread_call(acquire, close))
-            step()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                loop.run_until_complete(task)
-            unblock.set()
-            executor.shutdown(wait=True)
-            assert not started.is_set(), "a call cancelled before start ran"
-            assert closes == []
-        elif row == "cancel_result_ready":
-            task = loop.create_task(run_owned_thread_call(acquire, close))
-            step()
-            assert started.wait(10)
-            release.set()
-            # The one worker runs this only after the call finished and handed back.
-            executor.submit(lambda: None).result(10)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                loop.run_until_complete(task)
-            assert_closed_once(on_loop=True)
-        else:
-            task = loop.create_task(run_owned_thread_call(acquire, close))
-            step()
-            assert started.wait(10)
-            if row != "loop_closed_running":
-                task.cancel()
-                if row == "duplicate_cancel":
-                    task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    loop.run_until_complete(task)
-                if row == "duplicate_cancel":
-                    task.cancel()
-            if row in {"loop_closed_running", "cancel_running_then_loop_closed"}:
-                loop.close()
-            release.set()
-            executor.shutdown(wait=True)  # joins the worker: every close has run
-            if row == "cancel_running_failure":
-                assert closes == []
-            else:
-                assert_closed_once(on_loop=False)
-    finally:
-        release.set()
-        unblock.set()
-        executor.shutdown(wait=True)
-        if not loop.is_closed():
-            loop.close()
-        for descriptor in descriptors:
+    def cleanup(self) -> None:
+        self.release.set()
+        self.executor.shutdown(wait=True)
+        if not self.loop.is_closed():
+            if self.transport is not None:
+                self.transport.close()
+                self.step()
+            self.loop.close()
+        for descriptor in self.descriptors:
             with suppress(OSError):
                 os.close(descriptor)
+        for sock in self.sockets:
+            sock.close()
+
+
+def _success(row: _Row) -> None:
+    row.release.set()
+    assert row.loop.run_until_complete(row.call()) == row.descriptors[0]
+    assert row.closes == []
+
+
+def _failure(row: _Row) -> None:
+    row.fail = True
+    row.release.set()
+    with pytest.raises(ValueError):
+        row.loop.run_until_complete(row.call())
+    assert row.closes == []
+
+
+def _refused_without_thread_safe_flag(row: _Row) -> None:
+    row.release.set()
+    with pytest.raises(TypeError, match="close_is_thread_safe"):
+        row.loop.run_until_complete(run_owned_thread_call(row.acquire, row.close))
+    assert not row.started.is_set(), "a refused call ran its work"
+    assert row.closes == []
+
+
+def _cancel_before_start(row: _Row) -> None:
+    unblock = threading.Event()
+    row.executor.submit(unblock.wait, 10)  # occupy the only worker
+    try:
+        task = row.loop.create_task(row.call())
+        row.step()
+        row.cancel(task)
+    finally:
+        unblock.set()
+    row.executor.shutdown(wait=True)
+    assert not row.started.is_set(), "a call cancelled before start ran"
+    assert row.closes == []
+
+
+def _cancel_running(row: _Row) -> None:
+    row.cancel(row.start())
+    row.release.set()
+    row.executor.shutdown(wait=True)  # joins the worker: every close has run
+    row.assert_closed_once(on_loop=False)
+
+
+def _cancel_running_failure(row: _Row) -> None:
+    row.fail = True
+    row.cancel(row.start())
+    row.release.set()
+    row.executor.shutdown(wait=True)
+    assert row.closes == []
+
+
+def _duplicate_cancel(row: _Row) -> None:
+    task = row.start()
+    task.cancel()
+    row.cancel(task)
+    task.cancel()
+    row.release.set()
+    row.executor.shutdown(wait=True)
+    row.assert_closed_once(on_loop=False)
+
+
+def _cancel_result_ready(row: _Row) -> None:
+    task = row.start()
+    row.finish_worker()
+    row.cancel(task)
+    row.assert_closed_once(on_loop=True)
+
+
+def _loop_closed_running(row: _Row) -> None:
+    row.start()
+    row.loop.close()
+    row.release.set()
+    row.executor.shutdown(wait=True)
+    row.assert_closed_once(on_loop=False)
+
+
+def _cancel_running_then_loop_closed(row: _Row) -> None:
+    row.cancel(row.start())
+    row.loop.close()
+    row.release.set()
+    row.executor.shutdown(wait=True)
+    row.assert_closed_once(on_loop=False)
+
+
+def _loop_closed_after_handback(row: _Row) -> None:
+    task = row.start()
+    row.finish_worker()  # the hand-back callback is queued on the loop
+    row.loop.close()  # discards the queued callback without running it
+    del task
+    gc.collect()
+    row.assert_closed_once(on_loop=True)
+    assert "hand-back was dropped" in row.caplog.text
+
+
+def _loop_closed_after_deliver(row: _Row) -> None:
+    task = row.start()
+    row.finish_worker()
+    row.loop.call_soon(row.loop.stop)
+    row.loop.run_forever()  # one turn: delivers, queues the task wake-up
+    row.loop.close()  # discards the wake-up; the awaiter never takes it
+    del task
+    gc.collect()  # the dropped task's coroutine is closed and abandons the call
+    row.assert_closed_once(on_loop=True)
+    assert "hand-back was dropped" not in row.caplog.text, "delivery did not run"
+
+
+def _loop_affine_taken(row: _Row) -> None:
+    transport = row.use_transport()
+    row.release.set()
+    assert row.loop.run_until_complete(row.call()) is transport
+    assert row.closes == []
+    assert not transport.is_closing()
+
+
+def _loop_affine_cancel_running(row: _Row) -> None:
+    transport = row.use_transport()
+    row.cancel(row.start())
+    row.release.set()
+    row.executor.shutdown(wait=True)
+    assert row.closes == [], "a loop-affine result was closed on the worker"
+    row.step()  # the close was handed to the loop
+    assert row.closes == [row.loop_thread], f"closes: {row.closes}"
+    assert transport.is_closing()
+
+
+def _loop_affine_loop_closed(row: _Row) -> None:
+    row.use_transport()
+    row.start()
+    row.loop.close()
+    row.release.set()
+    row.executor.shutdown(wait=True)
+    assert row.closes == [], "a loop-affine result was closed on the worker"
+    assert "leaked loop-affine" in row.caplog.text, "the leak was dropped silently"
+
+
+ROWS = {
+    "success": _success,
+    "failure": _failure,
+    "refused_without_thread_safe_flag": _refused_without_thread_safe_flag,
+    "cancel_before_start": _cancel_before_start,
+    "cancel_running": _cancel_running,
+    "cancel_running_failure": _cancel_running_failure,
+    "duplicate_cancel": _duplicate_cancel,
+    "cancel_result_ready": _cancel_result_ready,
+    "loop_closed_running": _loop_closed_running,
+    "cancel_running_then_loop_closed": _cancel_running_then_loop_closed,
+    "loop_closed_after_handback": _loop_closed_after_handback,
+    "loop_closed_after_deliver": _loop_closed_after_deliver,
+    "loop_affine_taken": _loop_affine_taken,
+    "loop_affine_cancel_running": _loop_affine_cancel_running,
+    "loop_affine_loop_closed": _loop_affine_loop_closed,
+}
+
+
+@pytest.mark.parametrize("name", ROWS)
+def test_owned_thread_call_closes_untaken_result_once(
+    name: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="zeta.core.thread_call")
+    row = _Row(tmp_path, caplog)
+    try:
+        ROWS[name](row)
+    finally:
+        row.cleanup()

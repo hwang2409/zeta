@@ -3,8 +3,10 @@
 One owner for blocking work run on a worker thread: each call has one state
 under a lock (pending, result_ready, taken, abandoned). Worker threads touch
 only that state; only the loop touches the asyncio future. When the awaiting
-side cancels, or the loop is closed before the hand-back, the result is closed
-exactly once by whichever side comes second.
+side cancels, or the loop closes before the awaiter takes the result (even after
+the hand-back was scheduled), the result is closed exactly once by whichever side
+comes second. A close may run on a worker thread, so callers declare it
+thread-safe when they register it.
 """
 
 from __future__ import annotations
@@ -21,6 +23,26 @@ logger = logging.getLogger(__name__)
 
 # Closing these off the loop thread calls loop methods from the wrong thread.
 _LOOP_AFFINE = (asyncio.Future, asyncio.BaseTransport, asyncio.StreamWriter)
+
+
+class _Handoff:
+    """The scheduled hand-back; a closed loop drops it without calling it."""
+
+    __slots__ = ("call",)
+
+    def __init__(self, call: _OwnedCall[Any]) -> None:
+        self.call: _OwnedCall[Any] | None = call
+
+    def __call__(self) -> None:
+        call, self.call = self.call, None
+        if call is not None:
+            call._deliver()
+
+    def __del__(self) -> None:
+        call, self.call = self.call, None
+        if call is not None:
+            logger.debug("closing a thread call result whose hand-back was dropped")
+            call._release_untaken()
 
 
 class _OwnedCall[T]:
@@ -53,24 +75,21 @@ class _OwnedCall[T]:
             outcome: tuple[Any, BaseException | None] = (self._function(), None)
         except BaseException as exc:  # noqa: BLE001 - every outcome goes to the loop
             outcome = (None, exc)
-        result = outcome[0]
-        if self._close is not None and isinstance(result, _LOOP_AFFINE):
-            # Refused: this result cannot be closed safely off the loop.
-            refused = f"owned thread call cannot own loop-affine {type(result).__name__}"
-            outcome = (None, TypeError(refused))
         with self._lock:
-            if self._state != "abandoned":
-                self._outcome = outcome
-                try:
-                    self._loop.call_soon_threadsafe(self._deliver)
-                except RuntimeError:  # the loop is closed; nobody can take it
-                    self._state = "abandoned"
-                else:
-                    self._state = "result_ready"
-                    return
-        if outcome[1] is None and self._close is not None:
-            logger.debug("closing abandoned thread call result on the worker thread")
-            self._close_result(outcome[0])
+            abandoned = self._state == "abandoned"
+            if not abandoned:
+                self._outcome, self._state = outcome, "result_ready"
+        if abandoned:
+            if outcome[1] is None:
+                logger.debug("closing an abandoned thread call result")
+                self._close_result(outcome[0])
+            return
+        handoff = _Handoff(self)
+        try:
+            self._loop.call_soon_threadsafe(handoff)
+        except RuntimeError:  # the loop is closed; nobody can take it
+            handoff.call = None
+            self._release_untaken()
 
     def _deliver(self) -> None:
         with self._lock:
@@ -85,7 +104,8 @@ class _OwnedCall[T]:
     async def wait(self) -> T:
         try:
             result = await self._future
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
+            # GeneratorExit: a closed loop dropped the pending task and gc closed it.
             self.abandon()
             raise
         with self._lock:
@@ -95,16 +115,41 @@ class _OwnedCall[T]:
         return result
 
     def abandon(self) -> None:
-        """Give up the result on the loop thread; close it if it is already here."""
+        """Give up the result; close it if it is already here."""
         with self._lock:
             previous, self._state = self._state, "abandoned"
-        self._future.cancel()
+        if not self._loop.is_closed():
+            self._future.cancel()
         if previous == "result_ready" and self._outcome[1] is None:
+            self._close_result(self._outcome[0])
+
+    def _release_untaken(self) -> None:
+        """Close a result whose hand-back can no longer reach the awaiter."""
+        with self._lock:
+            if self._state != "result_ready":
+                return  # taken, or abandon() already owns the close
+            self._state = "abandoned"
+        if self._outcome[1] is None:
             self._close_result(self._outcome[0])
 
     def _close_result(self, result: T) -> None:
         if self._close is None:
             return
+        if not isinstance(result, _LOOP_AFFINE):
+            self._close_now(result)
+            return
+        # A declared thread-safe close returned a loop-affine object: close it on
+        # its loop, never on this thread.
+        try:
+            self._loop.call_soon_threadsafe(self._close_now, result)
+        except RuntimeError:
+            logger.error(
+                "leaked loop-affine %s from a thread call: its loop is closed",
+                type(result).__name__,
+            )
+
+    def _close_now(self, result: T) -> None:
+        assert self._close is not None
         try:
             self._close(result)
         except Exception:  # a failed close must not mask the cancel
@@ -116,13 +161,20 @@ class _OwnedCall[T]:
 async def run_owned_thread_call[T](
     function: Callable[[], T],
     close_on_cancel: Callable[[T], None] | None = None,
+    *,
+    close_is_thread_safe: bool = False,
 ) -> T:
     """Run blocking work in the default executor; close an untaken result.
 
-    close_on_cancel may run on the worker thread, so it must be thread-safe
-    (files, fds, plain objects). Loop-affine results are refused.
+    close_on_cancel may run on a worker thread, so the caller must declare it
+    thread-safe (files, fds, plain objects) with close_is_thread_safe=True.
     """
 
+    if close_on_cancel is not None and not close_is_thread_safe:
+        raise TypeError(
+            "close_on_cancel may run on a worker thread; "
+            "pass close_is_thread_safe=True for a thread-safe close"
+        )
     loop = asyncio.get_running_loop()
     call = _OwnedCall(loop, function, close_on_cancel)
     loop.run_in_executor(None, call.run)

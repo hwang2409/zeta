@@ -99,7 +99,9 @@ async def test_off_loop_resource_has_one_owner(
                 # test-contract: seam finish the worker before its result is used.
                 monkeypatch.setattr(event_loop, "run_in_executor", run_controlled)
             task = asyncio.create_task(
-                run_owned_thread_call(acquire, _TrackedResource.close)
+                run_owned_thread_call(
+                    acquire, _TrackedResource.close, close_is_thread_safe=True
+                )
             )
             if scenario == "cancel_after_finish":
                 await asyncio.sleep(0)
@@ -115,7 +117,9 @@ async def test_off_loop_resource_has_one_owner(
 
                 original_acquire = shell_cwd_module.run_owned_thread_call
 
-                async def observed_acquire(acquirer: Any, close: Any) -> Any:
+                async def observed_acquire(
+                    acquirer: Any, close: Any, **kwargs: bool
+                ) -> Any:
                     def observed_close(result: Any) -> None:
                         close(result)
                         resource = next(
@@ -124,7 +128,7 @@ async def test_off_loop_resource_has_one_owner(
                         resource.close_calls += 1
                         resource.closed.set()
 
-                    return await original_acquire(acquirer, observed_close)
+                    return await original_acquire(acquirer, observed_close, **kwargs)
 
                 monkeypatch.setattr(
                     shell_cwd_module,

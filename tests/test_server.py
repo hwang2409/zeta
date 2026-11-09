@@ -9171,7 +9171,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
         try:
             return call_soon_threadsafe(callback, *args)
         finally:
-            if getattr(callback, "__qualname__", "") == "_OwnedCall._deliver":
+            if type(callback).__qualname__ == "_Handoff":
                 worker_completed.set()
 
     monkeypatch.setattr(loop, "call_soon_threadsafe", track_read_completion)
