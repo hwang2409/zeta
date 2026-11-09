@@ -6,10 +6,9 @@
 from ._log import (
     SCHEMA,
     InstalledEntriesDelta,
-    ObserverSnapshotChanged,
     PersistedAppend,
-    TranscriptLoadError,
 )
+from ..transcript_recovery import ObserverSnapshotChanged, TranscriptLoadError
 from ._row_history import (
     RECENT_ROW_WINDOW,
     ApprovalHistory,

@@ -10,10 +10,10 @@ from typing import TYPE_CHECKING
 
 from ..checkpoints import ConversationIntegrityError
 from ..session_files import open_session_file
+from ..transcript_recovery import ObserverSnapshotChanged
 from ..transcript_recovery.stream import TranscriptStream
 from ._log import (
     PREFIX_FINGERPRINT_BYTES,
-    ObserverSnapshotChanged,
     _FullLoadValidator,
 )
 
