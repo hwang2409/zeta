@@ -10,18 +10,18 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-from ..core.checkpoints import list_branches_from_entries
-from ..core.store._client_delivery import CLIENT_DELIVERY_METADATA
-from ..models.catalog import PROVIDER_MODELS, known_model_names
-from ..protocol.types import (
+from ...core.checkpoints import list_branches_from_entries
+from ...core.store._client_delivery import CLIENT_DELIVERY_METADATA
+from ...models.catalog import PROVIDER_MODELS, known_model_names
+from ...protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
     Message,
     is_passive_harness_message,
     is_visible_harness_notice,
 )
-from . import event_contract
-from .protocol import (
+from .. import event_contract
+from ..protocol import (
     MAX_FRAME_BYTES,
     MAX_REQUEST_ID_BYTES,
     ErrorDescriptor,
@@ -29,11 +29,11 @@ from .protocol import (
     ProtocolError,
     bounded,
 )
-from .runtime import ServerRuntime
-from .session_mutation import rename_session
+from ..runtime import ServerRuntime
+from ..session_mutation import rename_session
 
 if TYPE_CHECKING:
-    from ..core.store import ConversationStore
+    from ...core.store import ConversationStore
 
 EXTENSION_REQUESTS = [
     "rename_session",
@@ -445,7 +445,7 @@ def _attach_row_handle(
     content_read: bool,
 ) -> dict[str, object]:
     if fidelity and content_read:
-        from .content import row_handle
+        from ..content import row_handle
 
         block["handle"] = row_handle(entry_id, field, index)
     return block
