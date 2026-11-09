@@ -884,6 +884,20 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         row = load_session_json(line)
                         lines.append(json.dumps(row, separators=(",", ":")))
         except (ConversationIntegrityError, OSError) as exc:
+            try:
+                ConversationStore(
+                    self.sessions_dir,
+                    session_id=full_id,
+                    _read_only=True,
+                    _must_exist=True,
+                ).close()
+            except TranscriptLoadError as diagnosis:
+                raise SessionError(
+                    f"session {full_id} could not be exported: {diagnosis}; "
+                    f"run /repair-transcript {full_id} confirm"
+                ) from exc
+            except (ConversationIntegrityError, OSError):
+                pass
             raise SessionError(f"session {full_id} could not be exported") from exc
         return "\n".join(lines) + "\n"
 

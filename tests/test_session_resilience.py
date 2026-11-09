@@ -448,6 +448,26 @@ def test_listing_boundaries_propagate_programming_faults(
         manager.list_sessions_read_only()
 
 
+def test_print_resume_rejects_corrupt_rows_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from zeta.cli.main import main
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="offline")
+    opened.store.close()
+    opened.store.path.write_bytes(opened.store.path.read_bytes() + b"broken\n")
+    before = opened.store.path.read_bytes()
+
+    assert main(["--resume", opened.metadata.session_id, "-p", "hello"]) == 1
+    assert capsys.readouterr().err == (
+        f"zeta: transcript terminated invalid conversation row at row 2 "
+        f"(session {opened.metadata.session_id})\n"
+    )
+    assert opened.store.path.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "row",
     [b"\xff\n", b"broken\n", b"[" * 65 + b"]" * 65 + b"\n"],
@@ -477,7 +497,12 @@ def test_export_rejects_corrupt_rows_cleanly(
         out=str(destination),
     )
     assert session_cli.run(args, stdout=out, stderr=err) == 1
-    assert "could not be exported" in err.getvalue()
+    assert (
+        f"zeta: session {opened.metadata.session_id} could not be exported: "
+        f"transcript terminated invalid conversation row at row 2 "
+        f"(session {opened.metadata.session_id}); run "
+        f"/repair-transcript {opened.metadata.session_id} confirm\n"
+    ) == err.getvalue()
     assert out.getvalue() == ""
     assert not destination.exists()
     assert opened.store.path.read_bytes() == before
