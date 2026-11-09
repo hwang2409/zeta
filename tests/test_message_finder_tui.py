@@ -190,6 +190,7 @@ async def test_newest_candidates_publish_before_older_render_finishes() -> None:
 
 
 def test_rendered_padding_search_text_matches_ansi_oracle() -> None:
+    separators = ("\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
     shapes = (
         Text("plain"),
         Text("bold and plain", style="bold"),
@@ -215,6 +216,39 @@ def test_rendered_padding_search_text_matches_ansi_oracle() -> None:
                 assert [match.ranges for match in actual_matches] == [
                     match.ranges for match in expected_matches
                 ]
+
+    for separator in separators:
+        for text in (
+            f"{separator}a\t界  ",
+            f"a\t界  {separator}",
+            f"a{separator}b\t界  ",
+            Text.assemble((separator, "bold"), ("a\t界  ", "italic")),
+            Text.assemble(("a\t界  ", "bold"), (separator, "italic")),
+            Text.assemble(
+                ("a", "bold"),
+                (separator, "bold"),
+                ("b\t界  ", "italic"),
+            ),
+        ):
+            for padding in ((0, 0, 0, 0), (1, 2, 3, 4)):
+                for expand in (False, True):
+                    renderable = Padding(text, padding, expand=expand)
+                    transcript = TranscriptWidget()
+                    unit = transcript.append(renderable)
+                    for width in (8, 12, 40):
+                        expected = Text.from_ansi(
+                            transcript._search_rendered(unit, width)
+                        ).plain
+                        actual = transcript._render_search_snapshot(
+                            renderable, width, RICH_THEME
+                        )
+                        assert actual == expected
+                        for query in ("a", "b", "界", "missing"):
+                            actual_matches = find_matches(actual.splitlines(), query)
+                            expected_matches = find_matches(expected.splitlines(), query)
+                            assert [match.ranges for match in actual_matches] == [
+                                match.ranges for match in expected_matches
+                            ]
 
 
 def test_rendered_padding_search_avoids_ansi_round_trip(
