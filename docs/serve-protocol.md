@@ -1008,7 +1008,8 @@ not start a concurrent notification turn.
 {"jsonrpc":"2.0","method":"event","params":{"event":"compaction_end","session_id":"abc123","data":{"turn":2,"token_count":1200}}}
 ```
 
-`user_message` requires the `user_message_event` feature. The server emits it
+`user_message` requires the `user_message_event` feature, which
+`session_replay_seq` implies. The server emits it
 when it accepts `send`, `steer`, or `send_images`, before the acknowledgement.
 It carries `text` (the user text, bounded to 262,144 UTF-8 bytes), `mode`
 (`"send"` or `"steer"`; `send_images` uses `"send"`), and `attachments`, an
@@ -1370,8 +1371,11 @@ error code and message. Provider status and origin remain internal.
   at 1. The result has the same shape as `session_history` with `before: null`
   (`messages`, `next_before`, `history_validator`). Negotiating
   `session_replay_seq` also gives the connection the semantics of
-  `session_history_fidelity` and `session_history_backward`, for the join result,
-  later `session_history` pages, and the `delivery_status` live filter. Observers
+  `session_history_fidelity`, `session_history_backward`, and
+  `user_message_event`, for the join result, later `session_history` pages, and
+  the `delivery_status` and `user_message` live filters. A replay client's
+  history always carries user-message rows, so it also receives the live
+  `user_message` echo (the `delivery_id` field stays per-connection). Observers
   receive controller session events only through a successful join.
   An event whose history row is already in the join's history is not sent on
   that stream and spends no `seq`, so each effect appears once, in history or
@@ -1707,7 +1711,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
-| `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity` and `session_history_backward` for history reads |
+| `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |

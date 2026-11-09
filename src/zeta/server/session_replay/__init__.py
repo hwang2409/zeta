@@ -12,7 +12,9 @@ REPLAY_MAX_RECORDS = 256
 REPLAY_MAX_BYTES = 4 * 1024 * 1024
 REPLAY_SCOPE_MAX_RECORDS = 64
 REPLAY_SCOPE_MAX_BYTES = 1 * 1024 * 1024
-REPLAY_IMPLIED_FEATURES = frozenset({"session_history_fidelity", "session_history_backward"})
+REPLAY_IMPLIED_FEATURES = frozenset(
+    {"session_history_fidelity", "session_history_backward", "user_message_event"}
+)
 
 
 def history_features(features: frozenset[str] | set[str]) -> frozenset[str]:

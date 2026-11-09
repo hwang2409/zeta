@@ -284,11 +284,12 @@ async def test_config_changed_replay_observers_are_feature_filtered(
         user = await with_feature.event("user_message")
         assert user["seq"] == 4
         assert user["delivery_id"] == "delivery-marker"
-        frames = await _frames_before_status(without_feature, 5)
-        assert not [
-            frame for frame in frames
-            if frame.get("params", {}).get("event") == "user_message"
-        ]
+        # user_message rows are in every replay client's history, so a replay
+        # client receives the live echo even without user_message_event; only the
+        # delivery_id field stays per-connection.
+        user_without_feature = await without_feature.event("user_message")
+        assert user_without_feature["seq"] == 2
+        assert "delivery_id" not in user_without_feature
         user_without_delivery = await without_delivery.event("user_message")
         assert user_without_delivery["seq"] == 2
         assert "delivery_id" not in user_without_delivery
