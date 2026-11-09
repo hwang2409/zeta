@@ -24,6 +24,7 @@ from ..protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from ..runtime._async_close import is_control_exception, merge_exception
 
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
@@ -80,41 +81,6 @@ class MonotonicDeadlineClock:
             await ready
         finally:
             timer.cancel()
-
-
-def is_control_exception(value: BaseException) -> bool:
-    return isinstance(value, (asyncio.CancelledError, GeneratorExit))
-
-
-def _control_priority(value: BaseException) -> int:
-    if isinstance(value, asyncio.CancelledError):
-        return 2
-    if isinstance(value, GeneratorExit):
-        return 1
-    return 0
-
-
-def merge_exception(
-    primary: BaseException | None,
-    cleanup: BaseException,
-) -> BaseException:
-    if primary is None:
-        return cleanup
-    primary_is_control = is_control_exception(primary)
-    cleanup_is_control = is_control_exception(cleanup)
-    if cleanup_is_control and not primary_is_control:
-        cleanup.__cause__ = primary
-        cleanup.__context__ = primary
-        return cleanup
-    if (
-        cleanup_is_control
-        and primary_is_control
-        and _control_priority(cleanup) > _control_priority(primary)
-    ):
-        return cleanup
-    if primary_is_control and not cleanup_is_control:
-        primary.__context__ = cleanup
-    return primary
 
 
 def _first_provider_error(*errors: BaseException | None) -> BaseException | None:

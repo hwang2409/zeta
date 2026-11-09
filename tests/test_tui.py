@@ -13249,7 +13249,8 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
     try:
         with patch_stdout(raw=True):
             await app._run_full_screen(session)
-        assert any("background failed" in line for line in app._transcript_lines)
+        assert not any("background failed" in line for line in app._transcript_lines)
+        assert any("RuntimeError" in line for line in app._transcript_lines)
         assert not log_path.exists()
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -13263,7 +13264,7 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
 
 
 @pytest.mark.asyncio
-async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
+async def test_unhandled_loop_exception_shows_ui_error_without_leaking_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -13285,7 +13286,7 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
 
     async def run_async(**_kwargs: object) -> None:
         async def fail() -> None:
-            raise RuntimeError("background failed")
+            raise RuntimeError("sk-test-SECRET123")
 
         asyncio.create_task(fail())
         await asyncio.sleep(0)
@@ -13294,7 +13295,8 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
     with patch_stdout(raw=True):
         await app._run_full_screen(session)
 
-    assert any("background failed" in line for line in app._transcript_lines)
+    assert not any("sk-test-SECRET123" in line for line in app._transcript_lines)
+    assert any("RuntimeError" in line for line in app._transcript_lines)
     # The log path wraps inside the card on long tmp paths (macOS); compare
     # the text without ANSI codes, card borders, and line breaks.
     flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
@@ -13310,7 +13312,9 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
                 break
         await asyncio.sleep(0.01)
     assert len(records) == 1
-    assert "background failed" in json.loads(records[0])["traceback"]
+    assert "sk-test-SECRET123" in json.loads(records[0])["traceback"]
+    assert os.stat(log_path).st_mode & 0o777 == 0o600
+    assert os.stat(log_path.parent).st_mode & 0o777 == 0o700
 
 
 def test_tui_diagnostic_record_is_not_visible_before_write(

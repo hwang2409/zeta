@@ -11,6 +11,8 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
+from zeta.codex import CodexLoginRequiredError
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls
@@ -22,6 +24,7 @@ from zeta.tools import ToolRegistry, websearch
 from zeta.tools import fetch as fetch_tool
 
 _ASYNC_CLIENT = httpx.AsyncClient
+_ASYNC_HANDLE_REQUEST = httpx.AsyncHTTPTransport.handle_async_request
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +77,124 @@ class _ChunkedByteStream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         return None
+
+
+class _KeepAliveServer:
+    def __init__(
+        self,
+        body_for_host=None,
+        *,
+        response_gate: asyncio.Event | None = None,
+        response_headers: bytes = b"",
+    ):
+        self.body_for_host = body_for_host or (lambda _host: b"ok")
+        self.response_gate = response_gate
+        self.response_headers = response_headers
+        self.accepted = 0
+        self.closed = 0
+        self.request_headers: list[dict[str, str]] = []
+        self.request_started = asyncio.Event()
+        self.connection_closed = asyncio.Event()
+        self._server: asyncio.Server | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._writers: set[asyncio.StreamWriter] = set()
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None
+        return self._server.sockets[0].getsockname()[1]
+
+    @property
+    def open_connections(self) -> int:
+        return self.accepted - self.closed
+
+    def _accept(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        self.accepted += 1
+        self._writers.add(writer)
+        task = asyncio.create_task(self._serve(reader, writer))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _serve(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            while True:
+                try:
+                    head = await reader.readuntil(b"\r\n\r\n")
+                except (asyncio.IncompleteReadError, ConnectionResetError):
+                    return
+                header_lines = head.decode("latin-1").split("\r\n")
+                headers = {
+                    key.lower(): value.strip()
+                    for line in header_lines[1:]
+                    if ":" in line
+                    for key, value in [line.split(":", 1)]
+                }
+                self.request_headers.append(headers)
+                length = int(headers.get("content-length", "0"))
+                if length:
+                    await reader.readexactly(length)
+                self.request_started.set()
+                if self.response_gate is not None:
+                    await await_or_fail(
+                        self.response_gate.wait(), what="HTTP response gate to open"
+                    )
+                body = self.body_for_host(headers.get("host", ""))
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Content-Type: text/html\r\nConnection: keep-alive\r\n"
+                    + self.response_headers
+                    + b"\r\n"
+                    + body
+                )
+                await writer.drain()
+        finally:
+            self._writers.discard(writer)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionResetError:
+                pass
+            self.closed += 1
+            self.connection_closed.set()
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+        for writer in tuple(self._writers):
+            writer.close()
+        if self._tasks:
+            await await_or_fail(
+                asyncio.gather(*self._tasks, return_exceptions=True),
+                what="keep-alive server connections to close",
+            )
+
+
+def _route_test_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _ASYNC_HANDLE_REQUEST
+    )
+    monkeypatch.setattr(
+        fetch_tool.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                fetch_tool.socket.AF_INET,
+                fetch_tool.socket.SOCK_STREAM,
+                6,
+                "",
+                ("127.0.0.1", 0),
+            )
+        ],
+    )
 
 
 def _raw_deflate(value: bytes) -> bytes:
@@ -207,6 +328,279 @@ async def test_real_network_connections_are_blocked() -> None:
     async with httpx.AsyncClient() as client:
         with pytest.raises(AssertionError, match="real network"):
             await client.get("https://example.com")
+
+
+@pytest.mark.asyncio
+async def test_registry_reuses_fetch_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _KeepAliveServer(response_headers=b"Set-Cookie: session=secret\r\n")
+    await server.start()
+    _route_test_hosts(monkeypatch)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        for index in range(5):
+            result = await registry.execute(
+                ToolCall(
+                    f"fetch-{index}",
+                    "fetch",
+                    {"url": f"http://fetch.test:{server.port}/"},
+                )
+            )
+            assert result["isError"] is False, result
+
+        assert server.accepted == 1
+        assert "cookie" not in server.request_headers[1]
+    finally:
+        await registry.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_never_replays_fetch_response_cookies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _KeepAliveServer(response_headers=b"Set-Cookie: session=secret\r\n")
+    await server.start()
+    _route_test_hosts(monkeypatch)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        for index, host in enumerate(("cookie-a.test", "cookie-b.test", "cookie-a.test")):
+            result = await registry.execute(
+                ToolCall(
+                    f"fetch-cookie-{index}",
+                    "fetch",
+                    {"url": f"http://{host}:{server.port}/"},
+                )
+            )
+            assert result["isError"] is False, result
+
+        assert "cookie" not in server.request_headers[1]
+        assert "cookie" not in server.request_headers[2]
+    finally:
+        await registry.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_reuses_each_duckduckgo_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def body_for_host(host: str) -> bytes:
+        if host.startswith("html.test"):
+            return b'<link rel="canonical" href="https://duckduckgo.com/">'
+        return (
+            b'<a class="result-link" href="https://example.com">result</a>'
+            b'<td class="result-snippet">snippet</td>'
+        )
+
+    server = _KeepAliveServer(body_for_host)
+    await server.start()
+    _route_test_hosts(monkeypatch)
+    monkeypatch.setattr(
+        websearch, "DDG_HTML_ENDPOINT", f"http://html.test:{server.port}/html/"
+    )
+    monkeypatch.setattr(
+        websearch, "DDG_LITE_ENDPOINT", f"http://lite.test:{server.port}/lite/"
+    )
+
+    async def no_login(*_args, **_kwargs):
+        raise CodexLoginRequiredError("no login")
+
+    monkeypatch.setattr(websearch.codex, "search", no_login)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        for index in range(3):
+            result = await registry.execute(
+                ToolCall(f"search-{index}", "websearch", {"query": "zeta"})
+            )
+            assert result["structuredContent"]["backend"] == "duckduckgo"
+
+        assert server.accepted == 2
+    finally:
+        await registry.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_reuses_codex_search_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = (
+        b'data: {"type":"response.output_text.delta","delta":"answer"}\n\n'
+        b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    server = _KeepAliveServer(
+        lambda _host: body,
+        response_headers=b"Set-Cookie: session=secret\r\n",
+    )
+    await server.start()
+    _route_test_hosts(monkeypatch)
+    monkeypatch.setattr(
+        websearch.codex, "CODEX_API_URL", f"http://codex.test:{server.port}/responses"
+    )
+
+    async def access_token(_store, _client):
+        return "current-token"
+
+    monkeypatch.setattr(
+        websearch.codex.AccountCredentials, "access_token", access_token
+    )
+    monkeypatch.setattr(
+        websearch.codex.AccountCredentials,
+        "auth_headers",
+        lambda _store, token: {"Authorization": f"Bearer {token}"},
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        for index in range(3):
+            result = await registry.execute(
+                ToolCall(f"codex-{index}", "websearch", {"query": "zeta"})
+            )
+            assert result["structuredContent"]["backend"] == "codex", result
+
+        assert server.accepted == 1
+        assert "cookie" not in server.request_headers[1]
+    finally:
+        await registry.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_close_drains_in_flight_web_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response_gate = asyncio.Event()
+    server = _KeepAliveServer(response_gate=response_gate)
+    await server.start()
+    _route_test_hosts(monkeypatch)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    request = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "fetch-active",
+                "fetch",
+                {"url": f"http://active.test:{server.port}/"},
+            )
+        )
+    )
+    close_task: asyncio.Task[tuple[str, ...]] | None = None
+    try:
+        await await_or_fail(
+            server.request_started.wait(), what="in-flight fetch to reach server"
+        )
+        close_task = asyncio.create_task(registry.close())
+        close_started = asyncio.Event()
+        asyncio.get_running_loop().call_soon(close_started.set)
+        await await_or_fail(close_started.wait(), what="registry close to start")
+        assert not close_task.done(), "registry close did not drain the active request"
+
+        rejected = await registry.execute(
+            ToolCall(
+                "fetch-rejected",
+                "fetch",
+                {"url": f"http://active.test:{server.port}/next"},
+            )
+        )
+        assert rejected["isError"] is True
+        assert "web client owner is closed" in rejected["content"][0]["text"]
+        client = next(iter(registry.web_clients._anonymous.values())).client
+
+        close_task.cancel()
+        response_gate.set()
+        await await_or_fail(request, what="in-flight fetch to release its web client")
+        cancelled = await await_or_fail(
+            asyncio.gather(close_task, return_exceptions=True),
+            what="cancelled registry close caller to finish",
+        )
+        assert isinstance(cancelled[0], asyncio.CancelledError)
+        async with registry.web_clients._condition:
+            pass
+        client_closed = client.is_closed
+        if not client_closed:
+            await client.aclose()
+        await await_or_fail(
+            server.connection_closed.wait(), what="request connection context to close"
+        )
+        assert client_closed, "cancelled registry close left its web client open"
+        assert registry.web_clients._close_task is None
+        assert server.open_connections == 0
+    finally:
+        response_gate.set()
+        if not request.done():
+            request.cancel()
+            await await_or_fail(
+                asyncio.gather(request, return_exceptions=True),
+                what="cancelled in-flight fetch cleanup",
+            )
+        if close_task is not None and not close_task.done():
+            await await_or_fail(close_task, what="registry close cleanup")
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_cloned_registry_owns_separate_web_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _KeepAliveServer()
+    await server.start()
+    _route_test_hosts(monkeypatch)
+    parent = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    child_store = ConversationStore(tmp_path / "child")
+    child = parent.clone_for_session(child_store)
+    try:
+        for registry, call_id in ((parent, "parent"), (child, "child")):
+            result = await registry.execute(
+                ToolCall(
+                    call_id,
+                    "fetch",
+                    {"url": f"http://clone.test:{server.port}/"},
+                )
+            )
+            assert result["isError"] is False, result
+        assert server.accepted == 2
+
+        await parent.close()
+        result = await child.execute(
+            ToolCall(
+                "child-again",
+                "fetch",
+                {"url": f"http://clone.test:{server.port}/again"},
+            )
+        )
+        assert result["isError"] is False
+        assert server.accepted == 2
+    finally:
+        await parent.close()
+        await child.close()
+        child_store.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_bounds_idle_origin_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _KeepAliveServer()
+    await server.start()
+    _route_test_hosts(monkeypatch)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        for index in range(10):
+            result = await registry.execute(
+                ToolCall(
+                    f"origin-{index}",
+                    "fetch",
+                    {"url": f"http://origin-{index}.test:{server.port}/"},
+                )
+            )
+            assert result["isError"] is False, result
+
+        assert server.open_connections == 8
+    finally:
+        await registry.close()
+        await server.close()
 
 
 @pytest.mark.asyncio
@@ -1636,8 +2030,9 @@ async def test_websearch_parser_failure_error_carries_status_and_body_preview(
         )
 
     _mock_client(monkeypatch, handler)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     with pytest.raises(websearch.SearchParserError) as excinfo:
-        await websearch._ddg_search("zeta", max_results=1)
+        await websearch._ddg_search("zeta", 1, registry.web_clients)
 
     message = str(excinfo.value)
     assert "search backend failed" in message
