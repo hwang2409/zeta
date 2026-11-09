@@ -58,7 +58,7 @@ from .protocol import (
 )
 from .protocol import _dispatch as _dispatch_request
 from .runtime import BackendFactory, ServerRuntime
-from .session_replay import ReplayScopeId
+from .session_replay import join_history_and_subscribe
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
@@ -647,30 +647,7 @@ class _Client:
                 features=self.features,
             )
         if descriptor is MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE:
-            # any rejected or failed join ends this connection's old and pending stream
-            try:
-                if set(params) != {"session_id"} or not isinstance(
-                    params.get("session_id"), str
-                ) or not params["session_id"]:
-                    raise ProtocolError(
-                        ErrorDescriptor.INVALID_PARAMS,
-                        "session_history_and_subscribe requires session_id",
-                    )
-                session_id = params["session_id"]
-                if self.server.runtime.session_id != session_id:
-                    raise ProtocolError(
-                        ErrorDescriptor.NO_ACTIVE_SESSION,
-                        "session is not active",
-                    )
-                self.server.connections.begin_replay_join(
-                    self, ReplayScopeId.top(session_id)
-                )
-                connections = self.server.connections
-                read = await connections.read_replay_history(self, session_id)
-                return connections.finish_replay_join(self, *read)
-            except BaseException:
-                self.server.connections.invalidate_replay_connection(self, reason="rejoined")
-                raise
+            return await join_history_and_subscribe(self, params)
         if descriptor is MethodDescriptor.LIST_SESSIONS:
             result, _page_ids = await self.connections.run_read(
                 self, lambda: self._list_sessions(request_id, params)

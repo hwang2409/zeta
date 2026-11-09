@@ -22,6 +22,31 @@ def history_features(features: frozenset[str] | set[str]) -> frozenset[str]:
     return frozenset(features)
 
 
+async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> object:
+    """Validate and atomically join a client's session history stream."""
+    connections = client.server.connections
+    try:
+        if set(params) != {"session_id"} or not isinstance(
+            params.get("session_id"), str
+        ) or not params["session_id"]:
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "session_history_and_subscribe requires session_id",
+            )
+        session_id = params["session_id"]
+        if client.server.runtime.session_id != session_id:
+            raise ProtocolError(
+                ErrorDescriptor.NO_ACTIVE_SESSION,
+                "session is not active",
+            )
+        connections.begin_replay_join(client, ReplayScopeId.top(session_id))
+        read = await connections.read_replay_history(client, session_id)
+        return connections.finish_replay_join(client, *read)
+    except BaseException:
+        connections.invalidate_replay_connection(client, reason="rejoined")
+        raise
+
+
 @dataclass(frozen=True, slots=True)
 class ReplayScopeId:
     kind: str
