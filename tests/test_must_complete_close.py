@@ -152,8 +152,6 @@ class _Site:
     backend: Any
     body: _Body
     clients: list[httpx.AsyncClient] = field(default_factory=list)
-    # cleanup steps of the attempt close, recorded at its producer drain
-    trace: list[str] = field(default_factory=list)
 
     def attempt(self) -> Any:
         if self.name == "ollama":
@@ -251,6 +249,17 @@ async def _settle(task: asyncio.Task[Any]) -> BaseException | None:
         asyncio.gather(task, return_exceptions=True), what="close task"
     )
     return done[0] if isinstance(done[0], BaseException) else None
+
+
+async def _returned_at_bound(task: asyncio.Task[Any], what: str) -> Any:
+    """Return the outcome of a close the production bound must have ended.
+
+    The 10 s wait is a hang guard, not the proof: the clock already passed
+    the bound, so a close that still runs waits forever.
+    """
+    done, _ = await asyncio.wait({task}, timeout=10)
+    assert task in done, f"the bound expired but the {what} still waits"
+    return task.exception() or task.result()
 
 
 async def _closed_backend_failures(site: _Site) -> list[str]:
@@ -355,11 +364,17 @@ async def _park_attempt_close(
         await await_or_fail(site.body.read_parked.wait(), what="producer reading")
         closing = asyncio.create_task(attempt.aclose())
         await await_or_fail(site.body.cancel_seen[0].wait(), what="producer cancelled")
-        assert site.trace == ["drain"], "the close is not waiting on its producer drain"
+        # the stream close runs inside the cancelled producer, which cannot end
+        # while that close waits: the attempt close is parked on its drain.
+        # test-contract: seam the producer task has no public view
+        assert not attempt._producer.done(), "the close is not waiting on its producer drain"
     else:
         closing = asyncio.create_task(attempt.aclose())
         await await_or_fail(site.body.close_started.wait(), what="stream close started")
-        assert site.trace == ["drain", "drained"], "the close is not at its source close"
+        # the producer was parked between reads and has ended: the stream close
+        # was called by the attempt close itself, on its source.
+        # test-contract: seam the producer task has no public view
+        assert attempt._producer.done(), "the close is not at its source close"
     assert not closing.done()
     return closing, reader
 
@@ -378,7 +393,7 @@ async def _owner_returns(attempt: Any) -> BaseException | None:
     later = asyncio.create_task(attempt.aclose())
     try:
         done, _ = await asyncio.wait({later}, timeout=10)
-        assert later in done, "the attempt bound expired but the close owner still waits"
+        assert later in done, "the bound expired but the attempt close owner still waits"
         # test-contract: seam no public view of the owner task itself
         assert attempt._close.task.done(), "the close owner task is still live"
         return later.exception()
@@ -413,7 +428,7 @@ def _attempt_bound_at(seam: str) -> Callable[[_Site, ManualDeadlineClock], Any]:
         await _first_event(attempt)
         closing, reader = await _park_attempt_close(seam, site, attempt)
         clock.advance(clock.now() + completion.ATTEMPT_CLOSE_BOUND)
-        assert str(await _settle(closing)) == ATTEMPT_BOUND_FAILURE
+        assert str(await _returned_at_bound(closing, "attempt close")) == ATTEMPT_BOUND_FAILURE
         assert completion.ATTEMPT_CLOSE_BOUND == 20.0  # the production bound
         error = await _owner_returns(attempt)
         assert str(error) == ATTEMPT_BOUND_FAILURE
@@ -462,13 +477,13 @@ def _attempt_bound_swallowed_at(
         closing, reader = await _park_attempt_close(seam, site, attempt)
         site.body.swallow += 1
         clock.advance(clock.now() + completion.ATTEMPT_CLOSE_BOUND)
-        assert str(await _settle(closing)) == ATTEMPT_BOUND_FAILURE
+        assert str(await _returned_at_bound(closing, "attempt close")) == ATTEMPT_BOUND_FAILURE
         assert str(await _owner_returns(attempt)) == ATTEMPT_BOUND_FAILURE
         assert not site.body.release.is_set()
         backend_close = asyncio.create_task(site.backend.aclose())
         await await_or_fail(site.drained.waited.wait(), what="lease drain wait")
         clock.advance(clock.now() + transport.LEASE_DRAIN_BOUND)
-        outcome = await await_or_fail(backend_close, what="backend close")
+        outcome = await _returned_at_bound(backend_close, "backend close")
         named = [str(failure.error) for failure in outcome.failures]
         assert named == [f"{LEASE_BOUND_FAILURE}: borrows still open: {site.name} completion"]
         await _finish_reader(site, reader)
@@ -519,7 +534,7 @@ def _attempt_two_aborts_then_bound_at(
         backend_close = asyncio.create_task(site.backend.aclose())
         await await_or_fail(site.drained.waited.wait(), what="lease drain wait")
         clock.advance(clock.now() + transport.LEASE_DRAIN_BOUND)
-        outcome = await await_or_fail(backend_close, what="backend close")
+        outcome = await _returned_at_bound(backend_close, "backend close")
         named = [str(failure.error) for failure in outcome.failures]
         assert named == [f"{LEASE_BOUND_FAILURE}: borrows still open: {site.name} completion"]
         await _finish_reader(site, reader)
@@ -641,7 +656,7 @@ def _lease_bound_at(seam: str) -> Callable[[_Site, ManualDeadlineClock], Any]:
     async def row(site: _Site, clock: ManualDeadlineClock) -> None:
         closing, attempt = await _park_lease_close(seam, site)
         clock.advance(clock.now() + transport.LEASE_DRAIN_BOUND)
-        outcome = await await_or_fail(closing, what="backend close")
+        outcome = await _returned_at_bound(closing, "backend close")
         assert transport.LEASE_DRAIN_BOUND == 30.0  # the production bound
         named = [str(failure.error) for failure in outcome.failures]
         if seam == "drain-wait":
@@ -677,7 +692,7 @@ async def _lease_late_failure_after_bound(
     loop.set_exception_handler(report)
     try:
         clock.advance(clock.now() + transport.LEASE_DRAIN_BOUND)
-        outcome = await await_or_fail(closing, what="backend close")
+        outcome = await _returned_at_bound(closing, "backend close")
         assert [str(failure.error) for failure in outcome.failures] == [LEASE_BOUND_FAILURE]
         await await_or_fail(site.clients[0].close_cancelled.wait(), what="bound cancel")
         assert reported == []
@@ -687,6 +702,8 @@ async def _lease_late_failure_after_bound(
             ("http client close failed", "late client close failure")
         ]
     finally:
+        site.clients[0].release.set()
+        await _settle(closing)
         loop.set_exception_handler(previous)
 
 
@@ -746,15 +763,6 @@ async def test_close_site_releases_its_borrow_and_returns(
     site = _site(site_name, tmp_path, monkeypatch, owned=site_name == "lease")
     # test-contract: seam observe the lease close parked at its drain wait
     site.backend._lease._drained = _WatchedEvent()
-    drain = completion._drain_cancelled
-
-    async def traced_drain(producer: asyncio.Task[None]) -> None:
-        site.trace.append("drain")
-        await drain(producer)
-        site.trace.append("drained")
-
-    # test-contract: seam observe the attempt close parked at its producer drain
-    monkeypatch.setattr(completion, "_drain_cancelled", traced_drain)
     try:
         await row(site, clock)
     finally:
