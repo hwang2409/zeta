@@ -20,4 +20,6 @@ async def create_log_off_loop(open_log: Callable[[], IO[bytes]]) -> None:
 async def open_log_off_loop(open_log: Callable[[], IO[bytes]]) -> IO[bytes]:
     """Open a log off-loop and close it if the caller is canceled."""
 
-    return await run_owned_thread_call(open_log, lambda handle: handle.close())
+    return await run_owned_thread_call(
+        open_log, lambda handle: handle.close(), close_is_thread_safe=True
+    )

@@ -10,7 +10,6 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum, auto
 from functools import wraps
 from typing import Any, Protocol, runtime_checkable
@@ -31,12 +30,19 @@ from .must_complete_close import (
     MustCompleteClose,
     task_is_cancelling,
 )
+from .rate_limit_hold import (
+    RATE_LIMIT_CREDENTIAL_POLL_SECONDS,
+    RATE_LIMIT_PROBE_SECONDS,
+    credential_fingerprint,
+    is_rate_limit_hold,
+    rate_limit_hold_text,
+    retry_after_seconds,
+    subscription_limit_wait,
+)
 
 MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
-RATE_LIMIT_PROBE_SECONDS = 300.0
-RATE_LIMIT_CREDENTIAL_POLL_SECONDS = 5.0
 MAX_ACCOUNT_LOCK_ATTEMPTS = 5
 MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
@@ -139,6 +145,7 @@ class RetryPlan:
     is_account_lock: bool = False
     is_rate_limit_hold: bool = False
     retry_after: float | None = None
+    subscription_limit: Any = None
 
 
 @dataclass(slots=True)
@@ -198,6 +205,17 @@ class CompletionRetryBudget:
         first_failure = self.original_error is None
         if first_failure:
             self.original_error = source
+        limit = getattr(source, "subscription_limit", None)
+        if limit is not None and not self.exhausted:
+            wait = subscription_limit_wait(limit.resets_at.timestamp(), time.time())
+            return RetryPlan(
+                attempt=self.attempts,
+                reason="subscription_limit",
+                delay=wait,
+                is_rate_limit_hold=True,
+                retry_after=wait,
+                subscription_limit=limit,
+            )
         if self.exhausted or not retryable_provider_error(source, event_data):
             return None
         is_account_lock = getattr(source, "code", None) == "account_lock_timeout"
@@ -239,7 +257,7 @@ class CompletionRetryBudget:
             - self.excluded_account_lock_seconds
         )
         if (
-            _rate_limit_hold(source, explicit_retry_after)
+            is_rate_limit_hold(source, explicit_retry_after)
             and elapsed + delay > MAX_PROVIDER_RETRY_SECONDS
         ):
             return RetryPlan(
@@ -310,6 +328,8 @@ class CompletionControl:
     task_deadline: float | None
     # the session's account identity; a change ends a rate-limit hold at once
     account_generation: Callable[[], object] | None = None
+    # records a subscription limit and returns the user's recovery suggestion, if any
+    account_limit: Callable[[object], Awaitable[dict[str, object] | None]] | None = None
 
 
 class ProviderAttempt(Protocol):
@@ -574,7 +594,7 @@ class CompletionCleanupError(RuntimeError):
 
 
 class ProviderAccountSwitched(Exception):
-    pass
+    """The session switched accounts during a hold; redispatch through the new backend."""
 
 
 class TaskDeadlineExceeded(TimeoutError):
@@ -872,6 +892,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         if self._emitted:
             self._pending.append(StreamEvent(StreamEventType.ASSISTANT_RESET))
             self._emitted = False
+        if plan.subscription_limit is not None and self._control.account_limit is not None:
+            # a suggestion only: the runtime never switches accounts by itself
+            suggestion = await self._control.account_limit(error)
+            if suggestion is not None:
+                self._pending.append(StreamEvent(StreamEventType.ACCOUNT_LIMIT, data=suggestion))
         self._pending_retry = plan
         self._rate_limit_hold = plan.is_rate_limit_hold
         if plan.is_rate_limit_hold:
@@ -879,10 +904,9 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         return True
 
     def _hold_generation(self) -> tuple[object, object]:
-        state = getattr(self._adapter, "rate_limit_state", None)
         account = self._control.account_generation
         return (
-            state() if callable(state) else None,
+            credential_fingerprint(getattr(self._adapter, "token_store", None)),
             account() if account is not None else None,
         )
 
@@ -893,6 +917,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         await self._wait_step(delay)
 
     async def _wait_for_rate_limit_hold(self, delay: float) -> None:
+        """Wait out a hold; a re-login wakes it, an account switch ends this run."""
+
         initial = self._rate_limit_state
         assert isinstance(initial, tuple)
         remaining = delay
@@ -901,6 +927,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             await self._wait_step(step)
             credential, account = self._hold_generation()
             if account != initial[1]:
+                # this adapter belongs to the old account; the caller redispatches
                 self._closed = True
                 raise ProviderAccountSwitched("session account changed during rate-limit hold")
             if credential != initial[0]:
@@ -974,8 +1001,10 @@ class CompletionRun(AsyncIterator[StreamEvent]):
     def _retry_notice(self, plan: RetryPlan, error: object) -> StreamEvent:
         if plan.is_rate_limit_hold:
             assert plan.retry_after is not None
+            limit = plan.subscription_limit
             data: dict[str, Any] = {
                 "kind": "provider_rate_limit_hold",
+                "limit": "rate" if limit is None else "subscription",
                 "delay": plan.delay,
                 "retry_after": plan.retry_after,
                 "until": time.time() + plan.retry_after,
@@ -983,6 +1012,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 "attempt": plan.attempt,
                 "reason": plan.reason,
             }
+            if limit is not None:
+                data["until"] = limit.resets_at.timestamp()
+                data["account"] = str(limit.account)
+                data["text"] = f"{limit.account} {rate_limit_hold_text(data)}"
+                return StreamEvent(StreamEventType.RETRY, data=data)
             data["text"] = (
                 f"{self._adapter.provider} {rate_limit_hold_text(data)} "
                 "(log in again or switch account to resume sooner)"
@@ -1196,17 +1230,6 @@ def retryable_provider_error(
         and event_data.get("retryable") is True
     )
 
-
-def retry_after_seconds(
-    error: BaseException | object,
-    event_data: Mapping[str, Any] | None = None,
-) -> float | None:
-    value = getattr(error, "retry_after", None)
-    if value is None and event_data is not None:
-        value = event_data.get("retry_after")
-    return max(0.0, float(value)) if type(value) in {int, float} else None
-
-
 def retry_wait_seconds(
     error: BaseException | object,
     retry_number: int,
@@ -1217,30 +1240,6 @@ def retry_wait_seconds(
         return explicit_retry_after
     base = min(MAX_PROVIDER_RETRY_DELAY_SECONDS, float(2 ** (retry_number - 1)))
     return min(MAX_PROVIDER_RETRY_DELAY_SECONDS, random.uniform(base * 0.5, base * 1.5))
-
-
-def _rate_limit_hold(error: BaseException | object, retry_after: float | None) -> bool:
-    return retry_after is not None and getattr(error, "status_code", None) in {429, 503, 529}
-
-
-def rate_limit_hold_text(data: Mapping[str, Any]) -> str:
-    until = datetime.fromtimestamp(data["until"]).astimezone()
-    today = datetime.now().astimezone().date()
-    stamp = until.strftime("%H:%M" if until.date() == today else "%b %d %H:%M")
-    return (
-        f"rate-limited until {stamp} (provider asks {format_duration(data['retry_after'])}); "
-        f"checking again in {format_duration(data['delay'])}"
-    )
-
-
-def format_duration(seconds: float) -> str:
-    days, remainder = divmod(max(0, int(seconds)), 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, secs = divmod(remainder, 60)
-    parts = [f"{value}{unit}" for value, unit in ((days, "d"), (hours, "h"), (minutes, "m")) if value]
-    if secs and not parts:
-        parts.append(f"{secs}s")
-    return " ".join(parts) or "0s"
 
 
 def retry_reason(error: BaseException | object) -> str:

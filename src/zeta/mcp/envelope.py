@@ -75,6 +75,7 @@ class MCPCallEnvelope:
             self._handle = await run_owned_thread_call(
                 temporary.__enter__,
                 lambda _handle: temporary.__exit__(None, None, None),
+                close_is_thread_safe=True,
             )
             self._temporary = temporary
             self._spill_buffer.extend(b"".join(self._parts))
@@ -93,6 +94,7 @@ class MCPCallEnvelope:
             await run_owned_thread_call(
                 partial(self.spill_store.reserve_transient, byte_count),
                 lambda _result: self.spill_store.release_transient(byte_count),
+                close_is_thread_safe=True,
             )
         except RuntimeError as exc:
             raise MCPTransientQuotaError from exc
