@@ -17,7 +17,7 @@ _DURABILITY_CALLBACKS = {
     ("core/transcript_recovery/__init__.py", "resume_memory_review", "write_json_file"),
     ("session_retention.py", "write_retention_pin", "atomic_publish_file"),
     ("project_registry.py", "_publish", "atomic_publish_file"),
-    ("project_inbox.py", "_persist", "atomic_publish_file"),
+    ("project_inbox_sent/__init__.py", "publish", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
     (
         "memory/entry_history.py",
@@ -39,7 +39,7 @@ _RAW_PUBLICATION = {
     ("storage_format.py", "_publish_manifest", "os.replace"),
     ("project_registry.py", "_rename_without_replacement", "os.rename"),
     ("project_inbox.py", "claim", "os.rename"),
-    ("project_inbox.py", "done", "os.rename"),
+    ("project_inbox.py", "done_with_outcome", "os.rename"),
     ("project_inbox.py", "_recover_stale", "os.rename"),
     ("project_memory_history.py", "_publish_mirror_file", "os.replace"),
     ("tools/_spill.py", "write_group", "os.replace"),

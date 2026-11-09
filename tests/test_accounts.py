@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import hashlib
 import inspect
 import json
@@ -38,6 +39,7 @@ from tests.support.account_processes import (
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
+from tests.support.owned import await_or_fail
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import (
     AccountCredentialLockTimeoutError,
@@ -66,6 +68,7 @@ from zeta.protocol.types import (
 from zeta.providers.codex import CodexBackend
 from zeta.providers.completion import (
     MAX_ACCOUNT_LOCK_ATTEMPTS,
+    MAX_ACCOUNT_LOCK_RETRY_SECONDS,
     owned_completion,
     retryable_provider_error,
 )
@@ -105,6 +108,75 @@ def _hold_registry_lock(
         release.wait()
 
 
+def _refresh_account_token(
+    home: str,
+    account: AccountId,
+    started: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 5.0
+    credential = named_account_credentials(home, account.provider, account.name)
+
+    async def refresh(*_args: object) -> OAuthTokens:
+        started.set()
+        await asyncio.wait_for(asyncio.to_thread(release.wait), timeout=10)
+        return OAuthTokens("refreshed-access", "rotated-refresh", 9_999_999_999.0)
+
+    credential.refresh = refresh  # type: ignore[method-assign]
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(client)
+
+    try:
+        result.put(("ok", asyncio.run(access())))
+    except Exception as exc:  # noqa: BLE001 - return child failure to the parent
+        result.put(("error", type(exc).__name__, str(exc)))
+
+
+def _wait_for_refreshed_account_token(
+    home: str,
+    account: AccountId,
+    old_bound_crossed: multiprocessing.synchronize.Event,
+    holder_release: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 5.0
+    calls = 0
+
+    def monotonic() -> float:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            old_bound_crossed.set()
+            return 5.0
+        return 0.0
+
+    def wait_for_holder(_seconds: float) -> None:
+        if not holder_release.wait(timeout=10):
+            raise TimeoutError("refresh holder was not released")
+
+    account_store.time = SimpleNamespace(monotonic=monotonic, sleep=wait_for_holder)
+    credential = named_account_credentials(home, account.provider, account.name)
+
+    async def unexpected_refresh(*_args: object) -> OAuthTokens:
+        raise AssertionError("waiter started a second token refresh")
+
+    credential.refresh = unexpected_refresh  # type: ignore[method-assign]
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(
+                client, lock_timeout=account_store.credential_wait_timeout_seconds()
+            )
+
+    try:
+        result.put(("ok", asyncio.run(access())))
+    except Exception as exc:  # noqa: BLE001 - return child failure to the parent
+        result.put(("error", type(exc).__name__, str(exc)))
+
+
 def _access_turn_credentials(
     home: str,
     account: AccountId,
@@ -122,68 +194,119 @@ def _access_turn_credentials(
         result.put(None)
 
 
+def test_waiter_outlives_refresh_bound_and_reuses_refreshed_tokens(
+    tmp_path: Path,
+) -> None:
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, account.provider, account.name).save(
+        OAuthTokens("expired", "refresh-secret", 1.0)
+    )
+    context = multiprocessing.get_context("spawn")
+    refresh_started = context.Event()
+    old_bound_crossed = context.Event()
+    release = context.Event()
+    holder_result = context.Queue()
+    waiter_result = context.Queue()
+    holder = context.Process(
+        target=_refresh_account_token,
+        args=(str(tmp_path), account, refresh_started, release, holder_result),
+    )
+    waiter = context.Process(
+        target=_wait_for_refreshed_account_token,
+        args=(str(tmp_path), account, old_bound_crossed, release, waiter_result),
+    )
+    holder.start()
+    try:
+        assert refresh_started.wait(timeout=5), "holder did not enter token refresh"
+        waiter.start()
+        assert old_bound_crossed.wait(timeout=5), "waiter did not cross the old bound"
+        release.set()
+        waiter.join(timeout=10)
+        holder.join(timeout=10)
+        assert waiter.exitcode == 0
+        assert holder.exitcode == 0
+        assert waiter_result.get(timeout=1) == ("ok", "refreshed-access")
+        assert holder_result.get(timeout=1) == ("ok", "refreshed-access")
+    finally:
+        release.set()
+        for process in (waiter, holder):
+            if process.pid is not None and process.is_alive():
+                process.kill()
+            if process.pid is not None:
+                process.join(timeout=5)
+                process.close()
+        for queue in (holder_result, waiter_result):
+            queue.close()
+            queue.join_thread()
+
+
+def _codex_hello_sse() -> str:
+    response_events = [
+        {"type": "response.created", "response": {"id": "response-test"}},
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "message-test", "role": "assistant"},
+        },
+        {
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text"},
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hello",
+        },
+        {
+            "type": "response.output_text.done",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "hello",
+        },
+        {"type": "response.content_part.done", "output_index": 0, "content_index": 0},
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "message-test",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}],
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "response-test",
+                "status": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            },
+        },
+    ]
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+        for event in response_events
+    )
+
+
 def _run_contended_codex_turn(
     home: str,
     release: multiprocessing.synchronize.Event,
     result: multiprocessing.queues.Queue,
 ) -> None:
     account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 0.05
+    account_store.ACCOUNT_LOCK_TURN_WAIT_SECONDS = 0.05
     conversation = ConversationStore(Path(home) / "contended-session")
 
     async def run() -> None:
         account = AccountId("codex", "work")
         credential = credential_store("codex", home=home, account=account)
         assert credential is not None
-        response_events = [
-            {"type": "response.created", "response": {"id": "response-test"}},
-            {
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type": "message", "id": "message-test", "role": "assistant"},
-            },
-            {
-                "type": "response.content_part.added",
-                "output_index": 0,
-                "content_index": 0,
-                "part": {"type": "output_text"},
-            },
-            {
-                "type": "response.output_text.delta",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": "hello",
-            },
-            {
-                "type": "response.output_text.done",
-                "output_index": 0,
-                "content_index": 0,
-                "text": "hello",
-            },
-            {"type": "response.content_part.done", "output_index": 0, "content_index": 0},
-            {
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "type": "message",
-                    "id": "message-test",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "hello"}],
-                },
-            },
-            {
-                "type": "response.completed",
-                "response": {
-                    "id": "response-test",
-                    "status": "completed",
-                    "usage": {"input_tokens": 3, "output_tokens": 2},
-                },
-            },
-        ]
-        body = "".join(
-            f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
-            for event in response_events
-        )
+        body = _codex_hello_sse()
 
         async def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -224,6 +347,133 @@ def _run_contended_codex_turn(
                     if isinstance(block, TextContent)
                 ],
                 [event.error.message for event in events if event.error is not None],
+            )
+        )
+
+    asyncio.run(run())
+
+
+def _holder_refreshed_token() -> str:
+    return _jwt_token(
+        {
+            "exp": 4_000_000_000,
+            "https://api.openai.com/auth": {"chatgpt_account_id": "holder"},
+        }
+    )
+
+
+def _refresh_for_turn_holder(
+    home: str,
+    started: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+    done: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    # production refresh bound; the turn's virtual clock decides when this refresh ends
+    credential = named_account_credentials(home, "codex", "work")
+
+    async def refresh(*_args: object) -> OAuthTokens:
+        started.set()
+        if not await asyncio.to_thread(release.wait, 60):
+            raise TimeoutError("holder refresh was not released")
+        return OAuthTokens(_holder_refreshed_token(), "holder-refresh", 4_000_000_000)
+
+    credential.refresh = refresh  # type: ignore[method-assign]
+
+    async def access() -> str:
+        async with httpx.AsyncClient() as client:
+            return await credential.access_token(client)
+
+    try:
+        result.put(("ok", asyncio.run(access())))
+    except Exception as exc:  # noqa: BLE001 - return child failure to the parent
+        result.put(("error", type(exc).__name__, str(exc)))
+    finally:
+        done.set()
+
+
+def _run_virtual_clock_codex_turn(
+    home: str,
+    holder_refresh_seconds: float | None,
+    release: multiprocessing.synchronize.Event,
+    done: multiprocessing.synchronize.Event,
+    checked: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    # production lock and retry constants; only time is virtual, starting at an
+    # arbitrary nonzero monotonic value and reported relative to turn start
+    start = 1000.0
+    now = [start]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+        if (
+            holder_refresh_seconds is not None
+            and now[0] - start >= holder_refresh_seconds
+        ):
+            release.set()
+            if not done.wait(20):
+                raise TimeoutError("holder did not publish its refresh")
+
+    account_store.time = SimpleNamespace(monotonic=lambda: now[0], sleep=sleep)
+
+    class VirtualClock:
+        def now(self) -> float:
+            return now[0]
+
+        async def wait_until(self, _deadline: float) -> None:
+            await await_or_fail(
+                asyncio.Event().wait(), timeout=60, what="virtual deadline"
+            )
+
+    conversation = ConversationStore(Path(home) / "virtual-clock-session")
+
+    async def run() -> None:
+        credential = credential_store(
+            "codex", home=home, account=AccountId("codex", "work")
+        )
+        assert credential is not None
+        bearers: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            bearers.append(request.headers["authorization"])
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=_codex_hello_sse(),
+                request=request,
+            )
+
+        async def backoff(delay: float) -> None:
+            if not checked.is_set():
+                assert await await_or_fail(
+                    asyncio.to_thread(checked.wait, 20), what="parent lock checks"
+                )
+            now[0] += delay
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = CodexBackend(client=client, token_store=credential)
+        backend._completion_clock = VirtualClock()
+        backend._completion_wait = backoff
+        events: list[StreamEvent] = []
+        try:
+            async for stream_event in AgentLoop(
+                backend,
+                conversation,
+                skill_catalog=SkillCatalog.empty(),
+            ).run_turn("hello", origin=MessageOrigin.USER):
+                events.append(stream_event)
+                if stream_event.type is StreamEventType.RETRY:
+                    result.put(("retry", stream_event.data, now[0] - start))
+        finally:
+            await backend.aclose()
+        result.put(
+            (
+                "result",
+                [event.type.value for event in events],
+                [event.error.code for event in events if event.error is not None],
+                now[0] - start,
+                bearers,
             )
         )
 
@@ -348,6 +598,107 @@ def test_codex_turn_retries_real_account_lock_contention(tmp_path: Path) -> None
         result.join_thread()
 
 
+@pytest.mark.parametrize("holder_finishes", [True, False])
+def test_turn_behind_production_refresh_holder_shows_lock_notice(
+    tmp_path: Path, holder_finishes: bool
+) -> None:
+    account = AccountId("codex", "work")
+    named_account_credentials(tmp_path, account.provider, account.name).save(
+        OAuthTokens("expired", "refresh-secret", 1.0)
+    )
+    lock_path = tmp_path / "account-locks" / "codex" / "work" / "lifecycle.lock"
+    context = multiprocessing.get_context("spawn")
+    started = context.Event()
+    release = context.Event()
+    done = context.Event()
+    checked = context.Event()
+    holder_result = context.Queue()
+    turn_result = context.Queue()
+    holder = context.Process(
+        target=_refresh_for_turn_holder,
+        args=(str(tmp_path), started, release, done, holder_result),
+    )
+    turn = context.Process(
+        target=_run_virtual_clock_codex_turn,
+        args=(
+            str(tmp_path),
+            # the holder's refresh takes the full production refresh bound
+            oauth_module.OAUTH_REFRESH_TIMEOUT_SECONDS if holder_finishes else None,
+            release,
+            done,
+            checked,
+            turn_result,
+        ),
+    )
+    holder.start()
+    try:
+        assert started.wait(timeout=20), "holder did not enter token refresh"
+        before = (lock_path.stat(), lock_path.read_bytes())
+        turn.start()
+        first = turn_result.get(timeout=60)
+        assert first[0] == "retry", "the turn waited out the holder with no lock notice"
+        assert first[1]["kind"] == "account_lock_wait"
+        turn_wait = oauth_module.ACCOUNT_LOCK_TURN_WAIT_SECONDS
+        assert first[2] == pytest.approx(turn_wait, abs=0.1)
+        rendered = render_event(StreamEvent(StreamEventType.RETRY, data=first[1]))
+        assert rendered is not None
+        assert "waiting for account lock" in rendered.plain
+        # the timed-out waiter left the holder and its lock untouched
+        assert holder.is_alive()
+        assert not done.is_set()
+        after = (lock_path.stat(), lock_path.read_bytes())
+        assert (after[0].st_ino, after[0].st_mtime_ns, after[1]) == (
+            before[0].st_ino,
+            before[0].st_mtime_ns,
+            before[1],
+        )
+        probe = os.open(lock_path, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+        checked.set()
+        retries = [first]
+        while (message := turn_result.get(timeout=60))[0] == "retry":
+            retries.append(message)
+        _, event_types, error_codes, card_at, bearers = message
+        turn.join(timeout=20)
+        assert turn.exitcode == 0
+        if holder_finishes:
+            assert error_codes == []
+            assert event_types[-4:] == ["message_update", "message_end", "turn_end", "agent_end"]
+            assert bearers == [f"Bearer {_holder_refreshed_token()}"]
+            assert card_at < MAX_ACCOUNT_LOCK_RETRY_SECONDS
+        else:
+            assert error_codes == ["account_lock_timeout"]
+            assert bearers == []
+            # last wait starts before the 120 s window ends; backoffs are at most 1.5+3+6 s
+            assert MAX_ACCOUNT_LOCK_RETRY_SECONDS < card_at <= 4 * turn_wait + 10.5
+            assert len(retries) < MAX_ACCOUNT_LOCK_ATTEMPTS
+            assert holder.is_alive() and not done.is_set()
+            release.set()
+        holder.join(timeout=20)
+        assert holder.exitcode == 0
+        assert holder_result.get(timeout=1) == ("ok", _holder_refreshed_token())
+        stored = json.loads(
+            named_account_credentials(tmp_path, "codex", "work").path.read_text()
+        )
+        assert stored["access_token"] == _holder_refreshed_token()
+    finally:
+        release.set()
+        checked.set()
+        for process in (turn, holder):
+            if process.pid is not None:
+                if process.is_alive():
+                    process.kill()
+                process.join(timeout=5)
+            process.close()
+        for queue in (holder_result, turn_result):
+            queue.close()
+            queue.join_thread()
+
+
 @pytest.mark.asyncio
 async def test_access_token_times_out_when_another_process_holds_registry_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -356,6 +707,7 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
     credential = named_account_credentials(tmp_path, account.provider, account.name)
     await asyncio.to_thread(credential.save, tokens())
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(account_store, "ACCOUNT_LOCK_TURN_WAIT_SECONDS", 0.05)
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
     release = context.Event()
@@ -386,6 +738,7 @@ async def test_registry_lock_timeout_reaches_tui_turn_error_card(
     credential = named_account_credentials(tmp_path, account.provider, account.name)
     await asyncio.to_thread(credential.save, tokens())
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(account_store, "ACCOUNT_LOCK_TURN_WAIT_SECONDS", 0.05)
 
     class TurnSetupBackend:
         @owned_completion
@@ -456,13 +809,14 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
 
     async def ticker() -> None:
         nonlocal ticks
-        while not stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0)
 
     ticker_task = asyncio.create_task(ticker())
     try:
-        async with credential._async_guard(registry=False):
+        async with credential._async_guard(registry=False, timeout=30):
             with pytest.raises(AccountError):
                 await asyncio.wait_for(
                     asyncio.to_thread(credential_store, "codex", home=tmp_path),
@@ -471,7 +825,7 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
             assert ticks > 1
     finally:
         stop.set()
-        await ticker_task
+        await await_or_fail(ticker_task, what="event-loop ticker")
 
 
 def test_resolve_account_does_not_migrate(
@@ -2198,13 +2552,15 @@ _MISSING_REGISTRY_REFUSAL = (
     "accounts.json is missing but other account directories exist; "
     "restore accounts.json before adding an account"
 )
-_BROKEN_REGISTRY_REFUSAL = (
-    "accounts.json is unreadable; kept it and every account directory; "
-    "repair or restore accounts.json, then restart zeta"
-)
+def _broken_registry_refusal(home: Path) -> str:
+    return (
+        f"accounts.json is unreadable: {home / 'accounts.json'}; kept it and every account directory; "
+        "move it aside to a backup, then run login again or restore it from a backup, "
+        "then restart zeta"
+    )
 _REGISTRY_REFUSALS = {
     "missing": _MISSING_REGISTRY_REFUSAL,
-    "broken": _BROKEN_REGISTRY_REFUSAL,
+    "broken": "accounts.json is unreadable",
 }
 
 
@@ -2254,7 +2610,12 @@ def test_refused_login_leaves_the_home_byte_for_byte_unchanged(
     assert files_after == files_before
     assert directories_after == directories_before
     assert flows == []
-    assert str(refusal.value) == _REGISTRY_REFUSALS[registry_state]
+    expected = (
+        _REGISTRY_REFUSALS[registry_state]
+        if registry_state == "missing"
+        else _broken_registry_refusal(tmp_path)
+    )
+    assert str(refusal.value) == expected
     (tmp_path / "accounts.json").write_bytes(registry)
     store.migrate()
     store.resolve_account(refused.provider)
@@ -2317,7 +2678,12 @@ async def test_tui_accounts_login_renders_the_registry_refusal(
         await asyncio.wait_for(login_rendered.wait(), 10)
 
         rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
-        assert f"login failed: {_REGISTRY_REFUSALS[registry_state]}" in rendered
+        expected = (
+            _REGISTRY_REFUSALS[registry_state]
+            if registry_state == "missing"
+            else _broken_registry_refusal(home)
+        )
+        assert f"login failed: {expected}" in rendered
         assert flows == []
         assert not (home / "accounts" / "anthropic").exists()
     finally:
@@ -2347,7 +2713,7 @@ def test_cli_login_with_unreadable_registry_is_refused_before_the_browser(
     assert cli_main.main(["login", "codex", "--account", "new"]) == 1
 
     assert flows == []
-    assert capsys.readouterr().err == f"login failed: {_BROKEN_REGISTRY_REFUSAL}\n"
+    assert capsys.readouterr().err == f"login failed: {_broken_registry_refusal(home)}\n"
     assert home_snapshot(home / "accounts") == accounts_before
     assert (home / "accounts.json").read_bytes() == b"{"
 

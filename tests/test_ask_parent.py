@@ -143,6 +143,9 @@ async def test_ask_parent_returns_after_durable_question_without_answer(
             what="ask_parent test cleanup",
         )
         owner.cancel_all()
+        await registry.close()
+        child.close()
+        parent.close()
 
 
 @pytest.mark.asyncio

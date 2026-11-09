@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import math
+import multiprocessing
 import os
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,7 @@ import httpx
 import pytest
 
 from tests.support.credentials import named_account_credentials
+from tests.support.owned import await_or_fail
 from zeta.accounts import AccountCredentialLockTimeoutError, AccountId, AccountStore
 from zeta.accounts.usage import (
     AccountUsage,
@@ -51,6 +53,18 @@ def _tokens() -> OAuthTokens:
 def _seed(store: AccountStore, *accounts: AccountId) -> None:
     for account in accounts:
         named_account_credentials(store.home, account.provider, account.name).save(_tokens())
+
+
+def _save_account_token(
+    home: str, account: AccountId, result: multiprocessing.queues.Queue
+) -> None:
+    try:
+        named_account_credentials(home, account.provider, account.name).save(
+            _tokens(), lock_timeout=0.1
+        )
+        result.put("saved")
+    except Exception as exc:  # noqa: BLE001 - return child failure to the parent
+        result.put((type(exc).__name__, str(exc)))
 
 
 def test_anthropic_fixture_normalizes_five_hour_and_seven_day() -> None:
@@ -239,6 +253,55 @@ def test_refresh_is_sequential_one_request_per_account_and_respects_cooldown(
         "https://api.anthropic.com/api/oauth/usage",
         "https://chatgpt.com/backend-api/wham/usage",
     ]
+
+
+@pytest.mark.asyncio
+async def test_usage_request_does_not_hold_lifecycle_lock(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("codex", "work")
+    _seed(store, account)
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        request_started.set()
+        await await_or_fail(
+            release_request.wait(), what="release gated usage request"
+        )
+        return httpx.Response(200, json=_fixture("codex_wham_usage.json"))
+
+    usage = AccountUsage(
+        store,
+        clock=lambda: NOW,
+        transport=httpx.MockTransport(handler),
+    )
+    refresh_task = asyncio.create_task(usage.refresh_stale())
+    context = multiprocessing.get_context("spawn")
+    result = context.Queue()
+    saver = context.Process(
+        target=_save_account_token,
+        args=(str(tmp_path), account, result),
+    )
+    try:
+        await await_or_fail(request_started.wait(), what="usage request to start")
+        saver.start()
+        saved = await await_or_fail(
+            asyncio.to_thread(result.get, True, 5),
+            what="token save during usage request",
+        )
+        assert saved == "saved"
+    finally:
+        release_request.set()
+        await await_or_fail(refresh_task, what="usage refresh cleanup")
+        if saver.pid is not None and saver.is_alive():
+            saver.kill()
+        if saver.pid is not None:
+            saver.join(timeout=5)
+            saver.close()
+        result.close()
+        result.join_thread()
 
 
 @pytest.mark.asyncio

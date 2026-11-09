@@ -259,6 +259,13 @@ class BackgroundAgentOwner:
 
         self._stores.append(store)
 
+    def finish_store(self, instance_id: str, store: ConversationStore) -> None:
+        """Schedule a finished child store while its watcher remains owned."""
+
+        self._active_stores.pop(instance_id, None)
+        self.mark_store_finished(store)
+        self.release_unused_stores()
+
     def mark_store_finished(self, store: ConversationStore) -> None:
         self._pending_stores.add(store)
 
@@ -1170,3 +1177,5 @@ async def finish_background_child(
             cleanup_result = cleanup()
             if inspect.isawaitable(cleanup_result):
                 await cleanup_result
+            # Do not let the watcher finish before its child store lease closes.
+            await background_owner.wait_for_store_closes()

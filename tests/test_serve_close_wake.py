@@ -178,4 +178,3 @@ async def test_close_during_resume_wake_turn_ends_turn_and_releases_session(
             writer.close()
         if not closed:
             await await_or_fail(server.close(), timeout=30, what="serve cleanup close")
-

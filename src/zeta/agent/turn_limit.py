@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 from ..core.checkpoints import _now
 from ..protocol.types import Message, harness_notice
+from ..core.store._async_writes import _EnsureTurnLimitHandoffCommand
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
 
 HANDOFF_NAME = "turn-limit-handoff.md"
@@ -227,9 +228,8 @@ async def write_background_turn_limit(
     receipt: str,
     child_session_path: str,
 ) -> str:
-    await store._to_thread_agent_state(
-        store.ensure_turn_limit_handoff,
-        handoff_bytes,
+    await store._commit_storage_command(
+        _EnsureTurnLimitHandoffCommand(content=handoff_bytes)
     )
     return build_turn_limit_result(receipt, child_session_path)
 
@@ -264,8 +264,8 @@ async def finalize_exhausted_child(
             children=owned_children(),
             tasks=owned_tasks(),
         )
-        await child_store._to_thread_agent_state(
-            child_store.ensure_turn_limit_handoff, content
+        await child_store._commit_storage_command(
+            _EnsureTurnLimitHandoffCommand(content=content)
         )
     if background:
         result = terminal_result(state="completed", text=readable_text)
@@ -348,14 +348,14 @@ def make_child_progress_callbacks(
     child_store: Any,
     child_marker_key: str,
     child_tool_call_id: str,
-) -> tuple[Callable[[int], None], Callable[[int], None]]:
+) -> tuple[Callable[[int], None], Callable[[], None]]:
     def update_turns(turns: int) -> None:
         loop._agent_child_turns[child_tool_call_id] = turns
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
 
-    def update_tool_calls(tool_calls: int) -> None:
-        child_store.update_agent_lifecycle(tool_calls=tool_calls)
+    def update_tool_calls() -> None:
+        child_store.update_agent_lifecycle(tool_calls=1)
 
     return update_turns, update_tool_calls
 
