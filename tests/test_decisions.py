@@ -132,10 +132,11 @@ def _resolved_event(*, child: bool = False) -> StreamEvent:
 
 
 @pytest.mark.asyncio
-async def test_direct_tick_discards_scan_started_before_resolution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("mutation", ["dismiss", "recover_open"])
+async def test_direct_tick_discards_scan_delivered_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
-    import zeta.attention_decisions as decisions_module
+    import zeta.tui.slash_handlers.decisions_panel as panel_module
 
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
@@ -144,51 +145,72 @@ async def test_direct_tick_discards_scan_started_before_resolution(
         _request, current, project.project_id, "Current", "This one."
     )
     app = _decisions_app(tmp_path, current)
-    entered = asyncio.Event()
+    scan_ready = asyncio.Event()
     direct_started = asyncio.Event()
-    release = ThreadEvent()
-    real_open = decisions_module.open_decisions
-    calls = 0
+    held_delivery = []
+    hold_delivery = True
     read_calls = 0
     loop = asyncio.get_running_loop()
+    real_call_soon_threadsafe = loop.call_soon_threadsafe
+    real_read = app._read_decisions
+
+    async def wrapped_read(*args, **kwargs):
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 2:
+            direct_started.set()
+        return await real_read(*args, **kwargs)
+
+    async def release_delivery() -> None:
+        nonlocal hold_delivery
+        hold_delivery = False
+        callback, args = held_delivery.pop()
+        real_call_soon_threadsafe(callback, *args)
+
+    app._read_decisions = wrapped_read
+
+    def hold_first_delivery(callback, *args):
+        if callback is panel_module._deliver_decisions_scan and hold_delivery:
+            held_delivery.append((callback, args))
+            real_call_soon_threadsafe(scan_ready.set)
+            return
+        real_call_soon_threadsafe(callback, *args)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", hold_first_delivery)
     try:
-        real_read = app._read_decisions
+        app.start_decisions_poll()
+        await await_or_fail(scan_ready.wait(), what="completed old decision scan")
+        await _stop_decisions(app)
+        if mutation == "dismiss":
+            await asyncio.to_thread(
+                AttentionReplies(tmp_path, current.store.session_id).resolve_local,
+                record.id,
+                "done",
+            )
+            direct_tick = asyncio.create_task(app._decisions_tick())
+        else:
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
 
-        async def wrapped_read(*args, **kwargs):
-            nonlocal read_calls
-            read_calls += 1
-            if read_calls == 2:
-                direct_started.set()
-            return await real_read(*args, **kwargs)
+            def prepare_recovery() -> None:
+                replies = AttentionReplies(tmp_path, current.store.session_id)
+                with replies._operation():
+                    replies._prepare_locked(
+                        [(record.id, "done")],
+                        from_session=current.store.session_id,
+                    )
 
-        app._read_decisions = wrapped_read
-
-        def blocked_open(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            result = real_open(*args, **kwargs)
-            if calls == 1:
-                loop.call_soon_threadsafe(entered.set)
-                release.wait(timeout=10)
-            return result
-
-        monkeypatch.setattr(decisions_module, "open_decisions", blocked_open)
-        old_scan = asyncio.create_task(app._read_decisions(timeout=None))
-        await await_or_fail(entered.wait(), what="old decision scan")
-        await asyncio.to_thread(
-            AttentionReplies(tmp_path, current.store.session_id).resolve_local,
-            record.id,
-            "done",
-        )
-        direct_tick = asyncio.create_task(app._decisions_tick())
+            await asyncio.to_thread(prepare_recovery)
+            direct_tick = asyncio.create_task(app._open_decisions_panel())
         await await_or_fail(direct_started.wait(), what="direct decision tick")
-        release.set()
+        await release_delivery()
         await await_or_fail(direct_tick, what="direct decision refresh")
-        old_scan.cancel()
-        await asyncio.wait_for(asyncio.gather(old_scan, return_exceptions=True), 10)
         assert app.decisions_count == 0
+        assert "● " not in _rendered_decisions_status(app)
     finally:
-        release.set()
+        if held_delivery:
+            await release_delivery()
         await _stop_decisions(app)
         await app.close()
         current.store.close()
