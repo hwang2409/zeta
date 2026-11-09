@@ -50,6 +50,7 @@ from ..checkpoints import (
     active_branch,
     load_session_json,
 )
+from ..checkpoints.entry_types import validate_conversation_entry
 from ..checkpoints.mutation import (
     AppendConversationRows,
     ConversationGenerationConflict,
@@ -531,6 +532,7 @@ class ConversationStore(
 
     def _validate_entry_payload(self, entry: ConversationEntry) -> None:
         try:
+            validate_conversation_entry(self, entry)
             if entry.type == "message":
                 message = entry.data.get("message")
                 if type(message) is not dict:
