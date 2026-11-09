@@ -1387,6 +1387,18 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
             )
             await _event(reader, "session_grants_changed")
             backend.release_child_one.set()
+            child_one_approval = await _event(reader, "approval_request")
+            assert child_one_approval["tool_call"]["id"] == "child-bash-1"
+            assert child_one_approval["delegated"] is True
+            child_one_deny = await _request(
+                reader,
+                writer,
+                61,
+                "deny",
+                {"request_id": child_one_approval["request_id"]},
+            )
+            assert child_one_deny[-1].get("error") is None, child_one_deny
+            await _frames_until_event(reader, "agent_end")
             second_send = await _request(
                 reader, writer, 7, "send", {"text": "second delegate"}
             )
