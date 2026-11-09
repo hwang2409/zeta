@@ -68,6 +68,7 @@ def test_cli_account_error_exit_is_unchanged(
     def raise_account_error(_: list[str] | None) -> int:
         raise AccountError("account failed")
 
+    # test-contract: seam patch the console entry point to verify AccountError identity.
     monkeypatch.setattr(cli_main, "_main", raise_account_error)
 
     assert cli_main.main([]) == 2
