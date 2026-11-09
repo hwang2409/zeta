@@ -49,6 +49,7 @@ from .completion import (
     is_completion_sentinel,
     report_provider_record,
 )
+from .must_complete_close import task_is_cancelling
 from .stream_diagnostics import Cause, StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -65,7 +66,6 @@ from .transport import (
     is_control_exception,
     request_error,
     sse_lines,
-    task_is_cancelling,
 )
 from .usage import normalize_usage
 from ..protocol.types import (
@@ -538,7 +538,7 @@ class AnthropicBackend(CompletionBackend):
         *,
         token: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        async with self._lease.borrow() as client:
+        async with self._lease.borrow("anthropic completion") as client:
             events = self._complete_once_with_client(
                 client, messages, tool_schemas, token=token
             )
