@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from ...accounts import AccountCredentials, AccountId, AccountStore
+from ...accounts.store import credential_wait_timeout_seconds
 from ...codex import (
     CODEX_API_URL,
     DEFAULT_CODEX_MODEL,
@@ -175,7 +176,9 @@ async def _acquire_token(store: AccountCredentials, timeout: httpx.Timeout) -> s
     """Acquire and persist credentials in a task that is safe from caller cancellation."""
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        return await store.access_token(client)
+        return await store.access_token(
+            client, lock_timeout=credential_wait_timeout_seconds()
+        )
 
 
 _credential_tasks: dict[Path, asyncio.Task[str]] = {}

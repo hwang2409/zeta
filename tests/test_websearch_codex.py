@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.codex import CodexLoginRequiredError
 from zeta.core.abort import AbortSignal
 from zeta.protocol.types import ToolCall
@@ -101,7 +102,7 @@ def install_codex_transport(
     status: int = 200,
     stream: httpx.AsyncByteStream | None = None,
 ) -> None:
-    async def access_token(_store, _client):
+    async def access_token(_store, _client, **_kwargs):
         return "test-token"
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -527,9 +528,9 @@ async def test_codex_deadline_covers_credential_acquisition(monkeypatch, registr
     release_acquisition = asyncio.Event()
     acquisition_finished = asyncio.Event()
 
-    async def blocked_access_token(_store, _client):
+    async def blocked_access_token(_store, _client, **_kwargs):
         acquisition_started.set()
-        await release_acquisition.wait()
+        await await_or_fail(release_acquisition.wait(), what="acquisition release")
         acquisition_finished.set()
         return "test-token"
 
@@ -563,12 +564,12 @@ async def test_concurrent_searches_share_one_credential_acquisition(
     release_acquisition = asyncio.Event()
     acquisitions_finished = asyncio.Event()
 
-    async def slow_access_token(_store, _client):
+    async def slow_access_token(_store, _client, **_kwargs):
         nonlocal acquisition_calls, active_acquisitions
         acquisition_calls += 1
         active_acquisitions += 1
         try:
-            await release_acquisition.wait()
+            await await_or_fail(release_acquisition.wait(), what="acquisition release")
             return "test-token"
         finally:
             active_acquisitions -= 1
@@ -581,7 +582,7 @@ async def test_concurrent_searches_share_one_credential_acquisition(
 
     try:
         searches = [execute(registry) for _ in range(8)]
-        results = await asyncio.gather(*searches)
+        results = await await_or_fail(asyncio.gather(*searches), what="concurrent searches")
 
         assert all(
             result["structuredContent"]["backend"] == "duckduckgo"
@@ -608,11 +609,11 @@ async def test_inflight_acquisition_cleared_after_completion(monkeypatch, regist
     release_first = asyncio.Event()
     first_finished = asyncio.Event()
 
-    async def access_token(_store, _client):
+    async def access_token(_store, _client, **_kwargs):
         nonlocal acquisition_calls
         acquisition_calls += 1
         if acquisition_calls == 1:
-            await release_first.wait()
+            await await_or_fail(release_first.wait(), what="first token release")
             first_finished.set()
         return "test-token"
 
@@ -642,11 +643,11 @@ async def test_codex_deadline_does_not_cancel_token_refresh(monkeypatch, registr
     refresh_persisted = asyncio.Event()
     refresh_cancelled = False
 
-    async def blocked_access_token(_store, _client):
+    async def blocked_access_token(_store, _client, **_kwargs):
         nonlocal refresh_cancelled
         refresh_started.set()
         try:
-            await allow_refresh_to_finish.wait()
+            await await_or_fail(allow_refresh_to_finish.wait(), what="refresh release")
             refresh_persisted.set()
             return "test-token"
         except asyncio.CancelledError:
@@ -684,11 +685,11 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
     refresh_persisted = asyncio.Event()
     refresh_cancelled = False
 
-    async def slow_access_token(_store, _client):
+    async def slow_access_token(_store, _client, **_kwargs):
         nonlocal refresh_cancelled
         refresh_started.set()
         try:
-            await allow_refresh_to_finish.wait()
+            await await_or_fail(allow_refresh_to_finish.wait(), what="refresh release")
             refresh_persisted.set()
             return "test-token"
         except asyncio.CancelledError:
@@ -704,7 +705,7 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="credential task")
     allow_refresh_to_finish.set()
     await asyncio.wait_for(refresh_persisted.wait(), timeout=10)
 
