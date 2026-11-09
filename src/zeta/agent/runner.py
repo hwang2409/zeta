@@ -133,9 +133,7 @@ async def consume_child(
 
     def clean_no_output(text: str) -> dict[str, object]:
         if child_loop.explicit_finish:
-            return terminal_result(
-                state="idle", text="child is idle", status="running"
-            )
+            return terminal_result(state="idle", text="", status="running")
         return terminal_result(state="failed", text=text)
 
     def lifecycle_depth(call: ToolCall | None) -> int:
