@@ -63,11 +63,6 @@ from zeta.tools._shared import background_spawn as spawn_module
 from zeta.tools._shared.background_log_writer import _OrderedLogWriter
 from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
 from zeta.tools._shared.background_spawn import _group_exists, _terminate_process
-from zeta.tools._shared.background_task_owner import (
-    _NOTE_PRIORITY_ARCHIVE,
-    _NOTE_PRIORITY_CAUSE,
-    _set_terminal_note,
-)
 from zeta.tools._shared.background_task_types import TaskExitInput, _BackgroundRecord
 from zeta.tools._shared.process import BackgroundTaskRegistry
 from zeta.tui.render import format_status, render_event
@@ -1404,32 +1399,161 @@ async def test_background_task_owner_state_table(
         assert projected["tool_result"]["structured_content"]["cause"] == cause
 
 
-@pytest.mark.parametrize(
-    ("first", "second", "expected"),
-    [
-        (_NOTE_PRIORITY_ARCHIVE, _NOTE_PRIORITY_CAUSE, "kill cause; archive failure"),
-        (_NOTE_PRIORITY_CAUSE, _NOTE_PRIORITY_ARCHIVE, "archive failure; kill cause"),
-    ],
-)
+_ARCHIVE_NOTE = "background output archive failed; recovery will retry the retained log"
+
+
+def _fail_archive_append(tasks: BackgroundTaskRegistry, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        raise OSError("forced archive failure")
+
+    assert tasks._archive is not None
+    # test-contract: seam inject archive failure through the owner's real archive call
+    monkeypatch.setattr(tasks._archive, "append", fail)
+
+
 @pytest.mark.asyncio
-async def test_terminal_note_priority_is_runtime_only(
-    first: int, second: int, expected: str
+async def test_kill_cause_leads_archive_note_published_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    record = _BackgroundRecord(task_id="task", command="true", pid=1)
-    _set_terminal_note(record, "archive failure", first)
-    _set_terminal_note(record, "kill cause", second)
-    assert record.note == expected
-    assert record.note_priority == _NOTE_PRIORITY_CAUSE
-    registry = BackgroundTaskRegistry()
+    store = ConversationStore(tmp_path / "session")
+    tools = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+    tasks = tools.background_tasks
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    tasks.set_notification_sink(lambda item: flow.produce(_task_notification(item)))
+    cause = "test kill after archive failure"
+    archive_noted = asyncio.Event()
+    claimed = asyncio.Event()
+    release_terminal = asyncio.Event()
+    original_finish = owner_module._BackgroundTaskOwner._finish_terminal
+    original_claim = owner_module._BackgroundTaskOwner._claim_termination
+
+    async def gated_finish(self, exit_code):
+        archive_noted.set()
+        await await_or_fail(release_terminal.wait(), what="terminal release")
+        return await original_finish(self, exit_code)
+
+    async def signalled_claim(self, *args, **kwargs):
+        result = await original_claim(self, *args, **kwargs)
+        claimed.set()
+        return result
+
+    _fail_archive_append(tasks, monkeypatch)
+    # test-contract: seam hold the owner between archive-note publication and terminal commit
+    monkeypatch.setattr(owner_module._BackgroundTaskOwner, "_finish_terminal", gated_finish)
+    # test-contract: seam signal once the concurrent kill has published its cause
+    monkeypatch.setattr(owner_module._BackgroundTaskOwner, "_claim_termination", signalled_claim)
+    killer: asyncio.Task[dict[str, object]] | None = None
     try:
-        assert "note_priority" not in registry._persistence_rows((record,))[0]
+        task_id, _ = await tasks.start("true", tmp_path)
+        await await_or_fail(archive_noted.wait(), what="archive note published")
+        assert tasks._owners[task_id].record.note == _ARCHIVE_NOTE
+        killer = asyncio.create_task(tasks.kill(task_id, cause=cause))
+        await await_or_fail(claimed.wait(), what="kill cause published")
+        release_terminal.set()
+        with pytest.raises(OSError, match="forced archive failure"):
+            await await_or_fail(killer, what="kill completion")
+        rows = json.loads((store.session_dir / "background_tasks.json").read_text())
+        receipts = [
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        assert rows[0]["note"] == f"{cause}; {_ARCHIVE_NOTE}"
+        assert len(receipts) == 1
+        assert receipts[0].data["note"] == f"{cause}; {_ARCHIVE_NOTE}"
+        # the precedence state is runtime-only: the real stored row never carries it
+        assert "note_priority" not in rows[0]
     finally:
-        await registry.close()
+        release_terminal.set()
+        if killer is not None:
+            await asyncio.wait_for(asyncio.gather(killer, return_exceptions=True), 10)
+        await asyncio.wait_for(tools.close(), 10)
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["archive", "kill", "shutdown", "cutoff"])
+async def test_terminal_note_writer_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writer: str
+) -> None:
+    store = ConversationStore(tmp_path / "session")
+    tools = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+    tasks = tools.background_tasks
+    cause = f"table {writer} cause"
+    try:
+        if writer == "archive":
+            _fail_archive_append(tasks, monkeypatch)
+            task_id, _ = await tasks.start("true", tmp_path)
+            with pytest.raises(OSError, match="forced archive failure"):
+                await await_or_fail(tasks.wait(task_id), what="archive failure exit")
+            expected = _ARCHIVE_NOTE
+        elif writer == "kill":
+            task_id, _ = await tasks.start("sleep 30", tmp_path)
+            await await_or_fail(tasks.kill(task_id, cause=cause), what="kill")
+            expected = cause
+        else:
+            if writer == "cutoff":
+                held = asyncio.Event()
+
+                async def held_output(*args: object, **kwargs: object) -> None:
+                    await held.wait()
+
+                # test-contract: seam keep task output open so close must cut it off
+                monkeypatch.setattr(tasks, "_read_output", held_output)
+                monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
+            task_id, _ = await tasks.start("sleep 30", tmp_path)
+            tasks.begin_shutdown(cause)
+            await await_or_fail(tasks.close(), what="shutdown")
+            expected = cause if writer == "shutdown" else f"{cause}; {owner_module.OUTPUT_CUTOFF_NOTE}"
+        rows = json.loads((store.session_dir / "background_tasks.json").read_text())
+        assert tasks.snapshot()[0].note == expected
+        assert rows[0]["note"] == expected
+    finally:
+        await asyncio.wait_for(tools.close(), 10)
+        store.close()
+
+
+def test_background_note_has_one_writer() -> None:
+    import ast
+
+    root = Path(owner_module.__file__).parent
+    offenders = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        allowed = {
+            id(node)
+            for fn in ast.walk(tree)
+            if isinstance(fn, ast.FunctionDef) and fn.name == "_set_terminal_note"
+            for node in ast.walk(fn)
+        }
+        for node in ast.walk(tree):
+            if id(node) in allowed:
+                continue
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign))
+                else []
+            )
+            direct = any(isinstance(t, ast.Attribute) and t.attr == "note" for t in targets)
+            via_setattr = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "setattr"
+                and len(node.args) > 1
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "note"
+            )
+            if direct or via_setattr:
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert offenders == [], (
+        f"direct background note writes at {offenders}; route through _set_terminal_note "
+        "so a kill or shutdown cause keeps precedence over archive and cutoff notes"
+    )
 
 
 @pytest.mark.asyncio
 async def test_task_exit_recovers_original_receipt_after_store_closes(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tests.support.fake_backend import FakeBackend
 
@@ -1443,11 +1567,13 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
     )
     task_id, _ = await tools.background_tasks.start("sleep 30", tmp_path)
     cause = "test closed-store kill cause"
+    _fail_archive_append(tools.background_tasks, monkeypatch)
     try:
         store.close()
-        await tools.background_tasks.kill(
-            task_id, cause=cause, tui_presented=True
-        )
+        with pytest.raises(OSError, match="forced archive failure"):
+            await tools.background_tasks.kill(
+                task_id, cause=cause, tui_presented=True
+            )
     finally:
         await asyncio.wait_for(tools.close(), 10)
 
@@ -1474,11 +1600,11 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
         assert len(receipts) == 1
         assert archived_rows[0]["notify_on_exit"] is True
         assert "receipt_pending" not in archived_rows[0]
-        assert archived_rows[0]["note"] == cause
+        assert archived_rows[0]["note"] == f"{cause}; {_ARCHIVE_NOTE}"
         assert archived_rows[0]["terminal_phase"] == "task_kill"
         assert archived_rows[0]["tui_presented"] is True
         assert receipts[0].data["task_id"] == task_id
-        assert receipts[0].data["note"] == cause
+        assert receipts[0].data["note"] == f"{cause}; {_ARCHIVE_NOTE}"
         assert receipts[0].data["background_phase"] == "task_kill"
         assert resumed_store.is_agent_notification_presented_to_tui(receipts[0].id)
         rows = json.loads(

@@ -45,11 +45,6 @@ def _set_terminal_note(record: _BackgroundRecord, note: str, priority: int) -> N
         record.note_priority = max(existing_priority, priority)
 
 
-def _restore_terminal_note(record: _BackgroundRecord, note: str | None, priority: int | None) -> None:
-    record.note = note
-    record.note_priority = priority
-
-
 class _OwnerState(Enum):
     RUNNING = auto()
     DRAINING = auto()
