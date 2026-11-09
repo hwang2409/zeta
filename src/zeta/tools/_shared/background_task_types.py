@@ -49,6 +49,8 @@ class _BackgroundRecord:
     running: bool = True
     exit_code: int | None = None
     note: str | None = None
+    # runtime-only ordering state; never include this in persisted rows
+    note_priority: int | None = None
     log_path: str | None = None
     remove_log_on_archive: bool = False
     notify_on_exit: bool = True

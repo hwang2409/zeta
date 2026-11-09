@@ -31,6 +31,23 @@ OUTPUT_CUTOFF_NOTE = (
     "background output was cut off because a process outside the task "
     "still held its output"
 )
+_NOTE_PRIORITY_ARCHIVE = 1
+_NOTE_PRIORITY_CAUSE = 2
+
+
+def _set_terminal_note(record: _BackgroundRecord, note: str, priority: int) -> None:
+    if record.note is None:
+        record.note = note
+        record.note_priority = priority
+    elif note not in record.note:
+        existing_priority = record.note_priority or _NOTE_PRIORITY_ARCHIVE
+        record.note = f"{note}; {record.note}" if priority > existing_priority else f"{record.note}; {note}"
+        record.note_priority = max(existing_priority, priority)
+
+
+def _restore_terminal_note(record: _BackgroundRecord, note: str | None, priority: int | None) -> None:
+    record.note = note
+    record.note_priority = priority
 
 
 class _OwnerState(Enum):
@@ -65,7 +82,7 @@ class _BackgroundTaskOwner:
         self.state = _OwnerState.RUNNING if process is not None else _OwnerState.TERMINAL
         self.lifecycle: asyncio.Task[None] | None = None
         self.terminal_candidate: _BackgroundRecord | None = None
-        self.kill_cause: str | None = record.note if record.terminal_phase else None
+        self.kill_cause: str | None = record.note if record.note_priority == _NOTE_PRIORITY_CAUSE else None
         self.killed_by_claimant = False
         self.defer_receipt_for_close = False
         self._receipt_release = asyncio.Event()
@@ -124,8 +141,10 @@ class _BackgroundTaskOwner:
                     await self._archive()
                 except BaseException as exc:
                     archive_error = exc
-                    self.record.note = (
-                        "background output archive failed; recovery will retry the retained log"
+                    _set_terminal_note(
+                        self.record,
+                        "background output archive failed; recovery will retry the retained log",
+                        _NOTE_PRIORITY_ARCHIVE,
                     )
                     logger.exception(
                         "failed to archive background task output for %s",
@@ -315,7 +334,7 @@ class _BackgroundTaskOwner:
                 self.kill_cause = cause
                 self.killed_by_claimant = True
                 self.record.terminal_phase = phase
-                self.record.note = cause
+                _set_terminal_note(self.record, cause, _NOTE_PRIORITY_CAUSE)
                 self.record.tui_presented = tui_presented
 
             await self.registry._commit_transition(rows, publish, None)
@@ -372,7 +391,7 @@ class _BackgroundTaskOwner:
     def finish_close_output_drain(self) -> None:
         self._finish_output_drain.set()
         if not self._output_done.is_set():
-            self.record.note = f"{self.record.note}; {OUTPUT_CUTOFF_NOTE}"
+            _set_terminal_note(self.record, OUTPUT_CUTOFF_NOTE, _NOTE_PRIORITY_ARCHIVE)
         stream = self.process.stdout if self.process is not None else None
         transport = getattr(stream, "_transport", None)
         if transport is not None:
