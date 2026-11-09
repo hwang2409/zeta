@@ -2592,13 +2592,15 @@ _MISSING_REGISTRY_REFUSAL = (
     "accounts.json is missing but other account directories exist; "
     "restore accounts.json before adding an account"
 )
-_BROKEN_REGISTRY_REFUSAL = (
-    "accounts.json is unreadable; kept it and every account directory; "
-    "repair or restore accounts.json, then restart zeta"
-)
+def _broken_registry_refusal(home: Path) -> str:
+    return (
+        f"accounts.json is unreadable: {home / 'accounts.json'}; kept it and every account directory; "
+        "move it aside to a backup, then run login again or restore it from a backup, "
+        "then restart zeta"
+    )
 _REGISTRY_REFUSALS = {
     "missing": _MISSING_REGISTRY_REFUSAL,
-    "broken": _BROKEN_REGISTRY_REFUSAL,
+    "broken": "accounts.json is unreadable",
 }
 
 
@@ -2648,7 +2650,12 @@ def test_refused_login_leaves_the_home_byte_for_byte_unchanged(
     assert files_after == files_before
     assert directories_after == directories_before
     assert flows == []
-    assert str(refusal.value) == _REGISTRY_REFUSALS[registry_state]
+    expected = (
+        _REGISTRY_REFUSALS[registry_state]
+        if registry_state == "missing"
+        else _broken_registry_refusal(tmp_path)
+    )
+    assert str(refusal.value) == expected
     (tmp_path / "accounts.json").write_bytes(registry)
     store.migrate()
     store.resolve_account(refused.provider)
@@ -2711,7 +2718,12 @@ async def test_tui_accounts_login_renders_the_registry_refusal(
         await asyncio.wait_for(login_rendered.wait(), 10)
 
         rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
-        assert f"login failed: {_REGISTRY_REFUSALS[registry_state]}" in rendered
+        expected = (
+            _REGISTRY_REFUSALS[registry_state]
+            if registry_state == "missing"
+            else _broken_registry_refusal(home)
+        )
+        assert f"login failed: {expected}" in rendered
         assert flows == []
         assert not (home / "accounts" / "anthropic").exists()
     finally:
@@ -2741,7 +2753,7 @@ def test_cli_login_with_unreadable_registry_is_refused_before_the_browser(
     assert cli_main.main(["login", "codex", "--account", "new"]) == 1
 
     assert flows == []
-    assert capsys.readouterr().err == f"login failed: {_BROKEN_REGISTRY_REFUSAL}\n"
+    assert capsys.readouterr().err == f"login failed: {_broken_registry_refusal(home)}\n"
     assert home_snapshot(home / "accounts") == accounts_before
     assert (home / "accounts.json").read_bytes() == b"{"
 
