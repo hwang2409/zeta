@@ -25,6 +25,8 @@ from zeta.context_eviction import EVICTION_KIND
 from zeta.context_accounting import compact_json_length
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationEntry, ConversationStore
+from zeta.runtime.loop.agent import AgentLoop
+from zeta.skills import SkillCatalog
 from zeta.providers.anthropic import build_messages_payload
 from zeta.codex import CodexStreamError
 from zeta.providers.codex_payload import build_responses_payload
@@ -46,6 +48,14 @@ from zeta.protocol.types import (
     StreamEventType,
     ThinkingContent,
 )
+
+
+def _update_prompt(assembler: ContextAssembler, prompt: Message) -> None:
+    update = getattr(assembler, "update_system_prompt", None)
+    if update is None:
+        assembler.system_prompt = prompt
+    else:
+        update(prompt)
 
 
 @pytest.fixture(scope="module")
@@ -2428,3 +2438,45 @@ async def test_token_cache_on_and_off_give_identical_turns_across_eviction(
     assert markers[0] == markers[1]
     assert compacted >= 2, compacted
     assert {marker.get("kind") for marker in markers[0]} == {EVICTION_KIND}
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_change_during_preparation_is_retried(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        system_prompt="old prompt",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    assembler = loop.context_assembler
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+    real_prepare = assembler._preparation_owner._prepare
+
+    def blocked_prepare(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            assert release.wait(2)
+        return real_prepare(*args, **kwargs)
+
+    assembler._preparation_owner._prepare = blocked_prepare
+    preparation = asyncio.create_task(assembler.prepare_context())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        _update_prompt(assembler, Message(MessageRole.SYSTEM, [TextContent("new prompt")]))
+        release.set()
+        await asyncio.wait_for(preparation, 10)
+        messages = await asyncio.wait_for(assembler.assemble(), 10)
+        assert messages[0].content[0].text == "new prompt"
+        assert calls == 2
+    finally:
+        if not preparation.done():
+            preparation.cancel()
+            await asyncio.wait_for(preparation, 10)
+        await loop.close()
+        store.close()

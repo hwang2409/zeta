@@ -61,6 +61,14 @@ from zeta.tools import ToolRegistry, ToolStreamPublisher
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 
+def _update_prompt(assembler: ContextAssembler, prompt: Message) -> None:
+    update = getattr(assembler, "update_system_prompt", None)
+    if update is None:
+        assembler.system_prompt = prompt
+    else:
+        update(prompt)
+
+
 def test_empty_turn_tool_error_reports_success_state() -> None:
     error = empty_turn_tool_error(
         ToolCall("ping-call", "ping", {}), ToolResult("ping-call", "pong")
@@ -3284,3 +3292,36 @@ def test_run_turn_requires_explicit_origin(tmp_path: Path) -> None:
 
     with pytest.raises(TypeError):
         loop.run_turn("plain string without origin")  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_change_at_compaction_start_is_used(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        system_prompt="old prompt",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    assembler = loop.context_assembler
+    real_prepare = assembler.prepare_context
+
+    async def prepare_then_expose_compaction_window(**kwargs):
+        await real_prepare(**kwargs)
+        return True
+
+    assembler.prepare_context = prepare_then_expose_compaction_window
+    run = loop.run_turn("hello", origin=MessageOrigin.USER)
+    try:
+        while True:
+            event = await asyncio.wait_for(anext(run), 10)
+            if event.type is StreamEventType.COMPACTION_START:
+                break
+        _update_prompt(assembler, Message(MessageRole.SYSTEM, [TextContent("new prompt")]))
+        async for _ in run:
+            pass
+        assert backend.calls[0][0][0].content[0].text == "new prompt"
+    finally:
+        await loop.close()
+        store.close()

@@ -781,3 +781,43 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
         assert saved.skill_catalog[0]["name"] == "live"
     finally:
         resumed.store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_reload_between_turns_updates_next_provider_prompt(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    store = ConversationStore(tmp_path / "session", cwd=project)
+    old_skill = home / "skills" / "old-live-prompt.md"
+    _install_live_skill(home, "old-live-prompt", "live prompt")
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("first")]), ScriptedTurn([TextContent("second")])]
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        skill_catalog=SkillCatalog.empty(),
+        live_config_home=home,
+        live_config_project_dir=project,
+    )
+    try:
+        await loop.refresh_live_config(force=True)
+        async for _ in loop.run_turn("first", origin=MessageOrigin.USER):
+            pass
+        old_skill.unlink()
+        _install_live_skill(home, "new-live-prompt", "new-live-prompt")
+        await loop.refresh_live_config()
+        async for _ in loop.run_turn("second", origin=MessageOrigin.USER):
+            pass
+        prompt = "\n".join(
+            block.text
+            for message in backend.calls[1][0]
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        assert "new-live-prompt" in prompt
+    finally:
+        await loop.close()
+        store.close()
