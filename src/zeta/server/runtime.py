@@ -479,9 +479,6 @@ class ServerRuntime:
     async def resume_session(
         self, session_id: str, *, force: bool = False
     ) -> SessionMetadata:
-        session_id = await asyncio.to_thread(
-            self.manager.resolve_id, session_id, min_prefix_length=4
-        )
         if self._state is not None and self._state.session_id == session_id:
             if not force:
                 await self._session_cwd(self.metadata)

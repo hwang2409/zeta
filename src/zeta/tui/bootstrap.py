@@ -318,6 +318,7 @@ def _create_app_with_root(
             except (EOFError, ValueError) as exc:
                 raise SessionError("invalid resume session selection") from exc
         if resume_id is not None:
+            resume_id = manager.resolve_id(resume_id, min_prefix_length=4)
             opened = manager.open(resume_id)
         else:
             recent = manager.find_most_recent(cwd=invocation_cwd)

@@ -45,6 +45,7 @@ from .store.prompt_composition import (
 )
 from .session_files import (
     SessionError,
+    SessionIdAmbiguousError,
     SessionInUseError,
     SessionNotFoundError,
     open_session_file,
@@ -347,7 +348,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             return self._read(session_id, directory_fd=directory_fd)
 
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
-        session_id = self.resolve_id(session_id, min_prefix_length=4)
         metadata = self.read_metadata(session_id)
         try:
             store = ConversationStore(
@@ -831,7 +831,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             shown = ", ".join(match[:8] for match in matches[:8])
             if len(matches) > 8:
                 shown += ", …"
-            raise SessionError(
+            raise SessionIdAmbiguousError(
                 f"session id {session_id!r} is ambiguous; matches: {shown}; "
                 "please provide more characters"
             )
