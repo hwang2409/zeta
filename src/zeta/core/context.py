@@ -132,6 +132,7 @@ class ContextAssembler(ContextMarkerMixin):
             if isinstance(system_prompt, Message)
             else Message(MessageRole.SYSTEM, [TextContent(system_prompt)])
         )
+        self._prompt_generation = 0
         self.last_context: AssembledContext | None = None
         self.last_usage: dict[str, Any] = {}
         self._token_counts = MessageTokenCounts()
@@ -164,7 +165,15 @@ class ContextAssembler(ContextMarkerMixin):
             self._prepare_assembly,
             self.token_budget,
             self.estimator_token_budget,
+            self._prompt_state,
         )
+
+    def update_system_prompt(self, system_prompt: Message) -> None:
+        self.system_prompt = system_prompt
+        self._prompt_generation += 1
+
+    def _prompt_state(self) -> tuple[int, Message]:
+        return self._prompt_generation, self.system_prompt
 
     def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
@@ -593,6 +602,7 @@ class ContextAssembler(ContextMarkerMixin):
         force: bool,
         assembly_budget: int,
         system_append: str = "",
+        system_prompt: Message | None = None,
     ) -> _AssemblyPreparation:
         """Build the immutable inputs for compaction without store access."""
 
@@ -604,7 +614,7 @@ class ContextAssembler(ContextMarkerMixin):
             if item.entry is not None and item.message.tool_result is not None
         }
         boundary = self._tail_boundary(items)
-        system_prompt = self._system_prompt_message(system_append)
+        system_prompt = self._system_prompt_message(system_append, system_prompt)
         system_messages = [] if system_prompt is None else [system_prompt]
         latest_user = self._latest_user_index(items)
         committed_messages = self._committed_messages(
@@ -1103,12 +1113,15 @@ class ContextAssembler(ContextMarkerMixin):
             if item.count_source is not None
         )
 
-    def _system_prompt_message(self, system_append: str = "") -> Message | None:
-        if not _text_from_message(self.system_prompt).strip():
+    def _system_prompt_message(
+        self, system_append: str = "", system_prompt: Message | None = None
+    ) -> Message | None:
+        prompt = self.system_prompt if system_prompt is None else system_prompt
+        if not _text_from_message(prompt).strip():
             return None
         if not system_append:
-            return self.system_prompt
-        base = _text_from_message(self.system_prompt)
+            return prompt
+        base = _text_from_message(prompt)
         return Message(MessageRole.SYSTEM, [TextContent(f"{base}\n\n{system_append}")])
 
     def _total_tokens(self, messages: Sequence[Message]) -> int:

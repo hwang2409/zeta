@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 from ...context_accounting import cooperative_call
+from ...protocol.types import Message
 from ..store import ConversationEntry, ConversationStore
 from .types import _AssemblyPreparation
 
-PreparationKey = tuple[str | None, bool, int, str]
+PreparationKey = tuple[str | None, bool, int, str, int]
 Prepared = tuple[tuple[ConversationEntry, ...], _AssemblyPreparation]
 
 
@@ -22,6 +23,7 @@ class PrepareAssembly(Protocol):
         force: bool,
         assembly_budget: int,
         system_append: str,
+        system_prompt: Message,
     ) -> _AssemblyPreparation: ...
 
 
@@ -34,11 +36,13 @@ class ContextPreparation:
         prepare: PrepareAssembly,
         token_budget: int,
         estimator_budget: int,
+        prompt_state: Callable[[], tuple[int, Message]],
     ) -> None:
         self._store = store
         self._prepare = prepare
         self._token_budget = token_budget
         self._estimator_budget = estimator_budget
+        self._prompt_state = prompt_state
         self._prepared: tuple[PreparationKey, Prepared] | None = None
 
     @staticmethod
@@ -48,8 +52,9 @@ class ContextPreparation:
         force: bool,
         assembly_budget: int,
         system_append: str,
+        prompt_generation: int,
     ) -> PreparationKey:
-        return branch_id, force, assembly_budget, system_append
+        return branch_id, force, assembly_budget, system_append, prompt_generation
 
     def update_budgets(self, token_budget: int, estimator_budget: int) -> None:
         self._token_budget = token_budget
@@ -74,11 +79,13 @@ class ContextPreparation:
     ) -> tuple[tuple[ConversationEntry, ...], _AssemblyPreparation]:
         while True:
             assembly_budget = self.budget(reserved_estimator_tokens)
+            prompt_generation, _ = self._prompt_state()
             key = self.key(
                 self._store.active_branch_head_id(),
                 force=force,
                 assembly_budget=assembly_budget,
                 system_append=system_append,
+                prompt_generation=prompt_generation,
             )
             prepared = self.take(key)
             if prepared is not None:
@@ -102,6 +109,7 @@ class ContextPreparation:
                 assembly_budget = self.budget(reserved_estimator_tokens)
                 branch = self._store.active_branch_snapshot()
                 branch_id = branch[-1].id if branch else None
+                prompt_generation, system_prompt = self._prompt_state()
                 preparation = await asyncio.to_thread(
                     cooperative_call,
                     self._prepare,
@@ -109,18 +117,21 @@ class ContextPreparation:
                     force=force,
                     assembly_budget=assembly_budget,
                     system_append=system_append,
+                    system_prompt=system_prompt,
                 )
                 await asyncio.sleep(0)
                 current_budget = self.budget(reserved_estimator_tokens)
                 if (
                     self._store.active_branch_head_id() == branch_id
                     and current_budget == assembly_budget
+                    and self._prompt_state()[0] == prompt_generation
                 ):
                     key = self.key(
                         branch_id,
                         force=force,
                         assembly_budget=assembly_budget,
                         system_append=system_append,
+                        prompt_generation=prompt_generation,
                     )
                     self._prepared = (key, (tuple(branch), preparation))
                     return preparation.should_compact
@@ -135,6 +146,8 @@ class ContextPreparation:
             return None
         branch, preparation = prepared[1]
         if self._store.active_branch_head_id() != (branch[-1].id if branch else None):
+            return None
+        if self._prompt_state()[0] != key[-1]:
             return None
         return branch, preparation
 
