@@ -1390,11 +1390,10 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 async def gated_history(
                     store: ConversationStore, payload: dict[str, object]
                 ) -> object:
-                    result = await original_history(store, payload)
-                    # test-contract: seam gate the named production await
+                    # test-contract: hold the settlement before its history await
                     entered.set()
                     await await_or_fail(release.wait(), what="approval history")
-                    return result
+                    return await original_history(store, payload)
 
                 monkeypatch.setattr(
                     ConversationStore,
