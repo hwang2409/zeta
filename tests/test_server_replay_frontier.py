@@ -371,11 +371,12 @@ def _background_backend(
     )
 
 
-async def _background(serve: Serve) -> None:
+async def _background(serve: Serve, *, wait_for_parent_idle: bool = False) -> None:
     await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
     request = await _wait_event(serve.observer, "approval_request", delegated=True)
-    # The parent is idle before approval, so its completion cannot be folded into its turn.
-    await _wait_event(serve.observer, "agent_end")
+    if wait_for_parent_idle:
+        # The parent is idle before approval, so its completion cannot be folded into its turn.
+        await _wait_event(serve.observer, "agent_end")
     await serve.approve(request["request_id"])
     terminal = await _wait_event(serve.observer, "tool_end", **{"tool_call.id": "agent-bg"})
     while "notification_id" not in terminal["data"]:
@@ -475,6 +476,9 @@ SCENARIOS = {
     ),
     "foreground_tool": Scenario("foreground_tool", _foreground_tool_backend, lambda s, b: _foreground_tool(s)),
     "background_child": Scenario("background_child", _background_backend, lambda s, b: _background(s)),
+    "background_child_idle": Scenario(
+        "background_child_idle", _background_backend, lambda s, b: _background(s, wait_for_parent_idle=True)
+    ),
     "dropped_steer": Scenario("dropped_steer", lambda tmp: BlockingBackend(), _dropped_steer),
     "synthetic_abort": Scenario("synthetic_abort", lambda tmp: FakeBackend([]), lambda s, b: _synthetic_abort(s)),
     **{
@@ -497,7 +501,7 @@ PREMISE_SCENARIOS: dict[Route, tuple[str, ...]] = {
     (EventDescriptor.APPROVAL_REQUEST, "foreground"): ("foreground_tool",),
     (EventDescriptor.APPROVAL_REQUEST, "delegated"): ("background_child",),
     (EventDescriptor.APPROVAL_END, "foreground"): ("foreground_tool",),
-    (EventDescriptor.APPROVAL_END, "delegated"): ("background_child",),
+    (EventDescriptor.APPROVAL_END, "delegated"): ("background_child_idle",),
     (EventDescriptor.DELIVERY_STATUS, ""): ("dropped_steer",),
     **{(event, "durable"): (f"notification_{event.value}",) for event in NOTIFICATIONS},
 }
@@ -509,7 +513,7 @@ PREMISE_CASES = [
 ]
 NO_ROW_CASES: list[tuple[Route, str]] = [
     ((EventDescriptor.APPROVAL_END, "write_failed"), "synthetic_abort"),
-    ((EventDescriptor.TOOL_END, "child"), "background_child"),
+    ((EventDescriptor.TOOL_END, "child"), "background_child_idle"),
     ((EventDescriptor.TOOL_START, ""), "background_child"),
     ((EventDescriptor.USER_MESSAGE, "steer"), "dropped_steer"),
     ((EventDescriptor.TURN_ABORTED, ""), "dropped_steer"),
