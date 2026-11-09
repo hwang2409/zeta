@@ -192,7 +192,7 @@ def test_sent_message_text_starts_in_the_assistant_text_column(width: int) -> No
     )
     sent = " ".join(f"word{index}" for index in range(width // 3))
     presenter.print_user(user_message(Text(sent, style=theme.BODY)))
-    presenter.print_assistant(render_markdown("assistant reply"))
+    presenter.update_assistant(render_markdown("assistant reply"))
     height = 30
     margins = TranscriptMargins(
         [
