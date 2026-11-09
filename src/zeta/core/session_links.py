@@ -159,20 +159,20 @@ def persist_pending_root_link(
         "previous_project_id": previous_project_id,
         "transcript_path": str(Path(sessions_dir) / session_id),
     }
-    with SessionReferenceGate(Path(sessions_dir).parent, lease).shared(
-        installed_ids=(session_id,), referenced_ids=(parent_session_id,)
+    with (
+        SessionReferenceGate(Path(sessions_dir).parent, lease).shared(
+            installed_ids=(session_id,), referenced_ids=(parent_session_id,)
+        ),
+        session_directory(sessions_dir, session_id) as (_, directory_fd),
+        project_links_lock(directory_fd),
     ):
-        with (
-            session_directory(sessions_dir, session_id) as (_, directory_fd),
-            project_links_lock(directory_fd),
-        ):
-            lease.publish_json(
-                directory_fd,
-                "project_link_pending.json",
-                mapping_mutations(link),
-                write_session_file,
-            )
-            os.fsync(directory_fd)
+        lease.publish_json(
+            directory_fd,
+            "project_link_pending.json",
+            mapping_mutations(link),
+            write_session_file,
+        )
+        os.fsync(directory_fd)
 
 
 def persist_pending_child_link(
@@ -190,24 +190,24 @@ def persist_pending_child_link(
     """
     root = Path(root_session_dir)
     name = _encode_link_name(str(link["session_id"]))
-    with SessionReferenceGate(root.parent.parent, lease).shared(
-        installed_ids=(str(link["session_id"]),),
-        referenced_ids=(str(link.get("parent_session_id")), root.name),
+    with (
+        SessionReferenceGate(root.parent.parent, lease).shared(
+            installed_ids=(str(link["session_id"]),),
+            referenced_ids=(str(link.get("parent_session_id")), root.name),
+        ),
+        session_directory(root.parent, root.name) as (_, root_fd),
+        project_links_lock(root_fd),
+        child_directory(root_fd, PENDING_CHILD_LINKS_DIRNAME, create=True) as pending_fd,
     ):
-        with (
-            session_directory(root.parent, root.name) as (_, root_fd),
-            project_links_lock(root_fd),
-            child_directory(root_fd, PENDING_CHILD_LINKS_DIRNAME, create=True) as pending_fd,
-        ):
-            # Ensuring the index directory added its entry to the root session dir;
-            # fsync root_fd so that directory entry is durable before the registry
-            # append. Otherwise a crash after this returns but before the append
-            # could lose the whole index.
-            os.fsync(root_fd)
-            lease.publish_json(
-                pending_fd, name, mapping_mutations(link), write_session_file
-            )
-            os.fsync(pending_fd)
+        # Ensuring the index directory added its entry to the root session dir;
+        # fsync root_fd so that directory entry is durable before the registry
+        # append. Otherwise a crash after this returns but before the append
+        # could lose the whole index.
+        os.fsync(root_fd)
+        lease.publish_json(
+            pending_fd, name, mapping_mutations(link), write_session_file
+        )
+        os.fsync(pending_fd)
 
 
 _ReconcileOutcome = Literal["drained", "more", "failed"]
