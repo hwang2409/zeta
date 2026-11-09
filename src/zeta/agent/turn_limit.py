@@ -14,8 +14,8 @@ if TYPE_CHECKING:
     from ..core.store import ConversationStore
 
 from ..core.checkpoints import _now
-from ..protocol.types import Message, harness_notice
 from ..core.store._async_writes import _EnsureTurnLimitHandoffCommand
+from ..protocol.types import Message, harness_notice
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
 
 HANDOFF_NAME = "turn-limit-handoff.md"

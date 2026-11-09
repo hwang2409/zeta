@@ -73,7 +73,6 @@ from .turn_limit import (
     finalize_exhausted_child,
     make_child_progress_callbacks,
     make_finish_limited_child_turn,
-    make_publish_child_lifecycle,
 )
 
 logger = logging.getLogger(__name__)
@@ -109,7 +108,6 @@ async def consume_child(
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
-    last_message: Message | None = None
     failure_message: str | None = None
     failure_error: tuple[str, str] | None = None
     explicit_report: dict[str, object] | None = None
@@ -188,7 +186,6 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TURN_END:
-                last_message = event.message
                 turns = child_turns() + 1
                 update_turns(turns)
                 if event.data.get("tool_calls") == 0 and event.message is not None:
@@ -229,7 +226,7 @@ async def consume_child(
             await events.aclose()
         limited_result = await finalize_exhausted_child(
             control=getattr(child_loop, "child_turn_control", None),
-            text=assistant_text(last_message) if last_message is not None else "",
+            text=assistant_text(final_message) if final_message is not None else "",
             child_session_path=child_path,
             child_instance_id=child_loop.agent_instance_id or "unknown",
             child_store=child_store,
