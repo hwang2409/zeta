@@ -82,7 +82,26 @@ class MemoryMutationAuthorization:
 
 def memory_accept_preview(registry: object, project_id: str, name: str) -> tuple[str, str]:
     """Return the noun and bounded preview for one acceptance target."""
-    projection = registry.memory_transactions.read(project_id)
+    transactions = getattr(registry, "memory_transactions", None)
+    if transactions is None:
+        memory_format = registry.memory_format(project_id)
+        if memory_format == 2:
+            value = registry._entry_memory_view(project_id)
+            preview = next(
+                (
+                    str(entry.get("text", ""))[:240]
+                    for entry in value.get("entries", [])
+                    if entry.get("id") == name
+                ),
+                "",
+            )
+            return "entry", preview
+        projection = type("LegacyProjection", (), {
+            "format": 1,
+            "memory": registry.load_memory_for_context(project_id),
+        })()
+    else:
+        projection = transactions.read(project_id)
     if projection.format == 2:
         value = projection.view()
         preview = next(
