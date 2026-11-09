@@ -67,21 +67,15 @@ from zeta.storage_format import (
     ACCEPTED_KEY_SETS,
     _read_manifest,
     compare_registry_dumps,
+    validate_retention_arm,
+    validate_retention_manifest,
+    validate_retention_preview,
+    validate_retention_reservation,
+    validate_retention_state,
 )
 from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
 
 Validator = Callable[[dict[str, object]], object]
-
-# Registered before their writers exist so older releases can detect the future
-# authoritative shapes. Each named slice adds the production validator and case.
-_DORMANT_UNTIL_SLICE = {
-    "retention_state": 2,
-    "retention_preview": 2,
-    "retention_reservation": 3,
-    "retention_manifest": 3,
-    "retention_arm": 4,
-}
-
 
 @dataclass(frozen=True)
 class ShapeCase:
@@ -132,9 +126,7 @@ def test_every_registry_name_has_one_production_owner() -> None:
                 name_node.value, str
             ), f"{path}:{node.lineno} must use a literal stored-shape name"
             owners[name_node.value] = (str(path), node.lineno)
-    assert set(_DORMANT_UNTIL_SLICE) <= set(ACCEPTED_KEY_SETS)
-    assert all(slice_number in {2, 3, 4} for slice_number in _DORMANT_UNTIL_SLICE.values())
-    expected_owners = set(ACCEPTED_KEY_SETS) - set(_DORMANT_UNTIL_SLICE)
+    expected_owners = set(ACCEPTED_KEY_SETS)
     assert set(owners) == expected_owners, {
         "missing_owners": sorted(expected_owners - set(owners)),
         "unregistered_owners": sorted(set(owners) - expected_owners),
@@ -1203,11 +1195,91 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
             recovery_target,
             frozenset(recovery_target),
         ),
+        ShapeCase(
+            "retention_arm",
+            validate_retention_arm,
+            {
+                "schema_version": 1,
+                "gate_version": 1,
+                "armed_by_zeta_version": "1.0.0",
+                "armed_at": timestamp,
+                "preview_id": "preview-1",
+            },
+            ACCEPTED_KEY_SETS["retention_arm"],
+        ),
+        ShapeCase(
+            "retention_preview",
+            validate_retention_preview,
+            {
+                "preview_id": "preview-1",
+                "days": 30,
+                "cutoff": timestamp,
+                "root_ids": ["root-1"],
+                "count": 1,
+                "bytes": 10,
+                "created_at": timestamp,
+            },
+            ACCEPTED_KEY_SETS["retention_preview"],
+        ),
+        ShapeCase(
+            "retention_reservation",
+            validate_retention_reservation,
+            {
+                "schema_version": 1,
+                "session_id": "root-1",
+                "transaction_id": "transaction-1",
+                "source_path": "sessions/root-1",
+                "trash_path": "session-trash/root-1.transaction-1",
+                "device": 1,
+                "inode": 2,
+            },
+            ACCEPTED_KEY_SETS["retention_reservation"],
+        ),
+        ShapeCase(
+            "retention_manifest",
+            validate_retention_manifest,
+            {
+                "schema_version": 1,
+                "session_id": "root-1",
+                "transaction_id": "transaction-1",
+                "device": 1,
+                "inode": 2,
+                "descendants": ["child-1"],
+                "bytes": 10,
+                "stage": "quarantined",
+                "generation": 3,
+            },
+            ACCEPTED_KEY_SETS["retention_manifest"],
+        ),
+        ShapeCase(
+            "retention_state",
+            validate_retention_state,
+            {
+                "root_id": "root-1",
+                "device": 1,
+                "inode": 2,
+                "cutoff": timestamp,
+                "walk_started_at": timestamp,
+                "lease_epoch": "lease-1",
+                "frontier": [["agents", "1"]],
+                "completed_directories": [["agents", 1, 2, 3]],
+                "max_activity": 3,
+                "bytes": 10,
+                "descendant_ids": ["child-1"],
+                "entry_count": 4,
+                "reference_cursor": {},
+                "start_generation": 5,
+                "references": {},
+                "phase": "walk",
+                "preview": None,
+            },
+            ACCEPTED_KEY_SETS["retention_state"],
+        ),
     ]
 
     try:
         assert {case.name for case in cases} == (
-            set(ACCEPTED_KEY_SETS) - set(_DORMANT_UNTIL_SLICE)
+            set(ACCEPTED_KEY_SETS)
         )
         for case in cases:
             result = case.validator(dict(case.valid))
