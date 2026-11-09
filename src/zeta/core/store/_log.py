@@ -848,13 +848,7 @@ class ConversationLogMixin:
             valid_prefix_end=valid_prefix_end,
             reason_code=reason_code,
             repairable=repairable,
-            repair_available=(
-                repairable
-                and feature_enabled(
-                    self._storage_lease.observed_epoch,
-                    StorageFeature.TRANSCRIPT_REPAIR,
-                )
-            ),
+            repair_available=repairable and self._repair_enabled,
             source_device=stat.st_dev,
             source_inode=stat.st_ino,
             source_size=stat.st_size,
@@ -963,14 +957,18 @@ class ConversationLogMixin:
                 )
             yield row
 
+    @property
+    def _repair_enabled(self: ConversationStore) -> bool:
+        return feature_enabled(
+            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
+        )
+
     def _repair_explicit_load_error(
         self: ConversationStore, error: TranscriptLoadError, since: tuple[int, int]
     ) -> bool:
         if not self._repair_explicit or error._source_facts is None:
             return False
-        if not feature_enabled(
-            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
-        ):
+        if not self._repair_enabled:
             raise error
         self._last_repair_result = repair_transcript(
             self.directory_fd,
@@ -993,9 +991,7 @@ class ConversationLogMixin:
         if torn_row is None:
             return False
         torn_offset = torn_row.byte_offset
-        if not feature_enabled(
-            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
-        ):
+        if not self._repair_enabled:
             self._repair_torn_tail_legacy(torn_offset)
             self._log_offset = torn_offset
             self._publish_reload(since)
@@ -1047,9 +1043,7 @@ class ConversationLogMixin:
         if since is None:
             since = (self._reset_generation, len(self._entries))
         self._full_reload_count += 1
-        if not self._read_only and feature_enabled(
-            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
-        ):
+        if not self._read_only and self._repair_enabled:
             reconcile_pending(
                 self.directory_fd,
                 self._repair_target,
