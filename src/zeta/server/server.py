@@ -451,11 +451,12 @@ class _Client:
                         )
                     )
                 else:
-                    response = self.codec.response(request_id, result)
                     if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
-                        written = await self.connections.admit_join_response(self, response)
+                        written = await self.connections.admit_join_response(
+                            self, request_id, result
+                        )
                     else:
-                        written = await self._write(response)
+                        written = await self._write(self.codec.response(request_id, result))
                     if (
                         written
                         and request["method"] == "hello"

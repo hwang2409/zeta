@@ -788,3 +788,61 @@ async def test_join_of_a_full_newest_page_with_63_busy_children_fits_one_frame(
         start = {"event": "child_started", "session_id": session_id, "run_id": run_id, "sequence": 2**63 - 1}
         largest = projection.with_baseline({"messages": [start]})["messages"][1]
         assert _wire_size(largest) <= BASELINE_ROW_RESERVE
+
+
+
+# 675 bounded start rows in one group leave a newest-page join 2,388 B under the frame cap
+LONE_GROUP_STARTS = 675
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_oversized_join_response_sends_only_the_error_and_activates_no_stream(
+    tmp_path: Path, transport: Transport
+) -> None:
+    """A join whose result no longer fits one frame fails closed (design 6.1).
+
+    One group holds so many start rows that its page keeps no snapshot reserve (the
+    lone-group shortcut in ergonomics); a live child's grown row then overflows the join.
+    """
+    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
+        root = server.runtime.opened.store
+        live = _start_child(server, stores, f"{session_id}:1")
+        for n in range(100, 100 + LONE_GROUP_STARTS):
+            root.append_child_run_started(
+                f"{session_id}:{n}", None, "worker", "d" * 9_000, "2026-01-01T00:00:00+00:00"
+            )
+        root.append_message(Message(MessageRole.ASSISTANT, [TextContent("closed")]))
+        await _lifecycle_applied(server)
+        fitting = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})
+        assert fitting.get("error") is None
+        stream_id = fitting["result"]["replay"]["stream_id"]
+        slack = MAX_FRAME_BYTES - _wire_size(fitting)
+        assert _rows(fitting["result"]["messages"], "child_progress") == [f"{session_id}:1"]
+        assert 0 <= slack < 3_000, "the newest page is not within one grown row of the cap"
+
+        live.update_agent_lifecycle(current_step="c" * 5_000)
+        await _lifecycle_applied(server)
+        other = await connect_replay(server, transport)
+        try:
+            hello = await negotiate(
+                other,
+                observer=True,
+                extra=("child_run_history", "child_run_events"),
+                protocol_version="1.2",
+            )
+            assert "child_run_events" in hello["result"]["capabilities"]["features"]
+            failed = await other.request(3, "session_history_and_subscribe", {"session_id": session_id})
+            assert failed.get("result") is None
+            assert failed["error"]["code"] == -32007
+
+            live.update_agent_lifecycle(current_step="after")
+            await _lifecycle_applied(server)
+            await _publish_turns(server, session_id, 1)
+            # the published frames reach the joined stream, so they were sent
+            assert (await client.event("turn_start"))["stream_id"] == stream_id
+            await other.request(4, "status", {})
+            leaked = [frame for frame in other.buffered if "stream_id" in frame.get("params", {})]
+            assert leaked == [], "a frame carried the stream id of a join that failed"
+        finally:
+            await other.close()

@@ -448,7 +448,14 @@ class ReplayOutput:
                 continue
             self._publish_replay(state, event, session_id, fields, covers, scope=scope)
 
-    async def admit_join_response(self, connection: Any, frame: _Frame) -> bool:
+    async def admit_join_response(
+        self, connection: Any, request_id: str | int | None, result: object
+    ) -> bool:
+        frame = connection.codec.result_response(request_id, result)
+        if frame is None:
+            # fail closed: the client never gets this stream id, so no frame may carry it
+            self.invalidate_replay_connection(connection)
+            return await self.send(connection, connection.codec.response(request_id, result))
         state = self._connections.get(connection)
         if state is None or state.output is None:
             self.invalidate_replay_connection(connection)
