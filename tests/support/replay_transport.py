@@ -59,6 +59,7 @@ class ReplayClient:
                 # test-contract: transport replay transport reads unix and websocket serve frames
                 # test-contract: transport replay client reads raw unix frames, not standard JSON-RPC.
                 line = await await_or_fail(
+                    # test-contract: transport raw unix replay frame reader, not newline JSON-RPC client.
                     self.reader.readline(),
                     what=f"{what}; received={list(self.buffered)!r}",
                 )
