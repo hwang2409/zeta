@@ -143,7 +143,7 @@ class _WatchedEvent(asyncio.Event):
 
     async def wait(self) -> bool:
         self.waited.set()
-        return await super().wait()
+        return await asyncio.wait_for(super().wait(), 10)
 
 
 @dataclass
@@ -180,6 +180,7 @@ class _ClosingClient(httpx.AsyncClient):
         super().__init__(**kwargs)
         self.close_error: BaseException | None = None
         self.hold = False
+        self.swallow = False
         self.release = asyncio.Event()
         self.close_entered = asyncio.Event()
         self.close_cancelled = asyncio.Event()
@@ -187,12 +188,13 @@ class _ClosingClient(httpx.AsyncClient):
     async def aclose(self) -> None:
         await super().aclose()
         self.close_entered.set()
-        if self.hold:
+        while self.hold and not self.release.is_set():
             try:
                 await asyncio.wait_for(self.release.wait(), 10)
             except asyncio.CancelledError:
                 self.close_cancelled.set()
-                raise
+                if not self.swallow:
+                    raise
         if self.close_error is not None:
             raise self.close_error
 
@@ -410,7 +412,7 @@ def _attempt_bound_at(seam: str) -> Callable[[_Site, ManualDeadlineClock], Any]:
         attempt = site.attempt()
         await _first_event(attempt)
         closing, reader = await _park_attempt_close(seam, site, attempt)
-        clock.advance(20.0)
+        clock.advance(clock.now() + completion.ATTEMPT_CLOSE_BOUND)
         assert str(await _settle(closing)) == ATTEMPT_BOUND_FAILURE
         assert completion.ATTEMPT_CLOSE_BOUND == 20.0  # the production bound
         error = await _owner_returns(attempt)
@@ -438,7 +440,7 @@ def _attempt_abort_swallowed_at(
         await await_or_fail(
             site.body.cancel_seen[abort_index].wait(), what="abort reached the stream"
         )
-        clock.advance(20.0)
+        clock.advance(clock.now() + completion.ATTEMPT_CLOSE_BOUND)
         error = await _owner_returns(attempt)
         assert str(error) == ATTEMPT_BOUND_FAILURE
         assert not site.body.release.is_set()
@@ -459,13 +461,64 @@ def _attempt_bound_swallowed_at(
         await _first_event(attempt)
         closing, reader = await _park_attempt_close(seam, site, attempt)
         site.body.swallow += 1
-        clock.advance(20.0)
+        clock.advance(clock.now() + completion.ATTEMPT_CLOSE_BOUND)
         assert str(await _settle(closing)) == ATTEMPT_BOUND_FAILURE
         assert str(await _owner_returns(attempt)) == ATTEMPT_BOUND_FAILURE
         assert not site.body.release.is_set()
         backend_close = asyncio.create_task(site.backend.aclose())
         await await_or_fail(site.drained.waited.wait(), what="lease drain wait")
-        clock.advance(30.0)
+        clock.advance(clock.now() + transport.LEASE_DRAIN_BOUND)
+        outcome = await await_or_fail(backend_close, what="backend close")
+        named = [str(failure.error) for failure in outcome.failures]
+        assert named == [f"{LEASE_BOUND_FAILURE}: borrows still open: {site.name} completion"]
+        await _finish_reader(site, reader)
+
+    return row
+
+
+def _attempt_two_aborts_then_bound_at(
+    seam: str,
+) -> Callable[[_Site, ManualDeadlineClock], Any]:
+    # the serve shape: a client disconnect cancels the reading turn (abort 1),
+    # then server close cancels the task that closes it (aborts 2 and 3). the
+    # stream close catches every cancel and never ends; the production bound
+    # alone must end the close, and the lease bound then names the borrow.
+    async def row(site: _Site, clock: ManualDeadlineClock) -> None:
+        attempt = site.attempt()
+        await _first_event(attempt)
+        closing, reader = await _park_attempt_close(seam, site, attempt)
+        site.body.swallow = len(site.body.cancel_seen)
+        first_abort = 1 if seam == "producer-drain" else 0
+        closing.cancel()  # client disconnect
+        assert isinstance(await _settle(closing), asyncio.CancelledError)
+        await await_or_fail(
+            site.body.cancel_seen[first_abort].wait(), what="abort reached the stream"
+        )
+        serving = asyncio.Event()
+        closing_again = asyncio.Event()
+
+        async def server_close() -> None:
+            try:
+                serving.set()
+                await asyncio.wait_for(asyncio.Event().wait(), 10)
+            finally:
+                closing_again.set()  # the next line parks this task in aclose
+                await attempt.aclose()
+
+        server = asyncio.create_task(server_close())
+        await await_or_fail(serving.wait(), what="server task started")
+        server.cancel()  # server close: its cleanup closes the attempt aborted
+        await await_or_fail(closing_again.wait(), what="server close reached aclose")
+        server.cancel()  # server close gives up on that close too
+        assert isinstance(await _settle(server), asyncio.CancelledError)
+        # test-contract: seam no public view of the owner task itself
+        assert not attempt._close.task.done(), "the close ended before its bound"
+        clock.advance(clock.now() + completion.ATTEMPT_CLOSE_BOUND)
+        assert str(await _owner_returns(attempt)) == ATTEMPT_BOUND_FAILURE
+        assert not site.body.release.is_set()
+        backend_close = asyncio.create_task(site.backend.aclose())
+        await await_or_fail(site.drained.waited.wait(), what="lease drain wait")
+        clock.advance(clock.now() + transport.LEASE_DRAIN_BOUND)
         outcome = await await_or_fail(backend_close, what="backend close")
         named = [str(failure.error) for failure in outcome.failures]
         assert named == [f"{LEASE_BOUND_FAILURE}: borrows still open: {site.name} completion"]
@@ -587,7 +640,7 @@ def _lease_caller_cancelled_at(
 def _lease_bound_at(seam: str) -> Callable[[_Site, ManualDeadlineClock], Any]:
     async def row(site: _Site, clock: ManualDeadlineClock) -> None:
         closing, attempt = await _park_lease_close(seam, site)
-        clock.advance(30.0)
+        clock.advance(clock.now() + transport.LEASE_DRAIN_BOUND)
         outcome = await await_or_fail(closing, what="backend close")
         assert transport.LEASE_DRAIN_BOUND == 30.0  # the production bound
         named = [str(failure.error) for failure in outcome.failures]
@@ -601,6 +654,40 @@ def _lease_bound_at(seam: str) -> Callable[[_Site, ManualDeadlineClock], Any]:
         assert site.clients[0].is_closed
 
     return row
+
+
+async def _lease_late_failure_after_bound(
+    site: _Site, clock: ManualDeadlineClock
+) -> None:
+    # the client close catches the bound's cancel and fails only later: the
+    # backend close returns at the bound, and the late failure still reaches
+    # the loop's exception handler instead of vanishing.
+    site.clients[0].swallow = True
+    site.clients[0].close_error = RuntimeError("late client close failure")
+    closing, _ = await _park_lease_close("client-close", site)
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    published = asyncio.Event()
+
+    def report(_loop: object, context: dict[str, Any]) -> None:
+        reported.append(context)
+        published.set()
+
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(report)
+    try:
+        clock.advance(clock.now() + transport.LEASE_DRAIN_BOUND)
+        outcome = await await_or_fail(closing, what="backend close")
+        assert [str(failure.error) for failure in outcome.failures] == [LEASE_BOUND_FAILURE]
+        await await_or_fail(site.clients[0].close_cancelled.wait(), what="bound cancel")
+        assert reported == []
+        site.clients[0].release.set()
+        await await_or_fail(published.wait(), what="late failure report")
+        assert [(c["message"], str(c["exception"])) for c in reported] == [
+            ("http client close failed", "late client close failure")
+        ]
+    finally:
+        loop.set_exception_handler(previous)
 
 
 ATTEMPT_SITES = ("ollama", "anthropic", "codex")
@@ -619,6 +706,7 @@ ATTEMPT_ROWS: list[tuple[str, Callable[[_Site, ManualDeadlineClock], Any]]] = [
             ("bound", _attempt_bound_at),
             ("abort-swallowed-bound", _attempt_abort_swallowed_at),
             ("bound-swallowed", _attempt_bound_swallowed_at),
+            ("two-aborts-swallowed-bound", _attempt_two_aborts_then_bound_at),
         )
     ),
 ]
@@ -628,6 +716,7 @@ LEASE_ROWS: list[tuple[str, Callable[[_Site, ManualDeadlineClock], Any]]] = [
     ("client-close-failure", _lease_client_close_failure),
     ("duplicate", _lease_duplicate),
     ("close-after-caller-cancel", _lease_close_after_caller_cancel),
+    ("late-failure-after-bound", _lease_late_failure_after_bound),
     *(
         (f"{seam}-{name}", make(seam))
         for seam in LEASE_SEAMS
