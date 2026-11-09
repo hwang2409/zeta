@@ -36,6 +36,8 @@ from .commands.slash_registry import (
     SlashHandler,
     SlashLock,
     SlashSurface,
+    always,
+    never,
 )
 from .project_context import (
     discover_project_root,
@@ -869,10 +871,6 @@ def _no_args(args: str) -> bool:
     return not args.strip()
 
 
-def _never_mutates(_args: str) -> bool:
-    return False
-
-
 def _memory_mutates(args: str) -> bool:
     action = args.strip()
     return action == "undo" or action.startswith(
@@ -942,7 +940,7 @@ def create_slash_registry(
             _build_status,
             _publish_status,
             "show session status",
-            serve=ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+            serve=ServeSlash(mutates=never, runs_while_busy=_no_args),
         )
     )
     safe = SlashCommand.loop_safe
@@ -952,7 +950,7 @@ def create_slash_registry(
             "mcp",
             _delegate("slash_mcp", strip=True),
             "show MCP server status",
-            serve=ServeSlash(mutates=_mcp_mutates, runs_while_busy=_never_mutates),
+            serve=ServeSlash(mutates=_mcp_mutates, runs_while_busy=never),
             reason=native,
         )
     )
@@ -1028,7 +1026,7 @@ def create_slash_registry(
             "compact",
             _run_compact,
             "compact the context",
-            serve=ServeSlash(mutates=lambda _args: True),
+            serve=ServeSlash(mutates=always),
             reason=native,
         )
     )
@@ -1057,7 +1055,7 @@ def create_slash_registry(
             "inbox",
             _delegate("slash_inbox"),
             "list this project's inbox",
-            serve=ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+            serve=ServeSlash(mutates=never, runs_while_busy=_no_args),
             reason=native,
         )
     )
@@ -1077,7 +1075,7 @@ def create_slash_registry(
             "repair-transcript",
             _delegate("slash_repair_transcript"),
             "repair one corrupt transcript: /repair-transcript <session> confirm",
-            serve=ServeSlash(mutates=lambda _args: True),
+            serve=ServeSlash(mutates=always),
             reason=native,
         )
     )
@@ -1109,7 +1107,7 @@ def create_slash_registry(
             "help",
             lambda _session, _args: registry.help_text(),
             "list commands",
-            serve=ServeSlash(mutates=_never_mutates, runs_while_busy=_no_args),
+            serve=ServeSlash(mutates=never, runs_while_busy=_no_args),
             reason=pending,
         )
     )
