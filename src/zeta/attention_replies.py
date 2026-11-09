@@ -20,7 +20,7 @@ from .attention_records import (
     Missing,
     broken_record_refusal,
 )
-from .project_inbox import ProjectInbox, USER_ORIGIN
+from .project_inbox import USER_ORIGIN, ProjectInbox
 from .runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,

@@ -928,7 +928,7 @@ class ProjectInbox:
         if reply is not None:
             sender = record["from"]
             assert isinstance(sender, dict)
-            _reply_id_value, sent_outcome = self.send_with_outcome(
+            _reply_id_value, sent_outcome = self.send_agent_with_outcome(
                 from_project=target.project_id,
                 from_session=session_id,
                 to_project=str(sender["project"]),
