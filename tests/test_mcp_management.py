@@ -1028,6 +1028,31 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+async def test_mcp_startup_does_not_recreate_missing_session_cwd(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "deleted-worktree"
+    project.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=project)
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_mcp_scope(home=project / ".zeta", project_dir=project)
+    project.rmdir()
+    try:
+        await loop.ensure_mcp_servers()
+        assert not project.exists()
+        assert await loop.slash_mcp("status") == (
+            f"mcp error: MCP config directory does not exist: {project}"
+        )
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(
     tmp_path, monkeypatch
 ):

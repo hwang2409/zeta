@@ -257,6 +257,23 @@ class MCPManagementService:
             "project directory no longer exists; cannot write MCP config"
         )
 
+    def _ensure_nonproject_parent(self, path: Path) -> None:
+        home_root = home_config_path(self.home).parent.resolve()
+        try:
+            path.parent.relative_to(home_root)
+        except ValueError:
+            if not path.parent.is_dir():
+                raise MCPManagementError(
+                    f"MCP config directory does not exist: {path.parent}"
+                )
+            path.parent.mkdir(parents=False, exist_ok=True)
+        else:
+            if not home_root.parent.is_dir():
+                raise MCPManagementError(
+                    f"MCP config directory does not exist: {home_root.parent}"
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+
     def _project_root_for_path(self, path: Path) -> Path | None:
         if self.project_dir is None:
             return None
@@ -278,7 +295,7 @@ class MCPManagementService:
             except FileNotFoundError as exc:
                 raise self._no_project_error() from exc
         else:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_nonproject_parent(path)
         self._ensure_open()
         fd, temporary = tempfile.mkstemp(
             prefix=".mcp-management.", dir=str(path.parent)
@@ -356,7 +373,7 @@ class MCPManagementService:
                         unavailable.add(path)
                         continue
                 else:
-                    path.parent.mkdir(parents=True, exist_ok=True)
+                    self._ensure_nonproject_parent(path)
                 lock_path = path.with_name(f".{path.name}.lock")
                 self._ensure_open()
                 try:
