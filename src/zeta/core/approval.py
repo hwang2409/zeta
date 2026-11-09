@@ -26,7 +26,6 @@ from .store import ConversationStore
 
 PRECEDENCE = ("deny", "ask", "allow", "default")
 
-
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
@@ -48,7 +47,6 @@ class SessionGrantChange:
     change: Literal["grant", "revoke", "clear", "reset"]
     changed: tuple[str, ...]
     snapshot: PermissionSnapshot
-
 
 class SessionGrantNotFound(ValueError):
     """The exact displayed session grant is no longer active."""
@@ -271,7 +269,6 @@ class ApprovalRequest:
                 f"cannot resolve persisted tool call: {self.tool_call.name}"
             )
         return ApprovalRule(self.tool_call.name, action=self.action)
-
 
 class ApprovalCapability(Protocol):
     """Resolved authorization facts supplied by the tool registry."""
