@@ -2,9 +2,7 @@
 
 from .loader import (
     SkillCatalog,
-    SkillCatalogWatcher,
     SkillMeta,
-    SkillRefresh,
     discover_packaged_skills,
     discover_session_skills,
     discover_skills,
@@ -15,9 +13,7 @@ from .loader import (
 
 __all__ = [
     "SkillCatalog",
-    "SkillCatalogWatcher",
     "SkillMeta",
-    "SkillRefresh",
     "discover_packaged_skills",
     "discover_session_skills",
     "discover_skills",

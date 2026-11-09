@@ -997,8 +997,6 @@ async def _frames_until_eof(reader: asyncio.StreamReader) -> list[dict[str, Any]
     return frames
 
 
-
-
 class OAuthRefreshFailureBackend:
     def __init__(self, driver: Any, status_code: int) -> None:
         self.driver = driver
@@ -3171,9 +3169,15 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert next_reply not in json.dumps(
             [message.to_dict() for message in history]
         )
+        frames += await _request(reader, writer, 5, "status", {})
+        names = [frame.get("params", {}).get("event") for frame in frames]
+        assert names.count("approval_end") == 1
+        assert names.index("approval_end") < names.index("turn_aborted")
+        after_abort = names[names.index("turn_aborted") + 1 :]
+        assert not {"tool_start", "tool_end", "turn_start"}.intersection(after_abort)
 
         next_frames = await _request(
-            reader, writer, 5, "send", {"text": "run after abort"}
+            reader, writer, 6, "send", {"text": "run after abort"}
         )
         if not _named_events(next_frames, "turn_end"):
             try:
@@ -3945,9 +3949,7 @@ async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> Non
         await asyncio.sleep(0)
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         writers.append(writer)
-        hello = await _request(
-            reader, writer, 1, "hello", {"protocol_version": "1.0"}
-        )
+        hello = await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         assert hello[-1]["result"]["notices"] == [
             "could not clean up account directory /secret"
         ]
@@ -4298,7 +4300,10 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
         ),
         (
             "error",
-            {"error": {"code": "empty_turn", "message": bounded_error.message}, "data": {}},
+            {
+                "error": {"code": "empty_turn", "message": bounded_error.message},
+                "data": {},
+            },
         ),
     ]
 
@@ -12058,6 +12063,251 @@ async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
         await close_serve(server, writer)
 
 
+@pytest.mark.parametrize("negotiated", [False, True], ids=["legacy", "feature"])
+async def test_config_changed_requires_live_config_changed_feature(
+    tmp_path: Path, negotiated: bool
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        features = ["live_config_changed"] if negotiated else []
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": features},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        await server.runtime.loop.refresh_live_config()
+        assert len(prepared_events) == 1
+        notifications: list[str] = []
+        original_notify = server.control._notify
+
+        async def record_notify(event: str, *args: object, **kwargs: object) -> None:
+            notifications.append(event)
+            await original_notify(event, *args, **kwargs)
+
+        server.control._notify = record_notify
+        await server.control._event(prepared_events[0], background=True)
+        await _request(reader, writer, 3, "status", {})
+
+        assert ("config_changed" in notifications) is negotiated
+        if negotiated:
+            config_event = await _event(reader, "config_changed")
+            assert config_event["data"]["changes"]["agents"]["added"] == ["specialist"]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_unnegotiated_config_change_preserves_complete_frame_stream(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+
+    async def raw_request_frames(
+        request_id: int, method: str, params: dict[str, object]
+    ) -> bytes:
+        request = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+            ).encode()
+            + b"\n"
+        )
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), 10)
+        frames: list[bytes] = []
+        while True:
+            # test-contract: transport exact raw frames are required to compare byte-for-byte streams
+            frame = await asyncio.wait_for(reader.readline(), 10)
+            assert frame, f"server closed before the {method} response"
+            frames.append(frame)
+            if json.loads(frame).get("id") == request_id:
+                return b"".join(frames)
+
+    try:
+        await asyncio.wait_for(
+            raw_request_frames(1, "hello", {"protocol_version": "1.1", "features": []}),
+            30,
+        )
+        await asyncio.wait_for(
+            raw_request_frames(2, "new_session", {"provider": "codex"}), 30
+        )
+        assert server.runtime.loop is not None
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        await asyncio.wait_for(server.runtime.loop.refresh_live_config(), 10)
+        assert len(prepared_events) == 1
+
+        base_frames = await asyncio.wait_for(raw_request_frames(3, "status", {}), 30)
+        await asyncio.wait_for(
+            server.control._event(prepared_events[0], background=True), 10
+        )
+        actual_frames = await asyncio.wait_for(raw_request_frames(3, "status", {}), 30)
+
+        assert actual_frames == base_frames
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_many_config_changes_reach_negotiated_serve_client_bounded(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["live_config_changed"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        for index in range(132):
+            name = f"item-{index}-" + "x" * 8_000
+            for kind, body in (("skills", "skill body"), ("agents", "profile body")):
+                path = tmp_path / kind / f"item-{index}.md"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"---\nname: {name}\ndescription: focused\n---\n{body}\n",
+                    encoding="utf-8",
+                )
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        await server.runtime.loop.refresh_live_config()
+
+        assert len(prepared_events) == 1
+        await server.control._event(prepared_events[0], background=True)
+        frame = await _read(reader)
+        assert frame["params"]["event"] == "config_changed", (
+            "bounded config changes became a serve error frame"
+        )
+        config_event = frame["params"]
+
+        skills = config_event["data"]["changes"]["skills"]
+        agents = config_event["data"]["changes"]["agents"]
+        assert len(skills["added"]) == 26, "serve skill changes were not bounded"
+        assert len(agents["added"]) == 26, "serve agent changes were not bounded"
+        assert skills["added"][-1] == "and 107 more"
+        assert agents["added"][-1] == "and 107 more"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_active_status_overlays_live_config_without_persisting_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["live_config_changed"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        persisted = server.runtime.metadata.agent_catalog
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+        await server.runtime.loop.refresh_live_config()
+        from zeta.skills.agent_catalog import AgentCatalog
+        from zeta.skills.catalog import SkillCatalog
+
+        snapshot_calls: list[str] = []
+        original_skill_snapshot = SkillCatalog.to_snapshot
+        original_agent_snapshot = AgentCatalog.to_snapshot
+
+        def skill_snapshot(catalog: SkillCatalog):
+            snapshot_calls.append("skills")
+            return original_skill_snapshot(catalog)
+
+        def agent_snapshot(catalog: AgentCatalog):
+            snapshot_calls.append("agents")
+            return original_agent_snapshot(catalog)
+
+        monkeypatch.setattr(SkillCatalog, "to_snapshot", skill_snapshot)
+        monkeypatch.setattr(AgentCatalog, "to_snapshot", agent_snapshot)
+        status = (await _request(reader, writer, 3, "status", {}))[-1]["result"]
+
+        assert snapshot_calls == [], "status rebuilt active catalog snapshots"
+        assert "specialist" in {
+            item["name"] for item in status["session"]["agent_catalog"]
+        }
+        assert server.runtime.metadata.agent_catalog is persisted
+        assert "specialist" not in {item["name"] for item in (persisted or [])}
+    finally:
+        await close_serve(server, writer)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("record", "reason", "description"),
@@ -12287,6 +12537,7 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
+        # test-contract: transport raw request must remain pending while settlement gates are exercised
         writer.write(
             (
                 json.dumps(
@@ -12537,11 +12788,14 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     # test-contract: seam the bounded queue has no public admission hook
     monkeypatch.setattr(server.connections, "_enqueue", record_enqueue)
     # test-contract: seam approval settlement has no public pre-publication hook
-    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish_record)
+    monkeypatch.setattr(
+        server.control._approvals, "_finish_record", gated_finish_record
+    )
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
+        # test-contract: transport raw request must remain pending while settlement gates are exercised
         writer.write(
             (
                 json.dumps(

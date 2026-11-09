@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ...core.session import SessionNotFoundError
 from ...core.session_execution import SessionOwnedError
@@ -11,6 +11,9 @@ from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError
 from . import validation
+
+if TYPE_CHECKING:
+    from ...runtime.loop import AgentLoop
 
 
 async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
@@ -116,11 +119,37 @@ def host_commands(self, params: dict[str, Any]) -> SessionHostCommands:
     return SessionHostCommands.parse(params["host_commands"])
 
 
+def _active_runtime_snapshot(
+    persisted: dict[str, object], loop: AgentLoop | None
+) -> dict[str, object]:
+    if loop is None:
+        return persisted
+    snapshot = dict(persisted)
+    prompt = loop._runtime_prompt.system_prompt
+    if isinstance(prompt, str):
+        snapshot["system_prompt"] = prompt
+    snapshot["prompt_components"] = {
+        key: dict(component)
+        for key, component in loop._runtime_prompt.prompt_components.items()
+    }
+    snapshot["skill_catalog"] = (
+        snapshot.get("skill_catalog")
+        if loop._live_skill_catalog_snapshot is None
+        else loop._live_skill_catalog_snapshot
+    )
+    snapshot["agent_catalog"] = (
+        snapshot.get("agent_catalog")
+        if loop._live_agent_catalog_snapshot is None
+        else loop._live_agent_catalog_snapshot
+    )
+    return snapshot
+
+
 def session_snapshot(self) -> dict[str, object] | None:
     runtime = self.server.runtime
     if runtime.opened is None:
         return None
-    snapshot = runtime.metadata.to_dict()
+    snapshot = _active_runtime_snapshot(runtime.metadata.to_dict(), runtime.loop)
     if runtime.policy is not None:
         snapshot["approval_mode"] = runtime.policy.default.value
     return snapshot
