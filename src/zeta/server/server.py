@@ -34,11 +34,9 @@ from .protocol import (
     MethodDescriptor,
     ProtocolError,
     _Frame,
-    feature_error,
     finish_frame_write,
     hello_result,
     negotiate_protocol_version,
-    protocol_error,
 )
 from .protocol import _dispatch as _dispatch_request
 from .runtime import BackendFactory, ServerRuntime
@@ -550,8 +548,6 @@ class _Client:
 
     _dispatch = _dispatch_request
 
-    _descriptor_protocol_error = staticmethod(protocol_error)
-    _descriptor_feature_error = staticmethod(feature_error)
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:

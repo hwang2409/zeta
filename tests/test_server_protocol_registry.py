@@ -119,6 +119,126 @@ async def test_observer_access_uses_shared_dispatch_table(transport: str, tmp_pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_every_observer_request_has_transport_parity(
+    transport: str, tmp_path: Path
+) -> None:
+    contract = await ServeContract.start(tmp_path / transport, transport)  # type: ignore[arg-type]
+    features = [
+        "serve_observers",
+        "content_read",
+        "ping",
+        "delivery_id",
+        "session_grants",
+    ]
+    try:
+        controller = await contract.connect("controller")
+        await controller.request(
+            "controller-hello",
+            "hello",
+            {"protocol_version": "1.2", "features": features},
+        )
+        created = await controller.request(
+            "controller-new-session", "new_session", {"provider": "codex"}
+        )
+        session_id = created["result"]["session"]["session_id"]
+        observer = await contract.connect("observer")
+        await observer.request(
+            "observer-hello",
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": features,
+            },
+        )
+
+        listing = await observer.request("observer-list", "list_sessions")
+        controller_listing = await controller.request(
+            "controller-list", "list_sessions"
+        )
+        assert listing["result"] == controller_listing["result"]
+
+        status = await observer.request(
+            "observer-status",
+            "status",
+            {"include_connection_setup_counts": True},
+        )
+        assert set(status["result"]) == {
+            "compaction_markers",
+            "explicit_finish",
+            "max_agent_depth",
+            "pending_approvals",
+            "project_context_health",
+            "session",
+            "state",
+            "usage",
+        }
+        assert status["result"]["session"]["session_id"] == session_id
+
+        tree = await observer.request(
+            "observer-tree", "session_tree", {"session_id": session_id}
+        )
+        assert tree["result"] == {"branches": []}
+        history = await observer.request(
+            "observer-history", "session_history", {"session_id": session_id}
+        )
+        assert history["result"] == {"messages": [], "next_offset": None}
+        content = await observer.request(
+            "observer-content", "content_read", {"handle": "missing"}
+        )
+        assert content["error"] == {
+            "code": -32012,
+            "message": "content not found",
+            "data": {"code": "content_not_found"},
+        }
+
+        catalog = await observer.request("observer-catalog", "model_catalog")
+        controller_catalog = await controller.request(
+            "controller-catalog", "model_catalog"
+        )
+        assert catalog["result"] == controller_catalog["result"]
+        settings = await observer.request("observer-settings", "session_settings")
+        assert settings["result"] == {
+            "model": "gpt-5.6-luna",
+            "approval_mode": "ask",
+        }
+        ping = await observer.request("observer-ping", "ping")
+        assert ping["result"] == {"pong": True}
+        delivery = await observer.request(
+            "observer-delivery",
+            "delivery_status",
+            {"delivery_id": "missing"},
+        )
+        assert delivery["result"] == {
+            "delivery_id": "missing",
+            "status": "unknown",
+        }
+        grants = await observer.request("observer-grants", "session_grants")
+        assert grants["result"] == {
+            "session_id": session_id,
+            "default": "ask",
+            "precedence": ["deny", "ask", "allow", "default"],
+            "rules": {"deny": [], "ask": [], "allow": []},
+            "session_grants": [],
+        }
+        denied = await observer.request(
+            "observer-new-session", "new_session", {"provider": "codex"}
+        )
+        assert denied == {
+            "jsonrpc": "2.0",
+            "id": "observer-new-session",
+            "error": {
+                "code": -32008,
+                "message": "method is unavailable to read-only observers",
+                "data": {"code": "observer_read_only", "method": "new_session"},
+            },
+        }
+    finally:
+        await contract.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
 async def test_real_method_conformance_matrix(transport: str, tmp_path: Path) -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     section = _section(document, "## method table", "## common JSON-RPC shapes")
@@ -635,36 +755,140 @@ def test_static_gate_rejects_raw_method_dispatch_mutations(source: str) -> None:
     assert _source_bypasses(source)
 
 
-def _dispatch_mapping_bypasses(source: str) -> list[str]:
-    tree = ast.parse(source)
+def _dispatch_mapping_bypasses(sources: dict[Path, str]) -> list[str]:
+    wires = {item.wire for item in MethodDescriptor}
     violations: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
-            continue
-        if (
-            isinstance(node.left, ast.Name)
-            and node.left.id in {"method", "wire"}
-            and any(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in node.comparators)
-            and not any(isinstance(item, ast.Constant) and item.value == "hello" for item in node.comparators)
-        ):
-            violations.append(f"line {node.lineno}: method strings belong in the dispatch registry")
+
+    def report(path: Path, node: ast.AST, message: str) -> None:
+        violations.append(f"{path.relative_to(ROOT)}:{node.lineno}: {message}")
+
+    for path, source in sources.items():
+        tree = ast.parse(source)
+        allowed_table = next(
+            (
+                item.value
+                for item in tree.body
+                if path == ROOT / "src/zeta/server/handlers/registry.py"
+                and isinstance(item, ast.AnnAssign)
+                and isinstance(item.target, ast.Name)
+                and item.target.id == "HANDLERS"
+            ),
+            None,
+        )
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                operands = (node.left, *node.comparators)
+                string_method = any(
+                    isinstance(item, ast.Constant) and item.value in wires
+                    for item in operands
+                ) and any(
+                    isinstance(item, ast.Name) and item.id in {"method", "wire"}
+                    for item in operands
+                )
+                if string_method:
+                    report(path, node, "method strings belong in handlers/registry.py")
+                descriptor_branch = any(
+                    isinstance(item, ast.Attribute)
+                    and isinstance(item.value, ast.Name)
+                    and item.value.id == "MethodDescriptor"
+                    for item in (node.left, *node.comparators)
+                )
+                if descriptor_branch:
+                    report(path, node, "descriptor branches may not select implementations")
+            if (
+                isinstance(node, ast.Match)
+                and isinstance(node.subject, ast.Name)
+                and node.subject.id in {"method", "wire", "descriptor"}
+            ):
+                report(path, node, "serve methods may not be selected with match")
+            if isinstance(node, ast.Dict):
+                descriptor_keys = any(
+                    isinstance(key, ast.Attribute)
+                    and isinstance(key.value, ast.Name)
+                    and key.value.id == "MethodDescriptor"
+                    for key in node.keys
+                    if key is not None
+                )
+                callable_values = any(
+                    isinstance(value, (ast.Name, ast.Attribute, ast.Lambda))
+                    for value in node.values
+                )
+                if descriptor_keys and callable_values and node is not allowed_table:
+                    report(path, node, "HANDLERS is the only descriptor-to-callable map")
+            if isinstance(node, ast.DictComp) and any(
+                isinstance(item, ast.Name) and item.id == "MethodDescriptor"
+                for generator in node.generators
+                for item in ast.walk(generator.iter)
+            ):
+                report(path, node, "generated descriptor handler maps are forbidden")
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and (
+                    isinstance(node.args[1], ast.Name)
+                    and node.args[1].id in {"method", "wire"}
+                    or isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value in wires
+                )
+            ):
+                report(path, node, "getattr may not dispatch serve methods")
     return violations
 
 
-def test_dispatch_entrypoints_have_no_method_string_mapping() -> None:
-    for path in (ROOT / "src/zeta/server/server.py", ROOT / "src/zeta/server/connections.py"):
-        assert not (violations := _dispatch_mapping_bypasses(path.read_text())), "\\n".join(violations)
+def _server_sources() -> dict[Path, str]:
+    root = ROOT / "src/zeta/server"
+    return {path: path.read_text() for path in root.rglob("*.py")}
+
+
+def test_one_table_is_the_only_serve_method_dispatch_authority() -> None:
+    registry = ROOT / "src/zeta/server/handlers/registry.py"
+    tree = ast.parse(registry.read_text())
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            child.parent = parent
+    handlers = next(
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "HANDLERS"
+    )
+    assert isinstance(handlers, ast.Dict)
+    assert len(handlers.keys) == len(MethodDescriptor)
+    assert all(isinstance(value, ast.Name) for value in handlers.values)
+    assert len({value.id for value in handlers.values}) == len(MethodDescriptor)
+    assert not (
+        violations := _dispatch_mapping_bypasses(_server_sources())
+    ), "\n".join(violations)
 
 
 @pytest.mark.parametrize(
-    "source",
+    ("relative_path", "mutation"),
     (
-        'def route(method):\n    if method == "new_session":\n        return True\n',
-        'def route(wire):\n    if wire == "send":\n        return True\n',
+        ("accounts.py", 'if method == "account_list": pass'),
+        (
+            "handlers/registry.py",
+            "SECOND = {MethodDescriptor.PING: ping}",
+        ),
+        (
+            "handlers/registry.py",
+            "def bypass(descriptor): return ping if descriptor is MethodDescriptor.PING else status",
+        ),
+        (
+            "accounts.py",
+            'RESULT = getattr(object(), "ping")',
+        ),
     ),
 )
-def test_dispatch_guard_rejects_second_mapping(source: str) -> None:
-    assert _dispatch_mapping_bypasses(source)
+def test_dispatch_guard_rejects_production_mutations(
+    relative_path: str, mutation: str
+) -> None:
+    sources = _server_sources()
+    path = ROOT / "src/zeta/server" / relative_path
+    sources[path] += f"\n{mutation}\n"
+    assert _dispatch_mapping_bypasses(sources)
 
 
 def test_no_code_bypasses_the_typed_frame_codec() -> None:

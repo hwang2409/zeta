@@ -43,7 +43,6 @@ from ..runtime.status import (
     build_slash_status,
     capture_slash_status,
 )
-from . import accounts
 from .handlers import validation
 from .model_selection import apply as apply_settings
 from .protocol import (
@@ -466,30 +465,6 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         project_registry_state=runtime.manager.project_registry_state,
         surface=SlashSurface.SERVE,
     )
-
-
-READ_REQUESTS = {"slash_list", *accounts.REQUEST_METHODS}
-
-
-async def read_request(
-    method: str,
-    runtime: ServerRuntime,
-    require_idle: Callable[[], Awaitable[None]],
-    params: dict[str, object],
-    owner: object,
-) -> dict[str, object]:
-    if method == "slash_list":
-        include_unavailable = params.get("include_unavailable", False)
-        if not isinstance(include_unavailable, bool):
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS,
-                "include_unavailable must be a boolean",
-            )
-        return await list_commands(runtime, include_unavailable=include_unavailable)
-    operation = accounts.request(method, runtime, require_idle, params)
-    if method == "account_switch":
-        return await accounts.run_owned_switch(owner, operation)
-    return await operation
 
 
 async def list_commands(

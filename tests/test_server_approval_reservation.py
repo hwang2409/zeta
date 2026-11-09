@@ -39,7 +39,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.server import ZetaServer
-from zeta.server.handlers import lifecycle
+from zeta.server.handlers import lifecycle, registry
 from zeta.server.protocol import EventDescriptor, ProtocolError
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
@@ -1505,8 +1505,9 @@ async def test_slash_and_ergonomics_read_serve_control_not_store(
         status = session.slash_status()
         assert status.pending_approvals == ("call-1 (read)",)
         with pytest.raises(ProtocolError) as error:
-            await server._client._ergonomics(
-                "set_settings",
+            await registry.set_settings(
+                server._client,
+                "set-settings",
                 {
                     "session_id": server.runtime.session_id,
                     "model": server.runtime.metadata.model,

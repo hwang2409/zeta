@@ -113,6 +113,7 @@ from zeta.server.event_contract import (
     STREAM_EVENT_WIRE_EVENTS,
     tool_end,
 )
+from zeta.server.handlers import registry
 from zeta.server.protocol import (
     MAX_FRAME_BYTES,
     MAX_REQUEST_ID_BYTES,
@@ -11431,8 +11432,9 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             def start_rename() -> None:
                 rename_tasks.append(
                     asyncio.create_task(
-                        second_client._ergonomics(
-                            "rename_session",
+                        registry.rename_session(
+                            second_client,
+                            "rename-session",
                             {"session_id": sid, "name": "renamed during switch"},
                         )
                     )

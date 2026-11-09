@@ -335,14 +335,50 @@ class MethodDescriptor(Enum):
 
 
 
+_LOGIN_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
+)
+_ERGONOMICS_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in (
+        "RENAME_SESSION",
+        "DELETE_SESSION",
+        "REPAIR_TRANSCRIPT",
+        "SESSION_TREE",
+        "SESSION_HISTORY",
+        "CONTENT_READ",
+        "MODEL_CATALOG",
+        "SESSION_SETTINGS",
+        "SET_SETTINGS",
+        "SET_COMPACTION",
+        "SEND_IMAGES",
+        "SWITCH_BRANCH",
+        "FORK_MESSAGE",
+        "SLASH_LIST",
+        "SLASH_RUN",
+        "ACCOUNT_LIST",
+        "ACCOUNT_LOGOUT",
+        "ACCOUNT_REFRESH",
+        "ACCOUNT_SWITCH",
+    )
+)
+_PROJECT_METHODS = frozenset(
+    MethodDescriptor[name]
+    for name in (
+        "LIST_PROJECTS",
+        "PROJECT_SHOW",
+        "PROJECT_MEMORY_LOG",
+        "PROJECT_INBOX",
+    )
+)
+
+
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
 TOOL_OUTPUT_MAX_BYTES = 8_000
 
-_LOGIN_METHODS = frozenset(MethodDescriptor[name] for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS"))
-_ERGONOMICS_METHODS = frozenset(MethodDescriptor[name] for name in ("RENAME_SESSION", "DELETE_SESSION", "REPAIR_TRANSCRIPT", "SESSION_TREE", "SESSION_HISTORY", "CONTENT_READ", "MODEL_CATALOG", "SESSION_SETTINGS", "SET_SETTINGS", "SET_COMPACTION", "SEND_IMAGES", "SWITCH_BRANCH", "FORK_MESSAGE", "SLASH_LIST", "SLASH_RUN", "ACCOUNT_LIST", "ACCOUNT_LOGOUT", "ACCOUNT_REFRESH", "ACCOUNT_SWITCH"))
-_PROJECT_METHODS = frozenset(MethodDescriptor[name] for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX"))
 
 
 async def _dispatch(

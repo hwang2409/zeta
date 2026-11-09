@@ -128,35 +128,45 @@ class ProjectRequests:
             if item.project_id == project_id
         ]
 
-    def dispatch(
+    def list_projects(
+        self, request_id: str | int, params: dict[str, Any]
+    ) -> dict[str, object]:
+        return self._list_projects(request_id, params)
+
+    def show(
         self,
         request_id: str | int,
-        method: str,
         params: dict[str, Any],
         *,
-        features: frozenset[str] = frozenset(),
+        entry_response: bool,
     ) -> dict[str, object]:
-        if method == "list_projects":
-            return self._list_projects(request_id, params)
-        project_id = self._project_id(params)
-        project = self.require_project(project_id)
-        entry_response = "projects-memory-v2" in features
-        if method == "project_show":
-            self._only(params, {"project_id"})
-            return (
-                self.entry_views.show(request_id, project)
-                if entry_response
-                else self._show(request_id, project)
-            )
-        if method == "project_memory_log":
-            return (
-                self.entry_views.memory_log(request_id, project, params)
-                if entry_response
-                else self._memory_log(request_id, project, params)
-            )
-        if method == "project_inbox":
-            return self._inbox(request_id, project, params)
-        raise AssertionError(f"unknown project request: {method}")
+        project = self.require_project(self._project_id(params))
+        self._only(params, {"project_id"})
+        return (
+            self.entry_views.show(request_id, project)
+            if entry_response
+            else self._show(request_id, project)
+        )
+
+    def memory_log(
+        self,
+        request_id: str | int,
+        params: dict[str, Any],
+        *,
+        entry_response: bool,
+    ) -> dict[str, object]:
+        project = self.require_project(self._project_id(params))
+        return (
+            self.entry_views.memory_log(request_id, project, params)
+            if entry_response
+            else self._memory_log(request_id, project, params)
+        )
+
+    def inbox(
+        self, request_id: str | int, params: dict[str, Any]
+    ) -> dict[str, object]:
+        project = self.require_project(self._project_id(params))
+        return self._inbox(request_id, project, params)
 
     def _list_projects(
         self, request_id: str | int, params: dict[str, Any]
