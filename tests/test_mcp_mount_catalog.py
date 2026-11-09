@@ -25,6 +25,7 @@ async def test_remove_and_readd_server_updates_activation_catalog(
             ),
         )
     )
+    # test-contract: seam _build_client is the existing MCP fixture boundary.
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: next(clients))
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
