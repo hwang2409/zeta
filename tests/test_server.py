@@ -354,17 +354,21 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
 ) -> None:
     monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.05)
     release = asyncio.Event()
+    drain_exited = asyncio.Event()
 
     class StubbornWriter:
         def write(self, payload: bytes) -> None:
             pass
 
         async def drain(self) -> None:
-            while not release.is_set():
-                try:
-                    await asyncio.wait_for(release.wait(), 10)
-                except asyncio.CancelledError:
-                    continue
+            try:
+                while not release.is_set():
+                    try:
+                        await asyncio.wait_for(release.wait(), 10)
+                    except asyncio.CancelledError:
+                        continue
+            finally:
+                drain_exited.set()
 
     started = asyncio.Event()
     codec = protocol_module.FrameCodec()
@@ -395,8 +399,9 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
         assert outcomes == [False]
     finally:
         release.set()
-        # test-contract: latency <allow the cancellation-resistant drain to exit>
-        await asyncio.sleep(0.01)
+        await await_or_fail(drain_exited.wait(), what="cancellation-resistant drain")
+        with suppress(protocol_module.FrameWriteCancelled):
+            await await_or_fail(task, what="canceled frame write")
 
 
 @pytest.mark.asyncio

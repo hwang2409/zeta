@@ -1271,11 +1271,7 @@ async def _collect_second_parent_terminal(
         if buffered:
             frame = buffered.popleft()
         else:
-            # test-contract: transport <read event stream outside request-response flow>
-            line = await reader.readline()
-            if not line:
-                return frames, "socket eof"
-            frame = json.loads(line)
+            frame = await read(reader)
         frames.append(frame)
         if frame.get("params", {}).get("event") == "agent_end":
             release_child.set()
@@ -1290,11 +1286,7 @@ async def _read_until_child_bash_two(
         if buffered:
             frame = buffered.popleft()
         else:
-            # test-contract: transport <read event stream outside request-response flow>
-            line = await reader.readline()
-            if not line:
-                return "socket eof"
-            frame = json.loads(line)
+            frame = await read(reader)
         frames.append(frame)
         params = frame.get("params", {})
         if params.get("tool_call", {}).get("id") != "child-bash-2":
