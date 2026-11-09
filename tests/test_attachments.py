@@ -399,7 +399,7 @@ async def test_cancelled_image_paste_cleans_up_staged_file(
         return staged
 
     monkeypatch.setattr(paste_runtime, "paste_image", paste_image)
-    task = asyncio.create_task(app.paste_from_clipboard())
+    task = asyncio.create_task(app._paste_runtime.paste())
     while not entered.is_set():
         await asyncio.sleep(0)
     task.cancel()
@@ -599,7 +599,7 @@ async def test_paste_completion_file_io_stays_off_loop(
     monkeypatch.setattr(paste_runtime.os, "unlink", unlink)
     monkeypatch.setattr(_attachments.base64, "b64encode", b64encode)
 
-    assert await app.paste_from_clipboard() == "[Image #1]"
+    assert await app._paste_runtime.paste() == "[Image #1]"
     old_session = app._make_session()
     app._active_session = old_session
     task = app._paste_runtime.start()
@@ -1032,7 +1032,7 @@ async def test_clipboard_image_is_normalized_before_provider_request(
         return path
 
     monkeypatch.setattr(paste_runtime, "paste_image", paste_image)
-    token = await app.paste_from_clipboard()
+    token = await app._paste_runtime.paste()
     await app._handle_prompt_value(f"inspect {token}")
     assert app._active_task is not None
     await app._active_task
@@ -1141,7 +1141,7 @@ async def test_mixed_tui_submission_prepares_each_source_once_off_loop(
     monkeypatch.setattr(_attachments, "_read_attachment", read_attachment)
     monkeypatch.setattr(paste_runtime, "_read_attachment", read_attachment)
     monkeypatch.setattr(paste_runtime, "paste_image", paste_image)
-    token = await app.paste_from_clipboard()
+    token = await app._paste_runtime.paste()
 
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
