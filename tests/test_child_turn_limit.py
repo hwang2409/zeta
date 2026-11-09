@@ -38,6 +38,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
 )
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.server.ergonomics import _history_entry_rows
 from zeta.skills import SkillCatalog
@@ -245,11 +246,14 @@ async def test_nested_children_keep_independent_limits_after_adoption(
     release_grandchild = asyncio.Event()
 
     class PausedGrandchildBackend(FakeBackend):
-        async def complete(self, messages, tool_schemas, **kwargs):
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
             if not self.calls:
                 grandchild_started.set()
                 await asyncio.wait_for(release_grandchild.wait(), timeout=10)
-            async for event in super().complete(messages, tool_schemas, **kwargs):
+            async for event in FakeBackend.complete.__wrapped__(
+                self, messages, tool_schemas
+            ):
                 yield event
 
     grandchild_backend = PausedGrandchildBackend(
