@@ -131,6 +131,11 @@ class ErrorDescriptor(Enum):
         "session_not_found",
         "the requested session does not exist",
     )
+    SESSION_ID_AMBIGUOUS = (
+        -32602,
+        "session_id_ambiguous",
+        "the session id prefix matches more than one session",
+    )
     SESSION_MISMATCH = (
         -32003,
         "session_mismatch",
