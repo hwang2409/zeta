@@ -192,14 +192,30 @@ class Harness:
             probe.release.set()
         for task in self.tasks:
             task.cancel()
+        # Every step runs even if one raises; the first error is re-raised.
+        first_error: BaseException | None = None
+        steps: list[Callable[[], object]] = []
         if self.tasks:
-            await await_or_fail(
-                asyncio.wait(self.tasks), what="harness task cleanup"
+            steps.append(
+                lambda: await_or_fail(
+                    asyncio.wait(self.tasks), what="harness task cleanup"
+                )
             )
-        for loop in self.loops:
-            await await_or_fail(loop.close(), what="harness loop close")
-        for store in self.stores:
-            store.close()
+        steps += [
+            lambda loop=loop: await_or_fail(loop.close(), what="harness loop close")
+            for loop in self.loops
+        ]
+        steps += [store.close for store in self.stores]
+        for step in steps:
+            try:
+                result = step()
+                if asyncio.iscoroutine(result):
+                    # test-contract: complexity each step is await_or_fail-bounded
+                    await result
+            except BaseException as exc:  # noqa: BLE001 - cleanup must continue
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
 
 
 async def owner_call(
@@ -566,7 +582,11 @@ async def test_one_owner_cancels_the_handler_task(
             ["tool call-0: cleanup still running 0 s after its cancel; detached"] if hang else []
         )
     finally:
-        await harness.close()
-        gc.collect()
-        loop.set_exception_handler(previous_handler)
+        try:
+            await harness.close()
+        finally:
+            try:
+                gc.collect()
+            finally:
+                loop.set_exception_handler(previous_handler)
     assert loop_errors == []
