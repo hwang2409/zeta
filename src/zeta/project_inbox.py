@@ -30,10 +30,11 @@ from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 from .session_liveness import session_is_live
 from .storage_format import (
     CLOSED_VARIANTS,
-    StorageFormatError,
+    FEATURE_EPOCHS,
+    feature_enabled,
     mapping_mutations,
     require_closed_variant,
-    verify,
+    StorageFeature,
 )
 
 SCHEMA_VERSION = 1
@@ -54,7 +55,6 @@ _MAX_INVALID_REASON_BYTES = 512
 _MAX_INVALID_REPORTS_PER_STATUS = 100
 _MAX_LOGGED_INVALID = 1_000
 _WAKE_CLAIM_SECONDS = 10
-DELEGATION_WRITER_EPOCH = 7
 _LOG = logging.getLogger(__name__)
 _LOGGED_INVALID: OrderedDict[
     tuple[str, int, int, str, str, str, int, int, int], None
@@ -346,17 +346,11 @@ class ProjectInbox:
         return message_id
 
     def set_delegation(self, recipient: str, sender: str, kind: str, *, enabled: bool) -> None:
-        home = self.registry.root.parent
-        try:
-            observed_epoch = verify(home, capability=DELEGATION_WRITER_EPOCH).writer_epoch
-        except FileNotFoundError:
-            observed_epoch = None
-        except StorageFormatError as exc:
-            raise InboxError(f"inbox delegations unavailable: {exc}") from exc
-        if observed_epoch is not None and observed_epoch < DELEGATION_WRITER_EPOCH:
+        lease = self.registry._writer_lease()
+        if not feature_enabled(lease.observed_epoch, StorageFeature.INBOX_DELEGATION):
             raise InboxError(
                 "inbox delegations require stored-format epoch "
-                f"{DELEGATION_WRITER_EPOCH}; home is at epoch {observed_epoch}"
+                f"{FEATURE_EPOCHS[StorageFeature.INBOX_DELEGATION]}"
             )
         recipient_project = self._resolve_project(recipient).project_id
         sender_project = self._resolve_project(sender).project_id
