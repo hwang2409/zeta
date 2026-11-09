@@ -156,7 +156,10 @@ def active_agent_receipts(store: object) -> dict[str, Path]:
 
 
 def read_child_lifecycle(
-    store: ConversationStore, child_path: Path
+    store: ConversationStore,
+    child_path: Path,
+    *,
+    read_state: Callable[..., object] = read_agent_lifecycle_state,
 ) -> tuple[object, str | None]:
     with ExitStack() as cleanup:
         directory_fd = store.directory_fd
@@ -165,9 +168,7 @@ def read_child_lifecycle(
                 child_directory(directory_fd, component)
             )
         return (
-            read_agent_lifecycle_state(
-                directory_fd, child_path / "agent_lifecycle.json"
-            ),
+            read_state(directory_fd, child_path / "agent_lifecycle.json"),
             execution_owner_state(directory_fd),
         )
 

@@ -27,6 +27,8 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
+from ...core.agent_state import LoadedAgentLifecycle as LoadedAgentLifecycle
+from ...core.agent_state import read_agent_lifecycle_state
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -45,7 +47,7 @@ from ...core.child_runs import (
     read_agent_status,
 )
 from ...core.child_runs import (
-    read_child_lifecycle as _read_child_lifecycle,
+    read_child_lifecycle as _read_core_child_lifecycle,
 )
 from ...core.child_runs import (
     unreadable_agent_status as _unreadable_agent_status,
@@ -65,6 +67,16 @@ from ...protocol.types import (
     ToolUseContent,
 )
 from ...skills.agent_catalog import AgentCatalog
+
+
+def _read_child_lifecycle(
+    store: ConversationStore, child_path: Path
+) -> tuple[object, str | None]:
+    return _read_core_child_lifecycle(
+        store, child_path, read_state=read_agent_lifecycle_state
+    )
+
+
 from ..agent_send import (  # noqa: F401
     AGENT_SEND_COMMIT_TIMEOUT_SECONDS,
     register_send,
