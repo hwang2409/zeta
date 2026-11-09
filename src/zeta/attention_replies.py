@@ -166,6 +166,13 @@ class AttentionReplies:
             staged=tuple(staged),
         )
 
+    def staged(self) -> tuple[tuple[str, str], ...]:
+        """Read the staged replies without recovery or any other write."""
+        if not self.staged_dir.is_dir():
+            return ()
+        with self._lock():
+            return self._staged_locked()
+
     def stage(
         self,
         attention_id: str,
