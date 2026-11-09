@@ -1,12 +1,11 @@
-"""Cooperative context token accounting and canonical digests."""
+"""Cooperative context token accounting."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable
 from math import ceil
 from typing import Any
 
@@ -162,47 +161,3 @@ class MessageTokenCounts:
         tokens = counter(message)
         self._counts[id(source)] = (source, counter, tokens)
         return tokens
-
-
-def compact_json_chunks(value: Any) -> Iterator[str]:
-    """Yield canonical JSON in chunks that bound worker GIL holds."""
-
-    if isinstance(value, str):
-        if len(value) <= _JSON_STRING_CHUNK:
-            yield json.dumps(value)
-            return
-        yield '"'
-        for start in range(0, len(value), _JSON_STRING_CHUNK):
-            yield json.dumps(value[start : start + _JSON_STRING_CHUNK])[1:-1]
-            cooperative_pause()
-        yield '"'
-        return
-    if isinstance(value, list):
-        yield "["
-        for index, item in enumerate(value):
-            if index:
-                yield ","
-            yield from compact_json_chunks(item)
-        yield "]"
-        return
-    if isinstance(value, dict):
-        yield "{"
-        for index, key in enumerate(sorted(value)):
-            if index:
-                yield ","
-            yield from compact_json_chunks(key)
-            yield ":"
-            yield from compact_json_chunks(value[key])
-        yield "}"
-        return
-    yield json.dumps(value, separators=(",", ":"))
-
-
-def context_digest(messages: Sequence[Message]) -> str:
-    """Return the stable digest for an assembled context."""
-
-    digest = hashlib.sha256()
-    values = [message.to_dict() for message in messages]
-    for chunk in compact_json_chunks(values):
-        digest.update(chunk.encode())
-    return digest.hexdigest()

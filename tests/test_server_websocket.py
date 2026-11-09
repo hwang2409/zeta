@@ -692,3 +692,118 @@ def test_serve_websocket_cli_flags() -> None:
     )
     assert args.ws_port == 8765
     assert args.ws_origins == ["http://127.0.0.1:5173", "https://app.example:443"]
+
+
+async def _reply(reader: asyncio.StreamReader, request_id: int) -> dict[str, object]:
+    while True:
+        frame = await _read_json(reader)
+        if frame.get("id") == request_id:
+            return frame
+
+
+@pytest.mark.asyncio
+async def test_websocket_status_names_the_running_slash_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    import zeta.core.slash as core_slash
+    import zeta.runtime.status as runtime_status
+    from zeta.core.checkpoints import active_branch
+
+    event_loop = asyncio.get_running_loop()
+    started = event_loop.create_future()
+    release = threading.Event()
+
+    def gated(entries):
+        event_loop.call_soon_threadsafe(
+            lambda: started.done() or started.set_result(None)
+        )
+        release.wait(30)
+        return active_branch(entries)
+
+    # The transcript-sized /status work calls active_branch on both bases.
+    monkeypatch.setattr(core_slash, "active_branch", gated, raising=False)
+    monkeypatch.setattr(runtime_status, "active_branch", gated, raising=False)
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await server.start()
+    assert server._websocket is not None
+    reader, writer, _status, _headers = await _connect(
+        server, token=None, protocol_token=server._websocket.controller_token
+    )
+    observer = None
+    try:
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {"protocol_version": "1.2", "features": ["serve_observers"]},
+            },
+        )
+        await _reply(reader, 1)
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "new_session",
+                "params": {"provider": "codex"},
+            },
+        )
+        session_id = (await _reply(reader, 2))["result"]["session"]["session_id"]
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "slash_run",
+                "params": {"session_id": session_id, "text": "/status"},
+            },
+        )
+        await asyncio.wait_for(started, 10)
+
+        observer = await _connect(
+            server, token=None, protocol_token=server._websocket.observer_token
+        )
+        await _send_json(
+            observer[1],
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "hello",
+                "params": {
+                    "protocol_version": "1.2",
+                    "role": "observer",
+                    "features": ["serve_observers", "ping"],
+                },
+            },
+        )
+        await asyncio.wait_for(_reply(observer[0], 10), 10)
+        await _send_json(
+            observer[1], {"jsonrpc": "2.0", "id": 11, "method": "ping", "params": {}}
+        )
+        assert (await asyncio.wait_for(_reply(observer[0], 11), 10))["result"] == {
+            "pong": True
+        }
+        await _send_json(
+            observer[1], {"jsonrpc": "2.0", "id": 12, "method": "status", "params": {}}
+        )
+        held = (await asyncio.wait_for(_reply(observer[0], 12), 10))["result"]
+        assert held.get("slash_command") == {"name": "/status", "state": "running"}
+
+        release.set()
+        result = (await asyncio.wait_for(_reply(reader, 3), 10))["result"]
+        assert result["kind"] == "output"
+        assert f"session_id: {session_id}" in result["text"]
+        await _send_json(
+            observer[1], {"jsonrpc": "2.0", "id": 13, "method": "status", "params": {}}
+        )
+        free = (await asyncio.wait_for(_reply(observer[0], 13), 10))["result"]
+        assert "slash_command" not in free
+    finally:
+        release.set()
+        if observer is not None:
+            observer[1].close()
+        await close_serve(server, writer)

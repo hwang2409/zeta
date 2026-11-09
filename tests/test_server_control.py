@@ -172,7 +172,7 @@ async def test_protocol_1_2_projection_keeps_negotiated_version_before_hello() -
 def test_no_server_caller_branches_on_ready_controller() -> None:
     server_sources = "".join(
         path.read_text()
-        for path in Path("src/zeta/server").glob("*.py")
+        for path in Path("src/zeta/server").rglob("*.py")
         if path.name != "connections.py"
     )
     assert "current_controller" not in server_sources
