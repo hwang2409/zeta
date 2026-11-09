@@ -14,6 +14,7 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.layout.controls import UIContent
+from rich.ansi import re_ansi
 from rich.console import Console
 from rich.padding import Padding
 from rich.segment import Segment
@@ -31,7 +32,7 @@ from .transcript_search import (
 
 _LAZY_TAIL_MIN_UNITS = 128
 _VIRTUAL_MARGIN_SCREENS = 1
-_SEARCH_LINE_SEPARATORS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_ANSI_SENTINEL = "\ue000"
 
 
 class _HeightIndex:
@@ -88,32 +89,30 @@ class TranscriptVirtualMixin:
     """Bound synchronous transcript work to units in or entering the viewport."""
 
     @staticmethod
-    def _plain_search_lines(line: list[Segment]) -> list[str]:
-        text = "".join(segment.text for segment in line)
-        if not text:
-            return [""]
-        styled = [
-            bool(segment.style)
-            for segment in line
-            for _ in segment.text
-        ]
-        lines: list[str] = []
-        offset = 0
-        for chunk in text.splitlines(keepends=True):
-            plain = chunk.splitlines()[0] if chunk.splitlines() else ""
-            line_styled = styled[offset : offset + len(plain)]
-            break_styled = any(styled[offset + len(plain) : offset + len(chunk)])
-            while (
-                plain
-                and plain[-1] == " "
-                and not line_styled[-1]
-                and not break_styled
-            ):
-                plain = plain[:-1]
-                line_styled = line_styled[:-1]
-            lines.append(plain)
-            offset += len(chunk)
-        return lines
+    def _plain_search_segments(
+        segments: list[Segment], console: Console
+    ) -> str | None:
+        if any(
+            _ANSI_SENTINEL in segment.text
+            or "\x1b(" in segment.text
+            or ("\x1b" in segment.text and not segment.control)
+            for segment in segments
+        ):
+            return None
+
+        output: list[str] = []
+        for text, style, _control in segments:
+            if style:
+                text = style.render(
+                    text,
+                    color_system=console.color_system,
+                    legacy_windows=console.legacy_windows,
+                )
+            output.append(re_ansi.sub(_ANSI_SENTINEL, text))
+        rendered = "".join(output)
+        rendered = "\n".join(line.rstrip(" ") for line in rendered.splitlines())
+        decoded = "\n".join(line.rsplit("\r", 1)[-1] for line in rendered.split("\n"))
+        return decoded.replace(_ANSI_SENTINEL, "")
 
     @staticmethod
     def _render_search_snapshot(
@@ -139,19 +138,17 @@ class TranscriptVirtualMixin:
             )
             return Text.from_ansi(rendered).plain
 
-        rendered = list(console.render(renderable, console.options))
-        if rendered:
-            terminal = rendered[-1].text
-            if terminal.endswith("\n") and len(rendered) > 1:
-                terminal = rendered[-2].text
-            if terminal.endswith(tuple(_SEARCH_LINE_SEPARATORS[1:])):
-                rendered.append(Segment("\n"))
-        lines = [
-            plain
-            for line in Segment.split_lines(rendered)
-            for plain in TranscriptVirtualMixin._plain_search_lines(line)
-        ]
-        return "\n".join(lines)
+        plain = TranscriptVirtualMixin._plain_search_segments(
+            list(console.render(renderable, console.options)), console
+        )
+        if plain is not None:
+            return plain
+
+        console.print(renderable)
+        rendered = "\n".join(
+            line.rstrip(" ") for line in output.getvalue().splitlines()
+        )
+        return Text.from_ansi(rendered).plain
 
     def _search_rendered(self, unit: Any, width: int) -> str:
         value = unit.value
