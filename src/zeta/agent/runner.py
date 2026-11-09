@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
 from ..core.project_context import ProjectContext
+from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
@@ -35,6 +36,7 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
+from ..providers.completion import rate_limit_hold_text
 from ..providers.factory import build_backend, credential_store
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
@@ -44,6 +46,7 @@ from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
+from . import child_context as _child_context
 from .background import CancellationRequest, finish_background_child
 from .child_context import (
     _child_base_system_prompt,
@@ -63,6 +66,8 @@ from .presets import (
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
 from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
+
+_compose_child_system_prompt = _child_context._compose_child_system_prompt
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
@@ -123,6 +128,13 @@ async def consume_child(
         async for event in events:
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
+                update_step(status)
+                publish(status)
+            elif (
+                event.type is StreamEventType.RETRY
+                and event.data.get("kind") == "provider_rate_limit_hold"
+            ):
+                status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
                 publish(status)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -472,6 +484,13 @@ async def _build_child_loop(
         child_context = await asyncio.to_thread(
             _child_base_system_prompt, loop, cwd_override, child_registry
         )
+        child_scope = getattr(loop, "_live_config_scope", None)
+        child_home = Path(loop.active_home) if loop.active_home else env_home()
+        child_project_dir = (
+            child_scope.project_dir
+            if child_scope is not None
+            else Path(child_registry.cwd)
+        )
         child_context = _compose_child_project_context(
             child_context,
             preset,
@@ -501,7 +520,12 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            live_config_home=child_home,
+            live_config_project_dir=child_project_dir,
+            freeze_live_config=child_scope is None,
         )
+
+        await child_loop.refresh_live_config(publish=False)
 
         def prepare_child_project_context(
             projection: ProjectContextProjection,

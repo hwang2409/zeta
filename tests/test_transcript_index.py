@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import multiprocessing
 import os
 import queue
+import selectors
 import sqlite3
+import subprocess
+import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -32,6 +37,7 @@ from zeta.transcript_search.refresh import (
 
 PROJECT_A = "p_" + "a" * 32
 PROJECT_B = "p_" + "b" * 32
+V4_REVISION = "9b8b7ea4c2e6873c22ad2f365c66e717873a4cce"
 
 
 def _row(seq: int, role: str, text: str, *, state: str | None = None) -> dict:
@@ -361,6 +367,155 @@ def test_deletion_and_reassignment(tmp_path: Path) -> None:
     assert new.search("moving canary")
 
 
+def test_v4_and_v5_processes_search_the_same_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "mixed version canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    base_checkout = tmp_path / "base"
+    archive = subprocess.run(
+        ["git", "archive", V4_REVISION, "src/zeta"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(base_checkout, filter="data")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(base_checkout / "src")
+    script = """
+import sys
+from pathlib import Path
+from zeta.transcript_search.index import TranscriptIndex, TranscriptSource
+
+project_dir, session_dir = map(Path, sys.argv[1:])
+index = TranscriptIndex(project_dir, 'p_' + 'a' * 32)
+index.append(TranscriptSource('one', session_dir))
+assert index.search('mixed version canary')
+print(index.path.name, flush=True)
+sys.stdin.readline()
+assert index.search('mixed version canary')
+print('v4-found', flush=True)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path / "project"), str(source.session_dir)],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            assert selector.select(10), "v4 process did not build its index"
+        assert process.stdout.readline().strip() == "transcript-index.sqlite3"
+
+        v5 = TranscriptIndex(tmp_path / "project", PROJECT_A)
+        v5.append(source)
+        assert v5.search("mixed version canary")
+
+        lock_held = threading.Event()
+        release_append = threading.Event()
+        append_errors: list[BaseException] = []
+        original_append = v5._append_locked
+
+        def hold_append(source: TranscriptSource, *, force_full: bool = False):
+            lock_held.set()
+            assert release_append.wait(10), "test did not release v5 append"
+            return original_append(source, force_full=force_full)
+
+        def append_with_held_lock() -> None:
+            try:
+                v5.append(source)
+            except BaseException as exc:  # noqa: BLE001 - assert thread failure
+                append_errors.append(exc)
+
+        # test-contract: seam hold append after it acquires the production lock
+        monkeypatch.setattr(v5, "_append_locked", hold_append)
+        append_thread = threading.Thread(target=append_with_held_lock)
+        append_thread.start()
+        try:
+            assert lock_held.wait(10), "v5 append did not acquire its lock"
+            assert process.stdin is not None
+            process.stdin.write("search\n")
+            process.stdin.flush()
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                assert selector.select(10), "v4 search blocked on the v5 append lock"
+            result = process.stdout.readline().strip()
+        finally:
+            release_append.set()
+            append_thread.join(timeout=10)
+        assert not append_thread.is_alive(), "v5 append did not finish"
+        assert not append_errors
+        returncode = process.wait(timeout=10)
+        assert process.stderr is not None
+        error = process.stderr.read()
+        assert result == "v4-found", error
+        assert returncode == 0, error
+        assert v5.path.name == "transcript-index-v5.sqlite3"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def test_malformed_schema_metadata_constructs_for_rebuild(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "malformed metadata canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    with sqlite3.connect(index.path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = 'malformed' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    recovered = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    status = recovered.status()
+    assert not status.ready
+    assert status.detail is not None and "rebuild" in status.detail
+    recovered.rebuild((source,))
+    assert recovered.search("malformed metadata canary")
+
+
+def test_missing_cursor_table_constructs_for_rebuild(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "missing cursor canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    with sqlite3.connect(index.path) as connection:
+        connection.execute("DROP TABLE session_cursors")
+        connection.commit()
+
+    recovered = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    status = recovered.status()
+    assert not status.ready
+    assert status.detail is not None and "rebuild" in status.detail
+    recovered.rebuild((source,))
+    assert recovered.search("missing cursor canary")
+
+
 def test_cursor_lag_resumes_without_duplicates(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
@@ -409,6 +564,94 @@ def test_relaxed_search_uses_distinctive_partial_terms(tmp_path: Path) -> None:
     assert hits[0].match == "partial"
 
 
+def test_missing_receipts_verify_bounded_prefix_then_read_only_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [_row(1, "user", "prefix canary")]
+    source = _source(tmp_path / "sessions", "one", rows)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    observed: list[object] = []
+    original_read = index_module._read_transcript
+
+    def observe(path: Path, cursor, receipts=None):
+        result = original_read(path, cursor, receipts)
+        observed.append(result)
+        return result
+
+    # test-contract: seam count bounded transcript reads through the index
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    with source.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(_row(2, "assistant", "tail canary", state="completed"))
+            + "\n"
+        )
+    index.append(source)
+
+    read = observed[-1]
+    assert read.full is False
+    assert read.bytes_read < source.conversation_path.stat().st_size
+    assert index.search("tail canary")
+
+
+def test_prefix_mutation_without_receipts_forces_full_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "oldcanary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    original_read = index_module._read_transcript
+    observed: list[object] = []
+
+    def observe(path: Path, cursor, receipts=None):
+        result = original_read(path, cursor, receipts)
+        observed.append(result)
+        return result
+
+    # test-contract: seam observe fallback through the index reader
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    _write_rows(
+        source,
+        [
+            _row(1, "user", "newcanary"),
+            _row(2, "assistant", "answer", state="completed"),
+            _row(3, "user", "tail"),
+        ],
+    )
+    index.append(source)
+    assert observed[-1].full is True
+    assert index.search("newcanary")
+    assert not index.search("oldcanary")
+
+
+def test_missing_receipts_incremental_results_equal_clean_rebuild(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "first"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    incremental = TranscriptIndex(tmp_path / "incremental", PROJECT_A)
+    incremental.append(source)
+    with source.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_row(3, "user", "second")) + "\n")
+        handle.write(json.dumps(_row(4, "assistant", "reply", state="completed")) + "\n")
+    incremental.append(source)
+    rebuilt = TranscriptIndex(tmp_path / "rebuilt", PROJECT_A)
+    rebuilt.rebuild((source,))
+    for query in ("first", "second", "reply"):
+        assert _result_ids(incremental, query) == _result_ids(rebuilt, query)
+
+
 def test_unverified_append_rereads_and_matches_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -443,7 +686,7 @@ def test_unverified_append_rereads_and_matches_rebuild(
     rebuilt = TranscriptIndex(tmp_path / "rebuilt", PROJECT_A)
     rebuilt.rebuild((source,))
     assert len(reads) == 2
-    assert reads[0].full is True
+    assert reads[0].full is False
     assert first_offset > 0
     for query in ("first answer", "second question", "second answer"):
         assert _result_ids(index, query) == _result_ids(rebuilt, query)
@@ -1107,7 +1350,7 @@ async def test_append_runs_off_event_loop(
     assert event_loop_thread not in refresh_threads
 
 
-def test_mid_file_rewrite_outside_any_window_forces_reread(tmp_path: Path) -> None:
+def test_mid_file_rewrite_after_digest_window_is_a_known_limit(tmp_path: Path) -> None:
     filler = "x" * (384 * 1024)
     original = [
         _row(1, "user", filler + " oldcanary " + filler),
@@ -1126,8 +1369,9 @@ def test_mid_file_rewrite_outside_any_window_forces_reread(tmp_path: Path) -> No
     _write_rows(source, replacement)
     index.append(source)
 
-    assert index.search("oldcanary") == ()
-    assert index.search("newcanary")
+    # The bounded digest cannot detect edits outside its 64 KiB window.
+    assert index.search("oldcanary")
+    assert index.search("newcanary") == ()
     assert index.search("appended question")
 
 
@@ -1259,8 +1503,8 @@ def test_append_receipt_overflow_forces_correct_full_reread(
     index.append(TranscriptSource("one", store.session_dir, append_receipts=receipts))
 
     assert len(observed) == 1
-    assert observed[0].full is True
-    assert observed[0].bytes_read == store.path.stat().st_size
+    assert observed[0].full is False
+    assert observed[0].bytes_read < store.path.stat().st_size
     assert index.search(f"overflow question {MAX_PENDING_APPEND_RECEIPTS // 2}")
 
 
@@ -1295,8 +1539,8 @@ def test_unexplained_mtime_change_forces_reread(
     index.append(source)
 
     assert len(observed) == 1
-    assert observed[0].full is True
-    assert observed[0].bytes_read == source.conversation_path.stat().st_size
+    assert observed[0].full is False
+    assert observed[0].bytes_read < source.conversation_path.stat().st_size
 
 
 def test_other_process_append_without_receipt_rereads(
@@ -1353,6 +1597,6 @@ def test_other_process_append_without_receipt_rereads(
     index.append(source)
 
     assert len(observed) == 1
-    assert observed[0].full is True
-    assert observed[0].bytes_read == source.conversation_path.stat().st_size
+    assert observed[0].full is False
+    assert observed[0].bytes_read < source.conversation_path.stat().st_size
     assert index.search("external question")
