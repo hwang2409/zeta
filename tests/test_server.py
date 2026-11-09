@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
@@ -9156,16 +9157,20 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
     call_soon_threadsafe = loop.call_soon_threadsafe
     is_closed = loop.is_closed
 
+    # Only the held status worker sees a closed loop. Server close keeps
+    # running on the real loop, and its own executor completions must land.
     def close_aware_call_soon_threadsafe(
         callback: Callable[..., object], *args: object
     ) -> asyncio.Handle:
-        if loop_closed:
+        if loop_closed and threading.current_thread() is status_worker:
             raise RuntimeError("Event loop is closed")
         return call_soon_threadsafe(callback, *args)
 
     def track_closed_status_worker() -> bool:
+        if threading.current_thread() is not status_worker:
+            return is_closed()
         closed = loop_closed or is_closed()
-        if closed and threading.current_thread() is status_worker:
+        if closed:
             call_soon_threadsafe(worker_completed.set)
         return closed
 
@@ -9218,6 +9223,20 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         closing = asyncio.create_task(server.close())
         await asyncio.wait_for(shutdown_started.wait(), 10)
         loop_closed = True
+        # Server close finishing an executor call inside this window lost
+        # its completion and hung loop teardown (#883 py3.14 CI hang).
+        other_executor = ThreadPoolExecutor(max_workers=1)
+        other_release = threading.Event()
+        other_completion = asyncio.wrap_future(
+            other_executor.submit(other_release.wait)
+        )
+        other_release.set()
+        other_executor.shutdown(wait=True)
+        await asyncio.sleep(0)
+        assert other_completion.done(), (
+            "another thread's executor completion was dropped while only "
+            "the status worker should see a closed loop"
+        )
         release.set()
         await asyncio.wait_for(worker_completed.wait(), 10)
         assert not worker_errors

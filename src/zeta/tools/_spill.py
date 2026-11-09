@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import fcntl
 import os
 import re
@@ -18,6 +17,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from ..core.session_files import child_directory, open_session_file
+from ..core.thread_call import run_owned_thread_call
 
 SPILL_DIRECTORY = "spill"
 SPILL_MAX_BYTES = 100 * 1024 * 1024
@@ -93,14 +93,9 @@ class SpillStore:
     ) -> dict[str, SpillArtifact]:
         """Encode and publish one text result group in a worker thread."""
 
-        worker = asyncio.create_task(
-            asyncio.to_thread(self.write_text_group, tool, call_id, named_strings)
+        return await run_owned_thread_call(
+            lambda: self.write_text_group(tool, call_id, named_strings)
         )
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            await worker
-            raise
 
     async def awrite_bytes(
         self, tool: str, call_id: str, index: int, data: bytes
@@ -134,16 +129,9 @@ class SpillStore:
         releases it normally.
         """
 
-        worker = asyncio.create_task(
-            asyncio.to_thread(self.write_group, tool, call_id, artifacts)
+        return await run_owned_thread_call(
+            lambda: self.write_group(tool, call_id, artifacts)
         )
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            # Keep caller-owned source files alive and keep the publication
-            # transaction indivisible before cancellation leaves this method.
-            await worker
-            raise
 
     def write_text(self, tool: str, call_id: str, index: int, text: str) -> Path:
         artifacts = self.write_text_group(tool, call_id, {str(index): text})
