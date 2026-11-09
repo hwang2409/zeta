@@ -8,6 +8,7 @@ import math
 import os
 import time
 from collections.abc import Sequence
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -39,12 +40,15 @@ from ...core.agent_state import (
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
+    load_session_json,
 )
 from ...core.child_lifecycle import select_legacy_child_lifecycle
 from ...core.session_execution import execution_owner_state
 from ...core.session_files import (
-    descend_directory,
+    child_directory,
+    open_session_file,
     read_session_file,
+    session_root,
 )
 from ...core.store import ConversationStore
 from ...models.catalog import known_model_names
@@ -299,20 +303,24 @@ def _agent_output_page(
 
 
 def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> bytes:
-    with descend_directory(
-        store.directory_fd,
-        tuple(child_path.relative_to(store.session_dir.absolute()).parts),
-    ) as directory_fd:
+    with ExitStack() as cleanup:
+        directory_fd = store.directory_fd
+        for component in child_path.relative_to(store.session_dir.absolute()).parts:
+            directory_fd = cleanup.enter_context(
+                child_directory(directory_fd, component)
+            )
         return read_session_file(directory_fd, name)
 
 
 def _read_child_lifecycle(
     store: ConversationStore, child_path: Path
 ) -> tuple[object, str | None]:
-    with descend_directory(
-        store.directory_fd,
-        tuple(child_path.relative_to(store.session_dir.absolute()).parts),
-    ) as directory_fd:
+    with ExitStack() as cleanup:
+        directory_fd = store.directory_fd
+        for component in child_path.relative_to(store.session_dir.absolute()).parts:
+            directory_fd = cleanup.enter_context(
+                child_directory(directory_fd, component)
+            )
         return (
             read_agent_lifecycle_state(
                 directory_fd, child_path / "agent_lifecycle.json"
@@ -323,29 +331,64 @@ def _read_child_lifecycle(
 
 def _read_agent_transcript(
     child_path: Path,
-    cached: tuple[tuple[int, bytes], str] | None,
-) -> tuple[tuple[int, bytes], str, bool]:
+    cached: tuple[tuple[int, int, int], str] | None,
+) -> tuple[tuple[int, int, int], str, bool]:
     try:
-        store = ConversationStore(
-            child_path.parent,
-            session_id=child_path.name,
-            _read_only=True,
-            _observer_snapshot=True,
-            _must_exist=True,
-        )
-        try:
-            key = (store._log_offset, store._entry_prefix_digest)
-            if cached is not None and cached[0] == key:
-                return (*cached, True)
-            messages = [
-                Message.from_dict(entry.data["message"])
-                for entry in store.active_branch_snapshot()
-                if entry.type == "message"
-            ]
-            output = _serialize_agent_transcript(messages)
-            return key, output, key == (store._log_offset, store._entry_prefix_digest)
-        finally:
-            store.close()
+        with session_root(child_path) as directory_fd:
+            fd = open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY)
+            with os.fdopen(fd, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                key = (before.st_ino, before.st_size, before.st_mtime_ns)
+                if cached is not None and cached[0] == key:
+                    return (*cached, True)
+                raw = handle.read()
+                after = os.fstat(handle.fileno())
+            after_key = (after.st_ino, after.st_size, after.st_mtime_ns)
+        rows = raw.splitlines(keepends=True)
+        entries: list[ConversationEntry] = []
+        for index, line in enumerate(rows):
+            try:
+                row = load_session_json(line)
+            except ConversationIntegrityError as exc:
+                if (
+                    index == len(rows) - 1
+                    and not line.endswith(b"\n")
+                    and isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeError))
+                ):
+                    break
+                raise ConversationIntegrityError(
+                    f"invalid conversation row {index + 1}: {child_path}"
+                ) from exc
+            if index == 0:
+                if not isinstance(row, dict) or row.get("type") != "header":
+                    raise ConversationIntegrityError(
+                        f"unsupported conversation schema: {child_path}"
+                    )
+                continue
+            if not isinstance(row, dict):
+                raise ConversationIntegrityError(
+                    f"conversation row {index + 1} is not an object: {child_path}"
+                )
+            entries.append(ConversationEntry.from_dict(row))
+        by_id = {entry.id: entry for entry in entries}
+        current = entries[-1] if entries else None
+        branch: list[ConversationEntry] = []
+        seen: set[str] = set()
+        while current is not None:
+            if current.id in seen:
+                raise ConversationIntegrityError(
+                    f"conversation parent cycle at {current.id}"
+                )
+            seen.add(current.id)
+            branch.append(current)
+            current = by_id.get(current.parent_id) if current.parent_id else None
+        messages = [
+            Message.from_dict(entry.data["message"])
+            for entry in reversed(branch)
+            if entry.type == "message"
+        ]
+        output = _serialize_agent_transcript(messages)
+        return after_key, output, after_key == key
     except (OSError, ValueError, ConversationIntegrityError) as exc:
         raise ValueError("could not read child transcript") from exc
 
@@ -357,8 +400,8 @@ def _read_agent_output(
     offset: int,
     limit: int | None,
     max_bytes: int,
-    cached: tuple[tuple[int, bytes], str] | None = None,
-) -> tuple[tuple[int, bytes], str, bool, dict[str, object]]:
+    cached: tuple[tuple[int, int, int], str] | None = None,
+) -> tuple[tuple[int, int, int], str, bool, dict[str, object]]:
     identity, output, cacheable = _read_agent_transcript(child_path, cached)
     result = _agent_output_page(
         output,

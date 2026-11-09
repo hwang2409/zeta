@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..core.session_files import descend_directory
-from ..core.store import ConversationStore, ObserverSnapshotChanged
+from ..core.store import ConversationStore, ObserverSnapshotChanged, TranscriptLoadError
 from ..core.store._child_runs import (
     child_run_segments,
     parse_child_run_id,
@@ -859,14 +859,19 @@ class ConnectionRegistry:
             parent = root_store.session_dir
             for segment in segments[:-1]:
                 parent = parent / "agents" / str(segment)
-            reader = ConversationStore(
-                parent / "agents",
-                session_id=str(segments[-1]),
-                _read_only=True,
-                _observer_snapshot=True,
-                _must_exist=True,
-                _storage_lease=root_store._storage_lease,
-            )
+            try:
+                reader = ConversationStore(
+                    parent / "agents",
+                    session_id=str(segments[-1]),
+                    _read_only=True,
+                    _observer_snapshot=True,
+                    _must_exist=True,
+                    _storage_lease=root_store._storage_lease,
+                )
+            except TranscriptLoadError as exc:
+                exc.session_id = root_store.session_id
+                raise
+            reader._child_history_reader = True
             self._child_reader = (key, reader)
             return reader
 
@@ -1003,7 +1008,7 @@ class ConnectionRegistry:
     async def aclose(self) -> None:
         self._closed = True
         states = tuple(self._connections.values())
-        await self.run_blocking(self.close_child_reader)
+        await asyncio.to_thread(self.close_child_reader)
         with self._read_condition:
             self._read_stopping = True
             self._read_condition.notify_all()

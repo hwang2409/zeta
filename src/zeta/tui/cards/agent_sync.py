@@ -577,6 +577,7 @@ class AgentTranscriptSource:
                     path.parent,
                     session_id=path.name,
                     _read_only=True,
+                    _observer_snapshot=True,
                     _must_exist=True,
                 ).close()
             except TranscriptLoadError as diagnosis:

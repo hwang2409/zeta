@@ -43,6 +43,7 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     ("zeta.project_registry", "update_memory", "in-memory value"),
     ("zeta.protocol.tool_batches", "without_incomplete_tool_batches", "in-memory value"),
     ("zeta.server.connections", "capture_read", "rpc params"),
+    ("zeta.server.connections", "read_child_run_history", "rpc params"),
     ("zeta.server.control", "revoke", "rpc params"),
     ("zeta.server.entry_project_views", "_only", "rpc params"),
     ("zeta.server.ergonomics", "_validate_history_params", "rpc params"),

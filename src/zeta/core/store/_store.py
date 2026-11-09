@@ -930,7 +930,6 @@ class ConversationStore(
             data["telemetry"] = dict(telemetry)
         if fact_floor is not None:
             from ...context_eviction._fact_floor import validate_fact_floor
-
             if not validate_fact_floor(fact_floor):
                 raise ValueError("invalid eviction fact floor")
             data["fact_floor"] = dict(fact_floor)
@@ -987,7 +986,6 @@ class ConversationStore(
                     if existing_ids and existing_ids < request_ids:
                         entry = self._append_row_unlocked("message", data, parent_id)
                         return self._snapshot_entry(entry)
-
             persisted_requests = self._approval_request_entries(branch)
             missing_requests: list[dict[str, Any]] = []
             for request in request_data:
