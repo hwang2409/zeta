@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,7 +21,12 @@ class PathCompletion:
     kind: str
 
 
-def complete_paths(text_before_cursor: str, base_dir: str | Path) -> tuple[list[PathCompletion], bool]:
+def complete_paths(
+    text_before_cursor: str,
+    base_dir: str | Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[PathCompletion], bool]:
     """Complete one filesystem directory level for the active ``@`` token."""
 
     match = _PATH_TOKEN_RE.search(text_before_cursor)
@@ -28,33 +34,13 @@ def complete_paths(text_before_cursor: str, base_dir: str | Path) -> tuple[list[
         return [], False
     quoted = match.group("quoted") is not None
     path_text = match.group("quoted") or match.group("unquoted") or ""
-    directory, display_prefix, basename = _completion_context(
-        path_text, Path(base_dir)
-    )
-    show_hidden = basename.startswith(".")
-
-    try:
-        entries = os.scandir(directory)
-    except OSError:
+    base_path = Path(base_dir)
+    directory, display_prefix, basename = _completion_context(path_text, base_path)
+    if _escapes_base_through_symlink(directory, base_path):
         return [], False
-    scan_truncated = False
-    with entries:
-        matches: list[tuple[bool, str]] = []
-        for index, entry in enumerate(entries):
-            if index >= PATH_SCAN_LIMIT:
-                scan_truncated = True
-                break
-            name = entry.name
-            if not name.startswith(basename) or (
-                name.startswith(".") and not show_hidden
-            ):
-                continue
-            try:
-                is_directory = entry.is_dir()
-            except OSError:
-                continue
-            matches.append((is_directory, name))
-
+    matches, scan_truncated = _matching_entries(
+        directory, basename, basename.startswith("."), cancel_event
+    )
     matches.sort(key=lambda item: (not item[0], item[1]))
     truncated = scan_truncated or len(matches) > PATH_COMPLETION_LIMIT
     result = []
@@ -70,6 +56,50 @@ def complete_paths(text_before_cursor: str, base_dir: str | Path) -> tuple[list[
             )
         )
     return result, truncated
+
+
+def _matching_entries(
+    directory: Path,
+    basename: str,
+    show_hidden: bool,
+    cancel_event: threading.Event | None,
+) -> tuple[list[tuple[bool, str]], bool]:
+    try:
+        entries = os.scandir(directory)
+    except OSError:
+        return [], False
+    scan_truncated = False
+    matches: list[tuple[bool, str]] = []
+    with entries:
+        for index, entry in enumerate(entries):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            if index >= PATH_SCAN_LIMIT:
+                scan_truncated = True
+                break
+            name = entry.name
+            if not name.startswith(basename) or (
+                name.startswith(".") and not show_hidden
+            ):
+                continue
+            try:
+                is_directory = entry.is_dir()
+            except OSError:
+                continue
+            matches.append((is_directory, name))
+    return matches, scan_truncated
+
+
+def _escapes_base_through_symlink(directory: Path, base_dir: Path) -> bool:
+    try:
+        directory.relative_to(base_dir)
+    except ValueError:
+        return False
+    try:
+        directory.resolve().relative_to(base_dir.resolve())
+    except ValueError:
+        return True
+    return False
 
 
 def _completion_context(path_text: str, base_dir: Path) -> tuple[Path, str, str]:

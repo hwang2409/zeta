@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -41,7 +43,20 @@ async def complete(
             ErrorDescriptor.INVALID_PARAMS,
             "text_before_cursor must be at most 4096 UTF-8 bytes",
         )
-    rows, truncated = await run_blocking(lambda: complete_paths(text, base_dir))
+    cancel_event = threading.Event()
+    scan = asyncio.create_task(
+        run_blocking(
+            lambda: complete_paths(
+                text, base_dir, cancel_event=cancel_event
+            )
+        )
+    )
+    try:
+        rows, truncated = await asyncio.shield(scan)
+    except asyncio.CancelledError:
+        cancel_event.set()
+        await asyncio.shield(scan)
+        raise
     return {
         "entries": [
             {

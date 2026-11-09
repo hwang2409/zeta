@@ -9,10 +9,12 @@ from contextlib import suppress
 from pathlib import Path
 
 import pytest
+from prompt_toolkit.document import Document
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
+from tests.support.serve_contract import ServeContract
 from tests.support.sockets import short_socket_path
 from tests.test_server import (
     _connect,
@@ -20,6 +22,7 @@ from tests.test_server import (
     _request,
 )
 from zeta.server import ZetaServer
+from zeta.tui.completion import PathCompleter
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -268,6 +271,87 @@ async def test_path_complete_negotiation_validation_and_observer_access(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_path_complete_access_and_negotiation_over_each_transport(
+    tmp_path: Path, transport: str
+) -> None:
+    root = tmp_path / transport
+    workspace = root / "workspace"
+    workspace.mkdir(parents=True)
+    contract = await ServeContract.start(root, transport)  # type: ignore[arg-type]
+    client = await contract.connect()
+    observer = None
+    try:
+        hello = await client.request(
+            "hello", "hello", {"protocol_version": "1.2", "features": ["path_completion", "serve_observers"]}
+        )
+        created = await client.request("new", "new_session")
+        session_id = created["result"]["session"]["session_id"]
+        completed = await client.request(
+            "complete", "path_complete", {"session_id": session_id, "text_before_cursor": "plain text"}
+        )
+        assert completed["result"] == {"entries": [], "truncated": False}
+        assert "path_completion" in hello["result"]["capabilities"]["features"]
+
+        observer = await contract.connect("observer")
+        await observer.request(
+            "observer-hello", "hello", {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers", "path_completion"]}
+        )
+        rejected = await observer.request(
+            "observer-path", "path_complete", {"session_id": session_id, "text_before_cursor": "@"}
+        )
+        assert rejected["error"]["code"] == -32008
+    finally:
+        await contract.close()
+
+    contract = await ServeContract.start(root / "unnegotiated", transport)  # type: ignore[arg-type]
+    client = await contract.connect()
+    try:
+        await client.request("hello", "hello", {"protocol_version": "1.2", "features": []})
+        created = await client.request("new", "new_session")
+        session_id = created["result"]["session"]["session_id"]
+        rejected = await client.request(
+            "missing-feature", "path_complete", {"session_id": session_id, "text_before_cursor": "@"}
+        )
+        assert rejected["error"]["code"] == -32601
+    finally:
+        await contract.close()
+
+
+@pytest.mark.asyncio
+async def test_path_complete_symlink_matches_tui_without_outside_traversal(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").touch()
+    (workspace / "link").symlink_to(outside, target_is_directory=True)
+    server = _server(tmp_path, workspace)
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, features=["path_completion"])
+        created = (await _request(reader, writer, "new", "new_session"))[-1]
+        session_id = created["result"]["session"]["session_id"]
+        result = (
+            await _request(
+                reader, writer, "link", "path_complete", {"session_id": session_id, "text_before_cursor": "@"}
+            )
+        )[-1]["result"]
+        assert [entry["text"] for entry in result["entries"]] == ["link/"]
+        assert list(PathCompleter(workspace).get_completions(Document("@link/"), None)) == []
+        served = (
+            await _request(
+                reader, writer, "outside", "path_complete", {"session_id": session_id, "text_before_cursor": "@link/"}
+            )
+        )[-1]["result"]
+        assert served == {"entries": [], "truncated": False}
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_path_complete_publishes_no_response_or_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -281,8 +365,10 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
     entered = threading.Event()
     release = threading.Event()
     worker_finished = threading.Event()
+    scanner_observed_cancel = threading.Event()
     path_module = None
     original_scandir = None
+    original_complete_paths = None
 
     def gated_scandir(path: int | str | bytes | os.PathLike[str] | os.PathLike[bytes]):
         if not isinstance(path, int) and Path(path) == workspace:
@@ -312,9 +398,21 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
         assert probe.get("result") == {"entries": [], "truncated": False}, probe
         assert "path_completion" in hello["result"]["capabilities"]["features"]
         path_module = importlib.import_module("zeta.core.path_completion")
+        handler_module = importlib.import_module("zeta.server.handlers.path_completion")
         original_scandir = path_module.os.scandir
+        original_complete_paths = handler_module.complete_paths
+
+        def tracked_complete_paths(*args, **kwargs):
+            result = original_complete_paths(*args, **kwargs)
+            cancel_event = kwargs.get("cancel_event")
+            if cancel_event is not None and cancel_event.is_set():
+                scanner_observed_cancel.set()
+            worker_finished.set()
+            return result
+
         # test-contract: seam blocks the actual synchronous path scanner thread.
         monkeypatch.setattr(path_module.os, "scandir", gated_scandir)
+        monkeypatch.setattr(handler_module, "complete_paths", tracked_complete_paths)
         observer_reader, observer_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
         )
@@ -361,12 +459,15 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
             and any(frame.f_locals.get("client") is client for frame in task.get_stack())
         )
         request_task.cancel()
+        await asyncio.sleep(0)
+        assert not request_task.done()
+        release.set()
         with suppress(asyncio.CancelledError):
             await await_or_fail(request_task, what="cancelled path request")
-        release.set()
         assert await await_or_fail(
             asyncio.to_thread(worker_finished.wait, 10), what="path scanner drain"
         )
+        assert scanner_observed_cancel.is_set()
 
         frames = await _frames_until_eof(reader)
         assert not any(
