@@ -950,3 +950,49 @@ async def test_nested_delegated_approval_reaches_the_controller_and_resumes(
         assert target_file.read_text() == "written"
     finally:
         await _close(serve)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize("background", (False, True), ids=("foreground", "background"))
+async def test_child_setup_failure_ends_once_after_its_failed_lifecycle(
+    tmp_path: Path, transport: Transport, background: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child whose loop cannot be built is finalized ``failed`` before its receipt."""
+    from zeta.agent import runner
+    from zeta.core.agent_progress import register_child_run_sink
+
+    async def broken_setup(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("child setup failed")
+
+    # test-contract: seam the child loop cannot be built after its start row is durable
+    monkeypatch.setattr(runner, "_build_child_loop", broken_setup)
+    backend = Actors(
+        {"delegate": [ScriptedTurn(tool_calls=[_agent("agent-1", "child-work", background)]), _text("parent done")]}
+    )
+    serve = await _open(tmp_path, transport, backend)
+    probe = EndProbe(serve.store.session_dir)
+    unregister = register_child_run_sink(probe.sink)
+    try:
+        run_id = f"{serve.session_id}:1"
+        top = await serve.observer()
+        await serve.join(top, None)
+        await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
+        live = await _until(top, "agent_end")
+        live += await serve.drain(top)
+        assert len(_lifecycle(live, "child_started", run_id)) == 1, live
+        ends = _lifecycle(live, "child_ended", run_id)
+        assert len(ends) == 1, live
+        assert ends[0]["child"]["status"] == "failed" and "finished_at" in ends[0]["child"]
+        [receipt] = [
+            entry for entry in serve.store.entries
+            if entry.type == "message"
+            and (entry.data["message"].get("tool_result") or {}).get("tool_call_id") == "agent-1"
+        ]
+        assert ends[0]["sequence"] == receipt.seq
+        published = probe.for_run(run_id)
+        assert [number for number, _durable in published] == [receipt.seq]
+        assert published[0][1]["state"] == "failed" and published[0][1].get("finished_at")
+    finally:
+        unregister()
+        await _close(serve)
