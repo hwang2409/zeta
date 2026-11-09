@@ -120,6 +120,7 @@ def test_entry_id_index_matches_entries_after_mixed_appends(tmp_path: Path) -> N
             )
         assert store._entry_ids == expected_ids
 
+        # test-contract: seam cancels the direct append at its durable-write boundary
         with patch.object(
             store, "_write_line", side_effect=asyncio.CancelledError()
         ):
