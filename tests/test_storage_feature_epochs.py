@@ -17,43 +17,86 @@ from zeta.storage_format import StorageFormatError, open_writer
 from zeta.tools.registry import ToolRegistry
 
 
+def _allowed_writer_default(node: ast.AST, parents: dict[ast.AST, ast.AST], path: Path) -> bool:
+    if path != Path.cwd() / "src" / "zeta" / "cli" / "main.py":
+        return False
+    keyword = parents.get(node)
+    call = parents.get(keyword) if isinstance(keyword, ast.keyword) else None
+    return (
+        isinstance(keyword, ast.keyword)
+        and keyword.arg == "default"
+        and isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "add_argument"
+        and any(
+            isinstance(argument, ast.Constant) and argument.value == "--target-epoch"
+            for argument in call.args
+        )
+    )
+
+
+def _writer_epoch_names(tree: ast.AST) -> set[str]:
+    names = {"WRITER_EPOCH"}
+    module_names = {"storage_format"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "zeta.storage_format":
+            for imported in node.names:
+                if imported.name == "WRITER_EPOCH":
+                    names.add(imported.asname or imported.name)
+        elif isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name == "zeta.storage_format":
+                    module_names.add(imported.asname or "zeta.storage_format")
+                elif imported.name == "storage_format":
+                    module_names.add(imported.asname or imported.name)
+    return names | {f"{module}.WRITER_EPOCH" for module in module_names}
+
+
+def _writer_epoch_violations(path: Path, source: str) -> list[str]:
+    tree = ast.parse(source, filename=str(path))
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    names = _writer_epoch_names(tree)
+    violations = []
+    for node in ast.walk(tree):
+        is_name = isinstance(node, ast.Name) and node.id in names
+        is_attribute = (
+            isinstance(node, ast.Attribute)
+            and node.attr == "WRITER_EPOCH"
+            and isinstance(node.value, ast.Name)
+        )
+        if (is_name or is_attribute) and not _allowed_writer_default(node, parents, path):
+            violations.append(f"{path}:{node.lineno}")
+    return violations
+
+
 def test_feature_gates_do_not_compare_against_writer_epoch() -> None:
     source_root = Path.cwd() / "src" / "zeta"
-    violations: list[str] = []
-    for path in sorted(source_root.rglob("*.py")):
-        if path.name == "storage_format.py":
-            continue
-        tree = ast.parse(path.read_text(), filename=str(path))
-        parents: dict[ast.AST, ast.AST] = {}
-        for parent in ast.walk(tree):
-            for child in ast.iter_child_nodes(parent):
-                parents[child] = parent
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Name) or node.id != "WRITER_EPOCH":
-                continue
-            allowed = False
-            if path.relative_to(source_root).as_posix() == "cli/main.py":
-                keyword = parents.get(node)
-                call = parents.get(keyword) if isinstance(keyword, ast.keyword) else None
-                allowed = (
-                    isinstance(keyword, ast.keyword)
-                    and keyword.arg == "default"
-                    and isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
-                    and call.func.attr == "add_argument"
-                    and any(
-                        isinstance(argument, ast.Constant)
-                        and argument.value == "--target-epoch"
-                        for argument in call.args
-                    )
-                )
-            if not allowed:
-                violations.append(f"{path.relative_to(Path.cwd())}:{node.lineno}")
-
+    violations = [
+        violation
+        for path in sorted(source_root.rglob("*.py"))
+        if path.name != "storage_format.py"
+        for violation in _writer_epoch_violations(path, path.read_text())
+    ]
     assert not violations, (
         "compare against FEATURE_EPOCHS[<feature>] in storage_format.py: "
         + ", ".join(violations)
     )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from zeta.storage_format import WRITER_EPOCH as epoch\nif home_epoch == epoch: pass",
+        "from zeta.storage_format import WRITER_EPOCH as epoch\ndef f(value=epoch): pass",
+        "import zeta.storage_format as sf\nif home_epoch == sf.WRITER_EPOCH: pass",
+    ],
+)
+def test_writer_epoch_guard_rejects_aliases(source: str, tmp_path: Path) -> None:
+    path = tmp_path / "sample.py"
+    assert _writer_epoch_violations(path, source)
 
 
 @pytest.mark.parametrize("case", ["repair", "memory", "attention"])

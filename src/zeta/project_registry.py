@@ -336,7 +336,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
             raise AssertionError("read operations must use _read")
         lease = open_writer(self.root.parent)
         if not feature_enabled(
-            lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
+            lease.observed_epoch, StorageFeature.PROJECT_WRITES
         ):
             lease.close()
             raise ProjectRegistryError("project writes are unavailable before the writer epoch")

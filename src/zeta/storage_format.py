@@ -28,12 +28,14 @@ WRITER_EPOCH: Final = 5
 class StorageFeature(StrEnum):
     HISTORY_FIDELITY = "history_fidelity"
     TRANSCRIPT_REPAIR = "transcript_repair"
+    PROJECT_WRITES = "project_writes"
     ATTENTION_KINDS = "attention_kinds"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.HISTORY_FIDELITY: 2,
     StorageFeature.TRANSCRIPT_REPAIR: 4,
+    StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
 }
 

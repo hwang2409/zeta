@@ -81,7 +81,7 @@ class ForkViewMixin:
 
     def _load_fork_context(self) -> None:
         from ...attention_forks import read_attention_fork
-        from ...attention_records import AttentionStore, observed_epoch_for_session
+        from ...attention_records import AttentionStore
         from ...core.session import SessionManager
 
         home = self._home
@@ -93,7 +93,9 @@ class ForkViewMixin:
             return
         source_dir = home / "sessions" / fork.forked_from_session
         try:
-            record = AttentionStore(source_dir, writer_epoch=observed_epoch_for_session(source_dir)).get(fork.attention_id)
+            record = AttentionStore(
+                source_dir, writer_epoch=self.loop.store._storage_lease.observed_epoch
+            ).get(fork.attention_id)
             source_name = (
                 SessionManager(home).read_metadata(fork.forked_from_session).name
             )
@@ -170,14 +172,15 @@ class ForkViewMixin:
             return 0
 
     def _fork_item_open(self) -> bool:
-        from ...attention_records import AttentionStore, observed_epoch_for_session
+        from ...attention_records import AttentionStore
 
         if self._fork_context is None:
             return False
         try:
-            record = AttentionStore(self._fork_context.source_path, writer_epoch=observed_epoch_for_session(self._fork_context.source_path)).get(
-                self._fork_context.attention_id
-            )
+            record = AttentionStore(
+                self._fork_context.source_path,
+                writer_epoch=self.loop.store._storage_lease.observed_epoch,
+            ).get(self._fork_context.attention_id)
         except (OSError, ValueError):
             return False
         return record.status == "open"
