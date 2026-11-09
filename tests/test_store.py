@@ -145,6 +145,7 @@ def test_history_index_close_waits_for_an_inflight_page(
             def close(self) -> None:
                 return None
 
+        # test-contract: seam pauses the real leaf operation to prove close ordering.
         monkeypatch.setattr(index, "_connection", lambda write: BlockedConnection())
         page = threading.Thread(
             target=lambda: index.page({"after": 0}, facts), daemon=True
