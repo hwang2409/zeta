@@ -13,7 +13,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from .attention_records import AttentionRecord, AttentionStore
+from .attention_records import (
+    AttentionRecord,
+    AttentionStore,
+    Broken,
+    Missing,
+    broken_record_refusal,
+)
 from .project_inbox import ProjectInbox
 from .runtime.project_registry_state import (
     ProjectRegistryState,
@@ -22,13 +28,17 @@ from .runtime.project_registry_state import (
 
 _MAX_REPLY_BYTES = 32_000
 
-ReplyStatus = Literal["applied", "duplicate", "conflict", "already-resolved"]
+ReplyStatus = Literal[
+    "applied", "duplicate", "conflict", "already-resolved", "broken"
+]
 
 
 @dataclass(frozen=True, slots=True)
 class ReplyItemOutcome:
     attention_id: str
     status: ReplyStatus
+    # The repair refusal for a "broken" item; batch surfaces show it.
+    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,15 +132,20 @@ class AttentionReplies:
     def _recover_locked(self) -> ReplyOutcome:
         recovered_ids: list[str] = []
         journals = sorted(self.attention_dir.glob("sending-*-*"))
+        recoverable = []
         for journal in journals:
-            self._validate_journal(journal)
-        for journal in journals:
+            if self._validate_journal(journal) is not None:
+                # A broken record can become readable later, so retain its journal.
+                continue
+            recoverable.append(journal)
+        for journal in recoverable:
+            if self._try_send_journal(journal) is not None:
+                continue
             recovered_ids.extend(
                 path.name
                 for path in journal.iterdir()
                 if path.is_file() and not path.name.startswith(".")
             )
-            self._send_journal(journal)
             self._finish_journal_locked(journal)
         for path in self.attention_dir.glob("done-*"):
             if path.is_dir():
@@ -154,6 +169,13 @@ class AttentionReplies:
             ),
             staged=tuple(staged),
         )
+
+    def staged(self) -> tuple[tuple[str, str], ...]:
+        """Read the staged replies without recovery or any other write."""
+        if not self.staged_dir.is_dir():
+            return ()
+        with self._lock():
+            return self._staged_locked()
 
     def stage(
         self,
@@ -204,15 +226,13 @@ class AttentionReplies:
             if flush_ids is not None and flush_ids <= {
                 item_id for item_id, _ in staged
             }:
-                journal = self._prepare_locked(
-                    list(staged), source=self.staged_dir, from_session=from_session
-                )
-                message_id = journal.name.rsplit("-", 1)[-1]
-                self._send_journal(journal)
-                self._finish_journal_locked(journal)
-                return ReplyOutcome(
-                    items=(ReplyItemOutcome(attention_id, status),),
-                    message_id=message_id,
+                sent = self._send_staged_locked(staged, from_session)
+                return replace(
+                    sent,
+                    items=(
+                        ReplyItemOutcome(attention_id, status),
+                        *(item for item in sent.items if item.status == "broken"),
+                    ),
                 )
             return ReplyOutcome(
                 items=(ReplyItemOutcome(attention_id, status),),
@@ -222,37 +242,64 @@ class AttentionReplies:
     def flush(self, from_session: str) -> ReplyOutcome:
         from_session = self._validate_from_session(from_session)
         with self._operation() as recovered:
-            outcomes: list[ReplyItemOutcome] = []
-            open_pairs: list[tuple[str, str]] = []
-            for item_id, reply in recovered.staged:
-                record = self._record(item_id)
-                self._check_session(record)
-                if record.status == "resolved":
-                    if record.decision != reply:
-                        self._raise_conflict(
-                            "attention item is already resolved with a different reply"
-                        )
-                    outcomes.append(ReplyItemOutcome(item_id, "already-resolved"))
-                    (self.staged_dir / item_id).unlink()
-                    self._sync_directory(self.staged_dir)
-                else:
-                    outcomes.append(ReplyItemOutcome(item_id, "applied"))
-                    open_pairs.append((item_id, reply))
-            if not open_pairs:
-                return ReplyOutcome(
-                    items=tuple(outcomes),
-                    staged=self._staged_locked(),
+            return self._send_staged_locked(recovered.staged, from_session)
+
+    def _send_staged_locked(
+        self, staged: tuple[tuple[str, str], ...], from_session: str
+    ) -> ReplyOutcome:
+        """Send staged replies in one message; keep broken ones staged."""
+        outcomes, open_pairs = self._triage(list(staged))
+        for item in outcomes:
+            if item.status == "already-resolved":
+                (self.staged_dir / item.attention_id).unlink()
+                self._sync_directory(self.staged_dir)
+        if not open_pairs:
+            return ReplyOutcome(items=outcomes, staged=self._staged_locked())
+        keep_broken = any(item.status == "broken" for item in outcomes)
+        # Moving the staged directory would carry broken replies into the
+        # journal, so copy the sendable ones and remove them after the send.
+        # A crash before that removal leaves resolved staged replies, which the
+        # next flush drops as already resolved.
+        journal = self._prepare_locked(
+            open_pairs,
+            source=None if keep_broken else self.staged_dir,
+            from_session=from_session,
+        )
+        message_id = journal.name.rsplit("-", 1)[-1]
+        self._send_journal(journal)
+        self._finish_journal_locked(journal)
+        if keep_broken:
+            for item_id, _reply in open_pairs:
+                (self.staged_dir / item_id).unlink()
+            self._sync_directory(self.staged_dir)
+        return ReplyOutcome(
+            items=outcomes, staged=self._staged_locked(), message_id=message_id
+        )
+
+    def _triage(
+        self, pairs: list[tuple[str, str]]
+    ) -> tuple[tuple[ReplyItemOutcome, ...], list[tuple[str, str]]]:
+        """Classify batch items; broken records are reported, never sent."""
+        outcomes: list[ReplyItemOutcome] = []
+        open_pairs: list[tuple[str, str]] = []
+        for item_id, reply in pairs:
+            record = self._record_state(item_id)
+            if isinstance(record, Broken):
+                outcomes.append(
+                    ReplyItemOutcome(item_id, "broken", broken_record_refusal(record))
                 )
-            journal = self._prepare_locked(
-                open_pairs, source=self.staged_dir, from_session=from_session
-            )
-            message_id = journal.name.rsplit("-", 1)[-1]
-            self._send_journal(journal)
-            self._finish_journal_locked(journal)
-            return ReplyOutcome(
-                items=tuple(outcomes),
-                message_id=message_id,
-            )
+                continue
+            self._check_session(record)
+            if record.status == "resolved":
+                if record.decision != reply:
+                    self._raise_conflict(
+                        "attention item is already resolved with a different reply"
+                    )
+                outcomes.append(ReplyItemOutcome(item_id, "already-resolved"))
+            else:
+                outcomes.append(ReplyItemOutcome(item_id, "applied"))
+                open_pairs.append((item_id, reply))
+        return tuple(outcomes), open_pairs
 
     def reply(self, attention_id: str, reply: str, from_session: str) -> ReplyOutcome:
         attention_id = self._validate_attention_id(attention_id)
@@ -313,28 +360,15 @@ class AttentionReplies:
             conflicting = tuple(item_id for item_id, _ in pairs if item_id in staged)
             if conflicting:
                 self._raise_staged_conflict(conflicting[0])
-            outcomes: list[ReplyItemOutcome] = []
-            open_pairs: list[tuple[str, str]] = []
-            for item_id, reply in pairs:
-                record = self._record(item_id)
-                self._check_session(record)
-                if record.status == "resolved":
-                    if record.decision != reply:
-                        self._raise_conflict(
-                            "attention item is already resolved with a different reply"
-                        )
-                    outcomes.append(ReplyItemOutcome(item_id, "already-resolved"))
-                else:
-                    outcomes.append(ReplyItemOutcome(item_id, "applied"))
-                    open_pairs.append((item_id, reply))
+            outcomes, open_pairs = self._triage(pairs)
             if not open_pairs:
-                return self._outcome(recovered, items=tuple(outcomes))
+                return self._outcome(recovered, items=outcomes)
             journal = self._prepare_locked(open_pairs, from_session=from_session)
             message_id = journal.name.rsplit("-", 1)[-1]
             self._send_journal(journal)
             self._finish_journal_locked(journal)
             return ReplyOutcome(
-                items=tuple(outcomes),
+                items=outcomes,
                 staged=recovered.staged,
                 message_id=message_id,
             )
@@ -383,7 +417,16 @@ class AttentionReplies:
         )
 
     def _record(self, attention_id: str) -> AttentionRecord:
-        return AttentionStore(self.session_dir).get(attention_id)
+        state = self._record_state(attention_id)
+        if isinstance(state, Broken):
+            raise ReplyConflict(broken_record_refusal(state))
+        return state
+
+    def _record_state(self, attention_id: str) -> AttentionRecord | Broken:
+        state = AttentionStore(self.session_dir).record_state(attention_id)
+        if isinstance(state, Missing):
+            raise FileNotFoundError(attention_id)
+        return state if isinstance(state, Broken) else state.value
 
     def _check_session(self, record: AttentionRecord) -> None:
         if record.session_id != self.source_session_id:
@@ -435,7 +478,9 @@ class AttentionReplies:
         pairs: list[tuple[str, str]] = []
         for item in replies:
             if not isinstance(item, tuple) or len(item) != 2:
-                raise TypeError("replies must be a list of attention id and reply pairs")
+                raise TypeError(
+                    "replies must be a list of attention id and reply pairs"
+                )
             pairs.append(
                 (cls._validate_attention_id(item[0]), cls._validate_reply(item[1]))
             )
@@ -507,12 +552,18 @@ class AttentionReplies:
             if not path.name.startswith(".")
         ]
 
-    def _validate_journal(self, journal: Path) -> None:
+    def _validate_journal(self, journal: Path) -> Broken | None:
         pairs = self._journal_pairs(journal)
         if not pairs:
             raise ValueError("attention journal is empty")
+        store = AttentionStore(self.session_dir)
         for item_id, reply in pairs:
-            record = self._record(item_id)
+            state = store.record_state(item_id)
+            if isinstance(state, Broken):
+                return state
+            if isinstance(state, Missing):
+                raise FileNotFoundError(item_id)
+            record = state.value
             if record.status == "resolved" and record.decision != reply:
                 raise ValueError(
                     "attention journal conflicts with an already resolved reply"
@@ -521,9 +572,17 @@ class AttentionReplies:
                 raise ValueError(
                     "attention journal contains an invalid terminal record"
                 )
+        return None
 
     def _send_journal(self, journal: Path) -> None:
-        self._validate_journal(journal)
+        broken = self._try_send_journal(journal)
+        if broken is not None:
+            raise ReplyConflict(broken_record_refusal(broken))
+
+    def _try_send_journal(self, journal: Path) -> Broken | None:
+        broken = self._validate_journal(journal)
+        if broken is not None:
+            return broken
         pairs = self._journal_pairs(journal)
         if not pairs:
             raise ValueError("attention journal is empty")
@@ -538,10 +597,10 @@ class AttentionReplies:
         sender = (journal / ".sender").read_text(encoding="utf-8")
         first = records[0]
         label = "Decision" if first.kind == "decision" else "Reply"
-        sections = []
-        for record, (_, reply) in zip(records, pairs):
-            item_label = "Decision" if record.kind == "decision" else "Reply"
-            sections.append(f"{item_label}: {reply}")
+        sections = [
+            _reply_section(record, reply)
+            for record, (_, reply) in zip(records, pairs)
+        ]
         inbox = ProjectInbox(
             state.registry,
             sessions_root=self.home / "sessions",
@@ -555,8 +614,8 @@ class AttentionReplies:
             title=f"{label}: {first.title}"
             if len(records) == 1
             else f"{label} batch ({len(records)})",
-            body=f"User relayed from session {sender}. Check whether the situation has changed before acting.\\n\\n"
-            + "\\n\\n".join(sections),
+            body=f"User relayed from session {sender}. Check whether the situation has changed before acting.\n\n"
+            + "\n\n".join(sections),
             message_id=self._message_id(pairs),
             on_visible=self.on_inbox_visible,
         )
@@ -568,6 +627,7 @@ class AttentionReplies:
                         current, status="resolved", resolved_at=_now(), decision=reply
                     )
                 )
+        return None
 
     @staticmethod
     def _message_id(pairs: list[tuple[str, str]]) -> str:
@@ -580,6 +640,14 @@ class AttentionReplies:
         for child in path.iterdir():
             child.unlink()
         path.rmdir()
+
+
+def _reply_section(record: AttentionRecord, reply: str) -> str:
+    label = "Decision" if record.kind == "decision" else "Reply"
+    return (
+        f"Question: {record.title} (id {record.id}, asked {record.created_at})\n"
+        f"{label}: {reply}"
+    )
 
 
 def _now() -> str:

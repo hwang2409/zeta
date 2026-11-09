@@ -41,7 +41,6 @@ from .actors.lifecycle import (
     ChildFinished as _ChildFinished,
     Close as _Close,
     Remove as _Remove,
-    RemoveWhenIdle as _RemoveWhenIdle,
     TransportFailure as _TransportFailure,
 )
 from .actors.resource import (
@@ -173,7 +172,6 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._children: set[asyncio.Task[object]] = set()
         self._operation: _Operation | None = None
         self._pending_starts: list[_StartOperation] = []
-        self._pending_removes: list[asyncio.Future[None]] = []
         self._requests: dict[int, _CallRequest | _PromptRequest] = {}
         self._resource_requests: dict[int, _ResourceRequest] = {}
         self._scheduled_closes: dict[int, tuple[MCPClient, asyncio.Task[object]]] = {}
@@ -264,13 +262,6 @@ class MCPServerActor(MCPDefinitionPublisher):
             return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._queue.put_nowait(_Remove(future))
-        await asyncio.shield(future)
-
-    async def remove_when_idle(self) -> None:
-        if self.is_terminal:
-            return
-        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._queue.put_nowait(_RemoveWhenIdle(future))
         await asyncio.shield(future)
 
     async def close(self) -> None:
@@ -412,24 +403,12 @@ class MCPServerActor(MCPDefinitionPublisher):
                 elif isinstance(message, _Remove):
                     await self._handle_remove(message.result)
                     return
-                elif isinstance(message, _RemoveWhenIdle):
-                    if self._operation is None:
-                        await self._handle_remove(message.result)
-                        return
-                    self._pending_removes.append(message.result)
                 if (
                     self._operation is None
                     and self._pending_starts
                     and not self._closed
                 ):
                     self._handle_start(self._pending_starts.pop(0))
-                if (
-                    self._operation is None
-                    and self._pending_removes
-                    and not self._closed
-                ):
-                    await self._handle_remove(self._pending_removes.pop(0))
-                    return
         except asyncio.CancelledError:
             await asyncio.shield(self._finalize_terminal(message, None))
             raise
@@ -1017,10 +996,6 @@ class MCPServerActor(MCPDefinitionPublisher):
         if operation is not None and operation.task is not None:
             operation.task.cancel()
 
-    def _resolve_pending_removes(self) -> None:
-        while self._pending_removes:
-            _set_result(self._pending_removes.pop(0), None)
-
     def _abandon_current_operation(self) -> None:
         operation = self._operation
         if operation is None:
@@ -1057,7 +1032,6 @@ class MCPServerActor(MCPDefinitionPublisher):
                 _set_result(operation.waiter.result, _unavailable_result(self.name))
         while self._pending_starts:
             self._resolve_message(self._pending_starts.pop(0))
-        self._resolve_pending_removes()
         for request in self._requests.values():
             if request.task is not None:
                 request.task.cancel()
@@ -1113,7 +1087,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._resolve_message(message)
 
     def _resolve_message(self, message: object | None) -> None:
-        if isinstance(message, (_Remove, _RemoveWhenIdle, _Close)):
+        if isinstance(message, (_Remove, _Close)):
             _set_result(message.result, None)
         elif isinstance(message, (_CancelOperation, _CancelRequest)):
             _set_result(message.acknowledged, None)

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
+from ...attention_records import Broken, broken_record_refusal
 from ...runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
@@ -52,6 +53,7 @@ class DecisionsMixin:
         self._decisions_panel_control = OverlayControl()
         self._decisions_panel_open = False
         self._decisions_count = 0
+        self._decisions_staged_count = 0
         self._decisions_poll_task: asyncio.Task[None] | None = None
         self._decisions_refresh_task: asyncio.Task[None] | None = None
         self._decisions_restore_text = ""
@@ -67,6 +69,10 @@ class DecisionsMixin:
     @property
     def decisions_count(self) -> int:
         return self._decisions_count
+
+    @property
+    def decisions_staged_count(self) -> int:
+        return self._decisions_staged_count
 
     @property
     def _decisions_session_id(self) -> str:
@@ -105,6 +111,8 @@ class DecisionsMixin:
             )
             if record is None:
                 return "attention item not found"
+            if isinstance(record, Broken):
+                return broken_record_refusal(record)
             replies = self._attention_replies(record.session_id)
             if parts[0] == "dismiss":
                 await self._run_attention_operation(replies.dismiss, attention_id)
@@ -121,7 +129,11 @@ class DecisionsMixin:
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
-            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            (
+                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
+                if isinstance(item.record, Broken)
+                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            )
             for item in items
         )
 
@@ -145,20 +157,39 @@ class DecisionsMixin:
 
     async def _decisions_tick(self) -> None:
         from ...attention_decisions import open_decisions
+        from ...attention_records import Broken
+
+        session_id = self._decisions_session_id
+        registry_state = _registry_state(self)
+        replies = self._attention_replies(session_id)
+
+        def read():
+            items = open_decisions(self._home, session_id, registry_state)
+            # A broken record cannot take a reply, so it never shows as staged.
+            open_ids = {
+                item.record.id
+                for item in items
+                if not isinstance(item.record, Broken)
+            }
+            staged = {
+                item_id: reply
+                for item_id, reply in (replies.staged() if items else ())
+                if item_id in open_ids
+            }
+            return items, staged
 
         try:
-            items = await asyncio.to_thread(
-                open_decisions,
-                self._home,
-                self._decisions_session_id,
-                _registry_state(self),
-            )
+            items, staged = await asyncio.to_thread(read)
         except OSError:
             return
-        changed = len(items) != self._decisions_count
+        changed = (len(items), len(staged)) != (
+            self._decisions_count,
+            self._decisions_staged_count,
+        )
         self._decisions_count = len(items)
+        self._decisions_staged_count = len(staged)
         if self._decisions_panel_open:
-            self._decisions_panel.set_items(items)
+            self._decisions_panel.set_items(items, staged)
             self._decisions_panel_control.set_lines(
                 self._decisions_panel.render_lines(),
                 keep_offset=True,
@@ -233,12 +264,18 @@ class DecisionsMixin:
     async def _flush_staged_decisions(self) -> None:
         try:
             for session_id in self._decisions_session_ids():
-                await self._run_attention_operation(
+                outcome = await self._run_attention_operation(
                     self._attention_replies(session_id).flush,
                     self.loop.store.session_id,
                 )
+                self._print_broken_outcomes(outcome)
         except (OSError, ValueError) as exc:
             self._print_system(f"decisions not delivered: {exc}")
+
+    def _print_broken_outcomes(self, outcome) -> None:
+        for item in outcome.items:
+            if item.status == "broken":
+                self._print_system(f"decision not delivered: {item.detail}")
 
     def _decisions_session_ids(self) -> tuple[str, ...]:
         return tuple({item.session_id for item in self._decisions_panel.items})
@@ -281,13 +318,14 @@ class DecisionsMixin:
         elif (
             key == "d"
             and panel.selected is not None
+            and not isinstance(panel.selected.record, Broken)
             and panel.selected.record.kind != "decision"
         ):
             self._dismiss_selected()
             return
         elif key == "a":
-            panel.enter_answer()
-            self._decisions_answer_buffer = ""
+            if panel.enter_answer():
+                self._decisions_answer_buffer = ""
         elif key == "enter":
             self._discuss_selected()
             return
@@ -336,22 +374,27 @@ class DecisionsMixin:
         if item is None:
             return
         record = item.record
+        if isinstance(record, Broken):
+            self._print_system(f"attention record is broken: {record.reason}")
+            return
 
         async def run() -> None:
             item_ids = {
                 panel_item.record.id
                 for panel_item in self._decisions_panel.items
                 if panel_item.session_id == record.session_id
+                and not isinstance(panel_item.record, Broken)
             }
             try:
                 replies = self._attention_replies(record.session_id)
-                await self._run_attention_operation(
+                outcome = await self._run_attention_operation(
                     replies.stage,
                     record.id,
                     decision,
                     flush_ids=item_ids,
                     from_session=self.loop.store.session_id,
                 )
+                self._print_broken_outcomes(outcome)
             except (OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
             await self._decisions_tick()
@@ -362,7 +405,9 @@ class DecisionsMixin:
 
     def _dismiss_selected(self) -> None:
         item = self._decisions_panel.selected
-        if item is None:
+        if item is None or isinstance(item.record, Broken):
+            if item is not None:
+                self._print_system(f"attention record is broken: {item.record.reason}")
             return
 
         async def run() -> None:
@@ -378,6 +423,9 @@ class DecisionsMixin:
     def _discuss_selected(self) -> None:
         item = self._decisions_panel.selected
         if item is None or self._decisions_switching:
+            return
+        if isinstance(item.record, Broken):
+            self._print_system(broken_record_refusal(item.record))
             return
         self._decisions_switching = True
         source_id, attention_id = item.session_id, item.record.id

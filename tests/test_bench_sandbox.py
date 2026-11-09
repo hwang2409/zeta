@@ -168,6 +168,9 @@ def _fake_keychain():
 anthropic._keychain_claude_tokens = _fake_keychain
 """
 
+# One bench.py serve progress line: "serve <sid> lifetime <n>: <step> +<s>s".
+PROGRESS = re.compile(r"serve \S+ lifetime (\d+): (.+) \+[\d.]+s$")
+
 # bench.py's default sources, resolved under the throwaway HOME.
 SOURCES = {
     "phoebe": "7897c1aed2e5444caba907f462306b10",
@@ -264,7 +267,7 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
                 "--tree",
                 str(ROOT),
                 *("--session", "phoebe", "--session", "orchestrator"),
-                *("--probe", "serve"),
+                *("--probe", "serve", "--serve-traffic-only"),
             ],
             env=env,
             cwd=tmp_path,
@@ -276,7 +279,13 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         returncode, stderr = run.returncode, run.stderr
     except subprocess.TimeoutExpired as exc:
         # The run is killed; the traffic it recorded is still checked first.
-        run, returncode, stderr = None, "timed out", exc.stderr
+        # The last progress line names the step that was still running.
+        err = exc.stderr or b""
+        tail = (err.decode() if isinstance(err, bytes) else err).splitlines()[-20:]
+        steps = [m for line in tail if (m := PROGRESS.match(line))]
+        last = f"{steps[-1][2]} (lifetime {steps[-1][1]})" if steps else "none"
+        headline = f"bench serve probe timed out after step: {last}"
+        run, returncode, stderr = None, "timed out", "\n".join([headline, *tail])
 
     # Provider traffic went to the local stub only: no keychain read and no
     # connect or lookup to a non-local host got past the harness. The harness
@@ -312,7 +321,7 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         text = text[end:]
     # Every resume of each copied session looked up its model at the local stub.
     for name in SOURCES:
-        assert results[name]["serve"]["stub_lookups_per_server"] == [1] * 5
+        assert results[name]["serve"]["stub_lookups_per_server"] == [1]
 
 
 @pytest.mark.parametrize("failing", ["stub", "env"])

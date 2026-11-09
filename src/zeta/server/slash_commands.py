@@ -18,7 +18,8 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
-from ..attention_decisions import DecisionItem
+from ..attention_decisions import DecisionItem, open_decisions
+from ..attention_records import Broken
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
@@ -117,8 +118,6 @@ class ServerSlashSession:
     # --- runnable server-side ---
 
     async def slash_decisions(self, args: str) -> str:
-        from ..attention_decisions import open_decisions
-
         _loop, opened = self._active_loop_and_session()
         command, _, remainder = args.strip().partition(" ")
         registry_state = self._runtime.manager.project_registry_state
@@ -148,7 +147,11 @@ class ServerSlashSession:
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
-            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            (
+                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
+                if isinstance(item.record, Broken)
+                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            )
             for item in items
         )
 
@@ -198,12 +201,15 @@ class ServerSlashSession:
     async def _run_decisions_batch(
         self, batch: list[tuple[str, str]], from_session: str
     ) -> str:
-        await self._run_attention_operation(
+        outcome = await self._run_attention_operation(
             self._attention_replies(from_session).stage_and_flush,
             batch,
             from_session,
         )
-        return f"replied to {len(batch)} attention item(s)"
+        refusals = [item.detail for item in outcome.items if item.status == "broken"]
+        replied = len(outcome.items) - len(refusals)
+        lines = [f"replied to {replied} attention item(s)"] if replied else []
+        return "\n".join([*lines, *refusals])
 
     async def _slash_decisions_action(
         self,
@@ -218,6 +224,8 @@ class ServerSlashSession:
         item = next((item for item in items if item.record.id == attention_id), None)
         if item is None:
             return "attention item not found"
+        if isinstance(item.record, Broken):
+            return f"attention record {item.record.id} is broken ({item.record.reason}); repair {item.record.path} before replying"
         replies = self._attention_replies(item.session_id)
         if command == "dismiss":
             await self._run_attention_operation(replies.dismiss, item.record.id)

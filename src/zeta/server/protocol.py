@@ -131,6 +131,11 @@ class ErrorDescriptor(Enum):
         "session_not_found",
         "the requested session does not exist",
     )
+    SESSION_MISMATCH = (
+        -32003,
+        "session_mismatch",
+        "the requested session is not the attached session",
+    )
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
@@ -235,6 +240,7 @@ FEATURES = (
     "served_turn_end",
     "content_read",
     "session_grants",
+    "delivery_session_guard",
 )
 
 
@@ -552,7 +558,28 @@ async def _dispatch(
         raise self._descriptor_protocol_error(descriptor)
     if descriptor.feature is not None and descriptor.feature not in self.features:
         raise self._descriptor_feature_error(descriptor)
+    if descriptor.access is Access.DELIVERY:
+        _require_attached_session(self.server.runtime, params)
     return await HANDLERS[descriptor](self, request_id, params)
+
+
+def _require_attached_session(runtime: Any, params: dict[str, Any]) -> None:
+    """Reject a delivery aimed at another session before any delivery effect."""
+
+    if "session_id" not in params:
+        return
+    session_id = params["session_id"]
+    if not isinstance(session_id, str) or not session_id:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
+        )
+    attached = runtime.session_id if runtime.opened is not None else None
+    if attached is not None and session_id != attached:
+        raise ProtocolError(
+            ErrorDescriptor.SESSION_MISMATCH,
+            "session is not active",
+            {"attached_session_id": attached, "session_id": session_id},
+        )
 
 
 def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
