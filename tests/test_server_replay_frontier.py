@@ -749,6 +749,25 @@ async def test_row_older_than_lookup_window_ends_older_streams_only(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_generation_overcount_keeps_row_backed_frame_on_stream(
+    tmp_path: Path, transport: Transport
+) -> None:
+    serve = await _serve(tmp_path, transport, FakeBackend([]))
+    try:
+        _tool_rows(serve.store, "frontier-call")
+        await serve.join(serve.observer)
+        # This is the over-count from an async replace_entries install after an external append.
+        serve.store._reset_generation += 1
+        await _publish_tool_end(serve, "covered-call")
+        frames = await serve.live(serve.observer)
+        assert [frame["event"] for frame in frames] == ["tool_end"], frames
+        assert not any(frame["event"] == "replay_stream_ended" for frame in frames)
+    finally:
+        await _close(serve)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_store_reset_ends_streams_instead_of_dropping_renumbered_rows(
     tmp_path: Path, transport: Transport
 ) -> None:

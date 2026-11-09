@@ -198,17 +198,34 @@ class ReplayOutput:
         self, connection: Any, history: dict[str, object], frontier_seq: int
     ) -> dict[str, object]:
         scope = self.replay.scope_for(connection)
-        if scope is not None and not self._frontier_holds(connection, scope):
+        store = self._replay_store(scope) if scope is not None else None
+        if scope is not None and not self._frontier_holds(
+            connection, scope, frontier_seq=frontier_seq
+        ):
             self.invalidate_replay_scope(scope, "session_replaced")
-        return self.replay.finish_join(connection, history, frontier_seq)
+        row_id = None if store is None else store.row_id_at(frontier_seq)
+        return self.replay.finish_join(connection, history, frontier_seq, row_id)
 
-    def _frontier_holds(self, connection: Any, scope: ReplayScopeId) -> bool:
-        """False after a store reset that can renumber rows since the join began."""
+    def _frontier_holds(
+        self, connection: Any, scope: ReplayScopeId, *, frontier_seq: int | None = None
+    ) -> bool:
+        """Check a generation change against the frontier's stable row id."""
         generation = self.replay.reset_generation(connection)
         store = self._replay_store(scope)
-        return generation is None or (
-            store is not None and store.reset_generation() == generation
-        )
+        if generation is None or store is None:
+            return generation is None
+        current = store.reset_generation()
+        if current == generation:
+            return True
+        frontier = self.replay.frontier(connection)
+        if frontier is None:
+            return False
+        seq = frontier.seq if frontier_seq is None else frontier_seq
+        row_id = frontier.row_id
+        if row_id is None or store.row_id_at(seq) != row_id:
+            return False
+        self.replay.refresh_reset_generation(connection, current)
+        return True
 
     def invalidate_replay_connection(
         self,

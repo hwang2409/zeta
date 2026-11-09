@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..protocol import ErrorDescriptor, ProtocolError
@@ -73,11 +73,11 @@ class PublishedSessionEvent:
 
 @dataclass(frozen=True, slots=True)
 class Frontier:
-    """The newest row seq the join's history read included, and the store's
-    reset generation when the join began (a reset renumbers rows)."""
+    """The newest row seq and stable id included by the join's history read."""
 
     seq: int
     reset_generation: int
+    row_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -301,7 +301,11 @@ class SessionReplay:
         return pending
 
     def finish_join(
-        self, connection: Any, history_snapshot: dict[str, object], frontier_seq: int
+        self,
+        connection: Any,
+        history_snapshot: dict[str, object],
+        frontier_seq: int,
+        frontier_row_id: str | None = None,
     ) -> dict[str, object]:
         """Fix the join's frontier; drop held frames its history already shows."""
         pending = self._pending.get(connection)
@@ -310,7 +314,7 @@ class SessionReplay:
                 ErrorDescriptor.STALE_EVENT_SEQUENCE,
                 "replay continuity was invalidated",
             )
-        frontier = Frontier(frontier_seq, pending.reset_generation)
+        frontier = Frontier(frontier_seq, pending.reset_generation, frontier_row_id)
         kept: list[HeldFrame] = []
         for held in pending.frames:
             decision = decide(held.covers, frontier)
@@ -346,6 +350,24 @@ class SessionReplay:
         self._subscriptions[connection] = _Subscription(
             pending.scope, pending.stream_id, pending.frontier
         )
+
+    def frontier(self, connection: Any) -> Frontier | None:
+        subscription = self._subscriptions.get(connection)
+        if subscription is not None:
+            return subscription.frontier
+        pending = self._pending.get(connection)
+        return None if pending is None else pending.frontier
+
+    def refresh_reset_generation(self, connection: Any, reset_generation: int) -> None:
+        subscription = self._subscriptions.get(connection)
+        if subscription is not None:
+            subscription.frontier = replace(
+                subscription.frontier, reset_generation=reset_generation
+            )
+            return
+        pending = self._pending.get(connection)
+        if pending is not None:
+            pending.reset_generation = reset_generation
 
     def reset_generation(self, connection: Any) -> int | None:
         """The store reset generation a connection's stream or join began at."""
