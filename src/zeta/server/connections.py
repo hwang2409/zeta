@@ -885,7 +885,10 @@ class ConnectionRegistry(ReplayOutput):
                 served_turn_end="served_turn_end" in features,
                 child_runs=True,
             )
-            row = child_run_row(Path(runtime.opened.store.session_dir), params["run_id"])
+            # the row is read from the run's immediate parent, which is nested for a nested run
+            row = child_run_row(
+                Path(child_runtime.opened.store.session_dir).parent.parent, params["run_id"]
+            )
             if row is None:
                 raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
             return result[0], result[1], row
