@@ -476,11 +476,8 @@ def _assert_migrated_public_surfaces(
         runtime=SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list)),
         codec=FrameCodec(),
         registry=registry,
-    ).dispatch(
-        1,
-        "project_show",
-        {"project_id": project_id},
-        features=frozenset({"projects-memory-v2"}),
+    ).show(
+        1, {"project_id": project_id}, entry_response=True
     )
     assert shown["memory"]["profile"] == "zeta"
 
@@ -1032,7 +1029,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
         runtime = SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list))
         ProjectRequests(
             home=home, runtime=runtime, codec=FrameCodec(), registry=registry
-        ).dispatch(1, "project_show", {"project_id": project_id})
+        ).show(1, {"project_id": project_id}, entry_response=False)
     elif entry_point == "sync-push":
         await asyncio.to_thread(
             push_project_memory,
