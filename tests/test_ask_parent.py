@@ -166,6 +166,7 @@ async def test_ordinary_agent_send_is_not_consumed_as_question_answer(
             parent,
             handle,
             "Proceed",
+            owner=owner,
             channel=owner.conversation_channel,
         ),
         what="ordinary child follow-up",
