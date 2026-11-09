@@ -94,6 +94,7 @@ from ._completion import (
     provider_prompt_tokens,
     subscription_limit_failure,
     task_is_cancelling,
+    update_rate_limit_progress,
 )
 from ._store_writes import StoreWriteMixin
 from .backend_owners import BackendOwnerMixin
@@ -955,19 +956,9 @@ class AgentLoop(
                     }:
                         provider_started = True
                     self.context_assembler.observe_event(event)
-                    if event.type is StreamEventType.RETRY and event.data.get(
-                        "kind"
-                    ) == "provider_rate_limit_hold" and self.agent_instance_id is not None:
-                        delay = event.data.get("delay")
-                        step = (
-                            f"checking again in {delay:g}s"
-                            if isinstance(delay, (int, float))
-                            else "rate-limited"
-                        )
-                        self.store.update_agent_lifecycle(
-                            current_step=step,
-                            state="running",
-                        )
+                    update_rate_limit_progress(
+                        self.store, self.agent_instance_id, event
+                    )
                     if event.type is StreamEventType.ERROR:
                         provider_error = (
                             replace(event.error, provider_error=True)
