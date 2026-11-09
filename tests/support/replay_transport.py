@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 from tests.support.owned import await_or_fail
 from tests.support.sockets import short_socket_path
 from zeta.server import ZetaServer
+from zeta.server.protocol import MAX_FRAME_BYTES
 
 Transport = Literal["unix", "websocket"]
 
@@ -121,7 +122,10 @@ async def connect_replay(server: ZetaServer, transport: Transport) -> ReplayClie
     if transport == "unix":
         if server.connections is None:
             await server.start()
-        reader, writer = await asyncio.open_unix_connection(server.socket_path)
+        # a join response can be as large as one 1 MiB frame
+        reader, writer = await asyncio.open_unix_connection(
+            server.socket_path, limit=MAX_FRAME_BYTES + 1
+        )
         return ReplayClient(reader, writer, False)
     if server.connections is None:
         await server.start()

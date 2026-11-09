@@ -826,28 +826,36 @@ def _fit_history_groups(
             sizes.append(size)
         cursor = index if backward else min(index + 1, end)
         raw_group = projection.entry_groups[index]
-        fits, group, size = _history_group_fits(
-            codec,
-            request_id,
-            groups[index],
-            sizes[index],
-            body_size=body_size,
-            rows=rows,
-            cursor=cursor,
-            end=end,
-            backward=backward,
-            validator=validator,
-            raw_group=raw_group,
-            projection=projection,
-            include_delivery_id=include_delivery_id,
-            fidelity=fidelity,
-            content_read=content_read,
-        )
+        # a newest page may become a live join's response, which adds snapshot rows
+        reserve = child_history.baseline_reserve(groups[index]) if backward else 0
+        while True:
+            fits, group, size = _history_group_fits(
+                codec,
+                request_id,
+                groups[index],
+                sizes[index],
+                body_size=body_size + reserve,
+                rows=rows,
+                cursor=cursor,
+                end=end,
+                backward=backward,
+                validator=validator,
+                raw_group=raw_group,
+                projection=projection,
+                include_delivery_id=include_delivery_id,
+                fidelity=fidelity,
+                content_read=content_read,
+            )
+            if fits or rows or not reserve:
+                break
+            # shortcut: a lone group whose snapshot rows fit no page pages without the
+            # reserve, so its join can exceed one frame; split such groups if that occurs
+            reserve = 0
         if not fits:
             break
         groups[index], sizes[index] = group, size
         rows.extend(group)
-        body_size += int(bool(rows[: -len(group)] and group)) + size if group else 0
+        body_size += int(bool(rows[: -len(group)] and group)) + size + reserve if group else 0
         selected.append(index)
         response_groups.append(group)
     return (
