@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import multiprocessing
 import os
 import queue
+import selectors
 import sqlite3
+import subprocess
+import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -32,6 +37,7 @@ from zeta.transcript_search.refresh import (
 
 PROJECT_A = "p_" + "a" * 32
 PROJECT_B = "p_" + "b" * 32
+V4_REVISION = "9b8b7ea4c2e6873c22ad2f365c66e717873a4cce"
 
 
 def _row(seq: int, role: str, text: str, *, state: str | None = None) -> dict:
@@ -361,66 +367,80 @@ def test_deletion_and_reassignment(tmp_path: Path) -> None:
     assert new.search("moving canary")
 
 
-def test_v4_cursor_schema_migrates_and_missing_digest_rebuilds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_v4_and_v5_processes_search_the_same_home(
+    tmp_path: Path,
 ) -> None:
-    source = _source(tmp_path / "sessions", "one", [_row(1, "user", "before")])
-    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
-    index.append(source)
-    with sqlite3.connect(index.path) as connection:
-        columns = {
-            str(row[1])
-            for row in connection.execute("PRAGMA table_info(session_cursors)")
-        }
-        if "prefix_digest" in columns:
-            connection.execute("ALTER TABLE session_cursors DROP COLUMN prefix_digest")
-        connection.execute(
-            "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
-        )
-        connection.commit()
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "mixed version canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    base_checkout = tmp_path / "base"
+    archive = subprocess.run(
+        ["git", "archive", V4_REVISION, "src/zeta"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(base_checkout, filter="data")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(base_checkout / "src")
+    script = """
+import sys
+from pathlib import Path
+from zeta.transcript_search.index import TranscriptIndex, TranscriptSource
 
-    migrated = TranscriptIndex(tmp_path / "project", PROJECT_A)
-    assert migrated.status().schema_version == 5
-    observed: list[object] = []
-    original_read = index_module._read_transcript
+project_dir, session_dir = map(Path, sys.argv[1:])
+index = TranscriptIndex(project_dir, 'p_' + 'a' * 32)
+index.append(TranscriptSource('one', session_dir))
+assert index.search('mixed version canary')
+print(index.path.name, flush=True)
+sys.stdin.readline()
+assert index.search('mixed version canary')
+print('v4-found', flush=True)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path / "project"), str(source.session_dir)],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            assert selector.select(10), "v4 process did not build its index"
+        assert process.stdout.readline().strip() == "transcript-index.sqlite3"
 
-    def observe(*args, **kwargs):
-        result = original_read(*args, **kwargs)
-        observed.append(result)
-        return result
+        v5 = TranscriptIndex(tmp_path / "project", PROJECT_A)
+        v5.append(source)
+        assert v5.search("mixed version canary")
 
-    monkeypatch.setattr(index_module, "_read_transcript", observe)
-    with source.conversation_path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(_row(2, "assistant", "after", state="completed")) + "\n"
-        )
-    migrated.append(source)
-    assert observed[-1].full is True
-    assert migrated.search("after")
-
-
-def test_v4_reader_refuses_v5_index_without_rebuilding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    project_dir = tmp_path / "project"
-    index = TranscriptIndex(project_dir, PROJECT_A)
-    with sqlite3.connect(index.path) as connection:
-        connection.execute(
-            "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
-        )
-        connection.commit()
-
-    migrated = TranscriptIndex(project_dir, PROJECT_A)
-    assert migrated.status().ready
-    monkeypatch.setattr(index_module, "SCHEMA_VERSION", 4)
-    old_reader = TranscriptIndex(project_dir, PROJECT_A)
-
-    assert not old_reader.status().ready
-    with sqlite3.connect(old_reader.path) as connection:
-        version = connection.execute(
-            "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone()[0]
-    assert version == "5"
+        assert process.stdin is not None
+        process.stdin.write("search\n")
+        process.stdin.flush()
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            assert selector.select(10), "v4 process did not finish its search"
+        result = process.stdout.readline().strip()
+        returncode = process.wait(timeout=10)
+        assert process.stderr is not None
+        error = process.stderr.read()
+        assert result == "v4-found", error
+        assert returncode == 0, error
+        assert v5.path.name == "transcript-index-v5.sqlite3"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
 
 def test_malformed_schema_metadata_constructs_for_rebuild(tmp_path: Path) -> None:
@@ -447,7 +467,7 @@ def test_malformed_schema_metadata_constructs_for_rebuild(tmp_path: Path) -> Non
     assert recovered.search("malformed metadata canary")
 
 
-def test_v4_missing_cursor_table_constructs_for_rebuild(tmp_path: Path) -> None:
+def test_missing_cursor_table_constructs_for_rebuild(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
         "one",
@@ -459,9 +479,6 @@ def test_v4_missing_cursor_table_constructs_for_rebuild(tmp_path: Path) -> None:
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
     with sqlite3.connect(index.path) as connection:
         connection.execute("DROP TABLE session_cursors")
-        connection.execute(
-            "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
-        )
         connection.commit()
 
     recovered = TranscriptIndex(tmp_path / "project", PROJECT_A)
@@ -535,6 +552,7 @@ def test_missing_receipts_verify_bounded_prefix_then_read_only_tail(
         observed.append(result)
         return result
 
+    # test-contract: seam count bounded transcript reads through the index
     monkeypatch.setattr(index_module, "_read_transcript", observe)
     with source.conversation_path.open("a", encoding="utf-8") as handle:
         handle.write(
@@ -570,6 +588,7 @@ def test_prefix_mutation_without_receipts_forces_full_rebuild(
         observed.append(result)
         return result
 
+    # test-contract: seam observe fallback through the index reader
     monkeypatch.setattr(index_module, "_read_transcript", observe)
     _write_rows(
         source,

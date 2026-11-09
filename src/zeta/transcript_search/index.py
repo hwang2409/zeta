@@ -364,7 +364,7 @@ def _split_utf8(value: str, max_bytes: int) -> list[str]:
 
 SCHEMA_VERSION = 5
 SANITIZER_VERSION = 2
-INDEX_FILENAME = "transcript-index.sqlite3"
+INDEX_FILENAME = f"transcript-index-v{SCHEMA_VERSION}.sqlite3"
 MAX_ACTIVE_TAIL_BYTES = 1024 * 1024
 _TOKEN = re.compile(r"[\w.-]+", re.UNICODE)
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
@@ -455,8 +455,6 @@ class TranscriptIndex:
                     with self._temporary_database() as temporary_path:
                         self._initialize(temporary_path)
                         self._publish(temporary_path)
-                else:
-                    self._migrate_schema()
         except (OSError, sqlite3.Error) as exc:
             raise TranscriptIndexError(
                 f"could not initialize transcript index: {exc}"
@@ -931,28 +929,6 @@ class TranscriptIndex:
         finally:
             connection.close()
         os.chmod(path, 0o600)
-
-    def _migrate_schema(self) -> None:
-        try:
-            connection = sqlite3.connect(self.path)
-            with closing(connection), connection:
-                metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-                if metadata.get("schema_version") != "4":
-                    return
-                columns = {
-                    str(row[1])
-                    for row in connection.execute("PRAGMA table_info(session_cursors)")
-                }
-                if "prefix_digest" not in columns:
-                    connection.execute(
-                        "ALTER TABLE session_cursors ADD COLUMN prefix_digest TEXT"
-                    )
-                connection.execute(
-                    "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
-                    (str(SCHEMA_VERSION),),
-                )
-        except sqlite3.DatabaseError:
-            return
 
     def _version_state(self) -> tuple[int, int, int, str | None]:
         try:
