@@ -291,22 +291,32 @@ def register(registry: ToolRegistry) -> None:
     _register(registry, _ACTIONS)
 
 
+async def _prepare_arguments(
+    registry: ToolRegistry, arguments: Mapping[str, object]
+) -> Mapping[str, object]:
+    prepared = dict(arguments)
+    project = prepared.get("project")
+    if isinstance(project, str) and registry.project_registry is not None:
+        project_id = await asyncio.to_thread(
+            resolve_project_ref, registry.project_registry, project
+        )
+        if project_id is None:
+            raise ValueError(f"unknown inbox target project {project!r}")
+        cache = getattr(registry, "_inbox_project_refs", {})
+        cache[project] = project_id
+        cache[project_id] = project_id
+        registry._inbox_project_refs = cache
+        prepared["project"] = project_id
+    return prepared
+
+
 def _approval_subject(
     registry: ToolRegistry, arguments: Mapping[str, object]
 ) -> str | None:
     project = arguments.get("project")
     if not isinstance(project, str) or registry.project_registry is None:
         return None
-    # Capability resolution runs on the event loop; resolve names in the worker
-    # that executes the inbox operation instead of taking the identity lock here.
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        project_id = resolve_project_ref(registry.project_registry, project)
-        if project_id is None:
-            raise ValueError(f"unknown inbox target project {project!r}")
-        return project_id
-    return project
+    return getattr(registry, "_inbox_project_refs", {}).get(project, project)
 
 
 def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
@@ -339,4 +349,5 @@ def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
         approval_subject_resolver=lambda arguments: _approval_subject(
             registry, arguments
         ),
+        argument_preparer=lambda arguments: _prepare_arguments(registry, arguments),
     )

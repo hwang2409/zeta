@@ -171,6 +171,7 @@ class ToolDefinition:
     # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
     approval_subject: str | None = None
     approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None
+    argument_preparer: Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]] | None = None
     actions: Mapping[str, ToolAction] | None = None
 
     def schema(self) -> ToolSchema:
@@ -508,6 +509,7 @@ class ToolRegistry:
         binding: HandlerBinding = "loop",
         approval_subject: str | None = None,
         approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
+        argument_preparer: Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]] | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -580,6 +582,7 @@ class ToolRegistry:
             requires_approval=requires_approval,
             approval_subject=approval_subject,
             approval_subject_resolver=approval_subject_resolver,
+            argument_preparer=argument_preparer,
             actions=normalized_actions,
         )
         self._tools[name] = definition
@@ -1025,8 +1028,17 @@ class ToolRegistry:
                     kind="unknown_tool",
                 )
             )
+        prepared_arguments = tool_call.arguments
+        if definition.argument_preparer is not None:
+            try:
+                prepared_arguments = await definition.argument_preparer(tool_call.arguments)
+            except (KeyError, TypeError, ValueError) as exc:
+                self.abort_approval(tool_call)
+                return await finalize(_error_result(str(exc), kind="invalid_arguments"))
+        if prepared_arguments is not tool_call.arguments:
+            tool_call = replace(tool_call, arguments=dict(prepared_arguments))
         try:
-            capability = self.resolve_call(tool_call.name, tool_call.arguments)
+            capability = self.resolve_call(tool_call.name, prepared_arguments)
         except UnknownToolAction as exc:
             self.abort_approval(tool_call)
             return await finalize(

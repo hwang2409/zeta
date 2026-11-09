@@ -86,6 +86,48 @@ def _provider_text(provider: str, result: dict) -> str:
 
 
 @pytest.mark.asyncio
+async def test_inbox_execution_canonicalizes_approval_subjects(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
+    other = await asyncio.to_thread(projects.create_project, "other", "other")
+    async def send(project: str, *, skip_approval: bool = False) -> dict[str, object]:
+        return await registry.execute(
+            ToolCall(
+                "send-" + project,
+                "inbox",
+                {
+                    "action": "send",
+                    "project": project,
+                    "kind": "info",
+                    "title": "title",
+                    "body": "body",
+                },
+            ),
+            _skip_approval=skip_approval,
+        )
+
+    try:
+        for rule in (f"inbox(send {beta.project_id})", "inbox(send beta)"):
+            registry.set_approval_policy(
+                ApprovalPolicy(always_allow={rule}, default="deny", store=store)
+            )
+            for project in ("beta", beta.project_id):
+                assert (await send(project)).get("isError") is not True, (rule, project)
+        assert (await send(other.project_id)).get("isError") is True
+        registry.set_approval_policy(ApprovalPolicy(default="allow", store=store))
+        unknown = await send("missing", skip_approval=True)
+        assert unknown.get("isError") is True
+        assert "unknown inbox target project" in str(unknown)
+    finally:
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_inbox_approval_subject_keeps_canonical_project_ids(
     tmp_path: Path,
 ) -> None:
