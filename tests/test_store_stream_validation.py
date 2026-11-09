@@ -39,7 +39,7 @@ def test_full_load_never_requests_one_transcript_sized_read(
         requested_reads.append(length)
         return original(fd, length)
 
-    # test-contract: this existing seam catches whole-file full-load reads on main
+    # test-contract: seam catches whole-file full-load reads on main
     monkeypatch.setattr(ConversationStore, "_read_fd", staticmethod(record_read))
     reopened = ConversationStore(
         tmp_path, session_id="streamed-full-load", _read_only=True
