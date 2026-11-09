@@ -16,6 +16,8 @@ class StoreLifecycleMixin:
         """Drain durable writers, then release this store's activity leases."""
         self.on_entries_installed = None
         if self._drain_durable_writes_for_close():
+            if getattr(self, "_history_index_owner", False):
+                self._history_index.close()
             unregister_conversation_target(self)
             if self._runtime_lease is not None:
                 self._runtime_lease.close()

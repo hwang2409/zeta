@@ -56,6 +56,30 @@ def test_every_notification_kind_has_a_validator() -> None:
         validate_notification_data(payloads[kind])
 
 
+def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index")
+    try:
+        store.append_many([("warning", {"message": str(index)}) for index in range(3)])
+        index = store._history_index
+        assert index is not None
+        assert index.page({"after": 0, "limit": 128}, store._history_index_facts())[-1]["seq"] == 3
+        writer = store._new_persistent_durable_writer()
+        try:
+            assert writer._history_index is index
+        finally:
+            writer.close()
+    finally:
+        store.close()
+    reopened = ConversationStore(tmp_path, session_id="history-index")
+    try:
+        rows = reopened._history_index.page(
+            {"after": 0, "limit": 128}, reopened._history_index_facts()
+        )
+        assert [row["data"]["message"] for row in rows] == ["0", "1", "2"]
+    finally:
+        reopened.close()
+
+
 def test_persistent_detached_writer_retains_home_lease(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store._prepare_durable_writer_snapshot()

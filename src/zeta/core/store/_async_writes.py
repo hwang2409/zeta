@@ -634,6 +634,10 @@ class AsyncDurableWritesMixin:
         self._assert_owner_thread()
         with self._mutation_lock:
             delta = execute_mutation(self, command, expected_generation)
+            if delta.committed_entries and self._history_index is not None:
+                self._history_index.apply_committed(
+                    {**self._history_index_facts(), "rows": delta.committed_entries}
+                )
         if delta._resident_patch.replace_entries:
             self._publish_entries_installed("reset")
         elif delta.entries_to_install:
@@ -727,6 +731,13 @@ class AsyncDurableWritesMixin:
                 )
             try:
                 delta = execute_mutation(writer, durable_command, generation)
+                if delta.committed_entries and writer._history_index is not None:
+                    writer._history_index.apply_committed(
+                        {
+                            **writer._history_index_facts(),
+                            "rows": delta.committed_entries,
+                        }
+                    )
             except BaseException as error:
                 if prelude is None:
                     raise
@@ -1028,6 +1039,7 @@ class AsyncDurableWritesMixin:
             _storage_lease=self._storage_lease,
             _execution_lease=self.execution_lease,
             _mutation_target=True,
+            _history_index=self._history_index,
         )
 
     def _drain_durable_writes_for_close(self: ConversationStore) -> bool:

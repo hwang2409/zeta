@@ -75,6 +75,7 @@ from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
 from ._execution_owner import ExecutionOwnerStoreMixin
+from ._history_index import HistoryIndex
 from ._incremental_validation import (
     IncrementalValidationMixin,
     validate_approval_reason,
@@ -141,6 +142,7 @@ class ConversationStore(
         _mutation_target: bool = False,
         _repair_explicit: bool = False,
         _repair_target: RepairTarget | None = None,
+        _history_index: HistoryIndex | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -202,6 +204,12 @@ class ConversationStore(
                         fcntl.flock(root_fd, fcntl.LOCK_UN)
             self.path = self.session_dir / "conversation.jsonl"
             self.state_path = self.session_dir / "session_state.json"
+            self._history_index = _history_index
+            self._history_index_owner = _history_index is None and not _read_only
+            if self._history_index is None and not _read_only:
+                self._history_index = HistoryIndex(self.session_dir)
+            elif self._history_index is None and _read_only:
+                self._history_index = HistoryIndex(self.session_dir, observer=True)
             self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"
             self.lock_path = self.session_dir / ".lock"
             self.cwd = str(cwd or Path.cwd())
@@ -246,6 +254,8 @@ class ConversationStore(
                         self._strict_snapshot_sync = True
                     with self._append_lock(deadline=_lock_deadline):
                         self._load_session_state()
+                        if self._history_index_owner:
+                            self._sync_history_index(self._entries)
                     self._strict_snapshot_sync = False
                 self._release_lease = weakref.finalize(
                     self,
@@ -258,6 +268,24 @@ class ConversationStore(
             storage_ownership.pop_all()
         if not _read_only and not _mutation_target:
             register_conversation_target(self)
+
+    def _history_index_facts(self) -> dict[str, object]:
+        stat = self.path.stat()
+        last = self._entries[-1] if self._entries else None
+        return {
+            "st_dev": stat.st_dev,
+            "st_ino": stat.st_ino,
+            "byte_boundary": stat.st_size,
+            "last_seq": last.seq if last else 0,
+            "last_id": last.id if last else None,
+            "last_parent": last.parent_id if last else None,
+            "prefix_digest": self._entry_prefix_digest.hex(),
+            "reset_generation": self._transcript_generation,
+        }
+
+    def _sync_history_index(self, entries: Iterable[ConversationEntry]) -> None:
+        if self._history_index is not None:
+            self._history_index.sync_validated(self._history_index_facts(), entries)
 
     @property
     def last_repair_result(self) -> RepairResult | None:

@@ -288,6 +288,11 @@ def _backward_history_request(
         validator=validator,
         first_page=first_page,
     )
+    if _generation(store) != generation:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "session history changed; restart from the newest page",
+        )
     return _publish_history_page(
         store,
         generation,
@@ -325,6 +330,11 @@ def _forward_history_request(
         fidelity=fidelity,
         content_read=content_read,
     )
+    if _generation(store) != generation:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "session history changed; restart from the newest page",
+        )
     return _publish_history_page(
         store,
         generation,
