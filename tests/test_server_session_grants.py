@@ -1419,6 +1419,7 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     store: ConversationStore, payload: dict[str, object]
                 ) -> object:
                     record = server.control._approvals.state.records["call-1"]
+                    # test-contract: seam prove the settlement task owns this await
                     assert asyncio.current_task() is record.settlement
                     entered.set()
                     try:
