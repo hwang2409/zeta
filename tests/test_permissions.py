@@ -101,7 +101,7 @@ async def test_permissions_shows_effective_policy_without_changing_it(
 
         await app._handle_prompt_value("/permissions")
         assert "Permissions · current session" in output.getvalue()
-        view = app._slash_commands.dispatch(app, "/permissions")
+        view = await app._slash_commands.dispatch(app, "/permissions")
         assert f"Default: {expected[-1]}" in view
         assert "deny > ask > allow > default" in view
         assert "Deny rules:\n  bash(rm *)" in view
@@ -137,16 +137,16 @@ async def test_permissions_shows_effective_policy_without_changing_it(
         assert any(
             "shadows built-in /permissions" in notice for notice in commands.notices
         )
-        help_text = commands.dispatch(app, "/help")
+        help_text = await commands.dispatch(app, "/help")
         assert (
             "/permissions" in help_text
             and "tool/action for the running session" in help_text
         )
         assert any(name == "permissions" for name, _, _ in commands.completion_entries)
-        assert "usage:" in commands.dispatch(app, "/permissions allow bash")
+        assert "usage:" in await commands.dispatch(app, "/permissions allow bash")
         # The next view uses the live policy, not cached settings or constructor state.
         policy.default = ApprovalDecision.DENY
-        assert "Default: deny" in commands.dispatch(app, "/permissions")
+        assert "Default: deny" in await commands.dispatch(app, "/permissions")
     finally:
         await app.close()
 
@@ -207,7 +207,7 @@ async def test_permissions_tracks_always_scope_and_session_lifetime(
             await asyncio.sleep(0)
             requests_before = policy.pending_requests()
             assert len(requests_before) == 1
-            view = app._slash_commands.dispatch(app, "/permissions")
+            view = await app._slash_commands.dispatch(app, "/permissions")
             assert "with any arguments" in view
             assert policy.pending_requests() == requests_before
             await app._handle_prompt_value(f"/always {call.id}")
@@ -218,7 +218,7 @@ async def test_permissions_tracks_always_scope_and_session_lifetime(
             ApprovalRule("bash"),
             ApprovalRule("inbox", action="send"),
         }
-        view = app._slash_commands.dispatch(app, "/permissions")
+        view = await app._slash_commands.dispatch(app, "/permissions")
         assert "Session grants (/always):\n  bash\n  inbox(send)" in view
         for name, arguments, expected in (
             ("bash", {"command": "echo different"}, "allow"),
@@ -245,7 +245,7 @@ async def test_permissions_tracks_always_scope_and_session_lifetime(
         # Reconstructing a policy does not restore an /always session grant.
         restarted = ApprovalPolicy(store=store)
         registry.set_approval_policy(restarted)
-        view = app._slash_commands.dispatch(app, "/permissions")
+        view = await app._slash_commands.dispatch(app, "/permissions")
         assert "Session grants (/always):\n  none" in view
         assert (
             restarted.decide(
@@ -256,7 +256,7 @@ async def test_permissions_tracks_always_scope_and_session_lifetime(
     finally:
         if pending is not None:
             pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 10)
         await app.close()
 
 
@@ -385,7 +385,7 @@ async def test_permissions_revokes_only_session_grants_without_replaying_calls(
             "/permissions revoke missing",
             "/permissions allow bash",
         ):
-            assert commands.dispatch(app, command)
+            assert await commands.dispatch(app, command)
             assert policy.session_allow == grants
 
         await app._handle_prompt_value("/permissions revoke inbox(send)")
@@ -406,12 +406,12 @@ async def test_permissions_revokes_only_session_grants_without_replaying_calls(
         claim = registry.resolve_call("inbox", {"action": "claim", "id": "next"})
         assert policy.decide(send) == default
         assert policy.decide(claim) is ApprovalDecision.ALLOW
-        assert "no session grant matches" in commands.dispatch(
+        assert "no session grant matches" in await commands.dispatch(
             app, "/permissions revoke inbox(send)"
         )
         await app._handle_prompt_value("/permissions clear")
         assert not policy.session_allow
-        assert "no session grants to clear" in commands.dispatch(
+        assert "no session grants to clear" in await commands.dispatch(
             app, "/permissions clear"
         )
         for command, expected in (
@@ -444,9 +444,9 @@ async def test_permissions_revokes_only_session_grants_without_replaying_calls(
         assert f"Default: {default}" in receipt and "bash(git status*)" in receipt
         assert "remaining allow rules or default allow" in receipt.lower()
         assert "revocation adds no deny rule" in receipt
-        assert "/permissions revoke <grant>" in commands.dispatch(app, "/help")
-        assert "/permissions clear" in commands.dispatch(app, "/help")
-        assert "Session grants (/always):\n  none" in commands.dispatch(
+        assert "/permissions revoke <grant>" in await commands.dispatch(app, "/help")
+        assert "/permissions clear" in await commands.dispatch(app, "/help")
+        assert "Session grants (/always):\n  none" in await commands.dispatch(
             app, "/permissions"
         )
     finally:

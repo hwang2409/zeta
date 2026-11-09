@@ -219,7 +219,7 @@ async def slash_run(client, request_id, params):
         text,
         register_model_input=register,
         approval_control=client.server.control,
-        run_blocking=client.server.control._run_blocking,
+        slash_lock=client.server.control.slash_lock,
         busy=client.server.control.turn_busy(),
         registry=registry,
     )

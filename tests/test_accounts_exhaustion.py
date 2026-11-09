@@ -150,14 +150,19 @@ def test_anthropic_429_is_not_classified_without_fixture() -> None:
     )
 
 
-def test_classified_limit_is_not_retried_and_other_retries_unchanged() -> None:
+def test_classified_limit_holds_without_spending_attempts() -> None:
     exhausted = _failure(429, json.loads(FIXTURE.read_text()))
     exhausted.subscription_limit = classify_subscription_limit(
         "codex", ACCOUNT, exhausted
     )
     budget = CompletionRetryBudget()
     budget.start_attempt("completion", 0.0)
-    assert budget.plan(exhausted, 0.0) is None
+    plan = budget.plan(exhausted, 0.0)
+    assert plan is not None and plan.is_rate_limit_hold
+    assert plan.subscription_limit is exhausted.subscription_limit
+    # the fixture reset already passed; the probe floor keeps a re-probe from spinning
+    assert plan.delay == 60.0
+    assert budget.attempts == 1
     assert budget.plan(SimpleNamespace(status_code=429), 0.0) is not None
 
 
@@ -1025,7 +1030,7 @@ async def test_account_switch_never_replays_transcript(
 
 
 @pytest.mark.asyncio
-async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
+async def test_codex_limit_end_to_end_emits_account_limit_once_and_holds(
     tmp_path: Path,
 ) -> None:
     context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
@@ -1047,8 +1052,12 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
         requests += 1
         return httpx.Response(429, json=payload, request=request)
 
-    async def fail_retry_sleep(_delay: float) -> None:
-        raise AssertionError("classified account limit must not wait to retry")
+    holding = asyncio.Event()
+
+    async def hold_forever(_delay: float) -> None:
+        holding.set()
+        # only the test's cancel ends this wait
+        await asyncio.wait_for(asyncio.Event().wait(), 3600)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     backend = CodexBackend(
@@ -1056,15 +1065,23 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
         token_store=named_account_credentials(context.home, "codex", "first"),
         base_url="https://test.invalid/codex/responses",
     )
-    backend._completion_wait = fail_retry_sleep
+    backend._completion_wait = hold_forever
     loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
     loop.manager = context.manager
     loop.session_metadata = context.metadata
     loop.account_context = context
+    events: list = []
+
+    async def collect() -> None:
+        async for event in loop.run_turn("hello", origin=MessageOrigin.USER):
+            events.append(event)
+
+    turn = asyncio.ensure_future(collect())
     try:
-        events = [
-            event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
-        ]
+        await asyncio.wait_for(holding.wait(), 10)
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(turn, 10)
         assert requests == 1
         assert not any(
             isinstance(block, TextContent) and block.text
@@ -1074,12 +1091,7 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
         )
         types = [event.type for event in events]
         assert types.count(StreamEventType.ACCOUNT_LIMIT) == 1
-        assert types.index(StreamEventType.ACCOUNT_LIMIT) < types.index(
-            StreamEventType.ERROR
-        )
-        assert types.index(StreamEventType.ACCOUNT_LIMIT) < types.index(
-            StreamEventType.AGENT_END
-        )
+        assert StreamEventType.ERROR not in types
         limit_event = next(
             event for event in events if event.type is StreamEventType.ACCOUNT_LIMIT
         )
@@ -1107,6 +1119,8 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
         assert requests == 1
         assert await asyncio.to_thread(context.resolve, "codex") == second
     finally:
+        turn.cancel()
+        await loop.close()
         await client.aclose()
         opened.store.close()
 
