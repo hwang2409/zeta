@@ -194,11 +194,28 @@ class ProjectContextProjectionMixin:
             if selected is None:
                 memory, entry_memory, memory_health = [], None, None
             else:
-                with self._project_lock(
-                    selected.project_id, "memory", exclusive=False
-                ) as project_fd:
-                    memory, entry_memory, memory_health = self._read_selected_memory(
-                        project_fd, selected
+                try:
+                    projection = self.memory_transactions.read(selected.project_id)
+                    memory = list(projection.memory)
+                    entry_memory = (
+                        projection.snapshot if projection.format == 2 else None
+                    )
+                    memory_health = None
+                except (OSError, ProjectRegistryError, ValueError):
+                    memory, entry_memory = [], None
+                    source = "memory"
+                    pointer_path = self.root / selected.project_id / "memory-current.json"
+                    try:
+                        import json
+
+                        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+                        current = pointer.get("current")
+                        if isinstance(current, str):
+                            source = f"memory-versions/versions/{current}.json"
+                    except (OSError, ValueError, TypeError):
+                        source = "memory-current.json"
+                    memory_health = _health(
+                        "malformed_memory", selected.project_id, source
                     )
 
             if session_project_id is not None and selected is None:

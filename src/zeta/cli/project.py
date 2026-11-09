@@ -143,12 +143,11 @@ def run(
                 ).authorize(
                     action="accept", target=args.remote, preview=preview, noun=noun
                 )
-                if registry.memory_format(project_id) == 2:
+                if registry.memory_transactions.read(project_id).format == 2:
                     registry._accept_memory_entry(project_id, args.remote)
-                    value = registry._entry_memory_view(project_id)
                 else:
                     registry.accept_memory(project_id, args.remote)
-                    value = {name: content for name, content in registry.load_memory(project_id)}
+                value = registry.memory_transactions.read(project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "accept":
@@ -171,12 +170,11 @@ def run(
                 ).authorize(
                     action="accept", target=args.action, preview=preview, noun=noun
                 )
-                if registry.memory_format(project_id) == 2:
+                if registry.memory_transactions.read(project_id).format == 2:
                     registry._accept_memory_entry(project_id, args.action)
-                    value = registry._entry_memory_view(project_id)
                 else:
                     registry.accept_memory(project_id, args.action)
-                    value = {name: content for name, content in registry.load_memory(project_id)}
+                value = registry.memory_transactions.read(project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.project in {"push", "pull", "resolve"}:
@@ -210,11 +208,7 @@ def run(
                         file=err,
                     )
                     registry.finalize_memory_migration(project_id)
-                value = (
-                    registry._entry_memory_view(project_id)
-                    if registry.memory_format(project_id) == 2
-                    else {name: content for name, content in registry.load_memory(project_id)}
-                )
+                value = registry.memory_transactions.read(project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "resolve":
@@ -231,7 +225,7 @@ def run(
                     raise ProjectRegistryError(
                         "memory resolve requires at least one entry ID"
                     )
-                if registry.memory_format(project_id) != 2:
+                if registry.memory_transactions.read(project_id).format != 2:
                     raise ProjectRegistryError("memory resolve requires format-2 memory")
                 target = ", ".join(entry_ids)
                 MemoryMutationAuthorization.terminal(
@@ -246,7 +240,7 @@ def run(
                     entry_ids,
                     reason=getattr(args, "reason", None) or "resolved by user",
                 )
-                value = registry._entry_memory_view(project_id)
+                value = registry.memory_transactions.read(project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "schema":
@@ -272,7 +266,7 @@ def run(
                     kind_mappings=mappings,
                     resolve_kinds=frozenset(getattr(args, "resolve_kind", [])),
                 )
-                value = registry._entry_memory_view(project_id)
+                value = registry.memory_transactions.read(project_id).view()
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if (
@@ -296,24 +290,21 @@ def run(
                 else registry.show_project(name=args.project).project_id
             )
             supplied = list(args.set) + list(args.from_file)
-            memory_format = registry.memory_format(project_id)
+            projection = registry.memory_transactions.read(project_id)
+            memory_format = projection.format
             if not supplied:
                 if memory_format == 2:
-                    structured = registry._entry_memory_view(project_id)
+                    structured = projection.view()
                     value = (
                         structured
                         if getattr(args, "json", False)
                         else {
                             f"{kind}.md": rendered
-                            for kind, rendered in registry._entry_memory_mirrors(
-                                project_id
-                            ).items()
+                            for kind, rendered in projection.mirror_files().items()
                         }
                     )
                 else:
-                    value = {
-                        name: content for name, content in registry.load_memory(project_id)
-                    }
+                    value = projection.view()
             else:
                 if len(supplied) != 1:
                     raise ProjectRegistryError(
@@ -336,12 +327,10 @@ def run(
                 )
                 if memory_format == 2:
                     registry._replace_entry_kind(project_id, name, content)
-                    value = registry._entry_memory_view(project_id)
+                    value = registry.memory_transactions.read(project_id).view()
                 else:
                     registry.update_memory(project_id, {name: content})
-                    value = {
-                        name: content for name, content in registry.load_memory(project_id)
-                    }
+                    value = registry.memory_transactions.read(project_id).view()
         elif args.project_verb == "list":
             value = [
                 project.to_dict()

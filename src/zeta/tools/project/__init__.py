@@ -52,13 +52,9 @@ def _inspect_project_sync(
                     "sessions": links,
                 },
             )
-        if projects.memory_format(project.project_id) == 2:
-            memory = projects._entry_memory_view(project.project_id, byte_cap=64 * 1024)
-        else:
-            memory = {
-                name: content
-                for name, content in projects.load_memory(project.project_id)
-            }
+        memory = projects.memory_transactions.read(
+            project.project_id, byte_cap=64 * 1024
+        ).view(byte_cap=64 * 1024)
         return _success_result(
             text_block(f"read bounded memory for project {project.name}"),
             structured_content={

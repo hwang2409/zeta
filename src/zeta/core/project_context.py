@@ -391,13 +391,8 @@ def project_command_view(
         return ProjectCommandView(
             None, "unassociated (run /project init to associate this directory)"
         )
-    if registry.memory_format(project.project_id) == 2:
-        memory = ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
-    else:
-        memory = (
-            ", ".join(name for name, _ in registry.load_memory(project.project_id))
-            or "none"
-        )
+    projection = registry.memory_transactions.read(project.project_id)
+    memory = ", ".join(projection.mirror_files()) or "none"
     return ProjectCommandView(
         project,
         f"project: {project.name} ({project.project_id})\n"
@@ -996,15 +991,15 @@ def load_project_context(
                             context_entries = (
                                 project_projection.memory
                                 if project_projection is not None
-                                else available_registry.load_memory_for_context(
+                                else available_registry.memory_transactions.read(
                                     project.project_id
-                                )
+                                ).memory
                             )
                         except UnsupportedMemoryFormatError:
                             assert available_registry is not None
-                            snapshot = available_registry._entry_memory_state_for_context(
+                            snapshot = available_registry.memory_transactions.read(
                                 project.project_id
-                            )
+                            ).snapshot
                             entry_projection = render_entry_memory(
                                 snapshot.state,
                                 now=utc_now(),
