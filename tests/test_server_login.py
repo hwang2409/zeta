@@ -6,6 +6,7 @@ import asyncio
 import os
 import threading
 from dataclasses import replace
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
@@ -132,12 +133,18 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         await close_serve(server, writer)
 
 
-_REGISTRY_REFUSALS = {
-    "missing": "accounts.json is missing but other account directories exist; "
-    "restore accounts.json before adding an account",
-    "broken": "accounts.json is unreadable; kept it and every account directory; "
-    "repair or restore accounts.json, then restart zeta",
-}
+_MISSING_REGISTRY_REFUSAL = (
+    "accounts.json is missing but other account directories exist; "
+    "restore accounts.json before adding an account"
+)
+
+
+def _broken_registry_refusal(home: Path) -> str:
+    return (
+        f"accounts.json is unreadable: {home / 'accounts.json'}; kept it and every account directory; "
+        "move it aside to a backup, then run login again or restore it from a backup, "
+        "then restart zeta"
+    )
 
 
 @pytest.mark.parametrize(
@@ -164,7 +171,12 @@ async def test_login_refused_by_unloaded_registry_reports_the_cause(tmp_path, mo
     if registry_state == "broken":
         (home / "accounts.json").write_bytes(b"{")
     server, reader, writer, _ = await connect(tmp_path)
-    expected = {"state": "failed", "error": {"code": "login_save_failed", "message": _REGISTRY_REFUSALS[registry_state]}}
+    message = (
+        _MISSING_REGISTRY_REFUSAL
+        if registry_state == "missing"
+        else _broken_registry_refusal(home)
+    )
+    expected = {"state": "failed", "error": {"code": "login_save_failed", "message": message}}
     try:
         result = (await rpc(reader, writer, "login_start", provider="claude"))["result"]
         if orphan_appears == "during_browser":
