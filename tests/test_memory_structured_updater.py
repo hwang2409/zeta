@@ -2031,7 +2031,7 @@ async def test_five_rapid_user_turns_coalesce_into_one_request(tmp_path: Path) -
             or runner._early_pending_end != seq
             or clock.waits == previous_waits
         ):
-            await asyncio.sleep(0)
+            await await_or_fail(asyncio.sleep(0), what="debounce observation")
 
     rows: list[dict[str, object]] = []
     for turn in range(5):
@@ -2134,7 +2134,7 @@ async def test_restart_does_not_retrigger_consumed_user_turn(tmp_path: Path) -> 
     while not runner.position_path.exists() or json.loads(
         runner.position_path.read_text()
     ).get("early_trigger_seq") != 2:
-        await asyncio.sleep(0)
+        await await_or_fail(asyncio.sleep(0), what="early trigger persistence")
     await runner.close()
 
     replacement = AutoMemoryReconciler(
@@ -2475,13 +2475,13 @@ async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
         _write_session(runner.session_dir, *rows)
         runner.activity(seq + 1)
         while runner.state.early_trigger_seq < seq + 1:
-            await asyncio.sleep(0)
+            await await_or_fail(asyncio.sleep(0), what="early trigger update")
         while runner._seen_activity_generation < runner._activity_generation:
-            await asyncio.sleep(0)
+            await await_or_fail(asyncio.sleep(0), what="activity generation update")
         await await_or_fail(runner._drained.wait(), what="runner._drained.wait()")
         clock.now += 30
     for _ in range(10):
-        await asyncio.sleep(0)
+        await await_or_fail(asyncio.sleep(0), what="reconciliation settle")
     try:
         assert fired_at == [300, 600]
     finally:

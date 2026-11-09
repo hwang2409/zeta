@@ -887,7 +887,7 @@ async def test_close_stops_retrying_persistent_cas_conflicts(
     monkeypatch.setattr(registry, "compare_and_swap_memory", always_conflicts)
     runner.before_eviction(1, 2)
     while attempts == 0:
-        await asyncio.sleep(0)
+        await await_or_fail(asyncio.sleep(0), what="CAS conflict attempt")
 
     await asyncio.wait_for(runner.close(), timeout=0.2)
 
