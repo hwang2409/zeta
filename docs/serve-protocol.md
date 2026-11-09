@@ -1352,7 +1352,8 @@ error code and message. Provider status and origin remain internal.
   case the client sends a new join.
   The server retains at most 64 records/1 MiB per scope and 256 records/4 MiB
   globally, evicting the largest scope first; a scope holds at most two waiting
-  events (one `assistant_message`, one echo), counted in these limits. Older pages continue to use
+  events (one `assistant_message`, one echo), counted in these limits until a pressure eviction;
+  a scope holds at most two either way. Older pages continue to use
   `session_history` and do not change the live stream.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated

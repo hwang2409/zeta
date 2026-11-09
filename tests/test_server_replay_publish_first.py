@@ -41,7 +41,7 @@ from zeta.protocol.types import (
     TextContent,
 )
 from zeta.providers.completion import owned_completion
-from zeta.server import ZetaServer
+from zeta.server import ZetaServer, session_replay
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -385,6 +385,53 @@ async def test_join_while_user_row_is_held_sees_echo_once(
         kinds = [frame["event"] for frame in frames["before"]]
         assert kinds.index("user_message") < kinds.index("agent_start"), kinds
     finally:
+        await serve.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_pressure_evicted_echo_is_dropped_on_session_swap(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held, self-evicted echo must not cross a new_session/resume swap."""
+    scope_limit = session_replay.REPLAY_SCOPE_MAX_BYTES
+    monkeypatch.setattr("zeta.server.session_replay.REPLAY_SCOPE_MAX_BYTES", 1)
+    gates = Gates()
+    serve = await _serve(
+        tmp_path, transport, FakeBackend([ScriptedTurn([TextContent("after-marker")])]), gates
+    )
+    observer, _history = await serve.joined()
+    control = serve.server.control
+    start_turn = control.start_turn
+    old_session = serve.session_id
+    try:
+        def canceled_start(*args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        # test-contract: start_turn never runs, after the echo is held
+        control.start_turn = canceled_start  # type: ignore[method-assign]
+        await serve.controller.request(serve.request_id(), "send", {"text": "evicted-marker"})
+        control.start_turn = start_turn  # type: ignore[method-assign]
+
+        created = await serve.controller.request(
+            serve.request_id(), "new_session", {"provider": "codex"}
+        )
+        assert created["result"]["session"]["session_id"] != old_session
+        resumed = await serve.controller.request(
+            serve.request_id(), "resume", {"session_id": old_session}
+        )
+        assert resumed["result"]["session"]["session_id"] == old_session
+        history = await serve.join(observer)
+        monkeypatch.setattr("zeta.server.session_replay.REPLAY_SCOPE_MAX_BYTES", scope_limit)
+        await serve.controller.request(
+            serve.request_id(), "send", {"text": "after-marker"}
+        )
+        await _event(serve.controller, "agent_end")
+        frames = await serve.live(observer)
+        # the swap must discard the pressure-evicted record before the next publish
+        assert _count(history, frames, "evicted-marker") == 0
+    finally:
+        control.start_turn = start_turn  # type: ignore[method-assign]
         await serve.close()
 
 

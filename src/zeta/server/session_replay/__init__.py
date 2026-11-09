@@ -156,6 +156,7 @@ class SessionReplay:
                     *self._scopes,
                     *(pending.scope for pending in self._pending.values()),
                     *(subscription.scope for subscription in self._subscriptions.values()),
+                    *self._deferred,
                 )
             )
         )
