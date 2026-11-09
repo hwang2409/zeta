@@ -132,8 +132,19 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         await close_serve(server, writer)
 
 
-@pytest.mark.parametrize("orphan_appears", ["before_start", "during_browser"])
-async def test_login_refused_by_missing_registry_reports_the_cause(tmp_path, monkeypatch, orphan_appears):
+_REGISTRY_REFUSALS = {
+    "missing": "accounts.json is missing but other account directories exist; "
+    "restore accounts.json before adding an account",
+    "broken": "accounts.json is unreadable; kept it and every account directory; "
+    "repair or restore accounts.json, then restart zeta",
+}
+
+
+@pytest.mark.parametrize(
+    ("orphan_appears", "registry_state"),
+    [("before_start", "missing"), ("during_browser", "missing"), ("before_start", "broken")],
+)
+async def test_login_refused_by_unloaded_registry_reports_the_cause(tmp_path, monkeypatch, orphan_appears, registry_state):
     home = tmp_path / "zeta"
     other = home / "accounts" / "codex" / "work"
     captured = {}
@@ -149,11 +160,11 @@ async def test_login_refused_by_missing_registry_reports_the_cause(tmp_path, mon
     if orphan_appears == "before_start":
         initialize_storage_home(home)
         other.mkdir(parents=True)
+        (other / "oauth.json").write_bytes(b"kept")
+    if registry_state == "broken":
+        (home / "accounts.json").write_bytes(b"{")
     server, reader, writer, _ = await connect(tmp_path)
-    expected = {"state": "failed", "error": {"code": "login_save_failed", "message": (
-        "accounts.json is missing but other account directories exist; "
-        "restore accounts.json before adding an account"
-    )}}
+    expected = {"state": "failed", "error": {"code": "login_save_failed", "message": _REGISTRY_REFUSALS[registry_state]}}
     try:
         result = (await rpc(reader, writer, "login_start", provider="claude"))["result"]
         if orphan_appears == "during_browser":
@@ -164,8 +175,12 @@ async def test_login_refused_by_missing_registry_reports_the_cause(tmp_path, mon
         assert result == expected
         if orphan_appears == "before_start":
             assert captured == {}
+            assert (other / "oauth.json").read_bytes() == b"kept"
         assert (await rpc(reader, writer, "login_status", provider="claude"))["result"] == expected
-        assert not (home / "accounts.json").exists()
+        if registry_state == "broken":
+            assert (home / "accounts.json").read_bytes() == b"{"
+        else:
+            assert not (home / "accounts.json").exists()
         assert not (home / "accounts" / "anthropic").exists()
     finally:
         await close_serve(server, writer)

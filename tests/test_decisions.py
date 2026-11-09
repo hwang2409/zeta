@@ -147,7 +147,7 @@ async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -
 
     assert app.decisions_count == 1
 
-    await app.loop.tool_registry.close()
+    await app.close()
     child.close()
     current.store.close()
     other.store.close()
@@ -198,7 +198,7 @@ async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> 
 
     await registry.close()
     fork.store.close()
-    await app.loop.tool_registry.close()
+    await app.close()
     current.store.close()
     other.store.close()
 
@@ -235,7 +235,7 @@ async def test_resolve_attention_event_refreshes_rendered_count_immediately(
         assert "● " not in _rendered_decisions_status(app)
     finally:
         await _stop_decisions(app)
-        await app.loop.tool_registry.close()
+        await app.close()
         current.store.close()
 
 
@@ -295,7 +295,7 @@ async def test_failed_decisions_poll_restarts_and_renders_later_resolution(
     finally:
         release_failure.set()
         await _stop_decisions(app)
-        await app.loop.tool_registry.close()
+        await app.close()
         current.store.close()
 
 
@@ -349,7 +349,7 @@ async def test_persistent_decisions_failure_renders_unavailable_then_recovers(
         assert "decisions unavailable" not in _rendered_decisions_status(app)
     finally:
         await _stop_decisions(app)
-        await app.loop.tool_registry.close()
+        await app.close()
         current.store.close()
 
 
@@ -413,7 +413,7 @@ async def test_child_resolution_event_refreshes_rendered_count(
             await registry.close()
         if fork is not None:
             fork.store.close()
-        await app.loop.tool_registry.close()
+        await app.close()
         current.store.close()
 
 
@@ -488,7 +488,7 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
     finally:
         release.set()
         await _stop_decisions(app)
-        await app.loop.tool_registry.close()
+        await app.close()
         current.store.close()
 
 
@@ -528,7 +528,7 @@ async def test_stopping_decisions_scan_drains_owner_without_error(
     finally:
         release.set()
         await _stop_decisions(app)
-        await app.loop.tool_registry.close()
+        await app.close()
         current.store.close()
 
 
@@ -554,11 +554,12 @@ def test_stuck_decisions_scan_does_not_block_asyncio_run_shutdown(
     async def run_tui_lifecycle() -> None:
         try:
             app.start_decisions_poll()
-            while not entered.is_set():
-                await asyncio.sleep(0)
+            async with asyncio.timeout(10):
+                while not entered.is_set():
+                    await asyncio.sleep(0)
             await app.stop_decisions_poll()
         finally:
-            await app.loop.tool_registry.close()
+            await app.close()
             current.store.close()
 
     def run() -> None:

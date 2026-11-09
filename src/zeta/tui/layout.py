@@ -520,6 +520,7 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         background_count=app.loop.tool_registry.background_tasks.running_count,
         decisions_count=app.decisions_count,
         decisions_error=app.decisions_error,
+        decisions_staged=app.decisions_staged_count,
         main_active=app.main_activity_pending,
         undo_available=(
             app._undo_candidate is not None
