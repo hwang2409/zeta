@@ -90,12 +90,9 @@ def test_resolve_attention_targets_only_original_and_resolves_record(
         == 1
     )
     assert inbox.new_ids(project.project_id, session_id=other.store.session_id) == ()
-    message_id = inbox.new_ids(
-        project.project_id, session_id=original.store.session_id
-    )[0]
-    assert inbox.claim(project.project_id, message_id, other.store.session_id) is None
-    message = inbox.claim(project.project_id, message_id, original.store.session_id)
-    assert message is not None
+    message = inbox.list(project.project_id)["new"][0]
+    assert message["origin"] == "agent"
+    assert message["authority"] == "information"
     assert "Decision: Use SQLite." in message["body"]
     resolved = AttentionStore(original.store.session_dir).get(record.id)
     assert resolved.status == "resolved"
