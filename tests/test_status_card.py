@@ -310,7 +310,7 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
             DecisionItem(store.session_id, None, "Unassigned", information),
         ]
     )
-    app.open_decisions_panel()
+    await app._open_decisions_panel()
     try:
         with set_app(session.app):
             session.app.key_processor.feed(KeyPress("j"))
@@ -403,7 +403,7 @@ async def test_empty_decisions_popup_renders_and_closes(tmp_path) -> None:
         session = app._make_session()
         app._active_session = session
         app._install_full_screen_layout(session)
-        app.open_decisions_panel()
+        await app._open_decisions_panel()
 
         screen = await _render_status(session, 80, 24)
         text = "\n".join(

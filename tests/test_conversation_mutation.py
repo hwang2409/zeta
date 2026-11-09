@@ -150,19 +150,22 @@ def test_dedupe_survives_restart_and_wins_before_stale_generation(
 
 def test_dedupe_survives_compaction_marker(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="dedupe-compaction")
-    key = ConversationDedupeKey("message", "compacted")
-    command = AppendConversationRows(
-        (ConversationRow("warning", {"message": "once"}),),
-        dedupe_key=key,
-    )
-    first = store.commit(command, store.conversation_generation)
-    marker = store.append_compaction_marker("summary", 1, 1)
+    try:
+        key = ConversationDedupeKey("message", "compacted")
+        command = AppendConversationRows(
+            (ConversationRow("warning", {"message": "once"}),),
+            dedupe_key=key,
+        )
+        first = store.commit(command, store.conversation_generation)
+        marker = store.append_compaction_marker("summary", 1, 1)
 
-    duplicate = store.commit(command, 0)
+        duplicate = store.commit(command, 0)
 
-    assert duplicate.duplicate
-    assert duplicate.committed_entries == first.committed_entries
-    assert store.replay() == [*first.committed_entries, marker]
+        assert duplicate.duplicate
+        assert duplicate.committed_entries == first.committed_entries
+        assert store.replay() == [*first.committed_entries, marker]
+    finally:
+        store.close()
 
 
 def test_dedupe_returns_inactive_branch_publication_without_copying_it(

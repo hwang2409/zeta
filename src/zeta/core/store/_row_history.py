@@ -1,9 +1,4 @@
-"""Key-shaped lookup of recent resident rows for serve replay.
-
-The store owns these row shapes so readers never scan ``_entries`` themselves.
-p08 must keep the same names behind a bounded resident key index; these are
-synchronous owner-loop calls, so they may not query SQLite.
-"""
+"""Recent-row history lookup keys and owner-thread accessors."""
 
 from __future__ import annotations
 
@@ -22,6 +17,7 @@ from ._client_delivery import CLIENT_DELIVERY_METADATA
 
 if TYPE_CHECKING:
     from ._store import ConversationStore
+
 
 # The newest rows a lookup can see; older rows are unknown, not absent.
 RECENT_ROW_WINDOW = 1024

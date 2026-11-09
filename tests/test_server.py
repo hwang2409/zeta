@@ -56,7 +56,13 @@ from tests.support.server_client import (
     read as _buffered_read,
 )
 from tests.support.server_client import (
+    read_raw as _read_raw,
+)
+from tests.support.server_client import (
     request as _buffered_request,
+)
+from tests.support.server_client import (
+    send as _send,
 )
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.support.storage_homes import initialize_storage_home
@@ -98,7 +104,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
-from zeta.runtime.loop.empty_turn import empty_turn_error
+from zeta.runtime.loop.empty_turn import DispatchProgress, empty_turn_error
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import (
     ApprovalLifecycle,
@@ -774,12 +780,6 @@ _frames_until_event = _buffered_frames_until_event
 _event = _buffered_event
 
 
-async def _read_raw(reader: asyncio.StreamReader) -> bytes:
-    line = await asyncio.wait_for(reader.readline(), TIMEOUT)
-    assert line, "server closed the socket"
-    return line
-
-
 def _named_events(frames: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
     return [
         frame["params"]
@@ -1127,6 +1127,43 @@ async def _ready(server: ZetaServer, protocol_version: str = "1.0"):
     await _request(reader, writer, 1, "hello", {"protocol_version": protocol_version})
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     return reader, writer
+
+
+@pytest.mark.asyncio
+async def test_serve_reports_no_progress_stop_and_accepts_next_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    original_admit = DispatchProgress.admit
+
+    def repeated_admit(self, store, prepared, flow, retrying_context, **kwargs):
+        # the real stop path: the same request admitted a third time in a row.
+        original_admit(self, store, prepared, flow, retrying_context, **kwargs)
+        original_admit(self, store, prepared, flow, retrying_context, **kwargs)
+        return original_admit(self, store, prepared, flow, retrying_context, **kwargs)
+
+    monkeypatch.setattr(DispatchProgress, "admit", repeated_admit)
+    reader, writer = await _ready(server, "1.1")
+    try:
+        frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        while not any(
+            frame.get("params", {}).get("event") == "agent_end" for frame in frames
+        ):
+            frames.append(await _read(reader))
+        events = [frame["params"] for frame in frames if frame.get("method") == "event"]
+        error = next(event for event in events if event["event"] == "error")
+        assert error["error"]["code"] == "no_progress_loop"
+        assert "Input not delivered: it is held and goes with the next message." in error["error"]["message"]
+        assert not any(event["event"] == "assistant_message" for event in events)
+
+        monkeypatch.setattr(DispatchProgress, "admit", original_admit)
+        await _request(reader, writer, 4, "send", {"text": "again"})
+        committed = await _event(reader, "assistant_message")
+        assert committed["message"]["role"] == "assistant"
+    finally:
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -7074,6 +7111,7 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
     )
     await asyncio.to_thread(AccountStore(tmp_path).set_default, account)
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(account_store, "ACCOUNT_LOCK_TURN_WAIT_SECONDS", 0.05)
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -8022,26 +8060,11 @@ async def _raw_response_line(
     method: str,
     params: dict[str, Any],
 ) -> str:
-    writer.write(
-        (
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                },
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode()
+    await _send(reader, writer, request_id, method, params)
+    frames = await read_until(
+        reader, lambda frame: frame.get("id") == request_id, what=method
     )
-    await writer.drain()
-    while True:
-        line = await asyncio.wait_for(reader.readline(), timeout=TIMEOUT)
-        frame = json.loads(line)
-        if frame.get("id") == request_id:
-            return line.decode().removesuffix("\n")
+    return frames[-1].raw.decode().removesuffix("\n")
 
 
 async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
@@ -8208,6 +8231,8 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
             why="an answer",
             kind="answer",
         )
+        broken_path = store.directory / "junk.json"
+        broken_path.write_bytes(b"must not be read")
 
         listed = (
             await _request(
@@ -8221,6 +8246,8 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         assert listed.index(f"{decision.id} [decision]") < listed.index(
             f"{answer.id} [answer]"
         )
+        assert "junk.json [broken] attention/junk.json: invalid_name" in listed
+        assert broken_path.read_bytes() == b"must not be read"
 
         dismissed = (
             await _request(
@@ -9731,7 +9758,7 @@ async def test_serve_account_refresh_reports_busy_lifecycle_lock(
         named_account_credentials(home, "codex", "work").save,
         OAuthTokens("access", "refresh", 9_999_999_999),
     )
-    monkeypatch.setattr("zeta.accounts.usage.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("zeta.accounts.store.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
     server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     locked = threading.Event()
@@ -9782,11 +9809,11 @@ async def test_serve_accounts_panel_does_not_block_on_held_lifecycle_lock(
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait(1)
+            release.wait(30)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
-    assert locked.wait(1)
+    assert locked.wait(10)
     publisher_waiting = threading.Event()
     original_lifecycle_guard = AccountStore._lifecycle_guard
 
@@ -9796,14 +9823,21 @@ async def test_serve_accounts_panel_does_not_block_on_held_lifecycle_lock(
         with original_lifecycle_guard(store, home_fd, guarded_account, wait=wait):
             yield
 
+    # test-contract: seam no public seam exposes the account lifecycle guard
     monkeypatch.setattr(AccountStore, "_lifecycle_guard", waiting_lifecycle_guard)
-    publisher = threading.Thread(
-        target=lambda: named_account_credentials(home, "codex", "work").save(
-            OAuthTokens("new-access", "new-refresh", 9_999_999_999)
-        )
-    )
+    publisher_errors: list[BaseException] = []
+
+    def publish_credentials() -> None:
+        try:
+            named_account_credentials(home, "codex", "work").save(
+                OAuthTokens("new-access", "new-refresh", 9_999_999_999)
+            )
+        except BaseException as exc:  # noqa: BLE001 - assert the thread outcome below
+            publisher_errors.append(exc)
+
+    publisher = threading.Thread(target=publish_credentials)
     publisher.start()
-    assert publisher_waiting.wait(1)
+    assert publisher_waiting.wait(10)
     try:
         response = await asyncio.wait_for(
             _request(
@@ -9813,14 +9847,27 @@ async def test_serve_accounts_panel_does_not_block_on_held_lifecycle_lock(
                 "slash_run",
                 {"session_id": sid, "text": "/accounts"},
             ),
-            0.25,
+            10,
         )
         assert response[-1]["result"]["kind"] == "output"
+        assert not release.is_set()
+        assert holder.is_alive()
+        assert publisher.is_alive()
     finally:
         release.set()
-        holder.join(10)
-        publisher.join(10)
+        await asyncio.to_thread(holder.join, 10)
+        await asyncio.to_thread(publisher.join, 10)
         await close_serve(server, writer)
+
+    assert not holder.is_alive()
+    assert not publisher.is_alive()
+    assert publisher_errors == []
+    assert await asyncio.wait_for(
+        asyncio.to_thread(
+            named_account_credentials(home, "codex", "work").read,
+        ),
+        10,
+    ) == OAuthTokens("new-access", "new-refresh", 9_999_999_999)
 
 
 @pytest.mark.asyncio
@@ -12239,3 +12286,76 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         release_settlement_finish.set()
         release_write.set()
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_returns_broken_sent_ledger_activation_notice(
+    tmp_path: Path,
+) -> None:
+    from zeta.project_registry import ProjectRegistry
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    ProjectRegistry(tmp_path / "projects").create_project(
+        "project", "test", workspace
+    )
+    manager = SessionManager(tmp_path)
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="offline", cwd=workspace)
+    )
+    session_id = opened.metadata.session_id
+    ledger = opened.store.session_dir / "project-inbox-sent.json"
+    ledger.write_bytes(b"{")
+    opened.store.close()
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=workspace,
+        port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    writer = None
+    try:
+        activation_error = None
+        try:
+            await server.runtime.resume_session(session_id)
+        except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
+            activation_error = exc
+        assert activation_error is None
+        reader, writer = await _connect(server)
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        history = (
+            await _request(
+                reader,
+                writer,
+                2,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        notices = [
+            row
+            for row in history
+            if any(
+                block.get("type") == "text"
+                and "sent history is incomplete (invalid_json)" in block.get("text", "")
+                for block in row["content"]
+            )
+        ]
+        assert len(notices) == 1
+        notice = "\n".join(
+            block["text"]
+            for block in notices[0]["content"]
+            if block.get("type") == "text"
+        )
+        assert notices[0]["role"] == "system"
+        assert "file was not changed" in notice
+        assert "unless the repaired ledger includes their IDs" in notice
+    finally:
+        if writer is None:
+            await close_serve(server)
+        else:
+            await close_serve(server, writer)

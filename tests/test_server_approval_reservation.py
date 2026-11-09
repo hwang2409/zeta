@@ -542,8 +542,9 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         )
         # the async durable-writer seam does not expose the old registry-thread gate;
         # cleanup may overlap the off-loop history append without publishing a ghost.
-        while ("child", call.id) not in server.control._approvals.state.records:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while ("child", call.id) not in server.control._approvals.state.records:
+                await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
         await asyncio.wait_for(
@@ -681,8 +682,9 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             authorizer.authorize(call, signal, capability=capability)
         )
         if path == "delegated":
-            while key not in server.control._approvals.state.records:
-                await asyncio.sleep(0)
+            async with asyncio.timeout(10):
+                while key not in server.control._approvals.state.records:
+                    await asyncio.sleep(0)
         await server.control._event(
             StreamEvent(
                 StreamEventType.TOOL_APPROVAL_START,
@@ -1824,8 +1826,9 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
                 background=True,
             )
         )
-        while ("child", call.id) not in server.control._approvals.state.records:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while ("child", call.id) not in server.control._approvals.state.records:
+                await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
         await asyncio.wait_for(

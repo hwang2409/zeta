@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Self
 
+from ...storage_format import release_now
 from ..checkpoints import ConversationIntegrityError
 from ..checkpoints.mutation import unregister_conversation_target
 
@@ -19,7 +20,7 @@ class StoreLifecycleMixin:
             if self._runtime_lease is not None:
                 self._runtime_lease.close()
             self.directory_fd = -1
-            self._release_lease()
+            release_now(self._release_lease)
 
     def refresh(self) -> None:
         """Reload durable state without acquiring ownership of the session."""
