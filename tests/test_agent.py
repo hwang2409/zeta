@@ -839,6 +839,8 @@ async def test_background_owner_waits_for_child_close_before_unregister(
         release_close.set()
         await asyncio.wait_for(watcher, timeout=10)
         await asyncio.wait_for(waiting, timeout=10)
+        child_store.close()
+        parent_store.close()
     assert cleanup_called.is_set()
 
 
@@ -3952,6 +3954,7 @@ async def _run_post_cap_tool_cycle(
     finally:
         backend.release_grandchild.set()
         await await_or_fail(loop.close(), what="agent loop close")
+        store.close()
 
 
 @pytest.mark.asyncio
