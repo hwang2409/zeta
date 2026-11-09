@@ -559,17 +559,7 @@ class AgentLoop(
         await asyncio.to_thread(recover_attention)
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
-            await self.tool_registry.background_tasks._notify_exit(
-                item.task_id,
-                item.command,
-                item.exit_code,
-                item.output_tail,
-                item.log_path,
-                item.note,
-                owner=item.owner,
-                phase=item.phase,
-                tui_presented=item.tui_presented,
-            )
+            await self.tool_registry.background_tasks.deliver_recovered_exit(item)
         self._pending_task_recovery = ()
         await recovery_lease.activate_agent_children(self)
         self.session_start()
