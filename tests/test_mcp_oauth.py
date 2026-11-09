@@ -1611,6 +1611,17 @@ def test_format_resource_list_renders_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_credential_store_does_not_recreate_deleted_cwd(tmp_path: Path) -> None:
+    project = tmp_path / "deleted-worktree"
+    project.mkdir()
+    store = MCPCredentialStore(home=project / ".zeta")
+    project.rmdir()
+
+    with pytest.raises(oauth_store.MCPCredentialStoreError):
+        await store.load("server")
+    assert not project.exists()
+
+
 async def test_tokens_do_not_appear_in_conversation_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
