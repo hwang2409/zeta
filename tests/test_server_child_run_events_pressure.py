@@ -6,6 +6,7 @@ Every test crosses the real `zeta serve` unix socket and authenticated websocket
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,6 +23,7 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
+from zeta.core.agent_progress import publish_child_ended
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
@@ -417,3 +419,78 @@ async def test_byte_pressure_invalidates_before_the_record_cap_at_exact_codec_by
         assert scope not in replay._scopes
         assert not replay.is_pending(server._client)
         assert replay.stream_id(server._client) is None
+
+
+MAX_LIFECYCLE_FRAME_BYTES = 16_000
+
+
+def _maximal_lifecycle(run_id: str) -> dict[str, object]:
+    """A terminal lifecycle whose every field reaches the row's exported bound."""
+    return {
+        "handle": run_id,
+        "description": "d" * 9_000,
+        "agent_type": "a" * 900,
+        "state": "s" * 900,
+        "current_step": "c" * 9_000,
+        "started_at": "t" * 900,
+        "finished_at": "f" * 900,
+        "turns_used": 2**63 - 1,
+        "tool_calls": 2**63 - 1,
+        "elapsed": 999_999_999_999.999,
+    }
+
+
+def _wire_size(frame: dict[str, Any]) -> int:
+    """The exact codec bytes of a frame the client read: compact UTF-8 JSON plus newline."""
+    return len((json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n").encode())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_64_maximal_lifecycle_frames_fit_the_scope_byte_cap(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
+        assert server.connections is not None
+        replay = server.connections.replay
+        _start_child(server, stores, f"{session_id}:1")
+        scope = ReplayScopeId.child(f"{session_id}:1")
+        joined = await client.request(
+            3, "child_run_events", {"session_id": session_id, "run_id": f"{session_id}:1"}
+        )
+        stream_id = joined["result"]["replay"]["stream_id"]
+        control = replay._scopes[scope].bytes if scope in replay._scopes else 0
+        held, release = asyncio.Event(), asyncio.Event()
+        original_write = _Client._write_physical
+
+        async def gated(owner: _Client, payload: bytes) -> bool:
+            if b'"seq":1,' in payload and not held.is_set():
+                held.set()
+                await await_or_fail(release.wait(), what="release first lifecycle frame")
+            return await original_write(owner, payload)
+
+        # test-contract: seam keep every admitted frame charged until all are admitted
+        monkeypatch.setattr(_Client, "_write_physical", gated)
+        prefix = f"{session_id}:1:"
+        for index in range(SCOPE_RECORDS):
+            run_id = prefix + "9" * (256 - len(prefix) - 2) + f"{index + 10}"
+            assert len(run_id.encode()) == 256
+            publish_child_ended(run_id, 2**62 + index, _maximal_lifecycle(run_id))
+        await _lifecycle_applied(server)
+        await await_or_fail(held.wait(), what="first lifecycle frame write")
+        charged = replay._scopes[scope]
+        totals = (charged.records, charged.bytes)
+        release.set()
+        frames = [await client.read() for _ in range(SCOPE_RECORDS)]
+        events = [frame["params"] for frame in frames]
+        assert [(event["event"], event["stream_id"], event["seq"]) for event in events] == [
+            ("child_ended", stream_id, seq) for seq in range(1, SCOPE_RECORDS + 1)
+        ]
+        sizes = [_wire_size(frame) for frame in frames]
+        assert totals == (SCOPE_RECORDS, sum(sizes)), "charges are not the complete frame bytes"
+        assert max(sizes) <= MAX_LIFECYCLE_FRAME_BYTES
+        assert control + sum(sizes) <= REPLAY_SCOPE_MAX_BYTES
+        # the fixture reaches the row bound: every bounded text is at its limit
+        row = events[0]["child"]
+        assert len(json.dumps(row["description"], ensure_ascii=False).encode()) == 4_000
+        assert len(json.dumps(row["current_step"], ensure_ascii=False).encode()) == 4_000
