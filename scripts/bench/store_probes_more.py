@@ -593,8 +593,9 @@ def probe_search(args: argparse.Namespace) -> dict[str, Any]:
     project_id = _meta(session_dir)["project_id"]
     project_dir = home / "projects" / project_id
     out: dict[str, Any] = {"scale": scale(home, sid), "project_id": project_id}
+    index_path = project_dir / "transcript-index.sqlite3"
+    out["index_bytes"] = index_path.stat().st_size if index_path.exists() else 0
     index = TranscriptIndex(project_dir, project_id)
-    out["index_bytes"] = index.path.stat().st_size
     for query in (
         "eviction marker",
         "merge lock",
