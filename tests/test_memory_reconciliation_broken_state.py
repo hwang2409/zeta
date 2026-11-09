@@ -158,10 +158,10 @@ async def test_broken_cursor_stops_reconciliation_and_renders_through_tui_and_se
         replacement.before_eviction(1, 1)
         if replacement._worker_task is not None:
             await asyncio.wait_for(called.wait(), 10)
-        tui = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        tui = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
             app, "/status"
         )
-        serve = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        serve = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
             ServerSlashSession(runtime), "/status"
         )
 

@@ -848,6 +848,11 @@ Clients use `turn_id` to correlate this durable outcome with a negotiated
 {"jsonrpc":"2.0","id":9,"result":{"session":null,"state":"idle","explicit_finish":false,"pending_approvals":[],"usage":{},"compaction_markers":0}}
 ```
 
+While a slash command runs, `status` also carries
+`slash_command: {"name": "/status", "state": "running"}`. `state` is `waiting`
+after the command was cancelled and is finishing work it already started. The
+field is omitted when no slash command runs.
+
 ### `ping`
 
 Requires the `ping` feature; otherwise `-32601`. Params: none. The result is
