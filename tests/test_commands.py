@@ -113,7 +113,10 @@ async def _drain_submission_consumer(app: TUIApp) -> None:
         pending = [task for task in (consumer, *pipeline._slash_tasks.values()) if task is not None]
         try:
             await asyncio.wait_for(
-                asyncio.gather(*map(asyncio.shield, pending)), timeout=10
+                asyncio.gather(
+                    *map(asyncio.shield, pending), return_exceptions=True
+                ),
+                timeout=10,
             )
         except TimeoutError as exc:
             raise AssertionError(
