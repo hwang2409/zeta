@@ -788,7 +788,6 @@ class ApprovalLifecycle:
                 finish = self._start_settlement(
                     record, self._finish_record(record, synthetic, WRITE_FAILED)
                 )
-                )
                 try:
                     await approval_settlement.finish_despite_cancellation(
                         lambda: asyncio.shield(finish)
