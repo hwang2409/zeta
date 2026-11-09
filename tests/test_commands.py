@@ -700,8 +700,11 @@ async def test_init_becomes_the_model_user_message(tmp_path: Path) -> None:
     ],
 )
 async def test_input_loop_control_commands_exclude_their_own_submission(
-    tmp_path: Path, value: str, expected: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, expected: str
 ) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
