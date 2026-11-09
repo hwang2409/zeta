@@ -73,6 +73,7 @@ async def send(client: Any, params: dict[str, Any]) -> dict[str, object]:
         store,
         run_id,
         text,
+        owner=loop._background_owner,
         channel=loop._background_owner.conversation_channel,
         origin=MessageOrigin.USER,
     )
