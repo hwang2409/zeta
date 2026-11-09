@@ -15,7 +15,6 @@ from .protocol import (
     EventDescriptor,
     FrameCodec,
     FrameWriteCancelled,
-    MethodDescriptor,
     ProtocolError,
     _Frame,
 )

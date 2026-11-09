@@ -15,8 +15,8 @@ from ..protocol import (
     feature_error,
     protocol_error,
 )
-from . import lifecycle, session, settings, validation
 from ..session_replay import join_history_and_subscribe
+from . import lifecycle, session, settings, validation
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
