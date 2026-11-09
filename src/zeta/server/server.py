@@ -33,10 +33,10 @@ from .protocol import (
     MAX_FRAME_BYTES,
     ErrorDescriptor,
     FrameCodec,
+    FrameWriteOwner,
     MethodDescriptor,
     ProtocolError,
     _Frame,
-    finish_frame_write,
     hello_result,
     negotiate_protocol_version,
 )
@@ -233,6 +233,7 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
+        self._frame_writes = FrameWriteOwner()
         self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
@@ -300,6 +301,7 @@ class ZetaServer:
                 if self.connections is not None:
                     await self.connections.aclose()
                     self.connections = None
+                await self._frame_writes.aclose()
                 try:
                     if self._websocket is not None:
                         await self._websocket.close()
@@ -637,8 +639,9 @@ class _Client:
         return written
 
     async def _write_physical(self, payload: _Frame) -> bool:
-        async with self._write_lock:
-            return await finish_frame_write(self.codec, self.writer, payload)
+        return await self.server._frame_writes.write(
+            self.codec, self.writer, payload, self._write_lock
+        )
 
 
 def _home() -> Path:

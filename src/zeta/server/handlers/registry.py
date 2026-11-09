@@ -208,9 +208,9 @@ async def slash_run(client, request_id, params):
     runtime = client.server.runtime
     validation.active(runtime, params)
     text = validation.required_string(params, "text")
-    if (
-        client.server.control.turn_busy()
-        and not await slash_commands.can_run_while_busy(runtime, text)
+    registry = await slash_commands.registry_for_request(runtime)
+    if client.server.control.turn_busy() and not slash_commands.can_run_while_busy(
+        registry, text
     ):
         await client.server.control.require_idle()
     register = client.server.control.model_input_registrar(client.features)
@@ -221,6 +221,7 @@ async def slash_run(client, request_id, params):
         approval_control=client.server.control,
         run_blocking=client.server.control._run_blocking,
         busy=client.server.control.turn_busy(),
+        registry=registry,
     )
 
 
