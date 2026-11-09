@@ -1500,26 +1500,24 @@ async def test_typed_mutation_snapshots_one_nested_resident_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="bounded-resident-snapshot")
-    original_deepcopy = _async_writes.copy.deepcopy
-    resident_deepcopies = 0
-
-    def counted_deepcopy(value: object, *args: object, **kwargs: object) -> object:
-        nonlocal resident_deepcopies
-        caller = sys._getframe(1)
-        is_snapshot = (
-            caller.f_globals.get("__name__") == _async_writes.__name__
-            and caller.f_code.co_name != "_install_delta_entries"
-        )
-        if is_snapshot:
-            resident_deepcopies += 1
-        return original_deepcopy(value, *args, **kwargs)
-
-    # test-contract: seam measures snapshot work through a real typed mutation
-    monkeypatch.setattr(_async_writes.copy, "deepcopy", counted_deepcopy)
-
     try:
-        await store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
+        original_deepcopy = _async_writes.copy.deepcopy
+        resident_deepcopies = 0
 
+        def counted_deepcopy(value: object, *args: object, **kwargs: object) -> object:
+            nonlocal resident_deepcopies
+            caller = sys._getframe(1)
+            is_snapshot = (
+                caller.f_globals.get("__name__") == _async_writes.__name__
+                and caller.f_code.co_name != "_install_delta_entries"
+            )
+            if is_snapshot:
+                resident_deepcopies += 1
+            return original_deepcopy(value, *args, **kwargs)
+
+        # test-contract: seam measures snapshot work through a real typed mutation
+        monkeypatch.setattr(_async_writes.copy, "deepcopy", counted_deepcopy)
+        await store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
         assert resident_deepcopies == 1
     finally:
         store.close()
@@ -1531,47 +1529,47 @@ async def test_durable_publish_preserves_nested_owner_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="nested-owner-change")
-    call = ToolCall("agent-1", "agent", {"prompt": "work"})
-    store.register_agent_child(
-        call,
-        child_session_path=str(tmp_path / "agents" / "1"),
-        description="work",
-    )
-    commit_ready = threading.Event()
-    release_commit = threading.Event()
-    original_write = ConversationStore._run_committed_mutation
+    try:
+        call = ToolCall("agent-1", "agent", {"prompt": "work"})
+        store.register_agent_child(
+            call,
+            child_session_path=str(tmp_path / "agents" / "1"),
+            description="work",
+        )
+        commit_ready = threading.Event()
+        release_commit = threading.Event()
+        original_write = ConversationStore._run_committed_mutation
 
-    def blocked_write(candidate: ConversationStore, *args: object):
-        outcome = original_write(candidate, *args)
-        commit_ready.set()
-        assert release_commit.wait(timeout=5)
-        return outcome
+        def blocked_write(candidate: ConversationStore, *args: object):
+            outcome = original_write(candidate, *args)
+            commit_ready.set()
+            assert release_commit.wait(timeout=5)
+            return outcome
 
-    # test-contract: seam exercises a nested owner edit during durable publication
-    monkeypatch.setattr(ConversationStore, "_run_committed_mutation", blocked_write)
-    worker_call = ToolCall("agent-2", "agent", {"prompt": "worker"})
-    write = asyncio.create_task(
-        store._commit_storage_command(
-            _async_writes._RegisterAgentChildCommand(
-                tool_call=worker_call,
-                child_session_path=str(tmp_path / "agents" / "2"),
-                description="worker",
-                agent_type=None,
-                background=False,
-                child_instance_id=None,
-                accepts_follow_ups=False,
-                explicit_finish=False,
-                turns_used=0,
+        # test-contract: seam exercises a nested owner edit during durable publication
+        monkeypatch.setattr(ConversationStore, "_run_committed_mutation", blocked_write)
+        worker_call = ToolCall("agent-2", "agent", {"prompt": "worker"})
+        write = asyncio.create_task(
+            store._commit_storage_command(
+                _async_writes._RegisterAgentChildCommand(
+                    tool_call=worker_call,
+                    child_session_path=str(tmp_path / "agents" / "2"),
+                    description="worker",
+                    agent_type=None,
+                    background=False,
+                    child_instance_id=None,
+                    accepts_follow_ups=False,
+                    explicit_finish=False,
+                    turns_used=0,
+                )
             )
         )
-    )
-    assert await asyncio.to_thread(commit_ready.wait, 2)
+        assert await asyncio.to_thread(commit_ready.wait, 2)
 
-    store.update_agent_child_turns(call.id, 7)
-    release_commit.set()
-    await await_or_fail(write, what="nested owner change publication")
+        store.update_agent_child_turns(call.id, 7)
+        release_commit.set()
+        await await_or_fail(write, what="nested owner change publication")
 
-    try:
         assert store.agent_children()[call.id]["turns_used"] == 7
     finally:
         store.close()
@@ -1584,9 +1582,9 @@ async def test_durable_publish_preserves_newer_owner_state(
     monkeypatch: pytest.MonkeyPatch,
     owner_change: str,
 ) -> None:
+    store = ConversationStore(tmp_path, session_id=f"durable-{owner_change}")
     fresh: ConversationStore | None = None
     try:
-        store = ConversationStore(tmp_path, session_id=f"durable-{owner_change}")
         commit_ready = threading.Event()
         release_commit = threading.Event()
         original_write = ConversationStore._run_committed_mutation
@@ -1645,9 +1643,9 @@ async def test_off_loop_refresh_preserves_newer_owner_state(
     monkeypatch: pytest.MonkeyPatch,
     owner_change: str,
 ) -> None:
+    store = ConversationStore(tmp_path, session_id=f"refresh-{owner_change}")
     fresh: ConversationStore | None = None
     try:
-        store = ConversationStore(tmp_path, session_id=f"refresh-{owner_change}")
         snapshot_ready = threading.Event()
         release_snapshot = threading.Event()
         original_mutation = ConversationStore._run_committed_mutation
@@ -1702,8 +1700,8 @@ async def test_off_loop_refresh_is_bounded_under_owner_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    store = ConversationStore(tmp_path, session_id="bounded-refresh")
     try:
-        store = ConversationStore(tmp_path, session_id="bounded-refresh")
         original_mutation = ConversationStore._run_committed_mutation
         loop = asyncio.get_running_loop()
         loads = 0
@@ -2386,6 +2384,32 @@ def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:
     with pytest.raises(
         ConversationIntegrityError, match="terminated invalid conversation row at row 2"
     ):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_duplicate_anchored_tool_call_uses_first_match_on_load(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="duplicate-anchored-tool-call")
+    first = ToolCall("same", "tool", {"value": "first"})
+    second = ToolCall("same", "tool", {"value": "second"})
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(first), ToolUseContent(second)],
+        )
+    )
+    store.close()
+
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[-1])
+    row["data"]["approval_requests"] = [
+        {"request_id": "request-1", "tool_call": second.to_dict()}
+    ]
+    rows[-1] = json.dumps(row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError, match="invalid payload"):
         ConversationStore(tmp_path, session_id=store.session_id)
 
 
