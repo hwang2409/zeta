@@ -2072,7 +2072,8 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     decision: str,
                     reason: str | None = None,
                 ) -> dict[str, str]:
-                    nonlocal settlement, gate_owner
+                    nonlocal settlement
+                    nonlocal gate_owner
                     result = await original_settle_record(
                         lifecycle, record, decision, reason
                     )
