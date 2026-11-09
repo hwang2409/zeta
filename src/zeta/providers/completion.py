@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum, auto
 from functools import wraps
 from typing import Any, Protocol, runtime_checkable
@@ -322,6 +323,8 @@ class CompletionControl:
     reset: ResetPolicy
     budget: CompletionRetryBudget
     task_deadline: float | None
+    # the session's account identity; a change ends a rate-limit hold at once
+    account_generation: Callable[[], object] | None = None
 
 
 class ProviderAttempt(Protocol):
@@ -550,6 +553,10 @@ class PrematureCompletionError(RuntimeError):
 
 class CompletionCleanupError(RuntimeError):
     """Closing a successful provider attempt failed."""
+
+
+class ProviderAccountSwitched(Exception):
+    """The session switched accounts during a hold; redispatch through the new backend."""
 
 
 class TaskDeadlineExceeded(TimeoutError):
@@ -850,28 +857,42 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._pending_retry = plan
         self._rate_limit_hold = plan.is_rate_limit_hold
         if plan.is_rate_limit_hold:
-            state = getattr(self._adapter, "rate_limit_state", None)
-            self._rate_limit_state = state() if callable(state) else None
+            self._rate_limit_state = self._hold_generation()
         return True
 
-    async def _wait_for_retry(self, delay: float) -> None:
+    def _hold_generation(self) -> tuple[object, object]:
         state = getattr(self._adapter, "rate_limit_state", None)
-        if self._rate_limit_hold and callable(state):
-            remaining = delay
-            while remaining > 0:
-                step = min(remaining, RATE_LIMIT_CREDENTIAL_POLL_SECONDS)
-                await self._await_step(
-                    self._wait(step),
-                    deadline=self._control.task_deadline,
-                    deadline_error=TaskDeadlineExceeded(
-                        "finish-gate task safety bound expired"
-                    ),
-                    abort=self._control.abort,
-                )
-                if state() != self._rate_limit_state:
-                    return
-                remaining -= step
+        account = self._control.account_generation
+        return (
+            state() if callable(state) else None,
+            account() if account is not None else None,
+        )
+
+    async def _wait_for_retry(self, delay: float) -> None:
+        if self._rate_limit_hold:
+            await self._wait_for_rate_limit_hold(delay)
             return
+        await self._wait_step(delay)
+
+    async def _wait_for_rate_limit_hold(self, delay: float) -> None:
+        """Wait out a hold; a re-login wakes it, an account switch ends this run."""
+
+        initial = self._rate_limit_state
+        assert isinstance(initial, tuple)
+        remaining = delay
+        while remaining > 0:
+            step = min(remaining, RATE_LIMIT_CREDENTIAL_POLL_SECONDS)
+            await self._wait_step(step)
+            credential, account = self._hold_generation()
+            if account != initial[1]:
+                # this adapter belongs to the old account; the caller redispatches
+                self._closed = True
+                raise ProviderAccountSwitched("session account changed during rate-limit hold")
+            if credential != initial[0]:
+                return
+            remaining -= step
+
+    async def _wait_step(self, delay: float) -> None:
         await self._await_step(
             self._wait(delay),
             deadline=self._control.task_deadline,
@@ -938,23 +959,20 @@ class CompletionRun(AsyncIterator[StreamEvent]):
     def _retry_notice(self, plan: RetryPlan, error: object) -> StreamEvent:
         if plan.is_rate_limit_hold:
             assert plan.retry_after is not None
-            return StreamEvent(
-                StreamEventType.RETRY,
-                data={
-                    "text": (
-                        f"{self._adapter.provider} rate limit: provider asks to wait "
-                        f"{format_duration(plan.retry_after)}; checking again in "
-                        f"{format_duration(plan.delay)} (log in again or switch account "
-                        "to resume sooner)"
-                    ),
-                    "kind": "provider_rate_limit_hold",
-                    "delay": plan.delay,
-                    "retry_after": plan.retry_after,
-                    "provider": self._adapter.provider,
-                    "attempt": plan.attempt,
-                    "reason": plan.reason,
-                },
+            data: dict[str, Any] = {
+                "kind": "provider_rate_limit_hold",
+                "delay": plan.delay,
+                "retry_after": plan.retry_after,
+                "until": time.time() + plan.retry_after,
+                "provider": self._adapter.provider,
+                "attempt": plan.attempt,
+                "reason": plan.reason,
+            }
+            data["text"] = (
+                f"{self._adapter.provider} {rate_limit_hold_text(data)} "
+                "(log in again or switch account to resume sooner)"
             )
+            return StreamEvent(StreamEventType.RETRY, data=data)
         if plan.is_account_lock:
             return StreamEvent(
                 StreamEventType.RETRY,
@@ -1188,6 +1206,18 @@ def retry_wait_seconds(
 
 def _rate_limit_hold(error: BaseException | object, retry_after: float | None) -> bool:
     return retry_after is not None and getattr(error, "status_code", None) in {429, 503, 529}
+
+
+def rate_limit_hold_text(data: Mapping[str, Any]) -> str:
+    """Describe a rate-limit hold event as local wall time plus the next probe."""
+
+    until = datetime.fromtimestamp(data["until"]).astimezone()
+    today = datetime.now().astimezone().date()
+    stamp = until.strftime("%H:%M" if until.date() == today else "%b %d %H:%M")
+    return (
+        f"rate-limited until {stamp} (provider asks {format_duration(data['retry_after'])}); "
+        f"checking again in {format_duration(data['delay'])}"
+    )
 
 
 def format_duration(seconds: float) -> str:

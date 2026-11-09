@@ -75,6 +75,7 @@ from ...providers.completion import (
     CompletionControl,
     CompletionRetryBudget,
     CompletionRun,
+    ProviderAccountSwitched,
     ResetPolicy,
 )
 from ...runtime.tool_setup import select_tool_registry
@@ -88,13 +89,13 @@ from ..prompt import RuntimePrompt
 from ._completion import (
     _error_info,
     _sanitize_account_message,
+    account_generation,
     can_retry_context,
     ensure_context_reduced,
     observed_completion,
     provider_prompt_tokens,
     subscription_limit_failure,
     task_is_cancelling,
-    update_rate_limit_progress,
 )
 from ._store_writes import StoreWriteMixin
 from .backend_owners import BackendOwnerMixin
@@ -940,6 +941,7 @@ class AgentLoop(
                         ),
                         budget=provider_retry_budget,
                         task_deadline=task_deadline,
+                        account_generation=account_generation(self),
                     ),
                 )
                 has_active_delivery = prepared_delivery.has_active_delivery
@@ -956,9 +958,6 @@ class AgentLoop(
                     }:
                         provider_started = True
                     self.context_assembler.observe_event(event)
-                    update_rate_limit_progress(
-                        self.store, self.agent_instance_id, event
-                    )
                     if event.type is StreamEventType.ERROR:
                         provider_error = (
                             replace(event.error, provider_error=True)
@@ -1021,6 +1020,10 @@ class AgentLoop(
                     await completion.aclose()
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
+            except ProviderAccountSwitched:  # redispatch through the new account's backend
+                await completion.aclose()  # type: ignore[union-attr]
+                self._dispatch_progress.reset()
+                continue
             except Exception as exc:
                 if completion is not None:
                     await completion.aclose()

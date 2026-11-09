@@ -159,6 +159,7 @@ async def drive_turn(
                     "delay",
                     "is_stall",
                     "retry_after",
+                    "until",
                     "provider",
                 ):
                     if key in data:

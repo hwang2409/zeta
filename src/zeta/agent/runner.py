@@ -35,6 +35,7 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
+from ..providers.completion import rate_limit_hold_text
 from ..providers.factory import build_backend, credential_store
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
@@ -123,6 +124,13 @@ async def consume_child(
         async for event in events:
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
+                update_step(status)
+                publish(status)
+            elif (
+                event.type is StreamEventType.RETRY
+                and event.data.get("kind") == "provider_rate_limit_hold"
+            ):
+                status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
                 publish(status)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:

@@ -155,16 +155,14 @@ async def subscription_limit_failure(
 
 
 
-def update_rate_limit_progress(store: object, agent_instance_id: str | None, event: StreamEvent) -> None:
-    if (
-        agent_instance_id is None
-        or event.type is not StreamEventType.RETRY
-        or event.data.get("kind") != "provider_rate_limit_hold"
-    ):
-        return
-    delay = event.data.get("delay")
-    step = f"checking again in {delay:g}s" if isinstance(delay, (int, float)) else "rate-limited"
-    store.update_agent_lifecycle(current_step=step, state="running")
+def account_generation(loop: Any) -> Callable[[], object]:
+    """Read the session's backend and account identity; a change ends a rate-limit hold."""
+
+    context = getattr(loop, "account_context", None)
+    return lambda: (
+        loop.backend,
+        None if context is None else (context.active_provider, context.switch_sequence),
+    )
 
 
 def task_is_cancelling() -> bool:

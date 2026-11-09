@@ -1293,6 +1293,36 @@ class AccountLockRetryBackend:
         )
 
 
+class LongRateLimitError(RuntimeError):
+    status_code = 429
+    retry_after = 524749.0
+    retryable = True
+
+
+class LongRateLimitBackend:
+    provider = "codex"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.waits: list[float] = []
+        self._completion_wait = self._wait
+
+    async def _wait(self, delay: float) -> None:
+        self.waits.append(delay)
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        del messages, tool_schemas
+        self.calls += 1
+        if self.calls == 1:
+            raise LongRateLimitError("busy")
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="done")
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+
 async def _no_wait(_delay: float) -> None:
     return None
 
@@ -4148,6 +4178,42 @@ async def test_account_lock_wait_precedes_successful_assistant_frame(
     assert "waiting for account lock" in retry["data"]["text"]
     assert names.index("retry") < names.index("assistant_message")
     assert backend.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_long_rate_limit_hold_reaches_client_then_turn_completes(
+    tmp_path: Path,
+) -> None:
+    backend = LongRateLimitBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        while not any(
+            frame.get("params", {}).get("event") == "agent_end" for frame in frames
+        ):
+            frames.append(await _read(reader))
+    finally:
+        await close_serve(server, writer)
+
+    events = [frame["params"] for frame in frames if frame.get("method") == "event"]
+    names = [event["event"] for event in events]
+    retry = next(event for event in events if event["event"] == "retry")["data"]
+    assert retry["kind"] == "provider_rate_limit_hold"
+    assert (retry["delay"], retry["retry_after"]) == (300, 524749)
+    assert retry["provider"] == "codex"
+    assert retry["reason"] and retry["attempt"] == 1
+    assert retry["until"] > 0 and "rate-limited until" in retry["text"]
+    assert names.index("retry") < names.index("assistant_message")
+    assert "error" not in names
+    assert backend.calls == 2 and sum(backend.waits) == 300
 
 
 @pytest.mark.asyncio
