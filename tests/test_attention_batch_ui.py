@@ -210,9 +210,13 @@ async def test_tui_broken_row_does_not_block_good_batch(tmp_path: Path) -> None:
         assert broken_path.read_bytes() == broken_bytes
         assert (
             len(
-                ProjectInbox(
-                    manager.project_registry, sessions_root=tmp_path / "sessions"
-                ).new_ids(project.project_id, session_id=owner.store.session_id)
+                await asyncio.to_thread(
+                    ProjectInbox(
+                        manager.project_registry, sessions_root=tmp_path / "sessions"
+                    ).new_ids,
+                    project.project_id,
+                    session_id=owner.store.session_id,
+                )
             )
             == 1
         )
@@ -265,7 +269,13 @@ async def test_tui_escape_sends_good_staged_reply_and_reports_broken_one(
             manager.project_registry, sessions_root=tmp_path / "sessions"
         )
         assert (
-            len(inbox.new_ids(project.project_id, session_id=owner.store.session_id))
+            len(
+                await asyncio.to_thread(
+                    inbox.new_ids,
+                    project.project_id,
+                    session_id=owner.store.session_id,
+                )
+            )
             == 1
         )
 

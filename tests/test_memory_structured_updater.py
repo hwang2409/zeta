@@ -1310,7 +1310,7 @@ async def test_exact_literal_validation_ignores_cited_tool_output(
 async def test_cited_code_literal_containing_letter_n_is_required(
     tmp_path: Path,
 ) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, prompts = await _run(
         registry,
         project_id,
@@ -1327,14 +1327,15 @@ async def test_cited_code_literal_containing_letter_n_is_required(
     )
     assert len(prompts) == 2
     assert result.changed_entry_ids
-    assert next(iter(_entries(registry, project_id))).text == (
+    entries = await asyncio.to_thread(_entries, registry, project_id)
+    assert next(iter(entries)).text == (
         "Use `run_background` for long builds."
     )
 
 
 @pytest.mark.asyncio
 async def test_code_literal_does_not_span_lines(tmp_path: Path) -> None:
-    registry, project_id = _registry(tmp_path)
+    registry, project_id = await asyncio.to_thread(_registry, tmp_path)
     result, prompts = await _run(
         registry,
         project_id,

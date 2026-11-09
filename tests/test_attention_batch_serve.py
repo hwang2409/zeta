@@ -354,7 +354,9 @@ async def test_serve_batch_sends_good_items_and_refuses_broken_one(
         assert store.get(good.id).status == "resolved"
         assert bad_path.read_bytes() == b"{"
         inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
-        assert len(inbox.new_ids(project_id, session_id=session_id)) == 1
+        assert len(
+            await asyncio.to_thread(inbox.new_ids, project_id, session_id=session_id)
+        ) == 1
     finally:
         await close_serve(server, writer)
 
