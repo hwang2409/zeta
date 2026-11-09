@@ -105,11 +105,8 @@ AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
 HandlerBinding = Literal["loop", "shared"]
-
 def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
     return partial(handler, registry)
-
-
 def _discover_tool_modules() -> list[str]:
     package = importlib.import_module(__package__)  # import-boundary: load the package being scanned  # fmt: skip
     modules = (
@@ -118,11 +115,8 @@ def _discover_tool_modules() -> list[str]:
         if not module_info.name.startswith("_")
     )
     return sorted(modules, key=lambda name: (name.endswith(".agent"), name))
-
-
 def _register_discovered_tools(registry: ToolRegistry) -> None:
     """Load modules with ``register(registry)``; underscore modules are helpers."""
-
     for module_name in _discover_tool_modules():
         try:
             module = importlib.import_module(module_name)  # import-boundary: load a discovered tool module  # fmt: skip
@@ -147,14 +141,10 @@ def _register_discovered_tools(registry: ToolRegistry) -> None:
             raise RuntimeError(
                 f"failed to register tool module {module_name}: {exc}"
             ) from exc
-
-
 def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
     call_ids = [tool_call.id for tool_call in tool_calls]
     if len(call_ids) != len(set(call_ids)):
         raise ValueError("duplicate tool call id in one execution batch")
-
-
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -172,15 +162,12 @@ class ToolDefinition:
     approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None
     call_preparer: Callable[[ToolCall], Awaitable[ToolCall]] | None = None
     actions: Mapping[str, ToolAction] | None = None
-
     def schema(self) -> ToolSchema:
         return {
             "name": self.name,
             "description": self.description,
             "parameters": copy.deepcopy(self.parameters),
         }
-
-
 def _copy_definition(
     definition: ToolDefinition, registry: ToolRegistry | None = None
 ) -> ToolDefinition:
@@ -192,11 +179,8 @@ def _copy_definition(
     return replace(
         definition, parameters=copy.deepcopy(definition.parameters), handler=handler
     )
-
-
 def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     """Open a directory descriptor for a session cwd, rejecting symlinks."""
-
     cwd_fd = -1
     try:
         cwd_fd = os.open(
@@ -211,10 +195,8 @@ def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
             f"tool cwd is not a directory or is a symlink: {path}"
         ) from exc
     return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
-
 class ToolRegistry:
     """One provider-neutral registry for built-in and custom tools."""
-
     def __init__(
         self,
         cwd: str | Path,
@@ -243,12 +225,10 @@ class ToolRegistry:
         mcp_limits: Any = None,
     ) -> None:
         """Create a registry with a shared tool-output limit.
-
         ``max_output_chars`` bounds ordinary tool results. Terminal agent
         receipts require room for their persisted envelope and therefore use
         ``max(max_output_chars, 1000)`` instead.
         """
-
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
         self.image_policy = image_policy
@@ -352,39 +332,31 @@ class ToolRegistry:
         self._skill_refresher: Callable[[bool], Awaitable[None]] | None = None
         if agent_catalog is None:
             from ..skills.agent_catalog import discover_packaged_agents
-
             agent_catalog = discover_packaged_agents()
         self.agent_catalog = agent_catalog
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
-
     def set_skill_refresher(
         self, refresher: Callable[[bool], Awaitable[None]]
     ) -> None:
         """Let tools request one live catalog refresh."""
-
         self._skill_refresher = refresher
-
     async def refresh_skills(self, *, force: bool = False) -> None:
         if self._skill_refresher is not None:
             await self._skill_refresher(force)
-
     @property
     def tool_allow(self) -> tuple[str, ...] | None:
         return self.tool_policy.allow
-
     @property
     def tool_deny(self) -> tuple[str, ...]:
         return self.tool_policy.deny
-
     def tool_is_allowed_by_policy(self, name: str) -> bool:
         definition = self._tools.get(name)
         actions = (
             tuple(definition.actions) if definition and definition.actions else None
         )
         return self.tool_policy.allows_tool(name, actions)
-
     def tool_is_allowed(self, name: str) -> bool:
         if (
             self._profile_tool_allow is not None
@@ -392,7 +364,6 @@ class ToolRegistry:
         ):
             return False
         return self.tool_is_allowed_by_policy(name)
-
     @property
     def missing_required_tools(self) -> tuple[str, ...]:
         registered = self.registered_names
@@ -420,7 +391,6 @@ class ToolRegistry:
             ):
                 missing.append(selector_text)
         return tuple(missing)
-
     @property
     def schemas(self) -> list[ToolSchema]:
         schemas: list[ToolSchema] = []
@@ -435,16 +405,13 @@ class ToolRegistry:
                 schema = filtered
             schemas.append(schema)
         return schemas
-
     @property
     def tool_schemas(self) -> list[ToolSchema]:
         return self.schemas
-
     def allowed_schemas(
         self, schemas: Sequence[ToolSchema]
     ) -> list[ToolSchema]:
         """Filter an external schema snapshot through this registry's policy."""
-
         allowed: list[ToolSchema] = []
         for schema in schemas:
             name = schema.get("name")
@@ -458,7 +425,6 @@ class ToolRegistry:
             else:
                 allowed.append(copy.deepcopy(schema))
         return allowed
-
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(
@@ -466,7 +432,6 @@ class ToolRegistry:
             for name, definition in self._tools.items()
             if self.tool_is_allowed(name)
         )
-
     @property
     def definitions_by_name(self) -> Mapping[str, ToolDefinition]:
         return {
@@ -474,15 +439,12 @@ class ToolRegistry:
             for name, definition in self._tools.items()
             if self.tool_is_allowed(name)
         }
-
     @property
     def registered_names(self) -> frozenset[str]:
         """Return the current tool names without copying definitions."""
-
         return frozenset(
             name for name in self._tools if self.tool_is_allowed(name)
         )
-
     @property
     def policy_allowed_registered_names(self) -> frozenset[str]:
         """Return registered names allowed before applying a profile layer."""
