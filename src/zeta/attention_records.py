@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
 import uuid
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -300,6 +303,39 @@ class AttentionStore:
             raise FileNotFoundError(attention_id)
         raise ValueError(f"broken attention record: {state.reason}")
 
+    def release_fork(self, attention_id: str, fork_session_id: str) -> None:
+        """clear an open record's binding to `fork_session_id`, if it still has it."""
+        with self._resolution_lock() as attention_fd:
+            try:
+                record = self._read_at(attention_fd, attention_id)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return
+            if record.status != "resolved" and record.fork_session_id == fork_session_id:
+                self._write_at(attention_fd, replace(record, fork_session_id=None))
+
+    @contextmanager
+    def _resolution_lock(self) -> Iterator[int]:
+        with (
+            session_directory(self.session_dir.parent, self.session_dir.name) as (
+                _,
+                session_fd,
+            ),
+            child_directory(session_fd, "attention") as attention_fd,
+        ):
+            fcntl.flock(attention_fd, fcntl.LOCK_EX)
+            try:
+                lock_fd = open_session_file(
+                    attention_fd, ".resolution.lock", os.O_RDWR | os.O_CREAT
+                )
+            finally:
+                fcntl.flock(attention_fd, fcntl.LOCK_UN)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                yield attention_fd
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
     def list(self) -> tuple[AttentionRecord | Broken, ...]:
         try:
             paths = tuple(self.directory.iterdir())
@@ -346,14 +382,33 @@ class AttentionStore:
                 session_fd, "attention", create=create_directory
             ) as attention_fd,
         ):
-            write_session_file(
-                attention_fd,
-                f"{record.id}.json",
-                (
-                    json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":"))
-                    + "\n"
-                ).encode(),
-            )
+            self._write_at(attention_fd, record)
+
+    @staticmethod
+    def _read_at(attention_fd: int, attention_id: str) -> AttentionRecord:
+        _check_id(attention_id)
+        value = read_bounded_session_json(attention_fd, f"{attention_id}.json")
+        if not isinstance(value, dict):
+            raise TypeError("attention record must be a JSON object")
+        return AttentionRecord.from_dict(value)
+
+    @staticmethod
+    def _write_at(attention_fd: int, record: AttentionRecord) -> None:
+        write_session_file(
+            attention_fd,
+            f"{record.id}.json",
+            (
+                json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode(),
+        )
+
+
+def _check_id(attention_id: str) -> None:
+    if len(attention_id) != 32 or any(
+        character not in "0123456789abcdef" for character in attention_id
+    ):
+        raise ValueError("invalid attention id")
 
 
 def _read_bounded_json_fd(fd: int) -> dict[str, Any] | list[Any]:

@@ -835,7 +835,8 @@ The result contains `session` (full metadata or `null`), `state` (`idle`,
 `running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`, and
 `compaction_markers`. Each pending approval has `request_id`, `tool_call`, and
 `delegated`. Delegated approvals also have `agent_instance_id`, the child agent
-instance that owns the approval.
+instance that owns the approval. An approval may also carry `label`, an optional
+display-only string naming the call's target; it is absent when there is none.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
@@ -957,7 +958,11 @@ separate ACP or app-server mapping. The `max_turns` error code is preserved
 on the wire.
 
 `approval_request` carries `request_id` and `tool_call`. It also carries
-`delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
+`delegated: true` and `agent_instance_id` for delegated approvals. It may also
+carry `label`, an optional display-only string that names the call's target for
+the operator (for example `"beta (p_...)"` for an inbox send to a project); it is
+derived from the call, never stored, and is absent when there is no label or when
+the lookup that would produce it fails. `approval_end`
 carries the same `request_id` as its matching `approval_request`, the tool call,
 and `data`. When a durable outcome is stored, `data.decision` is `allow`, `deny`,
 or `abort`, and an abort also sets `data.reason`. `data` can carry other
@@ -1165,11 +1170,11 @@ ToolResult = {
 }
 Approval = {
   required: { request_id: string, tool_call: ToolCall, delegated: boolean },
-  optional: { agent_instance_id: string (delegated only) }
+  optional: { agent_instance_id: string (delegated only), label: string (display-only) }
 }
 StatusPendingApproval = {
   required: { request_id: string, tool_call: ToolCall, delegated: boolean },
-  optional: { agent_instance_id: string (delegated only) }
+  optional: { agent_instance_id: string (delegated only), label: string (display-only) }
 }
 Attachment = { required: { name: string, mime_type: string, size: integer } }
 Usage = object with provider-defined JSON values
@@ -1228,7 +1233,7 @@ Event fields are:
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, `data: object` | `session_id` |
 | `tool_end` | `event`, `tool_call: ToolCall`, `tool_result: ToolResult or null`, `data: object` | `session_id` |
-| `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall`, `delegated: boolean` | `session_id`, `agent_instance_id: string` (delegated only) |
+| `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall`, `delegated: boolean` | `session_id`, `agent_instance_id: string` (delegated only), `label: string` (display-only) |
 | `approval_end` | `event`, `request_id: string`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
 | `task_exit_notification` | `event`, `data: object` | `session_id` |

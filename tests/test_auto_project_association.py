@@ -165,6 +165,7 @@ def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
         project_registry=m.project_registry,
         skill_catalog=SkillCatalog.empty(),
     )
+    tools.project_registry_state = m.project_registry_state
     # Registration is the public capability boundary; invoke the async handler directly.
     from zeta.tools.project import _inspect_project
 
@@ -638,8 +639,12 @@ async def test_registered_home_and_injected_filesystem_root_projects_do_not_auto
     nested = user_home / "nested"
     nested.mkdir(parents=True)
     m = SessionManager(tmp_path / "zeta", user_home=user_home)
-    home_project = m.project_registry.find_or_create_for_directory(user_home)
-    root_project = m.project_registry.find_or_create_for_directory(fake_root)
+    home_project = await asyncio.to_thread(
+        m.project_registry.find_or_create_for_directory, user_home
+    )
+    root_project = await asyncio.to_thread(
+        m.project_registry.find_or_create_for_directory, fake_root
+    )
 
     opened = await asyncio.to_thread(
         lambda: m.create(provider="codex", model="test", cwd=nested)
@@ -800,7 +805,9 @@ async def test_project_init_rebinds_runtime_child_and_approval(
         )
         async for _ in app.loop.run_turn("spawn child", origin=MessageOrigin.USER):
             pass
-        links = app.loop.project_registry.list_session_links(project_id)
+        links = await asyncio.to_thread(
+            app.loop.project_registry.list_session_links, project_id
+        )
         child_links = [item for item in links if item["role"] == "worker"]
         assert len(child_links) == 1
         assert child_links[0]["parent_session_id"] == app.loop.store.session_id
@@ -822,7 +829,8 @@ def test_project_init_uses_durable_pending_link_on_registry_failure(
     def fail(*args: object, **kwargs: object) -> None:
         raise OSError("injected registry failure")
 
-    monkeypatch.setattr(m.project_registry, "record_session", fail)
+    # test-contract: seam force durable pending-link recovery after publication fails
+    monkeypatch.setattr(m.project_registry, "_update_sessions_locked", fail)
     with caplog.at_level(logging.WARNING):
         current = m.associate_project(opened.metadata, project.project_id)
 
@@ -947,6 +955,7 @@ def test_explicit_resume_discovers_only_the_stored_session_cwd(
         repo_root=session_repo,
         zeta_home=home,
         catalog=skills,
+        registry=manager.project_registry_state,
     )
     opened = manager.create(
         provider="codex",
