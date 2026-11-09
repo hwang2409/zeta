@@ -87,9 +87,12 @@ class MemoryTransactions:
                     )
                 snapshot = registry._snapshot_locked(directory_fd)
                 contents = snapshot.contents
-                automatic = registry._automatic_files_from_records(
-                    registry._records_locked(directory_fd)
-                )
+                try:
+                    automatic = registry._automatic_files_from_records(
+                        registry._records_locked(directory_fd)
+                    )
+                except (OSError, ProjectRegistryError, KeyError, TypeError, ValueError):
+                    automatic = set()
                 memory = tuple(
                     MemoryContextEntry(name, content, name in automatic)
                     for name, content in contents.items()
