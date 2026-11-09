@@ -1893,12 +1893,14 @@ def test_rate_limit_hold_renders_as_waiting_text() -> None:
             StreamEventType.RETRY,
             data={
                 "kind": "provider_rate_limit_hold",
-                "text": "anthropic rate limit: checking again in 5m",
+                "text": "claude rate-limited until 09:30 (provider asks 6d 1h 45m); checking again in 5m",
             },
         )
     )
     assert rendered is not None
-    assert rendered.plain == "anthropic rate limit: checking again in 5m"
+    assert rendered.plain == (
+        "claude rate-limited until 09:30 (provider asks 6d 1h 45m); checking again in 5m"
+    )
     assert rendered.style == theme.DIM
 
 

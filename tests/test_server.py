@@ -4205,14 +4205,15 @@ async def test_long_rate_limit_hold_reaches_client_then_turn_completes(
 
     events = [frame["params"] for frame in frames if frame.get("method") == "event"]
     names = [event["event"] for event in events]
-    retry = next(event for event in events if event["event"] == "retry")["data"]
-    assert retry["kind"] == "provider_rate_limit_hold"
+    assert "error" not in names
+    retries = [event["data"] for event in events if event["event"] == "retry"]
+    assert [retry["kind"] for retry in retries] == ["provider_rate_limit_hold"]
+    retry = retries[0]
     assert (retry["delay"], retry["retry_after"]) == (300, 524749)
     assert retry["provider"] == "codex"
     assert retry["reason"] and retry["attempt"] == 1
     assert retry["until"] > 0 and "rate-limited until" in retry["text"]
     assert names.index("retry") < names.index("assistant_message")
-    assert "error" not in names
     assert backend.calls == 2 and sum(backend.waits) == 300
 
 

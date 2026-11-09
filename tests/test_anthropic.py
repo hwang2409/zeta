@@ -754,11 +754,17 @@ async def test_rate_limit_hold_wakes_on_relogin(tmp_path: Path) -> None:
     client = client_for(handler)
     backend = AnthropicBackend(client=client, token_store=store)
     backend._completion_wait = relogin_during_wait
+    events: list[StreamEvent] = []
+    outcome = "completed"
     try:
-        events = [event async for event in backend.complete([], [], control=completion_control())]
+        async for event in backend.complete([], [], control=completion_control()):
+            events.append(event)
+    except AnthropicHTTPError as exc:
+        outcome = f"failed: {exc}"
     finally:
         await client.aclose()
 
+    assert outcome == "completed"
     assert waits == [5], "a re-login must end the hold at the next 5 s check"
     assert requests[-1].headers["authorization"] == "Bearer access-after-relogin"
     assert any(event.delta == "hello" for event in events)
