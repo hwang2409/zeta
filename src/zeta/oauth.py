@@ -22,6 +22,8 @@ from urllib.parse import unquote_plus
 DEFAULT_STREAM_STALL_SECONDS = 90.0
 
 OAUTH_REFRESH_TIMEOUT_SECONDS = DEFAULT_STREAM_STALL_SECONDS
+# A model turn waits this long per attempt, so its account-lock retries show a notice.
+ACCOUNT_LOCK_TURN_WAIT_SECONDS = 30.0
 
 
 class ProviderLoginRequiredError(RuntimeError):
