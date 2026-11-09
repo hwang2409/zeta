@@ -13,6 +13,7 @@ from pathlib import Path
 from .attention_records import (
     AttentionRecord,
     AttentionStore,
+    observed_epoch_for_session,
     read_bounded_session_json,
 )
 from .config.tool_policy import ToolPolicy
@@ -102,7 +103,7 @@ def validate_attention_fork(
     if fork is None or current_project_id is None:
         raise ValueError("resolve_attention is available only in an attention fork")
     source_metadata = manager.read_metadata(fork.forked_from_session)
-    record = AttentionStore(manager.sessions_dir / fork.forked_from_session).get(
+    record = AttentionStore(manager.sessions_dir / fork.forked_from_session, writer_epoch=observed_epoch_for_session(manager.sessions_dir / fork.forked_from_session)).get(
         fork.attention_id
     )
     if (
@@ -134,7 +135,7 @@ def release_discussion_fork(
     fork = read_attention_fork(manager.sessions_dir / fork_session_id)
     if fork is None:
         raise ValueError("session is not a discussion fork")
-    store = AttentionStore(manager.sessions_dir / fork.forked_from_session)
+    store = AttentionStore(manager.sessions_dir / fork.forked_from_session, writer_epoch=observed_epoch_for_session(manager.sessions_dir / fork.forked_from_session))
     try:
         record = store.get(fork.attention_id)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -320,7 +321,7 @@ def create_discussion_fork(
     manager = SessionManager(home, project_registry_state=state)
     source = manager.open(source_session_id, _read_only=True)
     try:
-        attention_store = AttentionStore(source.store.session_dir)
+        attention_store = AttentionStore(source.store.session_dir, writer_epoch=observed_epoch_for_session(source.store.session_dir))
         with _fork_allocation_lock(attention_store):
             record = attention_store.get(attention_id)
             if record.session_id != source_session_id:

@@ -192,6 +192,7 @@ class EventDescriptor(StrEnum):
     TOOL_END = "tool_end"
     SUB_AGENT_RECEIPT = "sub_agent_receipt"
     CHILD_IDLE = "child_idle"
+    CHILD_HOLD = "child_hold"
     TASK_EXIT_NOTIFICATION = "task_exit_notification"
     PROJECT_INBOX_NOTIFICATION = "project_inbox_notification"
     CHILD_QUESTION = "child_question"

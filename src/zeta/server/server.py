@@ -640,7 +640,10 @@ class _Client:
         return result
 
     async def _write(self, payload: _Frame) -> bool:
-        written = await self.connections.send(self, payload)
+        try:
+            written = await self.connections.send(self, payload)
+        except OSError:
+            written = False
         if not written:
             self._transport_failed = True
         return written
