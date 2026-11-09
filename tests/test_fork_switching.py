@@ -487,6 +487,7 @@ def test_visible_approval_card_is_removed_when_request_ends() -> None:
         remove=lambda old, *, leading_blank: removed.append(old)
     )
     app._invalidate_prompt = lambda: None
+    app._approval_policy = None
     owner = SimpleNamespace()
     request = ApprovalRequest("main", ToolCall("main", "read", {"path": "x"}))
 
@@ -511,6 +512,7 @@ def test_shortcut_card_tracks_first_pending_approval(
                 remove=lambda unit, *, leading_blank: None
             )
             self._invalidate_prompt = lambda: None
+            self._approval_policy = None
 
         @property
         def local_pending_approvals(self) -> tuple[ApprovalRequest, ...]:
@@ -608,6 +610,7 @@ def test_replaced_approval_handle_renders_new_card(
         remove=lambda old, *, leading_blank: removed.append(old)
     )
     app._invalidate_prompt = lambda: None
+    app._approval_policy = None
     owner = SimpleNamespace()
     old_request = ApprovalRequest("same", ToolCall("same", "read", {"path": "x"}))
     replacement = ApprovalRequest(
@@ -681,6 +684,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app.stop_decisions_poll = lambda: cleaned.append("poll")
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
     app._close_finder_workers = fail_finder
+    app._close_approval_labels = lambda: async_cleanup("approval labels")
     async def close_navigation() -> None:
         cleaned.append("navigation close")
 
@@ -704,5 +708,6 @@ def test_tui_close_failure_still_runs_later_cleanup(
     assert "session" in cleaned
     assert cleaned.index("recency") < cleaned.index("session")
     assert "task sink" in cleaned
+    assert "approval labels" in cleaned
     assert cleaned.index("navigation close") < cleaned.index("navigation unbind")
     assert cleaned.index("navigation unbind") < cleaned.index("wizard")

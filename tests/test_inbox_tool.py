@@ -29,6 +29,7 @@ from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
+from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tools.inbox import _inbox, _model_visible, _validate_action
 from zeta.tools.registry import ToolRegistry
 
@@ -83,6 +84,143 @@ def _provider_text(provider: str, result: dict) -> str:
         payload = build_responses_payload(messages, [], model="codex-test")
         return payload["input"][1]["output"]
     return ollama_messages(messages)[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_inbox_execution_canonicalizes_approval_subjects(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
+    other = await asyncio.to_thread(projects.create_project, "other", "other")
+    async def send(project: str, *, skip_approval: bool = False) -> dict[str, object]:
+        return await registry.execute(
+            ToolCall(
+                "send-" + project,
+                "inbox",
+                {
+                    "action": "send",
+                    "project": project,
+                    "kind": "info",
+                    "title": "title",
+                    "body": "body",
+                },
+            ),
+            _skip_approval=skip_approval,
+        )
+
+    try:
+        registry.set_approval_policy(
+            ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny", store=store)
+        )
+        for project in ("beta", beta.project_id):
+            assert (await send(project)).get("isError") is not True, project
+        registry.set_approval_policy(
+            ApprovalPolicy(
+                always_allow={f"inbox(send {beta.project_id})"},
+                default="deny",
+                store=store,
+            )
+        )
+        assert (await send("beta")).get("isError") is not True
+        assert (await send(other.project_id)).get("isError") is True
+        registry.set_approval_policy(ApprovalPolicy(default="allow", store=store))
+        unknown = await send("missing", skip_approval=True)
+        assert unknown.get("isError") is True
+        assert "unknown inbox target project" in str(unknown)
+    finally:
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_name_rule_refreshes_after_project_creation(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    registry.set_approval_policy(
+        ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny", store=store)
+    )
+    try:
+        beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
+        result = await registry.execute(
+            ToolCall(
+                "late-beta",
+                "inbox",
+                {
+                    "action": "send",
+                    "project": "beta",
+                    "kind": "info",
+                    "title": "title",
+                    "body": "body",
+                },
+            )
+        )
+        assert result.get("isError") is not True
+        assert beta.project_id != "beta"
+    finally:
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_preparation_forwards_through_nested_child_policies(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    child_store = ConversationStore(tmp_path / "children", session_id="c" * 32)
+    nested_store = ConversationStore(tmp_path / "nested", session_id="n" * 32)
+    try:
+        projects = registry.project_registry
+        assert projects is not None
+        beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
+        parent = ApprovalPolicy(default="ask", store=store)
+        child = ChildApprovalPolicy(parent, child_store, "worker", "worker")
+        nested = ChildApprovalPolicy(child, nested_store, "nested", "nested")
+        registry.set_approval_policy(nested)
+        raw = ToolCall(
+            "nested-approval",
+            "inbox",
+            {"action": "send", "project": "beta", "kind": "info", "title": "t", "body": "b"},
+        )
+        prepared = await registry.prepare_tool_call(raw)
+        assert prepared.arguments["project"] == beta.project_id
+        request = registry.prepare_approval(prepared)
+        assert request is not None
+    finally:
+        await registry.close()
+        nested_store.close()
+        child_store.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_approval_subject_keeps_canonical_project_ids(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    try:
+        project_id = registry.project_id
+        assert project_id is not None
+        capability = registry.resolve_call(
+            "inbox",
+            {
+                "action": "send",
+                "project": project_id,
+                "kind": "question",
+                "title": "title",
+                "body": "body",
+            },
+        )
+        assert capability.subject_value == project_id
+        assert capability.arguments["project"] == project_id
+    finally:
+        await registry.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -326,44 +464,6 @@ def test_approval_subject_includes_action_and_target_project(tmp_path: Path) -> 
         store.close()
 
 
-def test_inbox_name_rule_allows_send_by_name_and_id(tmp_path: Path) -> None:
-    registry, store = _registry(tmp_path)
-    projects = registry.project_registry
-    assert projects is not None
-    beta = projects.create_project("beta", "beta")
-    try:
-        policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
-        registry.set_approval_policy(policy)
-        for project in ("beta", beta.project_id):
-            assert (
-                policy.decide(_send_capability(registry, project))
-                is ApprovalDecision.ALLOW
-            )
-    finally:
-        asyncio.run(registry.close())
-        store.close()
-
-
-def test_inbox_id_rule_allows_send_by_name_and_id(tmp_path: Path) -> None:
-    registry, store = _registry(tmp_path)
-    projects = registry.project_registry
-    assert projects is not None
-    beta = projects.create_project("beta", "beta")
-    try:
-        policy = ApprovalPolicy(
-            always_allow={f"inbox(send {beta.project_id})"}, default="deny"
-        )
-        registry.set_approval_policy(policy)
-        for project in ("beta", beta.project_id):
-            assert (
-                policy.decide(_send_capability(registry, project))
-                is ApprovalDecision.ALLOW
-            )
-    finally:
-        asyncio.run(registry.close())
-        store.close()
-
-
 def test_inbox_rule_does_not_allow_other_project(tmp_path: Path) -> None:
     registry, store = _registry(tmp_path)
     projects = registry.project_registry
@@ -406,7 +506,7 @@ def test_inbox_wildcard_rule_skips_project_lookup(
         assert (
             policy.decide(_send_capability(registry, "beta")) is ApprovalDecision.ALLOW
         )
-        assert references == ["beta"]
+        assert references == []
     finally:
         asyncio.run(registry.close())
         store.close()
