@@ -90,6 +90,35 @@ def test_method_registry_matches_documented_table() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_observer_access_uses_shared_dispatch_table(transport: str, tmp_path: Path) -> None:
+    contract = await ServeContract.start(tmp_path / transport, transport)  # type: ignore[arg-type]
+    controller = observer = None
+    try:
+        controller = await contract.connect("controller")
+        hello = await controller.request("controller-hello", "hello", {"protocol_version": "1.2"})
+        assert "new_session" in hello["result"]["capabilities"]["requests"]
+        controller_reply = await controller.request(
+            "controller-new-session", "new_session", {"provider": "codex"}
+        )
+        assert "result" in controller_reply
+        observer = await contract.connect("observer")
+        await observer.request(
+            "observer-hello",
+            "hello",
+            {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]},
+        )
+        reply = await observer.request("observer-new-session", "new_session")
+        assert reply["error"] == {
+            "code": -32008,
+            "message": "method is unavailable to read-only observers",
+            "data": {"code": "observer_read_only", "method": "new_session"},
+        }
+    finally:
+        await contract.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
 async def test_real_method_conformance_matrix(transport: str, tmp_path: Path) -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     section = _section(document, "## method table", "## common JSON-RPC shapes")
@@ -604,6 +633,38 @@ def test_slash_registry_gate_rejects_committed_bypass_mutations(source: str) -> 
 )
 def test_static_gate_rejects_raw_method_dispatch_mutations(source: str) -> None:
     assert _source_bypasses(source)
+
+
+def _dispatch_mapping_bypasses(source: str) -> list[str]:
+    tree = ast.parse(source)
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        if (
+            isinstance(node.left, ast.Name)
+            and node.left.id in {"method", "wire"}
+            and any(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in node.comparators)
+            and not any(isinstance(item, ast.Constant) and item.value == "hello" for item in node.comparators)
+        ):
+            violations.append(f"line {node.lineno}: method strings belong in the dispatch registry")
+    return violations
+
+
+def test_dispatch_entrypoints_have_no_method_string_mapping() -> None:
+    for path in (ROOT / "src/zeta/server/server.py", ROOT / "src/zeta/server/connections.py"):
+        assert not (violations := _dispatch_mapping_bypasses(path.read_text())), "\\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        'def route(method):\n    if method == "new_session":\n        return True\n',
+        'def route(wire):\n    if wire == "send":\n        return True\n',
+    ),
+)
+def test_dispatch_guard_rejects_second_mapping(source: str) -> None:
+    assert _dispatch_mapping_bypasses(source)
 
 
 def test_no_code_bypasses_the_typed_frame_codec() -> None:

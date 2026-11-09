@@ -104,7 +104,7 @@ async def _observer_read(client: object, request_id: str | int, descriptor: Meth
         )
         return result
     if descriptor in {MethodDescriptor.SESSION_TREE, MethodDescriptor.SESSION_HISTORY, MethodDescriptor.CONTENT_READ, MethodDescriptor.MODEL_CATALOG, MethodDescriptor.SESSION_SETTINGS}:
-        return await client.connections.read_session(client, descriptor.wire, params)  # type: ignore[attr-defined]
+        return await _observer_operation(client, descriptor, params)  # type: ignore[attr-defined]
     return await _dispatch_descriptor(client, request_id, descriptor, params)
 
 
@@ -153,7 +153,7 @@ async def _ergonomics(
         MethodDescriptor.SESSION_HISTORY,
     }:
         assert client.server.connections is not None
-        return await client.server.connections.read_session(client, method, params)
+        return await _observer_operation(client, descriptor, params)
     if descriptor is MethodDescriptor.CONTENT_READ:
         if "content_read" not in client.features:
             raise ProtocolError(
@@ -161,7 +161,7 @@ async def _ergonomics(
                 "content_read requires the negotiated content_read feature",
             )
         assert client.server.connections is not None
-        return await client.server.connections.read_session(client, method, params)
+        return await _observer_operation(client, descriptor, params)
     if descriptor is MethodDescriptor.MODEL_CATALOG:
         return settings.catalog(runtime)
     store = validation.active(runtime, params)
@@ -219,6 +219,21 @@ async def _ergonomics(
         if not current or current[-1].id != head:
             store.switch_to_branch(head)
     return session.tree(runtime)
+
+
+async def _observer_operation(client: object, descriptor: MethodDescriptor, params: dict[str, Any]) -> object:
+    connections = client.server.connections
+    if descriptor is MethodDescriptor.SESSION_TREE:
+        return await connections.read_tree(client, params)
+    if descriptor is MethodDescriptor.SESSION_HISTORY:
+        return await connections.read_history(client, params)
+    if descriptor is MethodDescriptor.CONTENT_READ:
+        return await connections.read_content(client, params)
+    if descriptor is MethodDescriptor.MODEL_CATALOG:
+        return await connections.read_catalog(client)
+    if descriptor is MethodDescriptor.SESSION_SETTINGS:
+        return await connections.read_settings(client, params)
+    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
 
 
 def _descriptor_handler(descriptor: MethodDescriptor):

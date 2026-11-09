@@ -758,29 +758,63 @@ class ConnectionRegistry:
             )
         return result
 
-    async def read_session(
-        self, connection: Any, method: str, params: dict[str, Any]
-    ) -> object:
-        target = capture_read(connection, method, params)
-        features = self._connections[connection].features
-        include_delivery_id = {
-            "delivery_id",
-            "user_message_event",
-            "user_message_delivery_id",
-        } <= features
+    async def read_tree(self, connection: Any, params: dict[str, Any]) -> object:
+        runtime = connection.server.runtime
+        store = validation.active(runtime, params)
         return await self.run_read(
             connection,
-            lambda: perform_read(
-                method,
-                target,
+            lambda: session.tree(_observer_runtime(store)),
+            session_id=runtime.session_id,
+        )
+
+    async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
+        runtime = connection.server.runtime
+        store = validation.active(runtime, params)
+        features = self._connections[connection].features
+        return await self.run_read(
+            connection,
+            lambda: history.history(
+                _observer_runtime(store),
                 params,
-                include_delivery_id=include_delivery_id,
+                include_delivery_id={
+                    "delivery_id", "user_message_event", "user_message_delivery_id"
+                } <= features,
                 backward_enabled="session_history_backward" in features,
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
             ),
-            session_id=target[0],
+            session_id=runtime.session_id,
+        )
+
+    async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
+        if set(params) - {"handle", "offset", "limit"}:
+            raise ProtocolError(ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read")
+        runtime = connection.server.runtime
+        if runtime.opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        store = runtime.opened.store
+        return await self.run_read(
+            connection,
+            lambda: content.read(
+                store,
+                params.get("handle"),
+                offset=params.get("offset", 0),
+                limit=params.get("limit", content.MAX_CONTENT_READ),
+            ),
+            session_id=runtime.session_id,
+        )
+
+    async def read_catalog(self, connection: Any) -> object:
+        runtime = connection.server.runtime
+        return await self.run_read(connection, lambda: settings.catalog(runtime))
+
+    async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
+        runtime = connection.server.runtime
+        return await self.run_read(
+            connection,
+            lambda: settings.settings(runtime),
+            session_id=runtime.session_id,
         )
 
     async def read_status(
@@ -929,36 +963,6 @@ def _capture_status(client: Any, fallback_config: Any) -> tuple[str | None, obje
     return session_id, status
 
 
-def capture_read(
-    client: Any,
-    method: str,
-    params: dict[str, Any],
-    *,
-    fallback_config: Any = None,
-) -> tuple[str | None, object]:
-    runtime = client.server.runtime
-    if method == "content_read":
-        if set(params) - {"handle", "offset", "limit"}:
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_CONTENT_READ,
-                "invalid content read",
-            )
-        if runtime.opened is None:
-            raise ProtocolError(
-                ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
-            )
-        return runtime.session_id, runtime.opened.store
-    if method in {"session_tree", "session_history"}:
-        store = validation.active(runtime, params)
-        return runtime.session_id, store
-    if method == "status":
-        return _capture_status(client, fallback_config)
-    if method == "model_catalog":
-        return None, settings.catalog(runtime)
-    if method == "session_settings":
-        return runtime.session_id, settings.settings(runtime)
-    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
-
 
 def project_status(target: object, *, served_turn_end: bool = False) -> dict[str, Any]:
     status = dict(target)
@@ -970,51 +974,14 @@ def project_status(target: object, *, served_turn_end: bool = False) -> dict[str
         outcome = None
         entry = store.last_turn_end() if store is not None else None
         if entry is not None:
-            outcome = {
-                "turn_id": entry.data["turn_id"],
-                "reason": entry.data["reason"],
-            }
+            outcome = {"turn_id": entry.data["turn_id"], "reason": entry.data["reason"]}
         status["last_turn_outcome"] = outcome
     return status
 
 
-def perform_read(
-    method: str,
-    target: tuple[str | None, object],
-    params: dict[str, Any],
-    *,
-    include_delivery_id: bool = False,
-    backward_enabled: bool = False,
-    fidelity: bool = False,
-    content_read: bool = False,
-    served_turn_end: bool = False,
-) -> object:
-    if method == "status":
-        return project_status(target[1], served_turn_end=served_turn_end)
-
-    if method in {"model_catalog", "session_settings"}:
-        return target[1]
-    store = target[1]
-    runtime = type(
-        "ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()}
+def _observer_runtime(store: object) -> object:
+    return type(
+        "ObserverRuntime",
+        (),
+        {"opened": type("Opened", (), {"store": store})()},
     )()
-    if method == "session_tree":
-        return session.tree(runtime)
-    if method == "session_history":
-        return history.history(
-            runtime,
-            params,
-            include_delivery_id=include_delivery_id,
-            backward_enabled=backward_enabled,
-            fidelity=fidelity,
-            content_read=content_read,
-            served_turn_end=served_turn_end,
-        )
-    if method == "content_read":
-        return content.read(
-            store,
-            params.get("handle"),
-            offset=params.get("offset", 0),
-            limit=params.get("limit", content.MAX_CONTENT_READ),
-        )
-    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
