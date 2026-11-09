@@ -14,7 +14,7 @@ from ..project_errors import (
     ProjectRegistryError,
     UnsupportedMemoryFormatError,
 )
-from ..project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
+from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
 from .entry_project_views import EntryProjectViews
@@ -68,6 +68,8 @@ _REQUIRED_MESSAGE_FIELDS = frozenset(
 _KNOWN_OPTIONAL_MESSAGE_FIELDS = frozenset(
     {
         "origin",
+        "author",
+        "authority",
         "to_session",
         "claimer_session",
         "claimed_at",
@@ -289,9 +291,6 @@ class ProjectRequests:
             limit,
             extra_for_page=lambda page: {
                 "status": status,
-                "untrusted": any(
-                    message.get("origin") != LOCAL_ORIGIN for message in page
-                ),
                 "invalid": invalid,
             },
         )
@@ -333,7 +332,6 @@ class ProjectRequests:
 
         envelope = {
             "status": "claimed",
-            "untrusted": result.get("origin") != LOCAL_ORIGIN,
             "messages": [result],
         }
         optional = [

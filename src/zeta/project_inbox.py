@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import stat
 import time
 import uuid
@@ -40,7 +41,9 @@ SENT_PAGE_LIMIT = 100
 _SENT_TRACKING_FILE = "project-inbox-sent.json"
 SENT_STATUS_EVENT = "project_inbox_sent_status"
 KINDS = frozenset(str(value) for value in CLOSED_VARIANTS["inbox.kind"])
-LOCAL_ORIGIN = "local"
+AGENT_ORIGIN = "agent"
+USER_ORIGIN = "user"
+LEGACY_LOCAL_ORIGIN = "local"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_FILE_BYTES = 10 * 1024 * 1024
 _MAX_JSON_DEPTH = 64
@@ -213,11 +216,95 @@ class ProjectInbox:
         self.sent_tracker = sent_tracker
         self.receipts = tuple(receipts)
 
+    def command(self, project: str, args: str, *, from_session: str | None = None) -> str:
+        body = None
+        if args.startswith("send ") and " -- " in args:
+            prefix, body = args.split(" -- ", 1)
+            parts = shlex.split(prefix)
+        else:
+            parts = shlex.split(args)
+        if not parts:
+            return json.dumps(self.list(project), indent=2, sort_keys=True)
+        if parts[0] == "send":
+            if body is None or from_session is None or len(parts) != 4:
+                raise InboxError("usage: /inbox send <recipient-project> <kind> <title> -- <body>")
+            message_id = self.send_user(
+                from_project=project,
+                from_session=from_session,
+                to_project=parts[1],
+                kind=parts[2],
+                title=parts[3],
+                body=body,
+            )
+            return f"inbox message sent: {message_id}"
+        if parts[0] not in {"delegate", "revoke", "delegations"}:
+            raise InboxError("usage: /inbox [send|delegate|revoke|delegations]")
+        if parts[0] == "delegations":
+            if len(parts) != 1:
+                raise InboxError("usage: /inbox delegations")
+            rows = [
+                {"from_project": source, "kind": kind}
+                for source, kind in sorted(self._delegations(self._resolve_project(project).project_id))
+            ]
+            return json.dumps({"delegations": rows}, indent=2, sort_keys=True)
+        if len(parts) != 3:
+            raise InboxError(f"usage: /inbox {parts[0]} <sender-project> <kind>")
+        self.set_delegation(
+            project,
+            parts[1],
+            parts[2],
+            enabled=parts[0] == "delegate",
+        )
+        return f"inbox delegation {parts[0]}d: {parts[1]} {parts[2]}"
+
     def known_projects(self) -> list[dict[str, str]]:
         return [
             {"id": project.project_id, "name": project.name, "scope": project.scope}
             for project in self.registry.list_projects()
         ]
+
+    @staticmethod
+    def _origin_author(origin: object) -> str:
+        return "user" if origin == USER_ORIGIN else "agent"
+
+    def _delegations(self, project_id: str) -> set[tuple[str, str]]:
+        path = self.registry.root / project_id / "inbox" / "delegations.json"
+        try:
+            with path.open(encoding="utf-8") as stream:
+                value = json.load(stream)
+        except FileNotFoundError:
+            return set()
+        if not isinstance(value, dict) or set(value) != {"schema_version", "delegations"}:
+            raise InboxError("invalid inbox delegations")
+        if value["schema_version"] != 1 or not isinstance(value["delegations"], list):
+            raise InboxError("invalid inbox delegations")
+        result: set[tuple[str, str]] = set()
+        for item in value["delegations"]:
+            if not isinstance(item, dict) or set(item) != {"from_project", "kind"}:
+                raise InboxError("invalid inbox delegations")
+            source, kind = item.get("from_project"), item.get("kind")
+            if not isinstance(source, str) or not isinstance(kind, str):
+                raise InboxError("invalid inbox delegations")
+            try:
+                require_closed_variant("inbox.kind", kind)
+            except ValueError as exc:
+                raise InboxError("invalid inbox delegations") from exc
+            result.add((source, kind))
+        return result
+
+    def _decorate(self, project_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        author = self._origin_author(record.get("origin"))
+        sender = record.get("from")
+        source = sender.get("project") if isinstance(sender, dict) else None
+        delegated = author == "agent" and isinstance(source, str) and (
+            source, record.get("kind")
+        ) in self._delegations(project_id)
+        result = dict(record)
+        result["author"] = author
+        result["authority"] = (
+            "trusted_assignment" if author == "user" or delegated else "information"
+        )
+        return result
 
     def send(
         self,
@@ -232,8 +319,10 @@ class ProjectInbox:
         message_id: str | None = None,
         to_session: str | None = None,
         on_visible: Callable[[], None] | None = None,
+        _origin: str = AGENT_ORIGIN,
     ) -> str:
         session, target, message_id = self._deliver(
+            origin=_origin,
             from_project=from_project,
             from_session=from_session,
             to_project=to_project,
@@ -253,6 +342,49 @@ class ProjectInbox:
         self._sent_tracker(session).record(message_id, target)
         return message_id
 
+    def set_delegation(self, recipient: str, sender: str, kind: str, *, enabled: bool) -> None:
+        recipient_project = self._resolve_project(recipient).project_id
+        sender_project = self._resolve_project(sender).project_id
+        try:
+            require_closed_variant("inbox.kind", kind)
+        except ValueError as exc:
+            raise InboxError(f"unknown message kind: {kind}") from exc
+        with self._lock(recipient_project, exclusive=True) as project_fd:
+            current = self._delegations(recipient_project)
+            key = (sender_project, kind)
+            if enabled:
+                current.add(key)
+            else:
+                current.discard(key)
+            rows = [
+                {"from_project": source, "kind": message_kind}
+                for source, message_kind in sorted(current)
+            ]
+            payload = json.dumps(
+                {"schema_version": 1, "delegations": rows},
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            inbox_fd = os.open(
+                "inbox", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=project_fd
+            )
+            try:
+                atomic_publish_file(inbox_fd, "delegations.json", payload, sync_directory=True)
+            finally:
+                os.close(inbox_fd)
+
+    def send_agent(self, **kwargs: Any) -> str:
+        return self.send(**kwargs, _origin=AGENT_ORIGIN)
+
+    def send_user(self, **kwargs: Any) -> str:
+        return self.send(**kwargs, _origin=USER_ORIGIN)
+
+    def send_agent_with_outcome(self, **kwargs: Any) -> tuple[str, SentLedgerOutcome[None]]:
+        return self.send_with_outcome(**kwargs, _origin=AGENT_ORIGIN)
+
+    def send_user_with_outcome(self, **kwargs: Any) -> tuple[str, SentLedgerOutcome[None]]:
+        return self.send_with_outcome(**kwargs, _origin=USER_ORIGIN)
+
     def send_with_outcome(
         self,
         *,
@@ -265,8 +397,10 @@ class ProjectInbox:
         in_reply_to: str | None = None,
         message_id: str | None = None,
         to_session: str | None = None,
+        _origin: str = AGENT_ORIGIN,
     ) -> tuple[str, SentLedgerOutcome[None]]:
         session, target, message_id = self._deliver(
+            origin=_origin,
             from_project=from_project,
             from_session=from_session,
             to_project=to_project,
@@ -302,6 +436,7 @@ class ProjectInbox:
         in_reply_to: str | None = None,
         message_id: str | None = None,
         to_session: str | None = None,
+        origin: str = AGENT_ORIGIN,
     ) -> tuple[str, str, str, str, dict[str, Any]]:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
@@ -320,7 +455,7 @@ class ProjectInbox:
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "id": message_id,
-            "origin": LOCAL_ORIGIN,
+            "origin": origin,
             "from": {"project": sender.project_id, "session": session},
             "to_project": target.project_id,
             "to_session": to_session,
@@ -371,7 +506,7 @@ class ProjectInbox:
         }
         comparable = {
             key: (
-                existing.get(key, LOCAL_ORIGIN)
+                existing.get(key, LEGACY_LOCAL_ORIGIN)
                 if key == "origin"
                 else existing.get(key)
                 if key == "to_session"
@@ -413,6 +548,10 @@ class ProjectInbox:
                     if record.get("to_session") in {None, session_id}
                 ]
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
+        for status in ("new", "claimed", "done"):
+            result[status] = [
+                self._decorate(target.project_id, item) for item in result[status]
+            ]
         return result
 
     def sent(
@@ -695,6 +834,8 @@ class ProjectInbox:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)
+                if self._decorate(target.project_id, record)["authority"] != "trusted_assignment":
+                    raise InboxError("inbox message is information, not an authorized assignment")
                 target_session = record.get("to_session")
                 if target_session is not None and target_session != session_id:
                     return None
@@ -798,16 +939,6 @@ class ProjectInbox:
                 message_id=reply_id,
             )
         return completed, sent_outcome
-
-    def notice(self, project: str) -> str | None:
-        count = len(self.new_ids(project))
-        if not count:
-            return None
-        return (
-            f"Local project inbox has {count} new message{'s' if count != 1 else ''}; "
-            "use inbox action list. Requests are work to do: claim, do, and mark done. "
-            "You do not need to confirm the sender with the user."
-        )
 
     def _resolve_project(self, value: str) -> Project:
         _text(value, "project")
@@ -990,7 +1121,7 @@ class ProjectInbox:
         }
         if not required.issubset(value):
             raise InboxError(f"invalid inbox message fields: {name}")
-        origin = value.setdefault("origin", LOCAL_ORIGIN)
+        origin = value.setdefault("origin", LEGACY_LOCAL_ORIGIN)
         _text(origin, "message origin")
         if value.get("to_session") is not None:
             _id(value["to_session"], "target session")

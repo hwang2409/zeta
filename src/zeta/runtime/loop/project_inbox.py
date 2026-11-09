@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 from ...agent.pending_delivery import NotificationInput
+from ...core.project_inbox_notifications import NEUTRAL_INBOX_TEXT
 from ...project_inbox import (
     SENT_STATUS_EVENT,
     InboxError,
@@ -195,12 +196,7 @@ class ProjectInboxNotificationMixin:
             await ProjectInboxNotificationMixin._record_sent_statuses(self, sent)
         if message_ids is None or not message_ids:
             return
-        text = (
-            f"Local project inbox has {len(message_ids)} new message"
-            f"{'s' if len(message_ids) != 1 else ''}; use inbox action list. "
-            "Requests are work to do: claim, do, and mark done. You do not need "
-            "to confirm the sender with the user."
-        )
+        text = NEUTRAL_INBOX_TEXT
         flow = await self._ensure_step_delivery()
         await flow.produce(
             NotificationInput(

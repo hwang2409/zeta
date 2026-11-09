@@ -9,7 +9,6 @@ from typing import Any
 
 from ...project_inbox import (
     KINDS,
-    LOCAL_ORIGIN,
     InboxError,
     ProjectInbox,
 )
@@ -89,7 +88,7 @@ def _sender_header(messages: list[dict[str, Any]]) -> str:
 def _model_visible(action: str, project_id: str, result: dict[str, Any]) -> str:
     payload = json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False)
     messages = _result_messages(result)
-    if all(message.get("origin", LOCAL_ORIGIN) == LOCAL_ORIGIN for message in messages):
+    if all(message.get("authority") == "trusted_assignment" for message in messages):
         return (
             f"Inbox {action} result for project {project_id}.\n"
             f"{_sender_header(messages)}"
@@ -183,7 +182,7 @@ def _send(
     session_id: str,
     arguments: dict[str, Any],
 ) -> StructuredToolResult:
-    message_id, sent_outcome = inbox.send_with_outcome(
+    message_id, sent_outcome = inbox.send_agent_with_outcome(
         from_project=project_id,
         from_session=session_id,
         to_project=arguments["project"],

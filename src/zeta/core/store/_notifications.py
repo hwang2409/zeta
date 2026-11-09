@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from ...agent.receipt import valid_killed_task_fields
 from ...protocol.types import Message, MessageOrigin, ToolUseContent
 from ..checkpoints import ConversationEntry
+from ..project_inbox_notifications import NEUTRAL_INBOX_TEXT
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     CHILD_IDLE_NOTIFICATION_KIND,
@@ -165,12 +166,7 @@ class NotificationStateMixin:
             "message_ids": list(message_ids),
             "description": "project inbox",
             "status": "new",
-            "text": (
-                f"Local project inbox has {len(message_ids)} new message"
-                f"{'s' if len(message_ids) != 1 else ''}; use inbox action list. "
-                "Requests are work to do: claim, do, and mark done. You do not need "
-                "to confirm the sender with the user."
-            ),
+            "text": NEUTRAL_INBOX_TEXT,
         }
         with self._append_lock():
             pending = next(

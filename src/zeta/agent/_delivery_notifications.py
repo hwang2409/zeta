@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from ..core.checkpoints import ConversationEntry
+from ..core.project_inbox_notifications import project_inbox_notification
 from ..protocol.types import Message, harness_notice
 
 if TYPE_CHECKING:
@@ -45,7 +46,7 @@ def _bounded_text(value: object, limit: int) -> str:
     return str(value or "")[:limit]
 
 def _notification_digest(entry: ConversationEntry) -> dict[str, JSONValue]:
-    data = entry.data
+    data = project_inbox_notification(entry.data)
     report = data.get("report")
     report_data = report if isinstance(report, Mapping) else {}
     canonical = json.dumps(
@@ -86,7 +87,7 @@ def _notification_message(
         else {
             "notification_id": entry.id,
             "kind": entry.data.get("kind", "agent_completion"),
-            **entry.data,
+            **project_inbox_notification(entry.data),
         }
         for entry in entries
     ]
@@ -144,9 +145,11 @@ def _reuse_persisted_notification_delivery(
     pending_ids = {entry.id for entry in pending}
     if not represented or not represented.issubset(pending_ids):
         return None
-    if not _notification_fits(persisted, notification_budget, token_counter):
+    selected = [entry for entry in pending if entry.id in represented]
+    projected = _notification_message(selected)
+    if not _notification_fits(projected, notification_budget, token_counter):
         return None
-    return [entry for entry in pending if entry.id in represented], persisted, True
+    return selected, projected, True
 
 
 def _largest_fitting_notification_delivery(

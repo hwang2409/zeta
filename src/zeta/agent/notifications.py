@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Literal
 
 from ..core.abort import AbortSignal as ToolAbortSignal
+from ..core.project_inbox_notifications import project_inbox_notification
 from ..core.store import ConversationStore
 from ..protocol.types import (
     Message,
@@ -82,7 +83,7 @@ class AgentNotificationMixin:
                 StreamEventType.AGENT_NOTIFICATION,
                 data={
                     "notification_id": notification.id,
-                    **notification.data,
+                    **project_inbox_notification(notification.data),
                     "kind": notification.data.get("kind", "agent_completion"),
                     "tui_presented": self.store.is_agent_notification_presented_to_tui(
                         notification.id
