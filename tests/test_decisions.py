@@ -418,6 +418,40 @@ async def test_child_resolution_event_refreshes_rendered_count(
 
 
 @pytest.mark.asyncio
+async def test_decisions_refresh_discards_completed_stale_scan(tmp_path: Path) -> None:
+    from zeta.attention_decisions import open_decisions
+
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "git")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    records = [
+        await asyncio.to_thread(
+            _request, current, project.project_id, f"Choice {index}", "This one."
+        )
+        for index in range(2)
+    ]
+    replies = AttentionReplies(tmp_path, current.store.session_id)
+    await asyncio.to_thread(replies.stage, records[0].id, "first")
+    await asyncio.to_thread(replies.stage, records[1].id, "second")
+    app = _decisions_app(tmp_path, current)
+    loop = asyncio.get_running_loop()
+    work = loop.create_future()
+    work.set_result(open_decisions(tmp_path, current.store.session_id))
+    app._decisions_scan_work = work
+    app._decisions_scan_task = asyncio.create_task(asyncio.sleep(10))
+    broken = current.store.session_dir / "attention" / f"{records[0].id}.json"
+    try:
+        broken.write_bytes(b'{"why":"cut off"')
+        app.request_decisions_refresh()
+        await app._decisions_tick()
+        assert app.decisions_count == 2
+        assert app.decisions_staged_count == 1
+    finally:
+        await app.close()
+        current.store.close()
+
+
+@pytest.mark.asyncio
 async def test_hung_decisions_scan_stays_single_flight_and_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
