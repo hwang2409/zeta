@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import threading
 import weakref
@@ -29,25 +30,39 @@ _LOOP_AFFINE = (asyncio.Future, asyncio.BaseTransport, asyncio.StreamWriter)
 
 
 class _Handoff:
-    """The scheduled hand-back; a closed loop drops it without calling it.
+    """One callback handed to the loop; a closed loop drops it without calling it.
 
-    Dropping it uncalled queues the close for the next release point
-    (zeta.storage_format.drain_releases): a finalizer must not run the close.
+    Every callback this module schedules on the loop goes through schedule(), so
+    a dropped one always runs its dropped action: at once when the loop refuses
+    it, otherwise at the next release point (zeta.storage_format.drain_releases).
+    A finalizer only queues the action; it must not run it.
     """
 
-    __slots__ = ("__weakref__", "_call", "_dropped")
+    __slots__ = ("__weakref__", "_dropped", "_on_loop")
 
-    def __init__(self, call: _OwnedCall[Any]) -> None:
-        self._call = call
-        self._dropped = weakref.finalize(self, release_later, call._handoff_dropped)
+    def __init__(
+        self, on_loop: Callable[[], None], dropped: Callable[[], None]
+    ) -> None:
+        self._on_loop = on_loop
+        self._dropped = weakref.finalize(self, release_later, dropped)
+
+    @classmethod
+    def schedule(
+        cls,
+        loop: asyncio.AbstractEventLoop,
+        on_loop: Callable[[], None],
+        dropped: Callable[[], None],
+    ) -> None:
+        handoff = cls(on_loop, dropped)
+        try:
+            loop.call_soon_threadsafe(handoff)
+        except RuntimeError:  # the loop is closed; it will never run on_loop
+            handoff._dropped.detach()
+            dropped()
 
     def __call__(self) -> None:
         if self._dropped.detach() is not None:
-            self._call._deliver()
-
-    def cancel(self) -> None:
-        """The hand-back was never scheduled; the caller releases the result."""
-        self._dropped.detach()
+            self._on_loop()
 
 
 class _OwnedCall[T]:
@@ -89,12 +104,7 @@ class _OwnedCall[T]:
                 logger.debug("closing an abandoned thread call result")
                 self._close_result(outcome[0])
             return
-        handoff = _Handoff(self)
-        try:
-            self._loop.call_soon_threadsafe(handoff)
-        except RuntimeError:  # the loop is closed; nobody can take it
-            handoff.cancel()
-            self._release_untaken()
+        _Handoff.schedule(self._loop, self._deliver, self._handoff_dropped)
 
     def _deliver(self) -> None:
         with self._lock:
@@ -157,14 +167,20 @@ class _OwnedCall[T]:
             self._close_now(result)
             return
         # A declared thread-safe close returned a loop-affine object: close it on
-        # its loop, never on this thread.
-        try:
-            self._loop.call_soon_threadsafe(self._close_now, result)
-        except RuntimeError:
-            logger.error(
-                "leaked loop-affine %s from a thread call: its loop is closed",
-                type(result).__name__,
-            )
+        # its loop, never on this thread. If the loop never runs the close, only
+        # log the leak.
+        _Handoff.schedule(
+            self._loop,
+            functools.partial(self._close_now, result),
+            functools.partial(self._loop_affine_leaked, type(result).__name__),
+        )
+
+    def _loop_affine_leaked(self, kind: str) -> None:
+        logger.error(
+            "leaked loop-affine %s from thread call %s: its loop closed first",
+            kind,
+            getattr(self._function, "__qualname__", repr(self._function)),
+        )
 
     def _close_now(self, result: T) -> None:
         assert self._close is not None

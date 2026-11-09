@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import errno
 import gc
@@ -376,6 +377,21 @@ def _loop_affine_loop_closed(row: _Row) -> None:
     assert "leaked loop-affine" in row.caplog.text, "the leak was dropped silently"
 
 
+def _loop_affine_close_dropped(row: _Row) -> None:
+    row.use_transport()
+    row.cancel(row.start())
+    row.release.set()
+    row.executor.shutdown(wait=True)  # the worker queued the close on the loop
+    row.loop.close()  # discards the queued close without running it
+    gc.collect()
+    drain_releases()
+    assert row.closes == [], "a loop-affine result was closed on the worker"
+    leaks = [r for r in row.caplog.records if "leaked loop-affine" in r.message]
+    assert len(leaks) == 1, "the dropped loop-affine close was not logged once"
+    assert "Transport" in leaks[0].message
+    assert "_Row.acquire" in leaks[0].message
+
+
 ROWS = {
     "success": _success,
     "failure": _failure,
@@ -392,6 +408,7 @@ ROWS = {
     "loop_affine_taken": _loop_affine_taken,
     "loop_affine_cancel_running": _loop_affine_cancel_running,
     "loop_affine_loop_closed": _loop_affine_loop_closed,
+    "loop_affine_close_dropped": _loop_affine_close_dropped,
 }
 
 
@@ -405,3 +422,31 @@ def test_owned_thread_call_closes_untaken_result_once(
         ROWS[name](row)
     finally:
         row.cleanup()
+
+
+def test_every_loop_callback_goes_through_the_owned_handoff() -> None:
+    """A plain loop callback is dropped silently when the loop closes first."""
+    import zeta.core.thread_call as module
+
+    tree = ast.parse(Path(module.__file__).read_text())
+    schedule = next(
+        (
+            fn for cls in ast.walk(tree)
+            if isinstance(cls, ast.ClassDef) and cls.name == "_Handoff"
+            for fn in cls.body
+            if isinstance(fn, ast.FunctionDef) and fn.name == "schedule"
+        ),
+        None,
+    )
+    owned = {id(node) for node in ast.walk(schedule)} if schedule else set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "call_soon_threadsafe"
+        ):
+            assert id(node) in owned, (
+                f"line {node.lineno} calls call_soon_threadsafe directly; use "
+                "_Handoff.schedule(loop, on_loop, dropped) so a dropped "
+                "callback runs its dropped action"
+            )
