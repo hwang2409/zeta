@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +135,38 @@ async def test_real_socket_backward_continuation_survives_append(tmp_path: Path,
             {"before": first["next_before"], "history_validator": first["history_validator"]},
         )
         assert "new" not in {row["content"][0]["text"] for row in page["messages"] if row["role"] == "user"}
+
+
+@pytest.mark.asyncio
+async def test_real_socket_branch_during_read_is_stale_and_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-owner branch between g0 and g1 rejects the in-flight page."""
+    async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
+        old_first = await _history_request(reader, writer, 3, session_id, {"offset": 0})
+        original_projection = history.history_projection
+        branch_ready = threading.Event()
+        release_projection = threading.Event()
+
+        def branch_during_projection(store: object, **kwargs: object) -> object:
+            branch_ready.set()
+            assert release_projection.wait(timeout=10)
+            return original_projection(store, **kwargs)
+
+        monkeypatch.setattr(history, "history_projection", branch_during_projection)
+        pending = asyncio.create_task(
+            request(reader, writer, 4, "session_history", {"session_id": session_id, "offset": 0})
+        )
+        await asyncio.to_thread(branch_ready.wait)
+        server.runtime.opened.store.append_message_fork(
+            server.runtime.opened.store.active_branch_snapshot()[0].id
+        )
+        release_projection.set()
+        response = (await pending)[-1]
+        assert response["error"]["code"] == -32009
+        assert response["error"]["data"] == {"code": "stale_history_snapshot"}
+        fresh = await _history_request(reader, writer, 5, session_id, {"offset": 0})
+        assert fresh["messages"] != old_first["messages"]
 
 
 @pytest.mark.asyncio

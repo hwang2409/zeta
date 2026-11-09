@@ -80,6 +80,56 @@ def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
         reopened.close()
 
 
+def test_history_index_close_waits_for_an_inflight_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index-close")
+    try:
+        index = store._history_index
+        assert index is not None
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        facts = store._history_index_facts()
+
+        class Result:
+            def __init__(self, rows: list[object]) -> None:
+                self.rows = rows
+
+            def fetchone(self) -> object:
+                return self.rows[0] if self.rows else None
+
+            def fetchall(self) -> list[object]:
+                return self.rows
+
+        class BlockedConnection:
+            def execute(self, sql: str, *args: object) -> Result:
+                if "FROM entries" in sql:
+                    return Result([])
+                entered.set()
+                assert release.wait(timeout=10)
+                return Result([(json.dumps(facts),)])
+
+            def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(index, "_connection", lambda write: BlockedConnection())
+        page = threading.Thread(
+            target=lambda: index.page({"after": 0}, facts), daemon=True
+        )
+        page.start()
+        assert entered.wait(timeout=10)
+        closer = threading.Thread(target=lambda: (index.close(), closed.set()), daemon=True)
+        closer.start()
+        assert not closed.is_set()
+        release.set()
+        page.join(timeout=10)
+        closer.join(timeout=10)
+        assert closed.is_set()
+    finally:
+        store.close()
+
+
 def test_persistent_detached_writer_retains_home_lease(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store._prepare_durable_writer_snapshot()
