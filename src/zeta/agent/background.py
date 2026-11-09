@@ -1188,3 +1188,5 @@ async def finish_background_child(
             cleanup_result = cleanup()
             if inspect.isawaitable(cleanup_result):
                 await cleanup_result
+            # Do not let the watcher finish before its child store lease closes.
+            await background_owner.wait_for_store_closes()
