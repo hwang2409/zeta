@@ -4067,6 +4067,9 @@ async def test_causal_budget_stop_shows_held_input_as_not_delivered(
         owner.cancel_all()
         await await_or_fail(owner.wait(), what="background owner completion")
         await await_or_fail(loop.close(), what="agent loop close")
+        for owned_store in owner.conversation_stores():
+            owned_store.close()
+        store.close()
 
 
 class CancelledBeforeAnswerBackend(CompletionBackend):
@@ -4138,6 +4141,7 @@ async def test_top_level_loop_stops_repeated_no_progress_notification_turns(
         ) == 1
     finally:
         await await_or_fail(loop.close(), what="agent loop close")
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -4190,6 +4194,7 @@ async def test_no_progress_dispatches_between_committed_items_never_stop(
         assert store.messages()[-1].content == [TextContent("answered")]
     finally:
         await await_or_fail(loop.close(), what="agent loop close")
+        store.close()
 
 
 class _RetryableStall(Exception):
@@ -4241,6 +4246,7 @@ async def test_completion_retries_do_not_count_as_no_progress_calls(
         assert store.messages()[-1].content == [TextContent("answered")]
     finally:
         await await_or_fail(loop.close(), what="agent loop close")
+        store.close()
 
 
 class RepeatedTimeoutBackend(PostCapBudgetBackend):
@@ -4409,6 +4415,9 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
         owner.cancel_all()
         await await_or_fail(owner.wait(), what="background owner completion")
         await await_or_fail(loop.close(), what="agent loop close")
+        for owned_store in owner.conversation_stores():
+            owned_store.close()
+        store.close()
 
 
 @pytest.mark.asyncio
