@@ -5379,7 +5379,7 @@ async def test_held_input_notice_renders_on_root_transcript(tmp_path: Path) -> N
     finally:
         await await_or_fail(child_loop.close(), what="child loop close")
         child_store.close()
-        await await_or_fail(app.loop.close(), what="root loop close")
+        await await_or_fail(app.close(), what="tui app close")
 
 
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:
