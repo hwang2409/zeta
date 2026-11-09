@@ -775,6 +775,11 @@ def _dispatch_mapping_bypasses(sources: dict[Path, str]) -> list[str]:
 
     for path, source in sources.items():
         tree = ast.parse(source)
+        function_names = {
+            item.name
+            for item in tree.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
         allowed_table = next(
             (
                 item.value
@@ -820,10 +825,19 @@ def _dispatch_mapping_bypasses(sources: dict[Path, str]) -> list[str]:
                     for key in node.keys
                     if key is not None
                 )
+                method_string_keys = any(
+                    isinstance(key, ast.Constant) and key.value in wires
+                    for key in node.keys
+                    if key is not None
+                )
                 callable_values = any(
-                    isinstance(value, (ast.Name, ast.Attribute, ast.Lambda))
+                    isinstance(value, ast.Lambda)
+                    or isinstance(value, ast.Name)
+                    and value.id in function_names
                     for value in node.values
                 )
+                if method_string_keys and callable_values:
+                    report(path, node, "method strings may not map to callables")
                 if descriptor_keys and callable_values and node is not allowed_table:
                     report(path, node, "HANDLERS is the only descriptor-to-callable map")
             if isinstance(node, ast.DictComp) and any(
@@ -879,6 +893,7 @@ def test_one_table_is_the_only_serve_method_dispatch_authority() -> None:
     ("relative_path", "mutation"),
     (
         ("accounts.py", 'if method == "account_list": pass'),
+        ("accounts.py", 'SECOND = {"ping": refresh}'),
         (
             "handlers/registry.py",
             "SECOND = {MethodDescriptor.PING: ping}",
