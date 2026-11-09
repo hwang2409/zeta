@@ -18,34 +18,18 @@ from ..core.store._child_runs import (
 )
 from ..core.thread_call import ThreadCallWorkers
 from . import content
-from .handlers import history, lifecycle, session, settings, validation
+from .handlers import history, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
     FrameCodec,
     FrameWriteCancelled,
-    MethodDescriptor,
     ProtocolError,
     _Frame,
 )
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
-OBSERVER_REQUESTS = frozenset(
-    {
-        "list_sessions",
-        "status",
-        "session_tree",
-        "session_history",
-        "content_read",
-        "model_catalog",
-        "session_settings",
-        "ping",
-        "delivery_status",
-        "session_grants",
-        "child_run_history",
-    }
-)
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
@@ -759,29 +743,63 @@ class ConnectionRegistry:
             )
         return result
 
-    async def read_session(
-        self, connection: Any, method: str, params: dict[str, Any]
-    ) -> object:
-        target = capture_read(connection, method, params)
-        features = self._connections[connection].features
-        include_delivery_id = {
-            "delivery_id",
-            "user_message_event",
-            "user_message_delivery_id",
-        } <= features
+    async def read_tree(self, connection: Any, params: dict[str, Any]) -> object:
+        runtime = connection.server.runtime
+        store = validation.active(runtime, params)
         return await self.run_read(
             connection,
-            lambda: perform_read(
-                method,
-                target,
+            lambda: session.tree(_observer_runtime(store)),
+            session_id=runtime.session_id,
+        )
+
+    async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
+        runtime = connection.server.runtime
+        store = validation.active(runtime, params)
+        features = self._connections[connection].features
+        return await self.run_read(
+            connection,
+            lambda: history.history(
+                _observer_runtime(store),
                 params,
-                include_delivery_id=include_delivery_id,
+                include_delivery_id={
+                    "delivery_id", "user_message_event", "user_message_delivery_id"
+                } <= features,
                 backward_enabled="session_history_backward" in features,
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
             ),
-            session_id=target[0],
+            session_id=runtime.session_id,
+        )
+
+    async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
+        if set(params) - {"handle", "offset", "limit"}:
+            raise ProtocolError(ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read")
+        runtime = connection.server.runtime
+        if runtime.opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        store = runtime.opened.store
+        return await self.run_read(
+            connection,
+            lambda: content.read(
+                store,
+                params.get("handle"),
+                offset=params.get("offset", 0),
+                limit=params.get("limit", content.MAX_CONTENT_READ),
+            ),
+            session_id=runtime.session_id,
+        )
+
+    async def read_catalog(self, connection: Any) -> object:
+        runtime = connection.server.runtime
+        return await self.run_read(connection, lambda: settings.catalog(runtime))
+
+    async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
+        runtime = connection.server.runtime
+        return await self.run_read(
+            connection,
+            lambda: settings.settings(runtime),
+            session_id=runtime.session_id,
         )
 
     async def read_child_run_history(
@@ -879,85 +897,6 @@ class ConnectionRegistry:
             session_id=session_id,
         )
 
-    async def route_request(
-        self,
-        connection: Any,
-        request_id: str | int,
-        method: str,
-        params: dict[str, Any],
-    ) -> tuple[bool, object]:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            return False, None
-        descriptor = MethodDescriptor.for_wire(method)
-        if descriptor is None or descriptor.access.value != "read":
-            return False, None
-        if method == "list_sessions" and "project_id" in params:
-            raise ProtocolError(
-                ErrorDescriptor.OBSERVER_READ_ONLY,
-                "method is unavailable to read-only observers",
-                {"method": method},
-            )
-        if method not in {
-            "list_sessions",
-            "status",
-            "session_tree",
-            "session_history",
-            "model_catalog",
-            "session_settings",
-            "content_read",
-            "child_run_history",
-        }:
-            return False, None
-        if method in {"session_tree", "session_history"}:
-            return True, await self.read_session(connection, method, params)
-        if method == "child_run_history":
-            if "child_run_history" not in state.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "child_run_history requires the negotiated child_run_history feature",
-                )
-            return True, await self.read_child_run_history(connection, params)
-        if method == "content_read":
-            if "content_read" not in state.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "content_read requires the negotiated content_read feature",
-                )
-            target = capture_read(connection, method, params)
-            return True, await self.run_read(
-                connection,
-                lambda: perform_read(method, target, params),
-                session_id=target[0],
-            )
-        if method == "list_sessions":
-            result, _ = await self.run_read(
-                connection, lambda: lifecycle.list_sessions(connection, request_id, params)
-            )
-            return True, result
-        fallback_config = None
-        if method == "status" and connection.server.runtime.loop is None:
-            fallback_config = await self.run_blocking(
-                lambda: connection.server.runtime._config(None, None)
-            )
-        target = capture_read(
-            connection, method, params, fallback_config=fallback_config
-        )
-        result = await self.run_read(
-            connection,
-            lambda: perform_read(
-                method,
-                target,
-                params,
-                backward_enabled="session_history_backward" in state.features,
-                fidelity="session_history_fidelity" in state.features,
-                content_read="content_read" in state.features,
-                served_turn_end="served_turn_end" in state.features,
-            ),
-            session_id=target[0],
-        )
-        return True, result
-
     async def aclose(self) -> None:
         self._closed = True
         states = tuple(self._connections.values())
@@ -1015,115 +954,6 @@ def perform_child_history_read(
     )
 
 
-def _active_status_parts(
-    client: Any, loop: Any, fallback_config: Any
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    runtime = client.server.runtime
-    transcript_index_failure = (
-        loop.transcript_index_failure(runtime.session_id)
-        if client.protocol_version != "1.0" and loop is not None
-        else None
-    )
-    project_context_health = (
-        (
-            loop.project_context_health.summary
-            if loop is not None and loop.project_context_health is not None
-            else "healthy"
-        )
-        if client.protocol_version != "1.0"
-        else None
-    )
-    status = {
-        "session": lifecycle.session_snapshot(client),
-        "state": (
-            "idle"
-            if client.server.control.unhealthy() or runtime.state is None
-            else runtime.state.status
-        ),
-        "explicit_finish": (
-            loop.explicit_finish
-            if loop is not None
-            else fallback_config.agents_explicit_finish
-        ),
-    }
-    suffix = {
-        "pending_approvals": [],
-        "usage": dict(runtime.usage),
-        **(
-            {"transcript_index_failure": transcript_index_failure}
-            if transcript_index_failure is not None
-            else {}
-        ),
-        **(
-            {"project_context_health": project_context_health}
-            if project_context_health is not None
-            else {}
-        ),
-        "store": runtime.opened.store,
-    }
-    slash_command = client.server.control.slash_lock.status()
-    if slash_command is not None:
-        suffix["slash_command"] = slash_command
-    return status, suffix
-
-
-def _capture_status(client: Any, fallback_config: Any) -> tuple[str | None, object]:
-    runtime = client.server.runtime
-    loop = runtime.loop
-    if loop is None and fallback_config is None:
-        raise RuntimeError("status fallback config was not resolved")
-    if runtime.opened is None:
-        status = {"session": None, "state": "idle", "explicit_finish": False}
-        suffix = {
-            "pending_approvals": [],
-            "usage": {},
-            "compaction_markers": 0,
-        }
-        session_id = None
-    else:
-        status, suffix = _active_status_parts(client, loop, fallback_config)
-        session_id = runtime.session_id
-    if client.protocol_version != "1.0":
-        status["max_agent_depth"] = (
-            loop.max_agent_depth
-            if loop is not None
-            else fallback_config.agents_max_depth
-        )
-    status.update(suffix)
-    return session_id, status
-
-
-def capture_read(
-    client: Any,
-    method: str,
-    params: dict[str, Any],
-    *,
-    fallback_config: Any = None,
-) -> tuple[str | None, object]:
-    runtime = client.server.runtime
-    if method == "content_read":
-        if set(params) - {"handle", "offset", "limit"}:
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_CONTENT_READ,
-                "invalid content read",
-            )
-        if runtime.opened is None:
-            raise ProtocolError(
-                ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
-            )
-        return runtime.session_id, runtime.opened.store
-    if method in {"session_tree", "session_history"}:
-        store = validation.active(runtime, params)
-        return runtime.session_id, store
-    if method == "status":
-        return _capture_status(client, fallback_config)
-    if method == "model_catalog":
-        return None, settings.catalog(runtime)
-    if method == "session_settings":
-        return runtime.session_id, settings.settings(runtime)
-    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
-
-
 def project_status(target: object, *, served_turn_end: bool = False) -> dict[str, Any]:
     status = dict(target)
     store = status.pop("store", None)
@@ -1134,51 +964,14 @@ def project_status(target: object, *, served_turn_end: bool = False) -> dict[str
         outcome = None
         entry = store.last_turn_end() if store is not None else None
         if entry is not None:
-            outcome = {
-                "turn_id": entry.data["turn_id"],
-                "reason": entry.data["reason"],
-            }
+            outcome = {"turn_id": entry.data["turn_id"], "reason": entry.data["reason"]}
         status["last_turn_outcome"] = outcome
     return status
 
 
-def perform_read(
-    method: str,
-    target: tuple[str | None, object],
-    params: dict[str, Any],
-    *,
-    include_delivery_id: bool = False,
-    backward_enabled: bool = False,
-    fidelity: bool = False,
-    content_read: bool = False,
-    served_turn_end: bool = False,
-) -> object:
-    if method == "status":
-        return project_status(target[1], served_turn_end=served_turn_end)
-
-    if method in {"model_catalog", "session_settings"}:
-        return target[1]
-    store = target[1]
-    runtime = type(
-        "ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()}
+def _observer_runtime(store: object) -> object:
+    return type(
+        "ObserverRuntime",
+        (),
+        {"opened": type("Opened", (), {"store": store})()},
     )()
-    if method == "session_tree":
-        return session.tree(runtime)
-    if method == "session_history":
-        return history.history(
-            runtime,
-            params,
-            include_delivery_id=include_delivery_id,
-            backward_enabled=backward_enabled,
-            fidelity=fidelity,
-            content_read=content_read,
-            served_turn_end=served_turn_end,
-        )
-    if method == "content_read":
-        return content.read(
-            store,
-            params.get("handle"),
-            offset=params.get("offset", 0),
-            limit=params.get("limit", content.MAX_CONTENT_READ),
-        )
-    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")

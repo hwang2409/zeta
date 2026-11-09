@@ -578,7 +578,10 @@ def render_agent_notification(
             or isinstance(event.data.get("verdict"), str)
         )
     )
-    if kind in {"child_question", "child_idle", "child_question_withdrawn"} or readable_completion:
+    if (
+        kind in {"child_question", "child_idle", "child_hold", "child_question_withdrawn"}
+        or readable_completion
+    ):
         rendered = render_agent_notification_message(event, identity_index)
         if rendered is not None:
             return rendered
