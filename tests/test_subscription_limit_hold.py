@@ -215,7 +215,8 @@ async def test_cancel_during_subscription_hold_ends_turn_at_once(tmp_path: Path)
     async def wait_forever(delay: float) -> None:
         held.waits.append(delay)
         holding.set()
-        await asyncio.Event().wait()
+        # only the test's cancel ends this wait
+        await asyncio.wait_for(asyncio.Event().wait(), 3600)
 
     held.on_wait(wait_forever)
     turn = asyncio.ensure_future(

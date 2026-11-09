@@ -1054,7 +1054,8 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_and_holds(
 
     async def hold_forever(_delay: float) -> None:
         holding.set()
-        await asyncio.Event().wait()
+        # only the test's cancel ends this wait
+        await asyncio.wait_for(asyncio.Event().wait(), 3600)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     backend = CodexBackend(
