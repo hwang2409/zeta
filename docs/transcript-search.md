@@ -27,10 +27,12 @@ Index failures are logged and do not fail an agent turn.
 When a new schema version first opens on a home that only has an older index,
 or finds its version file empty while the project has linked sessions, it builds
 that project's index once from the linked sessions. This one-time backfill runs
-off the event loop under the version lock; concurrent callers see an "index
-building" state rather than blocking or an empty result. It happens exactly once
-per version: a completed build bumps the index generation, so a project whose
-linked sessions are all unbound does not rebuild on every open.
+off the event loop under the version lock; concurrent callers either see an
+"index building" state or block on the version lock until the build ends. It
+happens once per home for processes on this revision: a completed build bumps
+the index generation, so a project whose linked sessions are all unbound does
+not rebuild on every open. Processes still on the older revision can rebuild a
+ready-but-empty index on open until they restart.
 
 Operator diagnostics are available from the CLI:
 
