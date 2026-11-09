@@ -13,8 +13,7 @@ from uuid import uuid4
 from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
-from . import event_contract
-from .approval_settlement import persist_durably
+from . import approval_settlement, event_contract
 from .approval_settlement.approval_grants import (
     ApprovalRecord,
     GrantPublication,
@@ -219,28 +218,6 @@ class ApprovalLifecycle:
 
     def _next_token(self) -> int:
         return max((item.token for item in self._state.records.values()), default=0) + 1
-
-    def _reset_for_retry(self, key: ApprovalKey, token: int, generation: int) -> None:
-        """Return an owned record whose durable write never committed to pending."""
-        current = self._state.records.get(key)
-        if (
-            current is None
-            or current.token != token
-            or generation != self._state.generation
-        ):
-            return
-        self._release_gate(current, error=asyncio.CancelledError())
-        self._put(
-            replace(
-                current,
-                admitted=asyncio.get_running_loop().create_future(),
-                token=self._next_token(),
-                phase="pending",
-                disposition="active",
-                settlement=None,
-                publication_owner=None,
-            )
-        )
 
     def _remove(self, key: ApprovalKey) -> None:
         records = dict(self._state.records)
@@ -698,7 +675,7 @@ class ApprovalLifecycle:
         settlement = asyncio.create_task(self._settle_record(record, decision))
         self._change(record, settlement=settlement)
         try:
-            resolution = await settlement
+            resolution = await approval_settlement.settlement_outcome(record.admitted, settlement)
         except OSError as exc:
             raise ProtocolError(
                 ErrorDescriptor.INTERNAL_ERROR, f"approval persistence failed: {exc}"
@@ -764,13 +741,11 @@ class ApprovalLifecycle:
         token = record.token
         generation = record.generation
         target = record.target
-
-        result = await persist_durably(
-            target.store, target.store_request_id, decision, reason
+        result = await approval_settlement.finish_despite_cancellation(
+            lambda: approval_settlement.persist_durably(
+                target.store, target.store_request_id, decision, reason
+            )
         )
-        if result.should_retry:
-            self._reset_for_retry(target.key, token, generation)
-            raise asyncio.CancelledError
         resolution = result.resolution
         current = self._state.records.get(target.key)
         owns_record = (
@@ -785,8 +760,14 @@ class ApprovalLifecycle:
                     "decision": "abort",
                     "reason": reason or "turn_canceled",
                 }
-                try:  # no resolution row was written: the end is live-only
-                    await asyncio.shield(self._finish_record(record, synthetic, WRITE_FAILED))
+                # no resolution row was written: the end is live-only (WRITE_FAILED)
+                finish = asyncio.create_task(
+                    self._finish_record(record, synthetic, WRITE_FAILED)
+                )
+                try:
+                    await approval_settlement.finish_despite_cancellation(
+                        lambda: asyncio.shield(finish)
+                    )
                 except BaseException as exc:
                     self._release_gate(record, error=exc)
                     raise
@@ -805,12 +786,14 @@ class ApprovalLifecycle:
             self._release_gate(record, resolution=resolution)
             return resolution
         try:
-            await self._finish_record(record, resolution)
+            await approval_settlement.finish_despite_cancellation(
+                lambda: self._finish_record(record, resolution)
+            )
         except BaseException as exc:
             self._release_gate(record, error=exc)
+            if self._owns(record):
+                self._remove(target.key)
             raise
-        if result.cancelled:
-            raise asyncio.CancelledError
         return resolution
 
     def request_approval_abort(
