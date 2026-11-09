@@ -63,7 +63,7 @@ from ..session_files import (
     session_directory,
     session_root,
 )
-from ..store_history import ApprovalHistoryStoreMixin
+from ._approval_history import ApprovalHistoryStoreMixin
 from ..todo import TodoItem, parse_todo_items
 from ..transcript_recovery import (
     RepairResult,
