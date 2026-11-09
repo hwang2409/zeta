@@ -34,6 +34,7 @@ class StorageFeature(StrEnum):
     PROJECT_WRITES = "project_writes"
     ATTENTION_KINDS = "attention_kinds"
     INBOX_DELEGATION = "inbox_delegation"
+    PROJECT_LOCKS = "project_locks"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -41,6 +42,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.TRANSCRIPT_REPAIR: 4,
     StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
+    StorageFeature.PROJECT_LOCKS: WRITER_EPOCH,
     StorageFeature.INBOX_DELEGATION: 7,
 }
 

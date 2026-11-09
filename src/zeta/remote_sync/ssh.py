@@ -16,9 +16,10 @@ from urllib.parse import unquote, urlparse
 from .. import memory_migration_plan, project_schema
 from ..storage_format import (
     ACCEPTED_KEY_SETS,
+    FEATURE_EPOCHS,
     GATED_HOME_PATHS,
-    P06_FEATURE_EPOCH,
-    WRITER_EPOCH,
+    StorageFeature,
+    writer_epoch,
 )
 from . import (
     RemoteSyncError,
@@ -69,8 +70,8 @@ finally:
 
 _PROJECT_AUTHORITY = rf'''
 import contextlib, fcntl, json, os, pathlib, secrets, stat, sys
-_P06_FEATURE_EPOCH = {P06_FEATURE_EPOCH}
-_WRITER_EPOCH = {WRITER_EPOCH}
+_PROJECT_LOCKS_FEATURE_EPOCH = {FEATURE_EPOCHS[StorageFeature.PROJECT_LOCKS]}
+_WRITER_EPOCH = {writer_epoch()}
 _GATED_HOME_PATHS = {tuple(pattern for pattern, _owner in GATED_HOME_PATHS)!r}
 _LEASE = None
 
@@ -175,7 +176,8 @@ def _project_authority(home, ident, *, identity, exclusive, nonblocking=False):
     project_fd = None
     lock_fd = None
     try:
-        legacy = epoch < _P06_FEATURE_EPOCH
+        project_locks_enabled = epoch >= _PROJECT_LOCKS_FEATURE_EPOCH
+        legacy = not project_locks_enabled
         operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         if nonblocking:
             operation |= fcntl.LOCK_NB

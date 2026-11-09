@@ -38,8 +38,10 @@ def _rendered_text(data: dict[str, object]) -> str:
 async def test_inbox_notification_matches_real_tui_and_serve_surfaces(
     tmp_path: Path,
 ) -> None:
-    home, registry, sender, recipient = await asyncio.to_thread(_projects, tmp_path)
+    home = tmp_path / ".zeta"
+    home.mkdir()
     (home / "storage-format.json").write_text('{"writer_epoch":7}\n')
+    home, registry, sender, recipient = await asyncio.to_thread(_projects, tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     message_id = await asyncio.to_thread(
         inbox.send,

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from zeta.attention_records import AttentionStore
+from zeta.attention_records import AttentionStore, observed_epoch_for_session
 from zeta.core.session import SessionManager
 from zeta.core.session_links import (
     PENDING_CHILD_LINKS_DIRNAME,
@@ -430,7 +430,10 @@ async def test_p06_below_epoch_real_tui_serve_journey(
 
             record = await asyncio.to_thread(
                 AttentionStore(
-                    home / "sessions" / serve_session_id
+                    home / "sessions" / serve_session_id,
+                    writer_epoch=observed_epoch_for_session(
+                        home / "sessions" / serve_session_id
+                    ),
                 ).request,
                 session_id=serve_session_id,
                 project_id=project.project_id,
@@ -456,7 +459,10 @@ async def test_p06_below_epoch_real_tui_serve_journey(
             assert (
                 await asyncio.to_thread(
                     lambda: AttentionStore(
-                        home / "sessions" / serve_session_id
+                        home / "sessions" / serve_session_id,
+                        writer_epoch=observed_epoch_for_session(
+                            home / "sessions" / serve_session_id
+                        ),
                     ).get(record.id).status
                 )
                 == "resolved"
