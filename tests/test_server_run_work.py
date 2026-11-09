@@ -301,6 +301,14 @@ async def test_run_work_real_transports_and_all_task_statuses(
             frame.get("params", {}).get("event") == "background_task_updated"  # type: ignore[union-attr]
             for frame in repeated_frames
         )
+        sentinel, sentinel_frames = await _rpc_transport_with_frames(
+            reader, writer, transport, "terminal-sentinel", "status", {}
+        )
+        assert sentinel["id"] == "terminal-sentinel"
+        assert not any(
+            frame.get("params", {}).get("event") == "background_task_updated"  # type: ignore[union-attr]
+            for frame in sentinel_frames
+        )
         for exit_code, expected in ((0, "exited"), (3, "failed")):
             command = f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit({exit_code})'"
             await registry.start(command, tmp_path)

@@ -672,6 +672,7 @@ class ServerRuntime:
         registry = state.loop.tool_registry.background_tasks
         if run_work_sink is None:
             registry.set_notice_sink(None)
+            registry.set_committed_transition_sink(None)
             state.opened.store.set_todo_change_sink(None)
         else:
             session_id = state.session_id
@@ -686,6 +687,19 @@ class ServerRuntime:
                         {"task": background_task_row(task, phase=notice.phase)},
                     )
             registry.set_notice_sink(task_changed)
+
+            def committed_task_changed(notice: BackgroundTaskNotice) -> None:
+                if notice.phase != "stopping":
+                    return
+                task = next((item for item in registry.snapshot() if item.task_id == notice.task_id), None)
+                if task is not None:
+                    run_work_sink(
+                        session_id,
+                        EventDescriptor.BACKGROUND_TASK_UPDATED,
+                        {"task": background_task_row(task, phase=notice.phase)},
+                    )
+
+            registry.set_committed_transition_sink(committed_task_changed)
             state.opened.store.set_todo_change_sink(
                 lambda todo: run_work_sink(session_id, EventDescriptor.TODO_UPDATED, {"todo": [dict(item) for item in todo]})
             )

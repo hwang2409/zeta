@@ -93,6 +93,7 @@ class BackgroundTaskRegistry:
         self.stdin_drain_timeout = stdin_drain_timeout
         self.command_niceness = command_niceness
         self._notice_sink = notice_sink
+        self._committed_transition_sink: Callable[[BackgroundTaskNotice], None] | None = None
         self._notification_sink = notification_sink
         self._pending_recovery: dict[str, TaskExitInput] = {}
         self._records: dict[str, _BackgroundRecord] = {}
@@ -174,6 +175,12 @@ class BackgroundTaskRegistry:
         self, sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None
     ) -> None:
         self._notice_sink = sink
+
+    def set_committed_transition_sink(
+        self, sink: Callable[[BackgroundTaskNotice], None] | None
+    ) -> None:
+        """Attach an observer for transitions after their durable commit."""
+        self._committed_transition_sink = sink
 
     def set_notification_sink(
         self,
@@ -988,14 +995,17 @@ class BackgroundTaskRegistry:
             record.terminal_phase, record.note, record.tui_presented = (
                 phase, reason, tui_presented
             )
-            notice = BackgroundTaskNotice(
-                "background task stopping: " + record.command,
-                record.task_id,
-                "stopping",
-                record.owner,
-            )
             try:
-                await self._commit_notice(notice)
+                await self._commit_notice(None)
+                if self._committed_transition_sink is not None:
+                    self._committed_transition_sink(
+                        BackgroundTaskNotice(
+                            "background task stopping: " + record.command,
+                            record.task_id,
+                            "stopping",
+                            record.owner,
+                        )
+                    )
             except Exception:
                 record.terminal_phase, record.note, record.tui_presented = previous
                 raise
