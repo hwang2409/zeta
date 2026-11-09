@@ -6,8 +6,10 @@ import asyncio
 import json
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import BinaryIO
 
+from ..core.thread_call import run_owned_thread_call
 from ..tools._spill import SpillStore
 
 _SPILL_WRITE_SIZE = 64 * 1024
@@ -68,25 +70,35 @@ class MCPCallEnvelope:
             self._parts.append(chunk)
             return
         if self._handle is None:
-            try:
-                self.spill_store.reserve_transient(self.total)
-            except RuntimeError as exc:
-                raise MCPTransientQuotaError from exc
-            self._reserved = self.total
-            self._temporary = self.spill_store.temporary_file()
-            self._handle = await asyncio.to_thread(self._temporary.__enter__)
+            await self._reserve(self.total)
+            temporary = self.spill_store.temporary_file()
+            self._handle = await run_owned_thread_call(
+                temporary.__enter__,
+                lambda _handle: temporary.__exit__(None, None, None),
+                close_is_thread_safe=True,
+            )
+            self._temporary = temporary
             self._spill_buffer.extend(b"".join(self._parts))
             self._parts.clear()
         extra = self.total - self._reserved
         if extra:
-            try:
-                self.spill_store.reserve_transient(extra)
-            except RuntimeError as exc:
-                raise MCPTransientQuotaError from exc
-            self._reserved += extra
+            await self._reserve(extra)
         self._spill_buffer.extend(chunk)
         if len(self._spill_buffer) >= _SPILL_WRITE_SIZE:
             await self._flush_spill()
+
+    async def _reserve(self, byte_count: int) -> None:
+        """Reserve off-loop; a reservation that lands after cancellation is released."""
+
+        try:
+            await run_owned_thread_call(
+                partial(self.spill_store.reserve_transient, byte_count),
+                lambda _result: self.spill_store.release_transient(byte_count),
+                close_is_thread_safe=True,
+            )
+        except RuntimeError as exc:
+            raise MCPTransientQuotaError from exc
+        self._reserved += byte_count
 
     async def _flush_spill(self) -> None:
         if self._handle is None or not self._spill_buffer:
