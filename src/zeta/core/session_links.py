@@ -161,7 +161,8 @@ def persist_pending_root_link(
     }
     with (
         SessionReferenceGate(Path(sessions_dir).parent, lease).shared(
-            installed_ids=(session_id,), referenced_ids=(parent_session_id,)
+            installed_ids=(session_id,),
+            referenced_ids=(parent_session_id,) if parent_session_id is not None else (),
         ),
         session_directory(sessions_dir, session_id) as (_, directory_fd),
         project_links_lock(directory_fd),
@@ -193,7 +194,11 @@ def persist_pending_child_link(
     with (
         SessionReferenceGate(root.parent.parent, lease).shared(
             installed_ids=(str(link["session_id"]),),
-            referenced_ids=(str(link.get("parent_session_id")), root.name),
+            referenced_ids=tuple(
+                session_id
+                for session_id in (link.get("parent_session_id"), root.name)
+                if isinstance(session_id, str)
+            ),
         ),
         session_directory(root.parent, root.name) as (_, root_fd),
         project_links_lock(root_fd),

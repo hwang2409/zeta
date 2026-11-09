@@ -172,7 +172,6 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
         }
     ),
     "transcript_recovery.target": frozenset({"root_session_id", "child_run_id"}),
-    "session_reference_generation": frozenset({"generation"}),
     "retention_arm": frozenset({
         "schema_version", "gate_version", "armed_by_zeta_version", "armed_at", "preview_id"
     }),

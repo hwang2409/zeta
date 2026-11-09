@@ -47,6 +47,7 @@ _RAW_PUBLICATION = {
     ("core/session.py", "create", "os.replace"),
     ("core/session_links.py", "_quarantine_entry", "os.rename"),
     ("core/session_files.py", "write_session_file", "os.replace"),
+    ("core/session_files.py", "bump_generation", "os.replace"),
     ("core/transcript_recovery/__init__.py", "repair_transcript", "os.replace"),
     ("memory/reconciliation_state.py", "_write_receipt_archive", "os.replace"),
     ("memory/reconciliation_state.py", "_publish_bytes", "os.replace"),

@@ -72,6 +72,16 @@ from zeta.tools._shared.background_output_archive import _BackgroundOutputArchiv
 
 Validator = Callable[[dict[str, object]], object]
 
+# Registered before their writers exist so older releases can detect the future
+# authoritative shapes. Each named slice adds the production validator and case.
+_DORMANT_UNTIL_SLICE = {
+    "retention_state": 2,
+    "retention_preview": 2,
+    "retention_reservation": 3,
+    "retention_manifest": 3,
+    "retention_arm": 4,
+}
+
 
 @dataclass(frozen=True)
 class ShapeCase:
@@ -122,9 +132,12 @@ def test_every_registry_name_has_one_production_owner() -> None:
                 name_node.value, str
             ), f"{path}:{node.lineno} must use a literal stored-shape name"
             owners[name_node.value] = (str(path), node.lineno)
-    assert set(owners) == set(ACCEPTED_KEY_SETS), {
-        "missing_owners": sorted(set(ACCEPTED_KEY_SETS) - set(owners)),
-        "unregistered_owners": sorted(set(owners) - set(ACCEPTED_KEY_SETS)),
+    assert set(_DORMANT_UNTIL_SLICE) <= set(ACCEPTED_KEY_SETS)
+    assert all(slice_number in {2, 3, 4} for slice_number in _DORMANT_UNTIL_SLICE.values())
+    expected_owners = set(ACCEPTED_KEY_SETS) - set(_DORMANT_UNTIL_SLICE)
+    assert set(owners) == expected_owners, {
+        "missing_owners": sorted(expected_owners - set(owners)),
+        "unregistered_owners": sorted(set(owners) - expected_owners),
     }
 
 
@@ -1193,7 +1206,9 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
     ]
 
     try:
-        assert {case.name for case in cases} == set(ACCEPTED_KEY_SETS)
+        assert {case.name for case in cases} == (
+            set(ACCEPTED_KEY_SETS) - set(_DORMANT_UNTIL_SLICE)
+        )
         for case in cases:
             result = case.validator(dict(case.valid))
             assert result is not False, case.name

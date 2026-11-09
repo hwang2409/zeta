@@ -29,7 +29,7 @@ from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.skills import SkillCatalog
-from zeta.storage_format import WRITER_EPOCH, advance
+from zeta.storage_format import FEATURE_EPOCHS, StorageFeature, advance
 from zeta.tui.app import TUIApp
 
 
@@ -304,7 +304,8 @@ def test_p06_3_identity_and_domain_publications_do_not_serialize(
 
 def test_p06_4_epoch_selects_legacy_then_named_authority(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
-    for epoch in range(WRITER_EPOCH - 1):
+    project_locks_epoch = FEATURE_EPOCHS[StorageFeature.PROJECT_LOCKS]
+    for epoch in range(project_locks_epoch - 1):
         advance(home, expected_epoch=epoch, target_epoch=epoch + 1)
     legacy = ProjectRegistry(home / "projects")
     old_project = legacy.create_project("old", "old")
@@ -313,7 +314,11 @@ def test_p06_4_epoch_selects_legacy_then_named_authority(tmp_path: Path) -> None
     assert not (home / "projects" / old_project.project_id / ".memory.lock").exists()
 
     del legacy
-    advance(home, expected_epoch=WRITER_EPOCH - 1, target_epoch=WRITER_EPOCH)
+    advance(
+        home,
+        expected_epoch=project_locks_epoch - 1,
+        target_epoch=project_locks_epoch,
+    )
     current = ProjectRegistry(home / "projects")
     current.load_memory(old_project.project_id)
     assert (home / "projects" / old_project.project_id / ".memory.lock").is_file()
@@ -479,6 +484,11 @@ async def test_p06_below_epoch_real_tui_serve_journey(
     assert json.loads((home / "storage-format.json").read_text())["writer_epoch"] == 5
 
 
+def _advance_to_project_locks(home: Path) -> None:
+    for epoch in range(FEATURE_EPOCHS[StorageFeature.PROJECT_LOCKS]):
+        advance(home, expected_epoch=epoch, target_epoch=epoch + 1)
+
+
 def _project_session_row(
     registry: ProjectRegistry, project_id: str, session_id: str
 ) -> dict[str, object] | None:
@@ -500,7 +510,7 @@ def test_p06_5_root_reconciliation_revalidates_replaced_intent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / ".zeta"
-    advance(home, expected_epoch=0)
+    _advance_to_project_locks(home)
     manager = SessionManager(home)
     registry = manager.project_registry
     old = registry.create_project("old", "old")
@@ -603,7 +613,7 @@ def test_p06_5_root_reconciliation_recovers_each_crash_boundary(
     boundary: str,
 ) -> None:
     home = tmp_path / boundary
-    advance(home, expected_epoch=0)
+    _advance_to_project_locks(home)
     manager = SessionManager(home)
     registry = manager.project_registry
     old = registry.create_project("old", "old")
