@@ -412,7 +412,7 @@ def test_inbox_claim_regression_guard_preserves_unknown_record_fields(
     inbox = ProjectInbox(registry, sessions_root=tmp_path / "sessions")
     message_id = "1" * 32
     session_id = "2" * 32
-    inbox.send(
+    inbox.send_user(
         from_project=sender.project_id,
         from_session=session_id,
         to_project=target.project_id,
@@ -763,7 +763,7 @@ def test_closed_variant_readers_reject_without_mutation(
 
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     message_id = "8" * 32
-    inbox.send(
+    inbox.send_user(
         from_project=project.project_id,
         from_session="9" * 32,
         to_project=project.project_id,

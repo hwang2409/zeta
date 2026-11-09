@@ -95,8 +95,7 @@ def test_resolve_attention_targets_only_original_and_resolves_record(
     )[0]
     assert inbox.claim(project.project_id, message_id, other.store.session_id) is None
     message = inbox.claim(project.project_id, message_id, original.store.session_id)
-    assert message is not None
-    assert "Decision: Use SQLite." in message["body"]
+    assert message is None
     resolved = AttentionStore(original.store.session_dir, writer_epoch=5).get(record.id)
     assert resolved.status == "resolved"
     assert resolved.fork_session_id == fork_id
