@@ -407,27 +407,23 @@ class ServeControl:
         Without a delivery id the row installs later in the turn, so ``origin``
         (what the caller passes to ``start_turn``) and the mark find it.
         """
-        if "user_message_event" in features:
-            fields: dict[str, object] = {
-                "text": bounded(text, USER_MESSAGE_MAX_BYTES),
-                "mode": mode,
-                "attachments": attachments or [],
-            }
-            if (
-                delivery_id is not None
-                and {"delivery_id", "user_message_delivery_id"} <= features
-            ):
-                fields["delivery_id"] = delivery_id
-            await self._notify(
-                event_contract.AUXILIARY_WIRE_EVENTS[
-                    event_contract.AuxiliaryEvent.USER_MESSAGE
-                ],
-                self.server.runtime.session_id,
-                replay_row=RowFacts(delivery_id=delivery_id)
-                if delivery_id is not None
-                else RowFacts(seq=self._row_mark(), origin=origin),
-                **fields,
-            )
+        fields: dict[str, object] = {
+            "text": bounded(text, USER_MESSAGE_MAX_BYTES),
+            "mode": mode,
+            "attachments": attachments or [],
+        }
+        if delivery_id is not None:
+            fields["delivery_id"] = delivery_id
+        await self._notify(
+            event_contract.AUXILIARY_WIRE_EVENTS[
+                event_contract.AuxiliaryEvent.USER_MESSAGE
+            ],
+            self.server.runtime.session_id,
+            replay_row=RowFacts(delivery_id=delivery_id)
+            if delivery_id is not None
+            else RowFacts(seq=self._row_mark(), origin=origin),
+            **fields,
+        )
 
     def _row_mark(self) -> int | None:
         """The newest resident row seq; a publish-first row installs after it."""
@@ -820,18 +816,12 @@ class ServeControl:
     async def _publish_config_changed(
         self, event: StreamEvent, session_id: str | None
     ) -> None:
-        controller = (
-            self.server.connections.controller_metadata()
-            if self.server.connections is not None
-            else None
-        )
-        if controller is None or "live_config_changed" not in controller.features:
+        if self.server.connections is None:
             return
         self._end_stale_approvals(session_id)
         await self._notify(
             event_contract.STREAM_EVENT_WIRE_EVENTS[event.type],
             session_id,
-            required_feature="live_config_changed",
             **event_contract.config_changed_wire_fields(event),
         )
 
@@ -1026,16 +1016,7 @@ class ServeControl:
 
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""
-        controller = (
-            self.server.connections.controller_metadata()
-            if self.server.connections
-            else None
-        )
-        if (
-            not self.closing
-            and controller is not None
-            and "memory_updated" in controller.features
-        ):
+        if not self.closing and self.server.connections is not None:
             asyncio.create_task(
                 self._notify(
                     event_contract.AUXILIARY_WIRE_EVENTS[

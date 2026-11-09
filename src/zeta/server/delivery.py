@@ -322,7 +322,6 @@ class DeliveryRequests:
                             event_contract.AuxiliaryEvent.DELIVERY_STATUS
                         ],
                         session_id,
-                        required_feature="session_history_fidelity",
                         replay_row=RowFacts(seq=entry.seq),
                         **{key: value for key, value in row.items() if key != "event"},
                     )

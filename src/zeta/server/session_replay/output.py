@@ -46,7 +46,13 @@ class ReplayOutput:
         """Send a controller event to observers that joined its replay scope."""
         for observer in tuple(self._observers):
             if not self._feature_rejected(observer, event, required_feature, fields):
-                self._publish_replay(observer, event, session_id, fields, covers)
+                self._publish_replay(
+                    observer,
+                    event,
+                    session_id,
+                    self._fields_for_connection(observer, event, fields),
+                    covers,
+                )
 
     def _replay_covers(
         self,
@@ -166,7 +172,11 @@ class ReplayOutput:
                 state, record.event, record.required_feature, record.fields
             ):
                 self._publish_replay(
-                    state, record.event, record.session_id, record.fields, covers
+                    state,
+                    record.event,
+                    record.session_id,
+                    self._fields_for_connection(state, record.event, record.fields),
+                    covers,
                 )
 
     def _replay_store(self, scope: ReplayScopeId) -> Any:

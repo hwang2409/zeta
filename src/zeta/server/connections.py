@@ -49,6 +49,20 @@ OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
 OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
 
+# one owner for feature gates and optional wire fields on every output path
+EVENT_FEATURES = {
+    EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
+    EventDescriptor.MEMORY_UPDATED: frozenset({"memory_updated"}),
+    EventDescriptor.USER_MESSAGE: frozenset({"user_message_event"}),
+    EventDescriptor.DELIVERY_STATUS: frozenset({"session_history_fidelity"}),
+    EventDescriptor.SESSION_GRANTS_CHANGED: frozenset({"session_grants"}),
+}
+OPTIONAL_FIELD_FEATURES = {
+    (EventDescriptor.USER_MESSAGE, "delivery_id"): frozenset(
+        {"delivery_id", "user_message_delivery_id"}
+    ),
+}
+
 
 async def _overflow_deadline_wait() -> None:
     await asyncio.sleep(OUTPUT_OVERFLOW_CLOSE_DEADLINE)
@@ -237,6 +251,7 @@ class ConnectionRegistry(ReplayOutput):
             return Admission("not_writable"), None, None
         if self._feature_rejected(state, event, required_feature, fields):
             return Admission("feature_rejected"), None, None
+        fields = self._fields_for_connection(state, event, fields)
         frame = state.connection.codec.notification(event, session_id, **fields)
         if frame is None:
             return Admission("codec_rejected"), None, None
@@ -256,9 +271,10 @@ class ConnectionRegistry(ReplayOutput):
         required_feature: str | None,
         fields: dict[str, object],
     ) -> bool:
-        if required_feature is not None and required_feature not in history_features(
-            state.features
-        ):
+        required = EVENT_FEATURES.get(event, frozenset())
+        if required_feature is not None:
+            required |= frozenset({required_feature})
+        if not required <= history_features(state.features):
             return True
         return (
             event is EventDescriptor.APPROVAL_END
@@ -266,6 +282,18 @@ class ConnectionRegistry(ReplayOutput):
             and isinstance(fields.get("data"), dict)
             and fields["data"].get("reason") == "grace_expired"
         )
+
+    @staticmethod
+    def _fields_for_connection(
+        state: _Connection, event: EventDescriptor, fields: dict[str, object]
+    ) -> dict[str, object]:
+        shaped = dict(fields)
+        for (field_event, name), required in OPTIONAL_FIELD_FEATURES.items():
+            if field_event is event and name in shaped and not required <= history_features(
+                state.features
+            ):
+                shaped.pop(name)
+        return shaped
 
     def try_admit_controller(
         self,
@@ -297,7 +325,11 @@ class ConnectionRegistry(ReplayOutput):
         if self._replay_holds_copy(self._controller, covers):
             return outcome
         if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            self._controller, event, session_id, dict(fields), covers
+            self._controller,
+            event,
+            session_id,
+            self._fields_for_connection(self._controller, event, fields),
+            covers,
         ):
             return outcome
         if not self._admit(self._controller, frame):
@@ -348,7 +380,11 @@ class ConnectionRegistry(ReplayOutput):
         if self._replay_holds_copy(state, covers):
             return True
         if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            state, event, session_id, fields, covers
+            state,
+            event,
+            session_id,
+            self._fields_for_connection(state, event, fields),
+            covers,
         ):
             return True
         if not self._admit(state, frame):

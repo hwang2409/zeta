@@ -42,6 +42,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
+from zeta.server.protocol import EventDescriptor
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -212,13 +213,25 @@ async def test_config_changed_replay_observers_are_feature_filtered(
     controller = await connect_replay(server, transport)
     without_feature = await connect_replay(server, transport)
     with_feature = await connect_replay(server, transport)
+    without_delivery = await connect_replay(server, transport)
     try:
-        await negotiate(controller, extra=("live_config_changed",))
+        await negotiate(
+            controller,
+            extra=("live_config_changed", "memory_updated", "user_message_event", "delivery_id", "user_message_delivery_id"),
+        )
         session_id = (await controller.request(2, "new_session", {"provider": "codex"}))["result"]["session"]["session_id"]
         await negotiate(without_feature, observer=True)
-        await negotiate(with_feature, observer=True, extra=("live_config_changed",))
-        for client in (without_feature, with_feature):
+        await negotiate(
+            with_feature,
+            observer=True,
+            extra=("live_config_changed", "memory_updated", "user_message_event", "delivery_id", "user_message_delivery_id"),
+        )
+        await negotiate(without_delivery, observer=True, extra=("user_message_event",))
+        with_joined = None
+        for client in (without_feature, with_feature, without_delivery):
             joined = await client.request(2, "session_history_and_subscribe", {"session_id": session_id})
+            if client is with_feature:
+                with_joined = joined
             assert joined["result"]["replay"]["history_seq"] == 0
 
         profile = tmp_path / "agents" / "specialist.md"
@@ -235,14 +248,52 @@ async def test_config_changed_replay_observers_are_feature_filtered(
         await server.control._event(prepared[0], background=True)
 
         config = await with_feature.event("config_changed")
-        assert config["stream_id"] == joined["result"]["replay"]["stream_id"]
+        assert with_joined is not None
+        assert config["stream_id"] == with_joined["result"]["replay"]["stream_id"]
         assert config["seq"] == 1
         frames = await _frames_before_status(without_feature, 3)
         assert not [
             frame for frame in frames
             if frame.get("params", {}).get("event") == "config_changed"
         ]
+
+        await server.control._notify(
+            EventDescriptor.TURN_ABORTED, session_id, data={"reason": "test"}
+        )
+        common_with = await with_feature.event("turn_aborted")
+        common_without = await without_feature.event("turn_aborted")
+        assert common_with["seq"] == 2
+        assert common_without["seq"] == 1
+
+        server.control._publish_memory_notice(session_id, "memory-marker")
+        memory = await with_feature.event("memory_updated")
+        assert memory["seq"] == 3
+        assert memory["message"] == "memory-marker"
+        frames = await _frames_before_status(without_feature, 4)
+        assert not [
+            frame for frame in frames
+            if frame.get("params", {}).get("event") == "memory_updated"
+        ]
+
+        await server.control.user_message(
+            "user-marker",
+            "default",
+            frozenset(),
+            delivery_id="delivery-marker",
+        )
+        user = await with_feature.event("user_message")
+        assert user["seq"] == 4
+        assert user["delivery_id"] == "delivery-marker"
+        frames = await _frames_before_status(without_feature, 5)
+        assert not [
+            frame for frame in frames
+            if frame.get("params", {}).get("event") == "user_message"
+        ]
+        user_without_delivery = await without_delivery.event("user_message")
+        assert user_without_delivery["seq"] == 2
+        assert "delivery_id" not in user_without_delivery
     finally:
+        await without_delivery.close()
         await with_feature.close()
         await without_feature.close()
         await controller.close()
