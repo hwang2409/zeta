@@ -25,6 +25,7 @@ from tests.test_server import (
     TIMEOUT,
     _connect,
     _frames_until_event,
+    _named_events,
     _read_raw,
     _request,
 )
@@ -37,6 +38,7 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
 )
 from zeta.server import ZetaServer
@@ -121,6 +123,104 @@ def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> 
     assert not violations, (
         "approval state writes outside lifecycle swap seam: " + ", ".join(violations)
     )
+
+
+@pytest.mark.asyncio
+async def test_delegated_tool_end_survives_approval_history_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, _foreground = await _approval_server(tmp_path)
+    child_store = ConversationStore(tmp_path / "child")
+    call = ToolCall("child-call", "read", {"path": "/tmp/input"})
+    child_store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+    )
+    policy = server.runtime.policy
+    assert policy is not None
+    request = ApprovalRequest(call.id, call, child_instance_id="child")
+    policy.register_delegated(request, child_store, child_instance_id="child")
+    history_started = asyncio.Event()
+    release_history = asyncio.Event()
+    resolving: asyncio.Task[dict[str, object]] | None = None
+    try:
+        await await_or_fail(
+            server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_APPROVAL_START,
+                    tool_call=call,
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            ),
+            what="delegated approval start",
+        )
+        await await_or_fail(
+            _frames_until_event(reader, "approval_request"), what="approval request"
+        )
+        wire_id = server.control._approvals.wire_id(request.key)
+        original_append = server.control._approvals._append_delegated_history
+
+        async def hold_history(
+            record: object, payload: dict[str, object] | None
+        ) -> object:
+            history_started.set()
+            await await_or_fail(
+                release_history.wait(), what="release approval history"
+            )
+            return await original_append(record, payload)
+
+        # test-contract: seam gates delegated history to force the stale-record order
+        monkeypatch.setattr(
+            server.control._approvals, "_append_delegated_history", hold_history
+        )
+        resolving = asyncio.create_task(
+            server.control.resolve_approval("deny", wire_id)
+        )
+        await await_or_fail(history_started.wait(), what="approval history start")
+        await await_or_fail(
+            server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=call,
+                    tool_result=ToolResult(call.id, "child result"),
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            ),
+            what="child tool end",
+        )
+        release_history.set()
+        await await_or_fail(resolving, what="approval resolution")
+
+        async def read_until_tool_end() -> list[dict[str, object]]:
+            frames: list[dict[str, object]] = []
+            while True:
+                try:
+                    raw = await asyncio.wait_for(_read_raw(reader), 10)
+                except TimeoutError:
+                    return frames
+                frame = json.loads(raw)
+                frames.append(frame)
+                if frame.get("params", {}).get("event") == "tool_end":
+                    return frames
+
+        frames = await await_or_fail(
+            read_until_tool_end(), timeout=20, what="child tool_end publication"
+        )
+        assert len(_named_events(frames, "tool_end")) == 1
+    finally:
+        release_history.set()
+        if resolving is not None and not resolving.done():
+            resolving.cancel()
+        if resolving is not None:
+            await await_or_fail(
+                asyncio.gather(resolving, return_exceptions=True),
+                what="approval resolution cleanup",
+            )
+        await close_serve(server, writer)
+        child_store.close()
 
 
 @pytest.mark.asyncio
@@ -1932,6 +2032,69 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         assert len(backend.calls) == 2
     finally:
         await close_serve(server, replay_writer or writer)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_approval_end_waits_for_hello_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    replacement: asyncio.StreamWriter | None = None
+    hello_held = asyncio.Event()
+    release_hello = asyncio.Event()
+    try:
+        await server.control._event(_start_event(call))
+        writer.close()
+        await await_or_fail(writer.wait_closed(), what="old controller close")
+        await _wait_controller_release(server)
+
+        assert server.connections is not None
+        original_send = server.connections.send
+
+        async def hold_hello(connection: object, payload: bytes) -> bool:
+            if json.loads(payload).get("id") == 10:
+                hello_held.set()
+                await await_or_fail(release_hello.wait(), what="hello response release")
+            return await original_send(connection, payload)
+
+        # test-contract: seam holds the claimed controller before its real hello write
+        monkeypatch.setattr(server.connections, "send", hold_hello)
+        replacement_reader, replacement = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        hello_request = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "hello",
+            "params": {
+                "protocol_version": "1.2",
+                "features": ["approval_reconnect"],
+            },
+        }
+        replacement.write((json.dumps(hello_request) + "\n").encode())
+        await await_or_fail(replacement.drain(), what="hello request write")
+        await await_or_fail(hello_held.wait(), what="held hello response")
+
+        await await_or_fail(
+            server.control.resolve_approval("deny", call.id),
+            what="approval terminal admission",
+        )
+        release_hello.set()
+        first = json.loads(
+            await await_or_fail(_read_raw(replacement_reader), what="first frame")
+        )
+        second = json.loads(
+            await await_or_fail(_read_raw(replacement_reader), what="second frame")
+        )
+
+        assert first.get("id") == 10, f"hello was not first: {first}"
+        assert second["params"]["event"] == "approval_end"
+        assert second["params"]["request_id"] == call.id
+    finally:
+        release_hello.set()
+        await close_serve(server, replacement or writer)
 
 
 @pytest.mark.asyncio

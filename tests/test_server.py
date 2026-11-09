@@ -354,17 +354,21 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
 ) -> None:
     monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.05)
     release = asyncio.Event()
+    drain_exited = asyncio.Event()
 
     class StubbornWriter:
         def write(self, payload: bytes) -> None:
             pass
 
         async def drain(self) -> None:
-            while not release.is_set():
-                try:
-                    await asyncio.wait_for(release.wait(), 10)
-                except asyncio.CancelledError:
-                    continue
+            try:
+                while not release.is_set():
+                    try:
+                        await asyncio.wait_for(release.wait(), 10)
+                    except asyncio.CancelledError:
+                        continue
+            finally:
+                drain_exited.set()
 
     started = asyncio.Event()
     codec = protocol_module.FrameCodec()
@@ -395,7 +399,205 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
         assert outcomes == [False]
     finally:
         release.set()
-        await asyncio.sleep(0.01)
+        await await_or_fail(drain_exited.wait(), what="cancellation-resistant drain")
+        with suppress(protocol_module.FrameWriteCancelled):
+            await await_or_fail(task, what="canceled frame write")
+
+
+@pytest.mark.asyncio
+async def test_server_close_owns_cancellation_resistant_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Writer:
+        class Transport:
+            def abort(self) -> None:
+                pass
+
+        transport = Transport()
+
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            started.set()
+            while not release.is_set():
+                try:
+                    await asyncio.wait_for(release.wait(), 10)
+                except asyncio.CancelledError:
+                    if getattr(self, "cancels", 0) < 2:
+                        self.cancels = getattr(self, "cancels", 0) + 1
+                        continue
+                    raise
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    client = _Client(server, asyncio.StreamReader(), Writer())
+    before = set(asyncio.all_tasks())
+    write = asyncio.create_task(client._write_physical(client.codec.response(None, {})))
+    try:
+        await await_or_fail(started.wait(), what="write start")
+        write.cancel()
+        with pytest.raises(protocol_module.FrameWriteCancelled):
+            await await_or_fail(write, what="canceled write")
+        orphaned = tuple(
+            task
+            for task in asyncio.all_tasks()
+            if task not in before
+            and not task.done()
+            and task.get_coro().__qualname__ == "FrameCodec.write"
+        )
+        assert len(orphaned) == 1
+        await await_or_fail(server.close(), what="server close")
+        assert all(task.done() or task.cancelled() for task in orphaned)
+    finally:
+        release.set()
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task not in before and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        await await_or_fail(
+            asyncio.gather(write, *pending, return_exceptions=True),
+            what="write cleanup",
+        )
+        if server.connections is not None:
+            await await_or_fail(server.close(), what="server cleanup")
+
+
+@pytest.mark.asyncio
+async def test_server_close_drains_write_registered_during_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Writer:
+        class Transport:
+            def abort(self) -> None:
+                pass
+
+        transport = Transport()
+
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            started.set()
+            while not release.is_set():
+                try:
+                    await asyncio.wait_for(release.wait(), 10)
+                except asyncio.CancelledError:
+                    self.cancels = getattr(self, "cancels", 0) + 1
+                    if self.cancels >= 3:
+                        raise
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    client = _Client(server, asyncio.StreamReader(), Writer())
+    assert server.connections is not None
+    registry = server.connections
+    registry.negotiate_role(client, "controller", "1.0", frozenset())
+    before = set(asyncio.all_tasks())
+    sending = asyncio.create_task(registry.send(client, client.codec.response(None, {})))
+    real_aclose = registry.aclose
+
+    async def skip_aclose() -> None:
+        pass
+
+    registry.aclose = skip_aclose  # type: ignore[method-assign]
+    try:
+        await await_or_fail(started.wait(), what="registered write start")
+        physical = tuple(
+            task
+            for task in asyncio.all_tasks()
+            if task not in before
+            and not task.done()
+            and task.get_coro().__qualname__ == "FrameCodec.write"
+        )
+        assert len(physical) == 1
+        await await_or_fail(server.close(), what="server close")
+        assert all(task.done() or task.cancelled() for task in physical)
+    finally:
+        release.set()
+        for task in asyncio.all_tasks():
+            if task not in before and not task.done():
+                task.cancel()
+        await await_or_fail(
+            asyncio.gather(sending, return_exceptions=True), what="registered write cleanup"
+        )
+        await await_or_fail(real_aclose(), what="registry cleanup")
+
+
+@pytest.mark.asyncio
+async def test_server_close_survives_orphaned_write_settling_during_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "FRAME_CANCEL_GRACE", 0.01)
+    started = asyncio.Event()
+    stall = asyncio.get_running_loop().create_future()
+    gate = asyncio.get_running_loop().create_future()
+
+    class Writer:
+        class Transport:
+            def abort(self) -> None:
+                pass
+
+        transport = Transport()
+
+        def write(self, payload: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            started.set()
+            try:
+                await asyncio.wait_for(stall, 10)
+            except asyncio.CancelledError:
+                pass  # resist the abort-time cancel so the write stays orphaned
+            await asyncio.wait_for(gate, 10)
+
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    await await_or_fail(server.start(), what="server start")
+    listener = server._server
+    assert listener is not None and listener.is_serving()
+    client = _Client(server, asyncio.StreamReader(), Writer())
+    write = asyncio.create_task(client._write_physical(client.codec.response(None, {})))
+    assert server.connections is not None
+    real_aclose = server.connections.aclose
+
+    async def settle_orphan_then_aclose() -> None:
+        await real_aclose()
+        # The orphaned write finishes in the step right before the frame
+        # owner closes, so its done callback runs inside the owner's close.
+        gate.set_result(None)
+        await asyncio.sleep(0)
+
+    server.connections.aclose = settle_orphan_then_aclose  # type: ignore[method-assign]
+    try:
+        await await_or_fail(started.wait(), what="write start")
+        write.cancel()
+        with pytest.raises(protocol_module.FrameWriteCancelled):
+            await await_or_fail(write, what="canceled write")
+        await await_or_fail(server.close(), what="server close")
+        assert not listener.is_serving()
+    finally:
+        if not gate.done():
+            gate.set_result(None)
+        if listener.is_serving():
+            listener.close()
+            await await_or_fail(listener.wait_closed(), what="listener cleanup")
 
 
 @pytest.mark.asyncio
@@ -793,8 +995,6 @@ async def _frames_until_eof(reader: asyncio.StreamReader) -> list[dict[str, Any]
     while line := await asyncio.wait_for(reader.readline(), TIMEOUT):
         frames.append(json.loads(line))
     return frames
-
-
 
 
 class OAuthRefreshFailureBackend:
@@ -2969,9 +3169,15 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert next_reply not in json.dumps(
             [message.to_dict() for message in history]
         )
+        frames += await _request(reader, writer, 5, "status", {})
+        names = [frame.get("params", {}).get("event") for frame in frames]
+        assert names.count("approval_end") == 1
+        assert names.index("approval_end") < names.index("turn_aborted")
+        after_abort = names[names.index("turn_aborted") + 1 :]
+        assert not {"tool_start", "tool_end", "turn_start"}.intersection(after_abort)
 
         next_frames = await _request(
-            reader, writer, 5, "send", {"text": "run after abort"}
+            reader, writer, 6, "send", {"text": "run after abort"}
         )
         if not _named_events(next_frames, "turn_end"):
             try:
@@ -3743,9 +3949,7 @@ async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> Non
         await asyncio.sleep(0)
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         writers.append(writer)
-        hello = await _request(
-            reader, writer, 1, "hello", {"protocol_version": "1.0"}
-        )
+        hello = await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         assert hello[-1]["result"]["notices"] == [
             "could not clean up account directory /secret"
         ]
@@ -4096,7 +4300,10 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
         ),
         (
             "error",
-            {"error": {"code": "empty_turn", "message": bounded_error.message}, "data": {}},
+            {
+                "error": {"code": "empty_turn", "message": bounded_error.message},
+                "data": {},
+            },
         ),
     ]
 
@@ -9973,7 +10180,8 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
-                    await asyncio.wait_for(release.wait(), 10)
+                    # test-contract: seam the whole serve journey owns the hang guard
+                    await release.wait()
 
     server = ZetaServer(
         home=tmp_path,
@@ -9982,64 +10190,70 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
         provider="codex",
         backend_factory=lambda *_args: (PausedBackend(delay=0), "offline"),
     )
-    reader, writer, sid = await _ready_extensions(server)
-    try:
-        await _request(reader, writer, 3, "send", {"text": "slow"})
-        await asyncio.wait_for(started.wait(), TIMEOUT)
-        fixture = Path(__file__).parent / "fixtures" / "serve_slash_busy_wire_pin.jsonl"
-        rows = [
-            json.loads(line)
-            for line in fixture.read_text().splitlines()
-            if line and not line.startswith("#")
-        ]
-        # These rows are explicit because the base fixture was captured before
-        # /plan was a serve command and must never be captured from the head.
-        rows.extend(
-            [
-                {"text": "/plan", "error_code": -32004},
-                {"text": "/plan on", "error_code": -32004},
-                {"text": "/plan write a plan", "error_code": -32004},
-                {"text": "/implement", "error_code": -32004},
+
+    async def exercise_busy_policy() -> None:
+        reader, writer, sid = await _ready_extensions(server)
+        try:
+            await _request(reader, writer, 3, "send", {"text": "slow"})
+            await asyncio.wait_for(started.wait(), TIMEOUT)
+            fixture = Path(__file__).parent / "fixtures" / "serve_slash_busy_wire_pin.jsonl"
+            rows = [
+                json.loads(line)
+                for line in fixture.read_text().splitlines()
+                if line and not line.startswith("#")
             ]
-        )
-        before = (
-            await _request(
-                reader, writer, "before-plan", "session_settings", {"session_id": sid}
+            # These rows are explicit because the base fixture was captured before
+            # /plan was a serve command and must never be captured from the head.
+            rows.extend(
+                [
+                    {"text": "/plan", "error_code": -32004},
+                    {"text": "/plan on", "error_code": -32004},
+                    {"text": "/plan write a plan", "error_code": -32004},
+                    {"text": "/implement", "error_code": -32004},
+                ]
             )
-        )[-1]["result"]["plan_mode"]
-        for request_id, row in enumerate(rows, start=4):
-            text = row["text"]
-            response = await _request(
-                reader,
-                writer,
-                request_id,
-                "slash_run",
-                {"session_id": sid, "text": text},
-            )
-            message = response[-1]
-            if text == "/plan":
-                after = (
-                    await _request(
-                        reader,
-                        writer,
-                        "after-plan",
-                        "session_settings",
-                        {"session_id": sid},
-                    )
-                )[-1]["result"]["plan_mode"]
-                assert after is before
-            if "result" in row:
-                assert "result" in message and "error" not in message, message
-                assert message["result"] == row["result"]
-            elif "result_kind" in row:
-                assert "result" in message and "error" not in message, message
-                assert message["result"]["kind"] == row["result_kind"]
-            else:
-                assert "error" in message and "result" not in message, message
-                assert message["error"]["code"] == row["error_code"], message
-    finally:
-        release.set()
-        await close_serve(server, writer)
+            before = (
+                await _request(
+                    reader, writer, "before-plan", "session_settings", {"session_id": sid}
+                )
+            )[-1]["result"]["plan_mode"]
+            for request_id, row in enumerate(rows, start=4):
+                text = row["text"]
+                response = await _request(
+                    reader,
+                    writer,
+                    request_id,
+                    "slash_run",
+                    {"session_id": sid, "text": text},
+                )
+                message = response[-1]
+                if text == "/plan":
+                    after = (
+                        await _request(
+                            reader,
+                            writer,
+                            "after-plan",
+                            "session_settings",
+                            {"session_id": sid},
+                        )
+                    )[-1]["result"]["plan_mode"]
+                    assert after is before
+                if "result" in row:
+                    assert "result" in message and "error" not in message, message
+                    assert message["result"] == row["result"]
+                elif "result_kind" in row:
+                    assert "result" in message and "error" not in message, message
+                    assert message["result"]["kind"] == row["result_kind"]
+                else:
+                    assert "error" in message and "result" not in message, message
+                    assert message["error"]["code"] == row["error_code"], message
+        finally:
+            release.set()
+            await close_serve(server, writer)
+
+    await await_or_fail(
+        exercise_busy_policy(), timeout=120, what="busy-policy serve journey"
+    )
 
 
 @pytest.mark.asyncio
@@ -10115,7 +10329,7 @@ async def test_serve_linked_worktree_runs_one_git_discovery(
     runtime = ServerRuntime(home, cwd=worktree, provider="codex")
     try:
         await runtime.create_session()
-        assert len(commands) == 3
+        assert len(commands) == 2
     finally:
         await runtime.close()
 
@@ -10174,7 +10388,7 @@ async def test_server_uses_only_existing_project_after_one_git_discovery(
     runtime = ServerRuntime(home, cwd=cwd, provider="codex")
     try:
         metadata = await runtime.create_session()
-        assert calls == 3
+        assert calls == 1
         assert metadata.project_id == (
             existing.project_id if existing is not None else None
         )
@@ -11768,6 +11982,251 @@ async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
         await close_serve(server, writer)
 
 
+@pytest.mark.parametrize("negotiated", [False, True], ids=["legacy", "feature"])
+async def test_config_changed_requires_live_config_changed_feature(
+    tmp_path: Path, negotiated: bool
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        features = ["live_config_changed"] if negotiated else []
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": features},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        await server.runtime.loop.refresh_live_config()
+        assert len(prepared_events) == 1
+        notifications: list[str] = []
+        original_notify = server.control._notify
+
+        async def record_notify(event: str, *args: object, **kwargs: object) -> None:
+            notifications.append(event)
+            await original_notify(event, *args, **kwargs)
+
+        server.control._notify = record_notify
+        await server.control._event(prepared_events[0], background=True)
+        await _request(reader, writer, 3, "status", {})
+
+        assert ("config_changed" in notifications) is negotiated
+        if negotiated:
+            config_event = await _event(reader, "config_changed")
+            assert config_event["data"]["changes"]["agents"]["added"] == ["specialist"]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_unnegotiated_config_change_preserves_complete_frame_stream(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+
+    async def raw_request_frames(
+        request_id: int, method: str, params: dict[str, object]
+    ) -> bytes:
+        request = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+            ).encode()
+            + b"\n"
+        )
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), 10)
+        frames: list[bytes] = []
+        while True:
+            # test-contract: transport exact raw frames are required to compare byte-for-byte streams
+            frame = await asyncio.wait_for(reader.readline(), 10)
+            assert frame, f"server closed before the {method} response"
+            frames.append(frame)
+            if json.loads(frame).get("id") == request_id:
+                return b"".join(frames)
+
+    try:
+        await asyncio.wait_for(
+            raw_request_frames(1, "hello", {"protocol_version": "1.1", "features": []}),
+            30,
+        )
+        await asyncio.wait_for(
+            raw_request_frames(2, "new_session", {"provider": "codex"}), 30
+        )
+        assert server.runtime.loop is not None
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        await asyncio.wait_for(server.runtime.loop.refresh_live_config(), 10)
+        assert len(prepared_events) == 1
+
+        base_frames = await asyncio.wait_for(raw_request_frames(3, "status", {}), 30)
+        await asyncio.wait_for(
+            server.control._event(prepared_events[0], background=True), 10
+        )
+        actual_frames = await asyncio.wait_for(raw_request_frames(3, "status", {}), 30)
+
+        assert actual_frames == base_frames
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_many_config_changes_reach_negotiated_serve_client_bounded(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["live_config_changed"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        for index in range(132):
+            name = f"item-{index}-" + "x" * 8_000
+            for kind, body in (("skills", "skill body"), ("agents", "profile body")):
+                path = tmp_path / kind / f"item-{index}.md"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"---\nname: {name}\ndescription: focused\n---\n{body}\n",
+                    encoding="utf-8",
+                )
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        await server.runtime.loop.refresh_live_config()
+
+        assert len(prepared_events) == 1
+        await server.control._event(prepared_events[0], background=True)
+        frame = await _read(reader)
+        assert frame["params"]["event"] == "config_changed", (
+            "bounded config changes became a serve error frame"
+        )
+        config_event = frame["params"]
+
+        skills = config_event["data"]["changes"]["skills"]
+        agents = config_event["data"]["changes"]["agents"]
+        assert len(skills["added"]) == 26, "serve skill changes were not bounded"
+        assert len(agents["added"]) == 26, "serve agent changes were not bounded"
+        assert skills["added"][-1] == "and 107 more"
+        assert agents["added"][-1] == "and 107 more"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_active_status_overlays_live_config_without_persisting_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["live_config_changed"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        persisted = server.runtime.metadata.agent_catalog
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+        await server.runtime.loop.refresh_live_config()
+        from zeta.skills.agent_catalog import AgentCatalog
+        from zeta.skills.catalog import SkillCatalog
+
+        snapshot_calls: list[str] = []
+        original_skill_snapshot = SkillCatalog.to_snapshot
+        original_agent_snapshot = AgentCatalog.to_snapshot
+
+        def skill_snapshot(catalog: SkillCatalog):
+            snapshot_calls.append("skills")
+            return original_skill_snapshot(catalog)
+
+        def agent_snapshot(catalog: AgentCatalog):
+            snapshot_calls.append("agents")
+            return original_agent_snapshot(catalog)
+
+        monkeypatch.setattr(SkillCatalog, "to_snapshot", skill_snapshot)
+        monkeypatch.setattr(AgentCatalog, "to_snapshot", agent_snapshot)
+        status = (await _request(reader, writer, 3, "status", {}))[-1]["result"]
+
+        assert snapshot_calls == [], "status rebuilt active catalog snapshots"
+        assert "specialist" in {
+            item["name"] for item in status["session"]["agent_catalog"]
+        }
+        assert server.runtime.metadata.agent_catalog is persisted
+        assert "specialist" not in {item["name"] for item in (persisted or [])}
+    finally:
+        await close_serve(server, writer)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("record", "reason", "description"),
@@ -11997,6 +12456,7 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
+        # test-contract: transport raw request must remain pending while settlement gates are exercised
         writer.write(
             (
                 json.dumps(
@@ -12247,11 +12707,14 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     # test-contract: seam the bounded queue has no public admission hook
     monkeypatch.setattr(server.connections, "_enqueue", record_enqueue)
     # test-contract: seam approval settlement has no public pre-publication hook
-    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish_record)
+    monkeypatch.setattr(
+        server.control._approvals, "_finish_record", gated_finish_record
+    )
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
+        # test-contract: transport raw request must remain pending while settlement gates are exercised
         writer.write(
             (
                 json.dumps(

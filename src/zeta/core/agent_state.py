@@ -27,13 +27,6 @@ from .agent_progress import (
 )
 from .checkpoints import ConversationIntegrityError, _now, load_session_json
 from .session_files import child_directory, read_session_file, write_session_file
-from .store._async_writes import (
-    _FinishAgentChildCommand,
-    _FinishAgentLifecycleCommand,
-    _FinishAgentParentCommand,
-    _MarkAgentCanceledCommand,
-    _RegisterAgentChildCommand,
-)
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
 _TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
@@ -622,7 +615,7 @@ class AgentStateMixin:
         state: str | None = None,
         idle_since: str | None = None,
     ) -> None:
-        """Update a live child's process-local progress."""
+        """Update a live child's progress; ``tool_calls`` adds to its total."""
 
         if current_step is not None and not current_step:
             raise ValueError("agent lifecycle step must be nonempty")
@@ -641,7 +634,7 @@ class AgentStateMixin:
         if turns_used is not None:
             self._agent_lifecycle["turns_used"] = turns_used
         if tool_calls is not None:
-            self._agent_lifecycle["tool_calls"] = tool_calls
+            self._agent_lifecycle["tool_calls"] += tool_calls
         if state is not None:
             self._agent_lifecycle["state"] = state
         if idle_since is not None:
@@ -793,6 +786,14 @@ class AgentStateMixin:
         canceled_tool_call_id: str | None = None,
     ) -> tuple[str, ...]:
         """Transfer direct markers and durably publish one terminal lifecycle."""
+
+        from .store._async_writes import (
+            _FinishAgentChildCommand,
+            _FinishAgentLifecycleCommand,
+            _FinishAgentParentCommand,
+            _MarkAgentCanceledCommand,
+            _RegisterAgentChildCommand,
+        )
 
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
