@@ -147,7 +147,7 @@ async def test_turn_limit_foreground_result_projects_status_and_handoff(
         assert (
             handoff == Path(structured["child_session_path"]) / "turn-limit-handoff.md"
         )
-        assert handoff.exists()
+        assert "child completion 2" in handoff.read_text(encoding="utf-8")
         rows = [
             load_session_json(line)
             for line in (Path(structured["child_session_path"]) / "conversation.jsonl")
