@@ -18,7 +18,7 @@ from ..project_errors import (
     ProjectRegistryBusyError,
     ProjectRegistryError,
 )
-from ..storage_format import P06_FEATURE_EPOCH, WriterLease
+from ..storage_format import StorageFeature, WriterLease, feature_enabled
 
 _READ_RETRIES = 10
 _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS = 1.0
@@ -230,7 +230,7 @@ class ProjectLockingMixin:
                 self._ensure_root()
             locks = (
                 self._legacy_project_locks
-                if lease.observed_epoch < P06_FEATURE_EPOCH
+                if not feature_enabled(lease.observed_epoch, StorageFeature.PROJECT_LOCKS)
                 else self._named_project_locks
             )
             with locks(domains, exclusive=exclusive) as project_fds:

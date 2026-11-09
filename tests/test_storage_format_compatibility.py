@@ -26,8 +26,9 @@ from zeta.remote_sync import LocalTransport, RemoteSyncError
 from zeta.remote_sync.project_publish import project_digest
 from zeta.remote_sync.ssh import SshTransport
 from zeta.storage_format import (
-    P06_FEATURE_EPOCH,
+    FEATURE_EPOCHS,
     WRITER_EPOCH,
+    StorageFeature,
     StorageFormatError,
     advance,
 )
@@ -263,7 +264,12 @@ def _below_epoch_home(source: Path, home: Path) -> dict[str, object]:
     ids = _finish_old(_start_old(source, home, "--operation", "setup"), source)
     assert ids["outcome"] == "done", ids
     old_epoch = _COMPAT._writer_epoch(source)
-    assert _manifest_epoch(home) == old_epoch < P06_FEATURE_EPOCH <= WRITER_EPOCH
+    assert (
+        _manifest_epoch(home)
+        == old_epoch
+        < FEATURE_EPOCHS[StorageFeature.PROJECT_LOCKS]
+        <= WRITER_EPOCH
+    )
     return ids
 
 
