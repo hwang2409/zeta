@@ -180,7 +180,6 @@ class DecisionsPanel:
     def _list_row(self, item: DecisionItem) -> FragmentLine:
         selected = item.record.id == self._selected_id
         if isinstance(item.record, Broken):
-            label = f"broken · {item.record.id}"
             title = f"{item.record.path}: {item.record.reason}"
             return overlay.row([(theme.ERROR, title)], selected=selected)
         staged = self._staged.get(item.record.id)
