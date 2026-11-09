@@ -1139,9 +1139,38 @@ class AgentLoop(
                 if isinstance(block, ToolUseContent)
             ]
             _validate_unique_tool_call_ids(calls)
+            prepared_calls: list[ToolCall] = []
+            preparation_errors: set[str] = set()
+            for tool_call in calls:
+                try:
+                    prepared_calls.append(
+                        await self.tool_registry.prepare_tool_call(tool_call)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    prepared_calls.append(tool_call)
+                    preparation_errors.add(tool_call.id)
+            if any(
+                prepared is not original
+                for original, prepared in zip(calls, prepared_calls, strict=True)
+            ):
+                prepared_by_id = {
+                    prepared.id: prepared for prepared in prepared_calls
+                }
+                assistant_message = Message(
+                    assistant_message.role,
+                    [
+                        ToolUseContent(prepared_by_id[block.tool_call.id])
+                        if isinstance(block, ToolUseContent)
+                        else block
+                        for block in assistant_message.content
+                    ],
+                    tool_result=assistant_message.tool_result,
+                    metadata=assistant_message.metadata,
+                )
+                calls = prepared_calls
             approval_requests: list[ApprovalAuditRequest] = []
             for tool_call in calls:
-                if not self.plan_mode_allows(tool_call):
+                if tool_call.id in preparation_errors or not self.plan_mode_allows(tool_call):
                     continue
                 request = self.tool_registry.prepare_approval(tool_call)
                 if request is not None:

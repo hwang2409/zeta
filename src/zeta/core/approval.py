@@ -494,6 +494,30 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             resolved.add(rule)
         return frozenset(resolved)
 
+    async def prepare_rules(
+        self, resolver: Callable[[ApprovalRule], Awaitable[ApprovalRule]]
+    ) -> None:
+        """Refresh configured and session rules using off-loop canonicalization."""
+
+        for tier in ("always_deny", "always_ask", "always_allow"):
+            source = self._rule_sources.get(tier, ())
+            parsed = tuple(
+                item if isinstance(item, ApprovalRule) else parse_approval_rule(item)
+                for item in source
+            )
+            resolved: set[ApprovalRule] = set()
+            for item, rule in zip(source, parsed, strict=True):
+                try:
+                    resolved.add(await resolver(rule))
+                except ValueError as exc:
+                    notice = f"approval · dropped rule {item!r}: {exc}"
+                    if notice not in self._notices:
+                        self._notices.append(notice)
+            setattr(self, f"_{tier}", frozenset(resolved))
+        self._session_allow = frozenset(
+            [await resolver(rule) for rule in self._session_allow]
+        )
+
     def bind_rule_resolver(
         self, resolver: Callable[[str | ApprovalRule], ApprovalRule]
     ) -> None:

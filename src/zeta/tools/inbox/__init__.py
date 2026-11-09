@@ -15,7 +15,8 @@ from ...project_inbox import (
 )
 from ...project_inbox_sent import SentMessageTracker
 from ...project_registry import ProjectRegistryError, resolve_project_ref
-from ...protocol.types import StructuredToolResult
+from ...project_schema import PROJECT_ID_PATTERN
+from ...protocol.types import StructuredToolResult, ToolCall
 from .._results import _success_result, text_block
 from ..registry import ToolAction, ToolRegistry
 
@@ -291,32 +292,25 @@ def register(registry: ToolRegistry) -> None:
     _register(registry, _ACTIONS)
 
 
-async def _prepare_arguments(
-    registry: ToolRegistry, arguments: Mapping[str, object]
-) -> Mapping[str, object]:
-    prepared = dict(arguments)
-    project = prepared.get("project")
-    if isinstance(project, str) and registry.project_registry is not None:
-        project_id = await asyncio.to_thread(
-            resolve_project_ref, registry.project_registry, project
-        )
-        if project_id is None:
-            raise ValueError(f"unknown inbox target project {project!r}")
-        cache = getattr(registry, "_inbox_project_refs", {})
-        cache[project] = project_id
-        cache[project_id] = project_id
-        registry._inbox_project_refs = cache
-        prepared["project"] = project_id
-    return prepared
+async def _prepare_call(registry: ToolRegistry, tool_call: ToolCall) -> ToolCall:
+    project = tool_call.arguments.get("project")
+    if not isinstance(project, str) or PROJECT_ID_PATTERN.fullmatch(project):
+        return tool_call
+    if registry.project_registry is None:
+        return tool_call
+    project_id = await asyncio.to_thread(
+        resolve_project_ref, registry.project_registry, project
+    )
+    if project_id is None:
+        raise ValueError(f"unknown inbox target project {project!r}")
+    arguments = dict(tool_call.arguments)
+    arguments["project"] = project_id
+    return ToolCall(tool_call.id, tool_call.name, arguments)
 
 
-def _approval_subject(
-    registry: ToolRegistry, arguments: Mapping[str, object]
-) -> str | None:
+def _approval_subject(arguments: Mapping[str, object]) -> str | None:
     project = arguments.get("project")
-    if not isinstance(project, str) or registry.project_registry is None:
-        return None
-    return getattr(registry, "_inbox_project_refs", {}).get(project, project)
+    return project if isinstance(project, str) else None
 
 
 def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
@@ -346,8 +340,6 @@ def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
             "additionalProperties": False,
         },
         requires_approval=True,
-        approval_subject_resolver=lambda arguments: _approval_subject(
-            registry, arguments
-        ),
-        argument_preparer=lambda arguments: _prepare_arguments(registry, arguments),
+        approval_subject_resolver=_approval_subject,
+        call_preparer=lambda tool_call: _prepare_call(registry, tool_call),
     )

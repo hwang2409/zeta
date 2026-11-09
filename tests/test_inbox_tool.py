@@ -111,17 +111,56 @@ async def test_inbox_execution_canonicalizes_approval_subjects(
         )
 
     try:
-        for rule in (f"inbox(send {beta.project_id})", "inbox(send beta)"):
-            registry.set_approval_policy(
-                ApprovalPolicy(always_allow={rule}, default="deny", store=store)
+        registry.set_approval_policy(
+            ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny", store=store)
+        )
+        for project in ("beta", beta.project_id):
+            assert (await send(project)).get("isError") is not True, project
+        registry.set_approval_policy(
+            ApprovalPolicy(
+                always_allow={f"inbox(send {beta.project_id})"},
+                default="deny",
+                store=store,
             )
-            for project in ("beta", beta.project_id):
-                assert (await send(project)).get("isError") is not True, (rule, project)
+        )
+        assert (await send("beta")).get("isError") is not True
         assert (await send(other.project_id)).get("isError") is True
         registry.set_approval_policy(ApprovalPolicy(default="allow", store=store))
         unknown = await send("missing", skip_approval=True)
         assert unknown.get("isError") is True
         assert "unknown inbox target project" in str(unknown)
+    finally:
+        await registry.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_name_rule_refreshes_after_project_creation(
+    tmp_path: Path,
+) -> None:
+    registry, store = await asyncio.to_thread(_registry, tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    registry.set_approval_policy(
+        ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny", store=store)
+    )
+    try:
+        beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
+        result = await registry.execute(
+            ToolCall(
+                "late-beta",
+                "inbox",
+                {
+                    "action": "send",
+                    "project": "beta",
+                    "kind": "info",
+                    "title": "title",
+                    "body": "body",
+                },
+            )
+        )
+        assert result.get("isError") is not True
+        assert beta.project_id != "beta"
     finally:
         await registry.close()
         store.close()

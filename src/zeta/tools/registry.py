@@ -7,6 +7,7 @@ also include ``full_size_chars`` for their readable-text character length.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib
 import inspect
@@ -171,7 +172,7 @@ class ToolDefinition:
     # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
     approval_subject: str | None = None
     approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None
-    argument_preparer: Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]] | None = None
+    call_preparer: Callable[[ToolCall], Awaitable[ToolCall]] | None = None
     actions: Mapping[str, ToolAction] | None = None
 
     def schema(self) -> ToolSchema:
@@ -509,7 +510,7 @@ class ToolRegistry:
         binding: HandlerBinding = "loop",
         approval_subject: str | None = None,
         approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
-        argument_preparer: Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]] | None = None,
+        call_preparer: Callable[[ToolCall], Awaitable[ToolCall]] | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -582,7 +583,7 @@ class ToolRegistry:
             requires_approval=requires_approval,
             approval_subject=approval_subject,
             approval_subject_resolver=approval_subject_resolver,
-            argument_preparer=argument_preparer,
+            call_preparer=call_preparer,
             actions=normalized_actions,
         )
         self._tools[name] = definition
@@ -923,6 +924,42 @@ class ToolRegistry:
             policy.bind_rule_resolver(self.resolve_approval_rule)
             policy.bind_capability_resolver(self.resolve_tool_call_capability)
 
+    async def prepare_tool_call(self, tool_call: ToolCall) -> ToolCall:
+        """Prepare one call once before approval, persistence, and execution."""
+
+        definition = self._tools.get(tool_call.name)
+        if definition is None:
+            return tool_call
+        prepare_rules = getattr(self.approval_policy, "prepare_rules", None)
+        if prepare_rules is not None:
+            await prepare_rules(lambda rule: self._prepare_approval_rule(rule))
+        if definition.call_preparer is None:
+            return tool_call
+        return await definition.call_preparer(tool_call)
+
+    async def _prepare_approval_rule(self, rule: ApprovalRule) -> ApprovalRule:
+        resolved = self.resolve_approval_rule(rule)
+        if resolved.tool != "inbox" or resolved.subject_pattern is None:
+            return resolved
+        definition = self._tools.get("inbox")
+        if definition is None:
+            return resolved
+        action = resolved.action
+        subject = resolved.subject_pattern
+        if action != "send" or not isinstance(subject, str):
+            return resolved
+        from ..project_registry import resolve_project_ref
+        from ..project_schema import PROJECT_ID_PATTERN
+
+        if PROJECT_ID_PATTERN.fullmatch(subject) or self.project_registry is None:
+            return resolved
+        project_id = await asyncio.to_thread(
+            resolve_project_ref, self.project_registry, subject
+        )
+        if project_id is None:
+            return resolved
+        return replace(resolved, subject_pattern=project_id)
+
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
             return None
@@ -1028,17 +1065,13 @@ class ToolRegistry:
                     kind="unknown_tool",
                 )
             )
-        prepared_arguments = tool_call.arguments
-        if definition.argument_preparer is not None:
-            try:
-                prepared_arguments = await definition.argument_preparer(tool_call.arguments)
-            except (KeyError, TypeError, ValueError) as exc:
-                self.abort_approval(tool_call)
-                return await finalize(_error_result(str(exc), kind="invalid_arguments"))
-        if prepared_arguments is not tool_call.arguments:
-            tool_call = replace(tool_call, arguments=dict(prepared_arguments))
         try:
-            capability = self.resolve_call(tool_call.name, prepared_arguments)
+            tool_call = await self.prepare_tool_call(tool_call)
+        except (KeyError, TypeError, ValueError) as exc:
+            self.abort_approval(tool_call)
+            return await finalize(_error_result(str(exc), kind="invalid_arguments"))
+        try:
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
         except UnknownToolAction as exc:
             self.abort_approval(tool_call)
             return await finalize(
