@@ -24,7 +24,12 @@ from zeta.providers import login as providers
 from zeta.providers.factory import credential_store
 from zeta.server import ZetaServer
 from zeta.server import login as server_login
-from zeta.server.login import REQUESTS, Logins
+from zeta.server.login import Logins
+from zeta.server.protocol import MethodDescriptor
+
+LOGIN_REQUESTS = tuple(
+    item.wire for item in MethodDescriptor if item.name.startswith("LOGIN_")
+)
 
 
 @pytest.fixture(autouse=True)
@@ -77,8 +82,8 @@ async def connect(tmp_path, provider="claude", version="1.1"):
 async def test_login_is_hidden_and_rejected_for_legacy_protocol(tmp_path, server_provider, version):
     server, reader, writer, hello = await connect(tmp_path, server_provider, version)
     try:
-        assert not set(REQUESTS) & set(hello["capabilities"]["requests"])
-        for method in REQUESTS:
+        assert not set(LOGIN_REQUESTS) & set(hello["capabilities"]["requests"])
+        for method in LOGIN_REQUESTS:
             result = await rpc(reader, writer, method, provider="claude")
             assert result["error"]["code"] == -32601
         assert not server._client.logins.tasks
@@ -105,7 +110,7 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
     monkeypatch.setattr(providers, "extract_account_id", lambda _: "test-account")
     server, reader, writer, hello = await connect(tmp_path)
     try:
-        assert set(REQUESTS) <= set(hello["capabilities"]["requests"])
+        assert set(LOGIN_REQUESTS) <= set(hello["capabilities"]["requests"])
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert rows == [{"provider": p, "credentials_present": False} for p in ("claude", "codex")]
         result = (await rpc(reader, writer, "login_start", provider=provider))["result"]

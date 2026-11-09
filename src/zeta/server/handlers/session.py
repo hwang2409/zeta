@@ -61,23 +61,26 @@ async def repair_transcript(self, params: dict[str, Any]) -> dict[str, object]:
     }
 
 
-async def mutate_session(
+async def delete_session(
     runtime: ServerRuntime,
-    method: str,
     session_id: str,
-    name: object,
     require_idle: Callable[[], Awaitable[None]],
 ) -> dict[str, object]:
     session_id = await asyncio.to_thread(runtime.manager.resolve_id, session_id)
-    if method == "delete_session":
-        await require_idle()
-        if runtime.opened is not None and session_id == runtime.session_id:
-            raise ProtocolError(
-                ErrorDescriptor.ACTIVE_SESSION,
-                "select another session before deleting this session",
-            )
-        await asyncio.to_thread(runtime.manager.delete, session_id)
-        return {"session_id": session_id}
+    await require_idle()
+    if runtime.opened is not None and session_id == runtime.session_id:
+        raise ProtocolError(
+            ErrorDescriptor.ACTIVE_SESSION,
+            "select another session before deleting this session",
+        )
+    await asyncio.to_thread(runtime.manager.delete, session_id)
+    return {"session_id": session_id}
+
+
+async def rename(
+    runtime: ServerRuntime, session_id: str, name: object
+) -> dict[str, object]:
+    session_id = await asyncio.to_thread(runtime.manager.resolve_id, session_id)
     if not isinstance(name, str):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "name must be a string")
     metadata = await rename_session(runtime, session_id, name)

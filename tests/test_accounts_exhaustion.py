@@ -1007,16 +1007,18 @@ async def test_account_switch_never_replays_transcript(
 
     task = TUIApp.accounts_picker_select(app)
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
     async def idle() -> None:
         return None
 
-    response = await server_accounts.request(
-        "account_switch",
-        SimpleNamespace(loop=loop, metadata=context.metadata),
-        idle,
-        {"account": str(first)},
+    response = await asyncio.wait_for(
+        server_accounts.switch(
+            SimpleNamespace(loop=loop, metadata=context.metadata),
+            idle,
+            {"account": str(first)},
+        ),
+        10,
     )
     assert response == {
         "account": str(first),
