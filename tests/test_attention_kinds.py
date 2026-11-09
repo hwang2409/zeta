@@ -7,14 +7,16 @@ from pathlib import Path
 import pytest
 
 from tests.test_attention import _session
-from zeta import attention_records
+from zeta import attention_records, storage_format
 from zeta.attention_decisions import open_decisions
-from zeta.attention_records import ATTENTION_KIND_EPOCH, AttentionStore
+from zeta.attention_records import AttentionStore
 from zeta.skills import SkillCatalog
 from zeta.storage_format import (
     StorageFormatError,
     advance,
     require_closed_variant,
+    FEATURE_EPOCHS,
+    StorageFeature,
 )
 from zeta.tools.registry import ToolRegistry
 
@@ -46,7 +48,7 @@ def test_old_attention_bytes_read_as_decision_and_remain_unchanged(
     tmp_path: Path,
 ) -> None:
     opened = _session(tmp_path)
-    store = AttentionStore(opened.store.session_dir)
+    store = AttentionStore(opened.store.session_dir, writer_epoch=5)
     record = _record(store, session_id=opened.store.session_id)
     path = store.directory / f"{record.id}.json"
     value = json.loads(path.read_text())
@@ -61,7 +63,7 @@ def test_old_attention_bytes_read_as_decision_and_remain_unchanged(
 
 def test_attention_kinds_sort_decisions_first(tmp_path: Path) -> None:
     opened = _session(tmp_path)
-    store = AttentionStore(opened.store.session_dir)
+    store = AttentionStore(opened.store.session_dir, writer_epoch=5)
     answer = _record(store, kind="answer", session_id=opened.store.session_id)
     decision = _record(store, session_id=opened.store.session_id)
     items = open_decisions(tmp_path, opened.store.session_id)
@@ -73,8 +75,8 @@ def test_attention_kinds_sort_decisions_first(tmp_path: Path) -> None:
 def test_attention_kind_epoch_is_independent_of_writer_epoch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(attention_records, "WRITER_EPOCH", 6)
     opened = _session(tmp_path)
+    monkeypatch.setattr(storage_format, "WRITER_EPOCH", 6)
     try:
         store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         try:
@@ -89,7 +91,7 @@ def test_attention_kind_epoch_is_independent_of_writer_epoch(
 
 def test_information_item_dismisses_without_reply(tmp_path: Path) -> None:
     opened = _session(tmp_path)
-    store = AttentionStore(opened.store.session_dir)
+    store = AttentionStore(opened.store.session_dir, writer_epoch=5)
     record = _record(store, kind="answer", session_id=opened.store.session_id)
     from zeta.attention_replies import AttentionReplies
 
@@ -105,7 +107,7 @@ def test_information_item_dismisses_without_reply(tmp_path: Path) -> None:
 
 def test_decision_cannot_be_dismissed(tmp_path: Path) -> None:
     opened = _session(tmp_path)
-    store = AttentionStore(opened.store.session_dir)
+    store = AttentionStore(opened.store.session_dir, writer_epoch=5)
     record = _record(store, session_id=opened.store.session_id)
     from zeta.attention_replies import AttentionReplies
 
@@ -137,18 +139,18 @@ def test_request_attention_kind_rules_use_registered_handler(tmp_path: Path) -> 
 def test_non_decision_creation_waits_for_shared_cutover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(attention_records, "WRITER_EPOCH", 6)
+    monkeypatch.setattr(storage_format, "WRITER_EPOCH", 6)
     advance(tmp_path, expected_epoch=0)
     session = _session(tmp_path)
     try:
         store = AttentionStore(session.store.session_dir, writer_epoch=4)
     except TypeError:
-        store = AttentionStore(session.store.session_dir)
+        store = AttentionStore(session.store.session_dir, writer_epoch=5)
     decision = _record(store, session_id=session.store.session_id)
     assert store.get(decision.id).kind == "decision"
     with pytest.raises(
         ValueError,
-        match=rf"zeta storage-format advance --expected-epoch 4 --target-epoch {ATTENTION_KIND_EPOCH}",
+        match=rf"zeta storage-format advance --expected-epoch 4 --target-epoch {FEATURE_EPOCHS[StorageFeature.ATTENTION_KINDS]}",
     ):
         _record(store, kind="answer", session_id=session.store.session_id)
     session.store.close()
@@ -156,7 +158,7 @@ def test_non_decision_creation_waits_for_shared_cutover(
 
 def test_attention_kind_closed_variant_is_fail_closed(tmp_path: Path) -> None:
     opened = _session(tmp_path)
-    store = AttentionStore(opened.store.session_dir)
+    store = AttentionStore(opened.store.session_dir, writer_epoch=5)
     record = _record(store, session_id=opened.store.session_id)
     path = store.directory / f"{record.id}.json"
     value = json.loads(path.read_text())
@@ -171,7 +173,7 @@ def test_attention_kind_closed_variant_is_fail_closed(tmp_path: Path) -> None:
 
 def test_information_items_reject_choice_affordances(tmp_path: Path) -> None:
     opened = _session(tmp_path)
-    store = AttentionStore(opened.store.session_dir)
+    store = AttentionStore(opened.store.session_dir, writer_epoch=5)
     with pytest.raises(ValueError, match="cannot have options"):
         _record(
             store, kind="decided", session_id=opened.store.session_id, options=["x"]

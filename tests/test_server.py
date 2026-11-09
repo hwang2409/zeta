@@ -8415,7 +8415,7 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         assert registry is not None
         project_record = registry.create_project("serve attention", "test")
         project_id = project_record.project_id
-        store = AttentionStore(opened.store.session_dir)
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         decision = store.request(
             session_id=session_id,
             project_id=project_id,
@@ -8574,7 +8574,7 @@ async def test_serve_request_attention_kind_is_in_tool_end_result(
 
         assert AttentionStore(
             server.runtime.opened.store.session_dir  # type: ignore[union-attr]
-        ).list()[0].kind == "answer"
+        , writer_epoch=5).list()[0].kind == "answer"
     finally:
         await close_serve(server, writer)
 

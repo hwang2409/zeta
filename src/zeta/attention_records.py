@@ -13,7 +13,6 @@ from typing import Any, Literal
 
 from .storage_format import (
     FEATURE_EPOCHS,
-    WRITER_EPOCH,
     StorageFeature,
     feature_enabled,
     require_closed_variant,
@@ -36,10 +35,14 @@ from .core.session_files import (
     session_directory,
     write_session_file,
 )
-from .storage_format import reject_unknown_keys
+from .storage_format import reject_unknown_keys, verify
 
 _MAX_RECORD_BYTES = 256 * 1024
 _MAX_BROKEN_ID_CHARS = 160
+
+
+def observed_epoch_for_session(session_dir: Path) -> int:
+    return verify(Path(session_dir).parent.parent).writer_epoch
 
 
 def _safe_broken_id(filename: str) -> str:
@@ -156,7 +159,7 @@ class AttentionRecord:
 class AttentionStore:
     """Own attention records behind one small session-local interface."""
 
-    def __init__(self, session_dir: Path, *, writer_epoch: int = WRITER_EPOCH):
+    def __init__(self, session_dir: Path, *, writer_epoch: int):
         self.session_dir = Path(session_dir)
         self.writer_epoch = writer_epoch
         self.directory = self.session_dir / "attention"
