@@ -15,16 +15,17 @@ from ..protocol.types import (
     ToolCall,
 )
 from .checkpoints import ConversationEntry
-from .store._approval_display import validated_approval_display
-from .store._async_writes import _AppendApprovalHistoryCommand
-from .store._client_delivery import CLIENT_DELIVERY_METADATA
-from .store._incremental_validation import APPROVAL_RESOLUTION_REASONS
 
 if TYPE_CHECKING:
     from .store._store import ConversationStore
 
 
 def validate_approval_history_data(data: Mapping[str, Any]) -> None:
+    # Imported lazily: this module is imported by the store package's _store,
+    # so importing these store submodules at load time would be circular.
+    from .store._approval_display import validated_approval_display
+    from .store._incremental_validation import APPROVAL_RESOLUTION_REASONS
+
     event = data.get("event")
     if event not in {"approval_request", "approval_end"}:
         raise ValueError("invalid approval history event")
@@ -100,6 +101,8 @@ class ApprovalHistoryStoreMixin:
         self, payload: Mapping[str, Any]
     ) -> ConversationEntry:
         """Append delegated history through the store's durable writer."""
+        from .store._async_writes import _AppendApprovalHistoryCommand
+
         return await self._commit_storage_command(
             _AppendApprovalHistoryCommand(payload=payload)
         )
@@ -188,6 +191,8 @@ def _metadata(message: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _predicate(key: RecentRowKey) -> tuple[str, Callable[[dict[str, Any]], bool]]:
     """Return the row type and a raw ``entry.data`` test; never decodes a Message."""
+    from .store._client_delivery import CLIENT_DELIVERY_METADATA
+
     match key:
         case ToolResult(tool_call_id):
             return "message", lambda data: (
