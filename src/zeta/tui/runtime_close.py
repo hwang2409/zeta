@@ -56,11 +56,7 @@ class RuntimeCloseMixin:
                     first_error = exc
 
         try:
-            cancel_background_invalidation = getattr(
-                self, "_cancel_background_invalidation", None
-            )
-            if cancel_background_invalidation is not None:
-                attempt(cancel_background_invalidation)
+            attempt(self._cancel_background_invalidation)
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
             prepare_ui_session_change = getattr(
