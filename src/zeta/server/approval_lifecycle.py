@@ -20,6 +20,7 @@ from .approval_settlement.approval_grants import (
     _ApprovalTarget,
     finish_grant,
 )
+from .approval_settlement.owner import TaskOwner
 from .connections import Admission
 from .protocol import (
     FRAME_CANCEL_GRACE,
@@ -197,7 +198,7 @@ class ApprovalLifecycle:
         self._is_closing = is_closing
         self._grant_published = grant_published
         self._state = ApprovalMachineState()
-        self._settlement_tasks: dict[asyncio.Task[object], ApprovalKey] = {}
+        self._task_owner = TaskOwner()
 
     @property
     def state(self) -> ApprovalMachineState:
@@ -545,52 +546,16 @@ class ApprovalLifecycle:
     async def wait_for_approval_settlement(
         self, timeout: float = APPROVAL_SETTLEMENT_CLOSE_TIMEOUT
     ) -> None:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while self._settlement_tasks:
-            tasks = tuple(self._settlement_tasks)
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            done, pending = await asyncio.wait(tasks, timeout=remaining)
-            for task in done:
-                if task in self._settlement_tasks:
-                    self._settlement_finished(task)
-            if pending:
-                break
-        if not self._settlement_tasks:
-            return
-        stuck = tuple(self._settlement_tasks)
-        logger.error(
-            "approval settlement tasks stuck during close",
-            extra={"approval_keys": [self._settlement_tasks[task] for task in stuck]},
-        )
-        for task in stuck:
-            task.cancel()
-        remaining = max(0.0, deadline - loop.time())
-        if remaining:
-            await asyncio.wait(stuck, timeout=remaining)
-
-    def _settlement_finished(self, task: asyncio.Task[object]) -> None:
-        key = self._settlement_tasks.pop(task, None)
-        if key is None or task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            logger.error(
-                "approval settlement task failed",
-                extra={"approval_key": key, "cause": repr(error)},
-                exc_info=(type(error), error, error.__traceback__),
-            )
+        await self._task_owner.drain(timeout)
 
     def _start_settlement(
-        self, record: ApprovalRecord | ApprovalKey, operation: Awaitable[object]
+        self,
+        record: ApprovalRecord | ApprovalKey,
+        operation: Awaitable[object],
+        kind: str = "settlement",
     ) -> asyncio.Task[object]:
         key = record.target.key if isinstance(record, ApprovalRecord) else record
-        task = asyncio.create_task(operation)
-        self._settlement_tasks[task] = key
-        task.add_done_callback(self._settlement_finished)
-        return task
+        return self._task_owner.start(key, operation, kind)
 
     def _new_record(self, target: _ApprovalTarget) -> ApprovalRecord:
         token = self._next_token()
@@ -987,8 +952,9 @@ class ApprovalLifecycle:
             terminal=(EventDescriptor.TOOL_END, session_id, fields),
         )
         if record.terminal_watchdog is None:
-            # terminal watchdogs are owned by their record and awaited by terminal transitions.
-            task = asyncio.create_task(self._terminal_bound(key, record.token))
+            task = self._start_settlement(
+                key, self._terminal_bound(key, record.token), "terminal watchdog"
+            )
             self._change(record, terminal_watchdog=task)
         return True
 
@@ -1021,6 +987,9 @@ class ApprovalLifecycle:
                     record.grant,
                     record.grant_committed,
                     record.grant_event_published,
+                    start_task=lambda operation, kind: self._start_settlement(
+                        record, operation, kind
+                    ),
                 )
                 record = self._change(
                     record,

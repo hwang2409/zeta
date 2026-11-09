@@ -42,6 +42,7 @@ from zeta.protocol.types import MessageRole, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer, approval_lifecycle, approval_settlement
 from zeta.server.approval_lifecycle import ExternalEnd
+from zeta.server.approval_settlement.owner import TaskOwner
 from zeta.server.protocol import EventDescriptor
 from zeta.tui.app import TUIApp
 
@@ -1321,17 +1322,14 @@ async def _first_child_bash_two_fact(
 
 
 def test_approval_task_creation_has_one_owner() -> None:
-    allowed = {
-        ("src/zeta/server/approval_lifecycle.py", "_start_settlement"),
-        ("src/zeta/server/approval_lifecycle.py", "release_or_hold_terminal"),
-        ("src/zeta/server/approval_settlement/approval_grants.py", "finish_grant"),
-    }
     root = Path(__file__).parents[1]
     violations: list[tuple[str, str, int]] = []
-    for relative in (
-        "src/zeta/server/approval_lifecycle.py",
-        "src/zeta/server/approval_settlement/approval_grants.py",
-    ):
+    files = [
+        root / "src/zeta/server/approval_lifecycle.py",
+        *root.glob("src/zeta/server/approval_settlement/**/*.py"),
+    ]
+    for path in files:
+        relative = str(path.relative_to(root))
         tree = ast.parse((root / relative).read_text())
         for parent in ast.walk(tree):
             if not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1340,11 +1338,33 @@ def test_approval_task_creation_has_one_owner() -> None:
                 if (
                     isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "create_task"
-                    and (relative, parent.name) not in allowed
+                    and node.func.attr in {"create_task", "ensure_future"}
+                    and not (
+                        relative.endswith("/approval_settlement/owner.py")
+                        and parent.name == "start"
+                    )
                 ):
                     violations.append((relative, parent.name, node.lineno))
     assert not violations, f"unowned approval task creation: {violations!r}"
+
+
+@pytest.mark.asyncio
+async def test_terminal_watchdog_failure_is_retrieved(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    owner = TaskOwner()
+
+    async def fail_terminal() -> None:
+        raise RuntimeError("terminal release failed")
+
+    owner.start("call-1", fail_terminal(), "terminal watchdog")
+    await owner.drain(0.1)
+    assert any(
+        record.message == "approval settlement task failed"
+        and record.approval_key == "call-1"
+        and record.kind == "terminal watchdog"
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
