@@ -4021,6 +4021,7 @@ async def _run_post_cap_tool_cycle(
                     store,
                     child_handle,
                     "fresh external prompt",
+                    owner=owner,
                     channel=owner.conversation_channel,
                 )
                 is None
@@ -4157,6 +4158,7 @@ async def test_causal_budget_stop_shows_held_input_as_not_delivered(
             store,
             child_handle,
             "fresh external prompt",
+            owner=owner,
             channel=owner.conversation_channel,
         )
         await await_or_fail(backend.fresh_prompt_seen.wait(), what="fresh prompt call")
@@ -4466,6 +4468,7 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             store,
             child_handle,
             "fresh external prompt",
+            owner=owner,
             channel=owner.conversation_channel,
         )
         terminal = asyncio.create_task(
@@ -10282,6 +10285,7 @@ async def test_step_delivery_never_reads_log_on_loop_after_foreign_change(
     monkeypatch.setattr(
         ConversationStore, "_load", observe("_load", ConversationStore._load)
     )
+    # test-contract: seam observes the full off-loop session load
     monkeypatch.setattr(
         ConversationStore,
         "_load_full",
@@ -11209,6 +11213,7 @@ async def test_turn_boundary_close_races_agent_send_atomically(
             assert release.wait(2)
         return original_append(store, entry_type, data, *args, **kwargs)
 
+    # test-contract: seam holds the durable prompt append at the race boundary
     monkeypatch.setattr(ConversationStore, "_append_row_unlocked", gate_prompt_append)
     send = asyncio.create_task(
         pending_delivery_module.send_to_run(
@@ -11549,6 +11554,8 @@ async def test_agent_send_cancellation_reports_durable_outcome(
     child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
     registry: ToolRegistry | None = None
     owner: BackgroundAgentOwner | None = None
+    from zeta.core.store import _async_writes as async_writes_module
+
     try:
         call = _run_agent_call()
         child_store.mark_agent_parent(call.id, agent_type="run")
@@ -11570,6 +11577,9 @@ async def test_agent_send_cancellation_reports_durable_outcome(
         delivery_flow = pending_delivery_module.StepDeliveryFlow(child_store)
         await delivery_flow.initialize()
         owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
+        watcher = asyncio.current_task()
+        assert watcher is not None
+        owner.register("parent:1", lambda: None, watcher, parent_store=parent_store)
         registry._agent_owner = owner
         canceled = asyncio.create_task(
             registry.execute(
@@ -11604,9 +11614,7 @@ async def test_agent_send_cancellation_reports_durable_outcome(
         monkeypatch.setattr(
             child_store, "_submitted_mutation_cancelled", observe_cancellation
         )
-        lock = child_store._append_lock()
-        lock.__enter__()
-        lock_held = True
+        lock_held = False
         task = asyncio.create_task(
             registry.execute(
                 ToolCall(
@@ -11626,13 +11634,9 @@ async def test_agent_send_cancellation_reports_durable_outcome(
                 cancellation_seen.wait(), what="agent_send cancellation policy"
             )
             release_worker.set()
-            lock.__exit__(None, None, None)
-            lock_held = False
             result = await await_or_fail(task, what="committed agent_send result")
         finally:
             release_worker.set()
-            if lock_held:
-                lock.__exit__(None, None, None)
             if not task.done():
                 task.cancel()
                 await await_or_fail(
@@ -13175,6 +13179,7 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
                 store,
                 child_handle,
                 "follow-up while task runs",
+                owner=owner,
                 channel=owner.conversation_channel,
             )
             is None
@@ -21789,6 +21794,9 @@ async def test_done_registered_watcher_cannot_send_or_cancel(
     assert "unknown child handle" in canceled["content"][0]["text"]
     assert publications == 0
     assert cancellations == 0
+    await loop.close()
+    child.close()
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -21822,6 +21830,9 @@ async def test_adoption_moves_live_mutation_control_to_current_owner(tmp_path: P
         watcher.cancel()
         await asyncio.wait_for(asyncio.gather(watcher, return_exceptions=True), 10)
         reopened_child.close()
+        grandchild.close()
+        child.close()
+        root.close()
 
 
 @pytest.mark.asyncio
@@ -21869,7 +21880,12 @@ async def test_agent_cancel_preserves_already_finished_for_direct_terminal_child
 
     assert result["isError"] is False
     assert result["structuredContent"]["status"] == "already_finished"
+    await loop.close()
+    child.close()
+    root.close()
 
+
+@pytest.mark.asyncio
 async def test_idle_child_wake_tool_count_is_cumulative(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -21955,6 +21971,7 @@ async def test_idle_child_wake_tool_count_is_cumulative(
                 parent_store,
                 handle,
                 "follow up",
+                owner=loop._background_owner,
                 channel=loop._background_owner.conversation_channel,
             )
             is None
