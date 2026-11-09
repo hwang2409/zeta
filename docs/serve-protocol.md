@@ -1210,6 +1210,7 @@ Event fields are:
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 | `replay_stream_ended` (feature `session_replay_seq`) | `event`, `session_id: string`, `stream_id: string`, `reason: "session_replaced"|"evicted"|"rejoined"` | none; never carries `seq` |
+| `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. It is an informational notice that a retry is
@@ -1660,6 +1661,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `send_images_delivery_id` | with `delivery_id`, lets `send_images` accept durable idempotency IDs; matching echoes and history rows use `user_message_delivery_id` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
+| `live_config_changed` | live skill and agent-profile reloads emit `config_changed` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 | `model_input_ids` | `slash_run` stores generated model input server-side and returns a single-use `input_id` accepted by `send` |

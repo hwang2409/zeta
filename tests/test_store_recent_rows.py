@@ -283,3 +283,43 @@ def test_scan_reads_raw_rows_without_decoding(
     assert store.recent_row_seq(ApprovalHistory("approval_end", "approval-raw")) == 1
     assert store.recent_row_seq(ToolResult("missing")) is None
     assert store.recent_row_seq(UserTurnMessageAfter(0, MessageOrigin.USER)) == 2
+
+
+def test_torn_tail_repair_of_a_rewritten_log_publishes_one_reset(
+    store: ConversationStore,
+) -> None:
+    first = store.append_message(_assistant("old"))
+    store.append_message(_assistant("tip"))
+    start = store.reset_generation()
+    installed: list[object] = []
+    store.on_entries_installed = installed.append
+
+    _replace_first_row_id(store)
+    with store.path.open("ab") as handle:
+        handle.write(b'{"seq": 3, "id": "torn"')
+    with pytest.warns(RuntimeWarning, match="dropped torn final"):
+        store.refresh()
+
+    assert installed == ["reset"]
+    assert store.reset_generation() == start + 1
+    assert store.row_id_at(first.seq) == "replacement-id" != first.id
+    assert store.entries[-1].type == "warning"
+
+
+def test_torn_tail_repair_of_an_extended_log_publishes_the_suffix(
+    store: ConversationStore,
+) -> None:
+    store.append_message(_assistant("old"))
+    store.append_message(_assistant("tip"))
+    start = store.reset_generation()
+    installed: list[object] = []
+    store.on_entries_installed = installed.append
+
+    with store.path.open("ab") as handle:
+        handle.write(b'{"seq": 3, "id": "torn"')
+    with pytest.warns(RuntimeWarning, match="dropped torn final"):
+        store.refresh()
+
+    assert [[entry.type for entry in delta] for delta in installed] == [["warning"]]
+    assert installed[0][0].id == store.entries[-1].id
+    assert store.reset_generation() == start

@@ -215,6 +215,7 @@ class EventDescriptor(StrEnum):
     USER_MESSAGE = "user_message"
     SESSION_GRANTS_CHANGED = "session_grants_changed"
     REPLAY_STREAM_ENDED = "replay_stream_ended"
+    CONFIG_CHANGED = "config_changed"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -229,6 +230,7 @@ FEATURES = (
     "send_images_delivery_id",
     "list_sessions_paging",
     "memory_updated",
+    "live_config_changed",
     "ping",
     "assistant_reset",
     "model_input_ids",

@@ -1018,7 +1018,9 @@ class _Client:
         runtime = self.server.runtime
         if runtime.opened is None:
             return None
-        snapshot = runtime.metadata.to_dict()
+        snapshot = ergonomics._active_runtime_snapshot(
+            runtime.metadata.to_dict(), runtime.loop
+        )
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
