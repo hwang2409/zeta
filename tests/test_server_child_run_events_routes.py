@@ -996,3 +996,87 @@ async def test_child_setup_failure_ends_once_after_its_failed_lifecycle(
     finally:
         unregister()
         await _close(serve)
+
+
+# --- cancellation inside the background terminal transition ----------------------
+
+TRANSITION_AWAITS = (
+    ("store", "finalize_background_agent"),
+    ("channel", "close_questions"),
+    ("channel", "reroute_questions_from"),
+    ("channel", "publish_completion"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize("owner,method", TRANSITION_AWAITS, ids=[name for _owner, name in TRANSITION_AWAITS])
+async def test_cancel_at_each_background_transition_await_still_publishes_one_consistent_end(
+    tmp_path: Path, transport: Transport, owner: str, method: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Design 9.1: the finalize/adopt/receipt transition is shielded from the watcher's cancel.
+
+    The watcher is canceled while the transition waits at one of its awaits. The
+    lifecycle still becomes terminal, the receipt installs once, and exactly one
+    ``child_ended`` reaches the wire after the durable lifecycle is terminal.
+    """
+    from zeta.agent.conversation_channel import ConversationChannel
+    from zeta.core.agent_progress import register_child_run_sink
+    from zeta.core.store import ConversationStore
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    holder = ConversationStore if owner == "store" else ConversationChannel
+    original = getattr(holder, method)
+
+    async def gated(self: Any, *args: Any, **kwargs: Any) -> Any:
+        current = asyncio.current_task()
+        if current is not None and current.get_coro().__qualname__.endswith("commit_adopt_publish"):
+            entered.set()
+            await await_or_fail(release.wait(), what=f"release {method}")
+        return await original(self, *args, **kwargs)
+
+    # test-contract: seam hold the background terminal transition at one of its awaits
+    monkeypatch.setattr(holder, method, gated)
+    route = LiveRoute(True, False, "completed")
+    backend = route.actors()
+    serve = await _open(tmp_path, transport, backend)
+    probe = EndProbe(serve.store.session_dir)
+    unregister = register_child_run_sink(probe.sink)
+    try:
+        target = f"{serve.session_id}:1"
+        top = await serve.observer()
+        await serve.join(top, None)
+        await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
+        await await_or_fail(backend.entered["child-work"].wait(), what="background child started")
+        backend.release_all()
+        await await_or_fail(entered.wait(), what=f"transition reached {method}")
+        [watcher] = [
+            task for task in asyncio.all_tasks()
+            if task.get_coro().__qualname__.endswith("finish_background")
+        ]
+        # the cancel is delivered to the watcher before the held transition resumes
+        watcher.cancel()
+        release.set()
+        await await_or_fail(asyncio.wait({watcher}), what="background watcher ended")
+        assert watcher.cancelled(), "the deferred cancel was not re-raised"
+        loop = asyncio.get_running_loop()
+        hop = loop.create_future()
+        loop.call_soon_threadsafe(hop.set_result, None)
+        await await_or_fail(hop, what="lifecycle callbacks applied")
+        live = await serve.drain(top)
+
+        ends = _lifecycle(live, "child_ended", target)
+        assert len(ends) == 1, live
+        assert ends[0]["child"]["status"] == "completed" and "finished_at" in ends[0]["child"]
+        receipt = _receipt_entry(serve.store, route, target, "agent-1")
+        assert ends[0]["sequence"] == receipt.seq
+        published = probe.for_run(target)
+        assert [number for number, _durable in published] == [receipt.seq]
+        assert published[0][1]["state"] == "completed" and published[0][1].get("finished_at")
+        durable = load_session_json(_lifecycle_path(serve.store.session_dir, target))
+        assert durable["state"] == "completed"
+    finally:
+        unregister()
+        release.set()
+        backend.release_all()
+        await _close(serve)
