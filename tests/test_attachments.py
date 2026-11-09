@@ -15,7 +15,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.owned import owned_app
+from tests.support.owned import await_or_fail, owned_app
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ImageContent,
@@ -394,22 +394,21 @@ async def test_cancelled_image_paste_cleans_up_staged_file(
     def paste_image(*args: object, **kwargs: object) -> Path:
         del args, kwargs
         entered.set()
-        release.wait()
+        release.wait(10)
         staged.write_bytes(PNG)
         return staged
 
     monkeypatch.setattr(paste_runtime, "paste_image", paste_image)
     task = asyncio.create_task(app._paste_runtime.paste())
-    while not entered.is_set():
-        await asyncio.sleep(0)
+    await await_or_fail(asyncio.to_thread(entered.wait), what="paste worker start")
     task.cancel()
     release.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="cancelled paste")
     assert not staged.exists()
     assert app._pending_attachments == []
-    await app.loop.close()
+    await await_or_fail(app.loop.close(), what="close app loop")
 
 
 @pytest.mark.asyncio
@@ -604,7 +603,7 @@ async def test_paste_completion_file_io_stays_off_loop(
     app._active_session = old_session
     task = app._paste_runtime.start()
     app._active_session = app._make_session()
-    assert await task == ""
+    assert await await_or_fail(task, what="stale paste") == ""
 
     assert io_threads
     assert all(thread != loop_thread for thread in io_threads)
@@ -1032,10 +1031,12 @@ async def test_clipboard_image_is_normalized_before_provider_request(
         return path
 
     monkeypatch.setattr(paste_runtime, "paste_image", paste_image)
-    token = await app._paste_runtime.paste()
-    await app._handle_prompt_value(f"inspect {token}")
+    token = await await_or_fail(app._paste_runtime.paste(), what="paste image")
+    await await_or_fail(
+        app._handle_prompt_value(f"inspect {token}"), what="submit image prompt"
+    )
     assert app._active_task is not None
-    await app._active_task
+    await await_or_fail(app._active_task, what="image prompt task")
 
     image = next(
         block
@@ -1155,7 +1156,7 @@ async def test_mixed_tui_submission_prepares_each_source_once_off_loop(
             resolve_threads.append(threading.get_ident())
             if threading.get_ident() != loop_thread:
                 loop.call_soon_threadsafe(resolve_entered.set)
-                resolve_release.wait()
+                resolve_release.wait(10)
         return real_resolve(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve)
@@ -1163,22 +1164,25 @@ async def test_mixed_tui_submission_prepares_each_source_once_off_loop(
     submission = asyncio.create_task(
         app._handle_prompt_value(f"use {token} then @./prompt.txt")
     )
-    entered = asyncio.create_task(resolve_entered.wait())
-    done, _ = await asyncio.wait(
-        {submission, entered}, return_when=asyncio.FIRST_COMPLETED
+    entered = asyncio.create_task(asyncio.to_thread(resolve_entered.wait, 10))
+    done, _ = await await_or_fail(
+        asyncio.wait({submission, entered}, return_when=asyncio.FIRST_COMPLETED),
+        what="attachment resolution start",
     )
     if entered in done:
         prompt_loop_ran = asyncio.Event()
         loop.call_soon(prompt_loop_ran.set)
-        await prompt_loop_ran.wait()
+        await await_or_fail(prompt_loop_ran.wait(), what="prompt loop turn")
         assert not submission.done()
         resolve_release.set()
-    await submission
+    await await_or_fail(submission, what="attachment submission")
     if app._active_task is not None:
-        await app._active_task
+        await await_or_fail(app._active_task, what="attachment prompt task")
     entered.cancel()
-    await asyncio.gather(entered, return_exceptions=True)
-
+    await await_or_fail(
+        asyncio.gather(entered, return_exceptions=True),
+        what="cancel resolution waiter",
+    )
     user = next(
         message for message in store.messages() if message.role is MessageRole.USER
     )
