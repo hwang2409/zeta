@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.server_client import (
+    _buffer,
     assert_event_order,
     event_owner,
     frames_for_call,
@@ -17,7 +19,6 @@ from tests.support.server_client import (
     request,
     send,
 )
-from tests.support.server_client import read as buffered_read
 
 _READ_METHODS = {"readline", "readuntil"}
 
@@ -206,22 +207,44 @@ async def test_event_reads_fail_when_a_sent_request_gets_no_response(
 
 
 @pytest.mark.asyncio
-async def test_buffered_read_regression_rejects_old_direct_read() -> None:
-    reader = _Reader(
-        {"params": {"event": "tool_end"}},
-        {"params": {"event": "approval_end"}},
-        {"id": 1, "result": {}},
-    )
-    await request(reader, _Writer(), 1, "deny")
+async def test_request_consumes_buffered_frames_before_socket_reads() -> None:
+    reader = _Reader({"id": 2, "result": {}})
+    _buffer(reader).append({"id": 1, "result": {}})
 
-    with pytest.raises(AssertionError, match="server closed"):
-        while True:
-            line = await reader.readline()
-            assert line, "server closed the socket"
-            if json.loads(line).get("params", {}).get("event") == "tool_end":
-                break
+    assert await request(reader, _Writer(), 1, "deny") == [{"id": 1, "result": {}}]
 
-    assert (await buffered_read(reader))["params"]["event"] == "tool_end"
+
+@pytest.mark.asyncio
+async def test_canceled_request_restores_deferred_frames() -> None:
+    read_started = asyncio.Event()
+    read_release = asyncio.Event()
+
+    class BlockingReader(_Reader):
+        async def readline(self) -> bytes:
+            read_started.set()
+            await await_or_fail(read_release.wait(), what="socket read release")
+            return b""
+
+    skipped = _event_frame("session_grants_changed", "grant")
+    reader = BlockingReader()
+    _buffer(reader).append(skipped)
+    pending = asyncio.create_task(request(reader, _Writer(), 1, "approve"))
+    try:
+        await await_or_fail(read_started.wait(), what="socket read start")
+        pending.cancel()
+        await await_or_fail(
+            asyncio.gather(pending, return_exceptions=True),
+            what="request cancellation",
+        )
+        assert list(_buffer(reader)) == [skipped]
+    finally:
+        read_release.set()
+        if not pending.done():
+            pending.cancel()
+            await await_or_fail(
+                asyncio.gather(pending, return_exceptions=True),
+                what="request cleanup",
+            )
 
 
 # The shape of the pre-#647 mistake in test_server.py: a raw readline on the
