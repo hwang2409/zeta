@@ -89,6 +89,27 @@ async def _event_transport(
             return frame
 
 
+async def _rpc_transport_with_frames(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    transport: Transport,
+    request_id: str,
+    method: str,
+    params: dict[str, object],
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    await _send_transport(
+        reader,
+        writer,
+        transport,
+        {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+    )
+    frames = []
+    while True:
+        frame = await _read_transport(reader, transport)
+        frames.append(frame)
+        if frame.get("id") == request_id:
+            return frame, frames
+
 
 async def _connect(server: ZetaServer) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     await asyncio.wait_for(server.start(), TIMEOUT)
@@ -271,6 +292,15 @@ async def test_run_work_real_transports_and_all_task_statuses(
         if killed is None:
             killed = await _event_transport(reader, transport, "background_task_updated")
         assert killed["params"]["task"]["status"] == "killed"  # type: ignore[index]
+        repeated, repeated_frames = await _rpc_transport_with_frames(
+            reader, writer, transport, "cancel-terminal", "background_task_cancel",
+            {"session_id": session_id, "task_id": task_id},
+        )
+        assert repeated["result"]["task"]["status"] == "killed"  # type: ignore[index]
+        assert not any(
+            frame.get("params", {}).get("event") == "background_task_updated"  # type: ignore[union-attr]
+            for frame in repeated_frames
+        )
         for exit_code, expected in ((0, "exited"), (3, "failed")):
             command = f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit({exit_code})'"
             await registry.start(command, tmp_path)
@@ -295,8 +325,15 @@ async def test_run_work_events_are_suppressed_without_negotiation_or_for_observe
         await _rpc_transport(controller_reader, controller_writer, transport, "hello", "hello", {"protocol_version": "1.2", "features": []})
         await _rpc_transport(controller_reader, controller_writer, transport, "new", "new_session", {"provider": "codex"})
         await server.runtime.loop.tool_registry.background_tasks.start("true", tmp_path)
-        sentinel = await _rpc_transport(controller_reader, controller_writer, transport, "sentinel", "status", {})
+        server.runtime.opened.store.set_todo_items([{"content": "hidden", "status": "pending"}])
+        sentinel, frames = await _rpc_transport_with_frames(
+            controller_reader, controller_writer, transport, "sentinel", "status", {}
+        )
         assert sentinel["id"] == "sentinel"
+        assert not any(
+            frame.get("params", {}).get("event") in {"background_task_updated", "todo_updated"}  # type: ignore[union-attr]
+            for frame in frames
+        )
     finally:
         await close_serve(server, controller_writer)
 
@@ -317,8 +354,15 @@ async def test_run_work_events_are_suppressed_without_negotiation_or_for_observe
         try:
             await _rpc_transport(observer_reader, observer_writer, transport, "observer-hello", "hello", {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers", "run_work"]})
             await server.runtime.loop.tool_registry.background_tasks.start("true", tmp_path)
-            sentinel = await _rpc_transport(observer_reader, observer_writer, transport, "observer-status", "status", {})
+            server.runtime.opened.store.set_todo_items([{"content": "hidden", "status": "pending"}])
+            sentinel, frames = await _rpc_transport_with_frames(
+                observer_reader, observer_writer, transport, "observer-status", "status", {}
+            )
             assert sentinel["id"] == "observer-status"
+            assert not any(
+                frame.get("params", {}).get("event") in {"background_task_updated", "todo_updated"}  # type: ignore[union-attr]
+                for frame in frames
+            )
         finally:
             await close_serve(server, observer_writer)
     finally:

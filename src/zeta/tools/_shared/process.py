@@ -988,8 +988,14 @@ class BackgroundTaskRegistry:
             record.terminal_phase, record.note, record.tui_presented = (
                 phase, reason, tui_presented
             )
+            notice = BackgroundTaskNotice(
+                "background task stopping: " + record.command,
+                record.task_id,
+                "stopping",
+                record.owner,
+            )
             try:
-                await self._commit_notice(None)
+                await self._commit_notice(notice)
             except Exception:
                 record.terminal_phase, record.note, record.tui_presented = previous
                 raise

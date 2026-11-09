@@ -15,7 +15,7 @@ class BackgroundTaskNotice:
 
     message: str
     task_id: str
-    phase: Literal["started", "natural_exit", "task_kill", "session_shutdown"]
+    phase: Literal["started", "stopping", "natural_exit", "task_kill", "session_shutdown"]
     owner: str
 
 
