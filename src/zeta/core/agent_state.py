@@ -27,13 +27,6 @@ from .agent_progress import (
 )
 from .checkpoints import ConversationIntegrityError, _now, load_session_json
 from .session_files import child_directory, read_session_file, write_session_file
-from .store._async_writes import (
-    _FinishAgentChildCommand,
-    _FinishAgentLifecycleCommand,
-    _FinishAgentParentCommand,
-    _MarkAgentCanceledCommand,
-    _RegisterAgentChildCommand,
-)
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
 _TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
@@ -793,6 +786,14 @@ class AgentStateMixin:
         canceled_tool_call_id: str | None = None,
     ) -> tuple[str, ...]:
         """Transfer direct markers and durably publish one terminal lifecycle."""
+
+        from .store._async_writes import (
+            _FinishAgentChildCommand,
+            _FinishAgentLifecycleCommand,
+            _FinishAgentParentCommand,
+            _MarkAgentCanceledCommand,
+            _RegisterAgentChildCommand,
+        )
 
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
