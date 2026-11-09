@@ -10,6 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from ..agent.turn_limit import project_notification_data, project_tool_result_data
 from ..core.checkpoints import list_branches_from_entries
 from ..core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ..models.catalog import PROVIDER_MODELS, known_model_names
@@ -526,7 +527,7 @@ def _history_entry_rows(
     if entry_type == "warning":
         return [_transcript_recovery_history_row(entry)]
     if entry_type == "notification":
-        data = entry.data
+        data = project_notification_data(entry.data)
         kind = data.get("kind", "agent_completion")
         if kind == "task_exited":
             text = (
@@ -590,6 +591,7 @@ def _history_entry_rows(
                 content.append({"type": "thinking", "text": ""})
     result = message.get("tool_result")
     if result:
+        result = project_tool_result_data(result)
         blocks = []
         if fidelity:
             for index, block in enumerate(result.get("content_blocks") or []):

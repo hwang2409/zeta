@@ -28,6 +28,7 @@ class AgentPreset:
     accepts_follow_ups: bool = False
     explicit_finish: bool = False
     max_child_depth: int | None = None
+    max_turns: int | None = None
 
     @property
     def description(self) -> str:

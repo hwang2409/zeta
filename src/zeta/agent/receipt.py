@@ -6,7 +6,8 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any, Literal, Protocol
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from ..core.checkpoints import ConversationEntry
 from ..protocol.types import (
@@ -19,8 +20,59 @@ from ..protocol.types import (
     flatten_tool_content,
 )
 
+if TYPE_CHECKING:
+    from ..core.store import ConversationStore
+
 ReceiptState = Literal["running", "completed", "failed", "canceled"]
 TerminalState = Literal["completed", "failed", "canceled"]
+
+
+def lifecycle_tool_result(
+    tool_call: ToolCall, child_store: ConversationStore, child_path: Path
+) -> ToolResult | None:
+    lifecycle = child_store.agent_lifecycle()
+    if lifecycle is None or lifecycle.get("finished_at") is None:
+        return None
+    state = lifecycle.get("state")
+    final_result = lifecycle.get("final_result")
+    if type(state) is not str or type(final_result) is not str or not final_result:
+        return None
+    structured: dict[str, object] = {
+        "turns_used": lifecycle.get("turns_used", 0),
+        "child_session_path": str(child_path),
+        "status": state,
+    }
+    for key in ("agent_type", "handle", "depth"):
+        if key in lifecycle:
+            structured["child_instance_id" if key == "handle" else key] = lifecycle[key]
+    state_value: TerminalState = (
+        "completed"
+        if state == "completed"
+        else "canceled"
+        if state == "canceled"
+        else "failed"
+    )
+    if lifecycle.get("final_result_is_receipt") is True:
+        return ToolResult(
+            tool_call.id,
+            final_result,
+            is_error=state_value == "failed",
+            structured_content=structured,
+            is_canceled=state_value == "canceled",
+        )
+    result = build_agent_receipt(
+        state_value,
+        final_result,
+        agent_stats(
+            lifecycle,
+            status=state_value,
+            turns_used=structured["turns_used"]
+            if type(structured["turns_used"]) is int
+            else 0,
+        ),
+        structured_content=structured,
+    )
+    return receipt_tool_result(tool_call.id, result)
 
 
 def child_cleanup_details(
@@ -738,6 +790,12 @@ def finalize_agent_results(
                     ),
                 ),
             )
+            if metadata.get("status") == "turn_limit":
+                from .turn_limit import project_payload
+
+                projected_path = metadata.get("child_session_path")
+                if type(projected_path) is str:
+                    payload = project_payload(payload, projected_path)
             result = replace(
                 receipt_tool_result(call.id, payload),
                 lifecycle_projection=candidate.lifecycle_projection or {},

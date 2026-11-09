@@ -9102,9 +9102,9 @@ def _stub_backend_factory(
         requested.append((provider, model))
         return child_backend, model or ""
 
-    monkeypatch.setattr("zeta.agent.runner.build_backend", build)
+    monkeypatch.setattr("zeta.agent.child_context.build_backend", build)
     monkeypatch.setattr(
-        "zeta.agent.runner.credential_store",
+        "zeta.agent.child_context.credential_store",
         lambda provider, **kwargs: _FakeCredentials(
             _ValidTokens() if tokens is None else tokens
         ),
@@ -9386,11 +9386,11 @@ def test_resolve_child_backend_accepts_bootstrapped_login(
             return _ValidTokens()
 
     monkeypatch.setattr(
-        "zeta.agent.runner.credential_store",
+        "zeta.agent.child_context.credential_store",
         lambda provider: BootstrapCredentials(None),
     )
     monkeypatch.setattr(
-        "zeta.agent.runner.build_backend",
+        "zeta.agent.child_context.build_backend",
         lambda provider, model, *, token_budget=None: (child, model),
     )
     assert resolve_child_backend(loop, "gpt-5.6-luna") == (child, None)
@@ -9403,7 +9403,7 @@ async def test_agent_reports_a_missing_provider_login(
     child_backend = FakeBackend([ScriptedTurn([TextContent("unreachable")])])
     _stub_backend_factory(monkeypatch, child_backend, tokens=None)
     monkeypatch.setattr(
-        "zeta.agent.runner.credential_store",
+        "zeta.agent.child_context.credential_store",
         lambda provider, **kwargs: _FakeCredentials(None),
     )
     backend = FakeBackend([ScriptedTurn(tool_calls=[_model_agent_call()])])

@@ -44,6 +44,15 @@ MAX_EMPTY_TURN_NUDGES = 3
 MAX_EMPTY_TURN_DETAIL_CHARS = 128
 
 
+@dataclass(frozen=True, slots=True)
+class ToollessTransition:
+    continue_turn: bool
+    consuming_notifications: bool
+    nudge_turn_pending: bool
+    recovery_state: EmptyTurnRecoveryState
+    error: ErrorInfo | None = None
+
+
 @dataclass(slots=True)
 class EmptyTurnRecoveryState:
     nudge_count: int = 0
@@ -60,6 +69,52 @@ class EmptyTurnRecoveryState:
     def record_event(self, event: Any) -> None:
         if event.type is StreamEventType.TOOL_EXECUTION_END:
             self.record_tool_result(event.tool_call, event.tool_result)
+
+
+async def toolless_transition(
+    loop: Any,
+    step_delivery: Any,
+    assistant_message: Message,
+    *,
+    iteration_consuming_notifications: bool,
+    notification_turn: bool,
+    recovery_state: EmptyTurnRecoveryState,
+) -> ToollessTransition:
+    should_nudge = (
+        not iteration_consuming_notifications
+        and should_nudge_empty_turn(
+            assistant_message,
+            stop_reason=loop._turn_stop_reason,
+            notification_turn=notification_turn,
+            already_nudged=(
+                recovery_state.nudge_episode == recovery_state.tool_result_episode
+            ),
+            nudge_count=recovery_state.nudge_count,
+        )
+    )
+    consume_pending = step_delivery.has_pending_edge and not notification_turn
+    error = empty_turn_recovery_error(
+        assistant_message,
+        notification_turn=notification_turn,
+        consuming_notifications=consume_pending,
+        should_nudge=should_nudge,
+        recovery_state=recovery_state,
+    )
+    if should_nudge:
+        await step_delivery.admit_terminal("nudge")
+        await loop._append_turn_message(build_nudge_message())
+    elif not step_delivery.has_pending_edge and loop.agent_instance_id is None:
+        await step_delivery.admit_terminal("foreground_end")
+    if should_nudge:
+        recovery_state.nudge_count += 1
+        recovery_state.nudge_episode = recovery_state.tool_result_episode
+    return ToollessTransition(
+        continue_turn=consume_pending or should_nudge,
+        consuming_notifications=consume_pending,
+        nudge_turn_pending=should_nudge,
+        recovery_state=recovery_state,
+        error=error,
+    )
 
 
 async def complete_empty_turn(

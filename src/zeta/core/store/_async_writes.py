@@ -354,6 +354,14 @@ class _FinishAgentParentCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _EnsureTurnLimitHandoffCommand(_StoreMutationCommand):
+    content: bytes
+
+    def apply(self, store: Any) -> bool:
+        return store.ensure_turn_limit_handoff(self.content)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _FinishAgentLifecycleCommand(_StoreMutationCommand):
     state: str
     final_result: str

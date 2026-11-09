@@ -79,6 +79,7 @@ class AgentCatalog:
                     "allow_delegation": agent.allow_delegation,
                     "accepts_follow_ups": agent.accepts_follow_ups,
                     "explicit_finish": agent.explicit_finish,
+                    "max_turns": agent.max_turns,
                 }
             )
             snapshots.append(snapshot)
@@ -100,6 +101,7 @@ class AgentCatalog:
             allow_delegation = item.get("allow_delegation", True)
             accepts_follow_ups = item.get("accepts_follow_ups", False)
             explicit_finish = item.get("explicit_finish", False)
+            max_turns = item.get("max_turns")
             source = item.get("source", "")
             path = item.get("path")
             agents_root = item.get("agents_root")
@@ -120,6 +122,7 @@ class AgentCatalog:
                 or type(allow_delegation) is not bool
                 or type(accepts_follow_ups) is not bool
                 or type(explicit_finish) is not bool
+                or (max_turns is not None and (type(max_turns) is not int or max_turns < 1))
                 or type(source) is not str
                 or (path is not None and type(path) is not str)
                 or (agents_root is not None and type(agents_root) is not str)
@@ -139,6 +142,7 @@ class AgentCatalog:
                     allow_delegation=allow_delegation,
                     accepts_follow_ups=accepts_follow_ups,
                     explicit_finish=explicit_finish,
+                    max_turns=max_turns,
                 )
             )
         return cls(tuple(agents))
@@ -196,6 +200,11 @@ def _build_agent(
         raise ValueError(
             f"agent {document.path} frontmatter explicit_finish must be a boolean"
         )
+    max_turns = metadata.get("max_turns")
+    if max_turns is not None and (type(max_turns) is not int or max_turns < 1):
+        raise ValueError(
+            f"agent {document.path} frontmatter max_turns must be a positive integer"
+        )
     max_child_depth = metadata.get("max_child_depth")
     if max_child_depth is not None and (
         type(max_child_depth) is not int
@@ -221,6 +230,7 @@ def _build_agent(
         accepts_follow_ups=accepts_follow_ups,
         explicit_finish=explicit_finish,
         max_child_depth=max_child_depth,
+        max_turns=max_turns,
     )
 
 

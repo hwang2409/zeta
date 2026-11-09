@@ -26,7 +26,12 @@ from .agent_progress import (
     remove_live_agent_lifecycle,
 )
 from .checkpoints import ConversationIntegrityError, _now, load_session_json
-from .session_files import child_directory, read_session_file, write_session_file
+from .session_files import (
+    child_directory,
+    read_session_file,
+    write_session_file,
+    write_session_file_if_absent,
+)
 from .store._async_writes import (
     _FinishAgentChildCommand,
     _FinishAgentLifecycleCommand,
@@ -779,6 +784,14 @@ class AgentStateMixin:
                     killed_task_ids_truncated
                 )
             self._write_agent_lifecycle()
+
+    def ensure_turn_limit_handoff(self, content: bytes) -> bool:
+        """Durably create the deterministic turn-limit handoff once."""
+        if type(content) is not bytes or not content:
+            raise ValueError("turn-limit handoff must be nonempty bytes")
+        return write_session_file_if_absent(
+            self.directory_fd, "turn-limit-handoff.md", content
+        )
 
     async def finalize_background_agent(
         self,
