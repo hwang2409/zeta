@@ -1024,7 +1024,7 @@ def load_project_context(
         except (ProjectRegistryError, OSError) as exc:
             notices.append(f"context · project memory unavailable: {exc}")
 
-        if inbox_enabled:
+        if inbox_enabled and project is not None:
             sections.append(
                 f"You work on project {project.name}. Do not change other "
                 "projects' code; report their bugs or requests with inbox "
