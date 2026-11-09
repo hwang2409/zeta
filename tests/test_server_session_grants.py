@@ -2222,7 +2222,13 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     # Force the real busy predicate to remain active while the
                     # replacement controller queries status and sends.
                     release_handoff = asyncio.Event()
-                    handoff = asyncio.create_task(release_handoff.wait())
+                    handoff = asyncio.create_task(
+                        await_or_fail(
+                            release_handoff.wait(),
+                            timeout=10,
+                            what="replacement turn handoff gate",
+                        )
+                    )
                     server.control._turn_handoff_task = handoff
                     try:
                         busy_status = (await request(12, "status", {}))[-1]
@@ -2231,7 +2237,9 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         assert busy_send[-1]["error"]["code"] == -32004
                     finally:
                         release_handoff.set()
-                        await await_or_fail(handoff, what="replacement turn handoff")
+                        await await_or_fail(
+                            handoff, timeout=10, what="replacement turn handoff"
+                        )
 
                     idle_status = (await request(14, "status", {}))[-1]
                     assert idle_status["result"]["state"] == "idle"
