@@ -278,7 +278,7 @@ async def test_config_changed_replay_observers_are_feature_filtered(
         await server.control.user_message(
             "user-marker",
             "default",
-            frozenset(),
+            frozenset({"user_message_event", "delivery_id", "user_message_delivery_id"}),
             delivery_id="delivery-marker",
         )
         user = await with_feature.event("user_message")
