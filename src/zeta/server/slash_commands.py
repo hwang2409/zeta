@@ -19,7 +19,7 @@ from typing import Protocol
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..attention_decisions import DecisionItem, open_decisions
-from ..attention_records import Broken, broken_record_refusal
+from ..attention_records import Broken
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
@@ -201,24 +201,15 @@ class ServerSlashSession:
     async def _run_decisions_batch(
         self, batch: list[tuple[str, str]], from_session: str
     ) -> str:
-        _loop, opened = self._active_loop_and_session()
-        items = await asyncio.to_thread(
-            open_decisions,
-            self._runtime.home,
-            opened.metadata.session_id,
-            self._runtime.manager.project_registry_state,
-        )
-        by_id = {item.record.id: item.record for item in items}
-        for attention_id, _reply in batch:
-            record = by_id.get(attention_id)
-            if isinstance(record, Broken):
-                return broken_record_refusal(record)
-        await self._run_attention_operation(
+        outcome = await self._run_attention_operation(
             self._attention_replies(from_session).stage_and_flush,
             batch,
             from_session,
         )
-        return f"replied to {len(batch)} attention item(s)"
+        refusals = [item.detail for item in outcome.items if item.status == "broken"]
+        replied = len(outcome.items) - len(refusals)
+        lines = [f"replied to {replied} attention item(s)"] if replied else []
+        return "\n".join([*lines, *refusals])
 
     async def _slash_decisions_action(
         self,
