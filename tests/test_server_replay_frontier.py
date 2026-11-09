@@ -47,6 +47,7 @@ pytest_plugins = ("tests.support.socket_fixtures",)
 
 TRANSPORTS: tuple[Transport, ...] = ("unix", "websocket")
 CONTROLLER_FEATURES = ("delivery_id", "user_message_event", "user_message_delivery_id", "model_input_ids")
+CHILD_FEATURES = ("child_run_history", "child_run_events")
 Route = tuple[EventDescriptor, str]
 
 
@@ -75,7 +76,9 @@ class Serve:
     async def client(self) -> ReplayClient:
         client = await connect_replay(self.server, self.transport)
         self.clients.append(client)
-        await negotiate(client, observer=True, extra=CONTROLLER_FEATURES, protocol_version="1.2")
+        await negotiate(
+            client, observer=True, extra=CONTROLLER_FEATURES + CHILD_FEATURES, protocol_version="1.2"
+        )
         return client
 
     async def join(self, client: ReplayClient) -> dict[str, Any]:
@@ -137,8 +140,18 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
         serve.published.append((record.event, dict(record.fields), record.facts, covers))
         admit_deferred(record, covers)
 
+    publish_child_lifecycle = server.connections.publish_child_lifecycle
+
+    def recorded_child(
+        event: EventDescriptor, scope: Any, session_id: str, fields: dict[str, Any], covers: Any
+    ) -> None:
+        serve.published.append((event, dict(fields), rows.RowFacts(), covers))
+        publish_child_lifecycle(event, scope, session_id, fields, covers)
+
     # test-contract: seam observe each publication's internal covers before the wire strips it
     server.connections._replay_covers = recorded  # type: ignore[method-assign]
+    # test-contract: seam observe each child lifecycle publication's covers
+    server.connections.publish_child_lifecycle = recorded_child  # type: ignore[method-assign]
     # test-contract: seam observe each deferred copy's covers when its row is found
     server.connections._admit_deferred = recorded_deferred  # type: ignore[method-assign]
     return serve
@@ -171,6 +184,12 @@ def _history_rows_for(
             row
             for row in history
             if row.get("event") == event.value and row.get("request_id") == fields["request_id"]
+        ]
+    if event in {EventDescriptor.CHILD_STARTED, EventDescriptor.CHILD_ENDED}:
+        return [
+            row
+            for row in history
+            if row.get("event") == event.value and row.get("run_id") == fields["run_id"]
         ]
     if event is EventDescriptor.DELIVERY_STATUS:
         return [
@@ -490,6 +509,8 @@ PREMISE_SCENARIOS: dict[Route, tuple[str, ...]] = {
     (EventDescriptor.APPROVAL_END, "foreground"): ("foreground_tool",),
     (EventDescriptor.APPROVAL_END, "delegated"): ("background_child",),
     (EventDescriptor.DELIVERY_STATUS, ""): ("dropped_steer",),
+    (EventDescriptor.CHILD_STARTED, ""): ("background_child",),
+    (EventDescriptor.CHILD_ENDED, ""): ("background_child",),
     **{(event, "durable"): (f"notification_{event.value}",) for event in NOTIFICATIONS},
 }
 ROW_BACKED = [
@@ -502,6 +523,7 @@ NO_ROW_CASES: list[tuple[Route, str]] = [
     ((EventDescriptor.APPROVAL_END, "write_failed"), "synthetic_abort"),
     ((EventDescriptor.TOOL_END, "child"), "background_child"),
     ((EventDescriptor.TOOL_START, ""), "background_child"),
+    ((EventDescriptor.CHILD_PROGRESS, ""), "background_child"),
     ((EventDescriptor.USER_MESSAGE, "steer"), "dropped_steer"),
     ((EventDescriptor.TURN_ABORTED, ""), "dropped_steer"),
 ]
@@ -545,7 +567,9 @@ async def test_premise_row_backed_frame_covers_its_history_row(
         for fields, facts, covers in records:
             matched = _history_rows_for(route[0], fields, facts, history)
             assert len({row["id"] for row in matched}) == 1, (route, fields, matched)
-            assert covers == seqs[matched[0]["id"]], (route, covers, matched[0])
+            # a child_ended row presents its immediate-parent receipt entry
+            row_id = matched[0]["id"].removesuffix(":child_ended")
+            assert covers == seqs[row_id], (route, covers, matched[0])
     finally:
         await _close(serve)
 
