@@ -608,6 +608,11 @@ class AttentionReplies:
             state.registry,
             sessions_root=self.home / "sessions",
         )
+        preamble = (
+            f"User relayed from session {sender}. Check whether the situation has changed before acting."
+            if self.origin == USER_ORIGIN
+            else f"Agent-authored attention decision from session {sender}. Check whether the situation has changed before acting."
+        )
         inbox.send(
             from_project=first.project_id,
             from_session=sender,
@@ -617,8 +622,7 @@ class AttentionReplies:
             title=f"{label}: {first.title}"
             if len(records) == 1
             else f"{label} batch ({len(records)})",
-            body=f"Attention decision relayed from session {sender}. Check whether the situation has changed before acting.\n\n"
-            + "\n\n".join(sections),
+            body=preamble + "\n\n" + "\n\n".join(sections),
             message_id=self._message_id(pairs),
             on_visible=self.on_inbox_visible,
             _origin=self.origin,
