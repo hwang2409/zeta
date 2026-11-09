@@ -5359,6 +5359,7 @@ async def test_child_registry_agent_schema_uses_its_catalog_snapshot(
     )
     child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
     child = None
+    loop = None
     try:
         child = registry.clone_for_session(child_store)
         loop = AgentLoop(
@@ -5376,6 +5377,8 @@ async def test_child_registry_agent_schema_uses_its_catalog_snapshot(
         assert properties["agent_type"]["enum"] == ["nested"]
         assert properties["preset"]["enum"] == ["nested"]
     finally:
+        if loop is not None:
+            await loop.close()
         if child is not None:
             await child.close()
         await registry.close()
