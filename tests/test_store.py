@@ -67,6 +67,76 @@ def test_persistent_detached_writer_retains_home_lease(tmp_path: Path) -> None:
         store.close()
 
 
+def test_ordinary_append_reuses_entry_id_index(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path, session_id="no-entry-scan") as store:
+        first = store.append_message(message(MessageRole.ASSISTANT, "first"))
+
+        class CountingEntries(list[ConversationEntry]):
+            iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        entries = CountingEntries(store._entries)
+        store._entries = entries
+        store.commit_compaction_marker(
+            "summary", 1, 1, expected_parent_id=first.id
+        )
+
+        assert entries.iterations == 0
+        assert store._entry_ids == {entry.id for entry in list(entries)}
+
+
+def test_entry_id_index_matches_entries_after_mixed_appends(tmp_path: Path) -> None:
+    session_id = "mixed-entry-id-index"
+    with ConversationStore(tmp_path, session_id=session_id) as store:
+        first = store.append_message(message(MessageRole.ASSISTANT, "first"))
+        store.append_many(
+            [("warning", {"message": "second"}), ("warning", {"message": "third"})]
+        )
+        expected_ids = {entry.id for entry in store.entries}
+        assert store._entry_ids == expected_ids
+
+        with patch("zeta.core.store._store.uuid.uuid4") as generated:
+            generated.return_value.hex = first.id
+            with pytest.raises(
+                ConversationIntegrityError,
+                match=f"duplicate conversation id: {first.id}",
+            ):
+                store.commit_compaction_marker(
+                    "duplicate",
+                    1,
+                    1,
+                    expected_parent_id=store.active_branch_head_id(),
+                )
+        assert store._entry_ids == expected_ids
+
+        with pytest.raises(
+            ConversationIntegrityError, match="missing prior parent missing-parent"
+        ):
+            store.append_message_with_approval_requests(
+                message(MessageRole.ASSISTANT, "missing"), parent_id="missing-parent"
+            )
+        assert store._entry_ids == expected_ids
+
+        with patch.object(
+            store, "_write_line", side_effect=asyncio.CancelledError()
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                store.commit_compaction_marker(
+                    "cancelled",
+                    1,
+                    1,
+                    expected_parent_id=store.active_branch_head_id(),
+                )
+        assert store._entry_ids == expected_ids
+
+    with ConversationStore(tmp_path, session_id=session_id) as reopened:
+        assert reopened._entry_ids == {entry.id for entry in reopened.entries}
+        assert reopened._entry_ids == expected_ids
+
+
 def test_store_rejects_unknown_notification_kind_on_write(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
