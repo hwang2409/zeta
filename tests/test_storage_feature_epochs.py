@@ -17,7 +17,17 @@ from zeta.storage_format import StorageFormatError, open_writer
 from zeta.tools.registry import ToolRegistry
 
 
-def _allowed_writer_default(node: ast.AST, parents: dict[ast.AST, ast.AST], path: Path) -> bool:
+def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    return {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+
+def _allowed_writer_default(
+    node: ast.Name, parents: dict[ast.AST, ast.AST], path: Path
+) -> bool:
     if path != Path.cwd() / "src" / "zeta" / "cli" / "main.py":
         return False
     keyword = parents.get(node)
@@ -35,40 +45,28 @@ def _allowed_writer_default(node: ast.AST, parents: dict[ast.AST, ast.AST], path
     )
 
 
-def _writer_epoch_names(tree: ast.AST) -> set[str]:
-    names = {"WRITER_EPOCH"}
-    module_names = {"storage_format"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "zeta.storage_format":
-            for imported in node.names:
-                if imported.name == "WRITER_EPOCH":
-                    names.add(imported.asname or imported.name)
-        elif isinstance(node, ast.Import):
-            for imported in node.names:
-                if imported.name == "zeta.storage_format":
-                    module_names.add(imported.asname or "zeta.storage_format")
-                elif imported.name == "storage_format":
-                    module_names.add(imported.asname or imported.name)
-    return names | {f"{module}.WRITER_EPOCH" for module in module_names}
+def _writer_epoch_violation(
+    node: ast.AST, parents: dict[ast.AST, ast.AST], path: Path
+) -> bool:
+    if isinstance(node, ast.alias):
+        return node.name == "WRITER_EPOCH" and path != (
+            Path.cwd() / "src" / "zeta" / "cli" / "main.py"
+        )
+    if isinstance(node, ast.Name):
+        return node.id == "WRITER_EPOCH" and not _allowed_writer_default(
+            node, parents, path
+        )
+    return isinstance(node, ast.Attribute) and node.attr == "WRITER_EPOCH"
 
 
 def _writer_epoch_violations(path: Path, source: str) -> list[str]:
     tree = ast.parse(source, filename=str(path))
-    parents: dict[ast.AST, ast.AST] = {}
-    for parent in ast.walk(tree):
-        for child in ast.iter_child_nodes(parent):
-            parents[child] = parent
-    names = _writer_epoch_names(tree)
-    violations = []
-    for node in ast.walk(tree):
-        is_name = isinstance(node, ast.Name) and node.id in names
-        is_attribute = (
-            isinstance(node, ast.Attribute)
-            and node.attr == "WRITER_EPOCH"
-        )
-        if (is_name or is_attribute) and not _allowed_writer_default(node, parents, path):
-            violations.append(f"{path}:{node.lineno}")
-    return violations
+    parents = _parent_map(tree)
+    return [
+        f"{path}:{node.lineno}"
+        for node in ast.walk(tree)
+        if _writer_epoch_violation(node, parents, path)
+    ]
 
 
 def test_feature_gates_do_not_compare_against_writer_epoch() -> None:
@@ -80,7 +78,8 @@ def test_feature_gates_do_not_compare_against_writer_epoch() -> None:
         for violation in _writer_epoch_violations(path, path.read_text())
     ]
     assert not violations, (
-        "compare against FEATURE_EPOCHS[<feature>] in storage_format.py: "
+        "compare against FEATURE_EPOCHS[...] / feature_enabled() in "
+        "src/zeta/storage_format.py: "
         + ", ".join(violations)
     )
 
@@ -90,9 +89,11 @@ def test_feature_gates_do_not_compare_against_writer_epoch() -> None:
     [
         "from zeta.storage_format import WRITER_EPOCH as epoch\nif home_epoch == epoch: pass",
         "from zeta.storage_format import WRITER_EPOCH as epoch\ndef f(value=epoch): pass",
+        "from .storage_format import WRITER_EPOCH as e\nif home_epoch == e: pass",
+        "from ..storage_format import WRITER_EPOCH as e\ndef f(value=e): pass",
         "def f(value=WRITER_EPOCH): pass",
         "import zeta.storage_format as sf\ndef f(value=sf.WRITER_EPOCH): pass",
-        "import zeta.storage_format as sf\nif home_epoch == sf.WRITER_EPOCH: pass",
+        "import storage_format as sf\nif home_epoch == sf.WRITER_EPOCH: pass",
     ],
 )
 def test_writer_epoch_guard_rejects_aliases(source: str, tmp_path: Path) -> None:

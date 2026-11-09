@@ -6,7 +6,7 @@ import asyncio
 from typing import TypedDict
 
 from ...attention_forks import validate_attention_fork
-from ...attention_records import AttentionStore, observed_epoch_for_session
+from ...attention_records import AttentionStore
 from ...attention_replies import AttentionReplies
 from ...protocol.types import StructuredToolResult
 from ...runtime.project_registry_state import ProjectRegistryState
@@ -48,7 +48,10 @@ async def _resolve_attention(
         store.session_id,
     )
     record = await asyncio.to_thread(
-        AttentionStore(home / "sessions" / validated.record.session_id, writer_epoch=observed_epoch_for_session(home / "sessions" / validated.record.session_id)).get,
+        AttentionStore(
+            home / "sessions" / validated.record.session_id,
+            writer_epoch=store.observed_storage_epoch,
+        ).get,
         validated.record.id,
     )
     if outcome.already_resolved:
@@ -85,7 +88,10 @@ async def _close_attention(
         arguments["decision"],
     )
     record = await asyncio.to_thread(
-        AttentionStore(store.session_dir, writer_epoch=observed_epoch_for_session(store.session_dir)).get, arguments["attention_id"]
+        AttentionStore(
+            store.session_dir, writer_epoch=store.observed_storage_epoch
+        ).get,
+        arguments["attention_id"],
     )
     if outcome.already_resolved:
         return _success_result(
