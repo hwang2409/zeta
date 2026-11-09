@@ -13603,6 +13603,42 @@ def test_tui_diagnostic_write_ignores_fd_exhaustion(
 
 
 @pytest.mark.asyncio
+async def test_slow_successful_draft_flush_does_not_report_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[str] = []
+    write_started = threading.Event()
+    release_write = threading.Event()
+    persistence = DraftPersistence(
+        tmp_path / "draft",
+        delay=0,
+        notice_sink=notices.append,
+    )
+    original_write = persistence_module.write_json_file
+
+    def slow_write(*args: object, **kwargs: object) -> None:
+        write_started.set()
+        assert release_write.wait(10)
+        original_write(*args, **kwargs)
+
+    monkeypatch.setattr(persistence_module, "write_json_file", slow_write)
+    monkeypatch.setattr(persistence_module, "PERSISTENCE_FLUSH_TIMEOUT", 0.01)
+    persistence.schedule("slow draft")
+    flush = asyncio.create_task(persistence.flush_pending())
+    try:
+        assert await asyncio.to_thread(write_started.wait, 10)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(flush, 10)
+        assert notices == []
+    finally:
+        release_write.set()
+    await persistence._writer.flush(timeout=10)
+    await asyncio.sleep(0)
+    assert persistence.load() == "slow draft"
+
+
+@pytest.mark.asyncio
 async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
