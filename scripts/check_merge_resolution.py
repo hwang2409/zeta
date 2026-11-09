@@ -131,7 +131,15 @@ def parse_items(
     cache_key = (
         id(tree),
         path,
-        tuple(sorted((name, ast.dump(elements, include_attributes=False)) for name, elements in collection_lookup.items())),
+        tuple(
+            sorted(
+                (
+                    name,
+                    tuple(ast.dump(element, include_attributes=False) for element in elements),
+                )
+                for name, elements in collection_lookup.items()
+            )
+        ),
     )
     cached = _PARSE_ITEMS_CACHE.get(cache_key)
     if cached is not None:
