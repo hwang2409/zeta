@@ -54,7 +54,7 @@ from zeta.remote_sync.project_publish import (
 )
 from zeta.remote_sync.project_publish import publish_version as publish_remote_version
 from zeta.remote_sync.ssh import SshTransport
-from zeta.server.project_requests import ProjectRequests
+from zeta.server.handlers.projects import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog

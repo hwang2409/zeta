@@ -21,7 +21,7 @@ from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import _MEMORY_MIRROR_HEADER
 from zeta.project_registry import ProjectRegistry
-from zeta.server.project_requests import ProjectRequests
+from zeta.server.handlers.projects import ProjectRequests
 from zeta.server.protocol import FrameCodec
 
 

@@ -966,7 +966,7 @@ class ConversationLogMixin:
             yield _PhysicalRow(row_number, row_offset, value)
 
     def _repair_explicit_load_error(
-        self: ConversationStore, error: TranscriptLoadError
+        self: ConversationStore, error: TranscriptLoadError, since: tuple[int, int]
     ) -> bool:
         if not self._repair_explicit or error._source_facts is None:
             return False
@@ -980,7 +980,7 @@ class ConversationLogMixin:
             memory_review_required=self._repair_target.child_run_id is None,
         )
         self._repair_explicit = False
-        self._load_full()
+        self._load_full(since)
         return True
 
     def _repair_torn_row(
@@ -989,14 +989,14 @@ class ConversationLogMixin:
         validator: _FullLoadValidator,
         stat: os.stat_result,
         raw: bytes,
-        delta: tuple[ConversationEntry, ...],
+        since: tuple[int, int],
     ) -> bool:
         if torn_offset is None:
             return False
         if self._storage_lease.observed_epoch != WRITER_EPOCH:
             self._repair_torn_tail_legacy(torn_offset)
             self._log_offset = torn_offset
-            self._publish_entries_installed(delta)
+            self._publish_reload(since)
             self._append_torn_warning_legacy()
             return True
         prefix = validator.validated_prefix(torn_offset)
@@ -1023,10 +1023,27 @@ class ConversationLogMixin:
             RuntimeWarning,
             stacklevel=2,
         )
-        self._load_full()
+        self._load_full(since)
         return True
 
-    def _load_full(self: ConversationStore) -> None:
+    def _publish_reload(self: ConversationStore, since: tuple[int, int]) -> None:
+        """Publish one reload: a reset if any install in it bumped the generation."""
+        if self.on_entries_installed is None:
+            return
+        generation, count = since
+        self._publish_entries_installed(
+            "reset"
+            if self._reset_generation != generation
+            else tuple(self._entries[count:])
+        )
+
+    def _load_full(
+        self: ConversationStore, since: tuple[int, int] | None = None
+    ) -> None:
+        # Nested reloads (repairs) receive the outer reload's start, so the
+        # whole operation publishes once against the rows resident before it.
+        if since is None:
+            since = (self._reset_generation, len(self._entries))
         self._full_reload_count += 1
         if not self._read_only and self._storage_lease.observed_epoch == WRITER_EPOCH:
             reconcile_pending(
@@ -1053,27 +1070,17 @@ class ConversationLogMixin:
                 validator.accept(physical_row)
             validator.finish()
         except TranscriptLoadError as error:
-            if self._repair_explicit_load_error(error):
+            if self._repair_explicit_load_error(error, since):
                 return
             raise
 
-        delta: InstalledEntriesDelta = ()
-        if self.on_entries_installed is not None:
-            delta = (
-                "reset"
-                if validator.resets_resident_rows
-                else self._owned_installed_delta(
-                    tuple(self._entries[validator.baseline[0] :])
-                )
-            )
-        if self._repair_torn_row(torn_offset, validator, stat, raw, delta):
+        if self._repair_torn_row(torn_offset, validator, stat, raw, since):
             return
         if not self._read_only and not raw.endswith(b"\n"):
             self._write_bytes(b"\n")
-            self._publish_entries_installed(delta)
         else:
             self._set_log_stat(stat)
-            self._publish_entries_installed(delta)
+        self._publish_reload(since)
 
     def _validate_header(self: ConversationStore, header: dict[str, Any]) -> None:
         header_data = header.get("data")

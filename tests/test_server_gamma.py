@@ -35,7 +35,8 @@ from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.completion import owned_completion
-from zeta.server import ZetaServer, image_delivery, slash_commands
+from zeta.server import ZetaServer, slash_commands
+from zeta.server.handlers import send_images, settings
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -102,13 +103,25 @@ def _tool_stdout(end: dict) -> str:
 @pytest.mark.asyncio
 async def test_controller_model_catalog_works_before_session_attachment(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class ReverseSet(set[str]):
+        def __iter__(self):
+            return iter(sorted(super().__iter__(), reverse=True))
+
+    monkeypatch.setattr(
+        settings,
+        "PROVIDER_MODELS",
+        {"test": ReverseSet({"model-a", "model-b"})},
+    )
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer)
-        result = (await _request(reader, writer, 2, "model_catalog"))[-1]
-        assert result["result"]["models"]
+        result = (await _request(reader, writer, 2, "model_catalog"))[-1]["result"]
+        assert result["models"]
+        assert list(result["providers"]) == ["model-a", "model-b"]
+        assert result["providers"] == {"model-a": "test", "model-b": "test"}
     finally:
         await close_serve(server, writer)
 
@@ -911,7 +924,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
     heartbeat = asyncio.Event()
     heartbeat_reached_thread = threading.Event()
     decoded_after_heartbeat: list[bool] = []
-    original_decode = image_delivery.base64.b64decode
+    original_decode = send_images.base64.b64decode
 
     def record_decode(*args, **kwargs):
         if threading.get_ident() != threading.main_thread().ident:
@@ -919,7 +932,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
         decoded_after_heartbeat.append(heartbeat.is_set())
         return original_decode(*args, **kwargs)
 
-    monkeypatch.setattr(image_delivery.base64, "b64decode", record_decode)
+    monkeypatch.setattr(send_images.base64, "b64decode", record_decode)
     output = io.BytesIO()
     Image.new("RGB", (3000, 180), "white").save(output, format="PNG")
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
@@ -965,7 +978,7 @@ async def test_cancelled_send_images_publishes_nothing(
     worker_started = threading.Event()
     release_worker = threading.Event()
     worker_finished = threading.Event()
-    original_normalize = image_delivery.normalize_image_bytes
+    original_normalize = send_images.normalize_image_bytes
 
     async def gated_normalize(*args, **kwargs):
         worker_started.set()
@@ -975,7 +988,7 @@ async def test_cancelled_send_images_publishes_nothing(
         finally:
             worker_finished.set()
 
-    monkeypatch.setattr(image_delivery, "normalize_image_bytes", gated_normalize)
+    monkeypatch.setattr(send_images, "normalize_image_bytes", gated_normalize)
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -1018,7 +1031,7 @@ async def test_send_images_publication_is_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publication_threads: list[int] = []
-    original_publish = image_delivery.write_session_file
+    original_publish = send_images.write_session_file
     output = io.BytesIO()
     Image.new("RGB", (3318, 180), "white").save(output, format="PNG")
     oversized = output.getvalue()
@@ -1027,7 +1040,7 @@ async def test_send_images_publication_is_off_event_loop(
         publication_threads.append(threading.get_ident())
         original_publish(*args, **kwargs)
 
-    monkeypatch.setattr(image_delivery, "write_session_file", record_publish)
+    monkeypatch.setattr(send_images, "write_session_file", record_publish)
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
     server = _server(
         tmp_path, backend, _launch(tmp_path), provider="anthropic"
