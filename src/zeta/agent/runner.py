@@ -934,13 +934,15 @@ async def run_agent_tool(
         # a subscription hold names its account; a rate limit uses the child's pin
         pinned = selected_accounts.get(account_provider(str(hold["provider"])) or "")
         account = hold.get("account") or (None if pinned is None else str(pinned))
-        await loop._background_owner.conversation_channel.publish_hold(
-            child_instance_id=child_instance_id,
-            child_session_path=child_path,
-            description=description,
-            hold=hold,
-            account=account,
-        )
+        # no live parent flow (the tree is closing) must not end the held child
+        with suppress(LookupError):
+            await loop._background_owner.conversation_channel.publish_hold(
+                child_instance_id=child_instance_id,
+                child_session_path=child_path,
+                description=description,
+                hold=hold,
+                account=account,
+            )
 
     def child_turns() -> int:
         return loop._agent_child_turns.get(tool_call.id, 0)
