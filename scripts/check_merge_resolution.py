@@ -478,22 +478,43 @@ def _direct_main_parent(
 
 
 def _train_chain_parent(
-    parents: list[str], first_parent_chain: set[str], origin_main: str
-) -> tuple[int | None, str]:
+    parents: list[str],
+    first_parent_chain: set[str],
+    origin_main: str,
+    train_head: str | None,
+) -> tuple[int | None, str, str]:
+    """Pick the train side of a merge on a train branch.
+
+    Without train evidence, only an all-merge chain qualifies. With
+    --train-head (CI passes it for train/* PRs, built per AGENTS.md as
+    train/<lane>-<n> from origin/main with a git merge --no-ff of each PR
+    head), the train side is the parent on the train head's own first-parent
+    chain, so plain fix commits between the train's merges are allowed.
+    """
     if not origin_main:
-        return None, ""
+        return None, "", "neither parent qualifies"
     matches = [
         index
         for index, parent in enumerate(parents)
         if _train_parent_qualifies(parent, first_parent_chain)
     ]
     if len(matches) == 1:
-        return matches[0], "the selected parent is the train merge chain"
-    return None, ""
+        return matches[0], "the selected parent is the train merge chain", ""
+    if len(matches) > 1:
+        return None, "", "both parents qualify"
+    if not train_head:
+        return None, "", "neither parent qualifies"
+    train_chain = set(
+        git("rev-list", "--first-parent", train_head, "^" + origin_main).splitlines()
+    )
+    matches = [index for index, parent in enumerate(parents) if parent in train_chain]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is on the --train-head first-parent chain", ""
+    return None, "", "neither parent qualifies"
 
 
 def _identify_main_parent(
-    parents: list[str],
+    parents: list[str], train_head: str | None
 ) -> tuple[int | None, str, str, str]:
     """Identify the main parent, or return evidence for an explicit refusal."""
     try:
@@ -511,17 +532,11 @@ def _identify_main_parent(
             origin_main,
             "exactly one parent is on origin/main ancestry",
         )
-    index, reason = _train_chain_parent(parents, first_parent_chain, origin_main)
+    index, reason, details = _train_chain_parent(
+        parents, first_parent_chain, origin_main, train_head
+    )
     if index is not None:
         return index, reason, origin_main, "exactly one parent is the train merge chain"
-    train_matches = [
-        parent
-        for parent in parents
-        if origin_main and _train_parent_qualifies(parent, first_parent_chain)
-    ]
-    details = (
-        "both parents qualify" if len(train_matches) > 1 else "neither parent qualifies"
-    )
     return None, "", origin_main, details
 
 
@@ -582,11 +597,11 @@ def _validate_override(
 
 
 def resolve_parent(
-    commit: str, parents: list[str], main_sha: str | None
+    commit: str, parents: list[str], main_sha: str | None, train_head: str | None
 ) -> tuple[str, str, str] | None:
     p1, p2 = parents
     print(f"parents: 1={p1} 2={p2}")
-    index, reason, origin_main, details = _identify_main_parent(parents)
+    index, reason, origin_main, details = _identify_main_parent(parents, train_head)
     if main_sha is not None:
         index = _validate_override(
             commit, parents, main_sha, index, origin_main, details
@@ -1281,6 +1296,10 @@ def main() -> int:
         "--main-sha",
         help="exact object name of the merge parent that carries main",
     )
+    parser.add_argument(
+        "--train-head",
+        help="head of the train/* branch; its first-parent chain is the main side",
+    )
     parser.add_argument("--allow", type=argparse.FileType("r"))
     parser.add_argument("--pr-body-file", type=argparse.FileType("r"))
     parser.add_argument(
@@ -1297,7 +1316,7 @@ def main() -> int:
     if len(parents) != 2:
         print(f"{commit} is not a two-parent merge; nothing to check")
         return 0
-    resolved = resolve_parent(commit, parents, args.main_sha)
+    resolved = resolve_parent(commit, parents, args.main_sha, args.train_head)
     if resolved is None:
         return 2
     main, branch, _reason = resolved

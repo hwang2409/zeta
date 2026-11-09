@@ -770,7 +770,15 @@ def _direct_case(
     )
 
 
-def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str, str]:
+def _train_case(
+    r: Path,
+    *,
+    newer: bool,
+    depth: int = 1,
+    plain: bool = False,
+    synced_pr: bool = False,
+    stacked_pr: bool = False,
+) -> tuple[str, str, str, str]:
     _api_repo(r)
     initial = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
@@ -812,6 +820,22 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
         )
         (r / "src/pr.py").write_text("def pr(): pass\n")
         commit(r, "older pr")
+        if synced_pr:
+            # the PR branch merges main, then adds a plain commit (#1050's shape).
+            subprocess.run(
+                ["git", "merge", "--no-ff", "--no-edit", base], cwd=r, check=True
+            )
+            (r / "src/pr_fix.py").write_text("def pr_fix(): pass\n")
+            commit(r, "pr fix after main merge")
+        if stacked_pr:
+            # the PR stacks on a PR the train already merged (#1085's shape).
+            subprocess.run(
+                ["git", "merge", "--no-ff", "--no-edit", train_change],
+                cwd=r,
+                check=True,
+            )
+            (r / "src/pr_fix.py").write_text("def pr_fix(): pass\n")
+            commit(r, "pr fix after stacking")
         pr_base = "pr-side"
     subprocess.run(
         ["git", "update-ref", "refs/remotes/origin/main", origin_main],
@@ -836,6 +860,10 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
             check=True,
         )
         commit(r, f"train merge {index + 1}")
+    if plain:
+        # a plain fix commit on the train between merges (train #1053's 72a6596d).
+        (r / "src/train_fix.py").write_text("def train_fix(): pass\n")
+        commit(r, "train plain fix")
     train_merge = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
@@ -850,12 +878,61 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
     subprocess.run(
         ["git", "merge", "--no-ff", "--no-commit", pr_head], cwd=r, check=True
     )
-    subprocess.run(["git", "rm", "-qf", "src/main_only.py"], cwd=r, check=True)
+    # the stacked PR also carries main_only, so plain shapes lose the fix commit.
+    loss = "train_fix" if plain else "main_only"
+    subprocess.run(["git", "rm", "-qf", f"src/{loss}.py"], cwd=r, check=True)
     commit(r, "train result")
     merge = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
-    return merge, train_merge, pr_head, "main_only"
+    return merge, train_merge, pr_head, loss
+
+
+def _branch_merge_case(r: Path, shape: str) -> tuple[str, str, str, str]:
+    """Build review b1's merges, where "brings a side" cannot tell a train from a PR."""
+
+    def git(*args: str) -> str:
+        return subprocess.check_output(["git", *args], cwd=r, text=True).strip()
+
+    def add(name: str, base: str) -> None:
+        git("checkout", "-q", "-B", name, base)
+        (r / f"src/{name}.py").write_text(f"def {name}(): pass\n")
+        commit(r, name)
+
+    def merge(into: str, side: str) -> None:
+        git("checkout", "-q", into)
+        git("merge", "--no-ff", "--no-edit", side)
+
+    _api_repo(r)
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    if shape == "pr-merges-pr-with-merge":
+        # PR head P merges PR Q, which merged branch R; the merge drops P's own file.
+        add("r_side", "main")
+        add("q_side", "main")
+        merge("q_side", "r_side")
+        add("q_fix", "q_side")
+        add("p_side", "main")
+        into, side, loss = "p_side", "q_fix", "p_side"
+    else:
+        # train merges A and stacked B, adds a plain fix, then merges C, which
+        # stacks on B and merged outside branch D; the merge drops the train fix.
+        add("a_side", "main")
+        add("b_side", "a_side")
+        add("d_side", "main")
+        git("checkout", "-q", "-B", "c_side", "b_side")
+        merge("c_side", "d_side")
+        add("c_fix", "c_side")
+        git("checkout", "-q", "-B", "train", "main")
+        merge("train", "a_side")
+        merge("train", "b_side")
+        add("train_fix", "train")
+        into, side, loss = "train_fix", "c_fix", "train_fix"
+    git("checkout", "-q", into)
+    p1 = git("rev-parse", "HEAD")
+    git("merge", "--no-ff", "--no-commit", side)
+    git("rm", "-qf", f"src/{loss}.py")
+    commit(r, "lossy merge")
+    return git("rev-parse", "HEAD"), p1, git("rev-parse", side), loss
 
 
 @pytest.mark.parametrize("case", ["lost line", "renamed owner"])
@@ -1261,6 +1338,16 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     assert run(r, "--pr-body-file", str(body)).returncode == 1
 
 
+_TRAIN_HEAD_SHAPES = {
+    "train-plain",
+    "train-plain-newer",
+    "train-plain-synced-pr",
+    "train-plain-stacked-pr",
+    "train-plain-wrong",
+    "train-stacked-pr-carries-all-train-head",
+}
+
+
 @pytest.mark.parametrize(
     ("shape", "expected", "refusal"),
     [
@@ -1270,6 +1357,15 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
         ("train-older", 0, False),
         ("train-newer", 0, False),
         ("train-newer-wrong", None, True),
+        ("train-plain", 0, False),
+        ("train-plain-newer", 0, False),
+        ("train-plain-synced-pr", 0, False),
+        ("train-plain-stacked-pr", 0, False),
+        ("train-plain-wrong", None, True),
+        ("train-plain-no-train-head", None, True),
+        ("pr-merges-pr-with-merge", None, True),
+        ("train-stacked-pr-carries-all", None, True),
+        ("train-stacked-pr-carries-all-train-head", 0, False),
         ("both", None, True),
         ("neither", None, True),
         ("wrong", None, True),
@@ -1280,12 +1376,19 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
 def test_parent_selection_table(
     tmp_path: Path, shape: str, expected: int | None, refusal: bool
 ) -> None:
-    if shape.startswith("train"):
+    args: tuple[str, ...] = ()
+    if shape == "pr-merges-pr-with-merge" or shape.startswith("train-stacked"):
+        r = repo(tmp_path)
+        merge, p1, p2, loss = _branch_merge_case(r, shape)
+    elif shape.startswith("train"):
         r = repo(tmp_path)
         merge, p1, p2, loss = _train_case(
             r,
-            newer=shape in {"train-newer", "train-newer-wrong"},
+            newer=shape in {"train-newer", "train-newer-wrong", "train-plain-newer"},
             depth=1 if shape == "train-1" else 2,
+            plain=shape.startswith("train-plain"),
+            synced_pr=shape == "train-plain-synced-pr",
+            stacked_pr=shape == "train-plain-stacked-pr",
         )
     else:
         r = repo(tmp_path)
@@ -1298,7 +1401,9 @@ def test_parent_selection_table(
             if shape == "update-branch"
             else "merge",
         )
-    args: tuple[str, ...] = ()
+    if shape in _TRAIN_HEAD_SHAPES:
+        # CI passes --train-head only for train/* head refs.
+        args = ("--train-head", merge)
     if shape == "both":
         subprocess.run(
             ["git", "checkout", "-qb", "later", f"{merge}^1^"], cwd=r, check=True
@@ -1320,8 +1425,8 @@ def test_parent_selection_table(
         subprocess.run(
             ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
         )
-    if shape == "train-newer-wrong":
-        args = ("--main-sha", p2)
+    if shape in {"train-newer-wrong", "train-plain-wrong"}:
+        args = (*args, "--main-sha", p2)
     elif shape == "wrong":
         # guard: this direct-shape refusal already held on 707549ed.
         args = ("--main-sha", p1)
@@ -1335,7 +1440,7 @@ def test_parent_selection_table(
         if shape == "wrong":
             assert f"disagrees with the identified main parent {p2}" in result.stderr
             assert "main parent:" not in result.stdout
-        elif shape == "train-newer-wrong":
+        elif shape in {"train-newer-wrong", "train-plain-wrong"}:
             assert f"disagrees with the identified main parent {p1}" in result.stderr
             assert "main parent:" not in result.stdout
         else:

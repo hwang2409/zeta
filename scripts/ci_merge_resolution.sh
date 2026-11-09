@@ -53,6 +53,8 @@ for commit in $commits; do
   echo "checking merge resolution: $commit"
   args=("$commit" --final "$FINAL_SHA")
   [ -z "$body_file" ] || args+=(--pr-body-file "$body_file")
+  # train/<lane>-<n> is built from origin/main with git merge --no-ff of each PR head.
+  case "${HEAD_REF:-}" in train/*) args+=(--train-head "$HEAD_SHA") ;; esac
   run_check "${args[@]}"
   # Only ask GitHub when the PR's own explanations leave findings.
   if [ "$status" -eq 1 ] && [ "$EVENT_NAME" = pull_request ]; then
