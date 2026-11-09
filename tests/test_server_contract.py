@@ -338,6 +338,8 @@ async def test_controller_and_observer_roles_match(
     observer_requests = observer_hello["result"]["capabilities"]["requests"]
     assert "new_session" not in observer_requests
     assert "session_grants" in observer_requests
+    assert "child_run_list" in observer_requests
+    assert "child_run_send" not in observer_requests
     assert "revoke_session_grants" not in observer_requests
     assert observed["result"] == {"sessions": []}
     assert rejected["error"]["code"] == -32008
