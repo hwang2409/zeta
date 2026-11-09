@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from ..core.checkpoints import ConversationEntry
@@ -250,6 +251,44 @@ class ConversationChannel:
             NotificationInput("child_idle", data),
         )
         return result.entries[0] if result.entries else None
+
+    async def publish_hold(
+        self,
+        *,
+        child_instance_id: str,
+        child_session_path: str,
+        description: str,
+        hold: Mapping[str, Any],
+        account: str | None,
+    ) -> None:
+        """Wake the parent once: a long provider hold is a stall with a known end."""
+
+        from .pending_delivery import NotificationInput
+
+        subscription = hold.get("limit") == "subscription"
+        until = datetime.fromtimestamp(hold["until"], UTC).isoformat()
+        cause = "subscription limit" if subscription else "provider rate limit"
+        data: dict[str, Any] = {
+            "origin": "notification",
+            "kind": "child_hold",
+            "child_instance_id": child_instance_id,
+            "child_session_path": child_session_path,
+            "description": description,
+            "status": "held",
+            "reason": "subscription_limit" if subscription else "rate_limit",
+            "until": until,
+            "provider": str(hold["provider"]),
+            "account": account,
+            "retry_after": float(hold["retry_after"]),
+            "text": (
+                f"child {child_instance_id} is held by a {cause} on "
+                f"{account or hold['provider']} until {until}. It stays running "
+                "and resumes by itself; cancel and restart it on another model or "
+                "account if you cannot wait."
+            ),
+        }
+        _parent_store, parent_id = self._live_parent(child_instance_id)
+        await self.produce_to(parent_id, NotificationInput("child_hold", data))
 
     async def publish_not_delivered(self, child_loop: AgentLoop, text: str) -> None:
         """Show input a stop held back on the root transcript; it wakes no agent."""

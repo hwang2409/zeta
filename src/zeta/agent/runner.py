@@ -6,12 +6,13 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from ..accounts.session import account_provider
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
 from ..core.project_context import ProjectContext
@@ -37,7 +38,7 @@ from ..protocol.types import (
     is_owned_completion_backend,
 )
 from ..providers.factory import build_backend, credential_store
-from ..providers.rate_limit_hold import rate_limit_hold_text
+from ..providers.rate_limit_hold import LONG_HOLD_WAKE_SECONDS, rate_limit_hold_text
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
@@ -96,9 +97,12 @@ async def consume_child(
     finish_gate_state: FinishGateState | None = None,
     delivering_prompt_id: str | None = None,
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
+    publish_hold: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
+    # one parent wake per hold; re-probes that re-enter the hold do not wake again
+    hold_woken = False
     failure_message: str | None = None
     failure_error: tuple[str, str] | None = None
     explicit_report: dict[str, object] | None = None
@@ -124,8 +128,11 @@ async def consume_child(
         gate_control: FinishGateControl | None = None,
     ) -> None:
         nonlocal failure_error, failure_message, final_message, explicit_report
+        nonlocal hold_woken
         final_message = None
         async for event in events:
+            if event.type in {StreamEventType.TURN_START, StreamEventType.MESSAGE_START}:
+                hold_woken = False
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
                 update_step(status)
@@ -137,6 +144,13 @@ async def consume_child(
                 status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
                 publish(status)
+                if (
+                    publish_hold is not None
+                    and not hold_woken
+                    and event.data["retry_after"] > LONG_HOLD_WAKE_SECONDS
+                ):
+                    hold_woken = True
+                    await publish_hold(event.data)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
                 name = event.tool_call.name if event.tool_call is not None else "tool"
                 status = f"turn {child_turns() + 1}: approval pending: {name}"
@@ -916,6 +930,18 @@ async def run_agent_tool(
         elif publisher is not None:
             publisher.publish(f"{description}: {status}\n", "stdout")
 
+    async def publish_hold(hold: Mapping[str, Any]) -> None:
+        # a subscription hold names its account; a rate limit uses the child's pin
+        pinned = selected_accounts.get(account_provider(str(hold["provider"])) or "")
+        account = hold.get("account") or (None if pinned is None else str(pinned))
+        await loop._background_owner.conversation_channel.publish_hold(
+            child_instance_id=child_instance_id,
+            child_session_path=child_path,
+            description=description,
+            hold=hold,
+            account=account,
+        )
+
     def child_turns() -> int:
         return loop._agent_child_turns.get(tool_call.id, 0)
 
@@ -1051,6 +1077,8 @@ async def run_agent_tool(
             **run_kwargs,
             child_path=child_path,
             publish=publish,
+            # a foreground parent is blocked on this call, so only background holds wake it
+            publish_hold=publish_hold if background else None,
             child_turns=child_turns,
             update_turns=update_turns,
             record_tool_call=record_tool_call,

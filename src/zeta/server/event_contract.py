@@ -94,6 +94,7 @@ LEGACY_NOTIFICATION_WIRE_EVENT = EventDescriptor.SUB_AGENT_RECEIPT
 NOTIFICATION_WIRE_EVENTS = {
     "agent_completion": LEGACY_NOTIFICATION_WIRE_EVENT,
     "child_idle": EventDescriptor.CHILD_IDLE,
+    "child_hold": EventDescriptor.CHILD_HOLD,
     "task_exited": EventDescriptor.TASK_EXIT_NOTIFICATION,
     "project_inbox": EventDescriptor.PROJECT_INBOX_NOTIFICATION,
     "child_question": EventDescriptor.CHILD_QUESTION,
