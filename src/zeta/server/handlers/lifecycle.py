@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from ...core.session import SessionNotFoundError
+from ...core.session import SessionError
 from ...core.session_execution import SessionOwnedError
 from .. import model_selection
 from ..host_commands import SessionHostCommands
@@ -72,7 +72,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                     await self.server.runtime.resume_session(
                         session_id, force=True
                     )
-                except SessionNotFoundError as exc:
+                except SessionError as exc:
                     raise ProtocolError(
                         ErrorDescriptor.SESSION_NOT_FOUND,
                         str(exc),
@@ -88,7 +88,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
             else:
                 try:
                     await self.server.runtime.resume_session(session_id)
-                except SessionNotFoundError as exc:
+                except SessionError as exc:
                     raise ProtocolError(
                         ErrorDescriptor.SESSION_NOT_FOUND,
                         str(exc),

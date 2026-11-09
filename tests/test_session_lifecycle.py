@@ -540,6 +540,56 @@ def test_session_delete_resolves_unique_prefix(
     assert not (home / "sessions" / session_id).exists()
 
 
+def test_session_open_resolves_unique_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    opened = SessionManager(home).create(
+        provider="codex", model="offline", cwd=tmp_path
+    )
+    session_id = opened.store.session_id
+    opened.store.close()
+
+    reopened = SessionManager(home).open(session_id[:8])
+    try:
+        assert reopened.metadata.session_id == session_id
+    finally:
+        reopened.store.close()
+
+
+def test_session_open_rejects_ambiguous_prefix_with_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = initialize_storage_home(tmp_path / "zeta-home")
+    sessions_dir = home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "abcde111").mkdir()
+    (sessions_dir / "abcde222").mkdir()
+    manager = SessionManager(home)
+
+    with pytest.raises(SessionError, match="please provide more characters") as raised:
+        manager.open("abcde")
+
+    assert "abcde111" in str(raised.value)
+    assert "abcde222" in str(raised.value)
+
+
+def test_session_open_rejects_short_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = initialize_storage_home(tmp_path / "zeta-home")
+    sessions_dir = home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "abcd1111").mkdir()
+    manager = SessionManager(home)
+
+    with pytest.raises(SessionError, match="at least 4 characters"):
+        manager.open("abc")
+
+
 def test_session_delete_rejects_ambiguous_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
