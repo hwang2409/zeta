@@ -247,10 +247,6 @@ class AsyncDurableWritesMixin:
                         self._durable_writer = None
                         self._durable_writer_snapshot = None
             raise
-        finally:
-            with self._durable_write_condition:
-                self._durable_writes_in_flight -= 1
-                self._durable_write_condition.notify_all()
 
     def _load_detached_log_state(self: ConversationStore) -> _DetachedLogState:
         """Load one validated transcript snapshot without touching resident state."""
@@ -387,38 +383,43 @@ class AsyncDurableWritesMixin:
         baseline: tuple[int, bytes],
         owner_log: tuple[tuple[int, int, int], int],
     ) -> tuple[Any, Any, Any]:
-        result, writer, receipts, writer_baseline, reloaded = self._run_durable_write(
-            method_name, args, kwargs
-        )
-        delta = self._proven_bounded_durable_delta(
-            method_name,
-            writer,
-            receipts,
-            writer_baseline,
-            baseline,
-            owner_log,
-            reloaded,
-        )
-        if delta is not None:
-            return result, delta, receipts
+        try:
+            result, writer, receipts, writer_baseline, reloaded = (
+                self._run_durable_write(method_name, args, kwargs)
+            )
+            delta = self._proven_bounded_durable_delta(
+                method_name,
+                writer,
+                receipts,
+                writer_baseline,
+                baseline,
+                owner_log,
+                reloaded,
+            )
+            if delta is not None:
+                return result, delta, receipts
 
-        state = writer._snapshot_log_state()
-        delta = self._installed_delta_from_baseline(state.entries, baseline)
-        if delta != "reset" and (
-            len(delta) > 64 or not self._linear_suffix(state.entries, baseline[0])
-        ):
-            # Keep owner publication bounded; large or nonlinear suffixes use
-            # one worker-owned state copy and an owner-thread pointer swap.
-            delta = "reset"
-        publication_delta = self._owned_installed_delta(delta)
-        state = replace(
-            state,
-            installed_delta=delta,
-            publication_delta=publication_delta,
-        )
-        if delta == "reset":
-            state = copy.deepcopy(state)
-        return result, state, receipts
+            state = writer._snapshot_log_state()
+            delta = self._installed_delta_from_baseline(state.entries, baseline)
+            if delta != "reset" and (
+                len(delta) > 64 or not self._linear_suffix(state.entries, baseline[0])
+            ):
+                # Keep owner publication bounded; large or nonlinear suffixes use
+                # one worker-owned state copy and an owner-thread pointer swap.
+                delta = "reset"
+            publication_delta = self._owned_installed_delta(delta)
+            state = replace(
+                state,
+                installed_delta=delta,
+                publication_delta=publication_delta,
+            )
+            if delta == "reset":
+                state = copy.deepcopy(state)
+            return result, state, receipts
+        finally:
+            with self._durable_write_condition:
+                self._durable_writes_in_flight -= 1
+                self._durable_write_condition.notify_all()
 
     def _publication_fence(self: ConversationStore) -> _PublicationFence:
         """Capture every owner field that a recovery refresh may replace."""
