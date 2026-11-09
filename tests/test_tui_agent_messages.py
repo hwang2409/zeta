@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from contextlib import ExitStack
 from io import StringIO
 from pathlib import Path
 
@@ -1007,31 +1008,39 @@ async def test_subtree_status_and_output_render_through_transcript_presenter(
     loop = AgentLoop(
         FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
-    status = await loop.tool_registry.execute(
-        ToolCall("status", "agent_status", {"handle": "root:1:1"})
-    )
-    output = await loop.tool_registry.execute(
-        ToolCall("output", "agent_output", {"handle": "root:1:1"})
-    )
+    try:
+        status = await loop.tool_registry.execute(
+            ToolCall("status", "agent_status", {"handle": "root:1:1"})
+        )
+        output = await loop.tool_registry.execute(
+            ToolCall("output", "agent_output", {"handle": "root:1:1"})
+        )
 
-    rendered = _render_sequence(
-        [
-            _tool_result_event(
-                "agent_status",
-                {"handle": "root:1:1"},
-                status["content"][0]["text"],
-                status["structuredContent"],
-            ),
-            _tool_result_event(
-                "agent_output",
-                {"handle": "root:1:1"},
-                output["content"][0]["text"],
-                output["structuredContent"],
-            ),
-        ],
-        100,
-    )
+        rendered = _render_sequence(
+            [
+                _tool_result_event(
+                    "agent_status",
+                    {"handle": "root:1:1"},
+                    status["content"][0]["text"],
+                    status["structuredContent"],
+                ),
+                _tool_result_event(
+                    "agent_output",
+                    {"handle": "root:1:1"},
+                    output["content"][0]["text"],
+                    output["structuredContent"],
+                ),
+            ],
+            100,
+        )
 
-    assert "nested verifier" in rendered
-    assert ":1:1" in rendered
-    assert "nested output" in rendered
+        assert "nested verifier" in rendered
+        assert ":1:1" in rendered
+        assert "nested output" in rendered
+    finally:
+        try:
+            await loop.close()
+        finally:
+            with ExitStack() as closes:
+                for store in (grandchild, child, root):
+                    closes.callback(store.close)
