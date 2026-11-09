@@ -15,9 +15,12 @@ import asyncio
 import contextlib
 import logging
 import threading
+import weakref
 from collections import deque
 from collections.abc import Callable
 from typing import Any, Literal
+
+from ..storage_format import release_later
 
 logger = logging.getLogger(__name__)
 
@@ -26,23 +29,25 @@ _LOOP_AFFINE = (asyncio.Future, asyncio.BaseTransport, asyncio.StreamWriter)
 
 
 class _Handoff:
-    """The scheduled hand-back; a closed loop drops it without calling it."""
+    """The scheduled hand-back; a closed loop drops it without calling it.
 
-    __slots__ = ("call",)
+    Dropping it uncalled queues the close for the next release point
+    (zeta.storage_format.drain_releases): a finalizer must not run the close.
+    """
+
+    __slots__ = ("__weakref__", "_call", "_dropped")
 
     def __init__(self, call: _OwnedCall[Any]) -> None:
-        self.call: _OwnedCall[Any] | None = call
+        self._call = call
+        self._dropped = weakref.finalize(self, release_later, call._handoff_dropped)
 
     def __call__(self) -> None:
-        call, self.call = self.call, None
-        if call is not None:
-            call._deliver()
+        if self._dropped.detach() is not None:
+            self._call._deliver()
 
-    def __del__(self) -> None:
-        call, self.call = self.call, None
-        if call is not None:
-            logger.debug("closing a thread call result whose hand-back was dropped")
-            call._release_untaken()
+    def cancel(self) -> None:
+        """The hand-back was never scheduled; the caller releases the result."""
+        self._dropped.detach()
 
 
 class _OwnedCall[T]:
@@ -88,7 +93,7 @@ class _OwnedCall[T]:
         try:
             self._loop.call_soon_threadsafe(handoff)
         except RuntimeError:  # the loop is closed; nobody can take it
-            handoff.call = None
+            handoff.cancel()
             self._release_untaken()
 
     def _deliver(self) -> None:
@@ -104,9 +109,13 @@ class _OwnedCall[T]:
     async def wait(self) -> T:
         try:
             result = await self._future
-        except (asyncio.CancelledError, GeneratorExit):
-            # GeneratorExit: a closed loop dropped the pending task and gc closed it.
+        except asyncio.CancelledError:
             self.abandon()
+            raise
+        except GeneratorExit:
+            # A closed loop dropped this task and gc closed it: defer the close.
+            if self._mark_abandoned():
+                release_later(self._close_result, self._outcome[0])
             raise
         with self._lock:
             if self._state == "abandoned":
@@ -115,13 +124,22 @@ class _OwnedCall[T]:
         return result
 
     def abandon(self) -> None:
-        """Give up the result; close it if it is already here."""
-        with self._lock:
-            previous, self._state = self._state, "abandoned"
+        """Give up the result on the loop thread; close it if it is already here."""
+        ready = self._mark_abandoned()
         if not self._loop.is_closed():
             self._future.cancel()
-        if previous == "result_ready" and self._outcome[1] is None:
+        if ready:
             self._close_result(self._outcome[0])
+
+    def _mark_abandoned(self) -> bool:
+        """Mark abandoned; true when this side now owns closing the result."""
+        with self._lock:
+            previous, self._state = self._state, "abandoned"
+        return previous == "result_ready" and self._outcome[1] is None
+
+    def _handoff_dropped(self) -> None:
+        logger.debug("closing a thread call result whose hand-back was dropped")
+        self._release_untaken()
 
     def _release_untaken(self) -> None:
         """Close a result whose hand-back can no longer reach the awaiter."""

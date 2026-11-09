@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from zeta.core.thread_call import run_owned_thread_call
+from zeta.storage_format import drain_releases
 
 
 def _run_guarded_subprocess(source: str) -> subprocess.CompletedProcess[str]:
@@ -326,6 +327,8 @@ def _loop_closed_after_handback(row: _Row) -> None:
     row.loop.close()  # discards the queued callback without running it
     del task
     gc.collect()
+    assert row.closes == [], "a finalizer ran the close instead of queueing it"
+    drain_releases()  # the next release point runs the queued close
     row.assert_closed_once(on_loop=True)
     assert "hand-back was dropped" in row.caplog.text
 
@@ -338,6 +341,8 @@ def _loop_closed_after_deliver(row: _Row) -> None:
     row.loop.close()  # discards the wake-up; the awaiter never takes it
     del task
     gc.collect()  # the dropped task's coroutine is closed and abandons the call
+    assert row.closes == [], "a finalizer ran the close instead of queueing it"
+    drain_releases()
     row.assert_closed_once(on_loop=True)
     assert "hand-back was dropped" not in row.caplog.text, "delivery did not run"
 
