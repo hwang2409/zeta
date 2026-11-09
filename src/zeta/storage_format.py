@@ -18,10 +18,40 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Self
 
 WRITER_EPOCH: Final = 5
+
+
+class StorageFeature(StrEnum):
+    HISTORY_FIDELITY = "history_fidelity"
+    TRANSCRIPT_REPAIR = "transcript_repair"
+    PROJECT_WRITES = "project_writes"
+    ATTENTION_KINDS = "attention_kinds"
+
+
+FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
+    StorageFeature.HISTORY_FIDELITY: 2,
+    StorageFeature.TRANSCRIPT_REPAIR: 4,
+    StorageFeature.PROJECT_WRITES: 4,
+    StorageFeature.ATTENTION_KINDS: 5,
+}
+
+
+def feature_enabled(home_epoch: int, feature: StorageFeature) -> bool:
+    """Return whether a home can use the feature's stored shapes."""
+    return home_epoch >= FEATURE_EPOCHS[feature]
+
+
+def writer_epoch() -> int:
+    """The epoch this writer publishes. Use this for writer-capability needs.
+
+    Feature gates must compare against FEATURE_EPOCHS / feature_enabled() instead,
+    so a new writer release does not silently change a home's feature set.
+    """
+    return WRITER_EPOCH
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
