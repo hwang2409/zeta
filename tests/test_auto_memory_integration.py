@@ -459,7 +459,7 @@ async def test_attention_fork_composition_cannot_write_project_memory(
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -543,7 +543,7 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
     anchor = original.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
     )
-    record = AttentionStore(original.store.session_dir).request(
+    record = AttentionStore(original.store.session_dir, writer_epoch=5).request(
         session_id=original.store.session_id,
         project_id=project.project_id,
         entry_id=anchor.id,
@@ -582,7 +582,9 @@ async def test_attention_fork_runtime_does_not_enter_project_transcript_index(
             "normalindexcanary", origin=MessageOrigin.USER
         ):
             pass
-        await asyncio.wait_for(asyncio.gather(*tuple(normal.loop._tracked_tasks)), 10)
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(normal.loop._tracked_tasks)), 10
+        )
     finally:
         await normal.loop.close()
 

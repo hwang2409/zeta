@@ -14,6 +14,7 @@ from typing import Any
 from .attention_records import (
     AttentionRecord,
     AttentionStore,
+    observed_epoch_for_session,
     read_bounded_session_json,
 )
 from .config.tool_policy import ToolPolicy
@@ -104,7 +105,7 @@ def validate_attention_fork(
     if fork is None or current_project_id is None:
         raise ValueError("resolve_attention is available only in an attention fork")
     source_metadata = manager.read_metadata(fork.forked_from_session)
-    record = AttentionStore(manager.sessions_dir / fork.forked_from_session).get(
+    record = AttentionStore(manager.sessions_dir / fork.forked_from_session, writer_epoch=observed_epoch_for_session(manager.sessions_dir / fork.forked_from_session)).get(
         fork.attention_id
     )
     if (
@@ -136,7 +137,7 @@ def release_discussion_fork(
     fork = read_attention_fork(manager.sessions_dir / fork_session_id)
     if fork is None:
         raise ValueError("session is not a discussion fork")
-    store = AttentionStore(manager.sessions_dir / fork.forked_from_session)
+    store = AttentionStore(manager.sessions_dir / fork.forked_from_session, writer_epoch=observed_epoch_for_session(manager.sessions_dir / fork.forked_from_session))
     try:
         store.release_fork(fork.attention_id, fork_session_id)
     except (SessionNotFoundError, FileNotFoundError):
@@ -314,7 +315,10 @@ def create_discussion_fork(
     """Create or reuse the read-only discussion fork for one attention record."""
     state = registry_state or available_project_registry(Path(home) / "projects")
     manager = SessionManager(home, project_registry_state=state)
-    attention_store = AttentionStore(manager.sessions_dir / source_session_id)
+    attention_store = AttentionStore(
+        manager.sessions_dir / source_session_id,
+        writer_epoch=observed_epoch_for_session(manager.sessions_dir / source_session_id),
+    )
     with _fork_allocation_lock(attention_store):
         source = manager.open(source_session_id, _read_only=True)
         try:

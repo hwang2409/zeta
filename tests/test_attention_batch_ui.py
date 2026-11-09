@@ -39,7 +39,7 @@ def _session(home: Path, project_id: str):
 
 
 def _request(opened, project_id: str, title: str, *, kind: str = "decision"):
-    return AttentionStore(opened.store.session_dir).request(
+    return AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
         project_id=project_id,
         entry_id=None,
@@ -56,7 +56,7 @@ def _records(owner, project_id: str):
 
 
 def _wait_for_records(home: Path, session_id: str, record_ids: set[str]) -> None:
-    store = AttentionStore(home / "sessions" / session_id)
+    store = AttentionStore(home / "sessions" / session_id, writer_epoch=5)
     deadline = time.monotonic() + 9
     while time.monotonic() < deadline:
         try:
@@ -254,7 +254,7 @@ async def test_tui_escape_sends_good_staged_reply_and_reports_broken_one(
         owned.release_with(owner.store.close)
         _press(app, "escape")
         await await_or_fail(reported.wait(), what="broken outcome report")
-        assert AttentionStore(owner.store.session_dir).get(good.id).status == (
+        assert AttentionStore(owner.store.session_dir, writer_epoch=5).get(good.id).status == (
             "resolved"
         ), f"broken staged record blocked the batch: {printed}"
         assert printed == [
@@ -317,7 +317,7 @@ async def test_tui_popup_waits_for_recovery_before_input(
         assert not app.decisions_panel_active
         _press(app, "1")
         assert all(
-            AttentionStore(owner.store.session_dir).get(r.id).status == "open"
+            AttentionStore(owner.store.session_dir, writer_epoch=5).get(r.id).status == "open"
             for r in records
         )
         gate.set()
@@ -374,7 +374,7 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         assert all(
-            AttentionStore(owner.store.session_dir).get(r.id).status == "open"
+            AttentionStore(owner.store.session_dir, writer_epoch=5).get(r.id).status == "open"
             for r in records
         )
         _press(app, "j")
@@ -465,7 +465,7 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
             10,
         )
         assert (
-            AttentionStore(owner.store.session_dir).get(records[2].id).status == "open"
+            AttentionStore(owner.store.session_dir, writer_epoch=5).get(records[2].id).status == "open"
         )
         inbox = ProjectInbox(
             manager.project_registry, sessions_root=tmp_path / "sessions"
