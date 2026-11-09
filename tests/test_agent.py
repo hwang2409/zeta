@@ -10979,90 +10979,96 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
 async def test_agent_send_cancellation_reports_durable_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    parent_store = ConversationStore(tmp_path / "parent")
-    child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
-    call = _run_agent_call()
-    child_store.mark_agent_parent(call.id, agent_type="run")
-    parent_store.allocate_agent_index()
-    parent_store.register_agent_child(
-        call,
-        child_session_path=str(child_store.session_dir),
-        description="long horizon run",
-        agent_type="run",
-        background=True,
-        child_instance_id="parent:1",
-        accepts_follow_ups=True,
-    )
-
-    registry = ToolRegistry(
-        tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
-    )
-    owner = BackgroundAgentOwner(parent_store)
-    delivery_flow = pending_delivery_module.StepDeliveryFlow(child_store)
-    await delivery_flow.initialize()
-    owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
-    registry._agent_owner = owner
-    canceled = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "agent-send-canceled-before-admission",
-                "agent_send",
-                {"child_instance_id": "parent:1", "message": "not sent"},
-            )
-        )
-    )
-    canceled.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(canceled, 10)
-    assert await asyncio.to_thread(child_store.pending_prompts) == []
-
-    entered_commit = threading.Event()
-    committed = threading.Event()
-    original_commit = step_delivery_store_module._commit_delivery_input
-
-    def observe_commit(store, item):
-        entered_commit.set()
-        try:
-            return original_commit(store, item)
-        finally:
-            committed.set()
-
-    # test-contract: seam observe the real durable commit admission point.
-    monkeypatch.setattr(
-        step_delivery_store_module, "_commit_delivery_input", observe_commit
-    )
-    lock = child_store._append_lock()
-    lock.__enter__()
     try:
-        task = asyncio.create_task(
+        parent_store = ConversationStore(tmp_path / "parent")
+        child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
+        call = _run_agent_call()
+        child_store.mark_agent_parent(call.id, agent_type="run")
+        parent_store.allocate_agent_index()
+        parent_store.register_agent_child(
+            call,
+            child_session_path=str(child_store.session_dir),
+            description="long horizon run",
+            agent_type="run",
+            background=True,
+            child_instance_id="parent:1",
+            accepts_follow_ups=True,
+        )
+
+        registry = ToolRegistry(
+            tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
+        )
+        owner = BackgroundAgentOwner(parent_store)
+        delivery_flow = pending_delivery_module.StepDeliveryFlow(child_store)
+        await delivery_flow.initialize()
+        owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
+        registry._agent_owner = owner
+        canceled = asyncio.create_task(
             registry.execute(
                 ToolCall(
-                    "agent-send-call",
+                    "agent-send-canceled-before-admission",
                     "agent_send",
-                    {"child_instance_id": "parent:1", "message": "follow up"},
+                    {"child_instance_id": "parent:1", "message": "not sent"},
                 )
             )
         )
-        await await_or_fail(
-            asyncio.to_thread(entered_commit.wait, 10),
-            what="agent_send commit to start",
-        )
-        task.cancel()
-        assert not task.done()
-    finally:
-        lock.__exit__(None, None, None)
+        canceled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(canceled, 10)
+        assert await asyncio.to_thread(child_store.pending_prompts) == []
 
-    await await_or_fail(
-        asyncio.to_thread(committed.wait, 10),
-        what="agent_send commit to finish",
-    )
-    result = await await_or_fail(task, what="committed agent_send result")
-    assert result["isError"] is False
-    assert result["content"][0]["text"].startswith("queued a follow-up")
-    assert [
-        entry.data["text"]
-        for entry in await asyncio.to_thread(child_store.pending_prompts)
-    ] == ["follow up"]
+        entered_commit = threading.Event()
+        committed = threading.Event()
+        original_commit = step_delivery_store_module._commit_delivery_input
+
+        def observe_commit(store, item):
+            entered_commit.set()
+            try:
+                return original_commit(store, item)
+            finally:
+                committed.set()
+
+        # test-contract: seam observe the real durable commit admission point.
+        monkeypatch.setattr(
+            step_delivery_store_module, "_commit_delivery_input", observe_commit
+        )
+        lock = child_store._append_lock()
+        lock.__enter__()
+        try:
+            task = asyncio.create_task(
+                registry.execute(
+                    ToolCall(
+                        "agent-send-call",
+                        "agent_send",
+                        {"child_instance_id": "parent:1", "message": "follow up"},
+                    )
+                )
+            )
+            await await_or_fail(
+                asyncio.to_thread(entered_commit.wait, 10),
+                what="agent_send commit to start",
+            )
+            task.cancel()
+            assert not task.done()
+        finally:
+            lock.__exit__(None, None, None)
+
+        await await_or_fail(
+            asyncio.to_thread(committed.wait, 10),
+            what="agent_send commit to finish",
+        )
+        result = await await_or_fail(task, what="committed agent_send result")
+        assert result["isError"] is False
+        assert result["content"][0]["text"].startswith("queued a follow-up")
+        assert [
+            entry.data["text"]
+            for entry in await asyncio.to_thread(child_store.pending_prompts)
+        ] == ["follow up"]
+    finally:
+        await registry.close()
+        owner.cancel_all()
+        child_store.close()
+        parent_store.close()
 
 
 @pytest.mark.asyncio

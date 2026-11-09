@@ -1245,9 +1245,21 @@ async def run_agent_tool(
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
-        await child_loop.close(
-            cancel_background=False,
-            background_task_cause=child_cleanup_details(
-                "foreground", child_task.cancelled()
-            )[0],
+        close_task = asyncio.create_task(
+            child_loop.close(
+                cancel_background=False,
+                background_task_cause=child_cleanup_details(
+                    "foreground", child_task.cancelled()
+                )[0],
+            )
         )
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            while not close_task.done():
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    continue
+            close_task.result()
+            raise

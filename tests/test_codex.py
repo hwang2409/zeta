@@ -2187,16 +2187,16 @@ async def test_codex_refusal_reaches_loop_completion_owner(
     backend = CodexBackend(
         client=client, token_store=store_for(tmp_path / "codex.json")
     )
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
     try:
         events = [
             item
-            async for item in AgentLoop(
-                backend,
-                ConversationStore(tmp_path / "sessions"),
-                skill_catalog=SkillCatalog.empty(),
-            ).run_turn("hello", origin=MessageOrigin.USER)
+            async for item in loop.run_turn("hello", origin=MessageOrigin.USER)
         ]
     finally:
+        await loop.close()
+        store.close()
         await client.aclose()
 
     turn_end = next(item for item in events if item.type is StreamEventType.TURN_END)
