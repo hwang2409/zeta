@@ -753,7 +753,9 @@ from 1 to 100. The result is `runs` and, when more rows remain, `next_offset`.
 Each row contains `run_id`, the top-level `session_id`, nullable
 `parent_run_id`, `description`, `agent_type`, `status`, `accepts_follow_ups`,
 `turns_used`, `tool_count`, `current_step`, `started_at`, optional or null
-`finished_at`, and `elapsed_seconds`. The public `run_id` is the existing child
+`finished_at`, and `elapsed_seconds`. `tool_count` is the total for the whole
+child run, cumulative across its follow-up segments, and never decreases. The
+public `run_id` is the existing child
 instance id. Child-local store ids and the agent tool's `handle` name are not
 exposed.
 
@@ -972,9 +974,13 @@ server-issued key, even when the parent and child use the same raw tool call ID.
 On protocol 1.0 and 1.1, `sub_agent_receipt` carries every durable notification
 kind. On protocol 1.2, `sub_agent_receipt` carries agent completion notifications
 and unknown future kinds; `task_exit_notification`,
-`project_inbox_notification`, `child_question`, `child_question_withdrawn`, and
-`child_idle` carry their durable notification `data` object with the matching
-known kind. `task_exit_notification.data.note` contains the task kill cause when
+`project_inbox_notification`, `child_question`, `child_question_withdrawn`,
+`child_idle`, and `child_hold` carry their durable notification `data` object
+with the matching known kind. `child_hold` is sent once per hold when a
+background child waits more than 15 minutes on a provider rate limit or a
+subscription limit; its data has `reason` (`rate_limit` or
+`subscription_limit`), `until` (ISO 8601), `provider`, `account` (string or
+null), and `retry_after` (seconds). The child stays running. `task_exit_notification.data.note` contains the task kill cause when
 the server stopped the task. `child_message_delivered` is emitted for the parent
 session after a running child starts answering a staged `agent_send`; its data
 contains the child label and the bounded one-line message preview.
@@ -1227,6 +1233,7 @@ Event fields are:
 | `child_question` | `event`, `data: object` | `session_id` |
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
+| `child_hold` | `event`, `data: object` | `session_id` |
 | `child_message_delivered` | `event`, `data: object` | `session_id` |
 | `delivery_status` (features `delivery_id` and `session_history_fidelity`) | `event`, `id: string`, `role: "system"`, `delivery_id: string`, `method: "steer"`, `status: "dropped"`, `content: array[ContentBlock]` | `session_id`, `reason: string` |
 | `retry` | `event`, `data: object` | `session_id` |

@@ -758,6 +758,7 @@ async def test_queued_steer_keeps_its_delivery_id_when_another_request_is_pendin
         echo = await _event(reader, "user_message")
         assert echo["delivery_id"] == "steer-queued"
 
+        # test-contract: transport hold the approval reply while queued events arrive
         writer.write(
             json.dumps(
                 {
