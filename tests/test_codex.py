@@ -2187,16 +2187,16 @@ async def test_codex_refusal_reaches_loop_completion_owner(
     backend = CodexBackend(
         client=client, token_store=store_for(tmp_path / "codex.json")
     )
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
     try:
         events = [
             item
-            async for item in AgentLoop(
-                backend,
-                ConversationStore(tmp_path / "sessions"),
-                skill_catalog=SkillCatalog.empty(),
-            ).run_turn("hello", origin=MessageOrigin.USER)
+            async for item in loop.run_turn("hello", origin=MessageOrigin.USER)
         ]
     finally:
+        await loop.close()
+        store.close()
         await client.aclose()
 
     turn_end = next(item for item in events if item.type is StreamEventType.TURN_END)
@@ -3514,12 +3514,12 @@ def _refresh_lock_probe_process(
     async def run() -> None:
         store = codex_credentials(path)
         if hold:
-            async with store._async_guard(registry=False):
+            async with store._async_guard(registry=False, timeout=30):
                 results.put("holding")
                 await asyncio.to_thread(release.wait)
             return
         await asyncio.to_thread(start.wait)
-        lock = store._async_guard(registry=False)
+        lock = store._async_guard(registry=False, timeout=30)
         try:
             await asyncio.wait_for(lock.__aenter__(), timeout=2)
         except TimeoutError:
@@ -3528,7 +3528,7 @@ def _refresh_lock_probe_process(
             results.put("unexpectedly acquired")
             await lock.__aexit__(None, None, None)
         await asyncio.to_thread(release.wait)
-        async with store._async_guard(registry=False):
+        async with store._async_guard(registry=False, timeout=30):
             results.put("acquired")
 
     asyncio.run(run())

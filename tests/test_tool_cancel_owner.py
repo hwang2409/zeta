@@ -118,6 +118,8 @@ class Harness:
         self.tmp_path = tmp_path
         self.probes = probes
         self.tasks: list[asyncio.Task[Any]] = []
+        self.loops: list[AgentLoop] = []
+        self.stores: list[ConversationStore] = []
 
     def outcome(self, result: tuple[str, ...]) -> Outcome:
         return Outcome(
@@ -150,9 +152,11 @@ class Harness:
             [ScriptedTurn([], calls), ScriptedTurn([TextContent("after")])]
         )
         self.store = ConversationStore(self.tmp_path)
+        self.stores.append(self.store)
         loop = AgentLoop(
             backend, self.store, registry=registry, skill_catalog=SkillCatalog.empty()
         )
+        self.loops.append(loop)
         task = asyncio.create_task(self._consume(loop))
         self.tasks.append(task)
         return loop, task
@@ -192,6 +196,10 @@ class Harness:
             await await_or_fail(
                 asyncio.wait(self.tasks), what="harness task cleanup"
             )
+        for loop in self.loops:
+            await await_or_fail(loop.close(), what="harness loop close")
+        for store in self.stores:
+            store.close()
 
 
 async def owner_call(
@@ -385,6 +393,8 @@ async def durable_inline(h: Harness) -> Outcome:
         manager.create, provider="codex", model="offline", cwd=h.tmp_path
     )
     policy = ApprovalPolicy(store=opened.store)
+    h.store = opened.store
+    h.stores.append(opened.store)
     loop = AgentLoop(
         FakeBackend([]),
         opened.store,
@@ -392,6 +402,7 @@ async def durable_inline(h: Harness) -> Outcome:
         approval_policy=policy,
         skill_catalog=SkillCatalog.empty(),
     )
+    h.loops.append(loop)
     call = ToolCall("call-0", "probe0", {})
     opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]

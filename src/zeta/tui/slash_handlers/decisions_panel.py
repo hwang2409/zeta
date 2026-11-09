@@ -16,6 +16,7 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
+from ...attention_records import Broken, broken_record_refusal
 from ...protocol.types import StreamEvent, StreamEventType
 from ...runtime.project_registry_state import (
     ProjectRegistryState,
@@ -48,6 +49,63 @@ def _registry_state(app: object) -> ProjectRegistryState:
     )
 
 
+def _scan_decisions(
+    home: Path,
+    session_id: str,
+    registry_state: ProjectRegistryState,
+    loop: asyncio.AbstractEventLoop,
+    work: asyncio.Future[tuple],
+) -> None:
+    from ...attention_decisions import open_decisions
+
+    attention_dir = home / "sessions" / session_id / "attention"
+
+    def signature() -> tuple[tuple[str, int, int], ...]:
+        try:
+            return tuple(
+                sorted(
+                    (
+                        path.name,
+                        path.stat().st_mtime_ns,
+                        path.stat().st_size,
+                    )
+                    for path in attention_dir.iterdir()
+                    if path.is_file()
+                )
+            )
+        except OSError:
+            return ()
+
+    try:
+        for attempt in range(_SCAN_RETRY_LIMIT + 1):
+            signature_before = signature()
+            result = open_decisions(home, session_id, registry_state)
+            # Keep the projection and its validation on the worker.
+            if signature() == signature_before or attempt == _SCAN_RETRY_LIMIT:
+                break
+    except Exception as exc:  # noqa: BLE001 - publish scan failures
+        result = exc
+    if loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(
+            _deliver_decisions_scan, work, result
+        )
+    except RuntimeError:
+        pass  # The loop closed after the check.
+
+
+def _deliver_decisions_scan(
+    work: asyncio.Future[tuple], result: tuple | Exception
+) -> None:
+    if work.done():
+        return
+    if isinstance(result, Exception):
+        work.set_exception(result)
+    else:
+        work.set_result(result)
+
+
 class DecisionsMixin:
     """Serve the interactive decisions popup and its status-bar count."""
 
@@ -56,9 +114,11 @@ class DecisionsMixin:
         self._decisions_panel_control = OverlayControl()
         self._decisions_panel_open = False
         self._decisions_count = 0
+        self._decisions_staged_count = 0
         self._decisions_error: str | None = None
         self._decisions_scan_task: asyncio.Task[None] | None = None
         self._decisions_scan_work: asyncio.Future[tuple] | None = None
+        self._decisions_scan_generation = 0
         self._decisions_scan_requested = asyncio.Event()
         self._decisions_stopping = False
         self._decisions_restore_text = ""
@@ -78,6 +138,10 @@ class DecisionsMixin:
     @property
     def decisions_error(self) -> str | None:
         return self._decisions_error
+
+    @property
+    def decisions_staged_count(self) -> int:
+        return self._decisions_staged_count
 
     @property
     def _decisions_session_id(self) -> str:
@@ -109,6 +173,8 @@ class DecisionsMixin:
             )
             if record is None:
                 return "attention item not found"
+            if isinstance(record, Broken):
+                return broken_record_refusal(record)
             replies = self._attention_replies(record.session_id)
             if parts[0] == "dismiss":
                 await self._run_attention_operation(replies.dismiss, attention_id)
@@ -125,7 +191,11 @@ class DecisionsMixin:
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
-            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            (
+                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
+                if isinstance(item.record, Broken)
+                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            )
             for item in items
         )
 
@@ -154,9 +224,14 @@ class DecisionsMixin:
         ):
             self.request_decisions_refresh()
 
+    def _advance_decisions_generation(self) -> int:
+        self._decisions_scan_generation += 1
+        return self._decisions_scan_generation
+
     def request_decisions_refresh(self) -> None:
         if self._decisions_stopping:
             return
+        self._advance_decisions_generation()
         self._decisions_scan_requested.set()
         if self._decisions_scan_task is None or self._decisions_scan_task.done():
             self._decisions_scan_task = asyncio.create_task(
@@ -198,56 +273,77 @@ class DecisionsMixin:
         self._decisions_error = reason[:80]
         self._invalidate_prompt()
 
-    async def _read_decisions(self, timeout: float | None) -> tuple:
-        from ...attention_decisions import open_decisions
-
-        work = getattr(self, "_decisions_scan_work", None)
-        if work is None:
-            loop = asyncio.get_running_loop()
-            work = loop.create_future()
-            self._decisions_scan_work = work
-            args = (self._home, self._decisions_session_id, _registry_state(self))
-
-            def deliver(result: tuple | Exception) -> None:
-                if work.done():
-                    return
-                if isinstance(result, Exception):
-                    work.set_exception(result)
-                else:
-                    work.set_result(result)
-
-            def scan() -> None:
-                try:
-                    result = open_decisions(*args)
-                except Exception as exc:  # noqa: BLE001 - publish scan failures
-                    result = exc
-                if loop.is_closed():
-                    return
-                try:
-                    loop.call_soon_threadsafe(deliver, result)
-                except RuntimeError:
-                    pass  # The loop closed after the check.
-
-            threading.Thread(
-                target=scan, name="zeta-decisions-scan", daemon=True
-            ).start()
-        try:
-            return await asyncio.wait_for(asyncio.shield(work), timeout=timeout)
-        finally:
-            if work.done() and self._decisions_scan_work is work:
-                self._decisions_scan_work = None
+    async def _read_decisions(
+        self, timeout: float | None, generation: int | None = None
+    ) -> tuple:
+        requested_generation = (
+            self._advance_decisions_generation() if generation is None else generation
+        )
+        while True:
+            current_generation = getattr(self, "_decisions_scan_generation", 0)
+            if requested_generation != current_generation:
+                requested_generation = current_generation
+            work = getattr(self, "_decisions_scan_work", None)
+            if work is None or work.done():
+                if work is not None and work.done() and not work.cancelled():
+                    work.exception()
+                loop = asyncio.get_running_loop()
+                work = loop.create_future()
+                self._decisions_scan_work = work
+                self._decisions_scan_work_generation = requested_generation
+                threading.Thread(
+                    target=_scan_decisions,
+                    args=(
+                        self._home,
+                        self._decisions_session_id,
+                        _registry_state(self),
+                        loop,
+                        work,
+                    ),
+                    name="zeta-decisions-scan",
+                    daemon=True,
+                ).start()
+            try:
+                result = await asyncio.wait_for(asyncio.shield(work), timeout=timeout)
+            finally:
+                if work.done() and self._decisions_scan_work is work:
+                    self._decisions_scan_work = None
+            if (
+                requested_generation == getattr(self, "_decisions_scan_generation", 0)
+                and requested_generation
+                == getattr(self, "_decisions_scan_work_generation", requested_generation)
+            ):
+                return result
 
     async def _decisions_tick(self) -> None:
+        generation = self._advance_decisions_generation()
         try:
-            items = await self._read_decisions(_SCAN_TIMEOUT)
+            items = await self._read_decisions(_SCAN_TIMEOUT, generation)
         except TimeoutError as exc:
             self._set_decisions_error(exc)
-            items = await self._read_decisions(timeout=None)
-        changed = len(items) != self._decisions_count or self._decisions_error is not None
+            items = await self._read_decisions(timeout=None, generation=generation)
+        replies = self._attention_replies(self._decisions_session_id)
+        from ...attention_records import Broken
+
+        open_ids = {
+            item.record.id for item in items if not isinstance(item.record, Broken)
+        }
+        staged = await asyncio.to_thread(
+            lambda: {
+                item_id: reply
+                for item_id, reply in (replies.staged() if items else ())
+                if item_id in open_ids
+            }
+        )
+        changed = (len(items), len(staged)) != (
+            self._decisions_count,
+            self._decisions_staged_count,
+        ) or self._decisions_error is not None
         self._decisions_count = len(items)
+        self._decisions_staged_count = len(staged)
         self._decisions_error = None
         if self._decisions_panel_open:
-            self._decisions_panel.set_items(items)
+            self._decisions_panel.set_items(items, staged)
             self._decisions_panel_control.set_lines(
                 self._decisions_panel.render_lines(),
                 keep_offset=True,
@@ -321,12 +417,18 @@ class DecisionsMixin:
     async def _flush_staged_decisions(self) -> None:
         try:
             for session_id in self._decisions_session_ids():
-                await self._run_attention_operation(
+                outcome = await self._run_attention_operation(
                     self._attention_replies(session_id).flush,
                     self.loop.store.session_id,
                 )
+                self._print_broken_outcomes(outcome)
         except (OSError, ValueError) as exc:
             self._print_system(f"decisions not delivered: {exc}")
+
+    def _print_broken_outcomes(self, outcome) -> None:
+        for item in outcome.items:
+            if item.status == "broken":
+                self._print_system(f"decision not delivered: {item.detail}")
 
     def _decisions_session_ids(self) -> tuple[str, ...]:
         return tuple({item.session_id for item in self._decisions_panel.items})
@@ -407,25 +509,31 @@ class DecisionsMixin:
         if item is None:
             return
         record = item.record
+        if isinstance(record, Broken):
+            self._print_system(f"attention record is broken: {record.reason}")
+            return
 
         async def run() -> None:
             item_ids = {
                 panel_item.record.id
                 for panel_item in self._decisions_panel.items
                 if panel_item.session_id == record.session_id
+                and not isinstance(panel_item.record, Broken)
             }
             try:
                 replies = self._attention_replies(record.session_id)
-                await self._run_attention_operation(
+                outcome = await self._run_attention_operation(
                     replies.stage,
                     record.id,
                     decision,
                     flush_ids=item_ids,
                     from_session=self.loop.store.session_id,
                 )
+                self._print_broken_outcomes(outcome)
             except (OSError, RuntimeError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
             self.request_decisions_refresh()
+            self._refresh_decisions_panel()
 
         self._decisions_panel.exit_answer()
         asyncio.create_task(run())

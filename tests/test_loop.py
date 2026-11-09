@@ -67,13 +67,18 @@ async def test_empty_completion_ends_with_classification(
     tmp_path: Path, stop_reason: str
 ) -> None:
     store = ConversationStore(tmp_path)
-    events = await collect(
-        AgentLoop(
-            FakeBackend([ScriptedTurn(stop_reason=stop_reason)]),
-            store,
-            skill_catalog=SkillCatalog.empty(),
-        ).run_turn("hello", origin=MessageOrigin.USER)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(stop_reason=stop_reason)]),
+        store,
+        skill_catalog=SkillCatalog.empty(),
     )
+    try:
+        events = await collect(
+            loop.run_turn("hello", origin=MessageOrigin.USER)
+        )
+    finally:
+        await loop.close()
+        store.close()
 
     turn_end = next(event for event in events if event.type is StreamEventType.TURN_END)
     assert turn_end.data["completion"] == (
@@ -107,17 +112,23 @@ async def test_empty_completion_ends_with_classification(
 async def test_refusal_with_visible_output_is_not_classified_as_empty(
     tmp_path: Path, turns: list[ScriptedTurn]
 ) -> None:
-    events = await collect(
-        AgentLoop(
-            FakeBackend(turns),
-            ConversationStore(tmp_path),
-            tools={"echo": lambda arguments: str(arguments["text"])},
-            skill_catalog=SkillCatalog.empty(),
-        ).run_turn("hello", origin=MessageOrigin.USER)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        FakeBackend(turns),
+        store,
+        tools={"echo": lambda arguments: str(arguments["text"])},
+        skill_catalog=SkillCatalog.empty(),
     )
+    try:
+        events = await collect(
+            loop.run_turn("hello", origin=MessageOrigin.USER)
+        )
 
-    turn_end = next(event for event in events if event.type is StreamEventType.TURN_END)
-    assert "completion" not in turn_end.data
+        turn_end = next(event for event in events if event.type is StreamEventType.TURN_END)
+        assert "completion" not in turn_end.data
+    finally:
+        await loop.close()
+        store.close()
 
 
 def test_empty_turn_tool_error_reports_success_state() -> None:
@@ -3050,6 +3061,7 @@ async def test_receipt_echo_reply_is_nudged_like_an_empty_reply(tmp_path: Path) 
         assert turn_ends[-1].message.content == [TextContent("here is the answer")]
     finally:
         await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio

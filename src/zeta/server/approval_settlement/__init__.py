@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
 
 from ...core.store import ConversationStore
 
@@ -27,12 +26,11 @@ async def persist_durably(
     reason: str | None = None,
 ) -> SettlementResult:
     """Commit a decision and reconcile deferred cancellation with durable state."""
-    kwargs: dict[str, Any] = {}
-    if decision == "abort" and reason:
-        kwargs["reason"] = reason
     try:
-        await store._to_thread_durable(
-            store.resolve_approval, request_id, decision, **kwargs
+        await store.resolve_approval_async(
+            request_id,
+            decision,
+            reason=reason if decision == "abort" else None,
         )
     except asyncio.CancelledError:
         resolution = store.approval_resolution_data(request_id)
@@ -42,8 +40,7 @@ async def persist_durably(
         if resolution is not None:
             return SettlementResult(resolution)
         try:
-            await store._to_thread_durable(
-                store.resolve_approval,
+            await store.resolve_approval_async(
                 request_id,
                 "abort",
                 reason=reason or "turn_canceled",
