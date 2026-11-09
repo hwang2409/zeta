@@ -106,6 +106,57 @@ def _deliver_decisions_scan(
         work.set_result(result)
 
 
+class _DecisionsScanOwner:
+    """Share scans while accepting only work at the requested generation."""
+
+    def __init__(self) -> None:
+        self._generation = 0
+        self._work: tuple[asyncio.Future[tuple], int] | None = None
+
+    def advance(self) -> int:
+        self._generation += 1
+        return self._generation
+
+    async def read(
+        self,
+        app: object,
+        timeout: float | None,
+        generation: int | None = None,
+    ) -> tuple:
+        requested = self.advance() if generation is None else generation
+        while True:
+            if requested != self._generation:
+                requested = self._generation
+            work = self._work
+            if work is None or work[0].done():
+                if work is not None and work[0].done() and not work[0].cancelled():
+                    work[0].exception()
+                loop = asyncio.get_running_loop()
+                future = loop.create_future()
+                work = (future, requested)
+                self._work = work
+                threading.Thread(
+                    target=_scan_decisions,
+                    args=(
+                        app._home,
+                        app._decisions_session_id,
+                        _registry_state(app),
+                        loop,
+                        future,
+                    ),
+                    name="zeta-decisions-scan",
+                    daemon=True,
+                ).start()
+            future, work_generation = work
+            try:
+                result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            finally:
+                if future.done() and self._work is work:
+                    self._work = None
+            if requested == self._generation and requested == work_generation:
+                return result
+
+
 class DecisionsMixin:
     """Serve the interactive decisions popup and its status-bar count."""
 
@@ -117,8 +168,7 @@ class DecisionsMixin:
         self._decisions_staged_count = 0
         self._decisions_error: str | None = None
         self._decisions_scan_task: asyncio.Task[None] | None = None
-        self._decisions_scan_work: asyncio.Future[tuple] | None = None
-        self._decisions_scan_generation = 0
+        self._decisions_scan_owner = _DecisionsScanOwner()
         self._decisions_scan_requested = asyncio.Event()
         self._decisions_stopping = False
         self._decisions_restore_text = ""
@@ -225,8 +275,7 @@ class DecisionsMixin:
             self.request_decisions_refresh()
 
     def _advance_decisions_generation(self) -> int:
-        self._decisions_scan_generation += 1
-        return self._decisions_scan_generation
+        return self._decisions_scan_owner.advance()
 
     def request_decisions_refresh(self) -> None:
         if self._decisions_stopping:
@@ -276,44 +325,7 @@ class DecisionsMixin:
     async def _read_decisions(
         self, timeout: float | None, generation: int | None = None
     ) -> tuple:
-        requested_generation = (
-            self._advance_decisions_generation() if generation is None else generation
-        )
-        while True:
-            current_generation = getattr(self, "_decisions_scan_generation", 0)
-            if requested_generation != current_generation:
-                requested_generation = current_generation
-            work = getattr(self, "_decisions_scan_work", None)
-            if work is None or work.done():
-                if work is not None and work.done() and not work.cancelled():
-                    work.exception()
-                loop = asyncio.get_running_loop()
-                work = loop.create_future()
-                self._decisions_scan_work = work
-                self._decisions_scan_work_generation = requested_generation
-                threading.Thread(
-                    target=_scan_decisions,
-                    args=(
-                        self._home,
-                        self._decisions_session_id,
-                        _registry_state(self),
-                        loop,
-                        work,
-                    ),
-                    name="zeta-decisions-scan",
-                    daemon=True,
-                ).start()
-            try:
-                result = await asyncio.wait_for(asyncio.shield(work), timeout=timeout)
-            finally:
-                if work.done() and self._decisions_scan_work is work:
-                    self._decisions_scan_work = None
-            if (
-                requested_generation == getattr(self, "_decisions_scan_generation", 0)
-                and requested_generation
-                == getattr(self, "_decisions_scan_work_generation", requested_generation)
-            ):
-                return result
+        return await self._decisions_scan_owner.read(self, timeout, generation)
 
     async def _decisions_tick(self) -> None:
         generation = self._advance_decisions_generation()
