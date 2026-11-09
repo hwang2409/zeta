@@ -1271,6 +1271,7 @@ async def _collect_second_parent_terminal(
         if buffered:
             frame = buffered.popleft()
         else:
+            # test-contract: transport <read event stream outside request-response flow>
             line = await reader.readline()
             if not line:
                 return frames, "socket eof"
@@ -1289,6 +1290,7 @@ async def _read_until_child_bash_two(
         if buffered:
             frame = buffered.popleft()
         else:
+            # test-contract: transport <read event stream outside request-response flow>
             line = await reader.readline()
             if not line:
                 return "socket eof"

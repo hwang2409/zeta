@@ -290,12 +290,6 @@ class SubmissionPipeline:
         self._ensure_open()
         self._send(_UndoAction())
 
-    def approval_action(
-        self, decision: ApprovalDecision, requested_key: str | None
-    ) -> None:
-        self._ensure_open()
-        self._send(_ApprovalAction(decision, requested_key))
-
     async def approval_command(
         self,
         decision: ApprovalDecision,

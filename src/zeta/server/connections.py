@@ -799,14 +799,6 @@ class ConnectionRegistry:
             session_id=session_id,
         )
 
-    async def run_observer_read(
-        self, connection: Any, callable: Callable[[], Any]
-    ) -> Any:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            raise RuntimeError("observer is not connected")
-        return await self.run_blocking(callable)
-
     def _read_worker(self) -> None:
         while True:
             with self._read_condition:

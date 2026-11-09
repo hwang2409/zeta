@@ -17,6 +17,8 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..attention_decisions import DecisionItem, open_decisions
+from ..attention_records import Broken
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import project_command_view
@@ -115,52 +117,126 @@ class ServerSlashSession:
     # --- runnable server-side ---
 
     async def slash_decisions(self, args: str) -> str:
-        from ..attention_decisions import open_decisions
-        from ..attention_forks import deliver_attention_decision
-        from ..attention_records import AttentionStore
-
-        loop = self._runtime.loop
-        opened = self._runtime.opened
-        if loop is None or opened is None:
-            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
-        parts = args.split(maxsplit=2)
+        _loop, opened = self._active_loop_and_session()
+        command, _, remainder = args.strip().partition(" ")
         registry_state = self._runtime.manager.project_registry_state
+        if command == "batch":
+            return await self._slash_decisions_batch(
+                remainder, opened.metadata.session_id
+            )
+        if command in {"dismiss", "reply"}:
+            items = await asyncio.to_thread(
+                open_decisions,
+                self._runtime.home,
+                opened.metadata.session_id,
+                registry_state,
+            )
+            return await self._slash_decisions_action(
+                command, remainder, items, opened.metadata.session_id
+            )
+        await self._run_attention_operation(
+            self._attention_replies(opened.metadata.session_id).recover
+        )
         items = await asyncio.to_thread(
             open_decisions,
             self._runtime.home,
             opened.metadata.session_id,
             registry_state,
         )
-        if parts and parts[0] in {"dismiss", "reply"}:
-            if len(parts) < 2:
-                return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
-            item = next((item for item in items if item.record.id == parts[1]), None)
-            if item is None:
-                return "attention item not found"
-            store = AttentionStore(self._runtime.home / "sessions" / item.session_id)
-            if parts[0] == "dismiss":
-                await asyncio.to_thread(
-                    store.dismiss, item.record.id, session_id=item.session_id
-                )
-                return f"dismissed {item.record.id}"
-            if len(parts) < 3 or not parts[2].strip():
-                return "reply text must be nonempty"
-            await asyncio.to_thread(
-                deliver_attention_decision,
-                self._runtime.home,
-                item.record,
-                parts[2],
-                from_session=opened.metadata.session_id,
-                registry_state=registry_state,
-            )
-            return f"replied to {item.record.id}"
         if not items:
             return "no open attention items"
         return "open attention items:\n" + "\n".join(
-            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            (
+                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
+                if isinstance(item.record, Broken)
+                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            )
             for item in items
         )
 
+    def _active_loop_and_session(self):
+        loop = self._runtime.loop
+        opened = self._runtime.opened
+        if loop is None or opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        return loop, opened
+
+    def _attention_replies(self, session_id: str):
+        from ..attention_replies import AttentionReplies
+
+        loop, _opened = self._active_loop_and_session()
+        on_visible = (
+            loop.notify_project_inbox_publication
+            if session_id == loop.store.session_id
+            else None
+        )
+        return AttentionReplies(
+            self._runtime.home,
+            session_id,
+            registry_state=self._runtime.manager.project_registry_state,
+            on_inbox_visible=on_visible,
+        )
+
+    async def _run_attention_operation(self, operation, *args):
+        return await asyncio.to_thread(operation, *args)
+
+    async def _slash_decisions_batch(self, payload: str, from_session: str) -> str:
+        if not payload:
+            return "usage: /decisions batch <json array>"
+        try:
+            submitted = json.loads(payload)
+            if not isinstance(submitted, list):
+                raise TypeError
+            batch = [(item["id"], item["reply"]) for item in submitted]
+            if any(
+                not isinstance(item_id, str) or not isinstance(reply, str)
+                for item_id, reply in batch
+            ) or len({item_id for item_id, _ in batch}) != len(batch):
+                raise TypeError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return "batch must be a JSON array of objects with id and reply"
+        return await self._run_decisions_batch(batch, from_session)
+
+    async def _run_decisions_batch(
+        self, batch: list[tuple[str, str]], from_session: str
+    ) -> str:
+        outcome = await self._run_attention_operation(
+            self._attention_replies(from_session).stage_and_flush,
+            batch,
+            from_session,
+        )
+        refusals = [item.detail for item in outcome.items if item.status == "broken"]
+        replied = len(outcome.items) - len(refusals)
+        lines = [f"replied to {replied} attention item(s)"] if replied else []
+        return "\n".join([*lines, *refusals])
+
+    async def _slash_decisions_action(
+        self,
+        command: str,
+        remainder: str,
+        items: tuple[DecisionItem, ...],
+        from_session: str,
+    ) -> str:
+        attention_id, separator, reply = remainder.partition(" ")
+        if not attention_id:
+            return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
+        item = next((item for item in items if item.record.id == attention_id), None)
+        if item is None:
+            return "attention item not found"
+        if isinstance(item.record, Broken):
+            return f"attention record {item.record.id} is broken ({item.record.reason}); repair {item.record.path} before replying"
+        replies = self._attention_replies(item.session_id)
+        if command == "dismiss":
+            await self._run_attention_operation(replies.dismiss, item.record.id)
+            text = f"dismissed {item.record.id}"
+        else:
+            if not separator or not reply.strip():
+                return "reply text must be nonempty"
+            await self._run_attention_operation(
+                replies.reply, item.record.id, reply, from_session
+            )
+            text = f"replied to {item.record.id}"
+        return text
     @property
     def plan_mode(self) -> bool:
         return self._runtime.loop.plan_mode if self._runtime.loop is not None else False
