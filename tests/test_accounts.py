@@ -804,8 +804,6 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
     credential = named_account_credentials(tmp_path, "codex")
     await asyncio.to_thread(credential.save, tokens())
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
-    ticks = 0
-    stop = asyncio.Event()
     lock_waiting = threading.Event()
     original_bounded_guard = account_store._bounded_guard
 
@@ -819,30 +817,55 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
     # test-contract: seam observes the existing worker-thread lock boundary.
     monkeypatch.setattr(account_store, "_bounded_guard", observe_lock_wait)
 
-    async def ticker() -> None:
-        nonlocal ticks
-        async with asyncio.timeout(10):
-            while not stop.is_set():
-                ticks += 1
-                await asyncio.sleep(0)
-
-    ticker_task = asyncio.create_task(ticker())
+    operation: asyncio.Task[object] | None = None
+    progress_future: asyncio.Future[None] | None = None
     try:
         async with credential._async_guard(registry=False, timeout=30):
             observe_waiting = True
             operation = asyncio.create_task(
                 asyncio.to_thread(credential_store, "codex", home=tmp_path)
             )
-            await await_or_fail(
+            assert await await_or_fail(
                 asyncio.to_thread(lock_waiting.wait, 10),
                 what="credential store lock-wait signal",
             )
-            assert ticks > 1
+
+            loop = asyncio.get_running_loop()
+            progress_future = loop.create_future()
+
+            def mark_progress() -> None:
+                if (
+                    operation is not None
+                    and not operation.done()
+                    and not progress_future.done()
+                ):
+                    progress_future.set_result(None)
+
+            loop.call_soon(mark_progress)
+            done, _ = await await_or_fail(
+                asyncio.wait(
+                    (progress_future, operation),
+                    timeout=10,
+                    return_when=asyncio.FIRST_COMPLETED,
+                ),
+                what="event-loop progress during credential store lock wait",
+            )
+            assert progress_future in done, (
+                "credential store lock wait completed without event-loop progress"
+            )
+            assert not operation.done()
             with pytest.raises(AccountError):
                 await await_or_fail(operation, what="credential store")
     finally:
-        stop.set()
-        await await_or_fail(ticker_task, what="event-loop ticker")
+        if progress_future is not None and not progress_future.done():
+            progress_future.cancel()
+        if operation is not None and not operation.done():
+            operation.cancel()
+        if operation is not None:
+            await await_or_fail(
+                asyncio.gather(operation, return_exceptions=True),
+                what="credential store operation",
+            )
 
 
 def test_resolve_account_does_not_migrate(
