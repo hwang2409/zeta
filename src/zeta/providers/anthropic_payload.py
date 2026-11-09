@@ -32,6 +32,7 @@ from .payload_common import (
     HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
     images_before_prompt,
     is_harness_notification,
+    provider_messages,
 )
 
 ANTHROPIC_MAX_BASE64_CHARACTERS = ANTHROPIC_IMAGE_POLICY.max_wire_size
@@ -180,7 +181,7 @@ def build_messages_payload(
     thinking_budget: int = 8_192,
 ) -> dict[str, Any]:
     _validate_thinking_parameters(max_tokens, thinking_budget)
-    messages = without_incomplete_tool_batches(messages)
+    messages = provider_messages(without_incomplete_tool_batches(messages))
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
     system_at_head = True
