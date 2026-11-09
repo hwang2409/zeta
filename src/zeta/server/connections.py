@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from ..core.thread_call import ThreadCallWorkers
 from . import content, ergonomics
 from .protocol import (
     ErrorDescriptor,
@@ -102,94 +102,6 @@ class _Connection:
     output: _OutputState | None = None
 
 
-class _ReadJob:
-    """One queued read; a worker sees only this token, never the future."""
-
-    __slots__ = ("callable",)
-
-    def __init__(self, callable: Callable[[], Any]) -> None:
-        self.callable = callable
-
-
-class _BlockingReads:
-    """Run blocking reads on worker threads; only the loop settles their futures.
-
-    The loop maps each job token to its future. Caller cancellation, close,
-    and the worker hand-back all settle futures on the loop thread, so a
-    hand-back after close or after cancellation finds no future and is dropped.
-    """
-
-    def __init__(self, loop: asyncio.AbstractEventLoop, workers: int = 2) -> None:
-        self._loop = loop
-        self._condition = threading.Condition()
-        self._queue: deque[_ReadJob] = deque()
-        self._stopping = False
-        self._futures: dict[_ReadJob, asyncio.Future[Any]] = {}  # loop thread only
-        self.threads = [
-            threading.Thread(target=self._work, daemon=True, name=f"zeta-read-{i}")
-            for i in range(workers)
-        ]
-        for thread in self.threads:
-            thread.start()
-
-    async def run(self, callable: Callable[[], Any]) -> Any:
-        job = _ReadJob(callable)
-        future = self._loop.create_future()
-        with self._condition:
-            if self._stopping:
-                raise RuntimeError("reads are closed")
-            self._queue.append(job)
-            self._condition.notify()
-        self._futures[job] = future
-        try:
-            return await future
-        finally:
-            if self._futures.pop(job, None) is not None:
-                with self._condition, contextlib.suppress(ValueError):
-                    self._queue.remove(job)  # cancelled before a worker took it
-
-    def close(self) -> None:
-        """Cancel every queued and running read; call on the loop thread."""
-        with self._condition:
-            self._stopping = True
-            self._queue.clear()
-            self._condition.notify_all()
-        futures = tuple(self._futures.values())
-        self._futures.clear()
-        for future in futures:
-            future.cancel()
-
-    def _work(self) -> None:
-        while True:
-            with self._condition:
-                while not self._queue and not self._stopping:
-                    self._condition.wait()
-                if not self._queue:
-                    return
-                job = self._queue.popleft()
-            try:
-                outcome: tuple[Any, BaseException | None] = (job.callable(), None)
-            except Exception as exc:  # noqa: BLE001 - worker must return every job failure
-                outcome = (None, exc)
-            with self._condition:
-                if self._stopping:
-                    continue  # close already cancelled this job's future on the loop
-                try:
-                    self._loop.call_soon_threadsafe(self._done, job, *outcome)
-                except RuntimeError:
-                    if not self._loop.is_closed():
-                        raise
-
-    def _done(self, job: _ReadJob, result: Any, error: BaseException | None) -> None:
-        future = self._futures.pop(job, None)
-        if future is None or future.done():
-            return
-        if error is None:
-            future.set_result(result)
-        else:
-            future.set_exception(error)
-
-
 class ConnectionRegistry:
     """Owns connection claims, output, and bounded observer reads."""
 
@@ -200,7 +112,7 @@ class ConnectionRegistry:
         self._controller_output_paused = False
         self._observers: list[_Connection] = []
         self._closed = False
-        self._reads = _BlockingReads(loop)
+        self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
 
     def register(self, connection: Any) -> None:
         if self._closed:

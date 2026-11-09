@@ -6,18 +6,13 @@ import os
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 
 import pytest
 
 from zeta.core.thread_call import run_owned_thread_call
-
-
-async def _next_loop_turn() -> None:
-    resumed = asyncio.Event()
-    asyncio.get_running_loop().call_soon(resumed.set)
-    await asyncio.wait_for(resumed.wait(), 10)
 
 
 def _run_guarded_subprocess(source: str) -> subprocess.CompletedProcess[str]:
@@ -140,95 +135,118 @@ else:
     assert completed.returncode == 0, completed.stderr
 
 
-@pytest.mark.asyncio
-async def test_owned_thread_call_closes_once_after_repeated_cancellation(
-    tmp_path: Path,
-) -> None:
+ROWS = (
+    "success",
+    "failure",
+    "loop_affine",
+    "cancel_before_start",
+    "cancel_running",
+    "cancel_running_failure",
+    "duplicate_cancel",
+    "cancel_result_ready",
+    "loop_closed_running",
+    "cancel_running_then_loop_closed",
+)
+
+
+@pytest.mark.parametrize("row", ROWS)
+def test_owned_thread_call_closes_untaken_result_once(row: str, tmp_path: Path) -> None:
+    """Each row drives a real loop and a one-thread executor it can join."""
+    loop = asyncio.new_event_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
+    loop_thread = threading.get_ident()
     started = threading.Event()
     release = threading.Event()
-    closed = threading.Event()
+    unblock = threading.Event()
     descriptors: list[int] = []
-    adopted: list[int] = []
+    closes: list[int] = []  # thread ident of each close
 
-    def acquire() -> int:
+    def acquire() -> object:
+        started.set()
+        assert release.wait(10), "worker was not released"
+        if row in {"failure", "cancel_running_failure"}:
+            raise ValueError("acquire failed")
+        if row == "loop_affine":
+            return asyncio.Future(loop=loop)
         descriptor = os.open(tmp_path / "owned", os.O_RDWR | os.O_CREAT, 0o600)
         descriptors.append(descriptor)
-        started.set()
-        assert release.wait(timeout=10)
         return descriptor
 
-    def adopt(descriptor: int) -> None:
-        adopted.append(descriptor)
-        os.close(descriptor)
-        closed.set()
+    def close(descriptor: object) -> None:
+        closes.append(threading.get_ident())
+        os.close(descriptor)  # type: ignore[arg-type]
 
-    task = asyncio.create_task(run_owned_thread_call(acquire, adopt))
-    try:
-        assert await asyncio.to_thread(started.wait, 10)
-        task.cancel()
-        await _next_loop_turn()
-        task.cancel()
-        await _next_loop_turn()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=10)
-        assert await asyncio.to_thread(closed.wait, 10)
+    def step() -> None:
+        loop.run_until_complete(asyncio.sleep(0))
 
-        assert adopted == descriptors
+    def assert_closed_once(*, on_loop: bool) -> None:
+        assert len(closes) == 1, f"close ran {len(closes)} times"
+        assert (closes[0] == loop_thread) is on_loop
         with pytest.raises(OSError) as error:
             os.fstat(descriptors[0])
         assert error.value.errno == errno.EBADF
-    finally:
-        release.set()
-        with suppress(BaseException):
-            await asyncio.wait_for(task, timeout=10)
-        for descriptor in descriptors:
-            with suppress(OSError):
-                os.close(descriptor)
 
-
-@pytest.mark.asyncio
-async def test_owned_thread_call_consumes_worker_failure_after_cancellation(
-    tmp_path: Path,
-) -> None:
-    class WorkerFailure(Exception):
-        pass
-
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-    descriptors: list[int] = []
-    adopted: list[int] = []
-
-    def fail() -> int:
-        descriptor = os.open(tmp_path / "failed", os.O_RDWR | os.O_CREAT, 0o600)
-        descriptors.append(descriptor)
-        started.set()
-        try:
-            assert release.wait(timeout=10)
-            raise WorkerFailure("worker failed")
-        finally:
-            os.close(descriptor)
-            finished.set()
-
-    task = asyncio.create_task(run_owned_thread_call(fail, adopted.append))
     try:
-        assert await asyncio.to_thread(started.wait, 10)
-        task.cancel()
-        await _next_loop_turn()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=10)
-        assert await asyncio.to_thread(finished.wait, 10)
-
-        assert adopted == []
-        with pytest.raises(OSError) as error:
-            os.fstat(descriptors[0])
-        assert error.value.errno == errno.EBADF
+        if row in {"success", "failure", "loop_affine"}:
+            release.set()
+            if row == "success":
+                assert loop.run_until_complete(
+                    run_owned_thread_call(acquire, close)
+                ) == descriptors[0]
+            else:
+                expected = ValueError if row == "failure" else TypeError
+                with pytest.raises(expected):
+                    loop.run_until_complete(run_owned_thread_call(acquire, close))
+            assert closes == []
+        elif row == "cancel_before_start":
+            executor.submit(unblock.wait, 10)  # occupy the only worker
+            task = loop.create_task(run_owned_thread_call(acquire, close))
+            step()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                loop.run_until_complete(task)
+            unblock.set()
+            executor.shutdown(wait=True)
+            assert not started.is_set(), "a call cancelled before start ran"
+            assert closes == []
+        elif row == "cancel_result_ready":
+            task = loop.create_task(run_owned_thread_call(acquire, close))
+            step()
+            assert started.wait(10)
+            release.set()
+            # The one worker runs this only after the call finished and handed back.
+            executor.submit(lambda: None).result(10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                loop.run_until_complete(task)
+            assert_closed_once(on_loop=True)
+        else:
+            task = loop.create_task(run_owned_thread_call(acquire, close))
+            step()
+            assert started.wait(10)
+            if row != "loop_closed_running":
+                task.cancel()
+                if row == "duplicate_cancel":
+                    task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    loop.run_until_complete(task)
+                if row == "duplicate_cancel":
+                    task.cancel()
+            if row in {"loop_closed_running", "cancel_running_then_loop_closed"}:
+                loop.close()
+            release.set()
+            executor.shutdown(wait=True)  # joins the worker: every close has run
+            if row == "cancel_running_failure":
+                assert closes == []
+            else:
+                assert_closed_once(on_loop=False)
     finally:
         release.set()
-        with suppress(BaseException):
-            await asyncio.wait_for(task, timeout=10)
+        unblock.set()
+        executor.shutdown(wait=True)
+        if not loop.is_closed():
+            loop.close()
         for descriptor in descriptors:
             with suppress(OSError):
                 os.close(descriptor)
