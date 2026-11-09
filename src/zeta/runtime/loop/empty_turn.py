@@ -144,6 +144,81 @@ def annotate_turn_metadata(
     )
 
 
+# One identical re-dispatch is legitimate: a gate deadline can cancel a turn
+# before the provider acknowledges its delivery, and the next call repeats it.
+# A second identical call means the same cancel route fired again; stop there.
+MAX_REPEATED_DISPATCHES = 1
+NO_PROGRESS_LOOP_CODE = "no_progress_loop"
+
+
+class DispatchProgress:
+    """Bound provider calls that repeat a request with nothing new committed."""
+
+    def __init__(self) -> None:
+        self._mark: tuple[object, ...] | None = None
+        self._repeats = 0
+
+    def reset(self) -> None:
+        self._mark = None
+        self._repeats = 0
+
+    def admit(
+        self,
+        store: Any,
+        prepared: Any,
+        flow: Any,
+        retrying_context: bool,
+        *,
+        waits_for_input: bool,
+    ) -> str | ErrorInfo:
+        """Return "dispatch", or stop with a typed error and keep the input pending."""
+
+        mark = (
+            store.active_branch_head_sequence(),
+            prepared.prompt_id,
+            prepared.notification_ids,
+        )
+        if retrying_context or prepared.steering is not None or mark != self._mark:
+            self._mark = mark
+            self._repeats = 0
+            return "dispatch"
+        self._repeats += 1
+        if self._repeats <= MAX_REPEATED_DISPATCHES:
+            return "dispatch"
+        self.reset()
+        flow.release_active()
+        # keep the input durable but stop it from waking the model again; the
+        # next new input carries it into the following request.
+        stopped = prepared.notification_ids + (
+            () if prepared.prompt_id is None else (prepared.prompt_id,)
+        )
+        flow.suppress_pending(stopped)
+        return ErrorInfo(
+            NO_PROGRESS_LOOP_CODE,
+            not_delivered_text(
+                f"the model was called {MAX_REPEATED_DISPATCHES + 1} times with "
+                "the same request and nothing new was saved; stopped to avoid "
+                "repeat spend",
+                waits_for_input=waits_for_input,
+            ),
+        )
+
+
+def not_delivered_text(reason: str, *, waits_for_input: bool) -> str:
+    """Word every stop that holds input back (repeat bound, causal budget) alike.
+
+    Only a loop that waits for more input (top level, or an explicit-finish
+    child) is sure to send the held input on; any other child may end first.
+    """
+
+    if waits_for_input:
+        return f"{reason}. Input not delivered: it is held and goes with the next message."
+    return (
+        f"{reason}. Input not delivered: it is held for the next message to this "
+        "agent and is lost if the agent ends first."
+    )
+
+
 def build_nudge_message() -> Message:
     """Build hidden zeta guidance that asks the model to actually respond."""
 
