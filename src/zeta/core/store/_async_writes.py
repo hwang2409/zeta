@@ -783,9 +783,6 @@ class AsyncDurableWritesMixin:
     async def _before_committed_install(self: ConversationStore) -> None:
         """Test seam after durability and before resident installation."""
 
-    async def _before_committed_publish(self: ConversationStore) -> None:
-        """Test seam after resident installation and before publication."""
-
     async def _finish_submitted_mutation(
         self: ConversationStore,
         command: ConversationMutation[Any],
@@ -800,7 +797,6 @@ class AsyncDurableWritesMixin:
                 if outcome.delta is not None:
                     installed.append(self._install_committed_delta(outcome.delta))
             self._accept_persisted_appends(outcome.receipts)
-        await self._before_committed_publish()
         if "reset" in installed:
             self._publish_entries_installed("reset")
         else:

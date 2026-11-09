@@ -11,7 +11,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, MessageRole, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.runtime.loop import AgentLoop
-from zeta.skills.loader import (
+from zeta.skills.catalog import (
     SkillCatalog,
     SkillMeta,
     discover_session_skills,
@@ -60,7 +60,7 @@ def test_discover_and_load_skill(tmp_path: Path) -> None:
 
 
 def test_discover_packaged_skills_is_empty() -> None:
-    from zeta.skills.loader import discover_packaged_skills
+    from zeta.skills.catalog import discover_packaged_skills
 
     catalog = discover_packaged_skills()
 
@@ -142,7 +142,7 @@ def test_skill_index_escapes_hostile_metadata(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    from zeta.skills.loader import SkillCatalog
+    from zeta.skills.catalog import SkillCatalog
 
     catalog = SkillCatalog(tuple(discover_skills(tmp_path)))
     index = catalog.index()
