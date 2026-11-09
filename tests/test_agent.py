@@ -7862,16 +7862,21 @@ async def _run_nested_loop_bound_case(
 
     monkeypatch.setattr(ToolRegistry, "clone_for_session", observe_clone)
     original_unregister = loop._background_owner.unregister
+    original_finish_store = loop._background_owner.finish_store
+
+    def observe_finish_store(instance_id: str, child_store: ConversationStore) -> None:
+        if loop._background_owner._descriptions.get(instance_id) == "child a":
+            backend.child_a_path = child_store.session_dir
+        original_finish_store(instance_id, child_store)
 
     def observe_unregister(instance_id: str) -> None:
         if loop._background_owner._descriptions.get(instance_id) == "child a":
             backend.child_a_id = instance_id
-            backend.child_a_path = loop._background_owner._active_stores[instance_id][
-                0
-            ].session_dir
             backend.child_a_finished.set()
         original_unregister(instance_id)
 
+    # test-contract: seam the runner finishes the child store before unregistering it
+    monkeypatch.setattr(loop._background_owner, "finish_store", observe_finish_store)
     monkeypatch.setattr(loop._background_owner, "unregister", observe_unregister)
     await _collect(loop.run_turn("root", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.child_a_started.wait(), 10)
@@ -13263,7 +13268,7 @@ async def test_background_cleanup_keeps_store_close_visible_to_owner(
 
     async def pause_cleanup(policy: ChildApprovalPolicy) -> None:
         cleanup_entered.set()
-        await release_cleanup.wait()
+        await asyncio.wait_for(release_cleanup.wait(), 10)
         await original_cleanup(policy)
 
     monkeypatch.setattr(agent_runner_module.ChildApprovalPolicy, "cleanup", pause_cleanup)
@@ -13290,7 +13295,9 @@ async def test_background_cleanup_keeps_store_close_visible_to_owner(
         await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
         await asyncio.wait_for(run, timeout=10)
         await asyncio.wait_for(cleanup_entered.wait(), timeout=10)
-        owner_wait = asyncio.create_task(loop._background_owner.wait())
+        owner_wait = asyncio.create_task(
+            asyncio.wait_for(loop._background_owner.wait(), 10)
+        )
         await asyncio.sleep(0)
         assert not owner_wait.done(), "owner wait returned before child store close"
         assert loop._background_owner._store_close_tasks
@@ -13299,7 +13306,9 @@ async def test_background_cleanup_keeps_store_close_visible_to_owner(
     finally:
         release_cleanup.set()
         if owner_wait is not None:
-            await asyncio.gather(owner_wait, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(owner_wait, return_exceptions=True), 10
+            )
         await loop.close()
         store.close()
 
@@ -13318,7 +13327,7 @@ async def test_foreground_child_close_finishes_before_cancellation(
     ) -> tuple[str, ...]:
         if child_loop.agent_instance_id is not None:
             close_started.set()
-            await release_close.wait()
+            await asyncio.wait_for(release_close.wait(), 10)
         result = await original_close(child_loop, **kwargs)
         if child_loop.agent_instance_id is not None:
             close_finished.set()
@@ -13356,7 +13365,7 @@ async def test_foreground_child_close_finishes_before_cancellation(
         assert close_finished.is_set(), "cancellation reached caller before child close"
     finally:
         release_close.set()
-        await asyncio.gather(run, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(run, return_exceptions=True), 10)
         await loop.close()
         store.close()
 
@@ -16157,14 +16166,14 @@ async def test_follow_up_commit_suppresses_racing_stalled_admission(
     channel = loop._background_owner.conversation_channel
     original_idle = channel.publish_idle
 
-    async def blocked_commit(item: object) -> object:
+    async def blocked_commit(item: object, **kwargs: bool) -> object:
         if isinstance(item, pending_delivery_module.PromptInput):
             commit_entered.set()
             await asyncio.wait_for(release_commit.wait(), 10)
-            result = await original_commit(item)
+            result = await original_commit(item, **kwargs)
             order.append("follow_up")
             return result
-        return await original_commit(item)
+        return await original_commit(item, **kwargs)
 
     async def observed_idle(**kwargs):
         order.append("idle")
