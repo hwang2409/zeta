@@ -171,6 +171,35 @@ def test_removed_and_cleared_units_leave_the_per_unit_caches() -> None:
     assert not transcript._unit_locations_cache
 
 
+def test_search_transitions_clear_highlights_and_anchors() -> None:
+    transcript = TranscriptWidget()
+    first = transcript.append(Text("alpha target"))
+    transcript.append(Text("beta target"))
+    transcript.append(Text("gamma needle"))
+
+    assert "\x1b[48;2" not in transcript.render(60)
+
+    transcript.begin_search()
+    transcript.update_search("target")
+    assert transcript.render(60).count("48;2") == 2
+
+    transcript.update_search("needle", anchor_key=first.key)
+    needle_render = transcript.render(60)
+    assert "needle\x1b[0m" in needle_render
+    assert "target\x1b[0m" not in needle_render
+
+    transcript.end_search()
+    assert "\x1b[48;2" not in transcript.render(60)
+    assert transcript._search_anchor_key is None
+
+    transcript.begin_search()
+    transcript.update_search("needle")
+    transcript.create_content(60, 1)
+    assert "needle\x1b[0m" in transcript.render(60)
+    assert transcript._search_anchor_key is None
+    assert transcript.scroll_offset == 2
+
+
 def test_search_highlight_path_still_paints_matches() -> None:
     transcript = _mixed_transcript()
     transcript.create_content(72, 20)
