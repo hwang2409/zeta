@@ -831,6 +831,7 @@ class ServeControl:
         await self._notify(
             event_contract.STREAM_EVENT_WIRE_EVENTS[event.type],
             session_id,
+            required_feature="live_config_changed",
             **event_contract.config_changed_wire_fields(event),
         )
 

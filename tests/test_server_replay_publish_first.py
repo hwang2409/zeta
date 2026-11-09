@@ -202,6 +202,53 @@ async def _counts(
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_config_changed_replay_observers_are_feature_filtered(
+    tmp_path: Path, transport: Transport
+) -> None:
+    server = replay_server(tmp_path, transport, _assistant_backend)
+    await server.start()
+    controller = await connect_replay(server, transport)
+    without_feature = await connect_replay(server, transport)
+    with_feature = await connect_replay(server, transport)
+    try:
+        await negotiate(controller, extra=("live_config_changed",))
+        session_id = (await controller.request(2, "new_session", {"provider": "codex"}))["result"]["session"]["session_id"]
+        await negotiate(without_feature, observer=True)
+        await negotiate(with_feature, observer=True, extra=("live_config_changed",))
+        for client in (without_feature, with_feature):
+            joined = await client.request(2, "session_history_and_subscribe", {"session_id": session_id})
+            assert joined["result"]["replay"]["history_seq"] == 0
+
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n---\nprofile body\n",
+            encoding="utf-8",
+        )
+        assert server.runtime.loop is not None
+        prepared: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared.append)
+        await server.runtime.loop.refresh_live_config()
+        assert len(prepared) == 1
+        await server.control._event(prepared[0], background=True)
+
+        config = await with_feature.event("config_changed")
+        assert config["stream_id"] == joined["result"]["replay"]["stream_id"]
+        assert config["seq"] == 1
+        frames = await _frames_before_status(without_feature, 3)
+        assert not [
+            frame for frame in frames
+            if frame.get("params", {}).get("event") == "config_changed"
+        ]
+    finally:
+        await with_feature.close()
+        await without_feature.close()
+        await controller.close()
+        await server.close()
+
+
 # --- moved in from the frontier proof (scratch/replay-frontier-proof@14af66a2) ---
 
 
