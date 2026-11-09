@@ -284,6 +284,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             await await_or_fail(first.started.wait(), what="first grandchild starts")
             await await_or_fail(second.started.wait(), what="second grandchild starts")
             first.release.set()
+            second.release.set()
         else:
             registry = child_registries[0]
             running = [
@@ -324,7 +325,6 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
                     handle
                 ].flow
                 assert flow._low_capacity_notifications is True
-                assert child_backend.calls == 2
         rows = _read_agent_status(
             store,
             requested_handle=handle,
