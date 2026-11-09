@@ -9,10 +9,13 @@ import sys
 import threading
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager, contextmanager
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
+from zeta.attention_records import AttentionStore
 from zeta.core.session import SessionManager
 from zeta.core.session_links import (
     PENDING_CHILD_LINKS_DIRNAME,
@@ -22,8 +25,12 @@ from zeta.core.session_links import (
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
+from zeta.server import ZetaServer
+from zeta.skills import SkillCatalog
 from zeta.storage_format import WRITER_EPOCH, advance
+from zeta.tui.app import TUIApp
 
 
 def _send(channel: socket.socket, value: str) -> None:
@@ -310,6 +317,160 @@ def test_p06_4_epoch_selects_legacy_then_named_authority(tmp_path: Path) -> None
     current = ProjectRegistry(home / "projects")
     current.load_memory(old_project.project_id)
     assert (home / "projects" / old_project.project_id / ".memory.lock").is_file()
+
+
+@pytest.mark.asyncio
+async def test_p06_below_epoch_real_tui_serve_journey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Normal TUI, serve, inbox, and attention use stays on an epoch-5 home."""
+    from tests.support.fake_backend import FakeBackend
+    from tests.support.owned import await_or_fail, owned_app
+    from tests.support.serve_close import close_serve
+    from tests.test_server import _ready_extensions, _request
+    from zeta.cli.main import main as cli_main
+
+    home = tmp_path / "home"
+    for epoch in range(5):
+        advance(home, expected_epoch=epoch, target_epoch=epoch + 1)
+    project_dir = tmp_path / "project"
+    await asyncio.to_thread(
+        subprocess.run,
+        ("git", "init", "--quiet", str(project_dir)),
+        check=True,
+        capture_output=True,
+    )
+    server = await asyncio.to_thread(
+        ZetaServer, home=home, cwd=project_dir, port=0, provider="codex"
+    )
+    reader = writer = None
+    opened = None
+    app = None
+    try:
+        monkeypatch.setenv("ZETA_HOME", str(home))
+        monkeypatch.chdir(project_dir)
+        assert await asyncio.to_thread(
+            cli_main, ["project", "init", str(project_dir)]
+        ) == 0
+        reader, writer, serve_session_id = await _ready_extensions(server)
+        project_result = (
+            await _request(
+                reader,
+                writer,
+                "project-init",
+                "slash_run",
+                {"session_id": serve_session_id, "text": "/project"},
+            )
+        )[-1]["result"]
+        assert "project" in project_result["text"].lower()
+        registry = server.runtime.manager.project_registry
+        assert registry is not None
+        project = (await asyncio.to_thread(registry.list_projects))[0]
+        assert project.name == project_dir.name
+        # epoch 5 homes must keep the legacy root authority until cutover.
+        assert (home / "projects" / ".lock").is_file()
+        assert not (home / "projects" / project.project_id / ".memory.lock").exists()
+
+        manager = SessionManager(home)
+        opened = await asyncio.to_thread(
+            manager.create,
+            provider="codex",
+            model="offline",
+            cwd=project_dir,
+            project_id=project.project_id,
+            auto_project=False,
+        )
+        app = TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                opened.store,
+                skill_catalog=SkillCatalog.empty(),
+                project_registry=manager.project_registry,
+                root_project_id=project.project_id,
+            ),
+            provider="codex",
+            model="offline",
+            console=Console(file=StringIO(), force_terminal=True),
+        )
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        async with owned_app(app):
+            await await_or_fail(app.loop.activate(), what="below-epoch TUI activation")
+            sent = await await_or_fail(
+                app.loop.tool_registry.execute(
+                    ToolCall(
+                        "below-epoch-send",
+                        "inbox",
+                        {
+                            "action": "send",
+                            "project": project.project_id,
+                            "kind": "question",
+                            "title": "below epoch",
+                            "body": "normal journey",
+                        },
+                    ),
+                    _skip_approval=True,
+                ),
+                what="below-epoch inbox send",
+            )
+            assert sent.get("isError") is not True
+            message_id = sent["structuredContent"]["id"]
+            listed = await await_or_fail(
+                app.loop.tool_registry.execute(
+                    ToolCall("below-epoch-list", "inbox", {"action": "list"})
+                ),
+                what="below-epoch inbox list",
+            )
+            assert listed.get("isError") is not True
+            assert any(
+                message["id"] == message_id
+                for message in listed["structuredContent"]["messages"]
+            )
+
+            record = await asyncio.to_thread(
+                AttentionStore(
+                    home / "sessions" / serve_session_id
+                ).request,
+                session_id=serve_session_id,
+                project_id=project.project_id,
+                entry_id=None,
+                entry_seq=None,
+                title="below epoch reply",
+                why="normal journey",
+                options=("yes",),
+            )
+            reply = (
+                await _request(
+                    reader,
+                    writer,
+                    "attention-reply",
+                    "slash_run",
+                    {
+                        "session_id": serve_session_id,
+                        "text": f"/decisions reply {record.id} yes",
+                    },
+                )
+            )[-1]["result"]
+            assert reply["text"] == f"replied to {record.id}"
+            assert (
+                await asyncio.to_thread(
+                    lambda: AttentionStore(
+                        home / "sessions" / serve_session_id
+                    ).get(record.id).status
+                )
+                == "resolved"
+            )
+    finally:
+        if opened is not None and app is None:
+            opened.store.close()
+        if opened is not None:
+            opened.store.close()
+        if writer is not None:
+            await close_serve(server, writer)
+        else:
+            await close_serve(server)
+    assert json.loads((home / "storage-format.json").read_text())["writer_epoch"] == 5
 
 
 def _project_session_row(
