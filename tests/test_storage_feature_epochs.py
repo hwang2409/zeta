@@ -25,23 +25,31 @@ def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     }
 
 
+def _cli_main_path() -> Path:
+    return Path.cwd() / "src" / "zeta" / "cli" / "main.py"
+
+
+def _allowed_writer_import(node: ast.alias, path: Path) -> bool:
+    # the single unaliased import that brings WRITER_EPOCH into cli/main.py.
+    return path == _cli_main_path() and node.asname is None
+
+
 def _allowed_writer_default(
     node: ast.Name, parents: dict[ast.AST, ast.AST], path: Path
 ) -> bool:
-    if path != Path.cwd() / "src" / "zeta" / "cli" / "main.py":
+    if path != _cli_main_path():
         return False
     keyword = parents.get(node)
-    call = parents.get(keyword) if isinstance(keyword, ast.keyword) else None
+    if not isinstance(keyword, ast.keyword) or keyword.arg != "default":
+        return False
+    call = parents.get(keyword)
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
     return (
-        isinstance(keyword, ast.keyword)
-        and keyword.arg == "default"
-        and isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "add_argument"
-        and any(
-            isinstance(argument, ast.Constant) and argument.value == "--target-epoch"
-            for argument in call.args
-        )
+        call.func.attr == "add_argument"
+        and bool(call.args)
+        and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == "--target-epoch"
     )
 
 
@@ -49,9 +57,7 @@ def _writer_epoch_violation(
     node: ast.AST, parents: dict[ast.AST, ast.AST], path: Path
 ) -> bool:
     if isinstance(node, ast.alias):
-        return node.name == "WRITER_EPOCH" and path != (
-            Path.cwd() / "src" / "zeta" / "cli" / "main.py"
-        )
+        return node.name == "WRITER_EPOCH" and not _allowed_writer_import(node, path)
     if isinstance(node, ast.Name):
         return node.id == "WRITER_EPOCH" and not _allowed_writer_default(
             node, parents, path
@@ -99,6 +105,29 @@ def test_feature_gates_do_not_compare_against_writer_epoch() -> None:
 def test_writer_epoch_guard_rejects_aliases(source: str, tmp_path: Path) -> None:
     path = tmp_path / "sample.py"
     assert _writer_epoch_violations(path, source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # an aliased import hides the epoch behind another name.
+        "from ..storage_format import WRITER_EPOCH as hidden\ndef f(value=hidden): pass",
+        # a second use outside the allowed --target-epoch default.
+        'p.add_argument("--target-epoch", type=int, default=WRITER_EPOCH)\nx = WRITER_EPOCH',
+        # a module attribute use.
+        "import zeta.storage_format as sf\nx = sf.WRITER_EPOCH",
+    ],
+)
+def test_writer_epoch_guard_rejects_cli_aliases_and_extra_uses(source: str) -> None:
+    assert _writer_epoch_violations(_cli_main_path(), source)
+
+
+def test_writer_epoch_guard_accepts_the_one_cli_site() -> None:
+    source = (
+        "from ..storage_format import WRITER_EPOCH\n"
+        'p.add_argument("--target-epoch", type=int, default=WRITER_EPOCH)\n'
+    )
+    assert not _writer_epoch_violations(_cli_main_path(), source)
 
 
 @pytest.mark.parametrize("case", ["repair", "memory", "attention"])
