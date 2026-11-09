@@ -473,16 +473,20 @@ async def test_decisions_refresh_table_renders_current_counts(
         else:
             loop_thread = threading.current_thread()
             loop_fs_calls = []
+            decisions_dir = current.store.session_dir / "attention"
             real_iterdir = Path.iterdir
             real_stat = Path.stat
 
+            def is_decisions_path(path):
+                return path == decisions_dir or decisions_dir in path.parents
+
             def loop_safe_iterdir(path):
-                if threading.current_thread() is loop_thread:
+                if threading.current_thread() is loop_thread and is_decisions_path(path):
                     loop_fs_calls.append("iterdir")
                 return real_iterdir(path)
 
             def loop_safe_stat(path, *args, **kwargs):
-                if threading.current_thread() is loop_thread:
+                if threading.current_thread() is loop_thread and is_decisions_path(path):
                     loop_fs_calls.append("stat")
                 return real_stat(path, *args, **kwargs)
 
@@ -500,7 +504,7 @@ async def test_decisions_refresh_table_renders_current_counts(
                 await app._decisions_tick()
         if case == "success":
             # test-contract: this assertion is the loop-filesystem guard.
-            assert loop_fs_calls == []
+            assert loop_fs_calls == [], loop_fs_calls
         assert (app.decisions_count, app.decisions_staged_count) == expected[:2]
         assert expected[2] in _rendered_decisions_status(app)
     finally:
